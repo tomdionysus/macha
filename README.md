@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.89.1*
+*v0.90.0*
 
 *Macha — Old Irish /ˈmˠaxə/ — approximately “MAKH-uh”*
 
@@ -104,11 +104,14 @@ Three explicit storage classes, with separate durability rules:
 Every known node is metadata-capable and any node accepts a write on its own:
 a single node, or the survivor of any number of losses, keeps reading and
 writing. `dht.replicas` is the DATA copy count repair converges to.
-`dht.write_copies` and `dht.metadata_write_copies` are the copies sought
-before a write returns, of a DATA object and of a namespace or control
-mutation: with that many nodes present and answering, the write is on that
-many when it returns; with fewer, it returns on the copies it has and repair
-delivers the rest. Divergent metadata heads are reconciled
+A namespace change is made on the node that receives it: the write returns
+once that node durably holds it, a read on that node sees it at once, and
+every node present is sent it straight afterwards. `dht.write_copies` and
+`dht.metadata_write_copies` are the copies sought before a write returns, of
+a DATA object and of a catalogue control object: with that many nodes present
+and answering, the write is on that many when it returns; with fewer, it
+returns on the copies it has and repair delivers the rest. Divergent metadata
+heads are reconciled
 automatically, non-conflicting namespace changes are merged, and incompatible
 alternatives are preserved as durable conflicts rather than silently picking a
 winner.

@@ -4,7 +4,7 @@
 
 Every Macha node is a metadata replica, and every replica has the same standing.
 
-A metadata commit is accepted once the committing node durably holds it. `dht.metadata_write_copies` is the number of copies sought before the write returns, not a condition of acceptance and not a majority derived from cluster membership: with that many nodes present and answering, the commit is on that many when it returns; with fewer, it returns on the copies it has and repair delivers the rest.
+A namespace commit is made on the committing node alone: it is accepted, and the write returns, once that node durably holds the commit, its acceptance certificate and its claims on the objects it refers to. No peer is asked first. The commit is then offered to every node present, in order, by a replicator the caller does not wait for; a node that is away, slow or stalled receives it from repair. A read on the committing node sees the commit at once. A read on another node sees it when it arrives there. `dht.metadata_write_copies` is the number of copies sought, before the write returns, of the control objects a catalogue write stores and of a merge commit; it is not a condition of acceptance and not a majority derived from cluster membership.
 
 For example, with twelve known nodes and:
 
@@ -17,11 +17,11 @@ any node may continue publishing metadata while the other eleven are unavailable
 
 ## Commit, acceptance and heads are separate concepts
 
-A live metadata write is two steps over immutable objects: store the commit on this node and on the replicas present, then record its acceptance.
+A live metadata write is two steps over immutable objects on the committing node: store the commit, then record its acceptance. The replicas present receive both afterwards.
 
 A `MetadataCommit` is an immutable DAG node: it contains a complete state or deterministic delta, its primary parent, and any additional merge parents. A replica may durably store a valid commit regardless of which accepted head it currently exposes. Storing a commit therefore never means "replace your current head".
 
-A commit becomes accepted once the writer has durably stored that exact immutable commit itself. It offers the commit to the nearest nodes present until `metadata_write_copies` hold it or none is left to ask, then persists an acceptance certificate naming the nodes that stored it, on itself first and then on each of them, so a peer never holds an accepted commit its author lacks. The certificate records where the commit was held when it was accepted; acceptance does **not** disappear merely because one of those nodes later goes offline.
+A commit becomes accepted once the writer has durably stored that exact immutable commit itself and persisted an acceptance certificate naming itself. The replicator then sends each node present the history it lacks and the certificate, so a peer never holds an accepted commit its author lacks. A merge commit, which is made in the background, is offered to the nearest nodes present until `metadata_write_copies` hold it before it is accepted, and its certificate names those nodes. The certificate records where the commit was held when it was accepted; acceptance does **not** disappear merely because one of those nodes later goes offline.
 
 Each replica persists a set of maximal accepted heads. Normally the set contains one commit. A partition may leave several accepted heads. Learning another accepted head adds it to the set rather than replacing an unrelated branch. Once a reconciliation commit descends from those heads, the ancestors cease to be maximal and the head set collapses naturally.
 

@@ -1,6 +1,47 @@
 # Plan: one local-first path for every read and write
 
-*2026-10-05. Status: proposed, awaiting the operator's go-ahead. Nothing built.*
+*2026-10-05. Approved by the operator the same day ("implement the plan").*
+
+**Status, 2026-10-05: stage 1 partly built, as 0.90.0.**
+
+Built:
+
+- The commit is local (design 3). A mutation asks no peer; a replicator
+  delivers claims and the head to every node present afterwards. This is
+  finding 2.1, and it gives every caller the contract's "acknowledge" and
+  "read" on its own: a commit is durable here when it returns and this
+  node's view (`MetadataView::local()`) shows it at once.
+- Lookups read the tree (1.1, 1.6): no whole-namespace index; stat-only
+  scans that seek and stop early.
+- The tree update splices (2.4, 2.5) and the tree diff reads only what
+  differs (the primitive stage 2 builds on).
+- The management API's global write lock is gone (2.2).
+- The working set's erasure lookups are a set (2.9, in part).
+
+How this differs from the design as written: the journal has not moved. With
+the commit made local, a caller outside FUSE is answered from a durable
+local commit rather than from a journal record, and concurrent callers share
+commits through the filesystem's group commit. FUSE keeps its own journal in
+front of that, for batching. What the journal would still add for other
+callers is one fsync shared across more operations; it is not needed for the
+contract.
+
+Not built yet, in the order intended:
+
+- FUSE's view (1.2, 1.3, 1.4): it still re-walks the tree after each commit
+  and scans its whole path map for a listing. The diff is ready; applying it
+  needs care where an operation is skipped or dropped after recovery, since
+  the walk is what reconciles those today.
+- Read-your-writes between FUSE and other callers: an operation FUSE has
+  journalled and not yet published is not visible through the API until its
+  commit lands (now a local commit, so soon).
+- Ingest and data publications still commit one operation at a time (2.3);
+  each commit is now local.
+- The per-commit handling of the non-namespace snapshot (2.6, 2.7) and the
+  journal's fsyncs under the FUSE lock (2.8).
+- Request paths that still call `converged()`: `find_media`, the scanner's
+  `namespace_signature`.
+- Stages 2 and 3.
 
 Evidence: [the audit](2026-10-05-whole-library-work-audit.md) (finding numbers
 below refer to it). Builds on
