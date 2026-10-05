@@ -71,8 +71,6 @@ fuse:
   max_pending_requests: 4096
   commit_workers: 8
   # Recovery publication is deliberately bounded independently of live commits.
-  recovery_commit_workers: 2
-  foreground_commit_workers: 1
   publication_quiet_ms: 5000
   max_pending_operations: 4096
 
@@ -194,7 +192,7 @@ catalogue:
     port: ${API_PORT}
     max_request_bytes: 8M
     workers: 16
-    max_queued_connections: 128
+    max_connections: 128
     client_io_timeout_ms: 30000
     stream_chunk_bytes: 256K
 

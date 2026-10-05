@@ -943,7 +943,6 @@ MACHA_FAST_TEST("foundations", test_config) {
     CHECK(maintenance_policy.scrub_interval == std::chrono::hours(24 * 30));
     CHECK(maintenance_policy.no_progress_backoff == 300000ms);
     FuseConfig fuse_defaults;
-    CHECK(fuse_defaults.recovery_commit_workers == 2);
     CHECK(fuse_defaults.publication_quantum_bytes == 32ULL * 1024 * 1024);
     CHECK(fuse_defaults.publication_inflight_bytes == 256ULL * 1024 * 1024);
     CHECK(fuse_defaults.publication_pipeline_bytes == 0);

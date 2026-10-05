@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.17 — configuration without dead settings (experiment)
+
+Configuration change: three keys are gone, and a file that still sets one is
+refused at startup as an unknown key. No wire, protocol, API or on-disk
+changes.
+
+**`fuse.recovery_commit_workers` and `fuse.foreground_commit_workers` are
+removed.** Neither had any effect: restored spool publishes as ordinary loader
+work, bounded by `commit_workers`.
+
+**`catalogue.api.max_queued_connections` is removed**; the setting is
+`max_connections`.
+
+**The example configuration's comments describe the system as it is**, without
+history.
+
 ## 0.90.16 — an album's tracks share one provider lookup (experiment)
 
 No wire, protocol, API or on-disk changes.
