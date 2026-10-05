@@ -790,6 +790,12 @@ struct FuseFrontend::State {
     // appends and namespace node reads.
     IoMutex refresh_mutex;
     std::atomic_uint64_t refreshed_namespace_revision{};
+    // The tree `paths` was last brought into line with. A refresh applies
+    // what differs between it and the new tree, unless the view may have
+    // parted from it: an operation applied here and then retired without
+    // being published. Then, and the first time, the whole tree is walked.
+    std::optional<ObjectId> adopted_namespace_root MACHA_GUARDED_BY(namespace_mutex);
+    std::atomic_bool namespace_view_diverged{true};
     // Last revision whose deferred adoption was logged; logs once per view.
     std::atomic_uint64_t namespace_refresh_deferred_logged_revision{};
 
@@ -2417,6 +2423,52 @@ struct FuseFrontend::State {
         return found->second;
     }
 
+    // The inodes whose paths lie directly inside a directory, in key order;
+    // `each` returns false to stop. `paths` is ordered by canonical path, so
+    // a directory's contents are one key range, and a child directory's own
+    // contents are stepped over.
+    template <typename Each>
+    void for_each_child_locked(std::string_view directory, Each&& each) const
+        MACHA_REQUIRES(namespace_mutex) {
+        const auto key = canonical_path(directory);
+        const auto prefix = key == "/" ? std::string("/") : key + "/";
+        for (auto it = paths.lower_bound(prefix); it != paths.end();) {
+            const std::string_view path = it->first;
+            if (!path.starts_with(prefix))
+                break;
+            const auto rest = path.substr(prefix.size());
+            const auto slash = rest.find('/');
+            if (rest.empty()) {
+                ++it;
+            } else if (slash == std::string_view::npos) {
+                if (!each(it->second))
+                    return;
+                ++it;
+            } else {
+                // '0' follows '/': the first key past this child's contents.
+                it = paths.lower_bound(prefix + std::string(rest.substr(0, slash)) + "0");
+            }
+        }
+    }
+
+    // The inodes at or beneath a path.
+    template <typename Each>
+    void for_each_under_locked(std::string_view root, Each&& each) const
+        MACHA_REQUIRES(namespace_mutex) {
+        const auto key = canonical_path(root);
+        if (key == "/") {
+            for (const auto& [_, inode] : paths)
+                each(inode);
+            return;
+        }
+        if (const auto self = paths.find(key); self != paths.end())
+            each(self->second);
+        const auto prefix = key + "/";
+        for (auto it = paths.lower_bound(prefix);
+             it != paths.end() && std::string_view(it->first).starts_with(prefix); ++it)
+            each(it->second);
+    }
+
     std::shared_ptr<Inode> resolve_inode(uint64_t id) const {
         Lock lock(namespace_mutex);
         auto found = inodes.find(id);
@@ -3064,6 +3116,7 @@ struct FuseFrontend::State {
                     const std::array<NamespaceOp, 1> abandoned_span{abandoned};
                     journal_namespace_done(abandoned_span);
                     release_namespace_references(abandoned_span);
+                    namespace_view_diverged.store(true, std::memory_order_release);
                     Log::warn("FUSE async namespace publication operator-skipped seq=" +
                              std::to_string(abandoned.sequence));
                     batch.erase(batch.begin());
@@ -5017,14 +5070,11 @@ struct FuseFrontend::State {
                 return;
             }
         }
-            std::set<std::string, std::less<>> seen;
             auto adopt_nodes = fs.namespace_nodes();
-            for_each_namespace_entry(snapshot, &adopt_nodes,
-                                     [&](const std::string& path, const FsEntry& entry)
+            const auto adopt_entry = [&](const std::string& path, const FsEntry& entry)
                                          MACHA_REQUIRES(namespace_mutex) {
             ++walked;
             const auto key = canonical_path(path);
-            seen.insert(key);
             auto found = paths.find(key);
             if (found == paths.end()) {
                 auto inode = std::make_shared<Inode>();
@@ -5074,23 +5124,67 @@ struct FuseFrontend::State {
                 inode->visible = entry;
                 inode->admitted_size = entry.size;
             }
-            });
-
-            for (auto it = paths.begin(); it != paths.end();) {
-            if (it->first == canonical_path("/") || seen.contains(it->first)) {
-                ++it;
-                continue;
-            }
-            auto inode = it->second;
-            Lock inode_lock(inode->mutex);
+            };
             // Remote unlink, POSIX semantics: the name goes now; open or dirty
             // state keeps the inode but cannot resurrect the path.
-            inode->published_path.reset();
-            it = paths.erase(it);
-            const auto detached_id = inode->id;
-            // Reclaimed after namespace_mutex is released.
-            detached.push_back(detached_id);
+            const auto drop_path = [&](decltype(paths)::iterator it)
+                                       MACHA_REQUIRES(namespace_mutex) {
+                auto inode = it->second;
+                Lock inode_lock(inode->mutex);
+                inode->published_path.reset();
+                // Reclaimed after namespace_mutex is released.
+                detached.push_back(inode->id);
+                return paths.erase(it);
+            };
+
+            const bool by_difference =
+                snapshot.namespace_root && adopted_namespace_root &&
+                !namespace_view_diverged.load(std::memory_order_acquire);
+            if (by_difference) {
+                for (const auto& [path, difference] : diff_namespace_trees(
+                         *adopted_namespace_root, *snapshot.namespace_root, adopt_nodes)) {
+                    if (difference.after) {
+                        adopt_entry(path, *difference.after);
+                        continue;
+                    }
+                    const auto key = canonical_path(path);
+                    auto it = paths.find(key);
+                    if (it == paths.end())
+                        continue;
+                    {
+                        // The name stands for another spelling of it.
+                        Lock inode_lock(it->second->mutex);
+                        if (it->second->published_path && *it->second->published_path != path)
+                            continue;
+                    }
+                    // A canonically-equivalent spelling may remain under the
+                    // canonical name itself.
+                    if (key != path) {
+                        if (const auto twin = namespace_entry(snapshot, &adopt_nodes, key)) {
+                            adopt_entry(key, *twin);
+                            continue;
+                        }
+                    }
+                    ++walked;
+                    drop_path(it);
+                }
+            } else {
+                std::set<std::string, std::less<>> seen;
+                for_each_namespace_entry(snapshot, &adopt_nodes,
+                                         [&](const std::string& path, const FsEntry& entry)
+                                             MACHA_REQUIRES(namespace_mutex) {
+                    seen.insert(canonical_path(path));
+                    adopt_entry(path, entry);
+                });
+                for (auto it = paths.begin(); it != paths.end();) {
+                    if (it->first == canonical_path("/") || seen.contains(it->first))
+                        ++it;
+                    else
+                        it = drop_path(it);
+                }
             }
+            adopted_namespace_root = snapshot.namespace_root;
+            namespace_view_diverged.store(false, std::memory_order_release);
             refreshed_namespace_revision.store(view.namespace_revision,
                                                  std::memory_order_release);
         }
@@ -5099,7 +5193,7 @@ struct FuseFrontend::State {
         if (Log::enabled(LogLevel::debug))
             Log::debug("FUSE namespace adopted revision=" + std::to_string(view.namespace_revision) +
                        " generation=" + std::to_string(view.generation) +
-                       " entries=" + std::to_string(walked) +
+                       " visited=" + std::to_string(walked) +
                        " new=" + std::to_string(adopted_new) +
                        " detached=" + std::to_string(detached.size()));
     }
@@ -5306,14 +5400,14 @@ FuseFrontend::readdir(std::string_view path) {
                 throw FsError(ENOTDIR, "not directory");
             parent_current_path = parent->current_path;
         }
-        for (const auto& [_, inode] : state_->paths) {
+        state_->for_each_child_locked(parent_current_path, [&](const auto& inode) {
             check_deadline(deadline, cancelled);
             Lock inode_lock(inode->mutex);
-            if (inode->current_path == "/" ||
-                parent_path(inode->current_path) != parent_current_path)
-                continue;
-            out.push_back({base_name(inode->current_path), fuse_attributes(inode->visible)});
-        }
+            if (inode->current_path != "/" &&
+                parent_path(inode->current_path) == parent_current_path)
+                out.push_back({base_name(inode->current_path), fuse_attributes(inode->visible)});
+            return true;
+        });
         std::sort(out.begin(), out.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
         return out;
@@ -5394,13 +5488,15 @@ void FuseFrontend::rmdir(std::string_view path) {
                          throw FsError(ENOTDIR, "not directory");
                      if (requested == "/")
                          throw FsError(EBUSY, "cannot remove root");
-                     for (const auto& [_, candidate] : state_->paths) {
+                     const std::string directory = inode->current_path;
+                     state_->for_each_child_locked(directory, [&](const auto& candidate) {
                          if (candidate == inode)
-                             continue;
+                             return true;
                          Lock candidate_lock(candidate->mutex);
-                         if (parent_path(candidate->current_path) == inode->current_path)
+                         if (parent_path(candidate->current_path) == directory)
                              throw FsError(ENOTEMPTY, "directory not empty");
-                     }
+                         return true;
+                     });
                      check_deadline(deadline, cancelled);
                      const auto sequence = state_->next_namespace_sequence++;
                      op.kind = State::NamespaceOp::Kind::rmdir;
@@ -5497,24 +5593,25 @@ void FuseFrontend::rename(std::string_view from, std::string_view to, bool norep
                 {
                     Lock destination_lock(displaced_inode->mutex);
                     if (displaced_inode->visible.type == EntryType::directory) {
-                        for (const auto& [_, candidate] : state_->paths) {
+                        const std::string displaced = displaced_inode->current_path;
+                        state_->for_each_child_locked(displaced, [&](const auto& candidate) {
                             if (candidate == displaced_inode || candidate == root)
-                                continue;
+                                return true;
                             Lock candidate_lock(candidate->mutex);
-                            if (parent_path(candidate->current_path) ==
-                                displaced_inode->current_path)
+                            if (parent_path(candidate->current_path) == displaced)
                                 throw FsError(ENOTEMPTY, "destination directory not empty");
-                        }
+                            return true;
+                        });
                     }
                 }
             }
 
             std::vector<std::shared_ptr<State::Inode>> affected_inodes;
-            for (const auto& [_, inode] : state_->paths) {
+            state_->for_each_under_locked(source, [&](const auto& inode) {
                 Lock inode_lock(inode->mutex);
                 if (under_path(inode->current_path, source))
                     affected_inodes.push_back(inode);
-            }
+            });
             const auto sequence = state_->next_namespace_sequence++;
             op.kind = State::NamespaceOp::Kind::rename;
             op.sequence = sequence;

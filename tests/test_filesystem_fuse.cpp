@@ -1215,6 +1215,45 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
                           [](const auto& item) { return item.first == "media.bin"; }));
         fs.unlink("/external/media.bin");
         CHECK(absent(*frontend, "/external/media.bin"));
+
+        // After the first, each refresh applies what differs between the tree
+        // it last took and the tree now. Whatever is changed outside, mixed
+        // with the frontend's own operations, the frontend lists what the
+        // filesystem lists.
+        const auto names = [](const auto& listing) {
+            std::vector<std::string> out;
+            for (const auto& item : listing)
+                out.push_back(item.first);
+            std::sort(out.begin(), out.end());
+            return out;
+        };
+        const auto agrees = [&](const std::string& directory) {
+            return names(frontend->readdir(directory)) == names(fs.readdir(directory));
+        };
+        fs.mkdir("/external/show", 0755, getuid(), getgid());
+        for (const char* name : {"/external/show/e1.bin", "/external/show/e2.bin"})
+            fs.create_file(name, 0644, getuid(), getgid());
+        fs.create_file("/external/show.nfo", 0644, getuid(), getgid());
+        CHECK(agrees("/external"));
+        CHECK(agrees("/external/show"));
+        frontend->mkdir("/external/own", 0755, getuid(), getgid());
+        REQUIRE(frontend->wait_for_idle(20s));
+        fs.rename("/external/show", "/external/renamed", false);
+        CHECK(absent(*frontend, "/external/show"));
+        CHECK(absent(*frontend, "/external/show/e1.bin"));
+        CHECK(frontend->getattr("/external/renamed/e2.bin").type == EntryType::file);
+        CHECK(agrees("/external"));
+        CHECK(agrees("/external/renamed"));
+        fs.chmod("/external/renamed/e1.bin", 0600);
+        CHECK((frontend->getattr("/external/renamed/e1.bin").mode & 0777U) == 0600U);
+        fs.unlink("/external/renamed/e1.bin");
+        fs.unlink("/external/renamed/e2.bin");
+        fs.rmdir("/external/renamed");
+        fs.rmdir("/external/own");
+        CHECK(absent(*frontend, "/external/renamed"));
+        CHECK(absent(*frontend, "/external/own"));
+        CHECK(agrees("/external"));
+        CHECK(agrees("/"));
         frontend->stop();
     }
 
