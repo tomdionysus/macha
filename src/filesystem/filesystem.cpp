@@ -2465,41 +2465,114 @@ std::optional<Hash256> FileSystem::available_namespace_signature(
     return metadata_namespace_signature(*view->snapshot);
 }
 
-std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached() {
-    const auto known_generation = metadata_server_.known_generation();
-    {
-        Lock lock(maintenance_index_mutex_);
-        if (maintenance_index_ && maintenance_index_generation_ >= known_generation)
-            return maintenance_index_;
-    }
-
-    auto view = m_.converged();
-    const auto& snapshot = *view.snapshot;
-    std::vector<ObjectId> live;
-    size_t extents = 0;
-    auto add_entry_extents = [&](const FsEntry& entry) {
-        extents += entry.extents.size();
-        for (const auto& extent : entry.extents) {
-            if (!extent.hole)
-                live.push_back(extent.id);
+namespace {
+// `base` with `add` put in and one of each of `remove` taken out, all three
+// in order. False when something to take out is not there.
+bool apply_to_census(std::vector<ObjectId>& base, std::vector<ObjectId> add,
+                     std::vector<ObjectId> remove) {
+    if (add.empty() && remove.empty())
+        return true;
+    std::sort(add.begin(), add.end());
+    std::sort(remove.begin(), remove.end());
+    std::vector<ObjectId> out;
+    out.reserve(base.size() + add.size());
+    auto adding = add.begin();
+    auto removing = remove.begin();
+    for (const auto& id : base) {
+        while (adding != add.end() && *adding < id)
+            out.push_back(*adding++);
+        if (removing != remove.end() && *removing < id)
+            return false;
+        if (removing != remove.end() && *removing == id) {
+            ++removing;
+            continue;
         }
-    };
+        out.push_back(id);
+    }
+    out.insert(out.end(), adding, add.end());
+    if (removing != remove.end())
+        return false;
+    base.swap(out);
+    return true;
+}
+
+std::vector<ObjectId> distinct(const std::vector<ObjectId>& sorted) {
+    std::vector<ObjectId> out;
+    out.reserve(sorted.size());
+    std::unique_copy(sorted.begin(), sorted.end(), std::back_inserter(out));
+    return out;
+}
+} // namespace
+
+void FileSystem::census_walk(const MetadataSnapshot& snapshot, NamespaceCensus& census) {
+    census = {};
     // The reachability walk GC trusts. for_each_namespace_entry walks a
     // tree-backed namespace; an empty live set would make every extent look
     // unreachable. The same walk names the tree's nodes, the namespace's own
     // control objects, and throws on any it cannot read.
-    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
-    size_t walked_entries = 0;
-    std::vector<ObjectId> tree_nodes;
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     for_each_namespace_entry(
-        snapshot, &namespace_nodes,
+        snapshot, &nodes,
         [&](const std::string&, const FsEntry& entry) {
-            ++walked_entries;
-            add_entry_extents(entry);
+            ++census.entries;
+            census.extent_count += entry.extents.size();
+            for (const auto& extent : entry.extents)
+                if (!extent.hole)
+                    census.extents.push_back(extent.id);
         },
-        tree_nodes);
-    std::sort(tree_nodes.begin(), tree_nodes.end());
-    tree_nodes.erase(std::unique(tree_nodes.begin(), tree_nodes.end()), tree_nodes.end());
+        census.nodes);
+    std::sort(census.extents.begin(), census.extents.end());
+    std::sort(census.nodes.begin(), census.nodes.end());
+    census.root = snapshot.namespace_root;
+}
+
+bool FileSystem::census_follow(const ObjectId& root, NamespaceCensus& census) {
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    std::vector<ObjectId> extents_in, extents_out, nodes_in, nodes_out;
+    diff_namespace_tree_nodes(*census.root, root, nodes, nodes_in, nodes_out);
+    auto entries = census.entries;
+    auto extent_count = census.extent_count;
+    for (const auto& [path, difference] : diff_namespace_trees(*census.root, root, nodes)) {
+        if (difference.before) {
+            --entries;
+            extent_count -= difference.before->extents.size();
+            for (const auto& extent : difference.before->extents)
+                if (!extent.hole)
+                    extents_out.push_back(extent.id);
+            const auto spine = namespace_entry_spine_nodes(*difference.before);
+            nodes_out.insert(nodes_out.end(), spine.begin(), spine.end());
+        }
+        if (difference.after) {
+            ++entries;
+            extent_count += difference.after->extents.size();
+            for (const auto& extent : difference.after->extents)
+                if (!extent.hole)
+                    extents_in.push_back(extent.id);
+            const auto spine = namespace_entry_spine_nodes(*difference.after);
+            nodes_in.insert(nodes_in.end(), spine.begin(), spine.end());
+        }
+    }
+    auto extents = census.extents;
+    auto tree_nodes = census.nodes;
+    if (!apply_to_census(extents, std::move(extents_in), std::move(extents_out)) ||
+        !apply_to_census(tree_nodes, std::move(nodes_in), std::move(nodes_out)))
+        return false;
+    census.extents = std::move(extents);
+    census.nodes = std::move(tree_nodes);
+    census.entries = entries;
+    census.extent_count = extent_count;
+    census.root = root;
+    return true;
+}
+
+MaintenanceObjects FileSystem::maintenance_objects_from(const MetadataSnapshotView& view,
+                                                        const NamespaceCensus& census) {
+    const auto& snapshot = *view.snapshot;
+    MaintenanceObjects built;
+    built.live = distinct(census.extents);
+    built.namespace_nodes = distinct(census.nodes);
+    built.entries = census.entries;
+    built.extents = census.extent_count;
 
     // Unresolved conflict alternatives are reachability roots until resolved;
     // their extents are counted and protected from GC.
@@ -2509,38 +2582,71 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
         for (const auto* candidate : {&conflict.base_entry, &conflict.left_entry,
                                       &conflict.right_entry}) {
             if (*candidate)
-                extents += (**candidate).extents.size();
+                built.extents += (**candidate).extents.size();
         }
     }
     const auto conflict_live = metadata_conflict_extent_roots(snapshot);
-    live.insert(live.end(), conflict_live.begin(), conflict_live.end());
-    std::sort(live.begin(), live.end());
-    live.erase(std::unique(live.begin(), live.end()), live.end());
+    if (!conflict_live.empty()) {
+        built.live.insert(built.live.end(), conflict_live.begin(), conflict_live.end());
+        std::sort(built.live.begin(), built.live.end());
+        built.live.erase(std::unique(built.live.begin(), built.live.end()), built.live.end());
+    }
 
     // Tombstones keep retired_at_ns: maintenance combines filesystem and
     // catalogue liveness before collecting, and it makes pruning ABA-safe.
-    auto garbage = snapshot.garbage;
-    std::sort(garbage.begin(), garbage.end(), [](const GarbageRef& a, const GarbageRef& b) {
-        if (a.id != b.id)
-            return a.id < b.id;
-        return a.retired_at_ns > b.retired_at_ns;
-    });
-    garbage.erase(std::unique(garbage.begin(), garbage.end(),
-                              [](const GarbageRef& a, const GarbageRef& b) {
-                                  return a.id == b.id;
-                              }),
-                  garbage.end());
+    built.garbage = snapshot.garbage;
+    std::sort(built.garbage.begin(), built.garbage.end(),
+              [](const GarbageRef& a, const GarbageRef& b) {
+                  if (a.id != b.id)
+                      return a.id < b.id;
+                  return a.retired_at_ns > b.retired_at_ns;
+              });
+    built.garbage.erase(std::unique(built.garbage.begin(), built.garbage.end(),
+                                    [](const GarbageRef& a, const GarbageRef& b) {
+                                        return a.id == b.id;
+                                    }),
+                        built.garbage.end());
+    built.metadata_generation = view.generation;
+    built.observed_mutations = snapshot.mutation_sequences;
+    return built;
+}
 
-    auto built = std::make_shared<MaintenanceObjects>();
-    built->live = std::move(live);
-    built->garbage = std::move(garbage);
-    built->namespace_nodes = std::move(tree_nodes);
-    built->metadata_generation = view.generation;
-    built->observed_mutations = snapshot.mutation_sequences;
-    // Counted during the walk: a tree-backed snapshot has no map to size.
-    built->entries = walked_entries;
-    built->extents = extents;
+std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached() {
+    const auto known_generation = metadata_server_.known_generation();
+    {
+        Lock lock(maintenance_index_mutex_);
+        if (maintenance_index_ && maintenance_index_generation_ >= known_generation)
+            return maintenance_index_;
+    }
 
+    // One build at a time; a second caller takes the first one's result.
+    Lock building(maintenance_build_mutex_);
+    {
+        Lock lock(maintenance_index_mutex_);
+        if (maintenance_index_ && maintenance_index_generation_ >= known_generation)
+            return maintenance_index_;
+    }
+    auto view = m_.converged();
+    const auto& snapshot = *view.snapshot;
+    // The census follows the tree: what the new tree holds that the last one
+    // did not goes in, what it no longer holds comes out. The whole tree is
+    // walked the first time, for a namespace that is not a tree, and if the
+    // census and the trees ever disagree.
+    bool followed = false;
+    if (snapshot.namespace_root && maintenance_census_.root) {
+        if (*maintenance_census_.root == *snapshot.namespace_root) {
+            followed = true;
+        } else {
+            followed = census_follow(*snapshot.namespace_root, maintenance_census_);
+            if (!followed)
+                Log::warn("maintenance census did not match the namespace tree; walking it again");
+        }
+    }
+    if (!followed)
+        census_walk(snapshot, maintenance_census_);
+
+    auto built = std::make_shared<MaintenanceObjects>(
+        maintenance_objects_from(view, maintenance_census_));
     Lock lock(maintenance_index_mutex_);
     if (!maintenance_index_ || view.generation >= maintenance_index_generation_) {
         maintenance_index_generation_ = view.generation;
@@ -2550,6 +2656,9 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
 }
 
 MaintenanceObjects FileSystem::maintenance_objects() {
-    return *maintenance_objects_cached();
+    const auto view = m_.converged();
+    NamespaceCensus census;
+    census_walk(*view.snapshot, census);
+    return maintenance_objects_from(view, census);
 }
 } // namespace macha
