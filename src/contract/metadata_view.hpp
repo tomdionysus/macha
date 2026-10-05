@@ -142,6 +142,15 @@ class MetadataView {
     // unmergeable for now.
     virtual MetadataHeadStanding head_standing() const noexcept = 0;
 
+    // The catalogue root at the common ancestor of two heads, when this
+    // node's history still reaches it: the base the catalogue merges two
+    // roots over. The outer value is empty when it does not. Reads local
+    // history.
+    static constexpr Waits common_ancestor_catalogue_root_waits =
+        Waits::state_device | Waits::locks;
+    virtual std::optional<std::optional<ObjectId>>
+    common_ancestor_catalogue_root(const Hash256& left, const Hash256& right) const = 0;
+
 };
 
 // The metadata component's upkeep of its own replicas, kept off the view so

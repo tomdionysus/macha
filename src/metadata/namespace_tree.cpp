@@ -1524,6 +1524,72 @@ NamespaceTreeMerge merge_tree_backed_snapshots(const MetadataSnapshot& base,
     return out;
 }
 
+NamespaceTreeMerge merge_tree_backed_heads(const MetadataSnapshot& left,
+                                           const MetadataSnapshot& right,
+                                           const Hash256& left_head, const Hash256& right_head,
+                                           const NamespaceNodeStore& store) {
+    if (!left.namespace_root || !right.namespace_root)
+        throw std::logic_error("a tree merge requires two tree-backed namespaces");
+    // The lower head is the merge commit's primary parent: the changes are
+    // against its tree, so they are also the commit's delta.
+    const bool left_primary = !(right_head < left_head);
+    NamespaceTreeMerge out;
+    out.onto = left_primary ? *left.namespace_root : *right.namespace_root;
+    if (left_head == right_head) {
+        out.merged.snapshot = left;
+        out.merged.snapshot.namespace_root.reset();
+        return out;
+    }
+    const auto differing = diff_namespace_trees(*left.namespace_root, *right.namespace_root, store);
+
+    // What the merge must see: each path that differs, each standing
+    // conflict's subject, and the directories above them.
+    std::set<std::string> paths{"/"};
+    for (const auto& [path, _] : differing)
+        paths.insert(path);
+    for (const auto* conflicts : {&left.conflicts, &right.conflicts})
+        for (const auto& [_, conflict] : *conflicts)
+            if (conflict.kind == MetadataConflictKind::namespace_entry)
+                paths.insert(conflict.key);
+    for (const auto& path : std::vector<std::string>(paths.begin(), paths.end()))
+        for (auto above = path; above != "/" && !above.empty();) {
+            above = parent_path(above);
+            paths.insert(above);
+        }
+
+    NamespaceEntries left_entries, right_entries;
+    for (const auto& path : paths) {
+        const auto found = differing.find(path);
+        if (found != differing.end()) {
+            if (found->second.before)
+                left_entries.emplace(path, *found->second.before);
+            if (found->second.after)
+                right_entries.emplace(path, *found->second.after);
+            continue;
+        }
+        // Not a difference: both heads hold the same entry, or neither.
+        if (auto same = namespace_tree_lookup(*left.namespace_root, path, store, true)) {
+            left_entries.emplace(path, *same);
+            right_entries.emplace(path, std::move(*same));
+        }
+    }
+
+    out.merged = merge_metadata_heads_over(left, right, left_entries, right_entries, left_head,
+                                           right_head);
+    const auto& primary_entries = left_primary ? left_entries : right_entries;
+    for (const auto& path : paths) {
+        const auto merged = out.merged.snapshot.entries.find(path);
+        const auto was = primary_entries.find(path);
+        const bool present = merged != out.merged.snapshot.entries.end();
+        if (present != (was != primary_entries.end()) ||
+            (present && merged->second != was->second))
+            out.changes[path] =
+                present ? std::optional<FsEntry>(merged->second) : std::optional<FsEntry>();
+    }
+    out.merged.snapshot.entries.clear();
+    return out;
+}
+
 std::optional<MetadataDelta> tree_merge_delta(const MetadataSnapshot& primary,
                                               const MetadataSnapshot& merged,
                                               const NamespaceChanges& changes) {

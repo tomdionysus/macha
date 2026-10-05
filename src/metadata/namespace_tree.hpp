@@ -228,6 +228,14 @@ NamespaceTreeMerge merge_tree_backed_snapshots(const MetadataSnapshot& base,
                                                const Hash256& left_head, const Hash256& right_head,
                                                const NamespaceNodeStore& store);
 
+// The merge of two tree-backed heads, without materialising them:
+// `merge_metadata_heads` over the paths at which the two trees differ. The
+// result is shaped as `merge_tree_backed_snapshots`'s.
+NamespaceTreeMerge merge_tree_backed_heads(const MetadataSnapshot& left,
+                                           const MetadataSnapshot& right,
+                                           const Hash256& left_head, const Hash256& right_head,
+                                           const NamespaceNodeStore& store);
+
 // The merge commit as a delta against its primary parent: what differs outside
 // the namespace, and `changes` as the namespace's. `merged` is the merge's
 // final snapshot. None when a delta cannot say it (metadata_delta).

@@ -284,6 +284,8 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
                              ? "namespace_entry"
                              : "catalogue_root"},
                 {"key", conflict.key},
+                // Which alternative is in place until someone decides.
+                {"installed", conflict.later_installed ? "left" : "base"},
                 {"left_head", hex(conflict.left_head.bytes)},
                 {"right_head", hex(conflict.right_head.bytes)}};
             if (conflict.kind == MetadataConflictKind::namespace_entry) {

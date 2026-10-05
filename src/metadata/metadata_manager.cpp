@@ -1226,36 +1226,28 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         try {
         auto left = heads[0];
         auto right = heads[1];
-        const auto common =
-            local_.replica().history_common_ancestor(left.hash, right.hash);
-        if (!common)
-            throw MergeUnavailable("divergent metadata heads have no known common ancestor");
-        auto base_materialized = local_.replica().materialized(*common);
-        if (!base_materialized)
-            throw MergeUnavailable("metadata common ancestor cannot be reconstructed");
         auto left_materialized = local_.replica().materialized(left.hash);
         auto right_materialized = local_.replica().materialized(right.hash);
         if (!left_materialized || !right_materialized)
             throw MergeUnavailable("metadata merge head cannot be materialized");
         const auto materialise_ms = stage_ms();
-        // Three trees merge by what differs between them. A branch still held
-        // as a map is materialised with the others, and the result re-rooted.
-        const auto& base_snapshot = *base_materialized->snapshot;
+        // The merge reads the two heads and nothing else. Two trees merge by
+        // what differs between them; a branch still held as a map is
+        // materialised with the other, and the result re-rooted.
         const auto& left_snapshot = *left_materialized->snapshot;
         const auto& right_snapshot = *right_materialized->snapshot;
         const auto tree_backed =
             left_snapshot.namespace_root.has_value() || right_snapshot.namespace_root.has_value();
         if (tree_backed && !namespace_store_)
             throw MetadataNotReady("no namespace node store is configured");
-        const bool all_trees = base_snapshot.namespace_root && left_snapshot.namespace_root &&
-                               right_snapshot.namespace_root;
+        const bool all_trees = left_snapshot.namespace_root && right_snapshot.namespace_root;
         MetadataMergeResult merged;
         std::optional<NamespaceTreeMerge> tree_merge;
         if (all_trees) {
             const auto reading =
                 ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_);
-            tree_merge = merge_tree_backed_snapshots(base_snapshot, left_snapshot, right_snapshot,
-                                                     left.hash, right.hash, reading);
+            tree_merge = merge_tree_backed_heads(left_snapshot, right_snapshot, left.hash,
+                                                 right.hash, reading);
             merged = std::move(tree_merge->merged);
         } else {
             auto reading = namespace_store_
@@ -1270,9 +1262,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                     throw MetadataNotReady("no namespace node store is configured");
                 return attach_namespace(snapshot, *reading);
             };
-            merged = merge_metadata_snapshots(materialise(base_snapshot),
-                                              materialise(left_snapshot),
-                                              materialise(right_snapshot), left.hash, right.hash);
+            merged = merge_metadata_heads(materialise(left_snapshot),
+                                          materialise(right_snapshot), left.hash, right.hash);
         }
         if (merged.snapshot.extent_size &&
             merged.snapshot.extent_size != node_.config().extent_size)
@@ -1757,6 +1748,12 @@ MetadataRecord MetadataManager::mutate_impl(
                 if (exact_delta)
                     supplied_delta.set_legacy_clock = snapshot.legacy_clock;
             }
+            if (exact_delta ? supplied_delta.catalogue != CatalogueDelta::unchanged
+                            : before->catalogue_root != snapshot.catalogue_root) {
+                snapshot.catalogue_dot = mutation;
+                if (exact_delta)
+                    supplied_delta.set_catalogue_dot = mutation;
+            }
             if (!exact_delta) {
                 for (auto& [path, entry] : snapshot.entries) {
                     const auto prior = before->entries.find(path);
@@ -1819,16 +1816,9 @@ MetadataRecord MetadataManager::mutate_impl(
         const bool resorted = !garbage_is_canonical(snapshot.garbage);
         if (resorted)
             canonicalise_garbage(snapshot.garbage);
-        const auto superseded = prune_superseded_conflicts(snapshot);
-        if (superseded)
-            conflicts_superseded_.fetch_add(superseded, std::memory_order_relaxed);
-        if (exact_delta) {
-            if (resorted || !supplied_delta.upsert_garbage.empty() ||
-                !supplied_delta.erase_garbage.empty())
-                supplied_delta.canonical_garbage = true;
-            if (superseded)
-                supplied_delta.replace_conflicts = snapshot.conflicts;
-        }
+        if (exact_delta && (resorted || !supplied_delta.upsert_garbage.empty() ||
+                            !supplied_delta.erase_garbage.empty()))
+            supplied_delta.canonical_garbage = true;
 
         // A tree-backed namespace commits by applying this mutation's change set
         // to the tree.
@@ -1848,6 +1838,25 @@ MetadataRecord MetadataManager::mutate_impl(
                 ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_);
             snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root,
                                                                     nodes, supplied_delta);
+        }
+
+        // Drop the conflicts this mutation decided by rewriting their subject,
+        // read from the namespace as the mutation leaves it.
+        if (!snapshot.conflicts.empty()) {
+            NamespaceLookup lookup;
+            std::optional<ControlNamespaceNodeStore> reader;
+            if (snapshot.namespace_root) {
+                reader.emplace(
+                    ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_));
+                lookup = [&](const std::string& path) {
+                    return namespace_entry(snapshot, &*reader, path);
+                };
+            }
+            if (const auto superseded = prune_superseded_conflicts(snapshot, lookup)) {
+                conflicts_superseded_.fetch_add(superseded, std::memory_order_relaxed);
+                if (exact_delta)
+                    supplied_delta.replace_conflicts = snapshot.conflicts;
+            }
         }
 
         auto payload =
@@ -1990,10 +1999,17 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
                                    ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_))
                              : std::nullopt;
             NamespaceWorkingSet working(snapshot, delta, nodes ? &*nodes : nullptr);
-            if (chosen)
-                working.put(conflict.key, *chosen);
-            else
+            if (chosen) {
+                // A decision is a change even when it keeps the value in
+                // place, so a head that has not seen it does not bring the
+                // conflict back.
+                auto decided = *chosen;
+                ++decided.version;
+                decided.ctime_ns = wall_time_ns();
+                working.put(conflict.key, decided);
+            } else {
                 working.erase(conflict.key);
+            }
         } else if (conflict.kind == MetadataConflictKind::catalogue_root) {
             snapshot.catalogue_root = choice == "left"    ? conflict.left_catalogue_root
                                       : choice == "right" ? conflict.right_catalogue_root
@@ -2009,6 +2025,17 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
     if (resolved)
         conflicts_resolved_.fetch_add(1, std::memory_order_relaxed);
     return resolved;
+}
+
+std::optional<std::optional<ObjectId>>
+MetadataManager::common_ancestor_catalogue_root(const Hash256& left, const Hash256& right) const {
+    const auto common = local_.replica().history_common_ancestor(left, right);
+    if (!common)
+        return {};
+    const auto ancestor = local_.replica().materialized(*common);
+    if (!ancestor)
+        return {};
+    return ancestor->snapshot->catalogue_root;
 }
 
 void MetadataManager::repair_once() {

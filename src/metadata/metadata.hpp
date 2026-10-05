@@ -84,6 +84,13 @@ struct GarbageRef {
 
 struct MetadataConflict {
     MetadataConflictKind kind{MetadataConflictKind::namespace_entry};
+    // Which value the merge left in place. Set by a merge of two heads: the
+    // left alternative, which is the later of the two (or the directory that
+    // had to stay). Unset by a three-way merge: the common ancestor.
+    bool later_installed{};
+    // With `later_installed`: the dot of the value left in place, which is
+    // how a later decision that keeps the same value is still seen.
+    MetadataDot installed_dot;
     std::string key;
     Hash256 left_head{}, right_head{};
     std::optional<FsEntry> base_entry, left_entry, right_entry;
@@ -139,6 +146,9 @@ struct MetadataSnapshot {
     // created an entry without provenance lies within it. Unset until then;
     // a merge joins by max.
     std::optional<std::map<NodeId, uint64_t>> legacy_clock;
+    // The mutation that last set or cleared `catalogue_root`. Carried with
+    // the legacy clock; none on a root set before that.
+    MetadataDot catalogue_dot;
     std::optional<ObjectId> catalogue_root;
     // SM14: the namespace tree root, carried instead of `entries`, never
     // alongside; both encoders refuse the mix. See namespace_tree.hpp.
@@ -346,6 +356,8 @@ struct MetadataDelta {
     std::optional<ObjectId> catalogue_root;
     // DLT10: sets the snapshot's legacy clock, once.
     std::optional<std::map<NodeId, uint64_t>> set_legacy_clock;
+    // DLT10: the catalogue root's dot, when the mutation moves it.
+    std::optional<MetadataDot> set_catalogue_dot;
 };
 // Applies one append to the entry at `path`, as both namespace forms do.
 // Throws DecodeError when the entry is not the file the append was made for.
@@ -370,9 +382,18 @@ void canonicalise_garbage(std::vector<GarbageRef>&);
 // Type, mode, ownership, size and extents equal; times and version may
 // differ. Two writers publishing the same media are not in conflict.
 bool same_content(const FsEntry&, const FsEntry&);
-// Drop every conflict whose subject no longer holds the common-ancestor value:
-// the later mutation is the resolution. Returns the count.
-size_t prune_superseded_conflicts(MetadataSnapshot&);
+// The alternative a conflict's merge left in place: the left one when
+// `later_installed`, the common ancestor otherwise.
+std::optional<FsEntry> conflict_installed_entry(const MetadataConflict&);
+std::optional<ObjectId> conflict_installed_catalogue_root(const MetadataConflict&);
+// Of two concurrent values, the one a merge leaves in place: the later
+// modification time, then the greater entry.
+const FsEntry& later_entry(const FsEntry&, const FsEntry&);
+// Drop every conflict whose subject no longer holds the value its merge left
+// in place: the later mutation is the resolution. Returns the count.
+// `lookup` reads the snapshot's namespace when it is not held as a map.
+using NamespaceLookup = std::function<std::optional<FsEntry>(const std::string& path)>;
+size_t prune_superseded_conflicts(MetadataSnapshot&, const NamespaceLookup& lookup = {});
 Bytes encode_snapshot(const MetadataSnapshot&);
 MetadataSnapshot decode_snapshot(std::span<const uint8_t>);
 // SM14: the non-entry fields plus `namespace_root`, so the payload size is
@@ -418,6 +439,22 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
 // any of the three carries. A path in none of them is the same on all three
 // and merges to itself. The result's entries cover the paths given.
 using NamespaceEntries = std::map<std::string, FsEntry>;
+// The merge of two heads from the heads alone: each entry's provenance and
+// each head's clock tell "removed there" from "never seen there" and "newer"
+// from "concurrent". A pure function of the two heads, so every reconciler
+// computes the same record. `merge_metadata_heads` takes materialised
+// namespaces; `..._over` takes each head's entries at the paths to consider
+// (every path that differs, each standing conflict's subject and the
+// directories above them) and returns the merged entries at those paths.
+MetadataMergeResult merge_metadata_heads(const MetadataSnapshot& left,
+                                         const MetadataSnapshot& right, const Hash256& left_head,
+                                         const Hash256& right_head);
+MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
+                                              const MetadataSnapshot& right,
+                                              const NamespaceEntries& left_entries,
+                                              const NamespaceEntries& right_entries,
+                                              const Hash256& left_head,
+                                              const Hash256& right_head);
 MetadataMergeResult merge_metadata_snapshots_over(const MetadataSnapshot& base,
                                                   const MetadataSnapshot& left,
                                                   const MetadataSnapshot& right,
