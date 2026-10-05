@@ -3,6 +3,22 @@
 *2026-10-05. Agreed by the operator the same day; decisions 1 to 4 taken as recommended, with
 stable file identity added to stage B.*
 
+**Status, 2026-10-05.** Implemented on `experiment/object-ledger-t5`: stages A and C as 0.88.0,
+stage B as 0.89.0 (protocol 23). Neither is deployed. Differences from the text below, as built:
+
+- Stage A's "history is kept for H" was not needed: stage B followed directly, so no merge reads
+  history.
+- Decision 2: a commit seeks its second copy from a peer for as long as the peer makes progress
+  (`dht.write_stall_ms`), not for a fixed second.
+- Two concurrent renames of one file keep the later name without a conflict record.
+- The catalogue root has its own dot; two concurrent roots leave one in place and the catalogue
+  merges the other in only while this node's history still holds their common ancestor.
+- A head set aside for H is dropped.
+- Still open: per-peer down state in the transport (a known node is dialled until it is
+  forgotten), `fsync` without a deadline, the journal's `durability_poisoned` flag (a local disk
+  fault, not an absent node), and a count of DATA objects below their replication target beyond
+  `prompt_replication.queued`.
+
 ## The rule
 
 Any node may disappear at any time and may never come back. Writes and deletes proceed with the
