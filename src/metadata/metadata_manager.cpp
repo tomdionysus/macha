@@ -1292,7 +1292,18 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                 node_.node_id(), merged.snapshot.mutation_sequences);
             publication_retention_(MetadataPublicationContext{
                 claim.author, claim.sequence, primary.record, merged.snapshot,
-                delta ? &*delta : nullptr});
+                delta ? &*delta : nullptr, false});
+            // A merge is made off every caller's path, so the peers' share
+            // is done here too, before the merge is offered to them.
+            try {
+                publication_retention_(MetadataPublicationContext{
+                    claim.author, claim.sequence, primary.record, merged.snapshot,
+                    delta ? &*delta : nullptr, true});
+            } catch (const std::exception& error) {
+                if (Log::enabled(LogLevel::debug))
+                    Log::debug("metadata merge claims on peers deferred: " +
+                               std::string(error.what()));
+            }
         }
         const auto retention_ms = stage_ms();
         (void)publish_commit(nodes, reconciliation, reconciliation_delta, frame_type);
