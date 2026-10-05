@@ -3099,6 +3099,15 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
         Lock lock(config_mutex_);
         max_artwork_bytes = config_.max_artwork_bytes;
     }
+    // Where a match's time goes, for its debug line.
+    auto stage_started = Clock::now();
+    const auto stage_ms = [&] {
+        const auto now = Clock::now();
+        const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - stage_started).count();
+        stage_started = now;
+        return std::to_string(ms);
+    };
     std::optional<ProviderMatch> match;
     {
         auto& seat = editor_seat();
@@ -3136,10 +3145,18 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
         const auto lock = item->external_ids.find("macha_metadata_locked");
         return lock != item->external_ids.end() && lock->second == "1";
     };
+    const auto lookup_ms = stage_ms();
     (void)stage_remote_artwork(*match, locked, {}, max_artwork_bytes, artwork_batch);
+    const auto artwork_ms = stage_ms();
     if (!catalogue_.artwork_durability_barrier(artwork_batch))
         throw CatalogueUnavailable("catalogue artwork durability floor unavailable");
+    const auto barrier_ms = stage_ms();
     catalogue_.reconcile_scanner(match->items, {probe.media_id}, false, {}, {});
+    if (Log::enabled(LogLevel::debug))
+        Log::debug("catalogue match path=" + hint->path + " lookup_ms=" + lookup_ms +
+                   " artwork_ms=" + artwork_ms + " images=" +
+                   std::to_string(match->artwork.size()) + " barrier_ms=" + barrier_ms +
+                   " commit_ms=" + stage_ms());
 
     ProviderRefMatch out;
     out.leaf_id = leaf_id;

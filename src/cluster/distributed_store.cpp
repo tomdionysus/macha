@@ -1011,6 +1011,51 @@ std::vector<ObjectId> DistributedStore::retain_data(const std::vector<ObjectId>&
     return unheld;
 }
 
+bool DistributedStore::holds_extents() const {
+    for (const auto& node : n_.membership().active())
+        if (node.id == n_.node_id())
+            return node_hosts_extents(node);
+    return false;
+}
+
+bool DistributedStore::put_here(const ObjectId& id, std::span<const uint8_t> data,
+                                FrameType frame_type) {
+    if (!holds_extents())
+        return put(id, data, frame_type);
+    auto resource = data_resources_.acquire(DataWorkContext(frame_type, data.size(), {}, nullptr),
+                                            data.size());
+    if (!resource)
+        return put(id, data, frame_type);
+    const bool held = local_.data().has(id);
+    if (!local_.data().put(id, data))
+        return put(id, data, frame_type);
+    if (!held)
+        events_.notify(NodeEvent::storage);
+    queue_prompt_replication(id);
+    return true;
+}
+
+bool DistributedStore::put_deferred_here(const ObjectId& id, std::span<const uint8_t> data,
+                                         DurabilityBatch& batch, FrameType frame_type) {
+    if (!holds_extents())
+        return put_deferred(id, data, batch, frame_type);
+    auto resource = data_resources_.acquire(DataWorkContext(frame_type, data.size(), {}, nullptr),
+                                            data.size());
+    if (!resource)
+        return put_deferred(id, data, batch, frame_type);
+    const bool held = local_.data().has(id);
+    const auto token = local_.data().put_deferred(id, data);
+    if (!token)
+        return put_deferred(id, data, batch, frame_type);
+    batch.add({id, 1,
+               {DurableReplica{n_.node_id(), n_.durability_epoch(), token->domain,
+                               token->generation, token->backend_instance}}});
+    if (!held)
+        events_.notify(NodeEvent::storage);
+    queue_prompt_replication(id);
+    return true;
+}
+
 std::vector<ObjectId> DistributedStore::retain_data_here(const std::vector<ObjectId>& input,
                                                          const RetentionDot& dot) {
     auto ids = input;

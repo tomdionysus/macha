@@ -1,5 +1,27 @@
 # Current release
 
+## 0.90.10 — a match waits for no other node (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**A catalogue write no longer begins by converging with the peers.** Every
+match, manual entry, artwork choice and item edit first ran the catalogue's
+repair step, which offers the previous commit's shards to every node present
+and waits for them. A write now only brings the catalogue to this node's own
+head; offering control objects to the peers is maintenance's pass, as it
+already was.
+
+**Artwork is stored on this node first.** The images a match or an artwork
+choice brings in were written as DATA with a second copy sought on another
+node before the write went on, so each image crossed the link first. They are
+written durably here, and prompt replication delivers the further copies.
+
+**A match's debug line says where its time went**: the provider lookup, the
+artwork downloads, the durability barrier and the commit.
+
+On 0.90.9 a match took 3.5 and 8.6 seconds and an artwork choice 16, measured
+on fi-1.
+
 ## 0.90.9 — the metadata editor's provider calls run side by side (experiment)
 
 No wire, protocol, API or on-disk changes.
