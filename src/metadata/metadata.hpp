@@ -240,19 +240,6 @@ struct MetadataAcceptance {
     auto operator<=>(const MetadataAcceptance&) const = default;
 };
 
-// Proof that every known participant acknowledged `floor_hash` as the new
-// history floor. `epoch` fingerprints the participant set, so a membership
-// change invalidates an in-flight proposal. Only a `committed` proof whose
-// floor_hash is the replica's committed head may justify compact_history_if_safe().
-struct HistoryCheckpointProof {
-    enum class Status : uint8_t { acked = 1, committed = 2 };
-    Hash256 floor_hash{};
-    uint64_t floor_generation{};
-    Hash256 epoch{};
-    std::vector<NodeId> participants;
-    Status status{Status::acked};
-};
-
 struct MetadataHistoryEntry {
     enum class Body : uint8_t { full = 1, delta = 2 };
 
@@ -378,8 +365,6 @@ Bytes encode_metadata_acceptance(const MetadataAcceptance&);
 MetadataAcceptance decode_metadata_acceptance(std::span<const uint8_t>);
 Bytes encode_metadata_acceptance_set(const std::vector<MetadataAcceptance>&);
 std::vector<MetadataAcceptance> decode_metadata_acceptance_set(std::span<const uint8_t>);
-Bytes encode_history_checkpoint_proof(const HistoryCheckpointProof&);
-HistoryCheckpointProof decode_history_checkpoint_proof(std::span<const uint8_t>);
 Bytes encode_metadata_history_entry(const MetadataHistoryEntry&);
 MetadataHistoryEntry decode_metadata_history_entry(std::span<const uint8_t>);
 Bytes encode_metadata_delta(const MetadataDelta&);
@@ -485,12 +470,12 @@ class MetadataReplica {
     std::filesystem::path journal_p_;
     std::filesystem::path history_p_;
     std::filesystem::path heads_p_;
-    std::filesystem::path checkpoint_proof_p_;
     std::filesystem::path mutation_sequence_p_;
     std::filesystem::path author_p_;
     // Present from the moment the head set is replaced until the next
     // mutation takes a new author id.
     std::filesystem::path author_chain_broken_p_;
+    std::filesystem::path set_aside_p_;
     std::filesystem::path recovery_p_;
     std::array<uint8_t, 32> key_;
     // Held across journal appends, heads and checkpoint writes and their
@@ -519,6 +504,13 @@ class MetadataReplica {
     // never become the committed record. Not persisted: a restart tries the
     // merge again.
     std::map<Hash256, uint64_t> set_aside_ MACHA_GUARDED_BY(m_);
+    // When each head was first set aside, on this node's wall clock; kept
+    // across restarts so a head whose content never arrives is dropped after
+    // the absence horizon rather than held for ever.
+    std::map<Hash256, uint64_t> set_aside_since_ MACHA_GUARDED_BY(m_);
+    bool set_aside_since_loaded_ MACHA_GUARDED_BY(m_){};
+    void load_set_aside_since_locked() MACHA_REQUIRES(m_);
+    void persist_set_aside_since_locked() MACHA_REQUIRES(m_);
     std::atomic_uint64_t set_aside_generation_{};
     void note_set_aside_locked() MACHA_REQUIRES(m_);
     // Per-hash retry cooldown for an accepted head that fails to reconstruct,
@@ -535,9 +527,6 @@ class MetadataReplica {
     // break: not indexed, parent absent, succession, cycle, unreadable frame,
     // or replay hash mismatch.
     std::string diagnose_unreconstructable_locked(const Hash256& hash) const MACHA_REQUIRES(m_);
-    // Loaded only if valid against committed_; record_checkpoint_ack() may
-    // later set an acked proposal. nullopt means no proof.
-    std::optional<HistoryCheckpointProof> checkpoint_proof_ MACHA_GUARDED_BY(m_);
     std::optional<MetadataHistoryEntry> pending_history_ MACHA_GUARDED_BY(m_);
     bool pending_recovered_ MACHA_GUARDED_BY(m_){};
     // This node as an author of mutations. One author's commits form a
@@ -596,8 +585,6 @@ class MetadataReplica {
     void load_history() MACHA_REQUIRES(m_);
     void load_heads() MACHA_REQUIRES(m_);
     void persist_heads_locked() MACHA_REQUIRES(m_);
-    void load_checkpoint_proof() MACHA_REQUIRES(m_);
-    void persist_checkpoint_proof_locked() MACHA_REQUIRES(m_);
     void ensure_history_root(const MetadataRecord&) MACHA_REQUIRES(m_);
     void migrate_legacy_head_locked() MACHA_REQUIRES(m_);
     bool prune_accepted_heads_locked() MACHA_REQUIRES(m_);
@@ -681,7 +668,10 @@ class MetadataReplica {
     std::vector<Hash256> unreconstructable_heads() const;
     // Sets an accepted head aside; false when it is the only head not set
     // aside, since a node always keeps a head to work on.
-    bool set_aside(const Hash256&);
+    bool set_aside(const Hash256&, uint64_t now_unix_ms);
+    // Drops every head that has been set aside for `horizon` and returns how
+    // many went: whatever held its content is not coming back.
+    size_t expire_set_aside(uint64_t now_unix_ms, std::chrono::milliseconds horizon);
     void clear_set_aside();
     // The highest generation among heads set aside, zero when none is. An
     // atomic read.
@@ -705,21 +695,11 @@ class MetadataReplica {
     std::shared_ptr<const MetadataMaterialization> materialized(const Hash256&) const;
     MetadataReplicaDiagnostics diagnostics() const;
     void compact();
-    // Re-root history at the sole committed accepted head once the cluster has
-    // converged, so disk and startup RSS do not grow with mutation count.
+    // Re-roots history at the sole accepted head once it is the committed
+    // record and a threshold is met, so disk and startup RSS do not grow
+    // with mutation count.
     bool compact_history_if_safe(size_t record_threshold = 256,
                                  uint64_t byte_threshold = 64ULL * 1024 * 1024);
-
-    // Unfiltered: may be merely acked. A caller relying on it must check
-    // status == committed and floor_hash == committed().hash itself.
-    std::optional<HistoryCheckpointProof> checkpoint_proof() const;
-    // Durably ack a proposal before replying. Refuses unless the accepted-head
-    // set is exactly {floor_hash}: acking a superseded floor would let a lagging
-    // proposer compact away ancestry others still need. Stores status acked,
-    // superseding any record for a different (floor_hash, epoch).
-    bool record_checkpoint_ack(HistoryCheckpointProof proposal);
-    // Promote the acked record for exactly (floor_hash, epoch); false if none.
-    bool record_checkpoint_commit(const Hash256& floor_hash, const Hash256& epoch);
 };
 std::string normalize_path(const std::string&);
 std::string parent_path(const std::string&);

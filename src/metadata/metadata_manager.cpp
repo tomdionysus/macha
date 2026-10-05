@@ -855,161 +855,20 @@ void MetadataManager::offer_accepted_head(
     }
 }
 
-std::optional<std::vector<std::pair<NodeInfo, MetadataAcceptance>>>
-MetadataManager::discover_accepted_heads_required(const std::vector<NodeInfo>& nodes,
-                                                   FrameType frame_type) {
-    std::vector<std::pair<NodeInfo, MetadataAcceptance>> out;
-    for (const auto& owner : nodes) {
-        try {
-            std::vector<MetadataAcceptance> heads;
-            if (owner.id == node_.node_id()) {
-                heads = metadata_server_.heads();
-            } else {
-                auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type);
-                if (reply.message.type != MessageType::metadata_heads_reply)
-                    return std::nullopt;
-                heads = decode_metadata_acceptance_set(reply.message.payload);
-            }
-            for (auto& head : heads)
-                out.emplace_back(owner, std::move(head));
-        } catch (const std::exception& error) {
-            Log::debug("metadata head survey (required) " + owner.host + ": " + error.what());
-            return std::nullopt;
-        }
-    }
-    return out;
-}
-
-bool MetadataManager::propose_history_floor_on(const NodeInfo& owner,
-                                               const HistoryCheckpointProof& proposal,
-                                               FrameType frame_type) {
-    if (owner.id == node_.node_id())
-        return local_.replica().record_checkpoint_ack(proposal);
-    try {
-        const auto encoded = encode_history_checkpoint_proof(proposal);
-        return bool_reply(
-            node_.call(owner, MessageType::propose_history_floor, encoded, frame_type));
-    } catch (const std::exception& error) {
-        Log::debug("history checkpoint proposal " + owner.host + ": " + error.what());
-        return false;
-    }
-}
-
-bool MetadataManager::commit_history_floor_on(const NodeInfo& owner, const Hash256& floor_hash,
-                                              const Hash256& epoch, FrameType frame_type) {
-    if (owner.id == node_.node_id())
-        return local_.replica().record_checkpoint_commit(floor_hash, epoch);
-    try {
-        HistoryCheckpointProof commit_message;
-        commit_message.floor_hash = floor_hash;
-        commit_message.epoch = epoch;
-        commit_message.status = HistoryCheckpointProof::Status::committed;
-        const auto encoded = encode_history_checkpoint_proof(commit_message);
-        return bool_reply(
-            node_.call(owner, MessageType::commit_history_floor, encoded, frame_type));
-    } catch (const std::exception& error) {
-        Log::debug("history checkpoint commit " + owner.host + ": " + error.what());
-        return false;
-    }
-}
-
-void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
-                                                 uint64_t byte_threshold) {
-    // Serialise the whole round against foreground mutations: it depends on
-    // accepted-head state as read_group()/repair_once() do.
+void MetadataManager::truncate_history(size_t record_threshold, uint64_t byte_threshold) {
+    // Serialised against foreground mutations: both read and change the
+    // accepted-head set.
     Lock mutation_lock(mutation_mutex_);
-
-    const auto diagnostics = local_.replica().diagnostics();
-    if (diagnostics.history_records < record_threshold &&
-        diagnostics.history_file_bytes < byte_threshold)
-        return;
     if (local_.replica().recovery_required())
         return;
-
-    // Only with exactly one local accepted head and every known participant
-    // directly reachable, as for destructive object GC.
-    auto local_heads = local_.replica().accepted_heads();
-    if (local_heads.size() != 1)
-        return;
-    if (!node_.membership().all_known_reachable())
-        return;
-    const auto floor_hash_candidate = local_heads.front().hash;
-
-    auto participants = node_.membership().all();
-    if (participants.empty())
-        return;
-    std::sort(participants.begin(), participants.end(),
-              [](const NodeInfo& a, const NodeInfo& b) { return a.id < b.id; });
-
-    // The epoch fingerprints this participant set, so a membership change
-    // invalidates any in-flight proposal.
-    Writer epoch_writer;
-    for (const auto& participant : participants)
-        epoch_writer.fixed(participant.id.bytes);
-    const auto epoch = sha256(epoch_writer.take());
-
-    // Every participant must answer with exactly one accepted head, this
-    // node's own.
-    auto surveyed = discover_accepted_heads_required(participants, FrameType::control);
-    if (!surveyed)
-        return;
-    std::map<NodeId, std::vector<MetadataAcceptance>> by_node;
-    for (auto& [owner, acceptance] : *surveyed)
-        by_node[owner.id].push_back(std::move(acceptance));
-    if (by_node.size() != participants.size())
-        return; // A participant reported no heads at all -- not settled yet.
-
-    std::optional<Hash256> floor_hash;
-    uint64_t floor_generation = 0;
-    for (const auto& [id, heads] : by_node) {
-        if (heads.size() != 1)
-            return; // That participant has not itself converged to one head.
-        if (!floor_hash) {
-            floor_hash = heads.front().hash;
-            floor_generation = heads.front().generation;
-        } else if (heads.front().hash != *floor_hash) {
-            return; // Participants disagree -- not settled yet.
-        }
-    }
-    if (!floor_hash || *floor_hash != floor_hash_candidate)
-        return;
-
-    HistoryCheckpointProof proposal;
-    proposal.floor_hash = *floor_hash;
-    proposal.floor_generation = floor_generation;
-    proposal.epoch = epoch;
-    proposal.participants.reserve(participants.size());
-    for (const auto& participant : participants)
-        proposal.participants.push_back(participant.id);
-    proposal.status = HistoryCheckpointProof::Status::acked;
-
-    // Every participant must durably ack before anyone commits. Abort on the
-    // first failure; the next cycle re-proposes the identical (floor_hash,
-    // epoch).
-    for (const auto& owner : participants) {
-        if (!propose_history_floor_on(owner, proposal, FrameType::control))
-            return;
-    }
-
-    // Commit locally first; if refused (a superseding proposal), broadcast
-    // nothing.
-    if (!local_.replica().record_checkpoint_commit(*floor_hash, epoch))
-        return;
-
-    for (const auto& owner : participants) {
-        if (owner.id == node_.node_id())
-            continue;
-        // Best-effort: a participant that misses this stays `acked` and adopts the
-        // commit via the next cycle's identical re-proposal.
-        (void)commit_history_floor_on(owner, *floor_hash, epoch, FrameType::control);
-    }
-
-    // Compact only once this replica's proof is committed;
-    // compact_history_if_safe() re-validates its own preconditions.
-    if (local_.replica().compact_history_if_safe(record_threshold, byte_threshold))
-        Log::info("metadata history checkpoint committed and compacted floor_generation=" +
-                  std::to_string(floor_generation) + " floor_hash=" + to_string(*floor_hash) +
-                  " participants=" + std::to_string(participants.size()));
+    if (const auto dropped = local_.replica().expire_set_aside(
+            unix_ms(), node_.config().maintenance.garbage_grace))
+        Log::warn("metadata: dropped " + std::to_string(dropped) +
+                  " head(s) set aside for the absence horizon; their content never arrived");
+    // A node's history is its own: once it holds one head and the history
+    // has grown past the thresholds, the head becomes its root. Nothing a
+    // peer may still hold depends on it, since heads merge without ancestry.
+    (void)local_.replica().compact_history_if_safe(record_threshold, byte_threshold);
 }
 
 namespace {
@@ -1079,7 +938,7 @@ MetadataRecord MetadataManager::own_head(const std::vector<MetadataRecord>& head
 
 void MetadataManager::set_aside(const MetadataRecord& head, std::string_view reason) const {
     set_aside_stamp_.store(membership_stamp(), std::memory_order_release);
-    if (local_.replica().set_aside(head.hash))
+    if (local_.replica().set_aside(head.hash, unix_ms()))
         Log::warn("metadata head set aside until membership changes generation=" +
                   std::to_string(head.generation) + " reason=\"" + std::string(reason) + "\"");
 }

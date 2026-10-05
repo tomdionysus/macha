@@ -5324,26 +5324,23 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
 }
 #endif // MACHA_TEST_PLUGIN_DIR
 
-// History checkpoints across a pair, round by round. A proposer that crashed
-// between every ack and its commit leaves an acked-only proof, which never
-// re-roots history and the next round supersedes. A round compacts the
-// proposer at once and the peer on its own next attempt, to one record at
-// one (floor_hash, epoch), with reads unchanged. Two proposers at once
-// converge on one proof. An unreachable participant aborts the round.
-MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_rounds_across_a_pair) {
+// A node truncates its own history while its peer is away, and goes on
+// committing. The peer returns holding the head from before the truncation,
+// takes the newer head, and the two serve one namespace.
+MACHA_TEST("rpc_cluster", test_a_node_truncates_its_history_with_its_peer_away_and_the_peer_converges) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     auto p1 = free_port();
     auto p2 = free_port();
-    auto c1 = config_for(cluster.path() / "checkpoint-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "checkpoint-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    auto c1 = config_for(cluster.path() / "truncate-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "truncate-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     Service s1(c1, keys, test_durability_window);
-    Service s2(c2, keys, test_durability_window);
+    auto s2 = std::make_unique<Service>(c2, keys, test_durability_window);
     s1.start();
-    s2.start();
+    s2->start();
     REQUIRE(wait_until([&] {
         return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
+               s2->node().membership().active().size() >= 2;
     }));
     const auto sees = [](Service& service, const std::string& path) {
         return wait_until([&] {
@@ -5354,78 +5351,129 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_rounds_across_a_pair)
             }
         });
     };
+    const auto one_shared_head = [&] {
+        return wait_until(
+            [&] {
+                const auto mine = s1.local_state().replica().accepted_heads();
+                const auto theirs = s2->local_state().replica().accepted_heads();
+                return mine.size() == 1 && theirs.size() == 1 &&
+                       mine.front().hash == theirs.front().hash;
+            },
+            30s);
+    };
     REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/a", 0755, getuid(), getgid()); }));
-    REQUIRE(sees(s2, "/a"));
-    s2.filesystem().mkdir("/b", 0755, getuid(), getgid());
+    REQUIRE(sees(*s2, "/a"));
+    s2->filesystem().mkdir("/b", 0755, getuid(), getgid());
     REQUIRE(sees(s1, "/b"));
-    // A round's gate needs direct reachability, not merely gossip.
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().all_known_reachable() &&
-               s2.node().membership().all_known_reachable();
-    }));
+    REQUIRE(one_shared_head());
+    const auto before = s1.local_state().replica().accepted_heads().front().hash;
+
+    s2->stop();
+    s2.reset();
+
+    // Two commits the peer never sees, so that no record it holds is the
+    // previous of the one this node keeps.
     auto& r1 = s1.local_state().replica();
-    auto& r2 = s2.local_state().replica();
-    CHECK(r1.diagnostics().history_records >= 3);
-
-    const auto floor = r1.accepted_heads();
-    REQUIRE(floor.size() == 1);
-    HistoryCheckpointProof stranded;
-    stranded.floor_hash = floor.front().hash;
-    stranded.floor_generation = floor.front().generation;
-    stranded.epoch.bytes[0] = 0x99;
-    stranded.participants = {s1.node().node_id(), s2.node().node_id()};
-    r2.record_checkpoint_ack(stranded);
-    CHECK(r2.checkpoint_proof()->status == HistoryCheckpointProof::Status::acked);
-    CHECK(r2.diagnostics().history_records > 1);
-
-    s1.metadata_manager().attempt_history_checkpoint(1, 1);
+    REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/c", 0755, getuid(), getgid()); }));
+    REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/d", 0755, getuid(), getgid()); }));
+    REQUIRE(r1.accepted_heads().size() == 1);
+    REQUIRE(r1.diagnostics().history_records > 1);
+    s1.metadata_manager().truncate_history(1, 1);
     CHECK(r1.diagnostics().history_records == 1);
-    const auto proof1 = r1.checkpoint_proof();
-    REQUIRE(proof1.has_value());
-    CHECK(proof1->status == HistoryCheckpointProof::Status::committed);
-    REQUIRE(wait_until([&] {
-        s2.metadata_manager().attempt_history_checkpoint(1, 1);
-        return r2.diagnostics().history_records == 1;
-    }));
-    const auto proof2 = r2.checkpoint_proof();
-    REQUIRE(proof2.has_value());
-    CHECK(proof2->status == HistoryCheckpointProof::Status::committed);
-    CHECK(proof2->floor_hash == proof1->floor_hash);
-    CHECK(proof2->epoch == proof1->epoch);
-    CHECK(proof2->epoch != stranded.epoch);
-    for (auto* service : {&s1, &s2})
-        for (const auto* path : {"/a", "/b"})
+    CHECK(!r1.history_contains(before));
+    for (const auto* path : {"/a", "/b", "/c", "/d"})
+        CHECK(s1.filesystem().getattr(path).type == EntryType::directory);
+
+    REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/e", 0755, getuid(), getgid()); }));
+    CHECK(r1.diagnostics().history_records == 2);
+    const auto ahead = r1.committed().hash;
+
+    {
+        MetadataReplica stopped(c2.state_path, keys.storage, {}, false);
+        const auto held = stopped.accepted_heads();
+        REQUIRE(held.size() == 1);
+        CHECK(held.front().hash == before);
+    }
+    s2 = std::make_unique<Service>(c2, keys, test_durability_window);
+    s2->start();
+    REQUIRE(sees(*s2, "/e"));
+    REQUIRE(one_shared_head());
+    // The peer took this node's head as it stood: nothing was merged.
+    CHECK(s2->local_state().replica().accepted_heads().front().hash == ahead);
+    for (auto* service : {&s1, s2.get()})
+        for (const auto* path : {"/a", "/b", "/c", "/d", "/e"})
             CHECK(service->filesystem().getattr(path).type == EntryType::directory);
 
-    s1.filesystem().mkdir("/c", 0755, getuid(), getgid());
-    REQUIRE(sees(s2, "/c"));
-    REQUIRE(r1.diagnostics().history_records > 1);
-    std::thread t1([&] { s1.metadata_manager().attempt_history_checkpoint(1, 1); });
-    std::thread t2([&] { s2.metadata_manager().attempt_history_checkpoint(1, 1); });
-    t1.join();
-    t2.join();
-    REQUIRE(wait_until([&] {
-        s1.metadata_manager().attempt_history_checkpoint(1, 1);
-        s2.metadata_manager().attempt_history_checkpoint(1, 1);
-        return r1.diagnostics().history_records == 1 && r2.diagnostics().history_records == 1;
-    }));
-    const auto concurrent1 = r1.checkpoint_proof();
-    const auto concurrent2 = r2.checkpoint_proof();
-    REQUIRE(concurrent1.has_value());
-    REQUIRE(concurrent2.has_value());
-    CHECK(concurrent1->floor_hash != proof1->floor_hash);
-    CHECK(concurrent1->floor_hash == concurrent2->floor_hash);
-    CHECK(concurrent1->epoch == concurrent2->epoch);
-    CHECK(r1.committed().hash == concurrent1->floor_hash);
-    CHECK(r2.committed().hash == concurrent2->floor_hash);
-
-    s1.filesystem().mkdir("/d", 0755, getuid(), getgid());
-    REQUIRE(sees(s2, "/d"));
-    s2.stop();
-    s1.metadata_manager().attempt_history_checkpoint(1, 1);
-    CHECK(r1.diagnostics().history_records > 1);
-    CHECK(r1.checkpoint_proof()->epoch == concurrent1->epoch);
+    REQUIRE(retry_while_not_ready([&] { s2->filesystem().mkdir("/f", 0755, getuid(), getgid()); }));
+    REQUIRE(sees(s1, "/f"));
+    REQUIRE(one_shared_head());
+    s2->stop();
     s1.stop();
+}
+
+// History is truncated only while the node holds one head.
+MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto config = config_for(cluster.path() / "two-heads", cluster.keyfile(), free_port(), {});
+    config.metadata_cache = std::chrono::milliseconds(0);
+    BareNode node(config, keys);
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
+
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    auto& replica = node.metadata_replica();
+    const auto directory = [] {
+        FsEntry entry;
+        entry.type = EntryType::directory;
+        entry.mode = 0755;
+        entry.uid = getuid();
+        entry.gid = getgid();
+        return entry;
+    };
+    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/mine"] = directory(); });
+    const auto mine = replica.committed();
+
+    // Another author's head, which this node's clock does not cover.
+    const MetadataDot theirs{random_node_id(), 9};
+    auto foreign_snapshot = decode_snapshot(genesis_metadata().payload);
+    foreign_snapshot.metadata_write_replicas_required = 1;
+    foreign_snapshot.extent_size = decode_snapshot(mine.payload).extent_size;
+    foreign_snapshot.data_replication = decode_snapshot(mine.payload).data_replication;
+    foreign_snapshot.legacy_clock.emplace();
+    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
+    auto made = directory();
+    stamp_entry_provenance(made, "/theirs", nullptr, theirs);
+    foreign_snapshot.entries["/theirs"] = made;
+    MetadataRecord foreign;
+    foreign.generation = mine.generation + 7;
+    foreign.previous = sha256(pattern(64, 201));
+    foreign.payload = encode_snapshot(foreign_snapshot);
+    foreign.hash = metadata_hash(foreign.generation, foreign.previous, foreign.payload);
+    REQUIRE(replica.store_commit(foreign));
+    MetadataAcceptance acceptance;
+    acceptance.generation = foreign.generation;
+    acceptance.hash = foreign.hash;
+    acceptance.required = 1;
+    acceptance.replicas = {theirs.author};
+    REQUIRE(node.metadata_server().accept_commit(acceptance));
+    REQUIRE(replica.accepted_heads().size() == 2);
+
+    const auto records = replica.diagnostics().history_records;
+    REQUIRE(records > 1);
+    metadata.truncate_history(1, 1);
+    CHECK(replica.diagnostics().history_records == records);
+    CHECK(replica.accepted_heads().size() == 2);
+
+    // Reading merges the two; the one head then becomes the root.
+    CHECK(metadata.snapshot().entries.contains("/theirs"));
+    REQUIRE(replica.accepted_heads().size() == 1);
+    metadata.truncate_history(1, 1);
+    CHECK(replica.diagnostics().history_records == 1);
+    const auto after = metadata.snapshot();
+    CHECK(after.entries.contains("/mine"));
+    CHECK(after.entries.contains("/theirs"));
+    node.stop();
 }
 
 MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_from_a_peer) {
