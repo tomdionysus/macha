@@ -4,7 +4,7 @@
 
 Macha may publish a logical reference only after the storage class responsible for that reference has satisfied its durability contract.
 
-For DATA, the contract is a durable authoritative copy on a node present. For namespace/control metadata, it is a durable copy on the committing node. `dht.write_copies` and `dht.metadata_write_copies` are the copies sought before a write returns: with that many nodes present and answering, the write is on that many when it returns; with fewer, it returns on the copies it has and repair delivers the rest. Nothing is refused for lack of peers.
+For DATA, the contract is a durable authoritative copy on a node present. For namespace/control metadata, it is a durable copy on the committing node. `dht.write_copies` is the number of copies of a DATA object sought before its write returns: with that many nodes present and answering, the object is on that many when it returns; with fewer, it returns on the copies it has and repair delivers the rest. A namespace commit seeks no copy before it returns: it is durable on the committing node, and every node present is sent it afterwards. `dht.metadata_write_copies` is the copies sought, before the write returns, of the control objects a catalogue write stores. Nothing is refused for lack of peers.
 
 Cache never counts.
 
@@ -56,7 +56,7 @@ A full or offline preferred owner changes which eligible candidate supplies a co
 
 ## Namespace metadata
 
-Every node is metadata-capable. A metadata commit is accepted once the exact immutable commit and its acceptance certificate are durably held by the committing node; copies on up to `dht.metadata_write_copies` nodes are sought from those present before the write returns, and repair delivers it to the rest. A receiver stores the commit independently of its current head; separated nodes may therefore preserve different accepted successors of the same ancestor. Ordinary linear commits may use compact deterministic deltas in the history store, while full records remain valid recovery material.
+Every node is metadata-capable. A metadata commit is accepted, and its write returns, once the exact immutable commit and its acceptance certificate are durably held by the committing node. Every node present is then sent it without the caller waiting, and repair delivers it to the rest. Until a second node holds it, a commit exists on one node: the loss of that node's state disk in that interval loses it. A receiver stores the commit independently of its current head; separated nodes may therefore preserve different accepted successors of the same ancestor. Ordinary linear commits may use compact deterministic deltas in the history store, while full records remain valid recovery material.
 
 This is not majority consensus. It deliberately allows any surviving node to continue alone, so separated nodes can produce divergent valid histories. Those histories are preserved and destructive convergence is refused: two divergent heads are reconciled through a multi-parent commit computed from the two heads alone, non-conflicting namespace changes are merged, and concurrent alternatives are both retained in a durable conflict record, with the later one in place. Status reports them as `metadata.conflicts`, `conflicts_resolved` and `conflicts_superseded`; see [Metadata replication and reconciliation](metadata.md).
 

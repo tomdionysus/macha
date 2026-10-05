@@ -1,5 +1,53 @@
 # Current release
 
+## 0.90.0 — a commit is made on the node that receives it (experiment)
+
+No wire, protocol or on-disk format changes, and no API route or payload
+changes. One behaviour that clients can observe changes: see the first item.
+
+**A namespace change no longer waits for another node.** A commit used to
+survey the other nodes' heads, place its claims on them, store the commit on
+them and collect their acceptance before answering, all under the lock that
+serialises commits: two to three seconds each across a slow link, one at a
+time. A commit is now made on the committing node alone. It claims what it
+refers to on that node, stores and accepts the commit there, and answers. A
+replicator then delivers the claims and the head to every node present, in
+order, with no caller waiting; what it cannot deliver, repair does. A node
+with several heads extends the one carrying its own latest change and the
+merge follows in the background.
+
+What a client can see: a write answered by one node is visible on that node
+at once, and on another node when it arrives there, typically within a round
+trip. A client that writes through one node and reads through another
+straight afterwards may read the earlier state. Two nodes that change the
+same path before either has the other's commit both succeed, and the merge
+keeps the later one and records the other as a conflict, as it does after a
+partition.
+
+**Lookups read the tree.** The filesystem kept an index of every path in
+the namespace, rebuilt by walking the whole tree after each commit and
+consulted by every stat, listing and path resolution. It is gone. A stat
+reads the path to one leaf; a listing reads the directory and steps over each
+child directory's contents in one descent; an emptiness check stops at the
+first entry it finds. A canonically-equivalent spelling of a name (macOS) is
+matched one component at a time against the directory that would hold it.
+
+**A tree update reads and writes the path it changes.** Applying a commit
+listed every leaf of the namespace tree and rebuilt the whole spine above
+them, on the author and again on every node that received the commit. It
+now reads the path to the leaves its changes fall in, cuts those again and
+regroups the nodes above only until the groups fall on old boundaries. An
+entry that does not change is copied as its leaf holds it, so a neighbour's
+extent list is neither read nor rebuilt. The root is the one a full build
+reaches.
+
+**Telling two trees apart reads only where they differ**, so a merge of two
+heads costs what differs between them and the depth of the tree.
+
+**Management writes are no longer serialised behind one lock.** Deletes,
+renames and matches sent together run together, and namespace changes among
+them share commits.
+
 ## 0.89.1 — bulk namespace changes share commits; claims stop asking about what is not there (experiment)
 
 No wire, protocol, API or on-disk changes.
