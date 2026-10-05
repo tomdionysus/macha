@@ -412,6 +412,202 @@ MACHA_FAST_TEST("availability", test_the_survey_costs_what_differs_not_the_libra
     }
 }
 
+MACHA_FAST_TEST("availability", test_a_survey_asks_only_about_what_the_last_did_not_settle) {
+    MemoryNamespaceNodeStore store;
+    auto entries = library(60);
+    const auto root = build_namespace_tree(entries, store, small_limits());
+    auto here = subset(references(entries), 30, 1);
+    const auto at_peer = [](const std::map<std::string, FsEntry>& of) {
+        return subset(references(of), 60, 7);
+    };
+
+    SurveyMemo memo;
+    AvailabilitySurvey first;
+    {
+        const auto local = HoldingsRollup::build(root, store, holds(here));
+        FakePeer peer(root, store, at_peer(entries));
+        std::vector<PeerHoldings*> peers{&peer};
+        first = survey_availability(local, store, holds(here), peers, nullptr, &memo);
+        REQUIRE(!first.unavailable.empty());
+
+        // The same tree again: nothing is asked.
+        FakePeer again(root, store, at_peer(entries));
+        std::vector<PeerHoldings*> same{&again};
+        SurveyMemo kept;
+        const auto repeat = survey_availability(local, store, holds(here), same, &memo, &kept);
+        CHECK(repeat.unavailable == first.unavailable);
+        CHECK(repeat.nodes_asked == 0);
+        CHECK(again.asks == 0);
+        CHECK(kept.nodes.size() == memo.nodes.size());
+    }
+
+    // The tree moves; every node holds what it held.
+    entries.erase("/f1030");
+    entries["/new"] = file_of(90000, 9);
+    entries["/f1012"] = file_of(91000, 5);
+    const auto moved = build_namespace_tree(entries, store, small_limits());
+    const auto surveyed = [&](const SurveyMemo* known, SurveyMemo* made) {
+        const auto local = HoldingsRollup::build(moved, store, holds(here));
+        FakePeer peer(moved, store, at_peer(library(60)));
+        std::vector<PeerHoldings*> peers{&peer};
+        return survey_availability(local, store, holds(here), peers, known, made);
+    };
+    const auto fresh = surveyed(nullptr, nullptr);
+    SurveyMemo next;
+    const auto remembered = surveyed(&memo, &next);
+    CHECK(remembered.unavailable == fresh.unavailable);
+    CHECK(remembered.unknown == fresh.unknown);
+    CHECK(remembered.nodes_asked > 0);
+    CHECK(remembered.nodes_asked < fresh.nodes_asked / 2);
+
+    // This node gains some of what was missing: the memo's answer follows.
+    for (size_t i = 0; i < fresh.unavailable.size(); i += 2)
+        here.insert(fresh.unavailable[i]);
+    const auto after_gain = surveyed(nullptr, nullptr);
+    const auto remembered_gain = surveyed(&next, nullptr);
+    CHECK(after_gain.unavailable.size() < fresh.unavailable.size());
+    CHECK(remembered_gain.unavailable == after_gain.unavailable);
+    CHECK(remembered_gain.nodes_asked == 0);
+}
+
+MACHA_FAST_TEST("availability", test_a_node_a_peer_could_not_describe_is_asked_about_again) {
+    MemoryNamespaceNodeStore store;
+    const auto entries = library(30);
+    const auto root = build_namespace_tree(entries, store, small_limits());
+    // The peer is at an older tree and has none of this one's changed nodes.
+    MemoryNamespaceNodeStore peer_store;
+    auto peer_entries = entries;
+    peer_entries.erase("/f1010");
+    const auto peer_root = build_namespace_tree(peer_entries, peer_store, small_limits());
+    const auto peer_all = references(peer_entries);
+    const std::set<ObjectId> none;
+    const auto local = HoldingsRollup::build(root, store, holds(none));
+
+    SurveyMemo memo;
+    {
+        FakePeer peer(peer_root, peer_store, {peer_all.begin(), peer_all.end()});
+        std::vector<PeerHoldings*> peers{&peer};
+        const auto survey = survey_availability(local, store, holds(none), peers, nullptr, &memo);
+        REQUIRE(!survey.unknown.empty());
+    }
+    // It catches up: what it could not describe is asked about, and decided.
+    const auto all = references(entries);
+    FakePeer peer(root, store, {all.begin(), all.end()});
+    std::vector<PeerHoldings*> peers{&peer};
+    const auto survey = survey_availability(local, store, holds(none), peers, &memo, nullptr);
+    CHECK(survey.unknown.empty());
+    CHECK(survey.unavailable.empty());
+    CHECK(peer.asks > 0);
+}
+
+MACHA_FAST_TEST("availability", test_the_path_table_follows_a_change_to_the_tree) {
+    MemoryNamespaceNodeStore store;
+    uint64_t seed = 99;
+    const auto random = [&](uint64_t below) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        return (seed >> 33) % below;
+    };
+    const auto directory = [] {
+        FsEntry entry;
+        entry.type = EntryType::directory;
+        return entry;
+    };
+    const auto place = [&] {
+        return "/d" + std::to_string(random(4)) + "/s" + std::to_string(random(3));
+    };
+    std::map<std::string, FsEntry> entries;
+    uint64_t content = 0;
+    // A file, and sometimes the directories above it as entries of their own.
+    const auto add_file = [&] {
+        const auto in = place();
+        if (random(3)) {
+            entries["/"] = directory();
+            entries[in.substr(0, 3)] = directory();
+            entries[in] = directory();
+        }
+        // A file is never above another.
+        for (const auto& above : {in.substr(0, 3), in})
+            if (const auto found = entries.find(above);
+                found != entries.end() && found->second.type == EntryType::file)
+                found->second = directory();
+        // One in five shares another file's content.
+        const auto first = random(5) ? ++content * 100 : (1 + random(content + 1)) * 100;
+        entries[in + "/f" + std::to_string(random(40))] = file_of(first, 1 + random(8));
+    };
+    for (int i = 0; i < 40; ++i)
+        add_file();
+
+    const auto table_of = [&](const ObjectId& root, const AvailabilitySurvey& survey,
+                              const std::set<ObjectId>& held) {
+        MetadataSnapshot head;
+        head.namespace_root = root;
+        AvailabilitySnapshot table;
+        table.survey = survey;
+        fill_path_table(table, head, store, holds(held));
+        return table;
+    };
+    const auto pairs = [](const AvailabilitySnapshot& table) {
+        return std::set<std::pair<std::string, std::string>>(table.by_hash.begin(),
+                                                             table.by_hash.end());
+    };
+
+    auto root = build_namespace_tree(entries, store, small_limits());
+    for (int round = 0; round < 60; ++round) {
+        auto next = entries;
+        for (uint64_t changes = 1 + random(4); changes; --changes) {
+            const auto kind = random(5);
+            auto victim = next.begin();
+            if (!next.empty())
+                std::advance(victim, random(next.size()));
+            if (kind < 2 || next.empty()) {
+                std::swap(entries, next);
+                add_file();
+                std::swap(entries, next);
+            } else if (victim->second.type == EntryType::file) {
+                if (kind == 2)
+                    victim->second = file_of(++content * 100, 1 + random(8));
+                else
+                    next.erase(victim);
+            } else {
+                // A directory and everything beneath it; once in a while a
+                // file takes its place.
+                const auto path = victim->first;
+                const auto prefix = path == "/" ? path : path + "/";
+                std::erase_if(next, [&](const auto& item) {
+                    return item.first == path || item.first.starts_with(prefix);
+                });
+                if (kind == 4 && path != "/")
+                    next[path] = file_of(++content * 100, 2);
+            }
+        }
+        const auto next_root = build_namespace_tree(next, store, small_limits());
+
+        // Every node holds what it held: the survey lists stand for both.
+        auto all = references(entries);
+        const auto more = references(next);
+        all.insert(all.end(), more.begin(), more.end());
+        const auto held = subset(all, 40, 3);
+        AvailabilitySurvey survey;
+        for (const auto& id : subset(all, 30, 11))
+            if (!held.contains(id))
+                survey.unavailable.push_back(id);
+
+        const auto before = table_of(root, survey, held);
+        const auto expected = table_of(next_root, survey, held);
+        MetadataSnapshot head;
+        head.namespace_root = next_root;
+        AvailabilitySnapshot updated;
+        updated.survey = survey;
+        update_path_table(updated, before, diff_namespace_trees(root, next_root, store), head,
+                          store, holds(held));
+        CHECK(updated.paths == expected.paths);
+        CHECK(pairs(updated) == pairs(expected));
+
+        entries = std::move(next);
+        root = next_root;
+    }
+}
+
 MACHA_FAST_TEST("availability", test_a_peer_at_another_generation_answers_for_shared_subtrees) {
     MemoryNamespaceNodeStore store;
     auto entries = library(60);
