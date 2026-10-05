@@ -507,6 +507,126 @@ std::atomic_uint64_t syncfs_calls{0};
 // ManageApi over provider records: search says which results are already
 // catalogued, artwork options are listed per role, and a choice fetches the
 // full image, replaces the role's artwork and locks the item.
+MACHA_TEST("invariants", test_a_titles_files_are_unmatched_and_deleted_one_call_each) {
+    CatalogueBench bench("title-files");
+    auto& fs = bench.fs();
+    auto& catalogue = bench.catalogue();
+    auto& hints = bench.hints();
+    for (const auto* dir : {"/Music", "/Music/A", "/TV", "/TV/S"})
+        fs.mkdir(dir, 0755, getuid(), getgid());
+    write_file(fs, "/Music/A/1.flac", pattern(4096, 1));
+    write_file(fs, "/Music/A/2.flac", pattern(4096, 2));
+    write_file(fs, "/Music/A/copy-of-2.flac", pattern(4096, 2));
+    write_file(fs, "/TV/S/e1.mkv", pattern(4096, 3));
+    const auto one = file_media_id(fs.getattr("/Music/A/1.flac"));
+    const auto two = file_media_id(fs.getattr("/Music/A/2.flac"));
+    const auto episode_media = file_media_id(fs.getattr("/TV/S/e1.mkv"));
+    REQUIRE(file_media_id(fs.getattr("/Music/A/copy-of-2.flac")) == two);
+
+    // A hand-made artist and album, and a scanner-made show: removal does not
+    // depend on who made an item.
+    const auto item = [](CatalogueKind kind, std::string id, std::optional<std::string> parent,
+                         std::vector<std::string> media = {}, bool scanner = false) {
+        CatalogueItem out;
+        out.kind = kind;
+        out.id = std::move(id);
+        out.title = out.id;
+        out.parent_id = std::move(parent);
+        out.media_ids = std::move(media);
+        if (scanner) out.external_ids["macha_scanner"] = "1";
+        return out;
+    };
+    catalogue.upsert_many({item(CatalogueKind::artist, "artist", {}),
+                           item(CatalogueKind::album, "album", "artist"),
+                           item(CatalogueKind::track, "track-1", "album", {one}),
+                           item(CatalogueKind::track, "track-2", "album", {two}),
+                           item(CatalogueKind::show, "show", {}, {}, true),
+                           item(CatalogueKind::season, "season", "show", {}, true),
+                           item(CatalogueKind::episode, "episode", "season", {episode_media}, true),
+                           item(CatalogueKind::show, "other-show", {})});
+
+    auto scanner = bench.scanner();
+    ManageApi manage(bench.node(), bench.metadata(), fs, catalogue, hints, *scanner);
+    REQUIRE(ManageApi::title_file_route(request_for("DELETE", "/api/v1/files/Music/A/1.flac")));
+    REQUIRE(ManageApi::title_file_route(
+        request_for("DELETE", "/api/v1/catalogue/items/track-1/media/" + one)));
+    CHECK(!ManageApi::title_file_route(request_for("GET", "/api/v1/files/Music/A/1.flac")));
+    CHECK(!ManageApi::title_file_route(request_for("DELETE", "/api/v1/catalogue/items/track-1")));
+    const auto call = [&](const std::string& path,
+                          std::map<std::string, std::string, std::less<>> query = {}) {
+        auto response = manage.handle(request_for("DELETE", path, {}, std::move(query)));
+        return std::pair{response.status, body_json(response)};
+    };
+    const auto ids = [](const Json& body) {
+        std::vector<std::string> out;
+        for (const auto& id : body.find("removed_item_ids")->asArray()) out.push_back(id.asString());
+        return out;
+    };
+    const auto unmatched_paths = [&] {
+        std::set<std::string> out;
+        const auto listed = body_json(manage.handle(request_for("GET", "/api/v1/manage/unmatched")));
+        for (const auto& entry : listed.find("items")->asArray())
+            out.insert(entry.find("path")->asString());
+        return out;
+    };
+
+    // Unmatch: the file goes to the unmatched list as it is, and nothing is
+    // queued for a provider. The track goes; the album keeps its other track.
+    auto [status, body] = call("/api/v1/catalogue/items/track-1/media/" + one);
+    REQUIRE(status == 200);
+    CHECK(body.find("status")->asString() == "unmatched");
+    CHECK(body.find("item") == nullptr);
+    CHECK(ids(body) == std::vector<std::string>{"track-1"});
+    CHECK(!catalogue.get("track-1").has_value());
+    CHECK(catalogue.get("album").has_value());
+    CHECK(unmatched_paths() == std::set<std::string>{"/Music/A/1.flac"});
+    CHECK(hints.summary().queued == 0);
+    CHECK(fs.getattr("/Music/A/1.flac").size == 4096);
+    // A scan that finds the same file does not reopen it.
+    hints.submit("/Music/A/1.flac", "scanner", one, CatalogueHintPriority::periodic_scan);
+    CHECK(hints.summary().queued == 0);
+    CHECK(unmatched_paths() == std::set<std::string>{"/Music/A/1.flac"});
+
+    std::tie(status, body) = call("/api/v1/catalogue/items/track-2/media/" + one);
+    CHECK(status == 404);
+    CHECK(error_code(body) == "media_not_bound");
+    std::tie(status, body) = call("/api/v1/catalogue/items/missing/media/" + one);
+    CHECK(status == 404);
+    CHECK(error_code(body) == "not_found");
+
+    // One path: the content is still held by its copy, so the track stays.
+    std::tie(status, body) = call("/api/v1/files/Music/A/2.flac");
+    REQUIRE(status == 200);
+    CHECK(body.find("path")->asString() == "/Music/A/2.flac");
+    CHECK(ids(body).empty());
+    CHECK(catalogue.get("track-2")->media_ids == std::vector<std::string>{two});
+
+    // Every path of the content: the last track goes, and the album and
+    // artist left with no children go with it.
+    std::tie(status, body) = call("/api/v1/files", {{"hash", two}});
+    REQUIRE(status == 200);
+    CHECK(body.find("paths")->asArray().size() == 1);
+    CHECK((ids(body) == std::vector<std::string>{"album", "artist", "track-2"}));
+    CHECK(fs.media_paths(two).empty());
+    std::tie(status, body) = call("/api/v1/files", {{"hash", two}});
+    CHECK(status == 404);
+
+    // The last episode's file: episode, season and show go; another show stays.
+    std::tie(status, body) = call("/api/v1/files/TV/S/e1.mkv");
+    REQUIRE(status == 200);
+    CHECK((ids(body) == std::vector<std::string>{"episode", "season", "show"}));
+    CHECK(catalogue.get("other-show").has_value());
+
+    std::tie(status, body) = call("/api/v1/files/TV/S");
+    CHECK(status == 409);
+    CHECK(error_code(body) == "not_a_file");
+    std::tie(status, body) = call("/api/v1/files/TV/S/missing.mkv");
+    CHECK(status == 404);
+    std::tie(status, body) = call("/api/v1/files");
+    CHECK(status == 400);
+    CHECK(error_code(body) == "missing_hash");
+}
+
 MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {
     CatalogueBench bench("manage-providers");
     auto& catalogue = bench.catalogue();

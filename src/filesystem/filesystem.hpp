@@ -516,6 +516,9 @@ class FileSystem final : public PublicationTarget {
     // index lookup and one stat-only read. None also when `path` is another
     // spelling of the name the file is kept under.
     std::optional<FsEntry> media_stat(std::string_view id, std::string_view path);
+    // Every path in this node's own head whose content is `id`, in order. From
+    // the index.
+    std::vector<std::string> media_paths(std::string_view id);
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool, bool cache_puts = false,
                                             WriteDurability = WriteDurability::immediate,
                                             uint64_t publication_pipeline_bytes = 0,

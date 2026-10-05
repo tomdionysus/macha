@@ -127,6 +127,10 @@ class CatalogueHintQueue {
                          std::string result = {});
     void mark_no_match(std::string_view id, std::string provider, std::string media_id,
                        std::string result = {});
+    // Puts the file at `path` in the unmatched list as it is, to be identified
+    // by hand: nothing is queued and no provider is asked. A scan that finds
+    // the same content there does not reopen it. Returns the hint id.
+    std::string put_unmatched(std::string path, std::string media_id);
     void advance_candidate(std::string_view id, size_t next_cursor);
     void defer(std::string_view id, std::string code, std::string error, uint64_t retry_after_unix_ms);
     size_t defer_matching(const std::function<bool(const CatalogueHint&)>& predicate,

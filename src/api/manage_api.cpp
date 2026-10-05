@@ -593,6 +593,129 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
     }
 }
 
+namespace {
+
+constexpr std::string_view items_prefix = "/api/v1/catalogue/items/";
+constexpr std::string_view media_infix = "/media/";
+constexpr std::string_view files_root = "/api/v1/files";
+
+// "{id}/media/{media_id}" of an unmatch path, or nothing.
+std::optional<std::pair<std::string, std::string>> unmatch_target(std::string_view path) {
+    if (!path.starts_with(items_prefix))
+        return {};
+    const auto rest = path.substr(items_prefix.size());
+    const auto infix = rest.rfind(media_infix);
+    if (infix == std::string_view::npos || infix == 0 ||
+        infix + media_infix.size() == rest.size())
+        return {};
+    const auto media = rest.substr(infix + media_infix.size());
+    if (media.find('/') != std::string_view::npos)
+        return {};
+    return std::pair{std::string(rest.substr(0, infix)), std::string(media)};
+}
+
+std::optional<uint64_t> if_match_revision(const HttpRequest& request) {
+    auto it = request.headers.find("if-match");
+    if (it == request.headers.end())
+        return {};
+    auto value = it->second;
+    value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
+    if (value.starts_with("rev-")) value.erase(0, 4);
+    uint64_t revision{};
+    auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), revision);
+    if (ec != std::errc{} || end != value.data() + value.size())
+        throw std::runtime_error("invalid If-Match revision");
+    return revision;
+}
+
+Json string_array(const std::vector<std::string>& values) {
+    Json::Array out;
+    for (const auto& value : values) out.emplace_back(value);
+    return Json(std::move(out));
+}
+
+} // namespace
+
+bool ManageApi::title_file_route(const HttpRequest& request) {
+    if (request.method != "DELETE")
+        return false;
+    if (request.path == files_root || request.path.starts_with(std::string(files_root) + "/"))
+        return true;
+    return unmatch_target(request.path).has_value();
+}
+
+HttpResponse ManageApi::title_files(const HttpRequest& request) {
+    // A file goes to the unmatched list as it is: no provider is asked.
+    const auto unmatched = [&](const std::string& media_id) {
+        for (const auto& path : fs_.media_paths(media_id))
+            hints_.put_unmatched(path, media_id);
+    };
+
+    if (const auto target = unmatch_target(request.path)) {
+        const auto& [item_id, media_id] = *target;
+        const auto result =
+            catalogue_.unbind_media(std::string_view(item_id), media_id, if_match_revision(request));
+        if (!result.found)
+            return http_error(404, "not_found", "catalogue item not found");
+        if (!result.bound)
+            return http_error(404, "media_not_bound", "the item does not hold that media id");
+        unmatched(media_id);
+        Json::Object out;
+        out["status"] = "unmatched";
+        if (result.item)
+            out["item"] = catalogue_item_json(*result.item);
+        out["removed_item_ids"] = string_array(result.removed_ids);
+        return http_json(200, Json(std::move(out)).dump());
+    }
+
+    // Deleted content is unbound only once no path holds it any longer.
+    const auto unbind_if_gone = [&](const std::string& media_id) {
+        if (media_id.empty() || !fs_.media_paths(media_id).empty())
+            return std::vector<std::string>{};
+        return catalogue_.unbind_media(std::nullopt, media_id).removed_ids;
+    };
+
+    if (request.path == files_root || request.path == std::string(files_root) + "/") {
+        const auto hash = request.query.find("hash");
+        if (hash == request.query.end() || hash->second.empty())
+            return http_error(400, "missing_hash", "hash is required to delete by content");
+        const auto paths = fs_.media_paths(hash->second);
+        if (paths.empty())
+            return http_error(404, "not_found", "no file holds that content");
+        for (const auto& path : paths) {
+            fs_.unlink(path);
+            hints_.erase_prefix(path);
+        }
+        Json::Object out;
+        out["status"] = "deleted";
+        out["paths"] = string_array(paths);
+        out["removed_item_ids"] = string_array(unbind_if_gone(hash->second));
+        return http_json(200, Json(std::move(out)).dump());
+    }
+
+    const auto path = normalize_path(request.path.substr(files_root.size()));
+    if (path == "/")
+        return http_error(409, "not_a_file", "the root is a directory");
+    FsEntry entry;
+    try {
+        entry = fs_.getattr(path);
+    } catch (const FsError& error) {
+        if (error.code() == ENOENT || error.code() == ENOTDIR)
+            return http_error(404, "not_found", "no such file");
+        throw;
+    }
+    if (entry.type != EntryType::file)
+        return http_error(409, "not_a_file", "a directory is removed through the filesystem");
+    const auto media_id = entry.size ? file_media_id(entry) : std::string{};
+    fs_.unlink(path);
+    hints_.erase_prefix(path);
+    Json::Object out;
+    out["status"] = "deleted";
+    out["path"] = path;
+    out["removed_item_ids"] = string_array(unbind_if_gone(media_id));
+    return http_json(200, Json(std::move(out)).dump());
+}
+
 HttpResponse ManageApi::handle(const HttpRequest& request) {
     auto response = dispatch(request);
     // A write that was refused, and any request that failed here or
@@ -617,6 +740,8 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
     // media id it was given, so two stale UI sessions cannot both resolve or
     // delete the same exception.
     try {
+        if (title_file_route(request))
+            return title_files(request);
         if (request.method == "GET" && request.path == "/api/v1/manage") {
             Json::Object resources;
             resources["unmatched"] = "/api/v1/manage/unmatched";
