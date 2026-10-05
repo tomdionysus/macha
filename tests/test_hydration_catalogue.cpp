@@ -3866,6 +3866,23 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
         REQUIRE(second.has_value());
         CHECK(second->first == "/media/b.mkv");
         REQUIRE(node.filesystem().find_media(a_id).has_value());
+
+        // The index follows renames and removals, and content held at two
+        // paths still resolves while either remains.
+        node.filesystem().rename("/media/b.mkv", "/media/b-renamed.mkv");
+        auto renamed = node.filesystem().find_media(b_id);
+        REQUIRE(renamed.has_value());
+        CHECK(renamed->first == "/media/b-renamed.mkv");
+        const auto twin_id = node.write("/media/a-copy.mkv", pattern(32 * 1024 + 17));
+        CHECK(twin_id == a_id);
+        REQUIRE(node.filesystem().find_media(a_id).has_value());
+        node.filesystem().unlink("/media/a.mkv");
+        auto survivor = node.filesystem().find_media(a_id);
+        REQUIRE(survivor.has_value());
+        CHECK(survivor->first == "/media/a-copy.mkv");
+        node.filesystem().unlink("/media/a-copy.mkv");
+        CHECK(!node.filesystem().find_media(a_id).has_value());
+        CHECK(node.filesystem().find_media(b_id).has_value());
     }
 
 #if defined(__APPLE__)

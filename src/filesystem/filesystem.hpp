@@ -423,8 +423,11 @@ class FileSystem final : public PublicationTarget {
     // valid across generations; only a miss inspects newer metadata.
     std::shared_ptr<const MetadataSnapshot> media_index_snapshot_
         MACHA_GUARDED_BY(media_index_mutex_);
-    // Media id -> path.
-    std::map<std::string, std::string> media_index_ MACHA_GUARDED_BY(media_index_mutex_);
+    // Media id to every path holding that content.
+    std::map<std::string, std::vector<std::string>, std::less<>> media_index_
+        MACHA_GUARDED_BY(media_index_mutex_);
+    // The tree the index was built from, when the namespace is a tree.
+    std::optional<ObjectId> media_index_root_ MACHA_GUARDED_BY(media_index_mutex_);
     Mutex maintenance_index_mutex_;
     uint64_t maintenance_index_generation_ MACHA_GUARDED_BY(maintenance_index_mutex_){};
     std::shared_ptr<const MaintenanceObjects> maintenance_index_
