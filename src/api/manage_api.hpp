@@ -35,6 +35,7 @@ class ManageApi {
 
     void queue_identity_reset_audit(IdentityAssociationReset);
     void identity_reset_audit_loop(std::stop_token);
+    HttpResponse dispatch(const HttpRequest&);
 
   public:
     ManageApi(NodeRuntime& node, MetadataView& metadata, FileSystem& fs,
