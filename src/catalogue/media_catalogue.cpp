@@ -1815,7 +1815,7 @@ Json MusicBrainzProvider::api(std::string_view path,
     Lock gate(gate_->mutex);
     const auto now = std::chrono::steady_clock::now();
     if (gate_->unavailable_until > now)
-        throw ProviderTemporarilyUnavailable("musicbrainz", "MusicBrainz circuit open");
+        throw ProviderTemporarilyUnavailable("musicbrainz", "MusicBrainz is backing off after a failure");
 
     if (gate_->last_request != std::chrono::steady_clock::time_point{}) {
         const auto due = gate_->last_request + gate_->interval;
@@ -2295,7 +2295,7 @@ Json DiscogsProvider::api(std::string_view path,
                           const std::vector<std::pair<std::string, std::string>>& query) {
     const auto now = std::chrono::steady_clock::now();
     if (unavailable_until_ > now)
-        throw ProviderTemporarilyUnavailable("discogs", "Discogs circuit open");
+        throw ProviderTemporarilyUnavailable("discogs", "Discogs is backing off after a failure");
 
     // Discogs allows 60 requests/minute; paced here as well as by the scan budget.
     if (last_request_ != std::chrono::steady_clock::time_point{}) {
@@ -2924,6 +2924,12 @@ CatalogueScanProvider* CatalogueScanner::provider_for_path(std::string_view path
     return selected;
 }
 
+ProviderRequestError provider_unavailable(std::string_view provider, std::string_view reason) {
+    Log::warn("catalogue provider unavailable provider=" + std::string(provider) + " reason=\"" +
+              std::string(reason) + "\"");
+    return ProviderRequestError(503, "provider_unavailable", "Provider unavailable");
+}
+
 bool CatalogueScanner::stage_remote_artwork(
     ProviderMatch& match, const std::function<bool(std::string_view)>& locked,
     std::stop_token stop, size_t max_artwork_bytes,
@@ -3063,7 +3069,7 @@ std::vector<ProviderSearchResult> CatalogueScanner::search_providers(
         try {
             results = metadata->search(query);
         } catch (const std::exception& e) {
-            throw ProviderRequestError(503, "provider_unavailable", e.what());
+            throw provider_unavailable(metadata_provider, e.what());
         }
     }
     for (auto& result : results)
@@ -3139,7 +3145,7 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
         } catch (const ProviderRecordNotFound&) {
             // No match: answered below as provider_not_found.
         } catch (const std::exception& e) {
-            throw ProviderRequestError(503, "provider_unavailable", e.what());
+            throw provider_unavailable(parsed->provider, e.what());
         }
     }
     if (!match)
@@ -3255,7 +3261,7 @@ std::vector<ArtworkOption> CatalogueScanner::artwork_options(std::string_view re
     } catch (const ProviderRecordNotFound& e) {
         throw ProviderRequestError(404, "provider_not_found", e.what());
     } catch (const std::exception& e) {
-        throw ProviderRequestError(503, "provider_unavailable", e.what());
+        throw provider_unavailable(parsed->provider, e.what());
     }
 }
 
@@ -3277,7 +3283,7 @@ std::vector<ProviderReleaseTrack> CatalogueScanner::release_tracks(std::string_v
     } catch (const ProviderRecordNotFound& e) {
         throw ProviderRequestError(404, "provider_not_found", e.what());
     } catch (const std::exception& e) {
-        throw ProviderRequestError(503, "provider_unavailable", e.what());
+        throw provider_unavailable(parsed->provider, e.what());
     }
 }
 
@@ -3350,12 +3356,12 @@ CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::st
     try {
         response = http_->get(option->url, {}, max_artwork_bytes);
     } catch (const std::exception& e) {
-        throw ProviderRequestError(503, "provider_unavailable", e.what());
+        throw provider_unavailable("artwork", e.what());
     }
     auto mime = response.content_type;
     if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
     if (response.status != 200 || response.body.empty() || !mime.starts_with("image/"))
-        throw ProviderRequestError(503, "provider_unavailable",
+        throw provider_unavailable("artwork",
                                    "the image fetch answered HTTP " + std::to_string(response.status));
 
     auto art = catalogue_.stage_artwork(std::string(role), mime, response.body);
@@ -3520,7 +3526,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         return {};
     } catch (const ProviderTemporarilyUnavailable& e) {
         // An outage is provider state: defer every hint of the provider, or each
-        // would be probed locally only to meet the same open circuit.
+        // would be probed locally only to meet the same backoff.
         const auto retry_delay = std::max(config.provider_batch_delay, e.retry_after());
         const auto retry_at = unix_ms() + static_cast<uint64_t>(retry_delay.count());
         size_t deferred = 0;

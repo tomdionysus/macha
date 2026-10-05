@@ -150,8 +150,12 @@ struct ProviderRequestError : std::runtime_error {
         : std::runtime_error(message), status(http_status), code(std::move(error_code)) {}
 };
 
+// A provider that could not answer, as the client is told: the code and
+// "Provider unavailable". The reason is logged here, not sent.
+ProviderRequestError provider_unavailable(std::string_view provider, std::string_view reason);
+
 // MusicBrainz allows one request a second per client: every MusicBrainzProvider
-// on a node shares this gate and its circuit.
+// on a node shares this gate and its backoff.
 struct MusicBrainzGate {
     // The least time between two requests.
     const std::chrono::steady_clock::duration interval;

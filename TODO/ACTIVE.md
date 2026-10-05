@@ -131,7 +131,11 @@ file.
   `rpc_cluster/test_inbound_incapable_node_is_reached_only_over_its_own_sessions`;
   the pacing check in
   `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
-  under debug logging; the macOS-only torrent segfaults (5 of 21). Fixed
+  under debug logging; the macOS-only torrent segfaults (5 of 21);
+  `users/test_accounts_converge_across_nodes` (laptop, full suite at
+  `--jobs 8`, 2026-10-05: the sign-in it requires under 2 s took about 8 s;
+  sign-in runs scrypt, so CPU contention is suspected, not a peer wait;
+  passed alone and on the next full run). Fixed
   2026-10-05: `namespace_migration/test_a_merge_claims_what_it_introduces`
   (`45cba94`).
 - **An ingest dies on EAGAIN from a checkpoint commit** instead of re-basing

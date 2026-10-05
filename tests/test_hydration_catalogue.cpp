@@ -1253,7 +1253,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     CHECK(mb_error_http.requests() == 1);
 
     // A transient MusicBrainz outage must not burn every music hypothesis.
-    // The circuit opens after one 503 and Discogs receives the same candidate.
+    // MusicBrainz backs off after one 503 and Discogs receives the same candidate.
     TempDir discogs_temp;
     auto discogs_token = discogs_temp.path() / "discogs.token";
     {
