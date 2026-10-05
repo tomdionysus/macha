@@ -18,11 +18,14 @@ merge follows in the background.
 
 What a client can see: a write answered by one node is visible on that node
 at once, and on another node when it arrives there, typically within a round
-trip. A client that writes through one node and reads through another
+trip. That covers everything the metadata commit carries: MachaDFS changes,
+catalogue edits (the catalogue's root travels in the commit) and torrent job
+requests. A client that writes through one node and reads through another
 straight afterwards may read the earlier state. Two nodes that change the
 same path before either has the other's commit both succeed, and the merge
 keeps the later one and records the other as a conflict, as it does after a
-partition.
+partition. Account sessions, sign-in and playback sessions are not in the
+namespace and are unchanged.
 
 **Lookups read the tree.** The filesystem kept an index of every path in
 the namespace, rebuilt by walking the whole tree after each commit and
