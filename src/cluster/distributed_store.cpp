@@ -1011,6 +1011,10 @@ std::vector<ObjectId> DistributedStore::retain_data(const std::vector<ObjectId>&
     return unheld;
 }
 
+bool DistributedStore::held_here(const ObjectId& id) const {
+    return local_.data().has(id);
+}
+
 bool DistributedStore::holds_extents() const {
     for (const auto& node : n_.membership().active())
         if (node.id == n_.node_id())

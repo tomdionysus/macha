@@ -314,12 +314,18 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
                   R"({"id":3624,"name":"Season 1","episodes":[{"id":63057,"episode_number":2,"name":"The Kingsroad"}]})");
         http->add("/tv/1399", 200, "application/json",
                   R"({"id":1399,"name":"Game of Thrones","first_air_date":"2011-04-17"})");
+        // Before "/release/", which the cover lookup's URL also contains.
+        http->add("coverartarchive.org/release/" + release, 200, "application/json",
+                  R"({"images":[{"front":true,"image":"https://covers.example/full.jpg",
+                                 "thumbnails":{"500":"https://covers.example/front-500.jpg"}}]})");
+        http->add("covers.example", 200, "image/jpeg", "cover-bytes");
         http->add("/release/" + release, 200, "application/json",
                   R"({"id":")" + release + R"(","title":"Hand Album","date":"1999",
                       "artist-credit":[{"name":"Band","artist":{"id":"a1","name":"Band"}}],
                       "media":[{"position":1,"tracks":[{"position":1,"title":"One","recording":{"id":"r1","title":"One"}},
                                                        {"position":2,"title":"Two","recording":{"id":"r2","title":"Two"}}]}]})");
         http->add("image.tmdb.org", 200, "image/jpeg", "poster-bytes");
+        auto* http_ptr = http.get();
         auto scanner =
             bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
         ManageApi manage(bench.node(), bench.metadata(), fs, catalogue, hints, *scanner);
@@ -361,6 +367,20 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         REQUIRE(track.has_value());
         CHECK(track->title == "Two");
         CHECK(track->media_ids == std::vector<std::string>{track_media});
+        const auto album = catalogue.get(*track->parent_id);
+        REQUIRE(album.has_value());
+        REQUIRE(album->artwork.size() == 1);
+        CHECK(album->artwork.front().role == "cover");
+        CHECK(http_ptr->requests_containing("covers.example") == 1);
+
+        // Another track of the release: the cover this node already holds is
+        // neither fetched nor stored again.
+        auto [other_hint, other_media] = bench.unmatched("/Music/ref-3b.flac", 13);
+        std::tie(status, body) = match(other_hint, R"({"ref":"musicbrainz:release:)" + release + R"(","track_number":1})");
+        REQUIRE(status == 200);
+        CHECK(catalogue.get(body.find("leaf_item_id")->asString())->title == "One");
+        CHECK(http_ptr->requests_containing("covers.example") == 1);
+        CHECK(catalogue.get(album->id)->artwork == album->artwork);
 
         // Refusals leave the file unmatched.
         const auto refused = bench.unmatched("/Movies/ref-4.mkv", 4).first;

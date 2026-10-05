@@ -288,6 +288,8 @@ class CatalogueManager {
                                             std::span<const uint8_t> bytes,
                                             DistributedStore::DurabilityBatch& batch);
     bool artwork_durability_barrier(DistributedStore::DurabilityBatch& batch);
+    // Whether this node holds the artwork object itself.
+    bool artwork_held_here(const ObjectId& id) const { return store_.held_here(id); }
     // `vanished_media`: media a complete scan found nowhere in the namespace.
     // With `prune_missing`, every leaf drops them, manual items included; a
     // manual item stays when its last file goes.
