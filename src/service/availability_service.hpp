@@ -59,6 +59,15 @@ void fill_path_table(AvailabilitySnapshot&, const MetadataSnapshot&, const Names
                      const HeldFn& held, const AvailabilitySnapshot* last_known = nullptr,
                      const std::function<void()>& pause = {});
 
+// The path table of `snapshot` from the table of the namespace it was changed
+// from: `previous` with `changes` (before -> after) applied. Equal to
+// fill_path_table when neither survey left anything unknown and no extent of
+// an unchanged file has changed hands. Costs the changes and one copy of the
+// table.
+void update_path_table(AvailabilitySnapshot&, const AvailabilitySnapshot& previous,
+                       const NamespaceDifferences& changes, const MetadataSnapshot&,
+                       const NamespaceNodeStore&, const HeldFn& held);
+
 // A snapshot's path table, generation and survey time as kept on disk; the
 // extent lists are not kept. Decoding throws DecodeError.
 Bytes encode_availability_paths(const AvailabilitySnapshot&);
@@ -155,6 +164,12 @@ class AvailabilityService {
     bool surveyed_{};
     // The tree the last survey was of.
     ObjectId surveyed_root_{};
+    // The last survey's memo, when every peer answered it.
+    std::optional<SurveyMemo> memo_;
+    // The tree the published path table is of, when it is of a stored tree,
+    // and the storage events seen when it was made.
+    std::optional<ObjectId> table_root_;
+    uint64_t table_storage_events_{};
     // The head the roll-up was built at: its namespace root, or its record
     // hash when the namespace is inline.
     Hash256 rolled_head_{};

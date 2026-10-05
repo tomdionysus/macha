@@ -111,12 +111,32 @@ struct AvailabilitySurvey {
     bool is_unknown(const ObjectId&) const;
 };
 
+// What a survey found at each tree node every peer answered for: the extents
+// directly beneath it that nobody holds and the child nodes it went on into.
+// Tree nodes are content addresses, so while no peer's holdings have changed
+// and this node has lost nothing, a later survey of another tree finds the
+// same at any node the two trees share, less what this node has gained, and
+// need not ask about it.
+struct SurveyMemo {
+    struct Node {
+        std::vector<ObjectId> unavailable;
+        std::vector<ObjectId> descend;
+    };
+    std::map<ObjectId, Node> nodes;
+};
+
 // Descends from the root through the subtrees neither this node nor any one
 // peer holds whole. A peer that fails once is not asked again; what only it
 // could have described becomes `unknown`. Throws DecodeError if a tree node
 // this node must read is missing.
+//
+// `known`: a memo from a survey since which no peer's holdings have changed
+// and this node has lost nothing. A node in it is settled from it and no peer
+// is asked about it. `made` receives this survey's memo.
 AvailabilitySurvey survey_availability(const HoldingsRollup& local,
                                        const NamespaceNodeStore& store, const HeldFn& held,
-                                       std::span<PeerHoldings* const> peers);
+                                       std::span<PeerHoldings* const> peers,
+                                       const SurveyMemo* known = nullptr,
+                                       SurveyMemo* made = nullptr);
 
 } // namespace macha

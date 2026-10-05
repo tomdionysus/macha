@@ -14,6 +14,7 @@
 #include "storage/local_store.hpp"
 
 #include <algorithm>
+#include <set>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
@@ -89,19 +90,11 @@ std::string_view parent_of(std::string_view path) {
     return slash == 0 ? path.substr(0, 1) : path.substr(0, slash);
 }
 
-} // namespace
-
-void fill_path_table(AvailabilitySnapshot& out, const MetadataSnapshot& snapshot,
-                     const NamespaceNodeStore& store, const HeldFn& held,
-                     const AvailabilitySnapshot* last_known, const std::function<void()>& pause) {
-    for_each_namespace_entry(snapshot, &store, [&](const std::string& path, const FsEntry& entry) {
-        if (pause)
-            pause();
-        auto& facts = out.paths[path];
-        if (entry.type != EntryType::file) {
-            facts.directory = true;
-            return;
-        }
+// A file's own facts against a survey.
+PathAvailability file_facts(const FsEntry& entry, const AvailabilitySurvey& survey,
+                            const HeldFn& held, const AvailabilitySnapshot* last_known) {
+    PathAvailability facts;
+    {
         facts.size = entry.size;
         facts.hash = file_media_id(entry);
         for (const auto& extent : entry.extents) {
@@ -110,9 +103,9 @@ void fill_path_table(AvailabilitySnapshot& out, const MetadataSnapshot& snapshot
             ++facts.extents;
             if (held(extent.id))
                 ++facts.extents_local;
-            else if (out.survey.is_unavailable(extent.id))
+            else if (survey.is_unavailable(extent.id))
                 ++facts.extents_unavailable;
-            else if (out.survey.is_unknown(extent.id))
+            else if (survey.is_unknown(extent.id))
                 ++facts.extents_unknown;
         }
         if (facts.extents_unknown && last_known)
@@ -127,18 +120,99 @@ void fill_path_table(AvailabilitySnapshot& out, const MetadataSnapshot& snapshot
                                           facts.extents - facts.extents_local));
                     facts.extents_unknown = 0;
                 }
-        out.by_hash.emplace(facts.hash, path);
-        const auto file = facts;
-        for (auto parent = parent_of(path); !parent.empty(); parent = parent_of(parent)) {
-            auto& above = out.paths[std::string(parent)];
-            above.directory = true;
-            above.size += file.size;
-            above.extents += file.extents;
-            above.extents_local += file.extents_local;
-            above.extents_unavailable += file.extents_unavailable;
-            above.extents_unknown += file.extents_unknown;
-        }
+    }
+    return facts;
+}
+
+void add_file(AvailabilitySnapshot& out, const std::string& path, const PathAvailability& file) {
+    out.paths[path] = file;
+    out.by_hash.emplace(file.hash, path);
+    for (auto parent = parent_of(path); !parent.empty(); parent = parent_of(parent)) {
+        auto& above = out.paths[std::string(parent)];
+        above.directory = true;
+        above.size += file.size;
+        above.extents += file.extents;
+        above.extents_local += file.extents_local;
+        above.extents_unavailable += file.extents_unavailable;
+        above.extents_unknown += file.extents_unknown;
+    }
+}
+
+} // namespace
+
+void fill_path_table(AvailabilitySnapshot& out, const MetadataSnapshot& snapshot,
+                     const NamespaceNodeStore& store, const HeldFn& held,
+                     const AvailabilitySnapshot* last_known, const std::function<void()>& pause) {
+    for_each_namespace_entry(snapshot, &store, [&](const std::string& path, const FsEntry& entry) {
+        if (pause)
+            pause();
+        if (entry.type != EntryType::file)
+            out.paths[path].directory = true;
+        else
+            add_file(out, path, file_facts(entry, out.survey, held, last_known));
     });
+}
+
+void update_path_table(AvailabilitySnapshot& out, const AvailabilitySnapshot& previous,
+                       const NamespaceDifferences& changes, const MetadataSnapshot& snapshot,
+                       const NamespaceNodeStore& store, const HeldFn& held) {
+    out.paths = previous.paths;
+    out.by_hash = previous.by_hash;
+    // Directories that may have lost their reason to be listed.
+    std::set<std::string, std::greater<>> emptied;
+    for (const auto& [path, change] : changes) {
+        if (!change.before)
+            continue;
+        if (change.before->type != EntryType::file) {
+            if (!change.after)
+                emptied.insert(path);
+            continue;
+        }
+        const auto found = out.paths.find(path);
+        if (found == out.paths.end())
+            continue;
+        const auto file = found->second;
+        out.paths.erase(found);
+        for (auto [at, end] = out.by_hash.equal_range(file.hash); at != end; ++at)
+            if (at->second == path) {
+                out.by_hash.erase(at);
+                break;
+            }
+        for (auto parent = parent_of(path); !parent.empty(); parent = parent_of(parent)) {
+            const auto above = out.paths.find(parent);
+            if (above == out.paths.end())
+                continue;
+            above->second.size -= file.size;
+            above->second.extents -= file.extents;
+            above->second.extents_local -= file.extents_local;
+            above->second.extents_unavailable -= file.extents_unavailable;
+            above->second.extents_unknown -= file.extents_unknown;
+            emptied.insert(std::string(parent));
+        }
+    }
+    for (const auto& [path, change] : changes) {
+        if (!change.after)
+            continue;
+        if (change.after->type != EntryType::file)
+            out.paths[path].directory = true;
+        else
+            add_file(out, path, file_facts(*change.after, out.survey, held, nullptr));
+    }
+    // Deepest first. A directory is listed for its own entry or for a file
+    // beneath it.
+    for (const auto& path : emptied) {
+        const auto found = out.paths.find(path);
+        if (found == out.paths.end() || !found->second.directory ||
+            namespace_contains(snapshot, &store, path))
+            continue;
+        const auto prefix = path == "/" ? path : path + "/";
+        bool file_beneath = false;
+        for (auto at = std::next(found);
+             at != out.paths.end() && at->first.starts_with(prefix) && !file_beneath; ++at)
+            file_beneath = !at->second.directory;
+        if (!file_beneath)
+            out.paths.erase(found);
+    }
 }
 
 namespace {
@@ -406,8 +480,18 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     AvailabilitySnapshot next;
     next.generation = holdings->generation;
     next.surveyed_unix_ms = now_unix_ms;
+    // What the last survey settled stands while every peer holds what it
+    // held and this node has lost nothing.
+    const bool remembered = ask && memo_ && surveyed_ && !lost && same_peers && !shrank &&
+                            !(grew && missing) && topology_events == surveyed_topology_events_;
     if (ask) {
-        next.survey = survey_availability(*rollup, nodes, held, asking);
+        SurveyMemo made;
+        next.survey = survey_availability(*rollup, nodes, held, asking,
+                                          remembered ? &*memo_ : nullptr, &made);
+        if (next.survey.peers_failed)
+            memo_.reset();
+        else
+            memo_ = std::move(made);
         surveyed_at_ = now;
     } else {
         // Rolled up after a gain alone: what was missing is still missing,
@@ -417,12 +501,26 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         std::erase_if(next.survey.unknown, held);
     }
     bool table_changed = false;
+    const char* table = "kept";
     if (!rolled && surveyed_ && previous->survey.unavailable == next.survey.unavailable &&
         previous->survey.unknown == next.survey.unknown) {
         next.paths = previous->paths;
         next.by_hash = previous->by_hash;
     } else {
-        fill_path_table(next, *holdings->snapshot, stored, held, previous.get(), pause);
+        const auto& root = holdings->snapshot->namespace_root;
+        // Only the tree moved: the table follows what moved in it.
+        if (remembered && !holdings->built && root && table_root_ &&
+            storage_events == table_storage_events_ && previous->survey.unknown.empty() &&
+            next.survey.unknown.empty()) {
+            update_path_table(next, *previous, diff_namespace_trees(*table_root_, *root, stored),
+                              *holdings->snapshot, stored, held);
+            table = "followed";
+        } else {
+            fill_path_table(next, *holdings->snapshot, stored, held, previous.get(), pause);
+            table = "walked";
+        }
+        table_root_ = holdings->built ? std::nullopt : root;
+        table_storage_events_ = storage_events;
         table_changed = true;
     }
     if (ask)
@@ -438,7 +536,8 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                " peers=" + std::to_string(next.survey.peers_asked) +
                " peers_failed=" + std::to_string(next.survey.peers_failed) +
                " rounds=" + std::to_string(next.survey.rounds) +
-               " tree_nodes_asked=" + std::to_string(next.survey.nodes_asked));
+               " tree_nodes_asked=" + std::to_string(next.survey.nodes_asked) +
+               " remembered=" + (remembered ? "1" : "0") + " table=" + table);
     if (table_changed && !persisted_.empty()) {
         try {
             const auto bytes = encode_availability_paths(next);
