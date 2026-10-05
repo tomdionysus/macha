@@ -1,5 +1,33 @@
 # Current release
 
+## 0.90.12 — the survey, the path table and discovery follow the change (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**The availability survey asks about what the last one did not settle.** A
+survey keeps what it found at each tree node every peer answered for. While
+no peer's holdings have changed and this node has lost nothing, the next
+survey asks its peers only about the tree nodes the new tree does not share
+with the last, where it had descended the whole of what this node lacks. A
+tree node a peer could not describe is not kept, so it is asked about again.
+
+**The path table is the last one with the tree's differences applied**, under
+the same conditions and when neither survey left anything unknown. It was a
+walk of the whole namespace after every commit. The survey's debug line says
+which was done (`remembered=`, `table=followed|walked|kept`).
+
+**Catalogue discovery reads the filesystem's media index.** A scan walked
+every provider root with each file's whole extent list, ten seconds after any
+namespace commit, and the whole namespace again when a manual binding's file
+was not under a root. A targeted rematch walked the namespace too. All three
+read the index the filesystem keeps current from each commit's tree diff.
+
+**A match downloads its artwork four at a time**, and stages it in the order
+the provider gave.
+
+**A provider's artwork options are kept for ten minutes**, so choosing one of
+the options just listed does not ask the provider for the list again.
+
 ## 0.90.11 — a catalogue write touches its own shards (experiment)
 
 No wire, protocol, API or on-disk changes.

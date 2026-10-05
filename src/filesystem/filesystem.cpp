@@ -2167,6 +2167,24 @@ std::vector<std::string> FileSystem::media_ids() {
     return ids;
 }
 
+std::vector<std::pair<std::string, std::string>> FileSystem::media_files(MetadataSnapshotView& of) {
+    of = m_.local();
+    FsEntry nothing;
+    nothing.type = EntryType::file;
+    const auto empty = file_media_id(nothing);
+    std::vector<std::pair<std::string, std::string>> files;
+    {
+        Lock lock(media_index_mutex_);
+        refresh_media_index(of);
+        for (const auto& [id, paths] : media_index_)
+            if (id != empty)
+                for (const auto& path : paths)
+                    files.emplace_back(path, id);
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
 std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::string_view id) {
     if (id.starts_with("path:")) {
         auto path = std::string(id.substr(5));
