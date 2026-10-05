@@ -22,15 +22,9 @@ struct ExtentRef {
     bool hole{};
     auto operator<=>(const ExtentRef&) const = default;
 };
-struct FsEntry {
-    EntryType type{EntryType::file};
-    uint32_t mode{0644}, uid{}, gid{};
-    uint64_t size{};
-    int64_t ctime_ns{}, mtime_ns{};
-    uint64_t version{1};
-    std::vector<ExtentRef> extents;
-    auto operator<=>(const FsEntry&) const = default;
-};
+class Writer;
+class Reader;
+
 // One mutation of one author. Zero is no dot.
 struct MetadataDot {
     NodeId author{};
@@ -43,6 +37,39 @@ inline bool clock_covers(const std::map<NodeId, uint64_t>& clock, const Metadata
     const auto found = clock.find(dot.author);
     return found != clock.end() && found->second >= dot.sequence;
 }
+
+// Where an entry came from, which is what lets two heads be merged without
+// their common ancestor. An entry written before provenance was kept has
+// none (all three empty) and is encoded exactly as it always was.
+struct EntryProvenance {
+    // Set when the file or directory is created and carried by a rename.
+    NodeId file_id{};
+    // Its last change of content or attributes.
+    MetadataDot content;
+    // When it came to be at this path, by creation or rename.
+    MetadataDot name;
+    bool empty() const noexcept { return file_id == NodeId{} && !content && !name; }
+    auto operator<=>(const EntryProvenance&) const = default;
+};
+
+struct FsEntry {
+    EntryType type{EntryType::file};
+    uint32_t mode{0644}, uid{}, gid{};
+    uint64_t size{};
+    int64_t ctime_ns{}, mtime_ns{};
+    uint64_t version{1};
+    std::vector<ExtentRef> extents;
+    EntryProvenance provenance;
+    auto operator<=>(const FsEntry&) const = default;
+};
+// The identity of an entry that has none, from the path it sits at: two
+// branches that first touch the same such file agree on it.
+NodeId legacy_file_id(std::string_view path);
+// The wire form of an entry's type byte carries this bit when provenance
+// follows; a reader that does not know it refuses the entry.
+inline constexpr uint8_t entry_type_with_provenance = 0x80;
+void encode_entry_provenance(Writer&, const EntryProvenance&);
+EntryProvenance decode_entry_provenance(Reader&);
 
 struct GarbageRef {
     ObjectId id{};
@@ -107,6 +134,11 @@ struct MetadataSnapshot {
     // Highest mutation sequence incorporated per node: an idempotency clock
     // recognising an accepted mutation after retry or reconciliation.
     std::map<NodeId, uint64_t> mutation_sequences;
+    // `mutation_sequences` as it stood when this lineage was first written
+    // by code that keeps entry provenance: every mutation that could have
+    // created an entry without provenance lies within it. Unset until then;
+    // a merge joins by max.
+    std::optional<std::map<NodeId, uint64_t>> legacy_clock;
     std::optional<ObjectId> catalogue_root;
     // SM14: the namespace tree root, carried instead of `entries`, never
     // alongside; both encoders refuse the mix. See namespace_tree.hpp.
@@ -305,11 +337,26 @@ struct MetadataDelta {
         uint64_t version{};
         uint32_t base_extents{};        // extents the entry must already hold
         std::vector<ExtentRef> extents; // appended after them
+        // DLT10: the appending mutation, which becomes the entry's content
+        // dot. Empty in a delta written without provenance.
+        MetadataDot content;
     };
     std::map<std::string, EntryAppend> append_entries;
     CatalogueDelta catalogue{CatalogueDelta::unchanged};
     std::optional<ObjectId> catalogue_root;
+    // DLT10: sets the snapshot's legacy clock, once.
+    std::optional<std::map<NodeId, uint64_t>> set_legacy_clock;
 };
+// Applies one append to the entry at `path`, as both namespace forms do.
+// Throws DecodeError when the entry is not the file the append was made for.
+void apply_entry_append(FsEntry&, std::string_view path, const MetadataDelta::EntryAppend&);
+// Gives an entry written by a mutation its provenance. `prior` is the entry
+// the parent head holds at `path`; `dot` is the mutation. The entry keeps
+// the identity and name of a file it replaces in place, takes a new name
+// dot when it is new at the path, and a new content dot when it differs
+// from what was there or arrives with none.
+void stamp_entry_provenance(FsEntry&, std::string_view path, const FsEntry* prior,
+                            const MetadataDot& dot);
 
 // Record `after` as an append when `before`'s extents are a strict prefix of
 // its own, else as a whole-entry upsert.
