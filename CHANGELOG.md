@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.2 — a commit's tree nodes are written on this node alone (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**The last wait on a peer inside a commit is gone.** 0.90.0 made a commit
+local, but each namespace tree node the commit wrote was still copied to the
+other node as it was written, one round trip per node: 0.5 to 2.1 seconds of
+a commit whose other stages together took under 80 ms, measured on fi-1.
+A commit now writes its new nodes on the committing node only. The peers
+receive them from the replicator's claims, or build them from the commit's
+delta, as they already did.
+
+**A commit's debug line says where its time went**: finding the head,
+decoding it, applying the change, updating the tree, pruning conflicts,
+encoding, claims and storing, each in milliseconds.
+
 ## 0.90.1 — a catalogue conflict decided for the root in place is removed (experiment)
 
 No wire, protocol, API or on-disk changes.

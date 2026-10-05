@@ -9,9 +9,8 @@
 namespace macha {
 
 ControlNamespaceNodeStore::ControlNamespaceNodeStore(LocalStore& control,
-                                                     ControlObjectSource& source,
-                                                     DistributedStore* replicas, Mode mode)
-    : control_(control), source_(source), replicas_(replicas), mode_(mode) {}
+                                                     ControlObjectSource& source, Mode mode)
+    : control_(control), source_(source), mode_(mode) {}
 
 ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
     if (mode_ == Mode::read)
@@ -24,14 +23,13 @@ ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
         written_.push_back(id);
         return id;
     }
-    // A node already held was replicated when first written and is immutable
-    // by content address, so skip it. update_namespace_tree rewrites the
-    // spine, mostly byte-identical nodes; replicating each costs a WAN round
-    // trip, which dominates commit cost.
+    // A node already held is immutable by content address, so skip it. A new
+    // one is written here and nowhere else: a commit asks no peer. The peers
+    // get it from the replicator's claims, or build it themselves from the
+    // commit's delta.
     if (control_.has(id))
         return id;
-    (void)replicas_->replicate_control(id, node);
-    if (!control_.has(id))
+    if (!control_.put(id, node))
         throw std::runtime_error("namespace node could not be written locally: " + to_string(id));
     written_.push_back(id);
     return id;
