@@ -705,7 +705,18 @@ bool CatalogueManager::reconcile_catalogue_conflict(const MetadataSnapshotView& 
         if (conflict.kind != MetadataConflictKind::catalogue_root)
             continue;
 
-        const auto base = load_root(conflict.base_catalogue_root);
+        auto base_root = conflict.base_catalogue_root;
+        if (conflict.later_installed) {
+            // A merge of two heads keeps no base: it is the root their common
+            // ancestor held, while this node's history still reaches that.
+            // Without it the root left in place stands.
+            const auto ancestor =
+                metadata_.common_ancestor_catalogue_root(conflict.left_head, conflict.right_head);
+            if (!ancestor)
+                continue;
+            base_root = *ancestor;
+        }
+        const auto base = load_root(base_root);
         const auto left = load_root(conflict.left_catalogue_root);
         const auto right = load_root(conflict.right_catalogue_root);
         auto merged = merge_catalogue_snapshots(base, left, right);

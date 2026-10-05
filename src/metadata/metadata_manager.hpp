@@ -226,6 +226,11 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
                 mutation_publish_ms_total_.load(std::memory_order_relaxed),
                 mutation_publish_ms_max_.load(std::memory_order_relaxed)};
     }
+    // The catalogue root at the common ancestor of two heads, when this
+    // node's history still reaches it: the base the catalogue merges two
+    // roots over. The outer value is empty when it does not.
+    std::optional<std::optional<ObjectId>>
+    common_ancestor_catalogue_root(const Hash256& left, const Hash256& right) const override;
     MetadataHeadStanding head_standing() const noexcept override {
         return {head_holders_.load(std::memory_order_relaxed),
                 head_present_.load(std::memory_order_relaxed),
