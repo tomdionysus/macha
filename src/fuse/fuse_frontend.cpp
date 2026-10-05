@@ -1609,8 +1609,10 @@ struct FuseFrontend::State {
         journal_poisoned = false;
     }
 
+    // `sync` false leaves the records to the next append's barrier: for a
+    // record that means nothing until the one written straight after it.
     void append_journal_records_locked(const std::vector<Bytes>& payloads,
-                                       bool new_admission = false)
+                                       bool new_admission = false, bool sync = true)
         MACHA_REQUIRES(journal_mutex) {
         if (journal_poisoned)
             throw FsError(EIO,
@@ -1642,10 +1644,12 @@ struct FuseFrontend::State {
                 auto frame = fuse_journal_frame(payload);
                 write_exact(journal_fd, frame);
             }
-            fsync_fd(journal_fd, "cannot sync FUSE operation journal");
+            if (sync) {
+                fsync_fd(journal_fd, "cannot sync FUSE operation journal");
+                journal_durability_barriers.fetch_add(1, std::memory_order_relaxed);
+            }
             journal_append_batches.fetch_add(1, std::memory_order_relaxed);
             journal_records_appended.fetch_add(payloads.size(), std::memory_order_relaxed);
-            journal_durability_barriers.fetch_add(1, std::memory_order_relaxed);
         } catch (...) {
             // A batch is all-or-nothing to recovery: roll back partial records,
             // or poison the journal if that fails.
@@ -1664,11 +1668,11 @@ struct FuseFrontend::State {
     }
 
     void append_journal_record_locked(std::span<const uint8_t> payload,
-                                      bool new_admission = false)
+                                      bool new_admission = false, bool sync = true)
         MACHA_REQUIRES(journal_mutex) {
         std::vector<Bytes> payloads;
         payloads.emplace_back(payload.begin(), payload.end());
-        append_journal_records_locked(payloads, new_admission);
+        append_journal_records_locked(payloads, new_admission, sync);
     }
 
     void reset_journal_locked() MACHA_REQUIRES(journal_admission_mutex, journal_mutex) {
@@ -1690,7 +1694,9 @@ struct FuseFrontend::State {
         reset_journal_locked();
     }
 
-    void journal_inode_locked(const std::shared_ptr<Inode>& inode)
+    // `sync` false when the operation that needs this descriptor is journalled
+    // straight after it: that append's barrier makes both durable.
+    void journal_inode_locked(const std::shared_ptr<Inode>& inode, bool sync = true)
         MACHA_REQUIRES(inode->mutex, journal_admission_mutex) {
         const auto epoch = journal_epoch.load(std::memory_order_relaxed);
         if (inode->journal_epoch == epoch)
@@ -1707,7 +1713,7 @@ struct FuseFrontend::State {
         payload.u64(inode->namespace_sequence);
         payload.u64(inode->next_data_sequence);
         Lock journal_lock(journal_mutex);
-        append_journal_record_locked(payload.data(), true);
+        append_journal_record_locked(payload.data(), true, sync);
         inode->journal_epoch = epoch;
     }
 
@@ -1734,11 +1740,11 @@ struct FuseFrontend::State {
         // Lock order: inode locks before journal_admission_mutex.
         Lock journal_admission(journal_admission_mutex);
         for (const auto& inode : affected_inodes) {
-            journal_inode_locked(inode);
+            journal_inode_locked(inode, false);
             op.affected.push_back(inode->id);
         }
         if (displaced_inode) {
-            journal_inode_locked(displaced_inode);
+            journal_inode_locked(displaced_inode, false);
             op.removed.push_back(displaced_inode->id);
         }
         journal_namespace_operation(op);
@@ -2608,9 +2614,10 @@ struct FuseFrontend::State {
             return;
 
         // A path edge is an owner; check the index as well as published_path.
-        if (std::any_of(paths.begin(), paths.end(), [&](const auto& item) {
-                return item.second.get() == inode.get();
-            }))
+        // An inode stands in the index under its own current path and
+        // nowhere else.
+        if (const auto edge = paths.find(canonical_path(inode->current_path));
+            edge != paths.end() && edge->second.get() == inode.get())
             return;
         release_retained_owners_locked(*inode);
         inodes.erase(found);
@@ -5458,7 +5465,7 @@ void FuseFrontend::mkdir(std::string_view path, uint32_t mode, uint32_t uid, uin
                 // Journaled before the change becomes visible or succeeds.
                 {
                     Lock journal_admission(state_->journal_admission_mutex);
-                    state_->journal_inode_locked(inode);
+                    state_->journal_inode_locked(inode, false);
                     state_->journal_namespace_operation(op);
                 }
                 state_->paths[requested] = inode;
@@ -5506,7 +5513,7 @@ void FuseFrontend::rmdir(std::string_view path) {
                      op.affected = {inode->id};
                      {
                          Lock journal_admission(state_->journal_admission_mutex);
-                         state_->journal_inode_locked(inode);
+                         state_->journal_inode_locked(inode, false);
                          state_->journal_namespace_operation(op);
                      }
                      inode->namespace_sequence = sequence;
@@ -5543,7 +5550,7 @@ void FuseFrontend::unlink(std::string_view path) {
                      op.affected = {inode->id};
                      {
                          Lock journal_admission(state_->journal_admission_mutex);
-                         state_->journal_inode_locked(inode);
+                         state_->journal_inode_locked(inode, false);
                          state_->journal_namespace_operation(op);
                      }
                      inode->namespace_sequence = sequence;
@@ -5670,7 +5677,7 @@ void FuseFrontend::chmod(std::string_view path, uint32_t mode) {
                      op.affected = {inode->id};
                      {
                          Lock journal_admission(state_->journal_admission_mutex);
-                         state_->journal_inode_locked(inode);
+                         state_->journal_inode_locked(inode, false);
                          state_->journal_namespace_operation(op);
                      }
                      inode->visible.mode = mode & 07777;
@@ -5712,7 +5719,7 @@ void FuseFrontend::chown(std::string_view path, uint32_t uid, uint32_t gid, bool
                      op.affected = {inode->id};
                      {
                          Lock journal_admission(state_->journal_admission_mutex);
-                         state_->journal_inode_locked(inode);
+                         state_->journal_inode_locked(inode, false);
                          state_->journal_namespace_operation(op);
                      }
                      if (set_uid)
@@ -5752,7 +5759,7 @@ void FuseFrontend::utimens(std::string_view path, int64_t mtime_ns) {
                      op.affected = {inode->id};
                      {
                          Lock journal_admission(state_->journal_admission_mutex);
-                         state_->journal_inode_locked(inode);
+                         state_->journal_inode_locked(inode, false);
                          state_->journal_namespace_operation(op);
                      }
                      inode->visible.mtime_ns = mtime_ns;
@@ -5882,7 +5889,7 @@ FuseOpenHandle FuseFrontend::create(std::string_view path, uint32_t mode, uint32
                             op.affected = {inode->id};
                             {
                                 Lock journal_admission(state_->journal_admission_mutex);
-                                state_->journal_inode_locked(inode);
+                                state_->journal_inode_locked(inode, false);
                                 state_->journal_namespace_operation(op);
                             }
                             if (writable)

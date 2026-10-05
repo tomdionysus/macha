@@ -3394,11 +3394,11 @@ MACHA_TEST("filesystem_fuse", test_management_api_reports_and_acts_on_fuse_state
         CHECK(filesystem->find("namespace_operations_batched")->asUInt64() == 1);
         CHECK(filesystem->find("namespace_operations_published")->asUInt64() == 1);
         CHECK(filesystem->find("namespace_operations_confirmed")->asUInt64() == 1);
-        // A new live inode durably appends its descriptor and operation before
-        // returning, then published and done.
+        // A new live inode appends its descriptor and operation before
+        // returning, durable under one barrier, then published and done.
         CHECK(filesystem->find("journal_append_batches")->asUInt64() == 4);
         CHECK(filesystem->find("journal_records_appended")->asUInt64() == 4);
-        CHECK(filesystem->find("journal_durability_barriers")->asUInt64() == 4);
+        CHECK(filesystem->find("journal_durability_barriers")->asUInt64() == 3);
         CHECK(filesystem->find("spool_bytes")->asUInt64() == 0);
         CHECK(filesystem->find("spool_limit_bytes")->asUInt64() == config.fuse.max_spool_bytes);
         CHECK(filesystem->find("pending_write_request_limit_bytes")->asUInt64() ==
