@@ -1007,23 +1007,50 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
             }
         },
         10s));
-    // Reintroducing tombstoned extents makes maintenance erase the stale
-    // tombstones in a commit of its own, on a branch before the merge or on
-    // the merge itself, so the merge is found in the head's ancestry and
-    // checked against the parents it actually joined.
-    auto merge = replica.materialized(replica.accepted_heads().front().hash);
-    REQUIRE(merge != nullptr);
-    while (merge->snapshot->merge_parents.empty()) {
-        REQUIRE(merge->record.generation > left_generation);
-        merge = replica.materialized(merge->record.previous);
-        REQUIRE(merge != nullptr);
+    // The merge that joined the two branches is found in the head's ancestry.
+    // It need not be the head: bringing tombstoned extents back makes
+    // maintenance erase the stale tombstones in a commit of its own, which a
+    // mutation makes on this node's head without waiting for a merge, so it
+    // may lie under the merge, over it, or beside it and be merged in turn.
+    std::shared_ptr<const MetadataMaterialization> merge;
+    std::shared_ptr<const MetadataMaterialization> primary_parent;
+    std::vector<ObjectId> introduced;
+    {
+        std::vector<Hash256> pending{replica.accepted_heads().front().hash};
+        std::set<Hash256> visited;
+        while (!pending.empty() && !merge) {
+            const auto hash = pending.back();
+            pending.pop_back();
+            if (!visited.insert(hash).second)
+                continue;
+            const auto at = replica.materialized(hash);
+            if (!at || at->record.generation <= left_generation)
+                continue;
+            pending.push_back(at->record.previous);
+            for (const auto& parent : at->snapshot->merge_parents)
+                pending.push_back(parent);
+            if (at->snapshot->merge_parents.empty())
+                continue;
+            const auto parent = replica.materialized(at->record.previous);
+            if (!parent || !parent->snapshot->namespace_root)
+                continue;
+            std::vector<ObjectId> nodes;
+            collect_namespace_tree_changes(parent->snapshot->namespace_root,
+                                           *at->snapshot->namespace_root,
+                                           service.filesystem().namespace_nodes(), nodes);
+            // A merge with the tombstone commit changes no entry.
+            if (nodes.empty())
+                continue;
+            merge = at;
+            primary_parent = parent;
+            introduced = std::move(nodes);
+        }
     }
+    REQUIRE(merge != nullptr);
     const auto& merged = *merge->snapshot;
     REQUIRE(merged.merge_parents.size() == 1);
     REQUIRE(merged.namespace_root.has_value());
-    const auto primary_parent = replica.materialized(merge->record.previous);
     const auto other_parent = replica.materialized(merged.merge_parents.front());
-    REQUIRE(primary_parent != nullptr);
     REQUIRE(other_parent != nullptr);
     // A pure join: the clock is the parents', so any reconciler mints it.
     auto joined = primary_parent->snapshot->mutation_sequences;
@@ -1034,11 +1061,6 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
         for (const auto& [author, sequence] : branch->mutation_sequences)
             CHECK(clock_covers(merged.mutation_sequences, MetadataDot{author, sequence}));
 
-    const auto& primary = *primary_parent->snapshot;
-    std::vector<ObjectId> introduced;
-    collect_namespace_tree_changes(primary.namespace_root, *merged.namespace_root,
-                                   service.filesystem().namespace_nodes(), introduced);
-    REQUIRE(!introduced.empty());
     // The merge's claim on each: a dot of this node's, beyond the merged
     // head's clock, so a release at this head keeps it.
     const auto uncovered = [&](const ObjectId& node, const std::map<NodeId, uint64_t>& clock) {

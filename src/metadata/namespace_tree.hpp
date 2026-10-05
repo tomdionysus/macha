@@ -224,11 +224,11 @@ using NamespaceChanges = std::map<std::string, std::optional<FsEntry>>;
 // entries are never read or rewritten. The result is byte-identical to
 // `build_namespace_tree` over the resulting namespace (property 1).
 //
-// The spine above changed leaves is recomputed over the whole leaf sequence
-// rather than spliced: unchanged branches re-encode to the same address, so
-// written nodes are only the changed leaves and their paths; the local cost is
-// O(branch nodes) reads and encodes, plus the leaves the changes fall in:
-// leaves between distant changes are not read.
+// It reads the path to each leaf a change falls in, cuts those leaves again,
+// and regroups the nodes above only as far as the groups differ from the old
+// ones. A subtree no change falls in is neither read nor written, and an
+// entry that does not change is copied as its leaf holds it, so its extent
+// list is not read either. The cost follows the change and the tree's depth.
 ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
                                const NamespaceChanges& changes,
                                const NamespaceTreeLimits& limits = {});
