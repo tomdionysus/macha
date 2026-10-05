@@ -881,10 +881,18 @@ std::vector<ObjectId> DistributedStore::retain_data(const std::vector<ObjectId>&
     auto selected_by_object = select_present_batched(candidates_by_object, floor);
     const auto scan_ms = since_ms(started);
 
+    // An object the scan found on no node present has nothing to copy from
+    // and nobody to claim on: it is unheld, and nothing more is asked about
+    // it. One found on fewer nodes than sought is re-placed below.
+    std::set<ObjectId> absent;
     std::vector<ObjectId> short_ids;
-    for (const auto& id : ids)
-        if (selected_by_object[id].size() < floor)
+    for (const auto& id : ids) {
+        const auto present = selected_by_object[id].size();
+        if (!present)
+            absent.insert(id);
+        else if (present < floor)
             short_ids.push_back(id);
+    }
     const auto short_count = short_ids.size();
     size_t fallback_claims = 0;
     // Where a slow retention barrier spends its time: presence scan,
@@ -968,6 +976,11 @@ std::vector<ObjectId> DistributedStore::retain_data(const std::vector<ObjectId>&
         auto& successful = claimed[id];
         if (successful.size() >= floor)
             continue;
+        if (absent.contains(id)) {
+            ++under_claimed;
+            unheld.push_back(id);
+            continue;
+        }
         const auto candidates = candidates_by_object.find(id);
         if (candidates == candidates_by_object.end()) {
             ++under_claimed;

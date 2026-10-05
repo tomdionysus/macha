@@ -973,6 +973,26 @@ MACHA_TEST("namespace_tree", test_a_commit_claims_the_nodes_it_introduced_and_pr
     // The walk pruned: far fewer nodes than the tree holds.
     const auto total = before_shape.leaves + before_shape.branches + before_shape.extent_nodes;
     CHECK(claimed.size() * 4 < total);
+    // A change that rewrote no extent list claims no extent list: the leaf's
+    // other files, and this one's own unchanged list, are already named.
+    CHECK(claimed == written);
+
+    // A file given new extents has its new list claimed, and no other file's.
+    {
+        auto regrown = make_file(424242, 600);
+        store.forget_written();
+        const auto grown =
+            update_namespace_tree(after, store, {{"/TV/Show 4/Season 1/Episode 4.mkv", regrown}});
+        auto wrote = store.written();
+        std::sort(wrote.begin(), wrote.end());
+        std::vector<ObjectId> introduced;
+        collect_namespace_tree_changes(after, grown, store, introduced);
+        std::sort(introduced.begin(), introduced.end());
+        introduced.erase(std::unique(introduced.begin(), introduced.end()), introduced.end());
+        CHECK(introduced == wrote);
+        const auto shape = namespace_tree_stats(grown, store);
+        CHECK(introduced.size() * 4 < shape.leaves + shape.branches + shape.extent_nodes);
+    }
 
     // With no `before`, everything is new.
     std::vector<ObjectId> everything;
