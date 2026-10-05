@@ -2185,6 +2185,21 @@ std::vector<std::pair<std::string, std::string>> FileSystem::media_files(Metadat
     return files;
 }
 
+std::optional<FsEntry> FileSystem::media_stat(std::string_view id, std::string_view path) {
+    const auto view = m_.local();
+    Lock lock(media_index_mutex_);
+    refresh_media_index(view);
+    const auto found = media_index_.find(id);
+    if (found == media_index_.end() ||
+        std::find(found->second.begin(), found->second.end(), path) == found->second.end())
+        return {};
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto entry = namespace_entry(*media_index_snapshot_, &nodes, path, false);
+    if (!entry || entry->type != EntryType::file)
+        return {};
+    return entry;
+}
+
 std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::string_view id) {
     if (id.starts_with("path:")) {
         auto path = std::string(id.substr(5));
