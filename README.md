@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.90.2*
+*v0.90.3*
 
 *Macha — Old Irish /ˈmˠaxə/ — approximately “MAKH-uh”*
 
@@ -106,11 +106,10 @@ a single node, or the survivor of any number of losses, keeps reading and
 writing. `dht.replicas` is the DATA copy count repair converges to.
 A namespace change is made on the node that receives it: the write returns
 once that node durably holds it, a read on that node sees it at once, and
-every node present is sent it straight afterwards. `dht.write_copies` and
-`dht.metadata_write_copies` are the copies sought before a write returns, of
-a DATA object and of a catalogue control object: with that many nodes present
-and answering, the write is on that many when it returns; with fewer, it
-returns on the copies it has and repair delivers the rest. Divergent metadata
+every node present is sent it straight afterwards. A catalogue change is made the same way. `dht.write_copies` is the number of
+copies of a DATA object sought before its write returns: with that many nodes
+present and answering, the object is on that many when it returns; with
+fewer, it returns on the copies it has and repair delivers the rest. Divergent metadata
 heads are reconciled
 automatically, non-conflicting namespace changes are merged, and incompatible
 alternatives are preserved as durable conflicts rather than silently picking a

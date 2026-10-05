@@ -356,8 +356,10 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // returns the ones it does not.
     std::vector<ObjectId> retain_data_here(const std::vector<ObjectId>&, const RetentionDot&);
     // `here` claims on this node alone and asks no peer, unless an object is
-    // not held here and must be fetched to be claimed.
-    enum class ClaimScope { everywhere, here };
+    // not held here and must be fetched to be claimed. `everywhere` stops at
+    // metadata_write_copies holders; `every_node` offers the objects and the
+    // claim to each node present, which is what a replicator wants.
+    enum class ClaimScope { everywhere, here, every_node };
     bool retain_control(const std::vector<ObjectId>&, const RetentionDot&,
                         ClaimScope scope = ClaimScope::everywhere);
     std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true,

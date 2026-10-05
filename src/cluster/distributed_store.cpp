@@ -1036,7 +1036,9 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
 
     const size_t sought = scope == ClaimScope::here
                               ? 1
-                              : std::max<size_t>(1, n_.config().metadata_write_copies);
+                              : scope == ClaimScope::every_node
+                                    ? std::numeric_limits<size_t>::max()
+                                    : std::max<size_t>(1, n_.config().metadata_write_copies);
     const auto started = Clock::now();
     auto active = n_.membership().active();
     if (scope == ClaimScope::here)

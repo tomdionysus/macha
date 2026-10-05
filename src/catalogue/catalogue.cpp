@@ -1112,13 +1112,14 @@ void CatalogueManager::commit(
     const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
     const std::set<ObjectId>& old_artwork, std::optional<Hash256> expected_namespace,
     std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict) {
-    MetadataRecord metadata_record;
+    // This node's own head: a catalogue write asks no peer what the head is.
+    std::optional<MetadataSnapshotView> head;
     try {
-        metadata_record = metadata_.record();
+        head = metadata_.local();
     } catch (const std::exception& e) {
         throw CatalogueUnavailable(std::string("catalogue metadata unavailable: ") + e.what());
     }
-    auto metadata_snapshot = decode_snapshot(metadata_record.payload);
+    const auto& metadata_snapshot = *head->snapshot;
     if (metadata_snapshot.catalogue_root != expected_root)
         throw CatalogueConflict("catalogue changed concurrently");
     if (expected_namespace &&
@@ -1165,17 +1166,18 @@ void CatalogueManager::commit(
     // An unchanged root is nothing to commit, unless a conflict is being
     // decided in its favour: that decision is the commit.
     if (expected_root && *expected_root == root && !resolved_conflict) {
-        cache(metadata_record.generation, metadata_snapshot, next);
+        cache(head->generation, metadata_snapshot, next);
         return;
     }
 
-    // A commit may reference a control object once some node holds it; every
-    // active node is offered it, whatever its DATA capacity.
+    // A commit may reference a control object once this node holds it. The
+    // other nodes are sent it with the commit's claims, and convergence
+    // offers it to every active node, whatever its DATA capacity.
     for (const auto& [id, encoded] : changed_control) {
-        if (!store_.replicate_control(id, encoded))
+        if (!local_.control().put(id, encoded))
             throw CatalogueUnavailable("catalogue shard could not be stored");
     }
-    if (!store_.replicate_control(root, encoded_manifest))
+    if (!local_.control().put(root, encoded_manifest))
         throw CatalogueUnavailable("catalogue manifest could not be stored");
 
     try {
@@ -1224,15 +1226,14 @@ void CatalogueManager::commit(
                                    e.what());
     }
 
-    auto committed_record = metadata_.record();
-    auto committed_metadata = decode_snapshot(committed_record.payload);
+    const auto committed = metadata_.local();
     {
         Lock lock(mutex_);
         control_converged_root_.reset();
         control_converged_nodes_.clear();
         control_convergence_retry_ = {};
     }
-    cache(committed_record.generation, committed_metadata, next);
+    cache(committed.generation, *committed.snapshot, next);
 }
 
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,

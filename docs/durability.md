@@ -4,7 +4,7 @@
 
 Macha may publish a logical reference only after the storage class responsible for that reference has satisfied its durability contract.
 
-For DATA, the contract is a durable authoritative copy on a node present. For namespace/control metadata, it is a durable copy on the committing node. `dht.write_copies` is the number of copies of a DATA object sought before its write returns: with that many nodes present and answering, the object is on that many when it returns; with fewer, it returns on the copies it has and repair delivers the rest. A namespace commit seeks no copy before it returns: it is durable on the committing node, and every node present is sent it afterwards. `dht.metadata_write_copies` is the copies sought, before the write returns, of the control objects a catalogue write stores. Nothing is refused for lack of peers.
+For DATA, the contract is a durable authoritative copy on a node present. For namespace/control metadata, it is a durable copy on the committing node. `dht.write_copies` is the number of copies of a DATA object sought before its write returns: with that many nodes present and answering, the object is on that many when it returns; with fewer, it returns on the copies it has and repair delivers the rest. A namespace or catalogue commit seeks no copy before it returns: it is durable on the committing node, and every node present is sent it afterwards. `dht.metadata_write_copies` is the copies of a merge commit sought before it is accepted. Nothing is refused for lack of peers.
 
 Cache never counts.
 
@@ -69,7 +69,7 @@ Metadata copies are independent of DATA `dht.replicas` and `dht.write_copies`.
 Catalogue manifest/shard objects are CONTROL, as are the nodes of a tree-backed namespace: a new namespace root may be referenced only once the committing node durably holds every tree node it introduces, exactly as a manifest may not name a shard the node does not hold. Before namespace metadata can point at a new catalogue manifest:
 
 1. newly referenced artwork DATA must be readable through the normal DATA store;
-2. changed catalogue shards must be durable on the committing node, with copies sought on `metadata_write_copies` nodes;
+2. changed catalogue shards must be durable on the committing node; the other nodes are sent them after the commit;
 3. the successor manifest must be durable on the committing node, with copies sought likewise;
 4. namespace metadata acceptance publishes the new manifest root.
 

@@ -777,8 +777,10 @@ MACHA_TEST("storage_v18", test_a_full_preferred_node_spills_data_but_not_control
 
     const auto metadata = large.metadata().snapshot();
     REQUIRE(metadata.catalogue_root.has_value());
-    CHECK(small.node().control_store().has(*metadata.catalogue_root));
     CHECK(large.node().control_store().has(*metadata.catalogue_root));
+    // Delivered to the other node by the catalogue's convergence pass.
+    large.catalogue().repair_once();
+    CHECK(small.node().control_store().has(*metadata.catalogue_root));
     CHECK(!small.node().local_store().has(*metadata.catalogue_root));
     CHECK(!large.node().local_store().has(*metadata.catalogue_root));
 
@@ -1178,6 +1180,11 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
     const auto metadata = b.metadata().snapshot();
     REQUIRE(metadata.catalogue_root.has_value());
     const auto root = *metadata.catalogue_root;
+    // The write is answered from the node that took it. The other holds its
+    // control objects once they are delivered: here by the catalogue's own
+    // convergence pass, which maintenance runs (this fixture has no
+    // replicator claims).
+    b.catalogue().repair_once();
     REQUIRE(a.node().control_store().get(root).has_value());
     auto referenced = a.node().control_store().list();
     REQUIRE(referenced.size() >= 2);

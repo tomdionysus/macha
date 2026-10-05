@@ -1,5 +1,22 @@
 # Current release
 
+## 0.90.3 — a catalogue write is made on this node alone (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**A catalogue write no longer waits for another node.** A match, a manual
+entry, an artwork choice or an item edit read the head through a path that
+could survey the other nodes, then copied each changed shard and the manifest
+to them before committing. It now reads this node's own head and writes its
+shards and manifest here. The other nodes are sent them with the commit's
+claims, which the replicator now offers to every node present rather than
+stopping at `dht.metadata_write_copies`, and the catalogue's convergence pass
+offers them again. A node that reads a catalogue root before its shards
+arrive fetches them from the node that holds them, as before.
+
+`dht.metadata_write_copies` now governs only the copies a merge commit seeks
+before it is accepted.
+
 ## 0.90.2 — a commit's tree nodes are written on this node alone (experiment)
 
 No wire, protocol, API or on-disk changes.
