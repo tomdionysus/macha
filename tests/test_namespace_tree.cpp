@@ -1100,15 +1100,32 @@ MACHA_TEST("namespace_tree", test_an_update_reaches_the_root_a_full_build_reache
                 if (round == rounds - 1)
                     for (const auto& [path, _] : entries)
                         changes[path] = std::nullopt;
+                NamespaceDifferences expected;
                 for (const auto& [path, value] : changes) {
+                    NamespaceDifference difference;
+                    if (const auto found = entries.find(path); found != entries.end())
+                        difference.before = found->second;
+                    difference.after = value;
+                    if (difference.before != difference.after)
+                        expected.emplace(path, std::move(difference));
                     if (value)
                         entries[path] = *value;
                     else
                         entries.erase(path);
                 }
+                const auto previous = root;
                 root = update_namespace_tree(root, store, changes, limits);
                 MemoryNamespaceNodeStore fresh;
                 REQUIRE(root == build_namespace_tree(entries, fresh, limits));
+                // The diff of the two trees is exactly what changed.
+                const auto differing = diff_namespace_trees(previous, root, store);
+                REQUIRE(differing.size() == expected.size());
+                for (const auto& [path, difference] : expected) {
+                    const auto found = differing.find(path);
+                    REQUIRE(found != differing.end());
+                    CHECK(found->second.before == difference.before);
+                    CHECK(found->second.after == difference.after);
+                }
             }
         }
     }
@@ -1132,12 +1149,20 @@ MACHA_TEST("namespace_tree", test_an_update_reads_the_path_it_changes_not_the_tr
     entries[path] = changed;
     store.forget_reads();
     store.forget_written();
+    const auto before_change = root;
     root = update_namespace_tree(root, store, {{path, changed}});
     // The path down, the leaf, and at most a neighbour or two taken in.
     CHECK(store.reads() <= 4 * stats.depth);
     CHECK(store.written().size() <= 2 * stats.depth);
     MemoryNamespaceNodeStore fresh;
     CHECK(root == build_namespace_tree(entries, fresh));
+
+    // So does telling the two trees apart.
+    store.forget_reads();
+    const auto differing = diff_namespace_trees(before_change, root, store);
+    REQUIRE(differing.size() == 1);
+    CHECK(differing.begin()->first == path);
+    CHECK(store.reads() <= 8 * stats.depth);
 
     // Removing a show reads its leaves and the path, not the library.
     NamespaceChanges removal;
