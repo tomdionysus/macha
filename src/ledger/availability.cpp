@@ -49,9 +49,14 @@ void sort_unique(std::vector<ObjectId>& ids) {
 } // namespace
 
 HoldingsRollup HoldingsRollup::build(const ObjectId& root, const NamespaceNodeStore& store,
-                                     const HeldFn& held, const std::function<void()>& pause) {
+                                     const HeldFn& held, const std::function<void()>& pause,
+                                     const HoldingsRollup* carried) {
     HoldingsRollup rollup;
     rollup.root_ = root;
+    if (carried && carried->carries_ < carries_max) {
+        rollup.nodes_ = carried->nodes_;
+        rollup.carries_ = carried->carries_ + 1;
+    }
     (void)roll_up(root, store, held, pause, rollup.nodes_);
     return rollup;
 }
