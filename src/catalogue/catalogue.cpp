@@ -1162,7 +1162,9 @@ void CatalogueManager::commit(
 
     auto encoded_manifest = encode_catalogue_manifest(manifest);
     const auto root = object_id(encoded_manifest);
-    if (expected_root && *expected_root == root) {
+    // An unchanged root is nothing to commit, unless a conflict is being
+    // decided in its favour: that decision is the commit.
+    if (expected_root && *expected_root == root && !resolved_conflict) {
         cache(metadata_record.generation, metadata_snapshot, next);
         return;
     }

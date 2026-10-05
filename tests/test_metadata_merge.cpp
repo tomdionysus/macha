@@ -554,6 +554,22 @@ MACHA_FAST_TEST("metadata_merge", test_the_catalogue_root_follows_its_dot) {
     CHECK(conflict_installed_catalogue_root(conflict) == merged.catalogue_root);
     CHECK((merged.catalogue_root == root(2) || merged.catalogue_root == root(3)));
     CHECK(conflict.right_catalogue_root != conflict.left_catalogue_root);
+
+    // A node that has the merge decides the conflict for the root in place:
+    // the same root, set again. Merged with a head that still carries the
+    // conflict, the decision stands, whichever author's dot is the greater.
+    const auto standing = merged;
+    for (Author* decided : {&a, &b}) {
+        Author holder{4};
+        holder.adopt(standing);
+        decided->adopt(standing);
+        decided->head.conflicts.clear();
+        decided->head.catalogue_dot = decided->next();
+        const auto settled = merge(decided->head, holder.head).snapshot;
+        CHECK(settled.catalogue_root == standing.catalogue_root);
+        CHECK(settled.catalogue_dot == decided->head.catalogue_dot);
+        CHECK(settled.conflicts.empty());
+    }
 }
 
 } // namespace

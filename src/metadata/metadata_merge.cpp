@@ -251,17 +251,23 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
         throw std::runtime_error("metadata reconciliation lost filesystem root");
 
     // The catalogue root is one value with one dot.
+    const auto seen = [](const Side& viewer, const Side& owner) {
+        return owner.snapshot.catalogue_dot
+                   ? clock_covers(viewer.clock, owner.snapshot.catalogue_dot)
+                   : clock_covers_clock(viewer.clock, owner.legacy);
+    };
+    const bool left_seen = seen(r, l);
+    const bool right_seen = seen(l, r);
     if (left.catalogue_root == right.catalogue_root) {
         out.catalogue_root = left.catalogue_root;
-        out.catalogue_dot = std::max(left.catalogue_dot, right.catalogue_dot);
+        // The same root set twice: the dot is the later setting's, so a
+        // conflict a later commit decided in favour of the root in place is
+        // not taken for standing. Concurrent, the greater.
+        if (left_seen != right_seen)
+            out.catalogue_dot = right_seen ? left.catalogue_dot : right.catalogue_dot;
+        else
+            out.catalogue_dot = std::max(left.catalogue_dot, right.catalogue_dot);
     } else {
-        const auto seen = [](const Side& viewer, const Side& owner) {
-            return owner.snapshot.catalogue_dot
-                       ? clock_covers(viewer.clock, owner.snapshot.catalogue_dot)
-                       : clock_covers_clock(viewer.clock, owner.legacy);
-        };
-        const bool left_seen = seen(r, l);
-        const bool right_seen = seen(l, r);
         bool take_left = false;
         if (left_seen != right_seen) {
             take_left = right_seen;
