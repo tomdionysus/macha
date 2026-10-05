@@ -1523,9 +1523,6 @@ ExtentExecutorDiagnostics FileSystem::extent_executor_diagnostics() const {
             extent_tasks_peak_active_.load(std::memory_order_relaxed),
             extent_tasks_submitted_.load(std::memory_order_relaxed)};
 }
-MetadataSnapshot FileSystem::snap() {
-    return *m_.converged().snapshot;
-}
 
 namespace {
 // A name every byte of which is ASCII has no other canonically-equivalent
@@ -2469,7 +2466,7 @@ std::vector<ObjectId> FileSystem::live_objects() {
 }
 
 Hash256 FileSystem::namespace_signature(uint64_t* metadata_generation) {
-    const auto view = m_.converged();
+    const auto view = m_.local();
     if (metadata_generation) *metadata_generation = view.generation;
     return metadata_namespace_signature(*view.snapshot);
 }
