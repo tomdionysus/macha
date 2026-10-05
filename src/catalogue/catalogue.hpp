@@ -172,6 +172,9 @@ class CatalogueManager {
     // Single-flight refresh; guards nothing. Held across metadata reads and
     // control replica fetches.
     mutable IoMutex refresh_mutex_;
+    // Brings the catalogue to this node's head; with `converge`, also offers
+    // its control objects to every node present.
+    void refresh(bool converge);
     // Serialises read-modify-commit; guards nothing. Held across metadata
     // commits and DATA/CONTROL store writes.
     mutable IoMutex mutation_mutex_;
@@ -228,6 +231,8 @@ class CatalogueManager {
 
     const ClusterKeys& cluster_keys() const noexcept { return node_.keys(); }
 
+    // Brings the catalogue to the head and offers its control objects to every
+    // node present: maintenance's pass.
     void repair_once();
     bool refresh_needed() const;
     CatalogueStatus status() const;

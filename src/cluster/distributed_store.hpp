@@ -328,6 +328,15 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     bool put(const ObjectId&, std::span<const uint8_t>, std::atomic_bool* cancelled = nullptr);
     bool put(const ObjectId&, std::span<const uint8_t>, FrameType,
              std::atomic_bool* cancelled = nullptr);
+    // Stores the object durably on this node and returns; the further copies
+    // are owed and prompt replication delivers them. For a caller that must
+    // not wait on a peer. A node that holds no extents has nowhere local to
+    // put it and stores it as `put` does.
+    bool put_here(const ObjectId&, std::span<const uint8_t>, FrameType);
+    // The same, durable at `batch`'s barrier rather than on return.
+    bool put_deferred_here(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&, FrameType);
+    // Whether this node stores DATA extents itself.
+    bool holds_extents() const;
     ObjectId put_deferred(std::span<const uint8_t>, DurabilityBatch&,
                           std::atomic_bool* cancelled = nullptr);
     // A `work` no-progress budget fails the put (retryably) once no replica
