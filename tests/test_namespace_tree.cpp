@@ -1018,56 +1018,155 @@ Hash256 head_of(uint8_t first) {
     return head;
 }
 
-// One branch's edits to `entries`. Targets come from a small pool as often as
-// not, so two branches edit the same paths; a removed directory takes what is
-// beneath it, so the other branch can leave orphans there.
-void edit_branch(std::map<std::string, FsEntry>& entries, Random& random, size_t edits) {
-    const auto pick = [&](size_t pool) {
-        auto it = entries.begin();
-        std::advance(it, static_cast<ptrdiff_t>(random.next() % std::min(pool, entries.size())));
-        return it;
-    };
+// One node's lineage: the namespace it holds and the mutations it authors on
+// it, stamped as a commit stamps what it writes.
+struct Lineage {
+    NodeId author{};
+    uint64_t sequence{};
+    uint64_t created{};
+    MetadataSnapshot head;
+
+    explicit Lineage(uint8_t tag) { author.bytes[0] = tag; }
+
+    MetadataDot next() {
+        if (!head.legacy_clock)
+            head.legacy_clock = head.mutation_sequences;
+        head.mutation_sequences[author] = ++sequence;
+        return {author, sequence};
+    }
+    // Creates the entry, or changes the one already at the path.
+    void put(const std::string& path, FsEntry entry) {
+        const auto prior = head.entries.find(path);
+        entry.provenance = {};
+        if (prior == head.entries.end()) {
+            // A file id of this lineage's own, the same on every run.
+            entry.provenance.file_id.bytes[0] = author.bytes[0];
+            const auto number = ++created;
+            for (size_t i = 0; i < 8; ++i)
+                entry.provenance.file_id.bytes[8 + i] = static_cast<uint8_t>(number >> (8 * i));
+        }
+        const auto dot = next();
+        stamp_entry_provenance(entry, path, prior == head.entries.end() ? nullptr : &prior->second,
+                               dot);
+        head.entries[path] = std::move(entry);
+    }
+    // Changes the file at the path: its size, and the time it says.
+    void edit(const std::string& path, uint64_t grow, int64_t later) {
+        auto entry = head.entries.at(path);
+        entry.size += grow;
+        entry.mtime_ns += later;
+        put(path, std::move(entry));
+    }
+    // Removes the entry and everything beneath it, one mutation each.
+    void erase(const std::string& path) {
+        for (auto it = head.entries.begin(); it != head.entries.end();) {
+            if (it->first != path && !it->first.starts_with(path + "/")) {
+                ++it;
+                continue;
+            }
+            (void)next();
+            it = head.entries.erase(it);
+        }
+    }
+    void rename(const std::string& from, const std::string& to) {
+        auto entry = head.entries.at(from);
+        if (entry.provenance.file_id == NodeId{})
+            entry.provenance.file_id = legacy_file_id(from);
+        const auto dot = next();
+        head.entries.erase(from);
+        const auto prior = head.entries.find(to);
+        stamp_entry_provenance(entry, to, prior == head.entries.end() ? nullptr : &prior->second,
+                               dot);
+        head.entries[to] = std::move(entry);
+    }
+    // Takes the namespace another lineage reached, keeping its own identity.
+    void adopt(const MetadataSnapshot& other) { head = other; }
+};
+
+// A lineage's mutations between two merges. Targets come from a small pool as
+// often as not, so two lineages change the same paths; a removed directory
+// takes what is beneath it, so the other can add a file there.
+void mutate(Lineage& lineage, Random& random, size_t edits) {
+    const auto& entries = lineage.head.entries;
     for (size_t i = 0; i < edits; ++i) {
         const size_t pool = random.next() % 2 ? 12 : entries.size();
-        auto target = pick(pool);
+        auto target = entries.begin();
+        std::advance(target,
+                     static_cast<ptrdiff_t>(random.next() % std::min(pool, entries.size())));
         const auto path = target->first;
-        if (path == "/")
+        auto entry = target->second;
+        if (path == "/" || path == "/TV")
             continue;
         switch (random.next() % 6) {
         case 0: // change in place
-            target->second.mtime_ns += 1 + static_cast<int64_t>(random.next() % 3);
-            target->second.size += random.next() % 2 ? 4096 : 0;
+            entry.mtime_ns += 1 + static_cast<int64_t>(random.next() % 3);
+            entry.size += random.next() % 2 ? 4096 : 0;
+            lineage.put(path, std::move(entry));
             break;
-        case 1: // the same content, another time: compatible on both branches
-            target->second.ctime_ns += 7;
+        case 1: // the same content, another time: no disagreement
+            entry.ctime_ns += 7;
+            lineage.put(path, std::move(entry));
             break;
-        case 2: { // remove, with everything beneath a directory
-            for (auto it = entries.begin(); it != entries.end();)
-                it = it->first == path || it->first.starts_with(path + "/") ? entries.erase(it)
-                                                                            : std::next(it);
+        case 2: // remove, with everything beneath a directory
+            lineage.erase(path);
             break;
-        }
-        case 3: { // move a file
-            if (target->second.type != EntryType::file)
-                break;
-            auto moved = target->second;
-            entries.erase(target);
-            entries["/TV/moved " + std::to_string(random.next() % 5) + ".mkv"] = moved;
+        case 3: { // move a file, onto another as often as not
+            const auto to = "/TV/moved " + std::to_string(random.next() % 5) + ".mkv";
+            if (entry.type == EntryType::file && to != path)
+                lineage.rename(path, to);
             break;
         }
         case 4: { // a new file beside the target, or beneath it
-            const auto parent =
-                target->second.type == EntryType::directory ? path : parent_path(path);
-            entries[(parent == "/" ? "" : parent) + "/new " + std::to_string(random.next() % 4) +
-                    ".mkv"] = make_file(random.next(), random.next() % 5 == 0 ? 700 : 2);
+            const auto parent = entry.type == EntryType::directory ? path : parent_path(path);
+            const auto seed = random.next();
+            lineage.put(parent + "/new " + std::to_string(random.next() % 4) + ".mkv",
+                        make_file(seed, random.next() % 5 == 0 ? 700 : 2));
             break;
         }
-        default: // a new directory at a name both branches may choose
-            entries["/TV/made " + std::to_string(random.next() % 3)] =
-                make_directory(random.next() % 2);
+        default: // a new directory at a name both lineages may choose
+            lineage.put("/TV/made " + std::to_string(random.next() % 3),
+                        make_directory(random.next() % 2));
             break;
         }
     }
+}
+
+// What a tree merge must share with the merge of the materialised heads: the
+// root, the conflicts and every other field of the record. Its delta, applied
+// to the primary parent as a replica would, gives that record byte for byte.
+// Returns the encoded sizes of the delta and of the record.
+std::pair<uint64_t, uint64_t> check_tree_merge(const MetadataMergeResult& expected,
+                                               const NamespaceTreeMerge& merge,
+                                               const ObjectId& root,
+                                               const MetadataSnapshot& primary,
+                                               const Hash256& secondary_head,
+                                               MemoryNamespaceNodeStore& store) {
+    MemoryNamespaceNodeStore fresh;
+    const auto expected_root = build_namespace_tree(expected.snapshot.entries, fresh);
+    CHECK(root == expected_root);
+    CHECK(merge.merged.conflicts_created == expected.conflicts_created);
+    CHECK(merge.merged.conflicts_superseded == expected.conflicts_superseded);
+    CHECK(merge.merged.snapshot.conflicts == expected.snapshot.conflicts);
+    CHECK(merge.merged.snapshot.entries.empty());
+
+    auto expected_tree = expected.snapshot;
+    expected_tree.entries.clear();
+    expected_tree.namespace_root = expected_root;
+    auto merged_tree = merge.merged.snapshot;
+    merged_tree.namespace_root = root;
+    CHECK(encode_snapshot_v14(merged_tree) == encode_snapshot_v14(expected_tree));
+
+    CHECK(merge.onto == *primary.namespace_root);
+    merged_tree.merge_parents = {secondary_head};
+    const auto delta = tree_merge_delta(primary, merged_tree, merge.changes);
+    REQUIRE(delta.has_value());
+    const auto replayed =
+        apply_metadata_delta(primary, decode_metadata_delta(encode_metadata_delta(*delta)),
+                             [&](const ObjectId& tree, const MetadataDelta& applied) {
+                                 return apply_delta_to_namespace_tree(tree, store, applied);
+                             });
+    CHECK(encode_snapshot_v14(replayed) == encode_snapshot_v14(merged_tree));
+    return {encode_metadata_delta(*delta).size(), encode_snapshot_v14(merged_tree).size()};
 }
 
 } // namespace
@@ -1141,88 +1240,119 @@ MACHA_FAST_TEST("namespace_tree", test_distant_changes_read_no_leaf_between_them
     CHECK(reads < stats.leaves);
 }
 
-MACHA_FAST_TEST("namespace_tree", test_a_tree_merge_is_the_path_wise_merge) {
-    // The path-wise merge of materialised namespaces is the oracle: the tree
-    // merge must reach the same root, the same conflicts and the same snapshot
-    // from random divergent branches. Each round's result, standing conflicts
-    // included, is the next round's ancestor.
-    Random random{2026};
-    MetadataSnapshot base;
-    base.extent_size = 4 * 1024 * 1024;
-    base.metadata_write_replicas_required = 1;
-    base.entries = library(10, 8);
-    size_t conflicts = 0, clean = 0;
+MACHA_FAST_TEST("namespace_tree", test_a_tree_merge_is_the_merge_of_the_materialised_heads) {
+    // The merge of two materialised heads is the oracle: the tree merge must
+    // reach the same root, the same conflicts and the same record. Two
+    // lineages diverge from what the last round merged to, standing conflicts
+    // included.
+    Lineage origin{9};
+    origin.head.extent_size = 4 * 1024 * 1024;
+    origin.head.metadata_write_replicas_required = 1;
+    for (const auto& [path, entry] : library(10, 8))
+        origin.put(path, entry);
+    Lineage a{1}, b{2};
+    a.adopt(origin.head);
+    b.adopt(origin.head);
+
     uint64_t delta_bytes = 0, full_bytes = 0;
-    for (int round = 0; round < 40; ++round) {
-        auto left = base;
-        auto right = base;
-        edit_branch(left.entries, random, 1 + random.next() % 6);
-        edit_branch(right.entries, random, 1 + random.next() % 6);
-        left.mutation_sequences[NodeId{}] = static_cast<uint64_t>(round) + 1;
+    const auto merge_round = [&](int round) {
         const auto left_head = head_of(round % 2 ? 1 : 2);
         const auto right_head = head_of(round % 2 ? 2 : 1);
-
-        const auto expected = merge_metadata_snapshots(base, left, right, left_head, right_head);
-        MemoryNamespaceNodeStore fresh;
-        const auto expected_root = build_namespace_tree(expected.snapshot.entries, fresh);
+        auto expected = merge_metadata_heads(a.head, b.head, left_head, right_head);
 
         MemoryNamespaceNodeStore store;
-        const auto merge = merge_tree_backed_snapshots(
-            detach_namespace(base, store), detach_namespace(left, store),
-            detach_namespace(right, store), left_head, right_head, store);
+        const auto left = detach_namespace(a.head, store);
+        const auto right = detach_namespace(b.head, store);
+        const auto merge = merge_tree_backed_heads(left, right, left_head, right_head, store);
         const auto root = update_namespace_tree(merge.onto, store, merge.changes);
-        CHECK(root == expected_root);
-        CHECK(merge.merged.conflicts_created == expected.conflicts_created);
-        CHECK(merge.merged.conflicts_superseded == expected.conflicts_superseded);
-        CHECK(merge.merged.snapshot.conflicts == expected.snapshot.conflicts);
-        CHECK(merge.merged.snapshot.entries.empty());
+        const bool left_primary = left_head < right_head;
+        const auto [delta, full] =
+            check_tree_merge(expected, merge, root, left_primary ? left : right,
+                             left_primary ? right_head : left_head, store);
+        delta_bytes += delta;
+        full_bytes += full;
+        a.adopt(expected.snapshot);
+        b.adopt(expected.snapshot);
+        return expected;
+    };
 
-        auto expected_tree = expected.snapshot;
-        expected_tree.entries.clear();
-        expected_tree.namespace_root = expected_root;
-        auto merged_tree = merge.merged.snapshot;
-        merged_tree.namespace_root = root;
-        CHECK(encode_snapshot_v14(merged_tree) == encode_snapshot_v14(expected_tree));
-        if (root != expected_root)
-            break;
+    // One of each way two heads come to differ.
+    const std::string added_a = "/TV/Show 1/Season 1/from a.mkv";
+    const std::string added_b = "/TV/Show 8/Season 3/from b.mkv";
+    const std::string removed = "/TV/Show 2/Season 2/Episode 1.mkv";
+    const std::string disputed = "/TV/Show 3/Season 1/Episode 0.mkv";
+    const std::string renamed_from = "/TV/Show 4/Season 2/Episode 5.mkv";
+    const std::string renamed_to = "/TV/Show 4/Season 2/renamed.mkv";
+    const std::string emptied = "/TV/Show 5/Season 4";
+    const std::string far_a = "/TV/Show 0/Season 1/Episode 0.mkv";
+    const std::string far_b = "/TV/Show 9/Season 4/Episode 7.mkv";
+    a.put(added_a, make_file(9001, 2));
+    b.put(added_b, make_file(9002, 2));
+    a.erase(removed);
+    a.edit(disputed, 4096, 1);
+    b.edit(disputed, 8192, 2);
+    a.rename(renamed_from, renamed_to);
+    b.edit(renamed_from, 4096, 1);
+    a.erase(emptied);
+    b.put(emptied + "/added.mkv", make_file(9003, 2));
+    a.edit(far_a, 4096, 1);
+    b.edit(far_b, 4096, 1);
+    const auto edited = b.head.entries.at(renamed_from);
+    const auto later = b.head.entries.at(disputed);
+    const auto far_a_size = a.head.entries.at(far_a).size;
+    const auto far_b_size = b.head.entries.at(far_b).size;
+    {
+        const auto merged = merge_round(0);
+        const auto& entries = merged.snapshot.entries;
+        CHECK(entries.contains(added_a));
+        CHECK(entries.contains(added_b));
+        CHECK(!entries.contains(removed));
+        CHECK(merged.conflicts_created == 1);
+        REQUIRE(merged.snapshot.conflicts.size() == 1);
+        CHECK(merged.snapshot.conflicts.begin()->second.key == disputed);
+        CHECK(entries.at(disputed) == later);
+        CHECK(!entries.contains(renamed_from));
+        REQUIRE(entries.contains(renamed_to));
+        CHECK(entries.at(renamed_to).size == edited.size);
+        REQUIRE(entries.contains(emptied));
+        CHECK(entries.contains(emptied + "/added.mkv"));
+        CHECK(!entries.contains(emptied + "/Episode 3.mkv"));
+        CHECK(entries.at(far_a).size == far_a_size);
+        CHECK(entries.at(far_b).size == far_b_size);
+    }
 
-        // The same commit as a delta: applied to the primary parent, as a
-        // replica would, it gives the merge's snapshot byte for byte.
-        const auto& primary_map = left_head < right_head ? left : right;
-        const auto primary = detach_namespace(primary_map, store);
-        CHECK(merge.onto == *primary.namespace_root);
-        merged_tree.merge_parents = {left_head < right_head ? right_head : left_head};
-        const auto delta = tree_merge_delta(primary, merged_tree, merge.changes);
-        REQUIRE(delta.has_value());
-        const auto replayed = apply_metadata_delta(
-            primary, decode_metadata_delta(encode_metadata_delta(*delta)),
-            [&](const ObjectId& tree, const MetadataDelta& applied) {
-                return apply_delta_to_namespace_tree(tree, store, applied);
-            });
-        CHECK(encode_snapshot_v14(replayed) == encode_snapshot_v14(merged_tree));
-        delta_bytes += encode_metadata_delta(*delta).size();
-        full_bytes += encode_snapshot_v14(merged_tree).size();
-
-        (expected.snapshot.conflicts.empty() ? clean : conflicts) += 1;
-        base = expected.snapshot;
-        base.merge_parents.clear();
+    Random random{2026};
+    size_t conflicted = 0, clean = 0;
+    for (int round = 1; round <= 40; ++round) {
+        mutate(a, random, 1 + random.next() % 6);
+        mutate(b, random, 1 + random.next() % 6);
+        // Every third round both heads create one path, differently.
+        if (round % 3 == 0) {
+            const auto clash = "/TV/clash " + std::to_string(round) + ".mkv";
+            a.put(clash, make_file(7000 + static_cast<uint64_t>(round), 2));
+            b.put(clash, make_file(8000 + static_cast<uint64_t>(round), 3));
+        }
+        (merge_round(round).conflicts_created ? conflicted : clean) += 1;
     }
     // The rounds reached both outcomes.
-    CHECK(conflicts > 5);
-    CHECK(clean > 0);
-    CHECK(delta_bytes < full_bytes);
+    CHECK(conflicted > 5);
+    CHECK(clean > 5);
+    // Every round had a delta to publish; the reconciler stores whichever of
+    // delta and record is smaller.
+    CHECK(delta_bytes > 0);
+    CHECK(full_bytes > 0);
 
     // One head twice is that head.
     MemoryNamespaceNodeStore store;
-    const auto tree = detach_namespace(base, store);
-    const auto same = merge_tree_backed_snapshots(tree, tree, tree, head_of(1), head_of(1), store);
+    const auto tree = detach_namespace(a.head, store);
+    const auto same = merge_tree_backed_heads(tree, tree, head_of(1), head_of(1), store);
     CHECK(same.changes.empty());
     CHECK(same.onto == *tree.namespace_root);
 
-    // A map-backed branch is not a tree.
+    // A map-backed head is not a tree.
     bool refused = false;
     try {
-        (void)merge_tree_backed_snapshots(tree, base, tree, head_of(1), head_of(2), store);
+        (void)merge_tree_backed_heads(tree, a.head, head_of(1), head_of(2), store);
     } catch (const std::logic_error&) {
         refused = true;
     }
@@ -1230,37 +1360,49 @@ MACHA_FAST_TEST("namespace_tree", test_a_tree_merge_is_the_path_wise_merge) {
 }
 
 // A two-head reconciliation at the live library's size (8,700 paths, 900,000
-// extents), each branch one cycle of a loader: the materialising merge
-// against the tree merge. Prints "BENCH name=<name> ns_per_op=<n> ops=1";
-// run with `--filter baseline --verbose`.
+// extents), each head one cycle of a loader and a few changes to the library:
+// the materialising merge against the tree merge. Prints
+// "BENCH name=<name> ns_per_op=<n> ops=1"; run with `--filter baseline --verbose`.
 MACHA_HEAVY_TEST("baseline", test_baseline_reconcile_materialised_against_tree) {
     MemoryNamespaceNodeStore store;
-    MetadataSnapshot base;
-    base.extent_size = 4 * 1024 * 1024;
-    base.metadata_write_replicas_required = 1;
-    {
-        std::map<std::string, FsEntry> entries;
-        entries["/"] = make_directory(0);
-        entries["/Library"] = make_directory(1);
-        for (size_t d = 0; d < 700; ++d) {
-            const auto directory = "/Library/Title " + std::to_string(d);
-            entries[directory] = make_directory(10 + d);
-            for (size_t f = 0; f < 11; ++f)
-                entries[directory + "/part " + std::to_string(f) + ".mkv"] =
-                    make_file(d * 100 + f, f == 0 ? 600 : 60);
-        }
-        base.namespace_root = build_namespace_tree(entries, store);
+    Lineage origin{9};
+    origin.head.extent_size = 4 * 1024 * 1024;
+    origin.head.metadata_write_replicas_required = 1;
+    origin.put("/", make_directory(0));
+    origin.put("/Library", make_directory(1));
+    for (size_t d = 0; d < 700; ++d) {
+        const auto directory = "/Library/Title " + std::to_string(d);
+        origin.put(directory, make_directory(10 + d));
+        for (size_t f = 0; f < 11; ++f)
+            origin.put(directory + "/part " + std::to_string(f) + ".mkv",
+                       make_file(d * 100 + f, f == 0 ? 600 : 60));
     }
-    const auto branch = [&](const std::string& name, uint64_t seed) {
-        NamespaceChanges changes;
-        changes["/load-" + name] = make_directory(seed);
-        changes["/load-" + name + "/load.bin"] = make_file(seed, 8);
-        auto next = base;
-        next.namespace_root = update_namespace_tree(*base.namespace_root, store, changes);
-        return next;
+    Lineage a{1}, b{2};
+    a.adopt(origin.head);
+    b.adopt(origin.head);
+    const auto load = [](Lineage& lineage, const std::string& name, uint64_t seed) {
+        lineage.put("/load-" + name, make_directory(seed));
+        lineage.put("/load-" + name + "/load.bin", make_file(seed, 8));
     };
-    const auto left = branch("a", 7001);
-    const auto right = branch("b", 7002);
+    load(a, "a", 7001);
+    load(b, "b", 7002);
+    // One of each way two heads come to differ, far apart in the library.
+    const std::string removed = "/Library/Title 100/part 3.mkv";
+    const std::string disputed = "/Library/Title 250/part 1.mkv";
+    const std::string renamed_from = "/Library/Title 400/part 2.mkv";
+    const std::string renamed_to = "/Library/Title 400/renamed.mkv";
+    const std::string emptied = "/Library/Title 550";
+    a.erase(removed);
+    a.edit(disputed, 4096, 1);
+    b.edit(disputed, 8192, 2);
+    a.rename(renamed_from, renamed_to);
+    b.edit(renamed_from, 4096, 1);
+    a.erase(emptied);
+    b.put(emptied + "/added.mkv", make_file(7003, 2));
+    b.edit("/Library/Title 699/part 10.mkv", 4096, 1);
+
+    const auto left = detach_namespace(a.head, store);
+    const auto right = detach_namespace(b.head, store);
     const auto left_head = head_of(1);
     const auto right_head = head_of(2);
     const auto report = [](std::string_view name, Clock::duration elapsed) {
@@ -1270,22 +1412,31 @@ MACHA_HEAVY_TEST("baseline", test_baseline_reconcile_materialised_against_tree) 
     };
 
     auto started = Clock::now();
-    auto materialised = merge_metadata_snapshots(attach_namespace(base, store),
-                                                 attach_namespace(left, store),
-                                                 attach_namespace(right, store), left_head,
-                                                 right_head);
-    const auto rebuilt = detach_namespace(std::move(materialised.snapshot), store);
+    const auto materialised = merge_metadata_heads(attach_namespace(left, store),
+                                                   attach_namespace(right, store), left_head,
+                                                   right_head);
+    const auto rebuilt = detach_namespace(materialised.snapshot, store);
     report("reconcile.materialised", Clock::now() - started);
 
     store.forget_reads();
     started = Clock::now();
-    const auto merge =
-        merge_tree_backed_snapshots(base, left, right, left_head, right_head, store);
+    const auto merge = merge_tree_backed_heads(left, right, left_head, right_head, store);
     const auto root = update_namespace_tree(merge.onto, store, merge.changes);
     report("reconcile.tree", Clock::now() - started);
     std::cout << "BENCH name=reconcile.tree.node_reads ns_per_op=0 ops=" << store.reads() << '\n';
 
     CHECK(root == *rebuilt.namespace_root);
+    (void)check_tree_merge(materialised, merge, root, left, right_head, store);
+    CHECK(materialised.conflicts_created == 1);
     CHECK(namespace_tree_lookup(root, "/load-a/load.bin", store).has_value());
     CHECK(namespace_tree_lookup(root, "/load-b/load.bin", store).has_value());
+    CHECK(!namespace_tree_lookup(root, removed, store).has_value());
+    CHECK(namespace_tree_lookup(root, disputed, store) == b.head.entries.at(disputed));
+    CHECK(!namespace_tree_lookup(root, renamed_from, store).has_value());
+    const auto moved = namespace_tree_lookup(root, renamed_to, store);
+    REQUIRE(moved.has_value());
+    CHECK(moved->size == b.head.entries.at(renamed_from).size);
+    CHECK(namespace_tree_lookup(root, emptied, store).has_value());
+    CHECK(namespace_tree_lookup(root, emptied + "/added.mkv", store).has_value());
+    CHECK(!namespace_tree_lookup(root, emptied + "/part 0.mkv", store).has_value());
 }
