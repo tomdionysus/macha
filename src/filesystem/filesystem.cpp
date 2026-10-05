@@ -2105,31 +2105,10 @@ std::string file_media_id(const FsEntry& entry) {
     return "macha:" + to_string(object_id(writer.data()));
 }
 
-std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::string_view id) {
-    if (id.starts_with("path:")) {
-        auto path = std::string(id.substr(5));
-        try {
-            auto entry = getattr(path);
-            if (entry.type == EntryType::file)
-                return std::pair{normalize_path(path), entry};
-        } catch (...) {
-        }
-        return {};
-    }
-    if (!id.empty() && id.front() == '/') {
-        try {
-            auto entry = getattr(std::string(id));
-            if (entry.type == EntryType::file)
-                return std::pair{normalize_path(std::string(id)), entry};
-        } catch (...) {
-        }
-        return {};
-    }
-    // The index follows this node's own head: brought up to date from what
-    // differs between the tree it was built from and the tree now, so a
-    // lookup after a change costs the change, and no peer is asked.
-    const auto view = m_.local();
-    Lock lock(media_index_mutex_);
+// Brings the index to this head: from what differs between the tree it was
+// built from and the tree now, so the cost is the change. The whole namespace
+// is walked the first time and for a namespace that is not a tree.
+void FileSystem::refresh_media_index(const MetadataSnapshotView& view) {
     auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     const auto& root = view.snapshot->namespace_root;
     const bool current = media_index_valid_ &&
@@ -2177,6 +2156,45 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         media_index_snapshot_ = view.snapshot;
         media_index_valid_ = true;
     }
+
+}
+
+std::vector<std::string> FileSystem::media_ids() {
+    const auto view = m_.local();
+    Lock lock(media_index_mutex_);
+    refresh_media_index(view);
+    std::vector<std::string> ids;
+    ids.reserve(media_index_.size());
+    for (const auto& [id, _] : media_index_)
+        ids.push_back(id);
+    return ids;
+}
+
+std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::string_view id) {
+    if (id.starts_with("path:")) {
+        auto path = std::string(id.substr(5));
+        try {
+            auto entry = getattr(path);
+            if (entry.type == EntryType::file)
+                return std::pair{normalize_path(path), entry};
+        } catch (...) {
+        }
+        return {};
+    }
+    if (!id.empty() && id.front() == '/') {
+        try {
+            auto entry = getattr(std::string(id));
+            if (entry.type == EntryType::file)
+                return std::pair{normalize_path(std::string(id)), entry};
+        } catch (...) {
+        }
+        return {};
+    }
+    // The index follows this node's own head, and no peer is asked.
+    const auto view = m_.local();
+    Lock lock(media_index_mutex_);
+    refresh_media_index(view);
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
 
     const auto found = media_index_.find(std::string(id));
     if (found == media_index_.end())
