@@ -10,6 +10,32 @@ using namespace macha::test_support;
 
 namespace {
 
+// One mutation by an author on a head, stamped as a commit stamps what it
+// writes.
+struct Mutation {
+    MetadataSnapshot& head;
+    MetadataDot dot;
+
+    Mutation(MetadataSnapshot& snapshot, uint8_t author) : head(snapshot) {
+        if (!head.legacy_clock)
+            head.legacy_clock = head.mutation_sequences;
+        dot.author.bytes[0] = author;
+        dot.sequence = ++head.mutation_sequences[dot.author];
+    }
+    void put(const std::string& path, FsEntry entry) {
+        const auto prior = head.entries.find(path);
+        entry.provenance = {};
+        stamp_entry_provenance(entry, path, prior == head.entries.end() ? nullptr : &prior->second,
+                               dot);
+        head.entries[path] = std::move(entry);
+    }
+    void erase(const std::string& path) { head.entries.erase(path); }
+    void catalogue(const ObjectId& root) {
+        head.catalogue_root = root;
+        head.catalogue_dot = dot;
+    }
+};
+
 // Flips the last byte of the history frame ending at `frame_end`: the frame
 // stays indexed but no longer authenticates, so it cannot be replayed until it
 // is flipped back.
@@ -400,23 +426,32 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip
     directory.type = EntryType::directory;
     directory.mode = 0755;
 
+    // Two authors, each with a directory of its own, a different file at one
+    // path and a catalogue root of its own.
     auto left_snapshot = base;
-    left_snapshot.entries["/left"] = directory;
     FsEntry left_conflict;
     left_conflict.type = EntryType::file;
     left_conflict.mode = 0644;
     left_conflict.size = 11;
     left_conflict.version = 1;
-    left_snapshot.entries["/same"] = left_conflict;
-    left_snapshot.catalogue_root = object_id(pattern(111));
+    {
+        Mutation mutation(left_snapshot, 1);
+        mutation.put("/left", directory);
+        mutation.put("/same", left_conflict);
+        mutation.catalogue(object_id(pattern(111)));
+    }
 
     auto right_snapshot = base;
-    right_snapshot.entries["/right"] = directory;
     auto right_conflict = left_conflict;
     right_conflict.size = 22;
     right_conflict.version = 2;
-    right_snapshot.entries["/same"] = right_conflict;
-    right_snapshot.catalogue_root = object_id(pattern(222));
+    right_conflict.mtime_ns = 1;
+    {
+        Mutation mutation(right_snapshot, 2);
+        mutation.put("/right", directory);
+        mutation.put("/same", right_conflict);
+        mutation.catalogue(object_id(pattern(222)));
+    }
 
     auto make_child = [&](const MetadataSnapshot& snapshot) {
         MetadataRecord record;
@@ -430,12 +465,14 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip
     const auto right = make_child(right_snapshot);
     REQUIRE(left.hash != right.hash);
 
-    const auto merged =
-        merge_metadata_snapshots(base, left_snapshot, right_snapshot, left.hash, right.hash);
+    const auto merged = merge_metadata_heads(left_snapshot, right_snapshot, left.hash, right.hash);
     CHECK(merged.snapshot.entries.contains("/left"));
     CHECK(merged.snapshot.entries.contains("/right"));
-    CHECK(!merged.snapshot.entries.contains("/same"));
-    CHECK(!merged.snapshot.catalogue_root.has_value());
+    // The later file is in place, and one of the two catalogue roots.
+    REQUIRE(merged.snapshot.entries.contains("/same"));
+    CHECK(merged.snapshot.entries.at("/same").size == 22);
+    CHECK((merged.snapshot.catalogue_root == left_snapshot.catalogue_root ||
+           merged.snapshot.catalogue_root == right_snapshot.catalogue_root));
     CHECK(merged.conflicts_created == 2);
     CHECK(merged.snapshot.conflicts.size() == 2);
 
@@ -506,10 +543,10 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     directory.type = EntryType::directory;
     directory.mode = 0755;
 
-    auto make_child = [&](std::string name) {
+    auto make_child = [&](const std::string& name, uint8_t author) {
         auto snapshot = decode_snapshot(genesis.payload);
         snapshot.metadata_write_replicas_required = 2;
-        snapshot.entries[std::move(name)] = directory;
+        Mutation(snapshot, author).put(name, directory);
         MetadataRecord record;
         record.generation = genesis.generation + 1;
         record.previous = genesis.hash;
@@ -517,8 +554,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
         record.hash = metadata_hash(record.generation, record.previous, record.payload);
         return record;
     };
-    const auto left = make_child("/left");
-    const auto right = make_child("/right");
+    const auto left = make_child("/left", 1);
+    const auto right = make_child("/right", 2);
     REQUIRE(left.hash != right.hash);
     CHECK(decode_snapshot(left.payload).metadata_write_replicas_required == 2);
 
@@ -582,9 +619,10 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
         REQUIRE(common.has_value());
         CHECK(*common == genesis.hash);
 
-        auto merged = merge_metadata_snapshots(
-            decode_snapshot(genesis.payload), decode_snapshot(left.payload),
-            decode_snapshot(right.payload), left.hash, right.hash);
+        auto merged = merge_metadata_heads(decode_snapshot(left.payload),
+                                           decode_snapshot(right.payload), left.hash, right.hash);
+        CHECK(merged.snapshot.entries.contains("/left"));
+        CHECK(merged.snapshot.entries.contains("/right"));
         auto primary = left;
         auto secondary = right;
         if (secondary.hash < primary.hash)
@@ -1638,141 +1676,7 @@ MACHA_FAST_TEST("storage_metadata",
     }
 }
 
-MACHA_FAST_TEST("storage_metadata", test_manual_causal_metadata_repair_requires_strict_dominance) {
-    NodeId a{}, b{};
-    a.bytes[15] = 1;
-    b.bytes[15] = 2;
-    FsEntry directory;
-    directory.type = EntryType::directory;
-    directory.mode = 0755;
 
-    auto left_snapshot = decode_snapshot(genesis_metadata().payload);
-    left_snapshot.metadata_write_replicas_required = 2;
-    left_snapshot.mutation_sequences[a] = 7;
-    left_snapshot.mutation_sequences[b] = 3;
-    left_snapshot.entries["/preserved"] = directory;
-
-    auto right_snapshot = left_snapshot;
-    right_snapshot.mutation_sequences[a] = 6;
-    right_snapshot.entries.erase("/preserved");
-
-    auto record_for = [](uint64_t generation, const MetadataSnapshot& snapshot,
-                         uint8_t previous_seed) {
-        MetadataRecord record;
-        record.generation = generation;
-        record.previous.bytes[0] = previous_seed;
-        record.payload = encode_snapshot(snapshot);
-        record.hash = metadata_hash(record.generation, record.previous, record.payload);
-        return record;
-    };
-    const auto left = record_for(50, left_snapshot, 10);
-    const auto right = record_for(40, right_snapshot, 20);
-    auto plan = plan_causally_dominant_metadata_repair(left, left_snapshot,
-                                                        right, right_snapshot);
-    REQUIRE(plan.has_value());
-    CHECK(plan->dominant_head == left.hash);
-    CHECK(plan->subsumed_head == right.hash);
-    CHECK(plan->record.generation == 51);
-    CHECK(plan->record.previous == std::min(left.hash, right.hash));
-    const auto repaired = decode_snapshot(plan->record.payload);
-    CHECK(repaired.entries == left_snapshot.entries);
-    CHECK(repaired.mutation_sequences == left_snapshot.mutation_sequences);
-    REQUIRE(repaired.merge_parents.size() == 1);
-    CHECK(repaired.merge_parents.front() == std::max(left.hash, right.hash));
-    CHECK(valid_metadata_record(plan->record));
-
-    auto concurrent = right_snapshot;
-    concurrent.mutation_sequences[a] = 6;
-    concurrent.mutation_sequences[b] = 4;
-    const auto concurrent_record = record_for(41, concurrent, 30);
-    CHECK(!plan_causally_dominant_metadata_repair(left, left_snapshot,
-                                                   concurrent_record, concurrent));
-
-    auto equal_clock = left_snapshot;
-    equal_clock.entries.erase("/preserved");
-    const auto equal_record = record_for(42, equal_clock, 40);
-    CHECK(!plan_causally_dominant_metadata_repair(left, left_snapshot,
-                                                   equal_record, equal_clock));
-}
-
-MACHA_FAST_TEST("storage_metadata",
-                test_manual_conflict_preserving_repair_handles_concurrent_in_place_change) {
-    FsEntry directory;
-    directory.type = EntryType::directory;
-    directory.mode = 0755;
-    FsEntry file_left;
-    file_left.type = EntryType::file;
-    file_left.mode = 0644;
-    file_left.size = 100;
-    auto file_right = file_left;
-    file_right.size = 200;
-
-    auto base_snapshot = decode_snapshot(genesis_metadata().payload);
-    base_snapshot.metadata_write_replicas_required = 2;
-    base_snapshot.entries["/unchanged"] = directory;
-
-    auto left_snapshot = base_snapshot;
-    left_snapshot.entries["/disputed"] = file_left;
-    auto right_snapshot = base_snapshot;
-    right_snapshot.entries["/disputed"] = file_right;
-
-    auto record_for = [](uint64_t generation, const MetadataSnapshot& snapshot,
-                         uint8_t previous_seed) {
-        MetadataRecord record;
-        record.generation = generation;
-        record.previous.bytes[0] = previous_seed;
-        record.payload = encode_snapshot(snapshot);
-        record.hash = metadata_hash(record.generation, record.previous, record.payload);
-        return record;
-    };
-    const auto left = record_for(50, left_snapshot, 10);
-    const auto right = record_for(50, right_snapshot, 20);
-
-    // Concurrent, neither dominates: causal-dominance repair refuses, leaving the
-    // conflict-preserving repair.
-    CHECK(!plan_causally_dominant_metadata_repair(left, left_snapshot, right, right_snapshot));
-
-    auto plan = plan_conflict_preserving_metadata_repair(left, left_snapshot, right, right_snapshot);
-    REQUIRE(plan.has_value());
-    CHECK(plan->left_head == left.hash);
-    CHECK(plan->right_head == right.hash);
-    CHECK(plan->conflicts_created == 1);
-    CHECK(plan->record.generation == 51);
-    CHECK(plan->record.previous == std::min(left.hash, right.hash));
-    REQUIRE(valid_metadata_record(plan->record));
-
-    const auto repaired = decode_snapshot(plan->record.payload);
-    // The identical entry reconciles normally; the genuinely disputed one is
-    // held out of the namespace (not silently resolved to either side) and
-    // recorded as a first-class conflict preserving both alternatives.
-    CHECK(repaired.entries.at("/unchanged") == directory);
-    CHECK(!repaired.entries.contains("/disputed"));
-    REQUIRE(repaired.conflicts.size() == 1);
-    const auto& conflict = repaired.conflicts.begin()->second;
-    CHECK(conflict.kind == MetadataConflictKind::namespace_entry);
-    CHECK(conflict.key == "/disputed");
-    CHECK(!conflict.base_entry.has_value());
-    REQUIRE(conflict.left_entry.has_value());
-    REQUIRE(conflict.right_entry.has_value());
-    CHECK(*conflict.left_entry == file_left);
-    CHECK(*conflict.right_entry == file_right);
-    REQUIRE(repaired.merge_parents.size() == 1);
-    CHECK(repaired.merge_parents.front() == std::max(left.hash, right.hash));
-
-    // Refused when the heads differ by more than in-place changes: an empty base
-    // disables rename/move-collision detection, so add/remove asymmetry is unsafe.
-    auto right_with_extra = right_snapshot;
-    right_with_extra.entries["/right-only"] = directory;
-    const auto right_extra_record = record_for(50, right_with_extra, 20);
-    CHECK(!plan_conflict_preserving_metadata_repair(left, left_snapshot, right_extra_record,
-                                                    right_with_extra));
-
-    auto left_with_extra = left_snapshot;
-    left_with_extra.entries["/left-only"] = directory;
-    const auto left_extra_record = record_for(50, left_with_extra, 10);
-    CHECK(!plan_conflict_preserving_metadata_repair(left_extra_record, left_with_extra, right,
-                                                    right_snapshot));
-}
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_accepted_authority) {
     TempDir t;
@@ -2677,15 +2581,14 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_over_append_ordered_tomb
     directory.type = EntryType::directory;
     directory.mode = 0755;
     auto left = base;
-    left.entries["/left"] = directory;
+    Mutation(left, 1).put("/left", directory);
     left.garbage.push_back(tombstone(2));
     auto right = base;
-    right.entries["/right"] = directory;
+    Mutation(right, 2).put("/right", directory);
     right.garbage.push_back(tombstone(5));
     REQUIRE(!garbage_is_canonical(left.garbage));
 
-    auto merged = merge_metadata_snapshots(base, left, right, sha256(pattern(61)),
-                                           sha256(pattern(62)));
+    auto merged = merge_metadata_heads(left, right, sha256(pattern(61)), sha256(pattern(62)));
     CHECK(garbage_is_canonical(merged.snapshot.garbage));
     CHECK(merged.snapshot.garbage.size() == 5);
     merged.snapshot.merge_parents = {sha256(pattern(62))};
@@ -2709,26 +2612,36 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_superseded_conflicts_leave_the
     file.mode = 0644;
     file.size = 10;
     file.version = 1;
-    base.entries["/song.mp3"] = file;
-    base.catalogue_root = object_id(pattern(70));
+    {
+        Mutation mutation(base, 9);
+        mutation.put("/song.mp3", file);
+        mutation.catalogue(object_id(pattern(70)));
+    }
 
-    auto left = base;
-    left.entries["/song.mp3"].size = 20;
-    left.entries["/song.mp3"].version = 2;
-    left.catalogue_root = object_id(pattern(71));
-    auto right = base;
-    right.entries["/song.mp3"].size = 30;
-    right.entries["/song.mp3"].version = 2;
-    right.catalogue_root = object_id(pattern(72));
+    // Two authors change the file and the catalogue root, neither having
+    // seen the other.
+    const auto change = [&](uint8_t author, uint64_t size, int64_t mtime, uint8_t root) {
+        auto head = base;
+        auto entry = head.entries.at("/song.mp3");
+        entry.size = size;
+        entry.version = 2;
+        entry.mtime_ns = mtime;
+        Mutation mutation(head, author);
+        mutation.put("/song.mp3", entry);
+        mutation.catalogue(object_id(pattern(root)));
+        return head;
+    };
+    const auto left = change(1, 20, 100, 71);
+    const auto right = change(2, 30, 200, 72);
 
-    auto merged = merge_metadata_snapshots(base, left, right, sha256(pattern(81)),
-                                           sha256(pattern(82)));
+    auto merged = merge_metadata_heads(left, right, sha256(pattern(81)), sha256(pattern(82)));
     REQUIRE(merged.conflicts_created == 2);
     CHECK(merged.conflicts_superseded == 0);
     REQUIRE(merged.snapshot.conflicts.size() == 2);
-    // The merge keeps the common-ancestor values visible.
-    CHECK(merged.snapshot.entries.at("/song.mp3").size == 10);
-    CHECK(merged.snapshot.catalogue_root == base.catalogue_root);
+    // The later file is in place, and one of the two catalogue roots.
+    CHECK(merged.snapshot.entries.at("/song.mp3") == right.entries.at("/song.mp3"));
+    CHECK((merged.snapshot.catalogue_root == left.catalogue_root ||
+           merged.snapshot.catalogue_root == right.catalogue_root));
 
     // Nothing decided yet: pruning is a no-op.
     auto untouched = merged.snapshot;
@@ -2737,92 +2650,59 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_superseded_conflicts_leave_the
 
     // A later write to the path decides the namespace conflict only.
     auto rewritten = merged.snapshot;
-    rewritten.entries["/song.mp3"].size = 40;
-    rewritten.entries["/song.mp3"].version = 3;
+    {
+        auto entry = rewritten.entries.at("/song.mp3");
+        entry.size = 40;
+        entry.version = 3;
+        Mutation(rewritten, 3).put("/song.mp3", entry);
+    }
     CHECK(prune_superseded_conflicts(rewritten) == 1);
     REQUIRE(rewritten.conflicts.size() == 1);
     CHECK(rewritten.conflicts.begin()->second.kind == MetadataConflictKind::catalogue_root);
 
     // Removing the path decides it too; a new catalogue root decides the other.
     auto removed = merged.snapshot;
-    removed.entries.erase("/song.mp3");
-    removed.catalogue_root = object_id(pattern(73));
+    {
+        Mutation mutation(removed, 3);
+        mutation.erase("/song.mp3");
+        mutation.catalogue(object_id(pattern(73)));
+    }
     CHECK(prune_superseded_conflicts(removed) == 2);
     CHECK(removed.conflicts.empty());
 
-    // And the next merge over a decided subject drops the stale record itself.
-    auto later_left = rewritten;
-    later_left.entries["/other"] = file;
-    auto later_right = rewritten;
-    later_right.entries["/another"] = file;
-    // Reintroduce the stale namespace conflict on both sides as a merge
-    // would have carried it, with the subject already rewritten.
-    for (auto* side : {&later_left, &later_right})
-        side->conflicts = merged.snapshot.conflicts;
-    auto later = merge_metadata_snapshots(rewritten, later_left, later_right,
-                                          sha256(pattern(83)), sha256(pattern(84)));
+    // A head that has not seen the decision still carries the record: the
+    // merge with it keeps the decision and drops the record.
+    auto undecided = merged.snapshot;
+    Mutation(undecided, 4).put("/another", file);
+    const auto later = merge_metadata_heads(rewritten, undecided, sha256(pattern(83)),
+                                            sha256(pattern(84)));
     CHECK(later.conflicts_created == 0);
     CHECK(later.conflicts_superseded == 1);
     CHECK(later.snapshot.conflicts.size() == 1);
+    CHECK(later.snapshot.entries.at("/song.mp3").size == 40);
+    CHECK(later.snapshot.entries.contains("/another"));
 
-    // Same bytes on both sides (duplicate media): the merge settles it without a
-    // conflict, and an existing record of that shape settles at pruning.
-    auto dup_base = dlt7_base_snapshot();
-    auto dup_left = dup_base;
-    auto dup_right = dup_base;
+    // A record with a base and nothing installed, whose alternatives hold the
+    // same bytes (duplicate media), settles at pruning.
     FsEntry same = file;
     same.extents.push_back({0, 10, object_id(pattern(90)), false});
     same.version = 4;
     same.mtime_ns = 100;
-    dup_left.entries["/dup.mkv"] = same;
-    same.version = 7;
-    same.mtime_ns = 200;
-    dup_right.entries["/dup.mkv"] = same;
-    auto dup = merge_metadata_snapshots(dup_base, dup_left, dup_right, sha256(pattern(85)),
-                                        sha256(pattern(86)));
-    CHECK(dup.conflicts_created == 0);
-    CHECK(dup.snapshot.conflicts.empty());
-    REQUIRE(dup.snapshot.entries.contains("/dup.mkv"));
-    CHECK(dup.snapshot.entries.at("/dup.mkv").extents == same.extents);
-
     MetadataConflict legacy;
     legacy.kind = MetadataConflictKind::namespace_entry;
     legacy.key = "/dup.mkv";
     legacy.left_head = sha256(pattern(85));
     legacy.right_head = sha256(pattern(86));
-    legacy.left_entry = dup_left.entries.at("/dup.mkv");
-    legacy.right_entry = dup_right.entries.at("/dup.mkv");
-    auto with_legacy = dup_base; // base value (absent) still installed
+    legacy.left_entry = same;
+    same.version = 7;
+    same.mtime_ns = 200;
+    legacy.right_entry = same;
+    auto with_legacy = dlt7_base_snapshot();
     with_legacy.conflicts.emplace(metadata_conflict_id(legacy), legacy);
     CHECK(prune_superseded_conflicts(with_legacy) == 1);
     CHECK(with_legacy.conflicts.empty());
     REQUIRE(with_legacy.entries.contains("/dup.mkv"));
     CHECK(same_content(with_legacy.entries.at("/dup.mkv"), *legacy.left_entry));
-}
-
-MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_resolution_is_not_resurrected_by_merge) {
-    const auto genesis = genesis_metadata();
-    auto base = decode_snapshot(genesis.payload);
-    MetadataConflict conflict;
-    conflict.kind = MetadataConflictKind::namespace_entry;
-    conflict.key = "/old-conflict";
-    conflict.left_head = sha256(pattern(31));
-    conflict.right_head = sha256(pattern(32));
-    const auto conflict_id = metadata_conflict_id(conflict);
-    base.conflicts.emplace(conflict_id, conflict);
-
-    auto left = base;
-    left.conflicts.erase(conflict_id); // explicit resolution
-    auto right = base;
-    FsEntry directory;
-    directory.type = EntryType::directory;
-    directory.mode = 0755;
-    right.entries["/unrelated"] = directory;
-
-    const auto merged =
-        merge_metadata_snapshots(base, left, right, sha256(pattern(41)), sha256(pattern(42)));
-    CHECK(!merged.snapshot.conflicts.contains(conflict_id));
-    CHECK(merged.snapshot.entries.contains("/unrelated"));
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing_conflicts) {
@@ -2833,7 +2713,6 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     auto keyfile = t.path() / "key";
     write_key(keyfile);
     const auto keys = load_cluster_keys(keyfile);
-    const auto origin = random_node_id();
 
     const auto genesis = genesis_metadata();
     auto base = decode_snapshot(genesis.payload);
@@ -2852,10 +2731,9 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     directory.type = EntryType::directory;
     directory.mode = 0755;
     auto left = base;
-    left.mutation_sequences[origin] = 1;
-    left.entries["/left"] = directory;
+    Mutation(left, 1).put("/left", directory);
     auto right = base;
-    right.entries["/right"] = directory;
+    Mutation(right, 2).put("/right", directory);
 
     MetadataRecord base_record;
     base_record.generation = genesis.generation + 1;
@@ -2875,8 +2753,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     const auto right_record = make_child(right);
     REQUIRE(left_record.hash != right_record.hash);
 
-    auto merged =
-        merge_metadata_snapshots(base, left, right, left_record.hash, right_record.hash);
+    auto merged = merge_metadata_heads(left, right, left_record.hash, right_record.hash);
     CHECK(merged.conflicts_created == 0);
     REQUIRE(merged.snapshot.conflicts.contains(standing_id));
     merged.snapshot.merge_parents = {right_record.hash};
@@ -2891,8 +2768,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     REQUIRE(delta.has_value());
     const auto encoded = encode_metadata_delta(*delta);
     REQUIRE(encoded.size() >= 8);
-    // DLT7: only merge_parents changed, so the standing conflict set is not
-    // carried.
+    // DLT7: of the two topology sets only merge_parents changed, so the
+    // standing conflict set is not carried.
     CHECK(encoded[7] == '7');
     CHECK(delta->replace_merge_parents.has_value());
     CHECK(!delta->replace_conflicts.has_value());
@@ -3248,102 +3125,6 @@ MACHA_FAST_TEST("storage_metadata", test_the_legacy_clock_survives_snapshot_and_
     auto moved = after;
     (*moved.legacy_clock)[author] = 99;
     CHECK(!metadata_delta(after, moved).has_value());
-}
-
-// A merge is total: values both branches changed join to one answer that
-// does not depend on which reconciler computes it.
-MACHA_FAST_TEST("storage_metadata", test_a_merge_of_values_changed_on_both_branches_never_refuses) {
-    const auto genesis = genesis_metadata();
-    auto base = decode_snapshot(genesis.payload);
-    base.data_replication = 1;
-    MetadataConflict settled;
-    settled.key = "/settled";
-    settled.left_head = sha256(pattern(8, 1));
-    MetadataConflict changed;
-    changed.key = "/changed";
-    changed.left_head = sha256(pattern(8, 2));
-    base.conflicts["settled"] = settled;
-    base.conflicts["changed"] = changed;
-
-    auto left = base;
-    left.data_replication = 2;
-    left.conflicts.erase("settled");
-    left.conflicts["changed"].right_head = sha256(pattern(8, 3));
-    auto right = base;
-    right.data_replication = 3;
-    right.conflicts["settled"].right_head = sha256(pattern(8, 4));
-    right.conflicts["changed"].right_head = sha256(pattern(8, 5));
-
-    const auto left_head = sha256(pattern(71));
-    const auto right_head = sha256(pattern(72));
-    const auto merged = merge_metadata_snapshots(base, left, right, left_head, right_head);
-    CHECK(merged.snapshot.data_replication == 3);
-    // Settled on one branch and changed on the other: it stays settled.
-    CHECK(!merged.snapshot.conflicts.contains("settled"));
-    REQUIRE(merged.snapshot.conflicts.contains("changed"));
-    CHECK(merged.snapshot.conflicts.at("changed") ==
-          std::min(left.conflicts.at("changed"), right.conflicts.at("changed")));
-
-    const auto mirrored = merge_metadata_snapshots(base, right, left, right_head, left_head);
-    CHECK(mirrored.snapshot.data_replication == merged.snapshot.data_replication);
-    CHECK(mirrored.snapshot.conflicts == merged.snapshot.conflicts);
-}
-
-MACHA_FAST_TEST("storage_metadata", test_metadata_divergent_renames_become_conflicts) {
-    const auto genesis = genesis_metadata();
-    auto base = decode_snapshot(genesis.payload);
-    FsEntry file;
-    file.type = EntryType::file;
-    file.mode = 0644;
-    file.size = 123;
-    file.version = 7;
-    base.entries["/a"] = file;
-
-    auto left = base;
-    left.entries.erase("/a");
-    left.entries["/b"] = file;
-    auto right = base;
-    right.entries.erase("/a");
-    right.entries["/c"] = file;
-
-    auto merged =
-        merge_metadata_snapshots(base, left, right, sha256(pattern(51)), sha256(pattern(52)));
-    REQUIRE(merged.snapshot.entries.contains("/a"));
-    CHECK(merged.snapshot.entries.at("/a") == file);
-    CHECK(!merged.snapshot.entries.contains("/b"));
-    CHECK(!merged.snapshot.entries.contains("/c"));
-    std::set<std::string> conflict_paths;
-    for (const auto& [_, value] : merged.snapshot.conflicts)
-        if (value.kind == MetadataConflictKind::namespace_entry)
-            conflict_paths.insert(value.key);
-    CHECK(conflict_paths.contains("/a"));
-    CHECK(conflict_paths.contains("/b"));
-    CHECK(conflict_paths.contains("/c"));
-
-    // The same rename on both branches is not a conflict.
-    right = base;
-    right.entries.erase("/a");
-    right.entries["/b"] = file;
-    merged = merge_metadata_snapshots(base, left, right, sha256(pattern(61)), sha256(pattern(62)));
-    CHECK(!merged.snapshot.entries.contains("/a"));
-    REQUIRE(merged.snapshot.entries.contains("/b"));
-    CHECK(merged.snapshot.entries.at("/b") == file);
-    CHECK(merged.snapshot.conflicts.empty());
-
-    // Move-vs-modify also preserves the ancestor and both alternatives.
-    right = base;
-    right.entries["/a"].size = 456;
-    right.entries["/a"].version = 8;
-    merged = merge_metadata_snapshots(base, left, right, sha256(pattern(71)), sha256(pattern(72)));
-    REQUIRE(merged.snapshot.entries.contains("/a"));
-    CHECK(merged.snapshot.entries.at("/a") == file);
-    CHECK(!merged.snapshot.entries.contains("/b"));
-    conflict_paths.clear();
-    for (const auto& [_, value] : merged.snapshot.conflicts)
-        if (value.kind == MetadataConflictKind::namespace_entry)
-            conflict_paths.insert(value.key);
-    CHECK(conflict_paths.contains("/a"));
-    CHECK(conflict_paths.contains("/b"));
 }
 
 MACHA_FAST_TEST("storage_metadata", test_protocol20_state_rejects_legacy_authority_mutators) {
@@ -4602,7 +4383,7 @@ MACHA_FAST_TEST("storage_metadata", test_torrent_requests_ride_the_snapshot_and_
     Hash256 left_head{}, right_head{};
     left_head.bytes[0] = 1;
     right_head.bytes[0] = 2;
-    const auto merged = merge_metadata_snapshots(with, left, right, left_head, right_head);
+    const auto merged = merge_metadata_heads(left, right, left_head, right_head);
     CHECK(merged.conflicts_created == 0);
     const auto& joined = merged.snapshot.torrent_requests.at(request.id);
     CHECK(joined.desired == TorrentDesired::paused);

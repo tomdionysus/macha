@@ -135,11 +135,17 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
 
     // Two differing values for what is one entry: the newer when one head
     // has seen the other's, otherwise a concurrent change.
-    const auto settle = [&](const std::string& path, const FsEntry& a, const FsEntry& b) {
+    // A head has seen the other's entry at a path when it has seen both what
+    // it holds and how it came to be there: a different file moved onto the
+    // path is new there though its content is old. `one_file` compares two
+    // entries known to be the same file at different paths, where only the
+    // content is in question.
+    const auto settle = [&](const std::string& path, const FsEntry& a, const FsEntry& b,
+                            bool one_file = false) {
         if (without_provenance(a) == without_provenance(b))
             return a.provenance < b.provenance ? b : a;
-        const bool left_seen = content_seen(r, l, a);
-        const bool right_seen = content_seen(l, r, b);
+        const bool left_seen = content_seen(r, l, a) && (one_file || name_seen(r, l, a));
+        const bool right_seen = content_seen(l, r, b) && (one_file || name_seen(l, r, b));
         if (left_seen && !right_seen)
             return b;
         if (right_seen && !left_seen)
@@ -208,7 +214,7 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
             keep_left = from_right.provenance.name < from_left.provenance.name;
         const auto& kept = keep_left ? x : y;
         const auto& dropped = keep_left ? y : x;
-        auto merged = settle(kept, from_left, from_right);
+        auto merged = settle(kept, from_left, from_right, true);
         merged.provenance.name = (keep_left ? from_left : from_right).provenance.name;
         out.entries.erase(dropped);
         out.entries[kept] = std::move(merged);

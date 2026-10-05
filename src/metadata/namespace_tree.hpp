@@ -211,26 +211,17 @@ using NamespaceDifferences = std::map<std::string, NamespaceDifference>;
 NamespaceDifferences diff_namespace_trees(const ObjectId& before, const ObjectId& after,
                                           const NamespaceNodeStore& store);
 
-// The three-way merge of tree-backed snapshots, without materialising them:
-// `merge_metadata_snapshots` over the paths that differ from `base` on either
-// branch. `merged.snapshot` carries neither entries nor a root; its namespace
-// is `changes` applied to the tree `onto` (update_namespace_tree), the same
-// root a merge of the materialised namespaces would build. `onto` is the tree
-// of the lower head, the merge commit's primary parent.
+// The merge of two tree-backed heads, without materialising them:
+// `merge_metadata_heads` over the paths at which the two trees differ.
+// `merged.snapshot` carries neither entries nor a root; its namespace is
+// `changes` applied to the tree `onto` (update_namespace_tree), the same root
+// a merge of the materialised namespaces would build. `onto` is the tree of
+// the lower head, the merge commit's primary parent.
 struct NamespaceTreeMerge {
     MetadataMergeResult merged;
     ObjectId onto{};
     NamespaceChanges changes;
 };
-NamespaceTreeMerge merge_tree_backed_snapshots(const MetadataSnapshot& base,
-                                               const MetadataSnapshot& left,
-                                               const MetadataSnapshot& right,
-                                               const Hash256& left_head, const Hash256& right_head,
-                                               const NamespaceNodeStore& store);
-
-// The merge of two tree-backed heads, without materialising them:
-// `merge_metadata_heads` over the paths at which the two trees differ. The
-// result is shaped as `merge_tree_backed_snapshots`'s.
 NamespaceTreeMerge merge_tree_backed_heads(const MetadataSnapshot& left,
                                            const MetadataSnapshot& right,
                                            const Hash256& left_head, const Hash256& right_head,

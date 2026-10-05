@@ -1214,8 +1214,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         };
 
         // Fold the maximal head set deterministically, two branches at a time.
-        // Each merge names both parents and applies three-way conflict-presence
-        // semantics so explicit resolutions survive.
+        // Each merge names both parents; a conflict decided on either head
+        // stays decided.
         // A merge that cannot be made now never holds reads or writes: the
         // head that is not this node's own is set aside and the loop goes on
         // with the rest.

@@ -10,6 +10,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 using namespace macha;
 using namespace macha::test_support;
@@ -231,6 +232,51 @@ MACHA_FAST_TEST("metadata_merge", test_a_rename_meets_a_concurrent_edit_of_the_s
     CHECK(has(plain, "/d/renamed"));
 }
 
+// A file renamed onto another's path is new at that path though its content
+// is old: a head that has not seen the rename takes it, without a conflict.
+MACHA_FAST_TEST("metadata_merge", test_a_rename_onto_an_existing_file_replaces_it) {
+    Pair p;
+    p.a.file("/d/target", 5, 900);
+    p.b.adopt(p.a.head);
+    p.a.rename("/d/shared", "/d/target");
+    p.b.file("/d/unrelated", 1);
+    const auto result = merge(p.a.head, p.b.head);
+    CHECK(result.conflicts_created == 0);
+    CHECK(!has(result.snapshot, "/d/shared"));
+    REQUIRE(has(result.snapshot, "/d/target"));
+    CHECK(result.snapshot.entries.at("/d/target").size == 10);
+    CHECK(has(result.snapshot, "/d/unrelated"));
+}
+
+// Two files created at one path on two heads conflict; deciding for the one
+// not in place puts a different file at the path, and a head that has not
+// seen the decision does not undo it.
+MACHA_FAST_TEST("metadata_merge", test_deciding_for_the_other_file_is_kept) {
+    Pair p;
+    p.a.file("/d/new", 20, 200);
+    p.b.file("/d/new", 30, 300);
+    const auto conflicted = merge(p.a.head, p.b.head).snapshot;
+    REQUIRE(conflicted.conflicts.size() == 1);
+    REQUIRE(conflicted.entries.at("/d/new").size == 30);
+    const auto conflict = conflicted.conflicts.begin()->second;
+
+    Author unaware{4};
+    unaware.adopt(conflicted);
+    unaware.file("/d/unrelated", 1);
+    Author decider{3};
+    decider.adopt(conflicted);
+    auto chosen = *conflict.right_entry;
+    ++chosen.version;
+    chosen.ctime_ns = 999;
+    decider.put("/d/new", chosen);
+    decider.head.conflicts.clear();
+
+    const auto result = merge(decider.head, unaware.head);
+    CHECK(result.conflicts_created == 0);
+    CHECK(result.snapshot.entries.at("/d/new").size == 20);
+    CHECK(result.snapshot.conflicts.empty());
+}
+
 MACHA_FAST_TEST("metadata_merge", test_two_renames_of_one_file_keep_one_name) {
     Pair p;
     p.a.rename("/d/shared", "/d/by-a");
@@ -238,6 +284,17 @@ MACHA_FAST_TEST("metadata_merge", test_two_renames_of_one_file_keep_one_name) {
     const auto merged = merge(p.a.head, p.b.head).snapshot;
     CHECK(!has(merged, "/d/shared"));
     CHECK(has(merged, "/d/by-a") != has(merged, "/d/by-b"));
+}
+
+MACHA_FAST_TEST("metadata_merge", test_the_same_rename_on_both_heads_is_one_file_and_no_conflict) {
+    Pair p;
+    p.a.rename("/d/shared", "/d/renamed");
+    p.b.rename("/d/shared", "/d/renamed");
+    const auto result = merge(p.a.head, p.b.head);
+    CHECK(!has(result.snapshot, "/d/shared"));
+    REQUIRE(has(result.snapshot, "/d/renamed"));
+    CHECK(result.snapshot.entries.at("/d/renamed").size == 10);
+    CHECK(result.conflicts_created == 0);
 }
 
 // A directory removed on one side while the other puts a file in it comes
@@ -339,6 +396,99 @@ MACHA_FAST_TEST("metadata_merge", test_a_returning_node_from_before_provenance_l
     CHECK(!has(quiet, "/d/later-removed"));
     CHECK(has(quiet, "/d/written-since"));
     CHECK(has(quiet, "/d/common"));
+}
+
+// A decision as the manager makes it: the chosen alternative written again
+// as a later mutation of the subject (or the subject removed), and the record
+// erased.
+void decide(Author& author, const std::string& id, const std::optional<FsEntry>& chosen) {
+    const auto key = author.head.conflicts.at(id).key;
+    if (chosen) {
+        auto decided = *chosen;
+        ++decided.version;
+        decided.ctime_ns += 1000;
+        author.put(key, decided);
+    } else {
+        author.erase(key);
+    }
+    author.head.conflicts.erase(id);
+}
+
+// A head that has not seen a decision still carries the record and the value
+// the merge installed. Merging with it keeps the decision, whichever
+// alternative was chosen, and does not bring the record back.
+MACHA_FAST_TEST("metadata_merge", test_a_decision_is_kept_against_a_head_that_has_not_seen_it) {
+    Pair p;
+    p.a.edit("/d/shared", 20, 200);
+    p.b.edit("/d/shared", 30, 300);
+    const auto conflicted = merge(p.a.head, p.b.head).snapshot;
+    REQUIRE(conflicted.conflicts.size() == 1);
+    const auto id = conflicted.conflicts.begin()->first;
+    const auto conflict = conflicted.conflicts.begin()->second;
+
+    // A node that merged the two heads and then wrote something else.
+    Author unaware{4};
+    unaware.adopt(conflicted);
+    unaware.file("/d/unrelated", 1);
+
+    for (const auto& chosen :
+         {conflict.left_entry, conflict.right_entry, std::optional<FsEntry>()}) {
+        Author decider{3};
+        decider.adopt(conflicted);
+        decide(decider, id, chosen);
+        const std::vector<const MetadataSnapshot*> others{&unaware.head, &conflicted, &p.a.head,
+                                                          &p.b.head};
+        for (const auto* other : others) {
+            const auto result = merge(decider.head, *other);
+            CHECK(result.conflicts_created == 0);
+            CHECK(result.snapshot.conflicts.empty());
+            CHECK(has(result.snapshot, "/d/shared") == chosen.has_value());
+            if (chosen && has(result.snapshot, "/d/shared")) {
+                CHECK(result.snapshot.entries.at("/d/shared") ==
+                      decider.head.entries.at("/d/shared"));
+                CHECK(result.snapshot.entries.at("/d/shared").size == chosen->size);
+            }
+        }
+        CHECK(has(merge(decider.head, unaware.head).snapshot, "/d/unrelated"));
+    }
+}
+
+// Values of the cluster take the greater where the heads differ, and each
+// head's standing conflicts are kept.
+MACHA_FAST_TEST("metadata_merge",
+                test_cluster_values_take_the_greater_and_both_heads_conflicts_stand) {
+    Author a{1};
+    a.directory("/d");
+    a.file("/d/one", 1);
+    a.file("/d/two", 2);
+    Author b{2}, c{3}, d{4};
+    for (auto* author : {&b, &c, &d})
+        author->adopt(a.head);
+
+    // One conflict on each side, about different files.
+    a.edit("/d/one", 10, 100);
+    b.edit("/d/one", 11, 110);
+    c.edit("/d/two", 20, 200);
+    d.edit("/d/two", 21, 210);
+    auto left = merge(a.head, b.head).snapshot;
+    auto right = merge(c.head, d.head).snapshot;
+    REQUIRE(left.conflicts.size() == 1);
+    REQUIRE(right.conflicts.size() == 1);
+    left.data_replication = 2;
+    left.metadata_write_replicas_required = 3;
+    right.data_replication = 3;
+    right.metadata_write_replicas_required = 2;
+
+    const auto result = merge(left, right);
+    CHECK(result.snapshot.data_replication == 3);
+    CHECK(result.snapshot.metadata_write_replicas_required == 3);
+    CHECK(result.conflicts_created == 0);
+    CHECK(result.conflicts_superseded == 0);
+    CHECK(result.snapshot.conflicts.size() == 2);
+    CHECK(result.snapshot.conflicts.contains(left.conflicts.begin()->first));
+    CHECK(result.snapshot.conflicts.contains(right.conflicts.begin()->first));
+    CHECK(result.snapshot.entries.at("/d/one").size == 11);
+    CHECK(result.snapshot.entries.at("/d/two").size == 21);
 }
 
 MACHA_FAST_TEST("metadata_merge", test_three_heads_merge_to_the_same_namespace_in_any_order) {

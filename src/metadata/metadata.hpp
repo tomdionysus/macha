@@ -86,7 +86,7 @@ struct MetadataConflict {
     MetadataConflictKind kind{MetadataConflictKind::namespace_entry};
     // Which value the merge left in place. Set by a merge of two heads: the
     // left alternative, which is the later of the two (or the directory that
-    // had to stay). Unset by a three-way merge: the common ancestor.
+    // had to stay). Unset in a record made over a base: the base.
     bool later_installed{};
     // With `later_installed`: the dot of the value left in place, which is
     // how a later decision that keeps the same value is still seen.
@@ -163,8 +163,8 @@ struct MetadataSnapshot {
     // Extra parents of a reconciliation commit; MetadataRecord::previous stays
     // the primary parent.
     std::vector<Hash256> merge_parents;
-    // Each conflict keeps all alternatives while the effective value stays at
-    // the common ancestor; resolution is a later mutation.
+    // Each conflict keeps its alternatives while the one its merge installed
+    // stays in place; resolution is a later mutation.
     std::map<std::string, MetadataConflict, std::less<>> conflicts;
     // Torrents requested for download, by request id (SM15/SM16).
     std::map<std::string, TorrentRequest, std::less<>> torrent_requests;
@@ -287,33 +287,6 @@ struct MetadataMergeResult {
     size_t conflicts_superseded{};
 };
 
-struct MetadataManualRepairPlan {
-    MetadataRecord record;
-    Hash256 dominant_head{};
-    Hash256 subsumed_head{};
-};
-
-// Offline/manual recovery only: joins histories with no common ancestor when
-// one causal clock strictly dominates the other.
-std::optional<MetadataManualRepairPlan> plan_causally_dominant_metadata_repair(
-    const MetadataRecord&, const MetadataSnapshot&,
-    const MetadataRecord&, const MetadataSnapshot&);
-
-struct MetadataConflictPreservingRepairPlan {
-    MetadataRecord record;
-    Hash256 left_head{};
-    Hash256 right_head{};
-    size_t conflicts_created{};
-};
-
-// Offline/manual recovery only, for concurrent heads with no common ancestor.
-// Merges over an empty base: equal paths reconcile, differing paths become
-// durable conflicts. Returns nullopt if either head has a path the other lacks,
-// since an empty base cannot tell a rename from two independent creates.
-std::optional<MetadataConflictPreservingRepairPlan> plan_conflict_preserving_metadata_repair(
-    const MetadataRecord&, const MetadataSnapshot&,
-    const MetadataRecord&, const MetadataSnapshot&);
-
 enum class CatalogueDelta : uint8_t { unchanged = 0, clear = 1, set = 2 };
 
 // Deterministic mutation from one canonical snapshot to the next, used on the
@@ -383,7 +356,7 @@ void canonicalise_garbage(std::vector<GarbageRef>&);
 // differ. Two writers publishing the same media are not in conflict.
 bool same_content(const FsEntry&, const FsEntry&);
 // The alternative a conflict's merge left in place: the left one when
-// `later_installed`, the common ancestor otherwise.
+// `later_installed`, the base otherwise.
 std::optional<FsEntry> conflict_installed_entry(const MetadataConflict&);
 std::optional<ObjectId> conflict_installed_catalogue_root(const MetadataConflict&);
 // Of two concurrent values, the one a merge leaves in place: the later
@@ -427,17 +400,6 @@ MetadataRecord genesis_metadata();
 bool valid_metadata_record(const MetadataRecord&);
 std::vector<Hash256> metadata_record_parents(const MetadataRecord&);
 std::string metadata_conflict_id(const MetadataConflict&);
-MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
-                                             const MetadataSnapshot& left,
-                                             const MetadataSnapshot& right,
-                                             const Hash256& left_head, const Hash256& right_head);
-
-// The same merge over namespaces given apart from the snapshots, whose own
-// entry maps and roots are not read. The maps may hold a part of each
-// namespace: every path that differs between any two of the three, every
-// ancestor of a path they hold, "/", and the key of every namespace conflict
-// any of the three carries. A path in none of them is the same on all three
-// and merges to itself. The result's entries cover the paths given.
 using NamespaceEntries = std::map<std::string, FsEntry>;
 // The merge of two heads from the heads alone: each entry's provenance and
 // each head's clock tell "removed there" from "never seen there" and "newer"
@@ -445,7 +407,8 @@ using NamespaceEntries = std::map<std::string, FsEntry>;
 // computes the same record. `merge_metadata_heads` takes materialised
 // namespaces; `..._over` takes each head's entries at the paths to consider
 // (every path that differs, each standing conflict's subject and the
-// directories above them) and returns the merged entries at those paths.
+// directories above them) and returns the merged entries at those paths. The
+// snapshots' own entry maps and roots are not read.
 MetadataMergeResult merge_metadata_heads(const MetadataSnapshot& left,
                                          const MetadataSnapshot& right, const Hash256& left_head,
                                          const Hash256& right_head);
@@ -455,14 +418,6 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
                                               const NamespaceEntries& right_entries,
                                               const Hash256& left_head,
                                               const Hash256& right_head);
-MetadataMergeResult merge_metadata_snapshots_over(const MetadataSnapshot& base,
-                                                  const MetadataSnapshot& left,
-                                                  const MetadataSnapshot& right,
-                                                  const NamespaceEntries& base_entries,
-                                                  const NamespaceEntries& left_entries,
-                                                  const NamespaceEntries& right_entries,
-                                                  const Hash256& left_head,
-                                                  const Hash256& right_head);
 // Reachability roots held by unresolved conflicts, which GC must protect.
 std::set<ObjectId> metadata_conflict_extent_roots(const MetadataSnapshot&);
 std::set<ObjectId> metadata_catalogue_root_set(const MetadataSnapshot&);
