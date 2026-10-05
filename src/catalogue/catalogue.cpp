@@ -1689,17 +1689,31 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
     return art;
 }
 
-std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId& id) {
-    auto current = current_snapshot();
-    std::optional<std::string> mime_type;
-    for (const auto& [_, item] : current->items) {
-        auto it = std::find_if(item.artwork.begin(), item.artwork.end(),
-                               [&](const CatalogueArtwork& art) { return art.id == id; });
-        if (it != item.artwork.end()) {
-            mime_type = it->mime_type;
-            break;
-        }
+std::shared_ptr<const CatalogueIndexes> CatalogueManager::indexes() {
+    const auto current = current_snapshot();
+    {
+        Lock lock(mutex_);
+        if (indexes_ && indexed_ == current)
+            return indexes_;
     }
+    auto built = std::make_shared<CatalogueIndexes>();
+    for (const auto& [id, item] : current->items) {
+        for (const auto& art : item.artwork)
+            built->artwork_types.emplace(art.id, art.mime_type);
+        for (const auto& media_id : item.media_ids)
+            built->media_bindings[media_id].push_back(id);
+    }
+    Lock lock(mutex_);
+    indexed_ = current;
+    indexes_ = built;
+    return built;
+}
+
+std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId& id) {
+    const auto index = indexes();
+    std::optional<std::string> mime_type;
+    if (const auto found = index->artwork_types.find(id); found != index->artwork_types.end())
+        mime_type = found->second;
     if (!mime_type)
         return {};
     // Reading DATA never makes the reader an owner: artwork is read from its

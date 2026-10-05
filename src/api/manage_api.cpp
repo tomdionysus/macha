@@ -111,15 +111,6 @@ Json fs_entry_json(std::string path, std::string name, const FsEntry& entry,
     return Json(std::move(out));
 }
 
-std::map<std::string, std::vector<std::string>, std::less<>> media_bindings(
-    const CatalogueSnapshot& snapshot) {
-    std::map<std::string, std::vector<std::string>, std::less<>> out;
-    for (const auto& [id, item] : snapshot.items)
-        for (const auto& media_id : item.media_ids)
-            out[media_id].push_back(id);
-    return out;
-}
-
 std::optional<std::pair<FsEntry, std::string>> current_hint_file(
     FileSystem& fs, const CatalogueHint& hint) {
     try {
@@ -1046,8 +1037,9 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 return http_error(400, "not_directory", "path is not a directory");
             std::map<std::string, std::vector<std::string>, std::less<>> bindings;
             try {
-                bindings = media_bindings(*catalogue_.snapshot_view(
-                    WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/filesystem")));
+                (void)catalogue_.snapshot_view(
+                    WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/filesystem"));
+                bindings = catalogue_.indexes()->media_bindings;
             } catch (const std::exception& e) {
                 // MachaDFS browsing does not depend on the catalogue; binding annotations are
                 // a convenience.
