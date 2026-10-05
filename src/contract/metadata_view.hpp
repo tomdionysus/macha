@@ -68,7 +68,7 @@ struct MetadataMutationTiming {
 
 // Every operation is thread-safe. "Locks" are the replica's, which its
 // commits hold across state-device I/O, and the manager's mutation lock,
-// which repair and history checkpoints hold across network calls.
+// which repair holds across network calls.
 class MetadataView {
   public:
     virtual ~MetadataView() = default;
@@ -175,13 +175,13 @@ class MetadataMaintenance {
     static constexpr Waits repair_heads_waits =
         Waits::state_device | Waits::network | Waits::locks;
     virtual size_t repair_unreconstructable_heads(FrameType frame_type = FrameType::control) = 0;
-    // One round toward re-rooting local history at a checkpoint, gated on
-    // its thresholds. Holds the mutation lock throughout, so commits wait for
-    // the round.
-    static constexpr Waits checkpoint_waits =
-        Waits::state_device | Waits::network | Waits::locks;
-    virtual void attempt_history_checkpoint(size_t record_threshold = 256,
-                                            uint64_t byte_threshold = 64ULL * 1024 * 1024) = 0;
+    // Re-roots this node's own history at its head once it holds one head
+    // and the history has passed the thresholds, and drops any head set
+    // aside for the absence horizon. Asks no peer. Holds the mutation lock,
+    // so commits wait for it.
+    static constexpr Waits truncate_history_waits = Waits::state_device | Waits::locks;
+    virtual void truncate_history(size_t record_threshold = 256,
+                                  uint64_t byte_threshold = 64ULL * 1024 * 1024) = 0;
 };
 
 } // namespace macha

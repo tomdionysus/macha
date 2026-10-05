@@ -1,5 +1,77 @@
 # Current release
 
+## 0.89.0 — two heads merge from what they hold (experiment)
+
+A reconciliation no longer needs the common ancestor of the heads it joins,
+so history no longer decides whether a merge can be made. Each namespace
+entry says which mutation wrote it, each head says which mutations it has
+incorporated, and that is enough to tell an entry removed on one side from
+one the other never saw, and a newer value from a concurrent one. A node
+returning after any length of absence merges exactly.
+
+**Formats (breaking; upgrade every node).** An entry written from now on
+carries a provenance (an identity, the dot of its last change and the dot of
+when it came to be at its path) behind a bit in its type byte, which an
+older build refuses. Entries written before stay byte for byte as they are:
+nothing is rewritten for the upgrade. A head carries a legacy clock and the
+catalogue root's dot in the new snapshot forms SM17 (tree) and SM18 (map);
+DLT10 carries them and an append's dot in a delta. A conflict record notes
+which alternative is in place.
+
+**On disk.** `<state_path>/metadata/set-aside.meta` records when a head was
+set aside. `checkpoint-proof.meta` is no longer read or written.
+
+**The merge.**
+- Present on one head only: removed if the other head has incorporated the
+  mutations that named and last changed it, kept if it has not. Changed on
+  one side and removed on the other: the change is kept.
+- Different on both: the value the other head has already seen loses. If
+  neither has seen the other's, the change is concurrent: the later
+  modification time is installed and both are kept in a conflict record.
+  The same content written twice is no conflict.
+- A file renamed on one side and changed on the other is one file, at the
+  new name, with the change. Two renames of one file keep the later name.
+- A directory removed on one side comes back for an entry the other put
+  under it; a directory with entries under it wins a clash with a file.
+- An entry from before provenance is judged by the legacy clock: removed
+  only when the other head has every mutation that could have written it.
+  A node that was away with writes nobody saw therefore loses none of
+  them; files removed elsewhere in that time can reappear from it.
+- The catalogue root follows its own dot. Two concurrent roots leave one in
+  place; the catalogue merges the other in when this node's history still
+  holds their common ancestor.
+- A merge mints no dots and reads nothing but the two heads, so every
+  reconciler computes the same record.
+
+**Conflicts (API).** A conflict from this merge has the later value in
+place, where a conflict from the three-way merge left the common ancestor in
+place. `GET /api/v1/manage/metadata/conflicts` gains `installed` on each
+item: `left` (the left alternative is what the namespace holds) or `base`
+(a record made before this release). `base` is null on new records.
+Resolving with `choice=base` on such a record removes the path, as it did
+for a conflict whose ancestor was absent. A decision is a change of the
+subject, so a head that has not seen it does not bring the conflict back.
+
+**History is each node's own.** A node re-roots its history at its head once
+it holds one head and the history has passed its thresholds, asking no other
+node. A head a peer still holds from before is recognised as an ancestor by
+its clock. The cluster-wide checkpoint round and its two RPCs are gone.
+
+**A head set aside does not stay for ever.** A head whose namespace no node
+present can supply is still set aside until the membership changes; one set
+aside for `maintenance.garbage_grace_ms` is dropped, since whatever held its
+content is not coming back.
+
+**Removed.** The three-way merge, and `macha-metadata-repair`'s
+`--plan/--stage/--accept-causal-merge` and `--plan/--stage/--accept-conflict-merge`
+modes, which joined by hand two heads with no common ancestor. The tool
+still reports heads, diffs them and moves acceptance certificates.
+
+**Fixed.** On a tree-backed namespace a standing conflict was judged against
+an empty map by the next mutation, which dropped records still undecided and
+kept decided ones whose ancestor was absent. Conflicts are now read from the
+namespace as the mutation leaves it.
+
 ## 0.88.0 — a node carries on when another never returns (experiment)
 
 Any node may disappear at any time and may never come back. Writes and

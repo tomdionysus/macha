@@ -651,8 +651,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     REQUIRE(certificate.has_value());
     CHECK(*certificate == merge_accept);
 
-    // A globally converged owner may set a new local ancestry floor: the sole
-    // committed head stays reconstructable and obsolete branch history is dropped.
+    // With one head the history is truncated to it: the head stays
+    // reconstructable and the branches behind it are dropped.
     const auto history_path = path / "metadata" / "history.log";
     const auto history_before = std::filesystem::file_size(history_path);
     REQUIRE(reopened.compact_history_if_safe(1, 1));
@@ -1416,267 +1416,286 @@ MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluste
     CHECK(established_heads.front().hash == established.hash);
 }
 
-MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_only_trusted_once_committed) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-    const auto path = t.path() / "checkpoint-proof-ack";
+namespace {
 
-    NodeId a{}, b{};
-    a.bytes[15] = 1;
-    b.bytes[15] = 2;
-
-    MetadataReplica replica(path, keys.storage);
-    CHECK(!replica.checkpoint_proof().has_value());
-
-    HistoryCheckpointProof proposal;
-    proposal.floor_hash = replica.committed().hash;
-    proposal.floor_generation = replica.committed().generation;
-    proposal.epoch.bytes[0] = 0x11;
-    proposal.participants = {a, b};
-
-    // Committing before any ack for this exact (floor_hash, epoch) is refused.
-    CHECK(!replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
-    CHECK(!replica.checkpoint_proof().has_value());
-
-    replica.record_checkpoint_ack(proposal);
-    // The ack is visible only as `acked`: this accessor does not filter, so
-    // callers that gate on authority must check status == committed.
-    auto acked = replica.checkpoint_proof();
-    REQUIRE(acked.has_value());
-    CHECK(acked->status == HistoryCheckpointProof::Status::acked);
-
-    // A commit for the right floor but a different epoch (a membership
-    // change mid-round) is refused: no acked record matches it exactly.
-    auto other_epoch = proposal.epoch;
-    other_epoch.bytes[1] = 0x99;
-    CHECK(!replica.record_checkpoint_commit(proposal.floor_hash, other_epoch));
-    CHECK(replica.checkpoint_proof()->status == HistoryCheckpointProof::Status::acked);
-
-    REQUIRE(replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
-    auto proof = replica.checkpoint_proof();
-    REQUIRE(proof.has_value());
-    CHECK(proof->status == HistoryCheckpointProof::Status::committed);
-    CHECK(proof->floor_hash == proposal.floor_hash);
-    CHECK(proof->epoch == proposal.epoch);
-}
-
-MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_ack_refuses_a_floor_this_replica_has_already_superseded) {
-    // A stale proposer cannot extract an ack for a floor that is no longer this
-    // replica's single accepted head; acking it would let that proposer alone
-    // commit and compact away ancestry other replicas need to reconcile.
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-    const auto path = t.path() / "checkpoint-ack-stale-floor";
-
-    NodeId a{}, b{};
-    a.bytes[15] = 1;
-    b.bytes[15] = 2;
-
-    MetadataReplica replica(path, keys.storage);
-    const auto genuine_head = replica.committed().hash;
-
-    HistoryCheckpointProof stale;
-    stale.floor_hash = sha256(Bytes{1, 2, 3}); // not this replica's accepted head
-    stale.floor_generation = replica.committed().generation;
-    stale.epoch.bytes[0] = 0x33;
-    stale.participants = {a, b};
-
-    CHECK(!replica.record_checkpoint_ack(stale));
-    CHECK(!replica.checkpoint_proof().has_value());
-
-    // A proposal for this replica's actual current head still acks.
-    HistoryCheckpointProof genuine;
-    genuine.floor_hash = genuine_head;
-    genuine.floor_generation = replica.committed().generation;
-    genuine.epoch.bytes[0] = 0x34;
-    genuine.participants = {a, b};
-    CHECK(replica.record_checkpoint_ack(genuine));
-    auto acked = replica.checkpoint_proof();
-    REQUIRE(acked.has_value());
-    CHECK(acked->status == HistoryCheckpointProof::Status::acked);
-    CHECK(acked->floor_hash == genuine_head);
-}
-
-MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_reload_validates_against_committed) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-    const auto path = t.path() / "checkpoint-proof-reload";
-    NodeId a{};
-    a.bytes[15] = 1;
-
-    MetadataRecord committed_at_commit;
-    {
-        MetadataReplica replica(path, keys.storage);
-        committed_at_commit = replica.committed();
-        HistoryCheckpointProof proposal;
-        proposal.floor_hash = committed_at_commit.hash;
-        proposal.floor_generation = committed_at_commit.generation;
-        proposal.epoch.bytes[0] = 0x42;
-        proposal.participants = {a};
-        replica.record_checkpoint_ack(proposal);
-        REQUIRE(replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
-    }
-    {
-        // A restart must validate the proof before using it: it still
-        // matches the current committed head here, so it survives.
-        MetadataReplica reopened(path, keys.storage);
-        auto proof = reopened.checkpoint_proof();
-        REQUIRE(proof.has_value());
-        CHECK(proof->status == HistoryCheckpointProof::Status::committed);
-        CHECK(proof->floor_hash == committed_at_commit.hash);
-    }
-
-    // Advance committed_ past the proof's floor via an ordinary mutation.
-    {
-        MetadataReplica replica(path, keys.storage);
-        auto snapshot = decode_snapshot(replica.committed().payload);
-        FsEntry directory;
-        directory.type = EntryType::directory;
-        directory.mode = 0755;
-        snapshot.entries["/advanced"] = directory;
-        MetadataRecord advanced;
-        advanced.generation = replica.committed().generation + 1;
-        advanced.previous = replica.committed().hash;
-        advanced.payload = encode_snapshot(snapshot);
-        advanced.hash = metadata_hash(advanced.generation, advanced.previous, advanced.payload);
-        REQUIRE(replica.store_commit(advanced));
-        REQUIRE(replica.accept_commit({advanced.generation, advanced.hash, 0, {}}));
-    }
-    {
-        // The proof's floor_hash no longer matches committed_: a restart must not
-        // trust it at all.
-        MetadataReplica reopened(path, keys.storage);
-        CHECK(!reopened.checkpoint_proof().has_value());
-    }
-}
-
-MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_corrupt_file_ignored_on_restart) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-    const auto path = t.path() / "checkpoint-proof-corrupt";
-    NodeId a{};
-    a.bytes[15] = 1;
-
-    MetadataRecord committed_at_commit;
-    {
-        MetadataReplica replica(path, keys.storage);
-        committed_at_commit = replica.committed();
-        HistoryCheckpointProof proposal;
-        proposal.floor_hash = committed_at_commit.hash;
-        proposal.floor_generation = committed_at_commit.generation;
-        proposal.epoch.bytes[0] = 0x07;
-        proposal.participants = {a};
-        replica.record_checkpoint_ack(proposal);
-        REQUIRE(replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
-    }
-    const auto proof_path = path / "metadata" / "checkpoint-proof.meta";
-    REQUIRE(std::filesystem::exists(proof_path));
-    {
-        std::ofstream corrupt(proof_path, std::ios::binary | std::ios::trunc);
-        corrupt << "not a valid checkpoint proof file";
-    }
-
-    MetadataReplica reopened(path, keys.storage);
-    CHECK(!reopened.checkpoint_proof().has_value());
-    // A corrupt, unrelated proof file must never disturb ordinary replica
-    // startup or state.
-    CHECK(reopened.committed().hash == committed_at_commit.hash);
-}
-
-MACHA_FAST_TEST("storage_metadata",
-                test_returning_node_adopts_head_beyond_pruned_ancestry_only_with_committed_proof) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-
-    NodeId a{}, b{};
-    a.bytes[15] = 1;
-    b.bytes[15] = 2;
-
-    const auto genesis = genesis_metadata();
-    auto floor_snapshot = decode_snapshot(genesis.payload);
-    floor_snapshot.metadata_write_replicas_required = 2;
+// A record holding `paths` as directories under the clock `clock`.
+MetadataRecord record_with_clock(uint64_t generation, const Hash256& previous,
+                                 std::map<NodeId, uint64_t> clock,
+                                 std::initializer_list<const char*> paths) {
+    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    snapshot.metadata_write_replicas_required = 2;
+    snapshot.mutation_sequences = std::move(clock);
     FsEntry directory;
     directory.type = EntryType::directory;
     directory.mode = 0755;
-    floor_snapshot.entries["/floor"] = directory;
+    for (const auto* path : paths)
+        snapshot.entries[path] = directory;
+    MetadataRecord record;
+    record.generation = generation;
+    record.previous = previous;
+    record.payload = encode_snapshot(snapshot);
+    record.hash = metadata_hash(record.generation, record.previous, record.payload);
+    return record;
+}
 
-    MetadataRecord floor;
-    floor.generation = genesis.generation + 1;
-    floor.previous = genesis.hash;
-    floor.payload = encode_snapshot(floor_snapshot);
-    floor.hash = metadata_hash(floor.generation, floor.previous, floor.payload);
-    const MetadataAcceptance floor_accept{floor.generation, floor.hash, 2, {a, b}};
+// The record as a full history entry with no known previous.
+MetadataHistoryEntry rootless_entry(const MetadataRecord& record) {
+    MetadataHistoryEntry entry;
+    entry.generation = record.generation;
+    entry.previous = record.previous;
+    entry.hash = record.hash;
+    entry.previous_known = false;
+    entry.body = MetadataHistoryEntry::Body::full;
+    entry.payload.assign(record.payload.begin(), record.payload.end());
+    return entry;
+}
 
-    // A later head descending from `floor` through two compacted hops this node
-    // never saw. One compacted hop resolves through its direct previous hash;
-    // two do not.
-    Hash256 pruned_intermediate{};
-    pruned_intermediate.bytes[0] = 0x77;
-    auto beyond_snapshot = floor_snapshot;
-    beyond_snapshot.entries["/beyond"] = directory;
-    MetadataRecord beyond;
-    beyond.generation = floor.generation + 5;
-    beyond.previous = pruned_intermediate;
-    beyond.payload = encode_snapshot(beyond_snapshot);
-    beyond.hash = metadata_hash(beyond.generation, beyond.previous, beyond.payload);
-    const MetadataAcceptance beyond_accept{beyond.generation, beyond.hash, 2, {a, b}};
+NodeId author(uint8_t id) {
+    NodeId node{};
+    node.bytes[15] = id;
+    return node;
+}
 
-    MetadataHistoryEntry beyond_compacted_root;
-    beyond_compacted_root.generation = beyond.generation;
-    beyond_compacted_root.previous = beyond.previous;
-    beyond_compacted_root.hash = beyond.hash;
-    beyond_compacted_root.previous_known = false;
-    beyond_compacted_root.body = MetadataHistoryEntry::Body::full;
-    beyond_compacted_root.payload.assign(beyond.payload.begin(), beyond.payload.end());
+MetadataAcceptance accepted_by_two(const MetadataRecord& record) {
+    return {record.generation, record.hash, 2, {author(1), author(2)}};
+}
 
-    // Without a checkpoint proof for `floor`, a replica never adopts `beyond` on
-    // generation alone; it stays divergent until reconciled.
+std::vector<Hash256> hashes_of(const std::vector<MetadataRecord>& heads) {
+    std::vector<Hash256> out;
+    for (const auto& head : heads)
+        out.push_back(head.hash);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+} // namespace
+
+// A head with no clock says nothing about what it holds, so no other head's
+// clock makes it an ancestor: it stays a head, to be merged.
+MACHA_FAST_TEST("storage_metadata", test_a_head_with_no_clock_is_nobodys_ancestor) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto genesis = genesis_metadata();
+    Hash256 unseen{};
+    unseen.bytes[0] = 0x55;
+    const auto clockless = record_with_clock(genesis.generation + 4, unseen, {}, {"/only-here"});
+    const auto other =
+        record_with_clock(genesis.generation + 2, genesis.hash, {{author(2), 1}}, {"/other"});
+    MetadataReplica replica(t.path() / "clockless", keys.storage);
+    REQUIRE(replica.import_history(rootless_entry(clockless)));
+    REQUIRE(replica.accept_commit(accepted_by_two(clockless)));
+    REQUIRE(replica.import_history(rootless_entry(other)));
+    REQUIRE(replica.accept_commit(accepted_by_two(other)));
+    CHECK(hashes_of(replica.accepted_heads()) == hashes_of({clockless, other}));
+}
+
+MACHA_FAST_TEST("storage_metadata", test_a_head_from_before_truncation_is_recognised_by_its_clock) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "truncated";
+    const auto a = author(1), b = author(2);
+
+    const auto genesis = genesis_metadata();
+    const auto old = record_with_clock(genesis.generation + 1, genesis.hash, {{a, 1}}, {"/old"});
+    const auto between =
+        record_with_clock(old.generation + 1, old.hash, {{a, 2}}, {"/old", "/between"});
+    const auto now = record_with_clock(between.generation + 1, between.hash, {{a, 3}},
+                                       {"/old", "/between", "/now"});
+    // Written on `old` by another author: `now` does not carry it.
+    const auto side =
+        record_with_clock(old.generation + 1, old.hash, {{a, 1}, {b, 1}}, {"/old", "/side"});
+
     {
-        MetadataReplica replica(t.path() / "no-proof", keys.storage);
-        REQUIRE(replica.store_commit(floor));
-        REQUIRE(replica.accept_commit(floor_accept));
-        REQUIRE(replica.import_history(beyond_compacted_root));
-        REQUIRE(replica.accept_commit(beyond_accept));
-        auto heads = replica.accepted_heads();
-        CHECK(heads.size() == 2);
-        CHECK(!replica.history_common_ancestor(floor.hash, beyond.hash).has_value());
+        MetadataReplica replica(path, keys.storage);
+        for (const auto* record : {&old, &between, &now}) {
+            REQUIRE(replica.store_commit(*record));
+            REQUIRE(replica.accept_commit(accepted_by_two(*record)));
+        }
+        REQUIRE(replica.compact_history_if_safe(1, 1));
+        CHECK(replica.diagnostics().history_records == 1);
+        CHECK(!replica.historical(old.hash).has_value());
+
+        // A peer still holds `old` and offers it. No edge in history joins
+        // the two; the clock of `now` covers it.
+        REQUIRE(replica.import_history(rootless_entry(old)));
+        REQUIRE(replica.accept_commit(accepted_by_two(old)));
+        CHECK(!replica.history_is_ancestor(old.hash, now.hash));
+        CHECK(hashes_of(replica.accepted_heads()) == std::vector<Hash256>{now.hash});
+        CHECK(replica.committed().hash == now.hash);
+
+        // A head whose clock `now` does not cover stays beside it, to be merged.
+        REQUIRE(replica.import_history(rootless_entry(side)));
+        REQUIRE(replica.accept_commit(accepted_by_two(side)));
+        CHECK(hashes_of(replica.accepted_heads()) == hashes_of({now, side}));
+
+        // History is not truncated while two heads are held.
+        const auto records = replica.diagnostics().history_records;
+        CHECK(!replica.compact_history_if_safe(1, 1));
+        CHECK(replica.diagnostics().history_records == records);
     }
 
-    // With a committed checkpoint proof for exactly `floor`, the replica trusts it
-    // as an ancestor of anything at a later generation, as with genesis: the proof
-    // required every participant to agree floor was the sole accepted head.
+    MetadataReplica reopened(path, keys.storage);
+    CHECK(hashes_of(reopened.accepted_heads()) == hashes_of({now, side}));
+}
+
+MACHA_FAST_TEST("storage_metadata",
+                test_returning_replica_adopts_a_head_whose_ancestry_a_peer_truncated) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto a = author(1), b = author(2);
+
+    const auto genesis = genesis_metadata();
+    const auto floor =
+        record_with_clock(genesis.generation + 1, genesis.hash, {{a, 1}}, {"/floor"});
+    const auto between =
+        record_with_clock(floor.generation + 1, floor.hash, {{a, 2}}, {"/floor", "/between"});
+    const auto beyond = record_with_clock(between.generation + 1, between.hash, {{a, 2}, {b, 1}},
+                                          {"/floor", "/between", "/beyond"});
+
+    // The peer went on from `floor` and truncated: its head is all it serves.
+    MetadataHistoryEntry served;
     {
-        MetadataReplica replica(t.path() / "with-proof", keys.storage);
+        MetadataReplica peer(t.path() / "peer", keys.storage);
+        for (const auto* record : {&floor, &between, &beyond}) {
+            REQUIRE(peer.store_commit(*record));
+            REQUIRE(peer.accept_commit(accepted_by_two(*record)));
+        }
+        REQUIRE(peer.compact_history_if_safe(1, 1));
+        auto entry = peer.history_entry(beyond.hash);
+        REQUIRE(entry.has_value());
+        served = *entry;
+        CHECK(!served.previous_known);
+    }
+
+    // The returning replica holds `floor` and never saw `between`.
+    {
+        MetadataReplica replica(t.path() / "returning", keys.storage);
         REQUIRE(replica.store_commit(floor));
-        REQUIRE(replica.accept_commit(floor_accept));
+        REQUIRE(replica.accept_commit(accepted_by_two(floor)));
+        REQUIRE(replica.import_history(served));
+        REQUIRE(replica.accept_commit(accepted_by_two(beyond)));
+        CHECK(!replica.history_is_ancestor(floor.hash, beyond.hash));
+        CHECK(hashes_of(replica.accepted_heads()) == std::vector<Hash256>{beyond.hash});
+        CHECK(replica.committed().hash == beyond.hash);
+    }
 
-        HistoryCheckpointProof proposal;
-        proposal.floor_hash = floor.hash;
-        proposal.floor_generation = floor.generation;
-        proposal.epoch.bytes[0] = 0x5A;
-        proposal.participants = {a, b};
-        replica.record_checkpoint_ack(proposal);
-        REQUIRE(replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
-
-        REQUIRE(replica.import_history(beyond_compacted_root));
-        REQUIRE(replica.accept_commit(beyond_accept));
-        auto heads = replica.accepted_heads();
-        REQUIRE(heads.size() == 1);
-        CHECK(heads.front().hash == beyond.hash);
+    // A later head that does not carry this replica's mutations is a second
+    // head, whatever its generation.
+    {
+        Hash256 unseen{};
+        unseen.bytes[0] = 0x77;
+        const auto foreign =
+            record_with_clock(floor.generation + 5, unseen, {{b, 4}}, {"/foreign"});
+        MetadataReplica replica(t.path() / "diverged", keys.storage);
+        REQUIRE(replica.store_commit(floor));
+        REQUIRE(replica.accept_commit(accepted_by_two(floor)));
+        REQUIRE(replica.import_history(rootless_entry(foreign)));
+        REQUIRE(replica.accept_commit(accepted_by_two(foreign)));
+        CHECK(hashes_of(replica.accepted_heads()) == hashes_of({floor, foreign}));
     }
 }
 
+MACHA_FAST_TEST("storage_metadata", test_a_head_set_aside_for_the_horizon_is_dropped) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "set-aside";
 
+    const auto genesis = genesis_metadata();
+    const auto mine =
+        record_with_clock(genesis.generation + 1, genesis.hash, {{author(1), 1}}, {"/mine"});
+    const auto theirs =
+        record_with_clock(genesis.generation + 3, genesis.hash, {{author(2), 1}}, {"/theirs"});
+    const uint64_t first = 10'000;
+    const auto horizon = 1000ms;
+
+    {
+        MetadataReplica replica(path, keys.storage);
+        REQUIRE(replica.store_commit(mine));
+        REQUIRE(replica.accept_commit(accepted_by_two(mine)));
+
+        // The only head is never set aside, and nothing expires.
+        CHECK(!replica.set_aside(mine.hash, first));
+        CHECK(replica.expire_set_aside(first + 100'000, horizon) == 0);
+        CHECK(hashes_of(replica.accepted_heads()) == std::vector<Hash256>{mine.hash});
+
+        REQUIRE(replica.import_history(rootless_entry(theirs)));
+        REQUIRE(replica.accept_commit(accepted_by_two(theirs)));
+        CHECK(hashes_of(replica.usable_heads()) == hashes_of({mine, theirs}));
+        CHECK(replica.set_aside_generation() == 0);
+
+        REQUIRE(replica.set_aside(theirs.hash, first));
+        CHECK(hashes_of(replica.usable_heads()) == std::vector<Hash256>{mine.hash});
+        CHECK(replica.set_aside_generation() == theirs.generation);
+        // A node keeps a head to work on.
+        CHECK(!replica.set_aside(mine.hash, first));
+
+        CHECK(replica.expire_set_aside(first + 999, horizon) == 0);
+        CHECK(hashes_of(replica.accepted_heads()) == hashes_of({mine, theirs}));
+        CHECK(replica.set_aside_generation() == theirs.generation);
+    }
+    {
+        // A reopened replica holds both heads as usable again, and still
+        // counts the wait from the first time the head was set aside.
+        MetadataReplica replica(path, keys.storage);
+        CHECK(hashes_of(replica.usable_heads()) == hashes_of({mine, theirs}));
+        CHECK(replica.set_aside_generation() == 0);
+        REQUIRE(replica.set_aside(theirs.hash, first + 600));
+        CHECK(replica.expire_set_aside(first + 999, horizon) == 0);
+        CHECK(replica.expire_set_aside(first + 1000, horizon) == 1);
+        CHECK(hashes_of(replica.accepted_heads()) == std::vector<Hash256>{mine.hash});
+        CHECK(hashes_of(replica.usable_heads()) == std::vector<Hash256>{mine.hash});
+        CHECK(replica.set_aside_generation() == 0);
+        CHECK(replica.committed().hash == mine.hash);
+        CHECK(replica.expire_set_aside(first + 100'000, horizon) == 0);
+    }
+    MetadataReplica reopened(path, keys.storage);
+    CHECK(hashes_of(reopened.accepted_heads()) == std::vector<Hash256>{mine.hash});
+}
+
+MACHA_FAST_TEST("storage_metadata", test_the_set_aside_time_of_a_head_no_longer_held_is_forgotten) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "set-aside-forgotten";
+    const auto a = author(1), b = author(2), c = author(3);
+
+    const auto genesis = genesis_metadata();
+    const auto mine = record_with_clock(genesis.generation + 1, genesis.hash, {{a, 1}}, {"/mine"});
+    const auto theirs =
+        record_with_clock(genesis.generation + 3, genesis.hash, {{b, 1}}, {"/theirs"});
+    // Carries both.
+    const auto merged = record_with_clock(theirs.generation + 1, mine.hash,
+                                          {{a, 1}, {b, 1}, {c, 1}}, {"/mine", "/theirs"});
+    const uint64_t first = 10'000;
+    const auto horizon = 1000ms;
+    const auto times = path / "metadata" / "set-aside.meta";
+
+    MetadataReplica replica(path, keys.storage);
+    REQUIRE(replica.store_commit(mine));
+    REQUIRE(replica.accept_commit(accepted_by_two(mine)));
+    REQUIRE(replica.import_history(rootless_entry(theirs)));
+    REQUIRE(replica.accept_commit(accepted_by_two(theirs)));
+    REQUIRE(replica.set_aside(theirs.hash, first));
+    const auto recorded = std::filesystem::file_size(times);
+
+    REQUIRE(replica.import_history(rootless_entry(merged)));
+    REQUIRE(replica.accept_commit(accepted_by_two(merged)));
+    CHECK(hashes_of(replica.accepted_heads()) == std::vector<Hash256>{merged.hash});
+    CHECK(replica.set_aside_generation() == 0);
+
+    CHECK(replica.expire_set_aside(first + 100'000, horizon) == 0);
+    CHECK(hashes_of(replica.accepted_heads()) == std::vector<Hash256>{merged.hash});
+    CHECK(std::filesystem::file_size(times) < recorded);
+}
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_accepted_authority) {
     TempDir t;

@@ -30,7 +30,7 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM17{'D', 'H', 'T', 'M', 'E', 'T', 'B', '7'}, SM18{'D', 'H', 'T', 'M', 'E', 'T', 'B', '8'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
-    MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'}, CP{'D', 'H', 'T', 'M', 'C', 'K', 'P', '1'},
+    MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'},
     MAUTHOR{'D', 'H', 'T', 'M', 'A', 'U', 'T', '1'};
 constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2, JOURNAL_SEED_FULL = 3,
                   JOURNAL_COMMIT = 4;
@@ -1935,48 +1935,6 @@ MetadataAcceptance decode_metadata_acceptance(std::span<const uint8_t> data) {
     return value;
 }
 
-Bytes encode_history_checkpoint_proof(const HistoryCheckpointProof& input) {
-    if (input.floor_hash == Hash256{})
-        throw std::runtime_error("bad history checkpoint proof floor hash");
-    if (input.participants.size() > 1000000)
-        throw std::runtime_error("too many history checkpoint proof participants");
-    Writer writer;
-    writer.fixed(input.floor_hash.bytes);
-    writer.u64(input.floor_generation);
-    writer.fixed(input.epoch.bytes);
-    writer.u8(static_cast<uint8_t>(input.status));
-    writer.u32(static_cast<uint32_t>(input.participants.size()));
-    for (const auto& participant : input.participants)
-        writer.fixed(participant.bytes);
-    return writer.take();
-}
-
-HistoryCheckpointProof decode_history_checkpoint_proof(std::span<const uint8_t> data) {
-    Reader reader(data);
-    HistoryCheckpointProof value;
-    value.floor_hash.bytes = reader.fixed<32>();
-    value.floor_generation = reader.u64();
-    value.epoch.bytes = reader.fixed<32>();
-    const auto raw_status = reader.u8();
-    if (raw_status != static_cast<uint8_t>(HistoryCheckpointProof::Status::acked) &&
-        raw_status != static_cast<uint8_t>(HistoryCheckpointProof::Status::committed))
-        throw DecodeError("bad history checkpoint proof status");
-    value.status = static_cast<HistoryCheckpointProof::Status>(raw_status);
-    const auto count = reader.u32();
-    if (count > 1000000)
-        throw DecodeError("too many history checkpoint proof participants");
-    value.participants.reserve(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        NodeId participant;
-        participant.bytes = reader.fixed<16>();
-        value.participants.push_back(participant);
-    }
-    reader.finish();
-    if (value.floor_hash == Hash256{})
-        throw DecodeError("bad history checkpoint proof floor hash");
-    return value;
-}
-
 Bytes encode_metadata_acceptance_set(const std::vector<MetadataAcceptance>& values) {
     if (values.size() > 1000000)
         throw std::runtime_error("too many metadata accepted heads");
@@ -2124,10 +2082,10 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
     : p_(r / "metadata" / "current.meta"), committed_p_(r / "metadata" / "committed.meta"),
       checkpoint_p_(r / "metadata" / "checkpoint.meta"), journal_p_(r / "metadata" / "journal.log"),
       history_p_(r / "metadata" / "history.log"), heads_p_(r / "metadata" / "heads.meta"),
-      checkpoint_proof_p_(r / "metadata" / "checkpoint-proof.meta"),
       mutation_sequence_p_(r / "metadata" / "mutation-sequence.meta"),
       author_p_(r / "metadata" / "author.meta"),
       author_chain_broken_p_(r / "metadata" / "author-chain-broken"),
+      set_aside_p_(r / "metadata" / "set-aside.meta"),
       recovery_p_(r / "metadata" / "recovery.required"), key_(k),
       namespace_applier_(std::move(namespace_applier)),
       accept_pristine_genesis_authority_(accept_pristine_genesis_authority),
@@ -2159,7 +2117,6 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
                 pending_recovered_ = cur_.hash != committed_.hash;
                 ensure_history_root(committed_);
                 load_heads();
-                load_checkpoint_proof();
                 // This checkpoint may come from the metadata cache: no legacy
                 // acceptance; only heads.meta from a peer recovery grants authority.
                 refresh_materialized_head_locked();
@@ -2190,7 +2147,6 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
             pending_recovered_ = cur_.hash != committed_.hash;
             ensure_history_root(committed_);
             load_heads();
-            load_checkpoint_proof();
             migrate_legacy_head_locked();
             refresh_materialized_head_locked();
             return;
@@ -2212,7 +2168,6 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
             load_history();
             ensure_history_root(committed_);
             load_heads();
-            load_checkpoint_proof();
             migrate_legacy_head_locked();
             refresh_materialized_head_locked();
             return;
@@ -2239,7 +2194,6 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
         load_history();
         ensure_history_root(committed_);
         load_heads();
-        load_checkpoint_proof();
         migrate_legacy_head_locked();
         refresh_materialized_head_locked();
 
@@ -2263,7 +2217,7 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
 
     std::vector<std::filesystem::path> quarantined;
     for (const auto& path :
-         {checkpoint_p_, journal_p_, history_p_, heads_p_, checkpoint_proof_p_, p_, committed_p_}) {
+         {checkpoint_p_, journal_p_, history_p_, heads_p_, p_, committed_p_}) {
         if (auto moved = quarantine_metadata_file(path, stamp))
             quarantined.push_back(*moved);
     }
@@ -2274,7 +2228,6 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
     load_history();
     ensure_history_root(seed);
     load_heads();
-    load_checkpoint_proof();
     // The cache seed is not accepted: it cannot stand in for the lost durable
     // acceptance evidence.
     refresh_materialized_head_locked();
@@ -3034,80 +2987,6 @@ void MetadataReplica::persist_heads_locked() {
     }
 }
 
-void MetadataReplica::load_checkpoint_proof() {
-    checkpoint_proof_.reset();
-    if (!std::filesystem::exists(checkpoint_proof_p_))
-        return;
-    try {
-        std::ifstream stream(checkpoint_proof_p_, std::ios::binary);
-        if (!stream)
-            throw std::runtime_error("cannot open");
-        Bytes bytes(std::istreambuf_iterator<char>(stream), {});
-        Reader reader(bytes);
-        auto magic = reader.raw(8);
-        if (!std::equal(magic.begin(), magic.end(), CP.begin()))
-            throw std::runtime_error("bad metadata checkpoint proof file header");
-        auto nonce = reader.fixed<12>();
-        auto tag = reader.fixed<16>();
-        auto ciphertext = reader.bytes();
-        reader.finish();
-        auto proof =
-            decode_history_checkpoint_proof(aes_gcm_open(key_, nonce, tag, ciphertext, CP));
-        // Kept only if committed and matching committed_ (already loaded);
-        // see HistoryCheckpointProof.
-        if (proof.status == HistoryCheckpointProof::Status::committed &&
-            proof.floor_hash == committed_.hash)
-            checkpoint_proof_ = std::move(proof);
-    } catch (const std::exception& error) {
-        // An unreadable proof is no proof; startup continues.
-        Log::warn("metadata checkpoint proof file " + checkpoint_proof_p_.string() +
-                  " ignored: " + std::string(error.what()));
-    }
-}
-
-void MetadataReplica::persist_checkpoint_proof_locked() {
-    if (!checkpoint_proof_)
-        return;
-    auto plaintext = encode_history_checkpoint_proof(*checkpoint_proof_);
-    auto sealed = aes_gcm_seal(key_, plaintext, CP);
-    Writer writer;
-    writer.raw(CP);
-    writer.fixed(sealed.nonce);
-    writer.fixed(sealed.tag);
-    writer.bytes(sealed.ciphertext);
-    writefile(checkpoint_proof_p_, writer.data());
-}
-
-std::optional<HistoryCheckpointProof> MetadataReplica::checkpoint_proof() const {
-    Lock lock(m_);
-    return checkpoint_proof_;
-}
-
-bool MetadataReplica::record_checkpoint_ack(HistoryCheckpointProof proposal) {
-    Lock durable_lock(durable_mutation_m_);
-    proposal.status = HistoryCheckpointProof::Status::acked;
-    Lock lock(m_);
-    // Ack only while the floor is the sole accepted head (as
-    // compact_history_if_safe() requires); the proposer's survey may be stale.
-    if (accepted_heads_.size() != 1 || !accepted_heads_.contains(proposal.floor_hash))
-        return false;
-    // One proposal is tracked at a time; a new one supersedes it.
-    checkpoint_proof_ = std::move(proposal);
-    persist_checkpoint_proof_locked();
-    return true;
-}
-
-bool MetadataReplica::record_checkpoint_commit(const Hash256& floor_hash, const Hash256& epoch) {
-    Lock durable_lock(durable_mutation_m_);
-    Lock lock(m_);
-    if (!checkpoint_proof_ || checkpoint_proof_->floor_hash != floor_hash ||
-        checkpoint_proof_->epoch != epoch)
-        return false;
-    checkpoint_proof_->status = HistoryCheckpointProof::Status::committed;
-    persist_checkpoint_proof_locked();
-    return true;
-}
-
 bool MetadataReplica::prune_accepted_heads_locked() {
     bool changed = false;
     for (auto it = accepted_heads_.begin(); it != accepted_heads_.end();) {
@@ -3144,17 +3023,22 @@ bool MetadataReplica::accepted_head_is_ancestor_locked(const Hash256& ancestor,
         return materialized && materialized->record.generation > genesis.generation;
     }
 
-    // A committed checkpoint proof is the same kind of fact: every participant
-    // proved `ancestor` the sole accepted head (see HistoryCheckpointProof).
-    // Peers may since have compacted away the connecting edges, so trust the
-    // floor as an ancestor of any later generation. Other rootless records
-    // (import_history(), ensure_history_root()) carry no such proof.
-    if (checkpoint_proof_ && checkpoint_proof_->status == HistoryCheckpointProof::Status::committed &&
-        checkpoint_proof_->floor_hash == ancestor) {
-        auto materialized = materialized_locked(descendant);
-        return materialized && materialized->record.generation > checkpoint_proof_->floor_generation;
-    }
-    return false;
+    // History is truncated by each node on its own, so the edge between two
+    // heads may be gone. The clocks still say it: a head whose clock covers
+    // another's and goes beyond it has incorporated every mutation the other
+    // holds.
+    const auto older = materialized_locked(ancestor);
+    const auto newer = materialized_locked(descendant);
+    if (!older || !newer)
+        return false;
+    const auto& behind = older->snapshot->mutation_sequences;
+    const auto& ahead = newer->snapshot->mutation_sequences;
+    // A head with no clock says nothing about what it holds.
+    return !behind.empty() && behind != ahead &&
+           std::all_of(behind.begin(), behind.end(), [&](const auto& item) {
+               const auto found = ahead.find(item.first);
+               return found != ahead.end() && found->second >= item.second;
+           });
 }
 
 void MetadataReplica::migrate_legacy_head_locked() {
@@ -3304,14 +3188,86 @@ void MetadataReplica::note_set_aside_locked() {
     set_aside_generation_.store(highest, std::memory_order_release);
 }
 
-bool MetadataReplica::set_aside(const Hash256& hash) {
+void MetadataReplica::load_set_aside_since_locked() {
+    if (set_aside_since_loaded_)
+        return;
+    set_aside_since_loaded_ = true;
+    std::ifstream stream(set_aside_p_, std::ios::binary);
+    if (!stream)
+        return;
+    const Bytes bytes(std::istreambuf_iterator<char>(stream), {});
+    try {
+        Reader reader(bytes);
+        const auto count = reader.u32();
+        if (count > 4096)
+            throw DecodeError("too many set-aside heads");
+        for (uint32_t i = 0; i < count; ++i) {
+            Hash256 hash{reader.fixed<32>()};
+            set_aside_since_.emplace(hash, reader.u64());
+        }
+        reader.finish();
+    } catch (const std::exception& error) {
+        // Lost times only restart the wait.
+        Log::warn("metadata set-aside record unreadable: " + std::string(error.what()));
+        set_aside_since_.clear();
+    }
+}
+
+void MetadataReplica::persist_set_aside_since_locked() {
+    Writer writer;
+    writer.u32(static_cast<uint32_t>(set_aside_since_.size()));
+    for (const auto& [hash, since] : set_aside_since_) {
+        writer.fixed(hash.bytes);
+        writer.u64(since);
+    }
+    writefile(set_aside_p_, writer.data());
+}
+
+bool MetadataReplica::set_aside(const Hash256& hash, uint64_t now_unix_ms) {
     Lock lock(m_);
     const auto found = accepted_heads_.find(hash);
     if (found == accepted_heads_.end() || set_aside_.size() + 1 >= accepted_heads_.size())
         return false;
     set_aside_.emplace(hash, found->second.generation);
+    load_set_aside_since_locked();
+    if (set_aside_since_.try_emplace(hash, now_unix_ms).second)
+        persist_set_aside_since_locked();
     refresh_materialized_head_locked();
     return true;
+}
+
+size_t MetadataReplica::expire_set_aside(uint64_t now_unix_ms, std::chrono::milliseconds horizon) {
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
+    load_set_aside_since_locked();
+    if (set_aside_since_.empty())
+        return 0;
+    size_t dropped = 0;
+    bool changed = false;
+    for (auto it = set_aside_since_.begin(); it != set_aside_since_.end();) {
+        const bool held = accepted_heads_.contains(it->first);
+        const bool expired = held && set_aside_.contains(it->first) &&
+                             accepted_heads_.size() > 1 && now_unix_ms >= it->second &&
+                             now_unix_ms - it->second >= static_cast<uint64_t>(horizon.count());
+        if (expired) {
+            accepted_heads_.erase(it->first);
+            set_aside_.erase(it->first);
+            ++dropped;
+        }
+        if (expired || !held) {
+            it = set_aside_since_.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    if (changed)
+        persist_set_aside_since_locked();
+    if (dropped) {
+        persist_heads_locked();
+        refresh_materialized_head_locked();
+    }
+    return dropped;
 }
 
 void MetadataReplica::clear_set_aside() {
@@ -4509,7 +4465,7 @@ bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
     durable_replace_file(author_chain_broken_p_, reason);
     std::vector<std::filesystem::path> quarantined;
     for (const auto& path :
-         {checkpoint_p_, journal_p_, history_p_, heads_p_, checkpoint_proof_p_, p_, committed_p_}) {
+         {checkpoint_p_, journal_p_, history_p_, heads_p_, p_, committed_p_}) {
         if (auto moved = quarantine_metadata_file(path, stamp))
             quarantined.push_back(*moved);
     }
@@ -4520,7 +4476,6 @@ bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
     load_history();
     ensure_history_root(record);
     load_heads();
-    load_checkpoint_proof();
 
     // The record must be an accepted head or the node refuses to serve. The
     // certificate names the operator-named nodes being re-rooted onto this
@@ -4695,8 +4650,8 @@ bool MetadataReplica::compact_history_if_safe(size_t record_threshold, uint64_t 
         !accepted_heads_.contains(committed_.hash))
         return false;
 
-    // Re-root the sole accepted head as a full entry; previous_known=false sets
-    // the local ancestry floor once every participant has converged past it.
+    // The sole accepted head becomes a full entry with no known previous:
+    // the root of this node's history.
     MetadataHistoryEntry root;
     root.generation = committed_.generation;
     root.previous = committed_.previous;

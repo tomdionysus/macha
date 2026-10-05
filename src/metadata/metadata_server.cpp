@@ -194,22 +194,6 @@ void MetadataServer::bind_routes() {
               writer.u8(accept_commit(acceptance));
               return {MessageType::bool_reply, writer.take()};
           });
-    route(MessageType::propose_history_floor,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              auto proposal = decode_history_checkpoint_proof(request.payload);
-              Writer writer;
-              writer.u8(replica_.record_checkpoint_ack(proposal));
-              return {MessageType::bool_reply, writer.take()};
-          });
-    route(MessageType::commit_history_floor,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              auto commit = decode_history_checkpoint_proof(request.payload);
-              Writer writer;
-              writer.u8(replica_.record_checkpoint_commit(commit.floor_hash, commit.epoch));
-              return {MessageType::bool_reply, writer.take()};
-          });
 }
 
 } // namespace macha

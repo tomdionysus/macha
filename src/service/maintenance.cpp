@@ -993,11 +993,6 @@ void Maintenance::run(std::stop_token stop) {
                 (void)ledger_.compact_if_needed(4096);
             }
 
-            // Metadata ancestry is re-rooted only once a durable cluster-wide proof shows
-            // every durably-known participant's ancestry floor at the same accepted head
-            // (MetadataManager::attempt_history_checkpoint(), HistoryCheckpointProof).
-            // Usually a no-op: it returns unless size thresholds are due, and aborts,
-            // retrying next cycle, unless every participant is reachable and agrees.
             // An accepted head this replica cannot replay is excluded from reads
             // (MetadataReplica cooldown) and re-anchored here from any peer that can
             // materialize it. A no-op unless a head is flagged.
@@ -1011,10 +1006,10 @@ void Maintenance::run(std::stop_token stop) {
 
             if (!busy) {
                 try {
-                    enter_stage("history-checkpoint");
-                    metadata_upkeep_.attempt_history_checkpoint();
+                    enter_stage("history-truncate");
+                    metadata_upkeep_.truncate_history();
                 } catch (const std::exception& error) {
-                    Log::debug("maintenance: history checkpoint attempt failed: " +
+                    Log::debug("maintenance: history truncation failed: " +
                                std::string(error.what()));
                 }
             }
