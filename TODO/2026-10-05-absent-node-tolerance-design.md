@@ -4,7 +4,11 @@
 stable file identity added to stage B.*
 
 **Status, 2026-10-05.** Implemented on `experiment/object-ledger-t5`: stages A and C as 0.88.0,
-stage B as 0.89.0 (protocol 23). Neither is deployed. Differences from the text below, as built:
+stage B as 0.89.0 (protocol 23). Both nodes run them (0.89.0 deployed 2026-10-05, then 0.89.1).
+For namespace operations, decision 2's wait for a second copy is superseded by the
+[local-first filesystem plan](2026-10-05-local-first-filesystem-plan.md): the caller is answered
+from the local journal and the publisher seeks the second copy. Differences from the text below,
+as built:
 
 - Stage A's "history is kept for H" was not needed: stage B followed directly, so no merge reads
   history.
