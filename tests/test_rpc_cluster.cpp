@@ -4529,6 +4529,11 @@ MACHA_TEST("rpc_cluster", test_the_maintenance_inventory_follows_the_tree_it_was
         CHECK(followed->entries == walked.entries);
         CHECK(followed->extents == walked.extents);
         CHECK(followed->garbage == walked.garbage);
+        // What the release horizon is given in place of its own walk.
+        const auto counted = fs.namespace_references(service.metadata_manager().snapshot());
+        REQUIRE(counted.has_value());
+        CHECK(counted->extents == walked.live);
+        CHECK(counted->nodes == walked.namespace_nodes);
         return followed->live == walked.live &&
                followed->namespace_nodes == walked.namespace_nodes;
     };
