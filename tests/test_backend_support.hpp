@@ -651,6 +651,9 @@ class HeldLoaderAdmission final : public LoaderAdmission {
     void release() { set(false); }
 
     bool can_start(TimePoint) override { return !held_.load(std::memory_order_acquire); }
+    bool namespace_can_start(TimePoint) override {
+        return !held_.load(std::memory_order_acquire);
+    }
     void started(TimePoint, bool) override {}
     void service_started(TimePoint) override {}
     bool should_yield(TimePoint) override { return held_.load(std::memory_order_acquire); }

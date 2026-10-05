@@ -512,6 +512,10 @@ class FileSystem final : public PublicationTarget {
     // id) in path order, and the head they are of. From the index: no
     // namespace walk once it is built.
     std::vector<std::pair<std::string, std::string>> media_files(MetadataSnapshotView& of);
+    // The file at `path` if its content is `id`, without its extents: an
+    // index lookup and one stat-only read. None also when `path` is another
+    // spelling of the name the file is kept under.
+    std::optional<FsEntry> media_stat(std::string_view id, std::string_view path);
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool, bool cache_puts = false,
                                             WriteDurability = WriteDurability::immediate,
                                             uint64_t publication_pipeline_bytes = 0,
