@@ -171,7 +171,8 @@ bool AvailabilitySurvey::is_unknown(const ObjectId& id) const {
 
 AvailabilitySurvey survey_availability(const HoldingsRollup& local,
                                        const NamespaceNodeStore& store, const HeldFn& held,
-                                       std::span<PeerHoldings* const> peers) {
+                                       std::span<PeerHoldings* const> peers,
+                                       const SurveyMemo* known, SurveyMemo* made) {
     AvailabilitySurvey survey;
     survey.peers_asked = peers.size();
     std::vector<PeerHoldings*> asking(peers.begin(), peers.end());
@@ -181,13 +182,40 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
         frontier.push_back(local.root());
 
     while (!frontier.empty()) {
-        ++survey.rounds;
-        survey.nodes_asked += frontier.size();
+        std::set<ObjectId> next;
+        const auto settle = [&](const ObjectId& node, SurveyMemo::Node outcome) {
+            survey.unavailable.insert(survey.unavailable.end(), outcome.unavailable.begin(),
+                                      outcome.unavailable.end());
+            next.insert(outcome.descend.begin(), outcome.descend.end());
+            if (made)
+                made->nodes.insert_or_assign(node, std::move(outcome));
+        };
+
+        // What an earlier survey settled is settled; the rest is asked about.
+        std::vector<ObjectId> asked;
+        for (const auto& node : frontier) {
+            if (!known || !known->nodes.contains(node)) {
+                asked.push_back(node);
+                continue;
+            }
+            // Less what this node has gained since.
+            auto outcome = known->nodes.find(node)->second;
+            std::erase_if(outcome.unavailable, held);
+            std::erase_if(outcome.descend, [&](const ObjectId& child) {
+                const auto here = local.find(child);
+                return here && here->complete();
+            });
+            settle(node, std::move(outcome));
+        }
+        if (!asked.empty()) {
+            ++survey.rounds;
+            survey.nodes_asked += asked.size();
+        }
         std::vector<std::vector<NodeHoldings>> answers;
-        for (auto peer = asking.begin(); peer != asking.end();) {
+        for (auto peer = asking.begin(); !asked.empty() && peer != asking.end();) {
             try {
-                auto answer = (*peer)->ask(frontier);
-                if (answer.size() != frontier.size())
+                auto answer = (*peer)->ask(asked);
+                if (answer.size() != asked.size())
                     throw std::runtime_error("peer answered a different number of tree nodes");
                 answers.push_back(std::move(answer));
                 ++peer;
@@ -197,14 +225,15 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
             }
         }
 
-        std::set<ObjectId> next;
-        for (size_t i = 0; i < frontier.size(); ++i) {
+        for (size_t i = 0; i < asked.size(); ++i) {
             const auto whole = [&](const std::vector<NodeHoldings>& answer) {
                 return answer[i].known && answer[i].holding.complete();
             };
-            if (std::any_of(answers.begin(), answers.end(), whole))
+            if (std::any_of(answers.begin(), answers.end(), whole)) {
+                settle(asked[i], {});
                 continue;
-            const auto children = namespace_tree_children(read_node(store, frontier[i]));
+            }
+            const auto children = namespace_tree_children(read_node(store, asked[i]));
             // A peer describes this node only if it answered one flag per child.
             std::vector<const NodeHoldings*> describing;
             for (const auto& answer : answers)
@@ -212,6 +241,8 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
                     describing.push_back(&answer[i]);
             // Every asked peer described it, so what none holds, nobody holds.
             const bool described = describing.size() == peers.size();
+            SurveyMemo::Node outcome;
+            std::vector<ObjectId> undecided;
             for (size_t c = 0; c < children.size(); ++c) {
                 const auto& child = children[c];
                 const bool a_peer_has =
@@ -222,14 +253,21 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
                 if (child.extent) {
                     if (held(child.id))
                         continue;
-                    (described ? survey.unavailable : survey.unknown).push_back(child.id);
+                    (described ? outcome.unavailable : undecided).push_back(child.id);
                 } else {
                     const auto here = local.find(child.id);
                     if (here && here->complete())
                         continue;
-                    next.insert(child.id);
+                    outcome.descend.push_back(child.id);
                 }
             }
+            if (described) {
+                settle(asked[i], std::move(outcome));
+                continue;
+            }
+            // Not kept: a peer that could not describe it may yet.
+            survey.unknown.insert(survey.unknown.end(), undecided.begin(), undecided.end());
+            next.insert(outcome.descend.begin(), outcome.descend.end());
         }
         frontier.assign(next.begin(), next.end());
     }
