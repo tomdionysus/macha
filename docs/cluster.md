@@ -4,7 +4,7 @@
 
 Each node has a persistent random node ID, advertised endpoint, configured failure domain and DATA capacity. Bootstrap endpoints are discovery seeds, not masters. Once connected, peers exchange membership and maintain separate CONTROL and DATA transport lanes.
 
-The cluster protocol version is 21. Mixed-version operation is rejected at the
+The cluster protocol version is 23. Mixed-version operation is rejected at the
 handshake rather than negotiated down, so every node in a cluster runs the same
 version and a protocol change is a rolling upgrade of the whole cluster.
 
@@ -25,7 +25,7 @@ A namespace commit is accepted once the committing node durably holds it and its
 
 Commit storage is intentionally independent of a receiving node's current head. A replica can retain several accepted maximal heads when partitions have produced independent histories. The certificate records which nodes held the commit when it was accepted and does not vanish when one of them later goes offline.
 
-This availability model permits separated nodes to advance different valid histories. When they reconnect, accepted heads and compact ancestry are exchanged. Ancestor heads collapse; divergent heads are reconciled through immutable multi-parent commits. Non-conflicting namespace changes merge automatically and incompatible alternatives are preserved as first-class conflicts rather than silently discarded. A head that cannot be merged with the node's own (no common ancestor is known, or its content cannot be fetched from any node present) is set aside until the membership changes: reads serve the node's own head and writes extend it.
+This availability model permits separated nodes to advance different valid histories. When they reconnect, accepted heads are exchanged. Ancestor heads collapse; divergent heads are reconciled through immutable multi-parent commits, each computed from the two heads alone, with no common ancestor and no history needed (see [Metadata replication and reconciliation](metadata.md)). Non-conflicting namespace changes merge automatically and concurrent alternatives are preserved as first-class conflicts rather than silently discarded. A head whose namespace cannot be fetched from any node present is set aside until the membership changes: reads serve the node's own head and writes extend it. A head set aside for `maintenance.garbage_grace_ms` is dropped.
 
 Catalogue control objects and namespace tree nodes are valid on the committing node in the same way, then converge to the other active nodes.
 
@@ -58,6 +58,6 @@ No external catalogue provider is required for correctness recovery.
 
 ## Joining and rejoining nodes
 
-A joining node starts with its own empty DATA/control stores and learns current membership, accepted metadata heads and ancestry. It may store an accepted head regardless of which local head it previously exposed. DATA objects are pulled only according to placement/repair policy. Catalogue control objects are converged to active metadata replicas. Artwork remains ordinary DATA and is not pulled merely because a node stores metadata.
+A joining node starts with its own empty DATA/control stores and learns current membership and the accepted metadata heads. It may store an accepted head regardless of which local head it previously exposed. DATA objects are pulled only according to placement/repair policy. Catalogue control objects are converged to active metadata replicas. Artwork remains ordinary DATA and is not pulled merely because a node stores metadata.
 
-A returning node's immutable objects and accepted metadata branches are reusable after validation. Reconciliation determines metadata ancestry; DATA placement/repair decides which objects remain useful. The returning node removes an object no longer referenced only once it has itself seen it unreferenced for `maintenance.garbage_grace_ms`, so it deletes nothing on the strength of what happened while it was away.
+A returning node's immutable objects and accepted metadata branches are reusable after validation. Its head is merged with the cluster's from what the two heads hold, however long it was away; DATA placement/repair decides which objects remain useful. The returning node removes an object no longer referenced only once it has itself seen it unreferenced for `maintenance.garbage_grace_ms`, so it deletes nothing on the strength of what happened while it was away.

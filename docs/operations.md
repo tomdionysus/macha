@@ -31,7 +31,7 @@ A node whose peers are all absent, for a minute or for good, keeps reading and w
 
 Media is readable where a node present holds its extents; the availability survey reports the rest (see [Files and availability](files.md)). A rename, a chmod or an append to a file whose older extents live on an absent node commits. The one refusal is a commit that brings new bytes into the namespace when no node present holds those bytes (`DATA object is held by no node present before metadata publication`); the writer still has them and puts them again.
 
-If the absent nodes wrote too, there are two accepted heads when they return, and they are merged. A second head that cannot be merged with the node's own (no common ancestor is known, or its content cannot be fetched from any node present) is set aside until the membership changes: reads serve the node's own head and writes extend it. `diagnostics.metadata.heads_set_aside` counts them, and each is logged once as `metadata head set aside until membership changes`.
+If the absent nodes wrote too, there are two accepted heads when they return, and they are merged. The merge reads the two heads only, so it does not matter how long the nodes were apart or what history either still holds. A second head whose namespace cannot be fetched from any node present is set aside until the membership changes: reads serve the node's own head and writes extend it. `diagnostics.metadata.heads_set_aside` counts them, and each is logged once as `metadata head set aside until membership changes`. A head set aside for `maintenance.garbage_grace_ms` is dropped and logged as `metadata: dropped N head(s) set aside for the absence horizon; their content never arrived`; the times are kept in `<state_path>/metadata/set-aside.meta`.
 
 A node not heard of for `maintenance.garbage_grace_ms` (never sooner than twice `network.dead_after_ms`) is dropped from each node's known-node roster and logged as `membership: forgot N node(s) not heard of for the absence horizon`. Gossip that old does not teach it back; if it returns, its own connection does, and its namespace is merged like any other. An identity reset (see [Management](management.md)) removes a node sooner.
 
@@ -187,8 +187,8 @@ under `diagnostics`:
   persistence writes, encoded bytes, and failures; `head_holders` (how many of
   the nodes present held the current head at the last repair pass),
   `head_holders_present` (how many nodes were present at it) and
-  `heads_set_aside` (accepted heads waiting, unmergeable, for the membership
-  to change);
+  `heads_set_aside` (accepted heads whose namespace no node present can
+  supply, waiting for the membership to change);
 - `rpc_server` reports current metadata queue jobs/bytes, active and rejected
   jobs, plus request count, total/max queue wait, and total/max handler time in
   microseconds, grouped by wire message and frame class;
@@ -506,7 +506,7 @@ storage is ready — from briefly looking like real data loss in the cluster
 aggregate; `cluster.conditions` reports "one or more online nodes are still
 recovering" for that window instead.
 
-Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=unavailable reason="local metadata state ready"`. Routine negative checkpoint acknowledgements are silent because they are normal convergence decisions; transport/checkpoint exceptions remain diagnostic.
+Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=unavailable reason="local metadata state ready"`.
 
 `POST /api/v1/status/connectivity/check` and the node-specific equivalent perform diagnostic connectivity checks without changing cluster configuration. State-changing administrative operations belong under `/api/v1/manage`.
 
@@ -541,6 +541,21 @@ carries only its root; `--objects` names the control object store so the tree
 can be walked, the delta chain actually replayed (naming the first frame that
 diverges), and a stat timed against it.
 
+## Restoring a node's state from a copy
+
+A node authors its metadata mutations under an author id and a sequence kept
+in `<state_path>/metadata/author.meta`, and no sequence may be used twice.
+After restoring a node's state from a backup, delete `metadata/author.meta`
+before starting it (and `metadata/mutation-sequence.meta`, if that file is
+present): a node that has authored before then takes a new
+author id and starts again at 1, logged as `metadata author record missing;
+authoring as a new author`.
+
+A node also takes a new author id by itself, logged as `metadata author chain
+cannot be continued (...); authoring as a new author`, when the head it is
+about to extend lacks a mutation it had accepted or its head set was replaced
+by a recovery from the cache seed or by a re-root.
+
 ## Inspecting a replica's heads offline
 
 `macha-metadata-repair STATE_PATH KEY_FILE` reads a stopped node's metadata
@@ -571,8 +586,8 @@ node produced, `--witness NODE_ID` (once per node)
 names the nodes being re-rooted, `--adopt FILE` installs a record written by
 `--export-record` on the node migrated first (for a node that stopped a few
 commits behind it, after proving this node's namespace produces the same tree
-root), and `--dry-run` installs nothing. The previous checkpoint, journal, history, heads and
-acceptance proof are kept beside the originals with a `.pre-migration.<ns>`
+root), and `--dry-run` installs nothing. The previous checkpoint, journal, history and heads
+are kept beside the originals with a `.pre-migration.<ns>`
 suffix rather than deleted; no extent is touched.
 
 Once the nodes are started the namespace is served and written from the

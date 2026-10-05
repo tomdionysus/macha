@@ -123,15 +123,19 @@ carry the counts.
 ## Metadata conflicts
 
 When two branches of the namespace changed the same path (or the catalogue
-root) differently and are reconciled, the merge keeps the common-ancestor
-value visible and records both alternatives as a first-class conflict. A
+root) concurrently and are reconciled, the merge installs the alternative
+with the later modification time (for the catalogue root, the one with the
+greater dot), which is what the namespace serves, and records both
+alternatives as a first-class conflict. A
 conflict leaves the snapshot in one of two ways: a later mutation of its
 subject decides it (any write to or removal of the path, or a new catalogue
 root — the later write *is* the resolution, and the record is pruned at the
-next commit or merge), or an operator resolves it here.
+next commit or merge), or an operator resolves it here. A resolution is
+itself a change of the subject, even when it keeps the value in place, so a
+head that has not seen it does not bring the conflict back.
 
-- `GET /api/v1/manage/metadata/conflicts` → `{"generation": N, "conflicts": [{id, kind: "namespace_entry"|"catalogue_root", key, left_head, right_head, base, left, right}]}` — for a namespace entry `base`/`left`/`right` are `{type, size, mtime_ns, version, extents}` or `null` (absent on that side); for a catalogue root they are object ids or `null`.
-- `POST /api/v1/manage/metadata/conflicts/{id}/resolve?choice=left|right|base` — installs that alternative for the subject and drops the record in one metadata commit (`204`; `409 not_standing` if the conflict is no longer standing; `400 bad_choice`). Both routes answer `503 metadata_unavailable` while no metadata snapshot is available.
+- `GET /api/v1/manage/metadata/conflicts` → `{"generation": N, "conflicts": [{id, kind: "namespace_entry"|"catalogue_root", key, installed: "left"|"base", left_head, right_head, base, left, right}]}` — `installed` names the alternative the namespace holds until the conflict is decided. It is `left` for a conflict recorded by a merge, whose `left` is the value in place, `right` the other alternative and `base` `null`. It is `base` only for a record made by an older build, whose `base` is the common-ancestor value then in place. For a namespace entry `base`/`left`/`right` are `{type, size, mtime_ns, version, extents}` or `null` (absent); for a catalogue root they are object ids or `null`. `left_head` and `right_head` are all zeros on a namespace-entry conflict recorded by a merge.
+- `POST /api/v1/manage/metadata/conflicts/{id}/resolve?choice=left|right|base` — installs that alternative for the subject and drops the record in one metadata commit; `choice=base` on a record whose `base` is `null` removes the path, or clears the catalogue root (`204`; `409 not_standing` if the conflict is no longer standing; `400 bad_choice`). Both routes answer `503 metadata_unavailable` while no metadata snapshot is available.
 
 `diagnostics.metadata.{conflicts, namespace_conflicts, catalogue_conflicts}`
 in `GET /api/v1/status` are the standing counts;
