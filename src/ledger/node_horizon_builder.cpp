@@ -23,19 +23,26 @@ std::shared_ptr<const InventoryHorizon> build_inventory(const MaintenanceObjects
 }
 
 ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNodeStore& nodes,
-                           const CatalogueRetentionSource& catalogue) {
+                           const CatalogueRetentionSource& catalogue,
+                           const NamespaceReferences* counted) {
     std::vector<ObjectId> data;
     std::vector<ObjectId> control;
     bool complete = true;
     // The live set destructive GC acts on: an empty one means "collect
-    // everything".
-    for_each_namespace_entry(*head.snapshot, &nodes, [&](const std::string&, const FsEntry& entry) {
-        if (entry.type != EntryType::file)
-            return;
-        for (const auto& extent_ref : entry.extents)
-            if (!extent_ref.hole)
-                data.push_back(extent_ref.id);
-    });
+    // everything". What the namespace refers to is taken as already counted
+    // at this head's tree when it is given, and walked for otherwise.
+    if (counted) {
+        data = counted->extents;
+    } else {
+        for_each_namespace_entry(*head.snapshot, &nodes,
+                                 [&](const std::string&, const FsEntry& entry) {
+            if (entry.type != EntryType::file)
+                return;
+            for (const auto& extent_ref : entry.extents)
+                if (!extent_ref.hole)
+                    data.push_back(extent_ref.id);
+        });
+    }
     const auto conflict_extents = metadata_conflict_extent_roots(*head.snapshot);
     data.insert(data.end(), conflict_extents.begin(), conflict_extents.end());
 
@@ -53,7 +60,9 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
     // The namespace tree's own nodes: omitting them would let the collector
     // delete the namespace, so an unreadable node marks the whole set
     // incomplete and nothing is released against it.
-    if (head.snapshot->namespace_root) {
+    if (counted) {
+        control.insert(control.end(), counted->nodes.begin(), counted->nodes.end());
+    } else if (head.snapshot->namespace_root) {
         try {
             collect_namespace_tree_nodes(*head.snapshot->namespace_root, nodes, control);
         } catch (const std::exception& error) {
@@ -83,9 +92,17 @@ NodeHorizonBuilder::inventory(const MaintenanceObjects& namespace_objects,
 
 ReleaseBuild NodeHorizonBuilder::release(const MetadataSnapshotView& head) {
     auto nodes = ControlNamespaceNodeStore::for_reading(control_, store_);
-    return build_release(head, nodes, [this](const ObjectId& root) {
-        return catalogue_.retention_objects(std::nullopt, root);
-    });
+    // The filesystem's census, brought to this head's tree: no walk.
+    std::optional<NamespaceReferences> counted;
+    try {
+        counted = filesystem_.namespace_references(*head.snapshot);
+    } catch (const std::exception& error) {
+        Log::debug("retention release horizon walks the namespace: " + std::string(error.what()));
+    }
+    return build_release(
+        head, nodes,
+        [this](const ObjectId& root) { return catalogue_.retention_objects(std::nullopt, root); },
+        counted ? &*counted : nullptr);
 }
 
 } // namespace macha

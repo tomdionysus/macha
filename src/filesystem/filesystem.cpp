@@ -2655,6 +2655,18 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     return maintenance_index_;
 }
 
+std::optional<NamespaceReferences>
+FileSystem::namespace_references(const MetadataSnapshot& snapshot) {
+    if (!snapshot.namespace_root)
+        return {};
+    Lock building(maintenance_build_mutex_);
+    if (!maintenance_census_.root || (*maintenance_census_.root != *snapshot.namespace_root &&
+                                      !census_follow(*snapshot.namespace_root, maintenance_census_)))
+        census_walk(snapshot, maintenance_census_);
+    return NamespaceReferences{distinct(maintenance_census_.extents),
+                               distinct(maintenance_census_.nodes)};
+}
+
 MaintenanceObjects FileSystem::maintenance_objects() {
     const auto view = m_.converged();
     NamespaceCensus census;
