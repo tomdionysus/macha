@@ -2,8 +2,8 @@
 
 *2026-10-05. Approved by the operator the same day ("implement the plan").*
 
-**Status, 2026-10-05: stage 1 built bar the items listed; stage 2 begun.
-0.90.6 on both nodes, 0.90.7 building.**
+**Status, 2026-10-05: stage 1 built bar the items listed; stages 2 and 3
+begun. 0.90.9 on both nodes.**
 
 Measured on fi-1 (both nodes on the same build, the peer across the WAN):
 
@@ -44,6 +44,15 @@ Built:
   through the media index (3.6 in part; 0.90.6).
 - The management API logs why a write was refused or a request failed
   (0.90.7), which covers the provider 503s that left no trace.
+- **Stage 3, in part**: a catalogue loaded from its root keeps its keyframe
+  indexes, which it had been dropping; a catalogue commit's claims decode
+  only changed shards (4.2); a write does not re-read artwork held here
+  (0.90.8). The editor's provider calls run on four provider sets instead of
+  queueing behind one lock (4.6; 0.90.9). The scanner's namespace check reads
+  this node's own head (0.90.9).
+- Measured on 0.90.7: ten namespace-only commits, then one maintenance pass
+  ending with the availability survey about a minute later (seven round
+  trips to the peer, 2,839 tree nodes asked), then idle under 1% of a core.
 
 How this differs from the design as written: the journal has not moved. With
 the commit made local, a caller outside FUSE is answered from a durable
@@ -71,9 +80,12 @@ Not built yet:
   time (3.5); the catalogue scan 10 s after any namespace commit (3.6). After
   a commit on 0.90.5 the maintenance thread still ran for 20 to 30 s at about
   20% of a core; what of that remains on 0.90.7 is to be measured.
-- The rest of stage 3: the catalogue's whole re-encode per write (4.1, 4.2),
-  match and artwork (4.4, 4.5), the hint store (4.9), provider locks (4.6),
-  per-request catalogue scans (4.10).
+- The rest of stage 3: the catalogue's whole re-encode per write (4.1); a
+  match's artwork downloads in series (4.4: the test HTTP clients are not
+  safe to call concurrently, so this waits on them); artwork choice repeating
+  the options call (4.5); the hint store's whole-file rewrite per change
+  (4.9, small at 1,500 hints); per-request catalogue scans (4.10). A
+  multi-file match has not been measured on the cluster since 0.90.9.
 - A testing gap found and closed for what is built: a new test cluster keeps
   its namespace as a map, so service-level tests exercise the tree paths only
   where they migrate first (`tests/test_namespace_migration.cpp`). New

@@ -1,7 +1,7 @@
 # Active tasks
 
 Last updated: 2026-10-05, on `experiment/object-ledger-t5`. Both nodes run
-0.90.6; see entry 1's plan for what each 0.90.x carries.
+0.90.9; see entry 1's plan for what each 0.90.x carries.
 
 This is the ordered list of open work. `COMPLETED.md` is the ledger of
 finished work; `BACKLOG.md` holds the older P-1 to P2 sections, written
@@ -79,13 +79,13 @@ Plan: [stage 0](2026-09-29-object-ledger-implementation-plan.md). Evidence:
 ## Cluster state (2026-10-05)
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.6** (tarball md5
-  `78b67b8fff830839f00cac7b8791f78f`), **cluster protocol 23**, installed
-  14:30Z (fi-1) and 14:31Z (gbni-1). es-1 is offline indefinitely.
+  (10.35.1.10) run **0.90.9** (tarball md5
+  `1fc3ff6c445c76a6d20bf48a8d1fc07e`), **cluster protocol 23**, installed
+  15:26Z (fi-1) and 15:27Z (gbni-1). es-1 is offline indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
 - Rollback material on each node: `/root/pre-<version>/` holds the binaries
-  and config in place before that version was installed (`pre-0.90.6` back
+  and config in place before that version was installed (`pre-0.90.9` back
   to `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` were partly
   overwritten with macOS objects by a mis-excluded sync on 2026-10-05; their
