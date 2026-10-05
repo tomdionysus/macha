@@ -445,6 +445,12 @@ class CatalogueScanner {
     static constexpr size_t editor_seats = 4;
     std::array<EditorSeat, editor_seats> editor_seats_;
     std::atomic_size_t next_editor_seat_{};
+    // The options last offered for a reference and role, by when they lapse.
+    static constexpr size_t artwork_options_max = 128;
+    static constexpr std::chrono::minutes artwork_options_kept{10};
+    Mutex artwork_options_mutex_;
+    std::map<std::string, std::pair<Clock::time_point, std::vector<ArtworkOption>>>
+        artwork_options_ MACHA_GUARDED_BY(artwork_options_mutex_);
     EditorSeat& editor_seat() noexcept {
         return editor_seats_[next_editor_seat_.fetch_add(1, std::memory_order_relaxed) %
                              editor_seats];
