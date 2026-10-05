@@ -667,7 +667,13 @@ size_t RetentionStore::release_unreferenced(RetentionClass type,
     std::vector<ObjectId> candidates;
     candidates.reserve(operation_budget);
 
-    while (it != state.end() && candidates.size() < operation_budget) {
+    // A bounded stretch of claims from where the last call stopped: commits
+    // take this lock for their own claims, and nearly every claim is live,
+    // so a call that looked at them all would hold it for the whole store.
+    const size_t examine_max = std::max<size_t>(operation_budget * 128, 8192);
+    size_t examined = 0;
+    while (it != state.end() && candidates.size() < operation_budget &&
+           examined++ < examine_max) {
         if (!std::binary_search(live.begin(), live.end(), it->first) && !it->second.adds.empty())
             candidates.push_back(it->first);
         cursor = it->first;
