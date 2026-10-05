@@ -2185,6 +2185,18 @@ std::vector<std::pair<std::string, std::string>> FileSystem::media_files(Metadat
     return files;
 }
 
+std::vector<std::string> FileSystem::media_paths(std::string_view id) {
+    const auto view = m_.local();
+    Lock lock(media_index_mutex_);
+    refresh_media_index(view);
+    const auto found = media_index_.find(id);
+    if (found == media_index_.end())
+        return {};
+    auto paths = found->second;
+    std::sort(paths.begin(), paths.end());
+    return paths;
+}
+
 std::optional<FsEntry> FileSystem::media_stat(std::string_view id, std::string_view path) {
     const auto view = m_.local();
     Lock lock(media_index_mutex_);

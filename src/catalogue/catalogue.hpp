@@ -141,6 +141,15 @@ struct CatalogueClearResult {
     std::vector<std::string> media_ids;
 };
 
+// What unbinding a media id did: whether the item was there and held it, the
+// item as it now is (none when it was removed), and every item removed.
+struct CatalogueUnbindResult {
+    bool found{};
+    bool bound{};
+    std::optional<CatalogueItem> item;
+    std::vector<std::string> removed_ids;
+};
+
 struct ResolvedMediaProfile {
     MediaProbeResult probe;
     bool generated{};
@@ -279,6 +288,13 @@ class CatalogueManager {
     CatalogueClearResult clear_metadata_with_media(
         std::string_view id, std::optional<uint64_t> expected_revision = {});
     size_t clear_metadata(std::string_view id, std::optional<uint64_t> expected_revision = {});
+    // Unbinds `media_id` from item `item_id`, or from every item when none is
+    // named. A movie, episode or track left with no media is removed, and so
+    // is each item above a removed one left with no children, whoever made
+    // it. One commit.
+    CatalogueUnbindResult unbind_media(std::optional<std::string_view> item_id,
+                                       std::string_view media_id,
+                                       std::optional<uint64_t> expected_revision = {});
     CatalogueArtwork put_artwork(std::string_view item_id, std::string role,
                                  std::string mime_type, std::span<const uint8_t> bytes,
                                  std::optional<uint64_t> expected_revision = {});

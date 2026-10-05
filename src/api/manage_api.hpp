@@ -36,6 +36,7 @@ class ManageApi {
     void queue_identity_reset_audit(IdentityAssociationReset);
     void identity_reset_audit_loop(std::stop_token);
     HttpResponse dispatch(const HttpRequest&);
+    HttpResponse title_files(const HttpRequest&);
 
   public:
     ManageApi(NodeRuntime& node, MetadataView& metadata, FileSystem& fs,
@@ -45,6 +46,12 @@ class ManageApi {
     void stop();
 
     HttpResponse handle(const HttpRequest&);
+
+    // A title's files, which change the namespace, the catalogue and the
+    // unmatched list together: DELETE /api/v1/catalogue/items/{id}/media/{media_id},
+    // DELETE /api/v1/files/{path} and DELETE /api/v1/files?hash=. The service
+    // sends these here.
+    static bool title_file_route(const HttpRequest&);
 };
 
 } // namespace macha

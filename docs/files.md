@@ -40,6 +40,24 @@ Codes: `404 not_found`, `400 bad_media_id` (a hash that is not a `macha:`
 identity), `400 bad_request` (`?hash=` on anything but the collection),
 `405 method_not_allowed`.
 
+### Deleting a file
+
+```text
+DELETE /api/v1/files/<path>            that path only
+DELETE /api/v1/files?hash=macha:<id>   every path holding that content
+```
+
+Both need `manager`. Content stays bound to its catalogue items while any
+path still holds it. Once none does, it is unbound from every item, and an
+item left with nothing is removed: a movie, episode or track with no media,
+then each season, show, album or artist above it left with no children,
+whoever made it.
+
+A path answers `{"status": "deleted", "path", "removed_item_ids"}`; a hash
+`{"status": "deleted", "paths", "removed_item_ids"}`. Codes: `404 not_found`,
+`409 not_a_file` (a directory, removed through
+`DELETE /api/v1/manage/filesystem`), `400 missing_hash`.
+
 ## What `availability` means
 
 | code | meaning |

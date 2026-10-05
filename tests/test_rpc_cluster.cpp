@@ -3983,7 +3983,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
         REQUIRE(retry_while_not_ready(
             [&] { s1.filesystem().mkdir("/base", 0755, getuid(), getgid()); }));
         MetadataManager initial_repair(s1.node(), s1.local_state(), s1.metadata_server());
-        initial_repair.repair_once();
+        // A round in which a reachable peer did not take the head says so and
+        // is run again.
+        REQUIRE(retry_while_not_ready([&] { initial_repair.repair_once(); }));
         REQUIRE(wait_until([&] {
             try {
                 return s2.filesystem().getattr("/base").type == EntryType::directory &&

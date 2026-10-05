@@ -150,6 +150,10 @@ MACHA_FAST_TEST("users", test_role_policy) {
         {"PUT", "/api/v1/catalogue/items/movie:one", role_manager},
         {"PATCH", "/api/v1/catalogue/items/movie:one", role_manager},
         {"DELETE", "/api/v1/catalogue/items/movie:one/metadata", role_manager},
+        {"DELETE", "/api/v1/catalogue/items/movie:one/media/macha:1", role_manager},
+        {"DELETE", "/api/v1/files/Movies/one.mkv", role_manager},
+        {"DELETE", "/api/v1/files", role_manager},
+        {"GET", "/api/v1/files/Movies/one.mkv", role_media_viewer},
         {"DELETE", "/api/v1/status/nodes/one", role_manager},
         {"HEAD", "/api/v1/catalogue/items/movie:one", role_media_viewer},
         // Playing is a viewer's act, whatever the method.
