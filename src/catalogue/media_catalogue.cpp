@@ -3082,7 +3082,7 @@ std::vector<ProviderSearchResult> CatalogueScanner::search_providers(
     const auto kind = source->probe_kind;
     std::vector<ProviderSearchResult> results;
     {
-        auto& seat = editor_seat();
+        auto& seat = editor_seat(std::string(query.kind) + ":" + query.text);
         Lock editor(seat.mutex);
         auto* metadata = editor_metadata(seat.providers, scan_provider, metadata_provider);
         if (!metadata || !metadata->supports(kind))
@@ -3156,7 +3156,7 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
     };
     std::optional<ProviderMatch> match;
     {
-        auto& seat = editor_seat();
+        auto& seat = editor_seat(parsed->provider + ":" + parsed->id);
         Lock editor(seat.mutex);
         auto* metadata = editor_metadata(seat.providers, scan_provider, parsed->provider);
         if (!metadata || !metadata->supports(probe.kind))
@@ -3267,7 +3267,7 @@ std::vector<ArtworkOption> CatalogueScanner::artwork_options(std::string_view re
             return found->second.second;
     }
     const auto scan_provider = scan_provider_for(*parsed);
-    auto& seat = editor_seat();
+    auto& seat = editor_seat(parsed->provider + ":" + parsed->id);
     Lock editor(seat.mutex);
     auto* metadata = editor_metadata(seat.providers, scan_provider, parsed->provider);
     if (!metadata)
@@ -3294,7 +3294,7 @@ std::vector<ProviderReleaseTrack> CatalogueScanner::release_tracks(std::string_v
         parse_provider_ref(std::string(provider) + ":release:" + std::string(release_id));
     if (!parsed) throw ProviderRequestError(400, "bad_ref", "the release id must be an MBID");
     const auto scan_provider = scan_provider_for(*parsed);
-    auto& seat = editor_seat();
+    auto& seat = editor_seat(parsed->provider + ":" + parsed->id);
     Lock editor(seat.mutex);
     auto* metadata = editor_metadata(seat.providers, scan_provider, parsed->provider);
     if (!metadata || !metadata->supports(MediaProbeKind::track))

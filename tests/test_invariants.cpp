@@ -381,6 +381,9 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         CHECK(catalogue.get(body.find("leaf_item_id")->asString())->title == "One");
         CHECK(http_ptr->requests_containing("covers.example") == 1);
         CHECK(catalogue.get(album->id)->artwork == album->artwork);
+        // Both tracks were looked up through the provider that had the release.
+        CHECK(http_ptr->requests_containing("ws/2/release/" + release) == 1);
+        CHECK(http_ptr->requests_containing("coverartarchive.org/release/" + release) == 1);
 
         // Refusals leave the file unmatched.
         const auto refused = bench.unmatched("/Movies/ref-4.mkv", 4).first;

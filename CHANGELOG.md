@@ -1,5 +1,17 @@
 # Current release
 
+## 0.90.16 — an album's tracks share one provider lookup (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**Every editor call about one record takes the same provider set.** The
+editor's four provider sets each keep their own cache, and calls took them in
+turn, so each track of an album went to a set that had not seen the release:
+MusicBrainz was asked for it again (paced to one request a second) and the
+cover looked up again, 1.2 to 1.8 s per track. A call now takes the set chosen
+by its record, which has the release cached; other records spread over the
+other sets.
+
 ## 0.90.15 — a title's files: unmatch and delete (experiment)
 
 New API routes; nothing removed or changed. No wire, protocol or on-disk
