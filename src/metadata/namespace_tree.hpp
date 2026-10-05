@@ -245,6 +245,20 @@ using NamespaceDifferences = std::map<std::string, NamespaceDifference>;
 NamespaceDifferences diff_namespace_trees(const ObjectId& before, const ObjectId& after,
                                           const NamespaceNodeStore& store);
 
+// The branch and leaf nodes one tree holds and the other does not: `added` in
+// `after` only, `removed` in `before` only, each sorted. Extent spines are not
+// among them: one may be shared by entries anywhere in a tree, so they are
+// counted by entry (namespace_entry_spine_nodes). Reads only where the trees
+// differ. Throws DecodeError if a node cannot be read.
+void diff_namespace_tree_nodes(const ObjectId& before, const ObjectId& after,
+                               const NamespaceNodeStore& store, std::vector<ObjectId>& added,
+                               std::vector<ObjectId>& removed);
+
+// The extent spine nodes a tree holds for this entry: none when its extents
+// are inline in its leaf. Computed from the extents alone; reads nothing.
+std::vector<ObjectId> namespace_entry_spine_nodes(const FsEntry& entry,
+                                                  const NamespaceTreeLimits& limits = {});
+
 // The merge of two tree-backed heads, without materialising them:
 // `merge_metadata_heads` over the paths at which the two trees differ.
 // `merged.snapshot` carries neither entries nor a root; its namespace is
