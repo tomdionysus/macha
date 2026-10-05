@@ -1,5 +1,22 @@
 # Current release
 
+## 0.90.7 — a commit is not a storage change; refused writes are logged (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**A commit's claims are their own event.** Every commit raised a storage
+event to wake maintenance for its claims. The availability service reads a
+storage event as a change in what this node holds, so it made its roll-up
+afresh after every commit and 0.90.6's carried roll-up never applied. Claims
+now have an event of their own: maintenance wakes on it as before, and a
+commit that stores nothing leaves the roll-up carried.
+
+**The management API says in the journal why a write was refused.** A delete
+answered 404 or 409, or a provider call answered 503, left nothing in the
+journal: the reason went to the client only. A refused write, and any request
+that fails here or upstream, is logged with its status, code and message
+(`manage API DELETE ... status=409 ...`), at WARN for a 5xx.
+
 ## 0.90.6 — availability and media information stop re-reading the namespace (experiment)
 
 No wire, protocol, API or on-disk changes.
