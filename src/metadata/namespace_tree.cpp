@@ -432,46 +432,6 @@ ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, Nam
 
 namespace {
 
-// The tree's leaf sequence in order. Reads the branch nodes alone: a branch
-// directly above leaves names each one's first key and entry count. A root
-// that is itself a leaf is read for them.
-void collect_leaves(const ObjectId& id, const NamespaceNodeStore& store,
-                    std::vector<Child>& out) {
-    auto encoded = store.get(id);
-    if (!encoded)
-        throw DecodeError("namespace tree node unavailable: " + to_string(id));
-    Reader reader(*encoded);
-    const auto magic = reader.fixed<4>();
-    if (magic == leaf_magic) {
-        const auto count = reader.u32();
-        std::string first;
-        if (count)
-            first = reader.string(8192);
-        out.push_back(Child{std::move(first), id, count});
-        return;
-    }
-    if (magic != branch_magic)
-        throw DecodeError("not a namespace tree node");
-    const auto level = reader.u8();
-    const auto count = reader.u32();
-    std::vector<Child> children;
-    children.reserve(std::min<size_t>(count, reader.remaining() / 44));
-    for (uint32_t i = 0; i < count; ++i) {
-        Child child;
-        child.first_key = reader.string(8192);
-        child.id = ObjectId{reader.fixed<32>()};
-        child.items = reader.u64();
-        children.push_back(std::move(child));
-    }
-    reader.finish();
-    if (level == 1) {
-        std::move(children.begin(), children.end(), std::back_inserter(out));
-        return;
-    }
-    for (const auto& child : children)
-        collect_leaves(child.id, store, out);
-}
-
 // Exclusive upper bound of keys starting with `prefix`: the prefix with its
 // last non-0xFF byte incremented and trailing 0xFF bytes dropped. Empty means
 // unbounded.
@@ -1793,30 +1753,47 @@ void collect_namespace_tree_changes(const std::optional<ObjectId>& before, const
 
 namespace {
 
-// A leaf's entries as encoded. Equal bytes are equal entries, extents
-// included: an extent sequence's root is a function of its extents.
-void read_leaf_records(const ObjectId& id, const NamespaceNodeStore& store,
-                       std::map<std::string, Bytes>& out) {
-    const auto encoded = store.get(id);
-    if (!encoded)
-        throw DecodeError("namespace tree node unavailable: " + to_string(id));
-    Reader reader(*encoded);
-    if (reader.fixed<4>() != leaf_magic)
-        throw DecodeError("not a namespace tree leaf");
-    const auto count = reader.u32();
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto from = encoded->size() - reader.remaining();
-        auto item = decode_leaf_entry(reader, store, false);
-        const auto to = encoded->size() - reader.remaining();
-        out.emplace(std::move(item.first),
-                    Bytes(encoded->begin() + static_cast<std::ptrdiff_t>(from),
-                          encoded->begin() + static_cast<std::ptrdiff_t>(to)));
-    }
-    reader.finish();
-}
+// One tree's entries in path order, read a node at a time. `pending` holds
+// what has not been opened, next at the back; `records` the leaf being read,
+// each as encoded. Equal bytes are equal entries, extents included: an extent
+// sequence's root is a function of its extents.
+struct DiffStream {
+    const NamespaceNodeStore& store;
+    std::vector<SpineItem> pending;
+    std::deque<Bytes> backing;
+    std::vector<LeafRecord> records;
+    size_t next{};
 
-FsEntry decode_record(const Bytes& record, const NamespaceNodeStore& store) {
-    Reader reader(record);
+    DiffStream(const NamespaceNodeStore& nodes, const ObjectId& root) : store(nodes) {
+        pending.push_back({Child{{}, root, 0}, read_spine_node(root, nodes).level, false});
+    }
+    bool buffered() const { return next < records.size(); }
+    // Opens the next node: a branch into its children, a leaf into records.
+    void open() {
+        auto item = std::move(pending.back());
+        pending.pop_back();
+        if (item.level == 0) {
+            records.clear();
+            backing.clear();
+            next = 0;
+            read_leaf_records(item.child.id, store, backing, records);
+            return;
+        }
+        auto node = read_spine_node(item.child.id, store);
+        if (node.level != item.level)
+            throw DecodeError("namespace tree node at an unexpected level");
+        for (auto child = node.children.rbegin(); child != node.children.rend(); ++child)
+            pending.push_back({std::move(*child), static_cast<uint8_t>(item.level - 1), false});
+    }
+    // Reads on until a record is buffered or nothing is left.
+    void fill() {
+        while (!buffered() && !pending.empty())
+            open();
+    }
+};
+
+FsEntry decode_leaf_record(const LeafRecord& record, const NamespaceNodeStore& store) {
+    Reader reader(record.raw);
     auto item = decode_leaf_entry(reader, store, true);
     reader.finish();
     return std::move(item.second);
@@ -1829,39 +1806,78 @@ NamespaceDifferences diff_namespace_trees(const ObjectId& before, const ObjectId
     NamespaceDifferences out;
     if (before == after)
         return out;
-    std::vector<Child> leaves_before, leaves_after;
-    collect_leaves(before, store, leaves_before);
-    collect_leaves(after, store, leaves_after);
-    std::set<ObjectId> ids_before, ids_after;
-    for (const auto& leaf : leaves_before)
-        ids_before.insert(leaf.id);
-    for (const auto& leaf : leaves_after)
-        ids_after.insert(leaf.id);
-
-    // A leaf both trees hold has the same entries in both; a path in a leaf
-    // only one holds is in no leaf they share, keys being unique in a tree.
-    std::map<std::string, Bytes> records_before, records_after;
-    for (const auto& leaf : leaves_before)
-        if (!ids_after.contains(leaf.id))
-            read_leaf_records(leaf.id, store, records_before);
-    for (const auto& leaf : leaves_after)
-        if (!ids_before.contains(leaf.id))
-            read_leaf_records(leaf.id, store, records_after);
-
-    for (const auto& [path, record] : records_before) {
-        const auto other = records_after.find(path);
-        if (other != records_after.end() && other->second == record)
+    // Two streams of entries, walked together. Where both stand at the start
+    // of the same node, that subtree is the same in both and is passed over
+    // unread; otherwise the one standing higher is opened. Entries are
+    // compared as their leaves hold them, and only one that differs is
+    // decoded, extents and all.
+    DiffStream old_side(store, before);
+    DiffStream new_side(store, after);
+    const auto removed = [&](const LeafRecord& record) {
+        out[record.key].before = decode_leaf_record(record, store);
+    };
+    const auto added = [&](const LeafRecord& record) {
+        out[record.key].after = decode_leaf_record(record, store);
+    };
+    for (;;) {
+        if (!old_side.buffered() && !new_side.buffered()) {
+            if (old_side.pending.empty() && new_side.pending.empty())
+                break;
+            if (old_side.pending.empty()) {
+                new_side.fill();
+                continue;
+            }
+            if (new_side.pending.empty()) {
+                old_side.fill();
+                continue;
+            }
+            const auto& a = old_side.pending.back();
+            const auto& b = new_side.pending.back();
+            if (a.level == b.level && a.child.id == b.child.id) {
+                old_side.pending.pop_back();
+                new_side.pending.pop_back();
+            } else if (a.level > b.level) {
+                old_side.open();
+            } else if (b.level > a.level) {
+                new_side.open();
+            } else {
+                old_side.open();
+                new_side.open();
+            }
             continue;
-        NamespaceDifference difference;
-        difference.before = decode_record(record, store);
-        if (other != records_after.end())
-            difference.after = decode_record(other->second, store);
-        if (difference.before != difference.after)
-            out.emplace(path, std::move(difference));
+        }
+        if (!old_side.buffered()) {
+            old_side.fill();
+            if (!old_side.buffered())
+                added(new_side.records[new_side.next++]);
+            continue;
+        }
+        if (!new_side.buffered()) {
+            new_side.fill();
+            if (!new_side.buffered())
+                removed(old_side.records[old_side.next++]);
+            continue;
+        }
+        const auto& a = old_side.records[old_side.next];
+        const auto& b = new_side.records[new_side.next];
+        if (a.key < b.key) {
+            removed(a);
+            ++old_side.next;
+        } else if (b.key < a.key) {
+            added(b);
+            ++new_side.next;
+        } else {
+            if (!std::equal(a.raw.begin(), a.raw.end(), b.raw.begin(), b.raw.end())) {
+                NamespaceDifference difference;
+                difference.before = decode_leaf_record(a, store);
+                difference.after = decode_leaf_record(b, store);
+                if (difference.before != difference.after)
+                    out.emplace(a.key, std::move(difference));
+            }
+            ++old_side.next;
+            ++new_side.next;
+        }
     }
-    for (const auto& [path, record] : records_after)
-        if (!records_before.contains(path))
-            out[path].after = decode_record(record, store);
     return out;
 }
 
