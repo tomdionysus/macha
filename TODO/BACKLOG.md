@@ -8,6 +8,12 @@ the code before working it; ledger what is found done in `COMPLETED.md` and
 delete it here. Priority labels are as they were when written; `ACTIVE.md`'s
 queue outranks everything here.
 
+Three sections are absorbed by `ACTIVE.md` entry 1, the
+[local-first filesystem plan](2026-10-05-local-first-filesystem-plan.md), and
+are not to be worked separately: "The namespace does not meet its own scale
+target", "The catalogue materialises everything it has" and "Scaling
+cliffs".
+
 ## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, DEPLOYED 0.48.0 — joint test outstanding)
 
 **Shipped. 0.48.0 is tagged and running on all three nodes as of 2026-09-21.**

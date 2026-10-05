@@ -1,405 +1,210 @@
-# Active tasks and concepts to explore
+# Active tasks
 
-Last updated: 2026-10-02, on `experiment/object-ledger-t5`. Both nodes run
-0.75.0 (the experiment through T4 and T5.1), deployed 2026-10-02 11:38Z
-(fi-1) and 11:46Z (gbni-1); soaking.
+Last updated: 2026-10-05, on `experiment/object-ledger-t5` (`45cba94`). Both
+nodes run 0.89.1.
 
-This is the authoritative, ordered backlog. `COMPLETED.md` is the ledger of
-finished work; `BACKLOG.md` holds the older, unverified P-1 to P2 sections;
-`archive/` holds every past plan, UAT record, incident write-up, superseded
-spec and handover (evidence, not requirements). Work top-to-bottom unless
-new evidence changes the order.
+This is the ordered list of open work. `COMPLETED.md` is the ledger of
+finished work; `BACKLOG.md` holds the older P-1 to P2 sections, written
+2026-09-05..22 and not re-verified since; `archive/` holds every past plan,
+record, handover and superseded file (evidence, not requirements). Work top
+to bottom unless new evidence changes the order.
 
-**Start here after a clear: read [the handover](HANDOVER-2026-10-03.md),**
-then the experiment section below, then the canonical spec and plan.
+This file was cut down on 2026-10-05. The file as it stood, with the full
+text and evidence behind every carried item, is
+[`archive/2026-10-05-ACTIVE-before-rationalisation.md`](archive/2026-10-05-ACTIVE-before-rationalisation.md).
+Items below marked *carried* come from it and have not been re-checked
+against 0.89.1.
 
-## First: the object ledger experiment
+## 1. One local-first path for every read and write
 
-**This is the active work, and the only development stream.** `develop` is
-frozen at `75e6f98` and is never modified by the experiment. On success the
-whole experiment commit tree merges into `develop`; on failure development
-resumes from `develop` and the experiment's version line ceases to exist.
+**The top entry (operator, 2026-10-05).** File access and operations must be
+fast and consistent locally on every path; the cluster converges behind.
 
-- **Canonical spec**:
-  [the object ledger and the component model](2026-09-29-object-ledger-and-components-spec.md).
-  The most recent version is canonical; its three predecessors are in
-  `archive/`, historical only. Its decision log records every operator
-  decision, dated.
-- **Plan**: [stage 0 implementation plan](2026-09-29-object-ledger-implementation-plan.md):
-  T0 measure, T1 the instrument, P authoritative presence, T2 the thin
-  slice (the claim walk through every layer), T3 the ledger, T4 the
-  metadata contract, T5 component conversions into the composition root, S
-  the final sweep.
-- **Evidence** per step: [`object-ledger-evidence/`](object-ledger-evidence/)
-  (`t0`, `t1`, `p`, `control-gate`, `t2`).
-- **The clients** each have `experiment/object-ledger` in their own repos
-  and work only there (operator, 2026-10-01); see the handover.
-- **Where it stands** (2026-10-02): the chain `-t0` .. `-t3` is accepted
-  and merged into `experiment/object-ledger` (`46b3c1f`, pushed), after
-  fi-1's GCC build, three suites and coverage. T4 is cut as
-  `experiment/object-ledger-t4` (checked out, pushed).
+- **Plan**: [local-first filesystem](2026-10-05-local-first-filesystem-plan.md).
+  Proposed, awaiting the operator's go-ahead. Three stages: the local path
+  (journal, view, publisher, tree splice, commit off the network); per-commit
+  background work from the tree diff; the catalogue and the management API.
+- **Evidence**: [the audit](2026-10-05-whole-library-work-audit.md).
+- **How it is worked** (operator, 2026-10-05): designed across the whole
+  codebase, tested well once (the suite on the laptop and on fi-1), deployed,
+  measured, iterated. No soak runs, sanitizer builds or mutation sweeps as
+  gates.
+- **What it absorbs** from the older lists, so none is worked separately:
+  - Bulk delete of unmatched files reporting failures (old 0c, 2026-09-28,
+    seen again 2026-10-05). The false count was Core's 8 s request timeout,
+    fixed in Core at `340b8ae` by Core's account; the server finished every
+    delete, one commit at a time. Stage 1. Still its own small item: a failed
+    `DELETE /api/v1/manage/unmatched/{id}` logs its cause.
+  - HTTP and FUSE request paths that may wait on a peer through
+    `namespace_index()` and `find_media()` (old 2). Stage 1.
+  - Publications that neither batch nor throttle since the tree (old -3).
+    Stage 1.
+  - Validated probes reading every copy on the peer each pass (old 1).
+    Stage 2.
+  - Catalogue writes losing to "catalogue changed concurrently" (seen again
+    2026-10-05 as `media information prune deferred`), and the slow cold
+    artwork read (old 10). Stage 3.
+  - `BACKLOG.md`: "The namespace does not meet its own scale target", "The
+    catalogue materialises everything it has", "Scaling cliffs".
 
-  | step | branch | state |
-  |---|---|---|
-  | T0 measure | `-t0` | accepted 2026-10-02; baseline in `t0/baseline.md` |
-  | T1 instrument | `-t1` | accepted, merged |
-  | P presence | `-p` | merged |
-  | backlog fixes | `-fixes` | merged |
-  | control gate | `-control-gate` | merged |
-  | `universal` | `-universal` | merged |
-  | T2 slice | `-t2` | merged; assessed |
-  | T3 ledger | `-t3` | merged; assessed (`t3/assessment.md`) |
-  | T4 metadata | `-t4` | merged 2026-10-02; assessed (`t4/assessment.md`) |
-  | T5 conversions | `-t5` | T5.1: the node's composition root as code (`NodeServices`); next: the rest of the setters and locators; first deploy |
+## 2. The object ledger experiment: what is left
 
-- **T0's baseline is filled** (2026-10-01): soak plus a six-hour top-up,
-  2026-09-30 07:04Z to 2026-10-01 20:43Z,
-  `object-ledger-evidence/t0/baseline.md` and the spec's K table. Thin and
-  so weak as thresholds: fi-1's K3 (2 hours), K7 `start_ready` and
-  `update_ready` on both nodes (only the asynchronous paths record them).
-  Found along the way, recorded, not fixed:
-  - **fixed (2026-10-02, `-fuse-fixes`): shutdown hung while an fsync
-    waited for publication.** `FuseSubsystem::stop()` joined the mount
-    before stopping the frontend, the mount could not exit with an fsync
-    outstanding, and the fsync's wait for publication was unbounded and not
-    woken by a stop. `FuseFrontend::interrupt_waits()` now ends those waits
-    with EIO before the mount is joined (the data is journalled and
-    publishes after the restart). Test:
-    `filesystem_fuse/test_an_fsync_waiting_for_publication_ends_when_waits_are_interrupted`.
-    To confirm on the cluster with T5's first deploy (restart against an
-    fsync).
-  - **fixed (2026-10-02, `-fuse-fixes`): the FUSE publication writer cap
-    could be exceeded.** The cap was read at selection and taken at
-    creation under different locks; a worker now reserves its slot at
-    selection, under the queue lock. The backlog case, which failed about
-    1 run in 100-300 (also on `develop`), passes.
-  - repair completes no pass: one to three months a pass at its rate
-    (baseline.md K4). Repair's pace, not a broken gauge;
-  - an unattributed restart of fi-1 at 16:00:01Z from the laptop's
-    address, not the top-up's loop (baseline.md K10);
-  - one `ETIMEDOUT` from gbni-1's FUSE lookup of a directory fi-1 had just
-    removed, `ENOENT` on every retry;
-  - fi-1's playback errors under transcode (seek 503 after ~15 s, segment
-    500, `extent unavailable`) are the baseline's behaviour;
-  - the fi-1 watch's `journalctl -k -u macha` matched nothing (fixed in
-    the handover).
-  - **catalogue writes on fi-1 keep losing to "catalogue changed
-    concurrently"** (reported by Macha Client, 2026-10-02): from 17:29Z on
-    2026-10-01, fi-1's media information publication fails about once a
-    minute (33 by 21:27Z, none in the 42 hours before), and a manage
-    unmatched match returned 409 after up to 184 s. fi-1's catalogue root
-    changes every 40-60 s with the item count fixed (6,563). The onset
-    matches gbni-1's ingest burst (adoptions 32/116/82/0/40 in hours
-    17-21Z); the hourly counts do not track closely and the root's
-    once-a-minute writer is not identified. Plausible, not proven: a write
-    prepared against one root fails instead of rebasing when another lands
-    first. T0's diff touches no catalogue or metadata code, so this is
-    0.73 behaviour the baseline recorded. fi-1's restart at 21:59Z did not
-    clear it: 21 more failures by 22:27Z.
-    T4b found that every maintenance pass runs the catalogue's repair
-    twice: in its `catalogue-repair` stage and again inside the inventory
-    build (now the explicit `maintenance_repair()` step). Each run
-    reconciles at most one catalogue-root conflict and may commit. Whether
-    that second commit per pass feeds the loop is not established; removing
-    it is a behaviour change, for the operator.
-- **T4 is accepted and merged** (`experiment/object-ledger` at `fc72110`).
-  **T5 next** (plan, T5): component conversions into the root, strangler
-  style, and the first deploy since T0.
-- **Future experiment: memoised horizon builds** (spec, Later stages):
-  subtree referenced sets kept by subtree id, partial builds merging in any
-  order; first measure how often the inventory and release heads coincide.
-- **Rules for every step**: a branch cut from the previous step, merged
-  when accepted, then pushed; 100% line and branch coverage of what the
-  step builds or converts, mutation-proven; contracts as preconditions,
-  postconditions and invariants; evidence committed under
-  `object-ledger-evidence/<step>/`; decisions in the spec's decision log.
-  Backlog fixes are steps on the experiment line (question 5). In-process
-  testing until T5. Sanitizers are debuggers, not evidence. No CI.
-  basemind for every code query.
-- **The cluster** (gbni-1, fi-1) is the only Macha cluster and a disposable
-  test cluster: avoid dropping the library, but not at the experiment's
-  expense.
-- **Open spec questions still waiting**: 6 (release over pinned roots) and 7
-  (map-backed snapshots), both for after stage 0.
+The experiment is the development line; `develop` is frozen at `75e6f98`.
+Spec: [object ledger and component model](2026-09-29-object-ledger-and-components-spec.md).
+Plan: [stage 0](2026-09-29-object-ledger-implementation-plan.md). Evidence:
+[`object-ledger-evidence/`](object-ledger-evidence/).
 
-## Cluster state (2026-10-02)
+- T0 to T5 are built and merged into `-t5`. Absent-node tolerance
+  ([design](2026-10-05-absent-node-tolerance-design.md)) is built and
+  deployed: 0.88.0 (writes on the nodes present, own-clock deletion,
+  membership forgets) and 0.89.0 (entry provenance, the two-head merge,
+  protocol 23). 0.89.1 added a group commit of namespace batches and two
+  claim fixes.
+- **Entry 1 lands on this line** before the experiment is assessed. *An
+  assumption, for the operator to confirm.*
+- Left, as recorded 2026-10-04 (*carried*): a day on the cluster under
+  normal load on the final build; coverage of the composition root's
+  components; the T5 assessment and the merge of `-t5`; the operator's
+  decision on `develop`. The final sweep S (annotated lock wrappers, the
+  `*_for_tests` hooks) as far as it stands.
+- Open from the absent-node work: per-peer down state in the transport;
+  `fsync` without a deadline; the journal's `durability_poisoned` flag; a
+  count of DATA objects below their replication target; seven namespace
+  conflicts standing from before 0.89.0.
+- After the experiment: [cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md),
+  a proposal with six questions waiting on the operator.
 
-- **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1** (10.35.1.10,
-  also .50 and .148) both run **0.75.0** (tarball md5
-  `8269255302fa73e8c158c847a06fa249`), **cluster protocol 22**. Metadata
-  writable 2/2 against `metadata_min_write_replicas: 2`: restarting either
-  node makes metadata read-only until it is back. Install backups
-  `/root/macha-0.74.0-installed.tgz` on both. gbni-1 keeps its heap-check
-  drop-in (copy in `/root/heap-check.conf.keep`).
-- **Deletion paused** for the experiment: `garbage_grace_ms: 2592000000`
-  (30 days) on both, until the ledger's deletion decisions have been
-  watched on the real library.
-- **Observation**: `/etc/macha/state/observation/observations.jsonl` on
-  both nodes; `object-ledger-evidence/t0/observation_report.py` turns it
-  into the kill criteria table; the T0 baseline is
-  `object-ledger-evidence/t0/baseline.md`. No load scripts or cron entries
-  of ours remain on either node.
+## Cluster state (2026-10-05)
+
+- **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
+  (10.35.1.10) run **0.89.1** (tarball md5
+  `01ac8fd29ec28c4ec00b06e0a04d9316`), **cluster protocol 23**, installed
+  10:18Z (fi-1) and 10:20Z (gbni-1). es-1 is offline indefinitely.
+- Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
+  are copies sought, not floors: a node alone still accepts writes.
+- Rollback material on each node: `/root/pre-0.89.1/` (0.89.0) and
+  `/root/pre-0.89.0/` (0.87.3, with roster and sequence counter).
+- `garbage_grace_ms` is 30 days on both (the absence horizon).
+- gbni-1 keeps its heap-check drop-in (`/root/heap-check.conf.keep`).
+- Observation: `/etc/macha/state/observation/observations.jsonl` on both.
+- Left by testing on 2026-10-05: an empty `/scratch-delete-test` directory
+  in the namespace; `/root/burst-delete.sh` and `/root/mapi.sh` on fi-1.
 
 ## The queue
 
-**While the experiment runs, nothing below lands on `develop`.** A fix
-becomes its own step on the experiment line, with its test, pushed when
-accepted (operator, 2026-09-30, spec question 5). The pressing cases are the
-test crash in item 12 and gbni-1's unexplained heap corruption, which keeps
-glibc heap checking on. Items the experiment absorbs say so.
+After entry 1. Numbers in brackets are the item's number in the archived
+file.
 
-0. **Degraded operation is the normal case (operator, 2026-09-28).** "Macha
-   needs to work properly degraded like this, as best it can, indefinitely."
-   Review what still waits on absent replicas against that.
+**Seen 2026-10-05, not investigated**
 
-1. **Replication to fi-1: measure 0.73.1's pipelined pushes on an idle
-   node.** Not yet seen: every measurement since the deploy had torrents or
-   imports running on one node or both, so repair was on its 5% share (gbni-1:
-   161 MB in the hour after 17:55Z, ~45 KB/s, 2,934 share refusals). Before
-   0.73.1, with full credit and idle nodes, gbni-1 pushed ~500 KB/s, one
-   object in flight. Open with it:
-   - [ ] **`repair_weight`**: 5 against 95 today; 20 against 80 was offered.
-     Operator to decide.
-   - [ ] **Say why a node counts itself busy.** Status cannot show it: loader
-     work on the node itself (a torrent publishing, an import) crosses no wire
-     and is not in `nodes[].traffic`. Report the pacer's active classes
-     (playback, mounted reads, loader, a peer's viewers).
-   - [ ] **Log the resumed push position at INFO** at start. The 2026-09-29
-     restart's resume (~1,100 objects) was inferred from the saved file and
-     the counters, not proven.
-   - [ ] **fi-1 pulls objects it cannot store.** With its backend offline it
-     kept fetching from gbni-1 (1.3-2.7 MB/s of speculative traffic) and
-     counted each as `unsourceable`. Pull only when a local backend can take
-     the object; do not count a local failure as unsourceable.
-   - [ ] **fi-1's `unsourceable` keeps rising** (64 by 16:51Z, still climbing
-     after the disk returned; gbni-1 counts none). Find what those objects
-     are: probably extents lost with es-1.
-   - [ ] **Validated probes read every copy on the peer each pass**
-     (`have_valid_objects`, the operator's choice over index-only). The cost
-     scales with what the peer holds; the object ledger's diff-driven repair
-     (a stage after stage 0) is the answer.
-   - [ ] **A step's validation can run long on a busy HDD**, and the pacer's
-     cooldown is 19x the turn, so steps become rare. Measure step length under
-     load before changing anything.
+- `providers/artwork` and `providers/search` answered 503 after 17 to 19 s
+  on both nodes. The code path is `provider_unavailable` (an upstream fetch
+  that threw; 5 s connect, 20 s total). The reason is returned and not
+  logged. Not reproduced. Logging is in entry 1, stage 3.
+- The unmatched list differs by node (771 on fi-1, 822 on gbni-1): hints are
+  node-local.
+- Each node logged `RPC stalled (control)` against the other at 09:47Z and
+  09:50Z, 5 to 15 s without progress, then nothing.
+- fi-1 logs `repair cannot source an object this node should own`
+  continuously (see "unsourceable" below).
 
-0d. **The object ledger** moved to the top of this file as the active work.
+**Defects and unexplained failures**
 
-2. **HTTP reads that may wait on a peer.** 0.73.2 moved the torrent listing
-   onto the in-memory snapshot after stack traces showed `GET
-   /api/v1/torrents/jobs` surveying peers' accepted heads (0.6-1.7 s on
-   fi-1). Corrected 2026-09-30 (T2c, `object-ledger-evidence/t2/`): the four
-   `catalogue_api.cpp` sites call `CatalogueManager::snapshot_view()`, which
-   is memory-only when warm and reaches metadata only when cold; one
-   `manage_api.cpp` site (730, identity-association reset for a node absent
-   from live membership) calls `MetadataManager::snapshot_view()` directly.
-   Every site now passes a control `WorkContext` naming its route, and the
-   wait guard (record mode in production) logs any control path into a
-   guarded operation. The suites drive none; the cold-catalogue case and the
-   730 route need cases of their own before the list is complete. T4 splits
-   `snapshot_view()` into `current()` and `converged()`. The fixes stay this
-   item's.
-   **T4's list (2026-10-02), every `MetadataView::converged()` call outside
-   `src/metadata/`** (`converged()` reads the replicas when the cache is
-   behind, so it may wait on the network):
-   - `manage_api.cpp` 730, `POST /api/v1/manage/nodes/{id}`: control context,
-     guarded; the known violation.
-   - `FileSystem::namespace_index()`, reached from `resolve_existing_path`,
-     `resolve_new_path`, `getattr` and `readdir`: FUSE and HTTP request
-     paths, unguarded (no work context). Memory-only while the cache is
-     current; a stale cache makes them read the replicas.
-   - `FileSystem::find_media()` (playback's media lookup): reads the
-     replicas only when the decoded view is missing or behind the known
-     generation; unguarded.
-   - Background, not this item's: `FileSystem::namespace_signature()`
-     (catalogue scanner), `FileSystem::maintenance_objects_cached()` (the
-     maintenance pass), `TorrentCoordinator::current_view()` (its own
-     passes).
-   - `FileSystem::snap()` has no callers left: dead code, to delete.
+- **gbni-1 heap corruption**, three times, pre-dating the experiment. An
+  ASan 0.84.0 build and `/root/claude-missing-extent-driver.py` are staged
+  on fi-1 and have not been run. *Carried.*
+- **Test failures** (each is P0 when it recurs) [12], *carried*:
+  `filesystem_fuse/test_fuse_recovery_thousand_operations_have_bounded_publications`
+  (one segfault on fi-1, 2026-09-28);
+  `storage_v18/test_has_is_a_cheap_presence_check_not_a_decrypt`;
+  `filesystem_fuse/test_coalesced_delete_burst_wakes_at_exact_garbage_grace`;
+  `rpc_cluster/test_metadata_history_checkpoint_concurrent_proposers_converge`;
+  `users/test_a_node_that_was_down_learns_a_deletion_not_a_resurrection`;
+  `rpc_cluster/test_rpc_slow_control_does_not_abort_data`;
+  `test_write_data_work_context_preserves_loader_provenance`;
+  `rpc_cluster/test_inbound_incapable_node_is_reached_only_over_its_own_sessions`;
+  the pacing check in
+  `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
+  under debug logging; the macOS-only torrent segfaults (5 of 21). Fixed
+  2026-10-05: `namespace_migration/test_a_merge_claims_what_it_introduces`
+  (`45cba94`).
+- **An ingest dies on EAGAIN from a checkpoint commit** instead of re-basing
+  on the current entry [-3]. Entry 1 removes checkpoint commits; confirm
+  there. Also from [-3]: log the conflict key when a merge records one; an
+  ingest that dies when its node restarts mid-put. *Carried.* The merge rule
+  and the sibling-merge storm that item describes belong to the three-way
+  merge, which 0.89.0 removed.
+- **Unsourceable objects on fi-1** [1, handover]: the count rises with
+  repair's pull walk; three of five random films failed to read on both
+  nodes. Which node should hold them is not established. Probably extents
+  lost with es-1. fi-1 also pulls objects it cannot store when its backend
+  is offline, and counts each as unsourceable. *Carried.*
+- **60 of 296 movie posters are held by no online node** [0b]; nothing
+  re-fetches lost artwork
+  ([write-up](archive/2026-09-27-missing-artwork-and-single-copy-writes.md)).
+- **A rejoin or follower convergence retry waits out its backoff**
+  [handover]: wake it, debounced, with a cap from the first trigger. Tried
+  and reverted 2026-10-02.
+- **Torrent and ingest staging has no mount check** [handover]: with fi-1's
+  disk absent, staging wrote to the SD card under the mount point.
+- **fi-1, 2026-09-29 ~12:00Z** [3]: playback `PATCH` 503 after 19.9 s under
+  software transcode, and a `FUSE mount disappeared` ERROR during a restart.
+  Not investigated.
+- **Transport backoff after a peer restart** [13]: up to 4 s before a
+  restarted peer is dialled.
+- **Known defects from 2026-09-24/25** [7]: `catalogue_api` answers 503 for
+  some client errors and does not check a parent cycle; `metadata replica is
+  still recovering` and `local metadata replica unavailable` raise a bare
+  `runtime_error` an ingest would fail on; the acquisition API audit's four
+  findings; unverified package names in the install docs. (`object
+  replication quorum unavailable` went with 0.88.0.)
+- **What the disk resource audit left open** [-2]: one monitor per pool, not
+  per device; local maintenance budgeted from a network measurement; the
+  150-300% hysteresis band is a latch; law 1 holds by configuration only.
 
-3. **Unexplained on fi-1, 2026-09-29 ~12:00Z** (a viewer reported skips and
-   pauses): a playback `PATCH` answered 503 after 19.9 s, a `DELETE` took
-   11.7 s and creates 7-12 s, while fi-1 software-transcoded 1080p HEVC 10-bit
-   at 83% of four cores and fetched extents from gbni-1 at 0.8-1.2 MB/s. The
-   viewer recovered on its own. Also a `FUSE mount disappeared for three
-   consecutive successful watchdog checks` ERROR at 16:32:23Z during a
-   restart. Neither investigated.
+**Replication and repair** [1], *carried*
 
-0c. **Deleting unmatched files fails and logs nothing (operator, 2026-09-28).**
-   A delete of unmatched files reported "3 of 4 files could not be
-   deleted." (the client's wording) and the node logged no error. Every
-   failed `DELETE /api/v1/manage/unmatched/{id}` must log its cause (code,
-   path, media id, the filesystem error) so the next one is diagnosable from
-   the journal. Then find why three of four failed: not yet reproduced or
-   investigated.
+- `repair_weight`: 5 against 95 today, 20 against 80 offered. Operator.
+- Say why a node counts itself busy (the pacer's active classes in status).
+- Log the resumed push position at INFO.
+- Measure 0.73.1's pipelined pushes on an idle node; step length on a busy
+  HDD.
 
-0b. **Open from 2026-09-27, not yet fixed:**
-   - **The web client gates its torrent page on the answering node's
-     `/torrents/status`**: fixed in the web client (commit bd68eb7), not
-     verified deployed. Now that fi-1 runs torrents the symptom is gone either
-     way.
-   - **60 of 296 movie posters are held by no online node.** All from items
-     updated 2026-09-06..10; on es-1 or gbni-2, unknown until es-1 returns.
-     Nothing re-fetches lost artwork. Written up, parked:
-     [`archive/2026-09-27-missing-artwork-and-single-copy-writes.md`](archive/2026-09-27-missing-artwork-and-single-copy-writes.md).
+**Features and API, agreed or waiting**
 
-4. **Per-file readability (designed, operator to choose where it goes).**
-   Every extent of a file present on some reachable node: local
-   `LocalStore::has()` (index), then one batched `have_objects` per peer;
-   cache per `media_id`. Uses: a fact in `playback/media`, a clean refusal at
-   session create, a manage report of damaged files by path. The first two are
-   wire changes: announce to Core and every client first. The object ledger's
-   `lost` query would answer it cluster-wide. Known unreadable titles listed
-   as playable: The Martian `7b5743ad`, The Cannonball Run `11c474bb`, two
-   from the web client's retry.
-5. **A media-type context on torrent add** (operator, 2026-09-25). A `kind`
-   of `movie`, `show`, `music` on `POST /api/v1/torrents/jobs` and on ingest
-   submit, carried to the planner (`choose_destination` in
-   `src/acquisition/ingest.cpp`), which places every file of the job by it.
-   Why: Rome's extras became seven "movies" under `/Movies/`, and My Name Is
-   Earl's episodes without `SxxEyy` became movies too. Send the exact shape
-   to Core and every client before shipping; decide with the operator what
-   happens to Rome's extras already placed.
-6. **Decisions waiting on the operator** (do not act without them):
-   - Metadata editor B (richer probe candidates): waits on the choice of
-     fields (`TODO/archive/2026-09-28-metadata-editor-api-plan.md`). The operator
-     carries editor changes to the clients himself.
-   - 317 directories under `/Movies` and `/Music` on gbni-1 list empty
-     (`/root/empty-dirs.txt` there): confirm which should hold a film.
-   - Torrent staging option A vs B (stage 2 of the disk backend plan); stages
-     3-4 of that plan.
-   - A `CONTRIBUTING.md` checklist line: "A new gate may pace lower-class
-     work; it may never stop it." Offered 2026-09-29.
-   - Deleting fi-1's old backend copy `/var/lib/macha/data.moved-20260929`.
-7. **Known defects found 2026-09-24/25, not yet fixed:**
-   - `catalogue_api` still answers `503 catalogue_unavailable` for some client
-     errors (artwork upload, `If-Match` parsing not re-checked); a parent cycle
-     through `PUT`/`PATCH` is not checked.
-   - Three transient conditions raise a bare `runtime_error` an ingest would
-     fail on rather than block: `object replication quorum unavailable`
-     (`src/cluster/distributed_store.cpp`), `metadata replica is still
-     recovering` (`src/cluster/cluster.cpp`), `local metadata replica
-     unavailable` (`src/filesystem/filesystem.cpp`). None seen failing an
-     ingest yet.
-   - From the acquisition API audit (`docs/acquisition.md`): the torrent and
-     ingest `catalogue.state` rules disagree; a remote job's
-     `catalogue.items` is empty; server-side sort of search results by
-     seeders (clients own sorting); a pause or cancel landing while an ingest
-     fails is overwritten.
-   - Fedora and MacPorts package names in the install docs unverified.
-8. **OpenAPI endpoint** (operator, 2026-09-24). Served by the API,
-   switchable in config. There is no route table today; the agreed design is
-   to generate the document from a declarative route table that dispatch
-   actually runs from. Document the status and error codes with it.
-9. **People on catalogue items -- directors, cast** (approved), with a
-   required backfill: TMDB `append_to_response=credits` on the scanner's
-   requests; store on `CatalogueItem`; expose in the API; a background,
-   rate-limited, resumable pass over every item with a `tmdb` id and no
-   credits. Announce to every client.
-10. **Artwork:** a cold read is slow (1.1 s for 77 KB from gbni-1);
-   `CatalogueManager::artwork` fetches the whole object before the first
-   byte. Sized variants (`?w=300`) are a feature at the operator's priority.
-11. **The deploy viewer check** (`build/claude-viewers.sh`) reads
-   `playback/status` sessions and journal segment lines. A client polling a
-   paused session still shows as a session with no segment lines; the
-   operator's call each time.
-12. **Test failures** (no known flakes -- each is P0 work):
-    - **Rewritten 2026-10-01:** `rpc_cluster/test_three_node_cluster` (a
-      scenario of thirteen claims waiting on background work) became ten
-      claim tests that drive their steps (T2 README), and, once T3 injected
-      the activity clock, the joiner's pull through maintenance. Open:
-      cache-to-store promotion by idle maintenance has no test; the warm
-      view's freshness mechanism at the metadata layer is not yet traced.
-    - **Fixed 2026-10-01:** a Debug build compiled against libtorrent with
-      the wrong class layout (the exported target's `TORRENT_USE_ASSERTS`);
-      `hydration_catalogue/test_a_torrent_is_held_by_one_job_and_a_second_add_names_it`
-      failed every time in Debug. Dropped from the imported target.
-    - **Fixed 2026-10-01, watching for recurrence:**
-      `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
-      segfaulted ~60 ms in, ~1.7% at `--jobs 12` (also 5/500 on `c53efd7`).
-      ASan: null `this` in `DistributedStore::repair_diagnostics()` via
-      `Service::repair_diagnostics()`, which read `store_` before the
-      asynchronous service start had built it. The accessor now calls
-      `wait_services_ready()` like its siblings (it lost `const`). 5/5 after
-      the fix (operator: five runs, then watch). Any recurrence reopens it.
-    - The same test fails its pacing check (`share_after > share_before`,
-      `tests/test_rpc_cluster.cpp:968`) 2/100 with
-      `MACHA_TEST_LOG_LEVEL=DEBUG`, 0/300 without. Likely timing under slow
-      logging; not proven.
-    - **P0:** `filesystem_fuse/test_fuse_recovery_thousand_operations_have_bounded_publications`
-      segfaulted once in the full suite on fi-1 (2026-09-28). Not reproduced
-      since: 200/200 laptop, 200/200 fi-1 (2026-09-30). Next: ASan on fi-1
-      under full-suite load, after the soak.
-    - Fixed on `experiment/object-ledger-fixes`:
-      `media_playback/test_abandoned_transcode_pipeline_is_reclaimed_before_session`
-      (a 50 ms idle lease renewed by 20 ms wall-clock sleeps; `759e75a`) and
-      the HTTP test reader that kept a second pipelined response in the first
-      body (`c02f913`).
-    - `storage_v18/test_has_is_a_cheap_presence_check_not_a_decrypt`
-      (a truncated object reported present), full suite only, not
-      reproduced since. Step P (authoritative presence) re-checks existence
-      under the object lock in the warm-up scan and publishes presence only
-      after a put completes; the original route is not proven closed.
-    - `filesystem_fuse/test_coalesced_delete_burst_wakes_at_exact_garbage_grace`,
-      twice in full macOS runs, 0/58 isolated. It reaches its state in real
-      time (`object-ledger-evidence/t1/q-real-time-maintenance-tests.md`).
-    - `rpc_cluster/test_metadata_history_checkpoint_concurrent_proposers_converge`
-      and `users/test_a_node_that_was_down_learns_a_deletion_not_a_resurrection`,
-      once each on fi-1 2026-09-24, 10/10 alone.
-    - The macOS-only torrent segfaults (5 of 21 in `macha-tests-torrent`).
-13. **Transport backoff after a peer restart**: an inbound session does not
-    clear the dial backoff for the peer's other lanes, so a node refuses to
-    dial a restarted peer for up to 4 s. Costs latency, not correctness.
-14. **Movie sets** (operator, 2026-09-25, "later"): many-to-many membership;
-    not designed; needs a proposal first.
-15. **Ebooks** (operator, 2026-09-25, "later"):
-    [docs/macha-ebooks-proposal.md](../docs/macha-ebooks-proposal.md), to be
-    answered with what the server would need; nothing to build yet.
+- **Per-file readability** [4]: designed; the operator chooses where it
+  goes. Two of its three uses are wire changes.
+- **A media-type context on torrent add** [5] (operator, 2026-09-25).
+- **OpenAPI** [8]: generated from a declarative route table that dispatch
+  runs from. Agreed, unstarted.
+- **People on catalogue items** [9]: approved, with a backfill.
+- **The API is RESTful, all of it** [16]: audit every route; identity resets
+  become a resource (decided). `providers/artwork?ref=` and
+  `providers/artwork/choose` are among the routes to change.
+- **Core's request** [17]: `providers/artwork` taking `item_id`. Not now;
+  Core raises it again when the experiment ends.
+- **Placement API asks** [-1]: the target `node_id` and a viewer-facing
+  detail on `placement_failed`; the peer's own refusal text on a forwarded
+  add; an optional node `name` (operator's call).
+- **Movie sets** [14] and **ebooks** [15]: later; each needs a proposal
+  first.
 
-16. **The API is RESTful, all of it** (operator, 2026-10-01). Resources and
-    HTTP methods, not verbs in paths; any route that is not is a thing to
-    change. Not now: larger problems first. When it comes up:
-    - Audit every route against it and list the ones that are not.
-    - **Identity resets become a resource** (decided): `POST
-      /api/v1/manage/identity-resets` (host, port, node_id, reason) answers
-      202 with the reset's id; `GET /api/v1/manage/identity-resets/{id}`
-      gives its state (queued, applied, audited, failed with a code);
-      node-scoped `POST /api/v1/manage/nodes/{id}/identity-resets`. The
-      endpoint lookup for a node with no host given moves into the queued
-      work, so the request never waits: this also removes the wait-guard
-      violation at `src/api/manage_api.cpp:730` (T2 README). Replaces
-      `POST .../identity-associations/reset` and
-      `POST .../nodes/{id}/identity-association/reset`.
-    - Every change is an API change: announced to Core and every client
-      before it ships.
-    - Who calls the reset routes (replies 2026-10-01): the web client only,
-      the node-scoped one, through core's
-      `ManageApi.resetNodeIdentityAssociation` (core
-      `src/api/MachaManageApi.ts:156`), from the Status node card's "Reset
-      association" (manager role, confirmed); it shows the 2xx as an
-      acceptance and refreshes status once. With the resource it would POST
-      then follow `GET .../identity-resets/{id}` for the state. Core's
-      `resetIdentityAssociation` (the general route, :148) is unused by the
-      web. The TV and phone clients call neither.
+**Waiting on the operator** [6]
 
-17. **Core's request (2026-10-01): not now** (operator's answer as relayed
-    by Core: not mid-experiment; Core holds it as a TODO, `6f4c396`, and
-    raises it again when the experiment ends). Nothing built. The request: let
-    `GET /api/v1/manage/providers/artwork` take `item_id` (with `role`) as
-    well as `ref`, resolving the item's own provider reference the way
-    `POST .../artwork/choose` does in `scanner_.choose_artwork` (a TMDB movie
-    or show is its own; a season or episode is its show's with its season
-    and episode numbers; an album its MusicBrainz release). An explicit
-    `ref` still overrides; an item with no reference answers a named code
-    (`no_provider_ref` suggested). Same `{status, options}` answer. For the
-    web's metadata editor: today every client must parse the server's id
-    forms (an episode's show id is only in its season's id). An API change:
-    announce with exact codes before shipping.
+- Metadata editor B: the choice of fields.
+- 317 directories under `/Movies` and `/Music` on gbni-1 that list empty
+  (`/root/empty-dirs.txt` there).
+- Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
+- A `CONTRIBUTING.md` line: "A new gate may pace lower-class work; it may
+  never stop it."
+- Deleting fi-1's old backend copy `/var/lib/macha/data.moved-20260929`.
+- The catalogue repair that runs twice per maintenance pass; the replica's
+  applier lifetime; fi-1's USB power.
 
-Then the older ordered items below. Reconciled against 0.57.0 on 2026-09-24:
-what was found already done is ledgered in `COMPLETED.md` under "backlog
-reconciliation", and items only partly done now state what remains. The
-P-1/P0/P1/P2 sections that follow date from 2026-09-05 to 2026-09-22 and have
-not been re-verified against 0.73.2 item by item.
+**Older ordered items**, in the archived file and `BACKLOG.md`, *carried*:
+the namespace Merkle work's Stage D (demand-loaded extent nodes, a persisted
+`file_media_id`); the cache-sizing invariant; the metadata stall on the RPC
+path; the rejoin and materialisation-cache P0; the loader-I/O P0.
 
 ## Standing rules (learned the hard way; do not relearn)
 
@@ -435,343 +240,33 @@ not been re-verified against 0.73.2 item by item.
   the plugin tried to start 2,097,152 threads.
 - **After a deliberate mutation, delete the object file when restoring**: a
   same-second restore skipped the rebuild and an hour went on a phantom bug.
-- **Gate a gdb attach on the viewer check**, not just run the check.
 - **Every response has a snake_case status code; errors add a message beside
   it; clients own sorting and presentation; every API change is announced to
   Core and every client** (operator, 2026-09-24).
-
-**Read this before trusting anything below about a client.** Four client
-sessions spent 2026-09-21 testing 0.48.0 against the live cluster and
-reported sixteen findings. Six were real and are recorded; the rest were
-retracted, several of them client self-diagnoses that did not survive
-measurement. **A client's account of itself is evidence about the client, not
-a fact.**
-
--3. **P0: a reconciliation merge rolls committed ingest checkpoints back, and
-   the ingest dies on it -- `ingest failed: concurrent file content change`
-   (diagnosed 2026-09-23, NOT FIXED).**
-
-   On es-1, three torrent-sourced ingest jobs died at 12:51:12Z, 12:51:47Z and
-   12:52:07Z. What the namespace holds now versus what es-1 had committed and
-   had confirmed `stored=yes` on a replica:
-
-   | `.part` | on the mount (both nodes) | last committed by es-1 |
-   |---|---|---|
-   | Gremlins | 335,544,320 | 469,762,048 (12:50:57Z) |
-   | Voyager S04E04 | 402,653,184 | 469,762,048 (12:52:00Z) |
-   | Matrix Revolutions | 536,870,912 | 603,979,776 (12:51:38Z) |
-
-   One to two 64 MB checkpoints gone from each. Each failure lands within two
-   seconds of a `metadata histories reconciled ... conflicts=1 superseded=1`
-   line; the last one in the same second.
-
-   **Mechanism.** `src/metadata/metadata.cpp:2040-2046`: on a genuine three-way
-   conflict the merge installs the **common-ancestor value** at the path and
-   records a conflict ("Keep the common-ancestor value visible until explicit
-   resolution"). The ingest's open `WriteHandle` still carries its last
-   committed basis; the entry now has an older size and older extents under a
-   newer version; `commit_file`'s basis check (`src/filesystem/filesystem.cpp:2294`)
-   fails EAGAIN; `IngestManager::process_job` marks the job `failed`
-   (`src/acquisition/ingest.cpp:1221`). No bytes are lost -- extents are on disk and
-   `copy_file` resumes from the namespace size -- but the job is dead and a
-   retry re-copies 64-128 MB.
-
-   **Why a path only es-1 ever writes conflicts at all.** gbni-1's history for
-   gens 36465-36499 is a sibling-merge storm: ~20 merges in 25 records, with
-   two or three records at the *same* generation (36470 x3, 36477 x3, 36480 x3,
-   36484 x3). All three nodes reconcile, each sorts the accepted heads by hash
-   from its own view and folds `heads[0]`/`heads[1]`
-   (`src/metadata/metadata_manager.cpp:1248-1251`), so with three or more heads they
-   merge *different pairs* and manufacture sibling merges of each other's
-   merges. In that braid `history_common_ancestor` (which does follow
-   `merge_parents`) lands well below both heads, so es-1's checkpoint N (left)
-   and the other head's copy of es-1's earlier checkpoint N-1 (right, absorbed
-   via a different fold) *both* differ from a base at N-2 -> conflict -> N-2
-   installed. That is the one-to-two-checkpoint regression measured.
-
-   **It is a tree-cutover regression.** Reconciliations on es-1: 4 on
-   2026-09-21, **131** on 2026-09-22, 20 by noon on 2026-09-23. Tree-backed
-   merges are full records (17-34 KB, 300-400 ms) and six concurrent imports
-   each committing every ~7 s collide constantly. The cutover note in -1
-   already lists "a tree-native merge" for Stage F.
-
-   **Not proven:** which path each `conflicts=1` was on. No log line names the
-   conflict key, and es-1's history had compacted past the window before the
-   record could be materialised. Sizes, timing and the DAG leave no other
-   consistent explanation, but that last step is inference.
-
-   **Plugging the hole, three parts, none done:**
-   - [ ] **The merge rule.** When one side's entry is causally the other's
-     ancestor -- per-path `version` is monotonic and right's value equals an
-     earlier state of left's -- take the newer instead of declaring a
-     conflict. Today ancestry seen through a stale LCA is indistinguishable
-     from divergence.
-   - [ ] **The ingest.** On EAGAIN from a checkpoint commit, re-base on the
-     current entry and continue from its size rather than failing the job.
-     Same class as the restart-mid-put failure below.
-   - [ ] **The reconciler.** One merger at a time, or a deterministic pair
-     choice that every node makes identically, so three heads cannot fan out
-     into sibling merges. This is also where the operator's point lands:
-     **publications are supposed to batch and to throttle, and did before the
-     tree.** Six jobs x 64 MB checkpoints is the collision source. The only
-     throttle found so far is `fuse.publication_quiet_ms`, which gates on
-     *foreground viewer* activity alone and so cannot see an import; no
-     coalescing layer exists in `MetadataManager`. The operator knows what
-     used to batch; ask before guessing.
-   - [ ] Log the conflict key when a merge records one, so the next instance
-     is provable from the journal alone.
-
-   **Also open from the same afternoon** (and **not** the durability-barrier
-   defect in item -4, checked on 2026-09-23: this message comes from
-   `filesystem.cpp:1215`, the *write* quorum in `put_impl` failing to reach
-   `min_write_replicas`, not from the barrier, whose failure says "object
-   durability quorum unavailable before publication" instead): an ingest job
-   dies permanently when its node restarts mid-put -- `state='failed' error='object replication
-   quorum unavailable'` -- rather than pausing and resuming. It survived three
-   restarts today and failed on the fourth, so it is timing-dependent. Same
-   class as the read-only-window fix that shipped in 0.57.0, which blocks and
-   retries on `MetadataNotReady` only; this EIO from the object write quorum
-   is not covered by it. The job is retried from the UI; completed files are
-   skipped.
-
--2. **What the disk resource audit left open, and the batching question
-   (2026-09-23).** The audit itself is closed (`COMPLETED.md`, 0.53.0); these
-   are the parts it recorded rather than fixed:
-   - [ ] **One `DiskServiceMonitor` covers a whole `StoragePool`, not one
-     device.** A pool may hold several backends on several devices and the
-     monitor cannot tell them apart, so one slow backend pressures work bound
-     anywhere in the pool. Harmless today -- gbni-1 and es-1 configure exactly
-     one DATA backend each -- and it bites the moment a second is configured.
-     Per-device pressure also needs the arbiter to know an operation's
-     destination device, which it cannot: admission happens before placement.
-   - [ ] **Local disk maintenance is budgeted from a network measurement.**
-     `estimated_network_bps()` feeds `local_credit` as well as
-     `network_credit` (`src/service/service.cpp` maintenance loop), which is how a
-     GC/repair pass once took 51.6 MB/s of one spindle. The loader clock stops
-     maintenance during an import, which was the case that hurt, but the
-     budget still means nothing on a node with one spindle. No number is
-     proposed on purpose.
-   - [ ] **The 150-300% hysteresis band is a latch.** A device that settles
-     anywhere between stays pressured, and the EWMA does not decay without
-     traffic. The trickle drains so it does not wedge, but "pressure always
-     releases on a device that recovers" is only true past 150%.
-   - Law 1 holds **by configuration, not by construction**: control on
-     `nvme0n1p2` and DATA on `sdb1` on every node, but nothing stops
-     `metadata_store.path` being pointed at a DATA spindle, and the FUSE spool
-     and ingest staging already sit on the DATA spindle as plain file I/O the
-     monitor never sees.
-   - [ ] The ingest's own ceiling is now the spindle, not CPU: it reads its
-     staging copy from and writes its extents to the same disk
-     (`/mnt/diskB/ingest` and `/mnt/diskB`), measured at 34-49% util during a
-     13 MB/s import.
-
--1. **What the cutover cost on 2026-09-22, in order of how close it came.**
-   The cluster was re-rooted at 12:41Z. By 18:00Z four things had surfaced
-   that no test had, all recorded here so the next cutover of anything is
-   planned against them:
-   - **The tree was collectable.** The control-store live set walked
-     catalogue roots and nothing else; every tree node was an unreferenced
-     object to GC. Only a 30-day `garbage_grace_ms` set as a migration safety
-     net stood between the cluster and collecting the nodes that say where
-     every file lives. Fixed in 0.51.0 (`collect_namespace_tree_nodes` in the
-     release live set, `collect_namespace_tree_changes` for claims).
-     **The grace stays at 30 days until 0.51.0 has run on all three nodes for
-     a day**, then goes back to 24 h.
-   - **Ingest crawled at 1.8 MB/s on an idle node.** A commit re-chunks the
-     spine and replicated all ~12 nodes it touched synchronously to peers 60 ms
-     away, eleven of them byte-identical to what was stored. Fixed in 0.51.0:
-     a node already present is not re-replicated. Per-commit round trips ~12
-     to 1-3. **Measured 2026-09-23 on gbni-1 after 0.53.0/0.53.1: 13 MB/s
-     aggregate across three concurrent imports** (810 MB in 60 s), `sdb` at
-     34-49%, `macha-maint` at 0. The same defect -- re-sending what the peer
-     already holds -- turned out to be alive on the *retention* path too and
-     was the cause of the retention-floor ingest failures; fixed in 0.53.1.
-   - **A sixteen-minute stall with the wrong message on it.** Two heads at one
-     generation, no commits until reconciliation merged them, and every node
-     logging "delta replay ... does not reproduce the record hash" -- which
-     `diagnose_unreconstructable_locked` emits without ever replaying. The
-     chain replays byte-exactly (`macha-metadata-dump --objects`). The message
-     now says what it checked. **The stall itself is still open**: tree-backed
-     reconciliation materialises both branches and publishes a full record,
-     and the cost of that on a live branch is unmeasured. Item for Stage F:
-     a tree-native merge.
-   - **The DATA pressure gate was wrong twice before it was right** (0.51.0,
-     corrected in 0.52.0). First it compared every operation against a flat
-     50 ms, so a 4 MiB extent write -- 100-200 ms on a healthy spinner -- read
-     as pressure: gbni-1 declared itself pressured nine seconds after boot and
-     held the import to one background lease for an afternoon. Now pressure is
-     the moving average of actual against expected *for the operation's size*
-     (25 ms + 120 ms/MiB, pressured above 300%, released below 150%), plus an
-     absolute 2 s outlier trip. The outlier exists because the tests showed the
-     ratio alone would have let the founding 17.7 s write through: against
-     fifty healthy samples it moves the average to 237%, under the 300% line.
-     0.51.0 also flattened law 3 by making the loader yield to pressure with no
-     viewer present; it now yields only when a viewer is waiting or holding
-     credit. **Superseded by the 0.53.0 audit** (`COMPLETED.md`): the read
-     path was still measuring every read as zero bytes, the outlier is now a
-     ratio (`io_pressure_outlier_percent`, 1000), and the torrent clamp gained
-     law 3's second clause. Still untested against a genuinely pathological
-     device.
-   - **Every catalogue route returned 503 on every node and all clients
-     reported "no API"** (0.51.0, fixed in 0.52.0). `catalogue.cpp` committed a
-     resolved conflict through the non-exact `mutate()` path, which the
-     tree-backed guard refuses. It was the last caller on that path and the
-     line had been spotted hours earlier without being fixed. Health and auth
-     answered throughout, so the app loaded empty -- worth remembering as a
-     failure shape: *the server looks fine from every probe except the one the
-     client actually needs.*
-
-   **Client asks from the placement API round (2026-09-22), both sessions.**
-   Verified against the code before writing down; two need nothing:
-   - Per-node free disk: already on `/api/v1/status` as
-     `nodes[].storage.free_bytes`. Core had not read it.
-   - Node id format: `unhex` takes even-length unseparated hex, either case.
-   - [ ] Structured `placement_failed`: the code shipped in 0.56.0
-     (`error.reason`: `node_not_member`, `node_refused`, `node_unreachable`,
-     `node_did_not_start`, `missing_uri`, `add_failed` or the peer's own
-     code). Still open: the target `node_id` as a field, and the viewer-facing
-     `detail` (Core) -- 0.56.0 has no `error.detail`; weigh it against the
-     codes-are-primary rule. A host must never parse a message.
-   - [ ] Surface the peer's own refusal text on a forwarded add. fi-1 has
-     `torrent: enabled: false`, so a placement there is a correct 409 -- but
-     the message says "refused the request" where the peer said "torrents not
-     available on this node".
-   - [ ] Optional `name` per `nodes[]` entry on `/api/v1/status` (web client).
-     Needs a config knob and a `NodeTelemetry` field to travel; `host` is the
-     RPC bind address and is inconsistent on this cluster (two DNS names, one
-     machine name). **Operator's call** -- the operator chooses the names.
-   - Both sessions independently declined a server-side "best node" and a
-     name as the placement key. Core's reason stands: they already rank
-     endpoints and can say which axis decided; a second ranking on different
-     inputs would make placement unexplainable. Not doing it.
-
-0. **The namespace Merkle work**, the P-1 below. **Stages B, C and E have
-   shipped** (ledgered in `COMPLETED.md`): the SM14 record in 0.49.0, the
-   commit path and every namespace reader and writer on the tree in 0.49.1 and
-   0.50.0, and the migration tool in 0.50.0 -- the live cluster was re-rooted
-   onto the tree at 12:41Z on 2026-09-22 (0.50.1: a 22.79 MiB record became
-   3.97 KiB). What the cutover cost is item -1. **What remains is Stage D**
-   (demand-loaded extent nodes on the `RetainedMemoryLedger`; persist
-   `file_media_id`) **and Stage F** (the dependent O(N) items under P1 scaling
-   cliffs, plus the tree-native merge that items -1 and -3 call for:
-   reconciliation still materialises both branches and publishes a full
-   record). See [the plan](archive/2026-09-17-namespace-merkle-root-plan.md), which
-   carries the arithmetic that justified the work: 56 ms of CPU per namespace
-   write before the tree, ~3.1 s at the 100 TB target.
-1. **The other P-1, the cache-sizing invariant.** Still open, and note that
-   the block-cache item under it was falsified and downgraded on 2026-09-21 —
-   the cache works, it just could not be observed, and now can be.
-2. **The metadata-stall P0.** Its read-only blink was root-caused and fixed on
-   2026-09-21 (a hung health probe was given the whole liveness budget); the
-   stall that provokes it is still unexplained. Making an ingest survive a
-   read-only window shipped in 0.57.0 (`MetadataNotReady` blocks and retries
-   instead of failing the job).
-3. The **rejoin/cache P0** after it — worked around on all three nodes on
-   2026-09-20, not fixed, and the concrete instance of the first P-1.
-4. The **loader-I/O P0**. The node starves its own viewer I/O with loader
-   work: one ingest took es-1 to 91% iowait and aborted twelve client requests
-   at ~8 s. Governing law 2 is violated on the DATA backend, and no
-   configuration available prevents it. **Its reproduction is blocked** — read
-   that item's first bullet before attempting one.
-5. The **P0 cluster section**. The live cluster is **three** nodes as of
-   2026-09-20 evening, **all on 0.47.0** and converged at generation 31663:
-   es-1, fi-1 and gbni-1. gbni-2 is defunct and the operator expects it to stay
-   that way for some months (2026-09-20) — do not include it in a deploy, do
-   not wait for it, and do not treat its absence as an incident. Removing a
-   node is something the system does not really support, and that is the first
-   item there.
-6. **"What the client sessions now depend on"** near the end of this file.
-   These are API contracts settled in conversation with the four client
-   sessions and they exist nowhere else in this repository. Breaking one breaks
-   clients that cannot be fixed from here.
-7. **"Cluster state"** at the top of this file, which records node
-   addresses, what is deployed, and where the branches and tags stand (the
-   older snapshots are archived in `COMPLETED.md`).
-
-None of the last three is a task list; all of them will mislead you if you assume
-otherwise.
-
-**Four suite failures were diagnosed and fixed on 2026-09-15 (0.43.0)**,
-each to a written verdict in the deterministic-suite plan, step 3: the
-ingest case was a product defect (two concurrent imports both creating the
-shared scanner root, the loser's `EEXIST` failing its job); the divergence
-case a test defect (two Services' maintenance loops reconciling the
-divergence the test had just created); the edge-node placement case a test
-defect (observers compared before their capacity views had converged); and
-`test_three_node_cluster` a real transport deadlock, caught with gdb -- a
-writer loop exiting on a broken connection left queued notifications
-unanswered, and a metadata announcement waiting on one held the mutation
-mutex forever -- plus a test race against asynchronous promotion. Rates
-before and after, on es-1, are in the plan. The operator's rule, stated the
-same day: a failing test on a node is P0 work, not a footnote in a deploy
-report.
-
-**OpenAPI is the largest piece of agreed but unstarted work, and is now P1**
-(it sat at P2 until 2026-09-20, contradicting this very sentence): the operator
-asked for it on 2026-09-07 and upgraded it to "soon" on 2026-09-13. Generate it
-from the route table at build time so it cannot drift.
-
-2026-09-13 (evening): rationalisation pass for a new session. Twenty-three
-completed items were moved to `COMPLETED.md` in full rather than summarised —
-in several cases the reasoning *is* the record: a retraction, an option the
-operator declined, a measurement that disproved the thing it was taken to
-support. Before moving them, open remainders buried inside completed items were
-promoted to entries of their own rather than carried along or lost: the
-unmeasured iOS half of the bounded-VOD work, torrent session health not
-reaching the HTTP API, the TSan run nobody has made, and the web client holding
-a bearer token in JS-reachable storage. One completed item was kept in place as
-a numbered stub so an ordered list still reads. Nothing was deleted.
-
-2026-09-05: full reprioritisation pass. Two independent full-repo audits were
-run: (1) every doc under `TODO/`, `COMPLETED.md` and `CHANGELOG.md` in full,
-cross-referenced against each other; (2) an independent, docs-blind walk of all
-of `src/`/`tests/` verifying claims directly against current code (file:line
-citations). Findings were then cross-checked against each other. Consequences
-of that pass:
-
-- Items confirmed shipped (by both the changelog and direct code inspection)
-  were moved to `COMPLETED.md`.
-- Items this file called open that code inspection shows are now partially
-  shipped were reworded rather than re-litigated from scratch.
-- A new **P0 — Verified correctness defects** section and a new
-  **P0 — Security hardening** section were added: these are concrete bugs and
-  a concrete exposure found by reading the actual code, not carried over from
-  older docs. Nothing in `src/` carries a `TODO`/`FIXME` marker — the entire
-  informal backlog that would normally live in comments instead had to be
-  found as verified behaviour.
-- A new **P1 — Scaling cliffs** and **P2 — Code health / error-handling
-  consistency** section record real, verified-but-not-yet-urgent debt (the
-  system is small today; several of these are O(N) or O(N²) patterns that are
-  invisible at current scale and will not stay invisible).
-- This pass is still not exhaustive for the 73 dated plan docs in this
-  directory — see the "Documentation hygiene" item under P2 for the specific
-  staleness this audit found in those docs, root docs, and `CHANGELOG.md`.
-
-2026-09-08: pruning pass. Every remaining item was re-checked against current
-source (file:line) and against 0.24.1–0.35.0 in `CHANGELOG.md`. Items that
-shipped, that a later release superseded, or that duplicated another item were
-removed here and ledgered in `COMPLETED.md`; items whose evidence had moved on
-were reworded down to what is actually still open rather than left carrying a
-history that reads as work. What went, and why:
-
-- The self-healing programme (0.29.0–0.32.0) and its `[x]` durability-wedge
-  finding: shipped. Its three sub-items went with it — the publication hot
-  loop is now under `RetryPolicy` backoff and parking (0.30.0), and the 120 s
-  startup gate is now a no-progress gate (`startup_progress.hpp`,
-  `service_startup_no_progress_ms`, 0.30.0). Only the duplicate-path cause
-  survives, promoted to its own item.
-- The DLT7 scaling item: shipped as DLT7 in 0.32.0 (`metadata.cpp:780`).
-- Four `[x]` correctness/security items (0.24.0–0.24.3) and the retracted
-  `LocalStore::valid()` scaling item, which was already restated in P0.
-- The unlink-doesn't-abandon-publication sub-item, which was the same fix as
-  the "short-circuit unlink" item in P0 structural; merged into it.
-- The `mount_path` deployment rule: all three nodes run 0.34.0, so every
-  config has already moved.
-- The node-50 SSH item: diagnosed off-list as gbni-1 browning out under build
-  load, which is now a standing operational rule, not an open investigation.
-- Two claims in the "dead wiring" item that code inspection now contradicts
-  (`StorageLock` is used at `cluster.hpp:77`; the scanner's
-  `request_media_profiles` is invoked from `catalogue_api.cpp:441`).
+- **Testing** (operator, 2026-10-05): design it properly across the codebase,
+  test it well once, get it working, iterate. No soak runs, sanitizer builds
+  or mutation sweeps as gates; a sanitizer is a debugger for a specific bug.
+  This replaces the experiment's per-step rule of full coverage,
+  mutation-proven.
+- **The wait for viewers before load or a gdb attach was lifted**
+  (operator, 2026-10-03); never both nodes down at once.
+- **Report findings before fixing; prove a mechanism before editing.** A
+  failing test on a node is P0: reproduce it before deciding whose it is.
+- **A deploy needs the operator's order for that version.**
+- **Client sessions may ask; they do not decide.** An API change waits on
+  the operator.
+- **A client's account of itself is evidence about the client, not a fact.**
+- **The composition root is code**: concrete classes, constructor
+  references, dependency order written down. No framework injection.
+- **Check the branch before cutting one**; the operator sometimes commits in
+  this checkout.
+- **Never edit sources under a running build.**
+- **The DATA store is `StoragePool`** over one `LocalStore` per backend; the
+  control store is a `LocalStore`. Service accessors wait for the
+  asynchronous start (`wait_services_ready()`).
+- **The cmake install stage writes `etc/macha/macha.yaml`**: ship `usr` only.
+- **A journal watch over ssh needs `ssh -n`** and a flushing last stage;
+  test it against a known event before trusting its silence.
 
 The governing laws are stated, with their numbering, in
 [Principles and laws](../docs/principles-and-laws.md):
@@ -784,8 +279,8 @@ The governing laws are stated, with their numbering, in
 ## The older backlog
 
 The P-1 to P2 sections written 2026-09-05..22 are in
-[`BACKLOG.md`](BACKLOG.md), unverified against 0.73.2 item by item. The
-queue above outranks them.
+[`BACKLOG.md`](BACKLOG.md), not re-verified since. The entries above outrank
+them, and entry 1 absorbs three of them.
 
 ## What the client sessions now depend on (settled 2026-09-13)
 
