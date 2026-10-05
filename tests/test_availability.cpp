@@ -209,6 +209,54 @@ MACHA_FAST_TEST("availability", test_the_rollup_counts_references_and_what_is_he
               .complete());
 }
 
+// A roll-up carried to the next tree counts what a fresh one counts, and
+// reads only the nodes the last tree did not have.
+MACHA_FAST_TEST("availability", test_a_rollup_carried_to_the_next_tree_reads_what_changed) {
+    MemoryNamespaceNodeStore store;
+    auto entries = library(60);
+    const auto first_root = build_namespace_tree(entries, store, small_limits());
+    const auto held = subset(references(entries), 40, 3);
+    const auto first = HoldingsRollup::build(first_root, store, holds(held));
+
+    // One file changes, one goes, one arrives.
+    auto changed = std::next(entries.begin(), 20);
+    while (changed->second.type != EntryType::file)
+        ++changed;
+    changed->second = file_of(700000, 9);
+    auto gone = std::next(entries.begin(), 40);
+    while (gone->second.type != EntryType::file)
+        ++gone;
+    entries.erase(gone);
+    entries["/zz-new.bin"] = file_of(800000, 5);
+    const auto next_root = build_namespace_tree(entries, store, small_limits());
+    REQUIRE(next_root != first_root);
+
+    size_t fresh_reads = 0;
+    const auto fresh = HoldingsRollup::build(next_root, store, holds(held), [&] { ++fresh_reads; });
+    size_t carried_reads = 0;
+    const auto carried =
+        HoldingsRollup::build(next_root, store, holds(held), [&] { ++carried_reads; }, &first);
+    CHECK(carried.root() == next_root);
+    CHECK(carried.total() == fresh.total());
+    CHECK(carried_reads * 3 < fresh_reads);
+    std::vector<ObjectId> pending{next_root};
+    while (!pending.empty()) {
+        const auto node = pending.back();
+        pending.pop_back();
+        CHECK(carried.find(node) == fresh.find(node));
+        for (const auto& child : namespace_tree_children(*store.get(node)))
+            if (!child.extent)
+                pending.push_back(child.id);
+    }
+
+    // Carried often enough, a roll-up is made afresh and holds only its tree.
+    auto rollup = carried;
+    for (size_t i = 0; i < HoldingsRollup::carries_max + 1; ++i)
+        rollup = HoldingsRollup::build(next_root, store, holds(held), {}, &rollup);
+    CHECK(rollup.nodes() == fresh.nodes());
+    CHECK(carried.nodes() > fresh.nodes());
+}
+
 MACHA_FAST_TEST("availability", test_the_rollup_reads_a_shared_subtree_once_and_counts_it_twice) {
     MemoryNamespaceNodeStore store;
     std::map<std::string, FsEntry> entries;

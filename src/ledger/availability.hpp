@@ -39,8 +39,16 @@ class HoldingsRollup {
     // where it is referenced, read once) and asks `held` once per extent
     // reference. `pause`, if given, is called between tree nodes, for pacing.
     // Throws DecodeError if a tree node cannot be read.
+    //
+    // `carried`: a roll-up of another tree, taken while this node held what it
+    // holds now. A subtree the two trees share keeps its count and is not
+    // read again, so the cost is what differs between the trees. Counts of
+    // nodes the new tree no longer has are carried along; every
+    // `carries_max` builds a roll-up is made afresh and they are dropped.
     static HoldingsRollup build(const ObjectId& root, const NamespaceNodeStore& store,
-                                const HeldFn& held, const std::function<void()>& pause = {});
+                                const HeldFn& held, const std::function<void()>& pause = {},
+                                const HoldingsRollup* carried = nullptr);
+    static constexpr size_t carries_max = 64;
 
     const ObjectId& root() const noexcept { return root_; }
     Holding total() const { return nodes_.at(root_); }
@@ -51,6 +59,7 @@ class HoldingsRollup {
   private:
     ObjectId root_{};
     std::map<ObjectId, Holding> nodes_;
+    size_t carries_{};
 };
 
 // A node's answer about one tree node. `known`: the node is in its tree, and
