@@ -440,8 +440,6 @@ void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
         " attr_timeout_ms=" + std::to_string(policy.attr_timeout.count()) +
         " absolute_request_timeout_ms=" + std::to_string(policy.absolute_request_timeout.count()) +
         " commit_workers=" + std::to_string(policy.commit_workers) +
-        " recovery_commit_workers=" + std::to_string(policy.recovery_commit_workers) +
-        " foreground_commit_workers=" + std::to_string(policy.foreground_commit_workers) +
         " publication_quiet_ms=" + std::to_string(policy.publication_quiet.count()));
     return fuse_get_context()->private_data;
 }

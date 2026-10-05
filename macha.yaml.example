@@ -1,63 +1,50 @@
-# Macha 0.83.0
+# Macha node configuration.
 #
-# Copy this file per node. Paths, advertise address and failure_domain are
-# node-local. The cluster key contents and dht policy must match every node.
+# One file per node. Paths, network.advertise and network.failure_domain are
+# per node; the cluster key and the dht section must match on every node.
 #
-# Create state/cache/storage directories before starting the service. Storage
-# paths are deliberately not auto-created: a missing mounted disk must not turn
-# into an accidental directory on the root filesystem.
+# Create the state, cache and storage directories before starting. Storage
+# paths are never created: a disk that failed to mount must not become a
+# directory on the root filesystem.
 
 state_path: /var/lib/macha
 key_file: /etc/macha.key
 
-# Directory scanned for subsystem plugins (.so/.dylib). Defaults to this
-# build's private plugin directory (e.g. /usr/lib/macha/plugins) when
-# omitted. Uncomment only to override that default.
+# Where subsystem plugins (.so/.dylib) are found. Default: this build's
+# plugin directory, e.g. /usr/lib/macha/plugins.
 # plugin_path: /opt/macha/plugins
 
-# ALL, DEBUG, INFO, WARN or ERROR. Default: INFO.
-# ALL includes expensive per-object/FUSE/payload/extent/write trace output; DEBUG is low-volume operational diagnosis.
+# ALL, DEBUG, INFO, WARN or ERROR. Default: INFO. ALL adds per-object and
+# per-request tracing; DEBUG is low-volume operational detail.
 log_level: INFO
 
-# Independent libav/FFmpeg threshold. FFmpeg messages are routed through the
-# Macha logger, but this threshold is not limited by log_level above. Thus
-# log_level: INFO + ffmpeg_log_level: DEBUG is valid and useful.
-# QUIET, PANIC, FATAL, ERROR, WARN, INFO, VERBOSE, DEBUG or TRACE. Default: ERROR.
+# FFmpeg's own threshold, independent of log_level. QUIET, PANIC, FATAL,
+# ERROR, WARN, INFO, VERBOSE, DEBUG or TRACE. Default: ERROR.
 ffmpeg_log_level: ERROR
 
-# Startup gate. Local-state recovery (journal replay, metadata materialisation,
-# storage accounting) may take as long as it takes, as long as it keeps
-# making progress. Only when recovery has been silent — no journal record
-# parsed, no delta applied, no object scanned, no stage reached — for
-# service_startup_no_progress_ms is the process treated as internally stalled:
-# it logs known readiness state and terminates so the service supervisor
-# (systemd Restart=on-failure) brings up a fresh instance. Default: 120000.
-# service_startup_timeout_ms is an optional absolute ceiling on top of that;
-# 0 (the default) disables it, so a slow but progressing recovery can never
-# become a crash loop.
+# Startup. Recovery may take as long as it needs while it makes progress. If
+# it makes none for service_startup_no_progress_ms, the process exits so its
+# supervisor restarts it. service_startup_timeout_ms is an absolute ceiling;
+# 0 (default) disables it.
 service_startup_no_progress_ms: 120000
 service_startup_timeout_ms: 0
 
-# Linux/glibc process-memory bound. Apply one allocator arena per RPi core by
-# default instead of glibc's much larger CPU-derived allowance. This prevents
-# short-lived codec threads from ratcheting retained process memory after each
-# playback session. Accepted range: 1..64. Non-glibc platforms ignore it.
 runtime:
+  # glibc allocator arenas (1..64); ignored elsewhere. Few arenas keep codec
+  # threads from growing retained memory.
   glibc_arena_max: 4
   retained_memory_bytes: 768M
   control_memory_reserve_bytes: 64M
   viewer_memory_reserve_bytes: 192M
   loader_memory_reserve_bytes: 64M
 
-# Authoritative storage is split by correctness class. DATA holds media extents,
-# artwork and other immutable payloads. CONTROL/METADATA has an independent
-# priority quota and cannot be blocked by a full DATA backend.
+# DATA holds media extents, artwork and other immutable objects. The metadata
+# store has its own quota, so a full DATA backend cannot block it.
 storage:
-  # Whether this node is ever a DATA placement owner or fallback holder.
-  # false is the edge node: it serves the API and media to its own network
-  # from its cache, publishes writes to the owners, and stores no extents, so
-  # `data` may be omitted. auto resolves to false with no backends or when
-  # the node turns out to accept no inbound connections (network.inbound_capable).
+  # Whether this node stores DATA extents. false is an edge node: it serves
+  # from its cache and publishes writes to the nodes that store them, and
+  # needs no `data`. auto is false with no backends or when the node accepts
+  # no inbound connections.
   hosts_extents: auto
   data:
     backends:
@@ -67,50 +54,46 @@ storage:
       - path: /mnt/media-b/macha-data
         limit: 10T
         reserve_free: 4G
-    # Objects at or below threshold are packed locally. Packing never changes
-    # ObjectId, DHT ownership, replication, repair or GC. Set both to 0 to disable.
+    # Objects at or below threshold are stored in pack files. Both 0 disables
+    # packing. Packing changes nothing about identity, placement or repair.
     packing:
       threshold: 1M
       target_size: 64M
 
   metadata:
-    # Omit path to use <state_path>/metadata-objects.
+    # Default: <state_path>/metadata-objects.
     path: /var/lib/macha/metadata-objects
     limit: 4G
     packing:
       threshold: 1M
       target_size: 64M
 
-# Independent best-effort read cache. It does not count as a DHT replica.
-# SSD is a good fit. max_blocks is a block count, not a byte limit.
+# Local read cache; not a replica. An SSD suits it. max_blocks is a count of
+# blocks, not bytes.
 cache:
   path: /var/cache/macha
   max_blocks: 4096
   prefer_metadata: true
 
-# Root ownership/mode are used only when a brand-new namespace is formed.
-# They are then persisted in distributed metadata.
+# Owner and mode of the root directory, used only when a new namespace is
+# created.
 filesystem:
   root_uid: 0
   root_gid: 0
   root_mode: "0755"
 
-# The mounted filesystem is a bounded local frontend. Kernel callbacks never
-# wait synchronously for metadata publication, remote placement, repair or catalogue
-# work. Accepted namespace/data state is journalled locally and published by
-# asynchronous workers. Timeouts deliberately remain well below macFUSE's own
-# daemon timeout; a request fails to the kernel rather than hanging the mount.
+# The FUSE mount. Operations are journalled locally and answered at once;
+# publication to the cluster runs behind them. Every request has a timeout
+# below the kernel's, so the mount fails a request rather than hanging.
 fuse:
-  # Filesystem path to mount at. If omitted, Macha runs without a FUSE mount.
+  # Omit to run without a mount.
   mount_path: /srv/media
 
   allow_other: false
 
-  # Durable FUSE admission state can be placed independently of state_path.
-  # spool_path may hold the full unpublished byte backlog. The operation
-  # journal is small descriptor/control state and may live on another device.
-  # If omitted, spool_path defaults below state_path and the operation journal
-  # defaults inside the resolved spool directory.
+  # spool_path holds unpublished file data; the operation journal is small and
+  # may live on another device. Defaults: a spool under state_path, the
+  # journal inside the spool.
   spool_path: /var/spool/macha/fuse
   operation_journal_path: /var/lib/macha/fuse-operations.log
 
@@ -127,49 +110,39 @@ fuse:
     lifecycle_ms: 2000
   request_workers: 24
   max_pending_requests: 4096
-  # Aggregate heap ownership of copied writes waiting to enter the disk spool.
+  # Memory held by written data waiting to enter the spool.
   max_pending_write_bytes: 32M
   commit_workers: 8
-  # Compatibility settings retained for older configurations.
-  recovery_commit_workers: 2
-  foreground_commit_workers: 1
-  # Genuine streaming/viewer activity receives the dominant relative service
-  # share. FUSE is ingest/convenience traffic and always uses loader priority.
-  # Either class borrows 100% of unused capacity while the other is idle.
+  # Data publication is loader work: while a viewer is active it gets
+  # loader_weight time for every viewer_weight of the viewer's; otherwise it
+  # runs freely. A viewer counts as active for publication_quiet_ms after its
+  # last request. Namespace operations are not paced.
   viewer_weight: 95
   loader_weight: 5
   publication_quiet_ms: 5000
-  # A large file yields after each quantum so closed/smaller files make fair
-  # progress. The in-flight budget caps the aggregate quanta admitted at once.
+  # A large file yields after each quantum so smaller files progress; the
+  # in-flight budget caps the quanta admitted at once.
   publication_quantum_bytes: 32M
   publication_inflight_bytes: 256M
   publication_pipeline_bytes: 8M
-  # Files holding a provisional writer at once. 0 derives it from
-  # runtime.loader_memory_reserve_bytes / (extent_size + pipeline), never
-  # fewer than commit_workers. A soft bound: it can be overshot by up to
-  # commit_workers - 1.
+  # Files with an open publication writer at once. 0 derives it from
+  # runtime.loader_memory_reserve_bytes, never fewer than commit_workers.
   publication_max_open_writers: 0
-  # A publication worker blocked on retained-memory admission fails with
-  # EAGAIN (and enters the retry path below) after this long with no quantum
-  # completing anywhere in the pipeline. Not a time limit on publishing. 0
-  # waits forever.
+  # A publication waiting for memory fails and retries after this long with
+  # no progress anywhere in the pipeline. 0 waits forever.
   publication_no_progress_deadline_ms: 30000
   max_pending_operations: 4096
-  # DataOp/checksum history plus one concurrent publication snapshot.
   max_operation_metadata_bytes: 64M
-  # Ordered namespace operations that may share one metadata publication.
+  # Namespace operations published together in one commit.
   namespace_batch_operations: 256
   namespace_batch_bytes: 256K
 
-  # Retry budgets. A publication (or namespace operation) that keeps failing
-  # backs off exponentially between attempts; once it has failed more than
-  # max_failures times inside window_ms, or has not succeeded once for
-  # max_failing_ms (0 disables that backstop), it is *parked* — kept on disk, shown
-  # in status and GET /api/v1/manage/filesystem/parked-publications, and left
-  # for an operator to retry or abandon — so one poisoned file can never hold
-  # the loader queue or spin the log forever. The namespace queue cannot be
-  # parked (it is ordered), so on exhaustion it surfaces the blocking
-  # operation in status and keeps trying at the ceiling backoff.
+  # Retries back off exponentially. A publication that fails more than
+  # max_failures times within window_ms, or has not succeeded for
+  # max_failing_ms (0 disables that limit), is parked: kept on disk and listed
+  # at GET /api/v1/manage/filesystem/parked-publications for an operator to
+  # retry or abandon. Namespace operations are ordered and cannot be parked:
+  # the blocking one is shown in status and retried at the ceiling backoff.
   publication_retry_max_failures: 100
   publication_retry_window_ms: 1800000
   publication_retry_initial_backoff_ms: 250
@@ -181,12 +154,10 @@ fuse:
   namespace_retry_max_backoff_ms: 5000
   namespace_retry_max_failing_ms: 3600000
 
-  # Aggregate local write-back and recovery bounds. max_spool_bytes is the
-  # durable burst/backlog budget, not an ENOSPC threshold: admission is fast
-  # below half occupancy, then progressively tracks measured publication speed
-  # and blocks at the bound until publication creates room. A physical
-  # spool_reserve_free violation remains ENOSPC to protect the host filesystem.
-  # Changes to these FUSE limits take effect after a server restart.
+  # max_spool_bytes is a backlog budget, not an ENOSPC limit: writes are
+  # admitted freely below half of it, then at the measured publication rate,
+  # and wait at the bound. Breaching spool_reserve_free on the host filesystem
+  # is ENOSPC. These limits take effect on restart.
   max_spool_bytes: 16G
   spool_reserve_free: 2G
   max_orphan_bytes: 1G
@@ -197,174 +168,122 @@ fuse:
   hint_lifetime_ms: 5000
   write_through_cache: true
 
-  # Before starting cluster/storage services, detect an already-mounted Macha
-  # FUSE filesystem at mount_path. If true, remove that stale Macha mount and
-  # verify it disappeared. Unrelated filesystems are always refused.
+  # Remove a stale Macha mount at mount_path before starting. Any other
+  # filesystem there is refused.
   unmount_if_mounted: true
-  # Make the host directory under mount_path immutable (chattr +i) before the
-  # services start, so nothing -- root included -- can write into it while the
-  # mount is absent or not yet up. Stray entries found there are logged and
-  # reported as filesystem.mountpoint_stray_entries.
+  # Make the mount point directory immutable (chattr +i) so nothing can write
+  # into it while the mount is down. Stray entries are logged and reported as
+  # filesystem.mountpoint_stray_entries.
   fail_closed_mountpoint: true
   watchdog_interval_ms: 1000
-  # How long to wait for this node's metadata replica to produce any
-  # namespace at all before the mount reports a fault its supervisor can
-  # retry and eventually show you. It bounds "no metadata has arrived",
-  # not "recovery is slow": a progressing replay is never cut off by it.
-  # 0 waits forever, which is what every release before 0.41.0 did.
+  # How long to wait for any namespace to arrive before the mount reports a
+  # fault. A recovery that is making progress is never cut off. 0 waits
+  # forever.
   initial_namespace_timeout_ms: 600000
 
 network:
-  # listen is the local bind address. advertise is what peers connect to.
+  # listen is the bind address; advertise is what peers connect to.
   listen: 0.0.0.0
   advertise: media-node-2.example.net
   port: 7437
 
-  # Can peers connect *to* this node? false is the node behind CGNAT or a NAT
-  # nobody may forward: it dials its peers, they answer over the sessions it
-  # opened, and never dial it (advertise, upnp, external_ip and
-  # connectivity_check are then irrelevant). auto asks a peer to dial back,
-  # persists the answer under state_path/connectivity/ and re-checks it
-  # periodically. A founding node (no bootstrap) must be reachable.
+  # Whether peers can connect to this node. false (behind CGNAT, say): it
+  # dials its peers and they answer over its sessions; advertise, upnp,
+  # external_ip and connectivity_check are then unused. auto asks a peer to
+  # dial back and keeps the answer under state_path/connectivity/. A node
+  # with no bootstrap peers must be reachable.
   inbound_capable: auto
 
-  # Nodes sharing one physical/site failure domain should share this value.
+  # Nodes in one physical site share a value.
   failure_domain: site-a
 
   heartbeat_ms: 5000
-  # How often this node gossips its telemetry set, and so how stale a peer's
-  # view of it in /api/v1/status can be.
+  # How often telemetry is gossiped, so how stale a peer's view of this node
+  # in /api/v1/status can be.
   telemetry_interval_ms: 10000
   dead_after_ms: 30000
   connect_timeout_ms: 2500
 
-  # Variable transport frames are at most this large. Peers negotiate the lower
-  # ceiling. Smaller values give finer pre-emption; extent_size is independent.
+  # Largest transport frame; peers use the lower of their two values.
   max_frame_size: 256K
 
-  # DEBUG observability only. These never cancel a healthy RPC; 0 disables.
+  # Log a call that has made no progress for this long (DEBUG). 0 disables.
   control_stall_notice_ms: 5000
   data_stall_notice_ms: 120000
-  # A call that has made no progress (no bytes either way) for this long is
-  # cancelled and fails with a transient error its caller retries under its
-  # own retry policy, instead of waiting on the peer indefinitely. 0 disables.
-  # Data transfers have their own stall/spill handling, so the data lane
-  # deadline is off by default.
+  # Cancel a call that has made no progress for this long, with an error its
+  # caller retries. 0 disables; the data lane has its own stall handling.
   control_no_progress_deadline_ms: 30000
   data_no_progress_deadline_ms: 0
 
-  # Optional public ingress discovery. When a UPnP IGD mapping succeeds, Macha
-  # advertises the gateway's external address and mapped port to cluster peers.
-  # external_port: 0 requests the same external port as network.port.
+  # Map network.port on the gateway by UPnP and advertise the external
+  # address. external_port 0 asks for the same port.
   upnp:
     enabled: false
     external_port: 0
     discovery_timeout_ms: 2000
     lease_seconds: 0
 
-  # Optional fallback when UPnP cannot supply a public address. This uses
-  # https://checkip.amazonaws.com and assumes any required port forwarding is
-  # already configured outside Macha.
+  # When UPnP gives no address, learn it from https://checkip.amazonaws.com.
+  # Port forwarding must already be in place.
   external_ip:
     enabled: false
     timeout_ms: 3000
 
-  # Probe the effective advertised endpoint from this node after startup. A
-  # failure can mean the port is closed OR that the gateway lacks NAT hairpin.
+  # After startup, connect to this node's own advertised endpoint. A failure
+  # means a closed port or a gateway without NAT hairpinning.
   connectivity_check:
     enabled: false
     timeout_ms: 3000
 
-# Cluster policy. Every node is metadata-capable and any node accepts a write
-# on its own. `replicas` is the DATA copy count repair converges to.
-# `write_copies` and `metadata_write_copies` are the copies sought before a
-# write returns, of a DATA object and of a metadata commit: with that many
-# nodes present and answering, the write is on that many when it returns;
-# with fewer, it returns on the copies it has and repair delivers the rest.
-#
-# extent_size is fixed once a namespace exists. It is a logical file-chunk
-# ceiling and is unrelated to the physical small-object packing threshold.
+# Cluster policy; must match on every node. Any node accepts a write on its
+# own. replicas is the DATA copy count repair converges to. write_copies and
+# metadata_write_copies are the copies sought before a write returns: with
+# that many nodes present it returns on that many, with fewer it returns on
+# what it has and repair delivers the rest. extent_size is fixed once a
+# namespace exists.
 dht:
   replicas: 3
   metadata_write_copies: 2
 
-  # A full, offline or stalled preferred owner falls through to the next
-  # deterministic capacity-aware candidate.
+  # A full, offline or stalled owner falls through to the next candidate.
   write_copies: 1
   write_stall_ms: 2500
   extent_size: 4M
-  # Bound simultaneous blocking DATA work by bytes, while preserving headroom
-  # which ingest and maintenance cannot consume. CONTROL uses separate lanes
-  # and executors and does not enter this budget.
+  # Blocking DATA work in flight, by bytes, with a reserve ingest and
+  # maintenance cannot use. Control traffic does not count against it.
   data_inflight_bytes: 128M
   data_viewer_reserve_bytes: 32M
 
-  # Measured device service time the DATA backends defend. Above
-  # io_pressure_slowdown_percent, loader and speculative admission for those
-  # backends is held to io_pressure_min_background leases until the measured
-  # average falls back below io_pressure_release_percent. A viewer is never
-  # gated by this: if the disk is slow,
-  # the person waiting on it gets all of it.
-  #
-  # This bounds service *time*, which the byte reserves above do not. On
-  # 2026-09-19 one ordinary ingest took a node to 91% iowait with single 4 MiB
-  # extent writes at 17.7 s and twelve client requests aborted at ~8 s, while
-  # every byte budget was satisfied -- a viewer holding byte credit still
-  # queued behind the write. No setting available at the time would have
-  # prevented it.
-  #
-  # What an operation on a coping device should cost: a fixed per-operation
-  # budget plus a budget per MiB. Pressure is the moving average of
-  # actual/expected, so a 4 MiB extent write and a 4 KiB read are each judged
-  # against what they should cost rather than against one number -- a single
-  # millisecond threshold declared permanent pressure on every node doing
-  # ordinary writes.
-  #
-  # Under pressure, speculative work stands aside always, and the loader stands
-  # aside only when a viewer is present (a viewer read within
-  # maintenance.foreground_quiet_ms): law 3 says the loader waits only when
-  # it would otherwise make a viewer wait.
-  #
-  # io_pressure_slowdown_percent: 0 disables the mechanism entirely; release
-  # must then be below slowdown, the two expectations cannot both be 0, and
-  # io_pressure_min_background must be at least 1.
+  # Disk pressure. Each operation is judged against what it should cost:
+  # io_pressure_overhead_ms plus io_pressure_per_mib_ms per MiB. When the
+  # moving average of actual over expected passes io_pressure_slowdown_percent,
+  # speculative work stands aside, and so does the loader while a viewer is
+  # present, down to io_pressure_min_background operations, until the average
+  # falls below io_pressure_release_percent. A viewer is never held back. One
+  # operation past io_pressure_outlier_percent of its own cost trips pressure
+  # at once (0 disables that). io_pressure_slowdown_percent 0 disables the
+  # mechanism.
   io_pressure_overhead_ms: 25
   io_pressure_per_mib_ms: 120
   io_pressure_slowdown_percent: 300
   io_pressure_release_percent: 150
-  # One operation this far past its own expected cost trips pressure
-  # immediately, whatever the average says: a 17.7 s extent write barely moves
-  # a moving average and starves a viewer completely. A ratio, like the two
-  # thresholds above (until 0.53.0 it was an absolute io_pressure_outlier_ms,
-  # which is no longer read). 0 disables the single-operation trip.
   io_pressure_outlier_percent: 1000
   io_pressure_min_background: 1
-  # How long a DATA credit wait may make no progress before it fails instead
-  # of waiting for ever. "No progress" means not one lease was released
-  # anywhere for this long: under any real load releases happen constantly and
-  # the window keeps resetting, so a waiter queued behind genuine work is never
-  # disturbed. It fires only when the arbiter is wedged -- for example a caller
-  # holding credit while acquiring more -- and then logs the class, size and
-  # used/active/waiting counts rather than hanging silently. 0 waits for ever.
+  # A wait for DATA credit fails, logging the arbiter's state, if no credit is
+  # released anywhere for this long. 0 waits forever.
   data_credit_no_progress_deadline_ms: 120000
   read_ahead: 3
   metadata_cache_ms: 250
-  # Process-memory ceiling for decoded metadata snapshots. Durable history
-  # payloads stay disk-backed and are loaded only when required.
+  # Memory for decoded metadata snapshots.
   metadata_materialization_cache_bytes: 128M
-  # A DATA retention claim (e.g. accepting a metadata publication) checks
-  # candidate placement in have_objects batches of this many extent IDs per
-  # peer, not one have_object RPC per extent. Must fit within
-  # network.max_frame_size (32 bytes/id plus a small header).
+  # Extent ids per presence question to a peer when a retention claim checks
+  # placement; must fit in max_frame_size (32 bytes per id).
   retention_check_batch_size: 2000
-  # Bound on simultaneous have_objects batches in flight, across all peers
-  # combined, from a single retention claim -- caps fan-out against any one
-  # peer no matter how large the publication.
+  # Presence questions in flight at once for one claim, across all peers.
   retention_check_concurrency: 8
 
-# Speculative cache hydration. Hint engines are independent and their priorities
-# are merged by a weighted-fair scheduler. Ordered runs stay sequential: a next
-# episode is warmed from its beginning rather than by random extents.
+# Cache warming ahead of playback. Engines are scheduled by priority; ordered
+# runs stay sequential, so a next episode is warmed from its start.
 hydration:
   enabled: true
   interval_ms: 100
@@ -382,72 +301,65 @@ hydration:
       enabled: true
       priority: 300
 
-# Bootstrap may be one-way or symmetric. A configured joiner waits for a
-# reachable bootstrap peer rather than inventing a new namespace alone.
+# Peers to join through. A node with bootstrap peers waits for one to answer
+# rather than founding a namespace of its own.
 bootstrap:
   - media-node-1.example.net:7437
 
+# Background work: repair, rebalance, scrub and garbage collection.
 maintenance:
-  # Background work is byte-budgeted and adaptive. Foreground I/O wins.
   interval_ms: 1000
+  # Foreground I/O within this long counts as the node being busy.
   foreground_quiet_ms: 2000
   busy_bandwidth_fraction: 0.0   # rebalance and scrub only
   idle_bandwidth_fraction: 0.10
-  # Replica repair is paced, never stopped: while a viewer, the mount or the
-  # loader is busy, repair gets repair_weight time for every
-  # foreground_weight of theirs. Both 1..10000.
+  # Repair is paced, never stopped: while a viewer, the mount or the loader is
+  # busy it gets repair_weight time for every foreground_weight of theirs.
+  # Both 1..10000.
   foreground_weight: 95
   repair_weight: 5
   cpu_target: 0.10
-  # Loader/speculative DATA operations (publication, repair; one extent
-  # each) active at once. 0 = half the hardware threads, minimum 1.
+  # Background DATA operations at once. 0 is half the hardware threads.
   background_concurrency: 0
   initial_bandwidth: 32M
-  max_bandwidth: 0B       # 0 = no configured cap; observed rate still applies.
-  # Proactive physical integrity scrub is a scheduled campaign, not continuous
-  # idle work. The due time survives daemon restarts. Reads verify integrity too.
+  max_bandwidth: 0B       # 0: no cap beyond the measured rate
+  # The integrity scrub runs as a campaign every scrub_interval_ms, using
+  # scrub_fraction of the bandwidth; its due time survives restarts.
   scrub_fraction: 0.02
   scrub_interval_ms: 2592000000  # 30 days
-
-  # A settled repair/rebalance/GC pass backs off instead of rescanning the
-  # complete object set. Metadata/catalogue control verification remains capped
-  # at a 30-second cadence independently of this data-plane backoff.
+  # A pass that finds nothing to do waits this long before scanning again.
   no_progress_backoff_ms: 300000
+  # The absence horizon. A node removes an object's bytes only after seeing it
+  # unreferenced for this long itself, so a node away for less still finds
+  # what its branch refers to. A node unheard of for this long is forgotten,
+  # and retirement tombstones are pruned after it.
+  garbage_grace_ms: 2592000000  # 30 days
 
-  # The absence horizon (30 days). A node removes an object's bytes only once
-  # it has itself seen the object unreferenced for this long, so a node may be
-  # away this long and still find what its branch refers to. A node unheard of
-  # for this long is forgotten. Retirement tombstones are pruned after it.
-  garbage_grace_ms: 2592000000
-
-# Catalogue structure is CONTROL metadata: sharded content-addressed objects are
-# written by the committing node and then converged to all active nodes.
-# Artwork is ordinary DATA. The scanner and HTTP/JSON API are optional.
-# Each scan provider owns the roots
-# it is allowed to classify. Every enabled provider root must be readable for
-# deletion reconciliation to run.
+# The media catalogue. Its structure is metadata, committed locally and
+# replicated to every node; artwork is DATA. Each scan provider classifies the
+# files under its roots, and every enabled root must be readable for removed
+# files to be reconciled.
 catalogue:
   scanner:
     enabled: false
     interval_ms: 21600000
-    # Coalesce namespace create/write/rename/delete bursts before rescanning.
-    # Sustained mutation cannot defer a pending rescan beyond rescan_max_delay_ms.
+    # A rescan waits for namespace changes to settle for rescan_debounce_ms,
+    # and never longer than rescan_max_delay_ms.
     rescan_debounce_ms: 10000
     rescan_max_delay_ms: 600000
-    # Bound synchronous online metadata-provider work per scanner pass.
-    # A completed batch continues later without blocking the whole scan indefinitely.
+    # Provider requests per scan batch; the rest continue in later batches.
     max_provider_requests_per_scan: 32
     provider_batch_delay_ms: 30000
     max_artwork_bytes: 16M
-    # A file whose path below the scanner root has one of these as a word
-    # (ignoring case) is not catalogued: release samples, for instance.
+    # A file whose path below its root contains one of these as a word
+    # (ignoring case) is not catalogued.
     ignore_terms: [sample]
     providers:
       movies:
         enabled: true
         roots:
           - /Movies
-        # TMDB API Read Access Token, stored as the only content of this file.
+        # token_file holds a TMDB API read access token and nothing else.
         tmdb:
           enabled: true
           token_file: /etc/macha-tmdb.token
@@ -468,103 +380,74 @@ catalogue:
         enabled: true
         roots:
           - /Music
-        # MusicBrainz requires a meaningful application contact; no API key.
+        # MusicBrainz needs no key but requires a contact for the application.
         musicbrainz:
           enabled: true
           contact: https://github.com/tomdionysus/macha
           cover_size: "500"
 
-        # Optional secondary provider. Discogs database search requires an
-        # authenticated personal token. MusicBrainz remains first choice.
+        # Secondary music provider, tried after MusicBrainz. Needs a personal
+        # access token.
         discogs:
           enabled: false
           # token_file: /etc/macha-discogs.token
 
+  # The HTTP API and web client.
   api:
     enabled: true
     listen: 127.0.0.1
     port: 7438
-    # Optional: the URL clients should use to reach this node's API (exposed
-    # on every node in /api/v1/status's nodes[] as api_endpoint). listen/port
-    # above describe the INNER bind; this describes the OUTER address, and the
-    # two are independent on purpose.
-    #
-    # With a TLS-terminating proxy in front of the API, Macha serves plain
-    # http on listen:port while clients must be told https on the proxy's
-    # port -- neither the scheme nor the port of the outer address can be
-    # derived from the bind, which is why it is stated here rather than
-    # constructed by the client. Also covers NAT/port-forwarding.
-    #
-    # Scheme, host and optional port only. A PATH IS NOT SUPPORTED and is
-    # rejected at startup: fronting a node at a subpath is not a deployment
-    # this serves, and a client treating the value as an origin would drop the
-    # path and 404 silently.
-    #
-    # Defaults to http:// this node's network.advertise (not listen, which is
-    # conventionally a wildcard bind) and the port above.
+    # The URL clients use to reach this node, published as api_endpoint in
+    # /api/v1/status. Set it when a proxy or NAT is in front: behind a
+    # TLS-terminating proxy, listen and port are the plain-HTTP bind and this
+    # is the https address. Scheme, host and optional port; a path is refused
+    # at startup. Default: http://<network.advertise>:<port>.
     # advertised_endpoint: https://media-node-2.example.net:443
     # token_file: /etc/macha-api.token
     max_request_bytes: 8M
 
-    # One reactor thread owns every socket; these are the threads that
-    # compute. `workers` is the data lane (catalogue, playback, web assets,
-    # and every body read that can block on a disk or a replica);
-    # control_workers is the control lane (health, status, session, users),
-    # so a node saturated serving fragments still answers what is wrong.
+    # One reactor thread owns the sockets. workers serve the data lane
+    # (catalogue, playback, web assets, file reads); control_workers serve the
+    # control lane (health, status, sessions, users), so a node busy serving
+    # media still answers status.
     workers: 16
     control_workers: 2
-    # Open connections. An idle kept-alive connection is a descriptor and a
-    # small struct, not a thread. (max_queued_connections, the pre-0.43.0
-    # name, is still read as this.)
+    # Open connections. An idle connection costs a descriptor, not a thread.
     max_connections: 1024
-    # Requests waiting for a lane worker before the reactor answers 503.
+    # Requests queued for a worker before the server answers 503.
     max_queued_requests: 256
     client_io_timeout_ms: 30000
-    # A streaming body is sent in stream_chunk_bytes pieces, at most
-    # staging_chunks of them held ahead of a slow client, so streaming
-    # memory is bounded by connections x staging_chunks x stream_chunk_bytes.
+    # Streaming bodies are sent in stream_chunk_bytes pieces, at most
+    # staging_chunks ahead of a slow client.
     stream_chunk_bytes: 256K
     staging_chunks: 2
 
-    # HTTP/1.1 keep-alive. A connection is reused for up to
-    # keep_alive_max_requests before the server forces "Connection: close";
-    # it is also closed if it sits idle longer than keep_alive_idle_timeout_ms
-    # waiting for the next request.
+    # Keep-alive: a connection serves up to keep_alive_max_requests and is
+    # closed after keep_alive_idle_timeout_ms idle.
     keep_alive_max_requests: 100
     keep_alive_idle_timeout_ms: 15000
-    # A handler slower than this is logged with its route; a reactor pass
-    # longer than reactor_stall_threshold_ms is a diagnostics counter that
-    # must stay at zero.
+    # Requests slower than this are logged with their route. A reactor pass
+    # longer than reactor_stall_threshold_ms is counted in diagnostics.
     slow_request_threshold_ms: 1000
     reactor_stall_threshold_ms: 50
 
-    # gzip for complete in-memory text bodies (API JSON, the web client's
-    # HTML/CSS/JS) above compression_min_bytes (>= 64), at zlib level 1..9.
-    # Media is never compressed. A web-client asset with no precompressed .gz
-    # sibling is compressed on demand up to compression_max_asset_bytes (<= 64M)
-    # and streamed unchanged above it. Set compression: false behind a proxy
-    # that already compresses.
+    # gzip for text bodies of at least compression_min_bytes (>= 64), level
+    # 1..9. Media is never compressed. Web assets without a .gz sibling are
+    # compressed on demand up to compression_max_asset_bytes (<= 64M). Turn it
+    # off behind a proxy that compresses.
     compression: true
     compression_min_bytes: 1K
     compression_level: 6
     compression_max_asset_bytes: 4M
 
-    # Lifetime of a signed artwork capability URL (?exp=...&sig=...) embedded
-    # in catalogue responses, letting a client load artwork via a plain
-    # <img src> without a bearer header. Artwork is content-addressed/immutable
-    # and lower-stakes than a playback session, so this deliberately outlives
-    # a typical browsing session; an expired URL is recovered by re-fetching
-    # the catalogue item, which the client already does on navigation. It is
-    # also the response's max-age and the interval at which every artwork URL
-    # changes, so it is measured in days: at 24 h every poster was downloaded
-    # again every day.
+    # Lifetime of the signed artwork URLs in catalogue responses, which load
+    # without a bearer token. Also the artwork's max-age, and how often its URL
+    # changes.
     artwork_capability_ttl_ms: 2592000000
 
-# Persistent host-side ingest. Jobs may point at a regular file or recursively
-# import a directory (for example, a temporarily mounted USB disk). The source
-# path must be beneath one of source_roots unless it is an internal acquisition
-# producer such as BitTorrent. Planned namespace destinations and byte offsets
-# are checkpointed so jobs can pause/resume and survive daemon restarts.
+# Ingest: copies files or directory trees from the host into the namespace.
+# A source must be under one of source_roots, unless it is the node's own
+# acquisition (torrents). Jobs are checkpointed and survive restarts.
 ingest:
   enabled: false
   staging_path: /var/lib/macha/tmp/ingest
@@ -575,258 +458,163 @@ ingest:
   copy_chunk_bytes: 1M
   checkpoint_bytes: 64M
   blocked_retry_ms: 5000
-  # Jobs imported at once (1..64). Each holds its own publication writer, so
-  # this bounds retained memory as much as throughput. Applied at start.
+  # Jobs imported at once (1..64); each holds a publication writer. Applied
+  # at start.
   max_concurrent_jobs: 10
   cleanup:
-    # Macha-owned sources (currently torrent staging) are retained after a
-    # successful ingest until the terminal job is explicitly cleared.
+    # Delete a source Macha owns (torrent staging) when its job is cleared.
     delete_owned_source_on_clear: true
-    # External sources such as USB/import directories are preserved by default.
+    # Delete an external source (an import directory) when its job is cleared.
     delete_external_source_on_clear: false
-    # Cancelling an owned acquisition removes partial/staging payloads promptly.
+    # Delete an owned source's partial data when its job is cancelled.
     delete_owned_source_on_cancel: true
 
-# Optional BitTorrent acquisition. The download engine is a subsystem plugin
-# (libmacha-torrent.so, installed under plugin_path above): libtorrent-rasterbar
-# >= 2.0 is detected at build time, but whether a given node can acquire is
-# decided at run time by whether that file is present. With enabled: true and
-# no plugin, the node reports the torrent subsystem as unavailable in
-# GET /api/v1/status and answers 503 on /api/v1/torrents/* -- torrent search,
-# which needs no engine, keeps working. Completed torrents are submitted to the
-# generic ingest engine; torrent code does not write directly into the
-# catalogue or Macha namespace.
+# BitTorrent acquisition. The engine is the libmacha-torrent plugin under
+# plugin_path; without it, torrents report unavailable in /api/v1/status and
+# /api/v1/torrents/* answers 503, while search still works. Completed
+# torrents are imported by ingest.
 torrent:
   enabled: false
-  # Where the download engine binds, in libtorrent's syntax (an address or a
-  # device name, e.g. "wlan0:6881"). Unset means the node's network.advertise
-  # address: libtorrent's own default enumeration binds eth0 and loopback but
-  # not wlan0, so a node whose only live link is wireless would otherwise get
-  # a loopback-only session that reaches no peer and reports no error.
+  # Where the engine binds, in libtorrent's syntax (an address or a device,
+  # e.g. "wlan0:6881"). Default: network.advertise.
   # listen_interfaces: 10.44.1.51:6881
   listen_port: 6881
   max_active: 4
-  # false drains this node: it keeps its torrent jobs and takes no new ones.
+  # false: keep this node's jobs, take no new ones.
   accept_new_jobs: true
-  # How long after a torrent completes it is removed (torrent job, ingest
-  # job, staging payload). Absent or null is off; 0 is at once; at most
-  # 86400000 (24 h).
+  # Remove a completed torrent (its jobs and staging data) this long after it
+  # completes. Unset is never; 0 is at once; at most 86400000 (24 h).
   # remove_on_complete_after_ms: 3600000
-  max_download_rate: 0B  # 0 = unlimited
-  max_upload_rate: 0B    # 0 = unlimited
-  # Threshold for libtorrent's alert stream, independent of the top-level
-  # log_level. INFO keeps listen/DHT/port-mapping lines and warnings; DEBUG
-  # bridges every alert (thousands of lines a minute on a busy node); ALL
-  # also subscribes libtorrent's internal log categories.
+  max_download_rate: 0B  # 0: unlimited
+  max_upload_rate: 0B    # 0: unlimited
+  # libtorrent's alert threshold, independent of log_level. DEBUG logs every
+  # alert; ALL adds libtorrent's internal categories.
   log_level: INFO
 
-  # Threads doing the torrent's file I/O. Every read, write and hash they
-  # perform is admitted by the DATA arbiter as loader work and timed into the
-  # disk service monitor, so a download yields to a viewer on a slow device and
-  # the network waits for the disk. libtorrent's own backend ran ten, outside
-  # both, and on 2026-09-23 they wrote 65 MB/s onto a DATA spindle while
-  # macha's own writes waited behind them.
+  # Threads doing the torrent's file I/O. Their reads and writes are admitted
+  # as loader work, so a download yields to a viewer on a busy disk.
   disk_threads: 2
   dht: true
   pex: true
   lsd: true
 
-  # libtorrent maps its own listen port on the router. Both default on inside
-  # libtorrent, and until these keys existed it did so no matter what the rest
-  # of this file said -- a node with network.upnp.enabled false still had a
-  # 6881 mapping created that nothing here mentioned and nothing could refuse.
-  #
-  # These are deliberately separate from network.upnp, which maps the cluster
-  # RPC port through Macha's own UPnP client: different ports, different
-  # reasons, and you may want one without the other. Turn both off if you
-  # forward 6881 by hand, or if the router's UPnP is not to be trusted.
+  # Port mapping of listen_port on the router by libtorrent, separate from
+  # network.upnp (which maps the cluster port). Turn both off when forwarding
+  # the port by hand.
   upnp: true
   natpmp: true
 
-  # Search providers are server-side only. Torznab responses are reduced to
-  # typed result fields and acquisition URLs remain opaque to the frontend.
+  # Search providers, queried by the server; results are typed fields and
+  # acquisition URLs stay opaque to clients.
   search:
     providers: []
-    # Replace [] with entries such as:
+    # For example:
     #   - name: prowlarr
     #     type: torznab
     #     url: http://127.0.0.1:9696/api/v1/search
     #     api_key_file: /etc/macha-prowlarr.key
     #     max_results: 100
 
-# The web client this node serves at its root. Off until `root` names a
-# directory of built client assets. Any path that is not a file under that
-# directory is answered with `index`, because a single-page application owns
-# its own routing and a deep link has to reach it. Everything under /api stays
-# the server's, 404s included, so an API call never comes back as HTML.
-#
-# The client is served without a bearer token -- a browser has none until the
-# client has loaded and asked for one -- so `root` must contain only assets
-# meant to be public. Nothing outside it is reachable: a request cannot climb
-# out, and names beginning with a dot are refused.
+# The web client served at this node's root, from the built assets in
+# `root`. Any path that is not a file there is answered with `index`, for the
+# client's own routing; everything under /api stays the API's. Assets are
+# served without a token, so `root` must hold only public files; dot names
+# and paths outside it are refused.
 # web:
 #   enabled: true
 #   root: /var/lib/macha/web
 #   index: index.html
 
-# Playback API and media transformation. Macha links libavformat/libavcodec
-# directly and reads the pinned logical Macha file through a custom AVIOContext.
-# No ffmpeg/ffprobe subprocess or loopback media source is involved.
+# Playback and transcoding, through linked FFmpeg libraries.
 streaming:
   enabled: true
-  # temp_path: /var/lib/macha/tmp/playback  # spill only; active fragments are in memory
-  # Node-wide, every account together. This has to sit ABOVE
-  # max_sessions_per_account below or that cap can never be reached -- see the
-  # note there for why reaching it matters.
+  # temp_path: /var/lib/macha/tmp/playback  # spill only; fragments are in memory
+  # Sessions on this node, all accounts together. Keep it above
+  # max_sessions_per_account.
   max_sessions: 64
-  # How many playback sessions one account may hold on this node at once.
-  # Zero disables the per-account bound, leaving only max_sessions.
-  #
-  # A playback session is a resource rather than a property of the bearer, so
-  # one account may hold several; before that, one-session-per-bearer bounded
-  # accounts by accident, and removing it without this is how a rogue client
-  # launches a media DoS.
-  #
-  # Set it generously. The scarce resource is not this -- a session is a map
-  # entry, a transcode is a core, and max_video_transcodes below is 1. A
-  # coordinator-driven client holds a live session plus a standby per viewer
-  # and transiently three during a failover; four viewers on one account is
-  # twelve in a disturbance; a session abandoned on an unreachable node cannot
-  # be deleted and holds its slot for the whole of session_idle_ms. Set too
-  # low this does not present as a cap -- it presents as seamless failover
-  # quietly ceasing to work at the moment it fires.
-  #
-  # Keep it BELOW max_sessions above, or it can never be reached: the
-  # node-wide limit refuses first, and its 429 is node-scoped, which sends a
-  # client walking the cluster instead of telling it to stop.
+  # Sessions one account may hold on this node; 0 disables the bound. A
+  # client keeps a live and a standby session per viewer and more during a
+  # failover, so set it generously; too low, and failover stops working
+  # rather than reporting a limit. Keep it below max_sessions, whose refusal
+  # sends clients to other nodes.
   max_sessions_per_account: 32
   max_video_transcodes: 1
   max_audio_transcodes: 4
-  # Decoder threads per video transcode (1-16). max_video_transcodes bounds the
-  # number of such pipelines that may run concurrently.
+  # Decoder threads per video transcode (1..16).
   video_decoder_threads: 2
-  # x264 frame threads per video transcode; 0 = every hardware thread.
+  # Encoder threads per video transcode; 0 is every hardware thread.
   video_encoder_threads: 0
   session_idle_ms: 1800000
-  # A session that has never served a stream object (no playlist, fragment,
-  # subtitle or Direct Play body) expires on this shorter clock instead, so an
-  # abandoned create cannot hold a transcode slot for session_idle_ms.
+  # A session that has never served any stream object (playlist, fragment,
+  # subtitle or Direct Play body) expires after this instead.
   session_unused_idle_ms: 120000
-  # Stop an abandoned physical remux/transcode pipeline after one minute
-  # without a valid current-generation stream request. The logical session is
-  # retained until session_idle_ms for retry/reconciliation.
+  # A transcode or remux pipeline with no request for its current generation
+  # for this long is stopped; the session lives on until session_idle_ms.
   pipeline_idle_ms: 60000
-  # A session with no stream activity for this long releases its transcode
-  # entitlement and reacquires it (possibly refused) on resume. Meaningful
-  # only between pipeline_idle_ms and session_idle_ms.
+  # A session idle this long gives up its transcode entitlement and asks for
+  # it again on resume. Meaningful between pipeline_idle_ms and
+  # session_idle_ms.
   transcode_entitlement_idle_ms: 300000
   startup_timeout_ms: 15000
   segment_duration_ms: 4000
   max_ahead_segments: 8
   segment_memory_bytes: 64M
 
-  # Bounded segment holds. The media playlist is a complete VOD list served
-  # before any fragment exists, so a request for one that has not been produced
-  # yet is ordinary: the server holds it rather than answering 404. These bound
-  # that hold so control traffic stays serviceable.
-  #
-  # segment_hold_window is how far past the produced frontier a request may
-  # still be held, in fragments. It matches max_ahead_segments deliberately: a
-  # request inside it is one production is authorised to reach, and one outside
-  # it is one nothing is working toward. Beyond it the answer is an immediate
-  # retryable 500 segment_not_ready with Retry-After: 1 rather than a wait.
+  # A request for a fragment not yet produced is held until it is. Requests
+  # more than segment_hold_window fragments past production are refused at
+  # once with a retryable 500 segment_not_ready and Retry-After: 1.
   segment_hold_window: 8
-  # Outstanding holds per session: one in flight plus one prefetch. A player
-  # that queues thirty fragment requests gets one hold and twenty-nine prompt
-  # refusals, rather than thirty sequential waits on the encoder.
+  # Held requests per session; further ones are refused at once.
   max_session_holds: 2
-  # Outstanding holds across the whole node, every session together. A fairness
-  # and memory bound: since 0.43.0 a held request is parked as a continuation
-  # costing an fd and a small struct, not a worker thread, so holds are the
-  # ordinary case during steady-state transcoding rather than the exception.
+  # Held requests across the node.
   max_concurrent_holds: 64
-  # How long a held request may wait before answering. This must stay under
-  # the tightest time-to-first-byte deadline across the clients: a held request
-  # sends no bytes, so a client that gives up first never receives the answer
-  # at all and takes its timeout path instead, which retries hard and then
-  # fails. Known deadlines, each read from the shipped artifact rather than
-  # from documentation: hls.js 10000
-  # (fragLoadPolicy.default.maxTimeToFirstByteMs -- NOT the deprecated and
-  # inert fragLoadingTimeOut of 20000), expo-video 10000 (OkHttp default read
-  # timeout), React Native track player 8000 (media3
-  # DEFAULT_READ_TIMEOUT_MILLIS), iOS AVFoundation unknown. 6000 clears the
-  # tightest of those with margin for the WAN hop to the offsite node.
+  # The longest a held request waits. Keep it below the shortest
+  # time-to-first-byte deadline among the clients: hls.js 10000, expo-video
+  # 10000, React Native track player 8000.
   segment_timeout_ms: 6000
 
-  # Bound source inspection on distributed/slow media. probe_bytes and
-  # probe_analyze_duration_ms limit libavformat analysis; probe_timeout_ms is a
-  # wall-clock guard for the complete probe.
+  # Limits on inspecting a source: bytes and duration analysed, and a
+  # wall-clock limit on the whole probe.
   probe_bytes: 8M
   probe_analyze_duration_ms: 5000
   probe_timeout_ms: 20000
 
-# Authentication. Every HTTP route requires a Bearer token from
-# POST /api/v1/session; what that session may do is the roles it carries.
+# Sessions and accounts. Every API route needs a bearer token from
+# POST /api/v1/session; a session can do what its account's roles allow.
 #
-# Users, passwords and roles are cluster state: every node holds the whole
-# table and it converges by gossip. Verifying a password is a local lookup plus
-# a KDF -- no RPC, no metadata, no catalogue -- so a node that is temporarily
-# alone, or whose metadata has gone read-only, still logs people in. Nothing in
-# the login path waits on a peer.
+# Accounts are cluster state held by every node and converged by gossip.
+# Signing in is local: a node alone still signs people in.
 #
-# The node that founds the cluster (the one with no bootstrap peers) creates
-# two accounts on first start and never again:
+# The node that founds the cluster creates two accounts on first start:
+#   root       every role; its password is written to
+#              <state_path>/genesis-root-password (mode 0600). Sign in,
+#              change it, delete the file.
+#   anonymous  media_viewer; what an unauthenticated visitor is.
+# Neither can be renamed or deleted.
 #
-#   root       every role. Its generated password is written to
-#              <state_path>/genesis-root-password, mode 0600. Sign in, change
-#              it, delete that file.
-#   anonymous  media_viewer. This is what an unauthenticated visitor is.
+# Roles:
+#   media_viewer  media, playback, cluster status
+#   importer      torrents and ingest
+#   manager       files, namespaces, catalogue matches, identity resets
+#   manage_users  accounts
+# At least one account always holds manage_users.
 #
-# Neither can be renamed or deleted. Everything else about them is ordinary.
-#
-# If root's password is lost and no manage_users account can sign in, reset it
-# on any node with that node stopped:
-#
+# Offline, with the node stopped:
 #   macha-users <state_path> <cluster.key> passwd root
-#
-# There is no recovery key and no recovery endpoint: one would be a standing
-# unauthenticated path to the most privileged account, and anyone able to use
-# it already has root on a node, where the command above does the same job.
-#
-# At least one account always holds manage_users: removing the role from the
-# last account that has it, or deleting that account, is refused.
-#
-# Roles are capabilities, not a ladder -- importing does not imply managing:
-#   media_viewer  read all media, playback, cluster status
-#   importer      acquire content (torrents, ingest)
-#   manager       files, namespaces, catalogue matches, identity-association
-#                 reset
-#   manage_users  add, edit and remove accounts
-#
-# Add accounts over the API, or offline with the node stopped:
 #   macha-users /var/lib/macha /etc/macha/cluster.key create tom --roles manager
 session:
-  # Anonymous viewing. With this on, POST /api/v1/session with no credentials
-  # mints a session bound to the "anonymous" account. Turn it off to require a
-  # login for everything, including the web client -- note that televisions
-  # have no practical way to type a password, so this is what decides whether
-  # a TV can be used at all.
-  #
-  # What an anonymous visitor may *do* is not set here: it is the anonymous
-  # account's roles, changed like any other account's, and takes effect on the
-  # next session rather than on restart.
+  # Allow sessions without credentials, bound to the anonymous account. What
+  # such a session may do is that account's roles. Turning it off requires a
+  # login everywhere, which a television cannot practically do.
   allow_anonymous: true
 
-  # A session is valid for this long from creation; there is no sliding
-  # renewal, so the client re-mints when it expires.
+  # Sessions last this long from creation; there is no renewal.
   anonymous_ttl_ms: 2592000000
   max_sessions: 4096
   max_users: 4096
 
-  # scrypt is deliberately expensive, and POST /api/v1/session is reachable
-  # without a token, so password checks need a local brake. Neither of these is
-  # replicated: they protect this node's CPU, nothing more. On a Pi, two
-  # concurrent hashes is already most of a core each.
+  # Sign-in runs scrypt and needs no token, so this node limits concurrent
+  # password checks and locks an account out briefly after repeated failures.
   max_concurrent_password_checks: 2
   failed_login_attempts: 5
   failed_login_lockout_ms: 30000

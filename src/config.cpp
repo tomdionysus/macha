@@ -309,8 +309,6 @@ void parse_fuse(const ConfigNode& root, Config& c) {
     if (f["max_pending_write_bytes"])
         c.fuse.max_pending_write_bytes = yaml_size(f["max_pending_write_bytes"]);
     if (f["commit_workers"]) c.fuse.commit_workers = f["commit_workers"].as<size_t>();
-    if (f["recovery_commit_workers"]) c.fuse.recovery_commit_workers = f["recovery_commit_workers"].as<size_t>();
-    if (f["foreground_commit_workers"]) c.fuse.foreground_commit_workers = f["foreground_commit_workers"].as<size_t>();
     if (f["publication_quiet_ms"]) c.fuse.publication_quiet = milliseconds(f["publication_quiet_ms"], "fuse.publication_quiet_ms");
     if (f["publication_no_progress_deadline_ms"])
         c.fuse.publication_no_progress_deadline =
@@ -433,9 +431,6 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
             c.catalogue.api.workers = api["workers"].as<size_t>();
         if (api["control_workers"])
             c.catalogue.api.control_workers = api["control_workers"].as<size_t>();
-        // Legacy key, read as the connection cap; max_connections wins.
-        if (api["max_queued_connections"])
-            c.catalogue.api.max_connections = api["max_queued_connections"].as<size_t>();
         if (api["max_connections"])
             c.catalogue.api.max_connections = api["max_connections"].as<size_t>();
         if (api["max_queued_requests"])

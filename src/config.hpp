@@ -122,12 +122,6 @@ struct FuseConfig {
     // would let large copied callbacks exhaust memory under spool backpressure.
     uint64_t max_pending_write_bytes{32ULL * 1024 * 1024};
     size_t commit_workers{8};
-    // Accepted for configuration compatibility; journal-restored spool runs as
-    // ordinary loader work.
-    size_t recovery_commit_workers{2};
-    // Accepted for configuration compatibility. Viewer demand gates new
-    // publication directly; loader work is work-conserving up to commit_workers.
-    size_t foreground_commit_workers{1};
     std::chrono::milliseconds publication_quiet{5000};
     // A worker blocked on retained-memory admission fails after this long with
     // no quantum completing anywhere in the pipeline. A no-progress budget, not

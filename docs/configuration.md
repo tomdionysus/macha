@@ -738,8 +738,6 @@ For the web client, a precompressed file sitting next to the asset (`app.js.gz` 
 
 Set `compression: false` on a node that sits behind a proxy which already compresses. That is a supported deployment, not a degraded one, and the counters `responses_compressed` and `compression_bytes_saved` in the diagnostics route say what the setting is actually doing.
 
-`max_queued_connections` is accepted as an alias for `max_connections`.
-
 ## Streaming, ingest and acquisition
 
 Streaming, ingest and BitTorrent configuration remain independent of the storage authority model. The complete set of fields is shown in [`../macha.yaml.example`](../macha.yaml.example).

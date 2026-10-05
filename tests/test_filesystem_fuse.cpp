@@ -1471,8 +1471,6 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
     {
         auto fuse = node.fuse("open-loaders");
         fuse.commit_workers = 4;
-        // Open loader writers are neither viewers nor capped at one publisher.
-        fuse.foreground_commit_workers = 1;
         InterposedTarget target(fs);
         TestGate concurrent;
         target.before_open = [&](const std::string&) { concurrent.enter_and_wait(); };
@@ -3050,12 +3048,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_data_journal_recovery) {
 
     // Restored spool is provenance, not a scheduling class: recovered
     // publications start with no new FUSE request, ignore the interactive
-    // clock the node's own object writes feed, and use the loader worker
-    // bound rather than recovery_commit_workers.
+    // clock the node's own object writes feed, and use every commit worker.
     {
         auto fuse = node.fuse("recovered-loader");
         fuse.commit_workers = 4;
-        fuse.recovery_commit_workers = 2;
+        constexpr size_t beyond_two = 3;
         constexpr size_t files = 4;
         const auto payload = pattern(4 * extent);
         for (size_t i = 0; i < files; ++i)
@@ -3077,9 +3074,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_data_journal_recovery) {
         target.before_open = [&](const std::string&) { concurrent.enter_and_wait(); };
         auto recovered = node.frontend(fuse, target);
         GateOpener open_on_exit{concurrent};
-        CHECK(concurrent.wait_for_entries(fuse.recovery_commit_workers + 1, 10s));
+        CHECK(concurrent.wait_for_entries(beyond_two, 10s));
         const auto running = recovered->status();
-        CHECK(running.active_recovery_data > fuse.recovery_commit_workers);
+        CHECK(running.active_recovery_data >= beyond_two);
         CHECK(running.active_recovery_data <= fuse.commit_workers);
         CHECK(running.pending_recovery_data <= running.pending_data);
         concurrent.open();

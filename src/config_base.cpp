@@ -158,11 +158,6 @@ void validate(Config& config) {
         throw std::runtime_error("fuse.request_workers must be 6..256");
     if (!config.fuse.commit_workers || config.fuse.commit_workers > 64)
         throw std::runtime_error("fuse.commit_workers must be 1..64");
-    if (!config.fuse.recovery_commit_workers || config.fuse.recovery_commit_workers > 64)
-        throw std::runtime_error("fuse.recovery_commit_workers must be 1..64");
-    if (!config.fuse.foreground_commit_workers ||
-        config.fuse.foreground_commit_workers > config.fuse.commit_workers)
-        throw std::runtime_error("fuse.foreground_commit_workers must be 1..commit_workers");
     if (config.fuse.publication_quiet < std::chrono::milliseconds(0) ||
         config.fuse.publication_quiet > std::chrono::seconds(30))
         throw std::runtime_error("fuse.publication_quiet_ms must be 0..30000");
