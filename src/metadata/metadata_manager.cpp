@@ -1669,6 +1669,15 @@ MetadataRecord MetadataManager::mutate_impl(
 
     for (size_t attempt = 0; attempt < retries; ++attempt) {
         const auto total_started = Clock::now();
+        // Where a commit's time goes, stage by stage, for its debug line.
+        auto stage_started = total_started;
+        const auto stage_ms = [&] {
+            const auto now = Clock::now();
+            const auto ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - stage_started).count());
+            stage_started = now;
+            return ms;
+        };
 
         MetadataRecord current;
         auto local_heads = usable_heads();
@@ -1686,7 +1695,9 @@ MetadataRecord MetadataManager::mutate_impl(
                                                                 : own_head(local_heads));
         }
 
+        const auto head_ms = stage_ms();
         auto snapshot = decode_snapshot(current.payload);
+        const auto decode_ms = stage_ms();
         const bool clear_merge_parent_topology = !snapshot.merge_parents.empty();
         if (dot && clock_covers(snapshot.mutation_sequences, *dot)) {
             owe({current, {}});
@@ -1809,6 +1820,7 @@ MetadataRecord MetadataManager::mutate_impl(
         // Discipline 4. Keep tombstones in canonical order so the next
         // reconciliation's union is a delta (DLT7 sorts after applying edits), and
         // drop conflicts this mutation decided by rewriting their subject.
+        const auto apply_ms = stage_ms();
         const bool resorted = !garbage_is_canonical(snapshot.garbage);
         if (resorted)
             canonicalise_garbage(snapshot.garbage);
@@ -1836,6 +1848,7 @@ MetadataRecord MetadataManager::mutate_impl(
                                                                     nodes, supplied_delta);
         }
 
+        const auto tree_ms = stage_ms();
         // Drop the conflicts this mutation decided by rewriting their subject,
         // read from the namespace as the mutation leaves it.
         if (!snapshot.conflicts.empty()) {
@@ -1855,6 +1868,7 @@ MetadataRecord MetadataManager::mutate_impl(
             }
         }
 
+        const auto conflicts_ms = stage_ms();
         auto payload =
             snapshot.namespace_root ? encode_snapshot_v14(snapshot) : encode_snapshot(snapshot);
         if (payload == current.payload)
@@ -1885,6 +1899,7 @@ MetadataRecord MetadataManager::mutate_impl(
                 delta_payload = std::move(encoded);
         }
 
+        const auto encode_ms = stage_ms();
         // This node's own claims, then the commit, both on this node alone.
         // The caller is answered from here; the peers' share is owed.
         uint64_t retention_ms = 0;
@@ -1921,6 +1936,12 @@ MetadataRecord MetadataManager::mutate_impl(
             const auto total_ms = elapsed_ms(total_started);
             if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
                 Log::debug("metadata mutate total_ms=" + std::to_string(total_ms) +
+                           " head_ms=" + std::to_string(head_ms) +
+                           " decode_ms=" + std::to_string(decode_ms) +
+                           " apply_ms=" + std::to_string(apply_ms) +
+                           " tree_ms=" + std::to_string(tree_ms) +
+                           " conflicts_ms=" + std::to_string(conflicts_ms) +
+                           " encode_ms=" + std::to_string(encode_ms) +
                            " retention_ms=" + std::to_string(retention_ms) +
                            " publish_ms=" + std::to_string(publish_ms) +
                            " mode=" + std::string(delta_payload.empty() ? "snapshot" : "delta") +
