@@ -602,6 +602,10 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
             if (!snapshot.media_profiles.emplace(id, std::move(profile)).second)
                 throw std::runtime_error("media profile appears in multiple shards");
         }
+        for (auto& [id, index] : shard.media_indexes) {
+            if (!snapshot.media_indexes.emplace(id, index).second)
+                throw std::runtime_error("media index appears in multiple shards");
+        }
     }
     return snapshot;
 }
@@ -1663,19 +1667,45 @@ CatalogueRetentionObjects CatalogueManager::retention_objects(
         out.control.push_back(*shard);
     }
 
-    const auto before = load_root(old_root);
-    const auto after = load_root(new_root);
-    for (const auto& [id, item] : after.items) {
-        const auto found = before.items.find(id);
-        if (found != before.items.end() && found->second == item)
+    // Only a shard the two roots do not share can hold anything new: the
+    // rest are the same object. An old shard that cannot be read is taken as
+    // empty, which claims more, never less.
+    CatalogueManifest old_manifest;
+    if (old_root && store_.ensure_control_local(*old_root))
+        if (const auto encoded = local_.control().get(*old_root))
+            old_manifest = decode_catalogue_manifest(*encoded);
+    const auto shard_of = [&](const std::optional<ObjectId>& id, bool required) {
+        CatalogueSnapshot shard;
+        if (!id)
+            return shard;
+        std::optional<Bytes> encoded;
+        if (store_.ensure_control_local(*id))
+            encoded = local_.control().get(*id);
+        if (!encoded) {
+            if (required)
+                throw CatalogueUnavailable("catalogue shard unavailable locally: " +
+                                           to_string(*id));
+            return shard;
+        }
+        return decode_catalogue(*encoded);
+    };
+    for (size_t i = 0; i < manifest.shards.size(); ++i) {
+        if (manifest.shards[i] == old_manifest.shards[i])
             continue;
-        for (const auto& artwork : item.artwork)
-            out.data.push_back(artwork.id);
-    }
-    for (const auto& [media_id, index] : after.media_indexes) {
-        const auto found = before.media_indexes.find(media_id);
-        if (found == before.media_indexes.end() || found->second != index)
-            out.data.push_back(index);
+        const auto before = shard_of(old_manifest.shards[i], false);
+        const auto after = shard_of(manifest.shards[i], true);
+        for (const auto& [id, item] : after.items) {
+            const auto found = before.items.find(id);
+            if (found != before.items.end() && found->second == item)
+                continue;
+            for (const auto& artwork : item.artwork)
+                out.data.push_back(artwork.id);
+        }
+        for (const auto& [media_id, index] : after.media_indexes) {
+            const auto found = before.media_indexes.find(media_id);
+            if (found == before.media_indexes.end() || found->second != index)
+                out.data.push_back(index);
+        }
     }
     std::sort(out.data.begin(), out.data.end());
     out.data.erase(std::unique(out.data.begin(), out.data.end()), out.data.end());

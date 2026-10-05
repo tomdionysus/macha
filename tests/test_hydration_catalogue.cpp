@@ -4251,6 +4251,16 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         REQUIRE(stored.has_value());
         CHECK(std::string(stored->begin(), stored->end()) == body);
         CHECK(maintenance_inventory(node.catalogue()).live.contains(object_id(Bytes(body.begin(), body.end()))));
+        // A catalogue loaded from its root has the index too.
+        {
+            CatalogueManager from_root(node.node(), node.node().local_state(),
+                                       node.node().metadata_server(), node.store(),
+                                       node.metadata(), node.node().ledger());
+            from_root.repair_once();
+            auto loaded = from_root.media_index(media_id);
+            REQUIRE(loaded.has_value());
+            CHECK(std::string(loaded->begin(), loaded->end()) == body);
+        }
         int calls = 0;
         CatalogueApi index_api(node.catalogue(), node.hints(), {}, {}, {}, std::chrono::hours(24 * 30), {},
                                [&](const std::string& id) -> std::optional<Bytes> {
