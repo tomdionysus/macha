@@ -925,6 +925,124 @@ MACHA_TEST("namespace_tree", test_a_prefix_scan_descends_rather_than_walking_the
     CHECK(store.reads() * 4 < full_reads);
 }
 
+// A directory listing reads the directory, not what lies beneath it: each
+// child directory is stepped over in one descent. Names that sort between a
+// directory and its contents ("b.txt" between "b" and "b/x") are still
+// listed once and in order.
+MACHA_TEST("namespace_tree", test_a_listing_reads_the_directory_not_its_descendants) {
+    auto entries = library(40, 200);
+    entries["/TV/Show 3.nfo"] = make_file(9001, 1);
+    entries["/TV/Show 3-extras"] = make_directory(9002);
+    entries["/TV/Show 3-extras/clip.mkv"] = make_file(9003, 2);
+    const auto attached = populated_snapshot(entries);
+    MemoryNamespaceNodeStore store;
+    const auto detached = detach_namespace(attached, store);
+
+    const auto expected_children = [&](const std::string& directory) {
+        std::vector<std::pair<std::string, std::string>> out;
+        const auto prefix = directory == "/" ? std::string("/") : directory + "/";
+        for (const auto& [path, entry] : entries) {
+            if (!path.starts_with(prefix) || path == prefix)
+                continue;
+            const auto rest = path.substr(prefix.size());
+            if (rest.find('/') == std::string::npos)
+                out.emplace_back(rest, path);
+        }
+        return out;
+    };
+    const auto children_of = [&](const MetadataSnapshot& snapshot, const NamespaceNodeStore* nodes,
+                                 const std::string& directory) {
+        std::vector<std::pair<std::string, std::string>> out;
+        for_each_namespace_child(snapshot, nodes, directory,
+                                 [&](const std::string& name, const std::string& path,
+                                     const FsEntry& stat) {
+                                     CHECK(stat.type == entries.at(path).type);
+                                     CHECK(stat.size == entries.at(path).size);
+                                     CHECK(stat.extents.empty() ||
+                                           stat.extents == entries.at(path).extents);
+                                     out.emplace_back(name, path);
+                                 });
+        return out;
+    };
+
+    for (const std::string directory :
+         {"/", "/TV", "/TV/Show 3", "/TV/Show 3/Season 1", "/TV/Show 3-extras", "/nowhere"}) {
+        const auto expected = expected_children(directory);
+        CHECK(children_of(attached, nullptr, directory) == expected);
+        CHECK(children_of(detached, &store, directory) == expected);
+    }
+    REQUIRE(expected_children("/TV").size() == 42);
+
+    // Listing /TV visits its 42 children, at most one descent each; the
+    // thousands of entries beneath them are in leaves it never reads.
+    const auto stats = namespace_tree_stats(*detached.namespace_root, store);
+    store.forget_reads();
+    (void)children_of(detached, &store, "/TV");
+    const auto listing_reads = store.reads();
+    CHECK(listing_reads <= (42 + 3) * stats.depth);
+    CHECK(listing_reads < stats.leaves);
+
+    // The emptiness test stops at the first entry it finds.
+    store.forget_reads();
+    const auto first = first_namespace_path_under(detached, &store, "/TV");
+    REQUIRE(first.has_value());
+    CHECK(*first == first_namespace_path_under(attached, nullptr, "/TV"));
+    CHECK(first->starts_with("/TV/"));
+    CHECK(store.reads() <= 8);
+    CHECK(!first_namespace_path_under(detached, &store, "/TV/Show 3.nfo").has_value());
+    CHECK(!first_namespace_path_under(detached, &store, "/nowhere").has_value());
+    // Entries the caller has erased are passed over.
+    const auto skipping = first_namespace_path_under(
+        detached, &store, "/TV/Show 3-extras",
+        [](const std::string& path) { return path == "/TV/Show 3-extras/clip.mkv"; });
+    CHECK(!skipping.has_value());
+}
+
+// A scan can jump: the entries between where it was and where it seeks to
+// are never visited, and it ends when told to.
+MACHA_TEST("namespace_tree", test_a_scan_seeks_and_stops_where_it_is_told) {
+    const auto entries = library(20, 8);
+    const auto attached = populated_snapshot(entries);
+    MemoryNamespaceNodeStore store;
+    const auto detached = detach_namespace(attached, store);
+
+    for (const auto* form : {&attached, &detached}) {
+        const NamespaceNodeStore* nodes = form == &detached ? &store : nullptr;
+        std::vector<std::string> seen;
+        scan_namespace(*form, nodes, "/TV/Show 1/", [&](const std::string& path, const FsEntry&) {
+            seen.push_back(path);
+            if (seen.size() == 1)
+                return NamespaceScanStep::seek("/TV/Show 5");
+            if (seen.size() == 4)
+                return NamespaceScanStep::stop();
+            return NamespaceScanStep::next();
+        });
+        REQUIRE(seen.size() == 4);
+        auto expect = entries.lower_bound("/TV/Show 1/");
+        CHECK(seen[0] == expect->first);
+        expect = entries.lower_bound("/TV/Show 5");
+        for (size_t i = 1; i < 4; ++i, ++expect)
+            CHECK(seen[i] == expect->first);
+        // A scan from past the last key visits nothing.
+        size_t none = 0;
+        scan_namespace(*form, nodes, "/zzz", [&](const std::string&, const FsEntry&) {
+            ++none;
+            return NamespaceScanStep::next();
+        });
+        CHECK(none == 0);
+        // Seeking backwards is a caller's error.
+        bool refused = false;
+        try {
+            scan_namespace(*form, nodes, "/TV", [&](const std::string&, const FsEntry&) {
+                return NamespaceScanStep::seek("/");
+            });
+        } catch (const std::logic_error&) {
+            refused = true;
+        }
+        CHECK(refused);
+    }
+}
+
 MACHA_TEST("namespace_tree", test_every_tree_node_is_reachable_for_the_collector) {
     // The collector's set is exactly the nodes the build wrote: branches,
     // leaves and every extent spine node.

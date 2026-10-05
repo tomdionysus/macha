@@ -27,9 +27,6 @@ class ManageApi {
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
     CatalogueScanner& scanner_;
-    // Guards nothing; serialises management writes, held across their
-    // metadata commits.
-    IoMutex mutation_mutex_;
     Mutex identity_audit_mutex_;
     std::condition_variable_any identity_audit_cv_;
     std::map<std::string, IdentityAssociationReset, std::less<>> identity_audit_pending_
