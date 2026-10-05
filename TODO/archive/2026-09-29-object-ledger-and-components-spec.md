@@ -64,7 +64,7 @@ performant and testable system.
 Measured on 0.74.0, which is 0.73.2 plus observation
 (`src/observation.hpp`): each node appends a window a minute to
 `<state_path>/observation/observations.jsonl`, and
-`TODO/object-ledger-evidence/t0/observation_report.py` merges the windows'
+`TODO/archive/object-ledger-evidence/t0/observation_report.py` merges the windows'
 histogram buckets exactly and splits them into idle and loaded windows
 (loaded: FUSE publication bytes committed, a DATA retention barrier run, or
 a repair step with a higher class active). Histograms are in microseconds
