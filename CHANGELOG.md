@@ -463,7 +463,7 @@ Any node may disappear at any time and may never come back. Writes and
 deletes now proceed with the nodes that are present, reclamation and merging
 wait for no absent node, and a node that is gone for good is forgotten. The
 design and the audits behind it are in
-`TODO/2026-10-05-absent-node-tolerance-design.md` and `TODO/absent-node-audit/`.
+`TODO/archive/2026-10-05-absent-node-tolerance-design.md` and `TODO/archive/absent-node-audit/`.
 
 **Configuration (breaking).** `dht.min_write_replicas` is now
 `dht.write_copies` and `dht.metadata_min_write_replicas` is
@@ -978,7 +978,7 @@ maintenance inventory, a resumable namespace walk, and
 ## 0.74.0 — The node measures itself to a local file (experiment)
 
 The object ledger experiment's first version (T0 in
-`TODO/2026-09-29-object-ledger-implementation-plan.md`): the code of 0.73.2
+`TODO/archive/2026-09-29-object-ledger-implementation-plan.md`): the code of 0.73.2
 with observation added and nothing else changed. Every node appends one
 JSON line a minute to `<state_path>/observation/observations.jsonl`
 (rotated to `.1` at 64 MiB): latency histograms and counters for what moved
