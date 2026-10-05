@@ -1755,6 +1755,10 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
         // file in the subtree.
         for (auto& [path, entry] : working.subtree(x)) {
             const auto target = y + path.substr(x.size());
+            // The identity travels with the entry; one that has none takes
+            // the identity of the path it leaves.
+            if (entry.provenance.file_id == NodeId{})
+                entry.provenance.file_id = legacy_file_id(path);
             working.erase(path);
             working.put(target, entry);
         }

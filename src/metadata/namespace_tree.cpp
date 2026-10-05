@@ -206,10 +206,26 @@ void read_extent_sequence(const ObjectId& root, const NamespaceNodeStore& store,
         read_extent_sequence(child, store, out);
 }
 
+// Steps over a leaf record's stat fields and provenance, as encode_leaf_entry
+// writes them between the path and the extent form.
+void skip_leaf_entry_stat(Reader& reader) {
+    const auto type = reader.u8();
+    (void)reader.u32(); // mode
+    (void)reader.u32(); // uid
+    (void)reader.u32(); // gid
+    (void)reader.u64(); // size
+    (void)reader.i64(); // ctime
+    (void)reader.i64(); // mtime
+    (void)reader.u64(); // version
+    if (type & entry_type_with_provenance)
+        (void)decode_entry_provenance(reader);
+}
+
 void encode_leaf_entry(Writer& writer, const std::string& path, const FsEntry& entry,
                        NamespaceNodeStore& store, const NamespaceTreeLimits& limits) {
     writer.string(path);
-    writer.u8(static_cast<uint8_t>(entry.type));
+    const bool provenance = !entry.provenance.empty();
+    writer.u8(static_cast<uint8_t>(entry.type) | (provenance ? entry_type_with_provenance : 0));
     writer.u32(entry.mode);
     writer.u32(entry.uid);
     writer.u32(entry.gid);
@@ -217,6 +233,8 @@ void encode_leaf_entry(Writer& writer, const std::string& path, const FsEntry& e
     writer.i64(entry.ctime_ns);
     writer.i64(entry.mtime_ns);
     writer.u64(entry.version);
+    if (provenance)
+        encode_entry_provenance(writer, entry.provenance);
     if (entry.extents.empty()) {
         writer.u8(static_cast<uint8_t>(ExtentForm::none));
         return;
@@ -244,7 +262,9 @@ std::pair<std::string, FsEntry> decode_leaf_entry(Reader& reader, const Namespac
     item.first = reader.string(8192);
     const bool load_extents = load_all || (!load_only_for.empty() && item.first == load_only_for);
     auto& entry = item.second;
-    const auto type = reader.u8();
+    auto type = reader.u8();
+    const bool provenance = (type & entry_type_with_provenance) != 0;
+    type &= static_cast<uint8_t>(~entry_type_with_provenance);
     if (type < 1 || type > 2)
         throw DecodeError("bad namespace tree entry type");
     entry.type = static_cast<EntryType>(type);
@@ -255,6 +275,8 @@ std::pair<std::string, FsEntry> decode_leaf_entry(Reader& reader, const Namespac
     entry.ctime_ns = reader.i64();
     entry.mtime_ns = reader.i64();
     entry.version = reader.u64();
+    if (provenance)
+        entry.provenance = decode_entry_provenance(reader);
     switch (static_cast<ExtentForm>(reader.u8())) {
     case ExtentForm::none:
         break;
@@ -773,13 +795,9 @@ ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore&
             base = pending->second;
         else
             base = namespace_tree_lookup(root, normalized, store, true);
-        if (!base || base->type != EntryType::file || base->extents.size() != append.base_extents)
+        if (!base)
             throw DecodeError("metadata delta append base mismatch");
-        base->extents.insert(base->extents.end(), append.extents.begin(), append.extents.end());
-        base->size = append.size;
-        base->mtime_ns = append.mtime_ns;
-        base->ctime_ns = append.ctime_ns;
-        base->version = append.version;
+        apply_entry_append(*base, normalized, append);
         changes[normalized] = std::move(base);
     }
     const auto updated = update_namespace_tree(root, store, changes, limits);
@@ -804,14 +822,7 @@ std::vector<NamespaceTreeChild> namespace_tree_children(std::span<const uint8_t>
         const auto count = reader.u32();
         for (uint32_t i = 0; i < count; ++i) {
             (void)reader.string(8192);
-            (void)reader.u8();
-            (void)reader.u32();
-            (void)reader.u32();
-            (void)reader.u32();
-            (void)reader.u64();
-            (void)reader.i64();
-            (void)reader.i64();
-            (void)reader.u64();
+            skip_leaf_entry_stat(reader);
             switch (static_cast<ExtentForm>(reader.u8())) {
             case ExtentForm::none:
                 break;
@@ -1011,14 +1022,7 @@ void walk_stats(const ObjectId& id, const NamespaceNodeStore& store, NamespaceTr
         std::vector<ObjectId> extent_roots;
         for (uint32_t i = 0; i < count; ++i) {
             (void)reader.string(8192);
-            (void)reader.u8();
-            (void)reader.u32();
-            (void)reader.u32();
-            (void)reader.u32();
-            (void)reader.u64();
-            (void)reader.i64();
-            (void)reader.i64();
-            (void)reader.u64();
+            skip_leaf_entry_stat(reader);
             switch (static_cast<ExtentForm>(reader.u8())) {
             case ExtentForm::none:
                 break;
@@ -1241,14 +1245,7 @@ NodeShape read_shape(const ObjectId& id, const NamespaceNodeStore& store) {
         for (uint32_t i = 0; i < count; ++i) {
             // Mirrors encode_leaf_entry field by field, skipping stat data.
             auto path = reader.string(8192);
-            (void)reader.u8();  // type
-            (void)reader.u32(); // mode
-            (void)reader.u32(); // uid
-            (void)reader.u32(); // gid
-            (void)reader.u64(); // size
-            (void)reader.i64(); // ctime
-            (void)reader.i64(); // mtime
-            (void)reader.u64(); // version
+            skip_leaf_entry_stat(reader);
             std::optional<ObjectId> extent_root;
             switch (static_cast<ExtentForm>(reader.u8())) {
             case ExtentForm::none:

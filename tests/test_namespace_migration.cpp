@@ -153,6 +153,100 @@ std::vector<uint8_t> read_file(Service& service, const std::string& path, size_t
     return out;
 }
 
+// Every write says where it came from, on a namespace held as a map and on
+// one held as a tree: a new file gets an identity and its two dots, a change
+// moves the content dot, a rename keeps the identity and moves the name dot,
+// and an append travels as a delta that carries its dot.
+MACHA_TEST("namespace_migration", test_every_write_records_where_it_came_from) {
+    TestCluster cluster;
+    auto config = cluster.node_config("provenance");
+    make_solo(config);
+    NodeId node_id{};
+    // Whether `dot` is the head's latest mutation by its author.
+    const auto newest = [](Service& service, const MetadataDot& dot) {
+        const auto clock = service.metadata_manager().snapshot().mutation_sequences;
+        const auto found = clock.find(dot.author);
+        return found != clock.end() && found->second == dot.sequence;
+    };
+    const auto check_lifecycle = [&](Service& service, const std::string& dir) {
+        auto& fs = service.filesystem();
+        fs.mkdir(dir, 0755, getuid(), getgid());
+        const auto made = fs.getattr(dir);
+        CHECK(made.provenance.file_id != NodeId{});
+        CHECK(made.provenance.content == made.provenance.name);
+        CHECK(clock_covers(service.metadata_manager().snapshot().mutation_sequences,
+                           made.provenance.name));
+
+        write_file(service, dir + "/a.bin", pattern(64 * 1024, 7));
+        const auto written = fs.getattr(dir + "/a.bin");
+        CHECK(written.provenance.file_id != NodeId{});
+        CHECK(written.provenance.file_id != made.provenance.file_id);
+        CHECK(written.provenance.name.sequence < written.provenance.content.sequence);
+
+        fs.chmod(dir + "/a.bin", 0600);
+        const auto changed = fs.getattr(dir + "/a.bin");
+        CHECK(changed.provenance.file_id == written.provenance.file_id);
+        CHECK(changed.provenance.name == written.provenance.name);
+        CHECK(changed.provenance.content.sequence > written.provenance.content.sequence);
+
+        fs.rename(dir + "/a.bin", dir + "/b.bin", false);
+        const auto moved = fs.getattr(dir + "/b.bin");
+        CHECK(moved.provenance.file_id == written.provenance.file_id);
+        CHECK(moved.provenance.content == changed.provenance.content);
+        CHECK(moved.provenance.name.sequence > changed.provenance.content.sequence);
+
+        // A second extent appended: a delta commit, and the content dot moves.
+        const auto more = pattern(64 * 1024, 8);
+        auto writer = fs.open_write(dir + "/b.bin", false);
+        REQUIRE(writer->write(moved.size, more) == more.size());
+        writer->commit();
+        const auto grown = fs.getattr(dir + "/b.bin");
+        CHECK(grown.size == moved.size + more.size());
+        CHECK(grown.provenance.file_id == written.provenance.file_id);
+        CHECK(grown.provenance.name == moved.provenance.name);
+        CHECK(grown.provenance.content.sequence > moved.provenance.content.sequence);
+        CHECK(newest(service, grown.provenance.content));
+        // A map-form record is far larger than the append, so it travels as
+        // a delta; a tree-form record is already smaller than one.
+        if (!service.metadata_manager().snapshot().namespace_root) {
+            const auto head = service.local_state().replica().accepted_heads().front();
+            const auto entry = service.local_state().replica().history_entry(head.hash);
+            REQUIRE(entry.has_value());
+            CHECK(entry->body == MetadataHistoryEntry::Body::delta);
+        }
+
+        // A directory rename carries every identity under it.
+        fs.rename(dir, dir + "-moved", false);
+        CHECK(fs.getattr(dir + "-moved").provenance.file_id == made.provenance.file_id);
+        const auto carried = fs.getattr(dir + "-moved/b.bin");
+        CHECK(carried.provenance.file_id == written.provenance.file_id);
+        CHECK(carried.provenance.content == grown.provenance.content);
+        CHECK(newest(service, carried.provenance.name));
+    };
+    {
+        Service service(config, cluster.keys(), test_durability_window);
+        service.start();
+        node_id = service.node().node_id();
+        REQUIRE(wait_metadata_writable(service));
+        check_lifecycle(service, "/map");
+        const auto snapshot = service.metadata_manager().snapshot();
+        REQUIRE(!snapshot.namespace_root.has_value());
+        REQUIRE(snapshot.legacy_clock.has_value());
+        // The root was there before provenance and nothing has changed it.
+        CHECK(service.filesystem().getattr("/").provenance.empty());
+        service.stop();
+    }
+    (void)migrate_state(config, cluster.keys(), {node_id});
+    Service service(config, cluster.keys(), test_durability_window);
+    service.start();
+    REQUIRE(wait_metadata_writable(service));
+    REQUIRE(service.metadata_manager().snapshot().namespace_root.has_value());
+    // What was written before the tree is still there, provenance and all.
+    CHECK(service.filesystem().getattr("/map-moved/b.bin").provenance.file_id != NodeId{});
+    check_lifecycle(service, "/tree");
+    service.stop();
+}
+
 MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_library) {
     // End to end on one node: write a library, stop, re-root onto the tree,
     // restart. Every read must match and the filesystem must stay writable.
