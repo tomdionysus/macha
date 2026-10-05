@@ -1,5 +1,31 @@
 # Current release
 
+## 0.90.11 — a catalogue write touches its own shards (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**A catalogue write encodes and claims the shards it touches.** Every write
+copied the whole catalogue into its 64 shards, encoded and hashed all of
+them, and claimed all of them again, which meant 65 control objects rewritten
+on this node per write. It now finds the shards holding a key at which the
+new catalogue differs from the one it started from, builds and encodes those,
+and keeps the old manifest's object for the rest. Its claims name the root
+and the shards that changed.
+
+**Artwork types and media bindings are indexed once per catalogue
+snapshot.** Serving one poster scanned every catalogue item for the image's
+media type; a directory listing in the management API rebuilt the map from
+media id to items.
+
+**Claim release looks at a bounded stretch of claims per call.** It held the
+claim store's lock, which every commit needs, while it looked at every claim.
+
+**The mount journals a descriptor and its operation under one barrier.** A
+create or mkdir synced the journal twice and a rename once per entry it
+moved, each under the mount's global lock; the operation's sync covers the
+descriptors written just before it. Reclaiming an unlinked inode looks its
+path up where it scanned every path.
+
 ## 0.90.10 — a match waits for no other node (experiment)
 
 No wire, protocol, API or on-disk changes.
