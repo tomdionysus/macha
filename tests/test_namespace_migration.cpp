@@ -497,48 +497,59 @@ MACHA_TEST("namespace_migration", test_the_pre_migration_state_is_kept_not_delet
 }
 
 MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keeps_the_namespace) {
-    // The three-way merge works on entry maps, which are empty in tree-backed
-    // snapshots. The manager materialises the branches, merges, and re-roots;
-    // this exercises that sequence without a cluster.
+    // The merge of materialised heads reads entry maps, which are empty in
+    // tree-backed snapshots. A branch still held as a map makes the manager
+    // materialise both, merge, and re-root; this exercises that sequence
+    // without a cluster.
     MemoryNamespaceNodeStore store;
 
     std::map<std::string, FsEntry> base_entries;
     base_entries["/"] = make_directory(0);
     base_entries["/Films"] = make_directory(1);
     base_entries["/Films/shared.mkv"] = make_file(10, 3);
-    auto base = populated_snapshot(base_entries);
+    const auto base = populated_snapshot(base_entries);
 
-    // Each branch adds a file the other has not seen.
-    auto left = base;
-    left.entries["/Films/left.mkv"] = make_file(20, 4);
-    auto right = base;
-    right.entries["/Films/right.mkv"] = make_file(30, 5);
+    // Each branch is another author's one mutation, stamped as a commit
+    // stamps what it writes: a file the other has not seen.
+    const auto make_branch = [&](uint8_t author, const std::string& path, const FsEntry& file) {
+        MetadataDot dot;
+        dot.author.bytes[0] = author;
+        dot.sequence = 1;
+        auto branch = base;
+        branch.legacy_clock = base.mutation_sequences;
+        branch.mutation_sequences[dot.author] = dot.sequence;
+        auto entry = file;
+        stamp_entry_provenance(entry, path, nullptr, dot);
+        branch.entries[path] = entry;
+        return branch;
+    };
+    const auto left = make_branch(1, "/Films/left.mkv", make_file(20, 4));
+    const auto right = make_branch(2, "/Films/right.mkv", make_file(30, 5));
 
     Hash256 left_head{}, right_head{};
     left_head.bytes[0] = 1;
     right_head.bytes[0] = 2;
 
-    const auto expected = merge_metadata_snapshots(base, left, right, left_head, right_head);
+    const auto expected = merge_metadata_heads(left, right, left_head, right_head);
     CHECK(expected.snapshot.entries.size() == 5);
+    CHECK(expected.snapshot.entries.contains("/Films/shared.mkv"));
     CHECK(expected.conflicts_created == 0);
 
     // Merging the tree-backed forms directly is refused, not an empty result.
-    const auto base_tree = detach_namespace(base, store);
     const auto left_tree = detach_namespace(left, store);
     const auto right_tree = detach_namespace(right, store);
     bool refused = false;
     try {
-        (void)merge_metadata_snapshots(base_tree, left_tree, right_tree, left_head, right_head);
+        (void)merge_metadata_heads(left_tree, right_tree, left_head, right_head);
     } catch (const std::logic_error&) {
         refused = true;
     }
     CHECK(refused);
 
     // Materialised, merged, re-rooted: the root equals one built from scratch.
-    auto merged = merge_metadata_snapshots(attach_namespace(base_tree, store),
-                                           attach_namespace(left_tree, store),
-                                           attach_namespace(right_tree, store), left_head,
-                                           right_head);
+    auto merged = merge_metadata_heads(attach_namespace(left_tree, store),
+                                       attach_namespace(right_tree, store), left_head,
+                                       right_head);
     CHECK(merged.snapshot.entries == expected.snapshot.entries);
     const auto merged_tree = detach_namespace(merged.snapshot, store);
     REQUIRE(merged_tree.namespace_root.has_value());
@@ -546,6 +557,13 @@ MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keep
     MemoryNamespaceNodeStore fresh;
     CHECK(*merged_tree.namespace_root == build_namespace_tree(expected.snapshot.entries, fresh));
     CHECK(read_namespace_tree(*merged_tree.namespace_root, store) == expected.snapshot.entries);
+
+    // Two trees merge by what differs between them, to the same root.
+    const auto tree_merge =
+        merge_tree_backed_heads(left_tree, right_tree, left_head, right_head, store);
+    CHECK(update_namespace_tree(tree_merge.onto, store, tree_merge.changes) ==
+          *merged_tree.namespace_root);
+    CHECK(tree_merge.merged.snapshot.conflicts.empty());
 }
 
 MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_only_if_it_agrees) {

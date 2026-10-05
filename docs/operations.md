@@ -541,36 +541,18 @@ carries only its root; `--objects` names the control object store so the tree
 can be walked, the delta chain actually replayed (naming the first frame that
 diverges), and a stat timed against it.
 
-## Manual metadata ancestry repair
+## Inspecting a replica's heads offline
 
-`macha-metadata-repair` is an offline recovery tool, not a daemon maintenance
-path. With no option it reports committed/accepted heads and retained ancestry.
-Its causal-merge operation is intentionally manual and narrowly fenced: it
-requires exactly two accepted heads with no retained common ancestor and one
-head's durable mutation clock must strictly dominate the other. It refuses
-ordinary mergeable histories, concurrent/equal clocks, unstaged acceptance and
-insufficient distinct witnesses.
+`macha-metadata-repair STATE_PATH KEY_FILE` reads a stopped node's metadata
+replica and reports its committed record, each accepted head with its
+certificate, and for each pair of heads which one's mutation clock covers the
+other's and how many entries differ. `--diff-heads` lists the differences.
+`--export-acceptance` and `--import-acceptance` carry one accepted head's
+certificate to a replica that already holds the record. Run it with no
+arguments for the full usage.
 
-Stop every Macha node and make a recoverable copy of each configured
-`state_path/metadata` directory before use. Run `--plan-causal-merge` against
-every replica and require the generation, repair hash, primary, dominant and
-subsumed hashes to match exactly. Then run `--stage-causal-merge` everywhere.
-Only after the same record is durably staged on the named witness nodes may
-`--accept-causal-merge STATE_PATH KEY_FILE WITNESS...` be run on every replica.
-Start the whole cluster and verify one accepted descendant, writable metadata,
-matching local generations and zero unresolved reconciliation conflicts.
-
-This operation does not choose the numerically newest head. The state comes
-only from strict causal dominance, while the subsumed accepted head remains an
-authenticated additional parent of the repair record. Concurrent heads require
-a separate conflict-preserving repair and must not use this command.
-
-That repair is `--plan-conflict-merge`, `--stage-conflict-merge` and
-`--accept-conflict-merge STATE_PATH KEY_FILE WITNESS...`, run in the same
-plan-everywhere, stage-everywhere, accept-everywhere order. The tool also
-offers `--diff-heads`, and `--export-acceptance` / `--import-acceptance` to
-carry one accepted head's certificate to a replica that already holds the
-record. Run it with no arguments for the full usage.
+Nothing here is needed to bring heads together: a running node merges any
+two heads it holds from what the heads themselves record.
 
 ## Re-rooting the namespace onto the tree
 
