@@ -30,10 +30,10 @@ and cluster key the same everywhere.
   object. It does not copy the whole library onto every node.
 - `write_copies: 2` means new file data is on two nodes when the write
   returns, whenever two nodes are present to take it.
-- `metadata_write_copies: 2` does the same for the control objects a
-  catalogue change stores. A namespace change is durable on the node that
-  made it when the write returns and is sent to every node present
-  straight afterwards. With fewer nodes present, a write returns on the
+- A namespace or catalogue change is durable on the node that made it when
+  the write returns and is sent to every node present straight afterwards.
+  `metadata_write_copies: 2` is the copies a merge commit seeks before it is
+  accepted. With fewer nodes present, a write returns on the
   copies it has and repair delivers the rest; nothing is refused for lack of
   peers.
 - `failure_domain` tells Macha which nodes share a likely outage. Nodes on the

@@ -425,7 +425,7 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
         data_ms = since_ms(data_started);
         const auto control_started = Clock::now();
         if (!control.empty())
-            (void)store_.retain_control(control, dot);
+            (void)store_.retain_control(control, dot, DistributedStore::ClaimScope::every_node);
         control_ms = since_ms(control_started);
         report("ok");
         return;

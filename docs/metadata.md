@@ -4,7 +4,7 @@
 
 Every Macha node is a metadata replica, and every replica has the same standing.
 
-A namespace commit is made on the committing node alone: it is accepted, and the write returns, once that node durably holds the commit, its acceptance certificate and its claims on the objects it refers to. No peer is asked first. The commit is then offered to every node present, in order, by a replicator the caller does not wait for; a node that is away, slow or stalled receives it from repair. A read on the committing node sees the commit at once. A read on another node sees it when it arrives there. `dht.metadata_write_copies` is the number of copies sought, before the write returns, of the control objects a catalogue write stores and of a merge commit; it is not a condition of acceptance and not a majority derived from cluster membership.
+A namespace commit is made on the committing node alone: it is accepted, and the write returns, once that node durably holds the commit, its acceptance certificate and its claims on the objects it refers to. No peer is asked first. The commit is then offered to every node present, in order, by a replicator the caller does not wait for; a node that is away, slow or stalled receives it from repair. A read on the committing node sees the commit at once. A read on another node sees it when it arrives there. A catalogue write is made the same way: its shards and manifest are stored on the committing node and sent to the others afterwards. `dht.metadata_write_copies` is the number of copies of a merge commit sought before it is accepted; it is not a condition of acceptance and not a majority derived from cluster membership.
 
 For example, with twelve known nodes and:
 
