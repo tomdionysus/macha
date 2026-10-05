@@ -1,5 +1,24 @@
 # Current release
 
+## 0.90.1 — a catalogue conflict decided for the root in place is removed (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**A catalogue conflict could be reconciled for ever.** When two heads had
+each moved the catalogue root, the merge kept one and recorded the other as a
+conflict for the catalogue to merge in. Where merging the two gave back the
+root already in place, the catalogue returned without committing, so the
+conflict record stayed, and every maintenance pass loaded three whole
+catalogues and merged them again: every five seconds or so, on both nodes,
+from the first such conflict after 0.89.0. Deciding a conflict for the root
+in place is now a commit that removes it.
+
+**The same catalogue root set on two heads takes the later setting's dot.**
+The merge took the greater of the two dots, which follows the authors' ids,
+not the order of events. A decision made by the author with the lesser id
+could then be taken for no decision when merged with a head still carrying
+the conflict, and the conflict came back.
+
 ## 0.90.0 — a commit is made on the node that receives it (experiment)
 
 No wire, protocol or on-disk format changes, and no API route or payload
