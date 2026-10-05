@@ -10,9 +10,12 @@
 namespace macha {
 
 enum class NodeEvent : uint8_t {
+    // What this node holds changed: an object stored or removed.
     storage,
     metadata,
     topology,
+    // What this node's claims protect changed; what it holds did not.
+    claims,
 };
 
 // What has happened on this node, as one monotonic count per kind. Producers
@@ -27,7 +30,7 @@ enum class NodeEvent : uint8_t {
 // missed.
 class NodeEvents {
   public:
-    static constexpr size_t kinds = 3;
+    static constexpr size_t kinds = 4;
 
     void notify(NodeEvent kind) {
         counts_[index(kind)].fetch_add(1, std::memory_order_release);
