@@ -1,7 +1,7 @@
 # Active tasks
 
 Last updated: 2026-10-05, on `experiment/object-ledger-t5`. Both nodes run
-0.90.15; see entry 1's plan for what each 0.90.x carries.
+0.90.16; see entry 1's plan for what each 0.90.x carries.
 
 This is the ordered list of open work. `COMPLETED.md` is the ledger of
 finished work; `BACKLOG.md` holds the older P-1 to P2 sections, written
@@ -79,13 +79,12 @@ Plan: [stage 0](2026-09-29-object-ledger-implementation-plan.md). Evidence:
 ## Cluster state (2026-10-05)
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.15** (tarball md5
-  `1d96ae165873788694e84d78c86a7051`), **cluster protocol 23**, installed
-  20:30Z (node-f) and 20:31Z (node-c). node-e is offline indefinitely.
+  (198.51.100.10) run **0.90.16**, **cluster protocol 23**, installed 2026-10-05 (see
+  the CHANGELOG for what each 0.90.x carries). node-e is offline indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
 - Rollback material on each node: `/root/pre-<version>/` holds the binaries
-  and config in place before that version was installed (`pre-0.90.15` back
+  and config in place before that version was installed (`pre-0.90.16` back
   to `pre-0.89.0`, which also has the roster and sequence counter).
 - node-f's `/root/macha/build-asan` and `build-coverage` were partly
   overwritten with macOS objects by a mis-excluded sync on 2026-10-05; their
