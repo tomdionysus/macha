@@ -1,5 +1,31 @@
 # Current release
 
+## 0.90.4 — the mount and the media index follow a commit's changes (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**The mount applies what a commit changed.** After every commit, its own
+included, the FUSE frontend walked the whole namespace, extents and all,
+under its global lock before answering the next request. It now applies what
+differs between the tree it last took and the tree now. The whole tree is
+walked the first time, and again whenever an operation applied to the mount's
+view was retired without being published (an operator skipping a blocked
+operation), which is the case that walk exists to reconcile.
+
+**A listing reads its directory.** The mount's `readdir`, the emptiness
+checks of `rmdir` and of a rename onto a directory, and a rename's subtree
+scan read the directory's own range of the path map, not every path in the
+namespace.
+
+**A lookup by media id costs the change, not the library.** The index from
+media id to path was rebuilt by walking the whole namespace on the first miss
+after any change, and a miss could ask the other nodes what the head was. It
+now follows this node's own head, brought up to date from what differs
+between two trees, and asks no peer. It keeps every path that holds a piece
+of content: an id resolves while any copy remains and stops resolving when
+the last one goes, where before an id for content no longer in the namespace
+went on resolving until the next rebuild.
+
 ## 0.90.3 — a catalogue write is made on this node alone (experiment)
 
 No wire, protocol, API or on-disk changes.
