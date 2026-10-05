@@ -2930,6 +2930,16 @@ ProviderRequestError provider_unavailable(std::string_view provider, std::string
     return ProviderRequestError(503, "provider_unavailable", "Provider unavailable");
 }
 
+namespace {
+void add_artwork(CatalogueItem& item, CatalogueArtwork art) {
+    const bool duplicate =
+        std::any_of(item.artwork.begin(), item.artwork.end(), [&](const auto& current) {
+            return current.role == art.role && current.id == art.id;
+        });
+    if (!duplicate) item.artwork.push_back(std::move(art));
+}
+} // namespace
+
 bool CatalogueScanner::stage_remote_artwork(
     ProviderMatch& match, const std::function<bool(std::string_view)>& locked,
     std::stop_token stop, size_t max_artwork_bytes,
@@ -2949,6 +2959,18 @@ bool CatalogueScanner::stage_remote_artwork(
         });
         if (target == match.items.end()) continue;
         if (locked(art.item_id)) continue;
+        // An image this node already stored from the same URL, and still
+        // holds, is the same artwork: neither fetched nor written again.
+        std::optional<CatalogueArtwork> known;
+        {
+            Lock lock(remote_artwork_mutex_);
+            if (const auto found = remote_artwork_.find(art.url); found != remote_artwork_.end())
+                known = found->second;
+        }
+        if (known && known->role == art.role && catalogue_.artwork_held_here(known->id)) {
+            add_artwork(*target, std::move(*known));
+            continue;
+        }
         fetches.push_back({&art, &*target, {}, {}});
     }
 
@@ -2987,12 +3009,13 @@ bool CatalogueScanner::stage_remote_artwork(
         try {
             auto staged = catalogue_.stage_artwork_deferred(
                 art.role, mime, response.body, artwork_batch);
-            auto& artwork = fetched.target->artwork;
-            const bool duplicate =
-                std::any_of(artwork.begin(), artwork.end(), [&](const auto& current) {
-                    return current.role == staged.role && current.id == staged.id;
-                });
-            if (!duplicate) artwork.push_back(std::move(staged));
+            {
+                Lock lock(remote_artwork_mutex_);
+                if (remote_artwork_.size() >= remote_artwork_max)
+                    remote_artwork_.clear();
+                remote_artwork_.insert_or_assign(art.url, staged);
+            }
+            add_artwork(*fetched.target, std::move(staged));
         } catch (const std::exception& e) {
             Log::warn("catalogue artwork failed for " + art.item_id + ": " + e.what());
         }

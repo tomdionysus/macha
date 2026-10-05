@@ -1,5 +1,20 @@
 # Current release
 
+## 0.90.14 — a matched album's cover is not fetched again (experiment)
+
+No wire, protocol or on-disk changes. One API change in wording only.
+
+**A match reuses artwork this node already stored from the same URL.**
+Matching each track of an album downloaded the album's cover again (about
+2 s from the Cover Art Archive) and waited for it to be durable (0.5 s) before
+the commit. The scanner keeps the artwork each provider image URL was stored
+as; while this node holds it, a match takes it as it is.
+
+**A provider that cannot answer is reported as "Provider unavailable".** The
+code is still `provider_unavailable`; the message no longer passes on internal
+reasons such as the MusicBrainz gate's backoff ("circuit open"). The reason is
+logged with the provider.
+
 ## 0.90.13 — the mount commits without waiting for a viewer (experiment)
 
 No wire, protocol, API or on-disk changes.

@@ -337,6 +337,8 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     bool put_deferred_here(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&, FrameType);
     // Whether this node stores DATA extents itself.
     bool holds_extents() const;
+    // Whether this node's own store holds the object. Asks no peer.
+    bool held_here(const ObjectId&) const;
     ObjectId put_deferred(std::span<const uint8_t>, DurabilityBatch&,
                           std::atomic_bool* cancelled = nullptr);
     // A `work` no-progress budget fails the put (retryably) once no replica

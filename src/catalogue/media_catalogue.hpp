@@ -455,6 +455,11 @@ class CatalogueScanner {
     Mutex artwork_options_mutex_;
     std::map<std::string, std::pair<Clock::time_point, std::vector<ArtworkOption>>>
         artwork_options_ MACHA_GUARDED_BY(artwork_options_mutex_);
+    // The artwork each provider image URL was stored as. A URL whose image
+    // this node still holds is not fetched again.
+    static constexpr size_t remote_artwork_max = 4096;
+    Mutex remote_artwork_mutex_;
+    std::map<std::string, CatalogueArtwork> remote_artwork_ MACHA_GUARDED_BY(remote_artwork_mutex_);
     EditorSeat& editor_seat() noexcept {
         return editor_seats_[next_editor_seat_.fetch_add(1, std::memory_order_relaxed) %
                              editor_seats];
