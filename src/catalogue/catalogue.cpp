@@ -164,16 +164,41 @@ CatalogueManifest decode_catalogue_manifest(std::span<const uint8_t> bytes) {
     return manifest;
 }
 
-std::array<CatalogueSnapshot, catalogue_shard_count>
-shard_catalogue(const CatalogueSnapshot& snapshot) {
-    std::array<CatalogueSnapshot, catalogue_shard_count> shards;
+// One shard of a snapshot.
+CatalogueSnapshot catalogue_shard_of(const CatalogueSnapshot& snapshot, size_t shard) {
+    CatalogueSnapshot out;
     for (const auto& [id, item] : snapshot.items)
-        shards[catalogue_shard(id)].items.emplace(id, item);
+        if (catalogue_shard(id) == shard)
+            out.items.emplace(id, item);
     for (const auto& [id, profile] : snapshot.media_profiles)
-        shards[catalogue_shard(id)].media_profiles.emplace(id, profile);
+        if (catalogue_shard(id) == shard)
+            out.media_profiles.emplace(id, profile);
     for (const auto& [id, index] : snapshot.media_indexes)
-        shards[catalogue_shard(id)].media_indexes.emplace(id, index);
-    return shards;
+        if (catalogue_shard(id) == shard)
+            out.media_indexes.emplace(id, index);
+    return out;
+}
+
+// Marks the shard of every key at which two maps differ.
+template <typename Map>
+void mark_changed_shards(const Map& before, const Map& after,
+                         std::array<bool, catalogue_shard_count>& changed) {
+    auto a = before.begin();
+    auto b = after.begin();
+    while (a != before.end() || b != after.end()) {
+        if (b == after.end() || (a != before.end() && a->first < b->first)) {
+            changed[catalogue_shard(a->first)] = true;
+            ++a;
+        } else if (a == before.end() || b->first < a->first) {
+            changed[catalogue_shard(b->first)] = true;
+            ++b;
+        } else {
+            if (!(a->second == b->second))
+                changed[catalogue_shard(a->first)] = true;
+            ++a;
+            ++b;
+        }
+    }
 }
 
 bool valid_kind(uint8_t value) {
@@ -1165,15 +1190,39 @@ void CatalogueManager::commit(
         old_manifest = decode_catalogue_manifest(*encoded);
     }
 
+    // Which shards this write touches: those holding a key at which `next`
+    // differs from the catalogue it started from. The rest keep the object
+    // the old manifest names and are neither built nor encoded. Without the
+    // catalogue at the expected root to compare against, every shard is.
+    std::array<bool, catalogue_shard_count> touched;
+    touched.fill(true);
+    {
+        std::shared_ptr<const CatalogueSnapshot> started_from;
+        {
+            Lock lock(mutex_);
+            if (ready_ && cached_ && expected_root && cached_root_ == expected_root)
+                started_from = cached_;
+        }
+        if (started_from) {
+            touched.fill(false);
+            mark_changed_shards(started_from->items, next.items, touched);
+            mark_changed_shards(started_from->media_profiles, next.media_profiles, touched);
+            mark_changed_shards(started_from->media_indexes, next.media_indexes, touched);
+        }
+    }
+
     CatalogueManifest manifest;
-    const auto shards = shard_catalogue(next);
     std::vector<std::pair<ObjectId, Bytes>> changed_control;
     changed_control.reserve(catalogue_shard_count + 1);
     for (size_t i = 0; i < catalogue_shard_count; ++i) {
-        if (shards[i].items.empty() && shards[i].media_profiles.empty() &&
-            shards[i].media_indexes.empty())
+        if (!touched[i]) {
+            manifest.shards[i] = old_manifest.shards[i];
             continue;
-        auto encoded = encode_catalogue(shards[i]);
+        }
+        const auto shard = catalogue_shard_of(next, i);
+        if (shard.items.empty() && shard.media_profiles.empty() && shard.media_indexes.empty())
+            continue;
+        auto encoded = encode_catalogue(shard);
         const auto id = object_id(encoded);
         manifest.shards[i] = id;
         if (old_manifest.shards[i] != id)
@@ -1674,9 +1723,17 @@ CatalogueRetentionObjects CatalogueManager::retention_objects(
     if (!encoded_manifest)
         throw CatalogueUnavailable("catalogue manifest unavailable locally for retention publication");
     const auto manifest = decode_catalogue_manifest(*encoded_manifest);
+    // Only a shard the two roots do not share can hold anything new: the
+    // rest are the same object, claimed when it was written. An old root
+    // that cannot be read is taken as empty, which claims more, never less.
+    CatalogueManifest old_manifest;
+    if (old_root && store_.ensure_control_local(*old_root))
+        if (const auto encoded = local_.control().get(*old_root))
+            old_manifest = decode_catalogue_manifest(*encoded);
     out.control.push_back(*new_root);
-    for (const auto& shard : manifest.shards) {
-        if (!shard)
+    for (size_t i = 0; i < manifest.shards.size(); ++i) {
+        const auto& shard = manifest.shards[i];
+        if (!shard || shard == old_manifest.shards[i])
             continue;
         if (!store_.ensure_control_local(*shard))
             throw CatalogueUnavailable("catalogue shard unavailable for retention publication: " +
@@ -1684,13 +1741,6 @@ CatalogueRetentionObjects CatalogueManager::retention_objects(
         out.control.push_back(*shard);
     }
 
-    // Only a shard the two roots do not share can hold anything new: the
-    // rest are the same object. An old shard that cannot be read is taken as
-    // empty, which claims more, never less.
-    CatalogueManifest old_manifest;
-    if (old_root && store_.ensure_control_local(*old_root))
-        if (const auto encoded = local_.control().get(*old_root))
-            old_manifest = decode_catalogue_manifest(*encoded);
     const auto shard_of = [&](const std::optional<ObjectId>& id, bool required) {
         CatalogueSnapshot shard;
         if (!id)
