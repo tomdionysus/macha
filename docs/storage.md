@@ -157,7 +157,7 @@ The control-store `limit` is a safety ceiling, not a DATA budget. Operators shou
 
 Catalogue structure consists of 64 content-addressed shards plus a small manifest root. Those objects are CONTROL. Artwork bytes are DATA.
 
-A catalogue commit cannot reference a new manifest/shard until that control object is durable on the committing node; copies on `metadata_write_copies` nodes are sought from those present. After commit, maintenance converges current control objects onto every active node. Missing extra copies are convergence debt, not grounds for copying artwork everywhere.
+A catalogue commit cannot reference a new manifest/shard until that control object is durable on the committing node; every node present is sent it after the commit. After commit, maintenance converges current control objects onto every active node. Missing extra copies are convergence debt, not grounds for copying artwork everywhere.
 
 ## Reads
 

@@ -132,7 +132,7 @@ A catalogue mutation reads the current metadata root and uses optimistic concurr
 Before publishing a successor root:
 
 - newly introduced artwork references are verified through ordinary DATA reads;
-- changed shard objects are content-addressed and stored on the committing node, with copies sought on `metadata_write_copies` nodes from those present;
+- changed shard objects are content-addressed and stored on the committing node; every node present is sent them after the commit;
 - the successor manifest is stored the same way;
 - namespace metadata is CAS-updated from the expected old root to the new root.
 
