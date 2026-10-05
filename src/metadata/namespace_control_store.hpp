@@ -9,26 +9,27 @@
 
 namespace macha {
 
-// The namespace tree in the cluster's content-addressed control store, via
-// `replicate_control` and `ensure_control_local` as the catalogue uses: it
-// inherits replication, repair and GC with no second durability model.
+// The namespace tree in the cluster's content-addressed control store, read
+// through `ensure_control_local` as the catalogue reads: it inherits
+// replication, repair and GC with no second durability model.
 // The only place NamespaceNodeStore (cluster-agnostic, so the tree can be
 // built offline) meets the cluster.
 class ControlNamespaceNodeStore final : public NamespaceNodeStore {
   public:
     // A reader refuses `put`.
     static ControlNamespaceNodeStore for_reading(LocalStore& control, DistributedStore& store) {
-        return ControlNamespaceNodeStore(control, store, nullptr, Mode::read);
+        return ControlNamespaceNodeStore(control, store, Mode::read);
     }
-    // A commit writes each node here and offers it to every node present; a
-    // root is committed once this node holds every node it addresses.
+    // A commit writes each new node on this node alone; a root is committed
+    // once this node holds every node it addresses. The peers are sent them
+    // afterwards.
     static ControlNamespaceNodeStore for_commit(LocalStore& control, DistributedStore& store) {
-        return ControlNamespaceNodeStore(control, store, &store, Mode::commit);
+        return ControlNamespaceNodeStore(control, store, Mode::commit);
     }
-    // Replay writes locally and replicates nothing: content addressing makes
-    // a locally rebuilt node identical to the committed one.
+    // Replay writes every node it is given: content addressing makes a
+    // locally rebuilt node identical to the committed one.
     static ControlNamespaceNodeStore for_replay(LocalStore& control, ControlObjectSource& source) {
-        return ControlNamespaceNodeStore(control, source, nullptr, Mode::replay);
+        return ControlNamespaceNodeStore(control, source, Mode::replay);
     }
 
     // Writes the node and returns its content address. Throws when this node
@@ -40,21 +41,17 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
     // here" from "not found" and need to know which node was missing.
     std::optional<Bytes> get(const ObjectId& id) const override;
 
-    // Nodes written since construction, in write order: the dirty set a
-    // commit replicated.
+    // Nodes written since construction, in write order.
     const std::vector<ObjectId>& written() const noexcept {
         return written_;
     }
 
   private:
     enum class Mode : uint8_t { read, commit, replay };
-    ControlNamespaceNodeStore(LocalStore& control, ControlObjectSource& source,
-                              DistributedStore* replicas, Mode mode);
+    ControlNamespaceNodeStore(LocalStore& control, ControlObjectSource& source, Mode mode);
 
     LocalStore& control_;
     ControlObjectSource& source_;
-    // Set only in commit mode, the one that replicates.
-    DistributedStore* replicas_;
     Mode mode_;
     std::vector<ObjectId> written_;
 };
