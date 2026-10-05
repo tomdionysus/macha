@@ -247,6 +247,152 @@ MACHA_TEST("namespace_migration", test_every_write_records_where_it_came_from) {
     service.stop();
 }
 
+// The maintenance inventory is, at every step, what a walk of the whole
+// namespace finds: files with inline and with external extent lists, the
+// same content at two paths, renames, overwrites and removals. On a tree it
+// gets there by following the tree from one head to the next, and a lookup
+// by media id follows the same changes.
+MACHA_TEST("namespace_migration", test_the_inventory_and_the_media_index_follow_the_tree) {
+    TestCluster cluster;
+    auto config = cluster.node_config("census");
+    make_solo(config);
+    NodeId node_id{};
+    const auto check = [&](Service& service, const std::string& root, bool tree) {
+    auto& fs = service.filesystem();
+    const auto extent = config.extent_size;
+    const auto agrees = [&] {
+        const auto followed = fs.maintenance_objects_cached();
+        const auto walked = fs.maintenance_objects();
+        CHECK(followed->live == walked.live);
+        CHECK(followed->namespace_nodes == walked.namespace_nodes);
+        CHECK(followed->entries == walked.entries);
+        CHECK(followed->extents == walked.extents);
+        CHECK(followed->garbage == walked.garbage);
+        // What the release horizon is given in place of its own walk.
+        const auto counted = fs.namespace_references(service.metadata_manager().snapshot());
+        CHECK(counted.has_value() == tree);
+        if (counted) {
+            CHECK(counted->extents == walked.live);
+            CHECK(counted->nodes == walked.namespace_nodes);
+        }
+        return followed->live == walked.live &&
+               followed->namespace_nodes == walked.namespace_nodes;
+    };
+    const auto write = [&](const std::string& path, const Bytes& bytes) {
+        try {
+            fs.create_file(path, 0644, getuid(), getgid());
+        } catch (const FsError&) {
+        }
+        auto writer = fs.open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+    };
+    fs.mkdir(root, 0755, getuid(), getgid());
+    REQUIRE(agrees());
+    const auto small = pattern(extent + extent / 2, 3); // two extents, inline
+    const auto large = pattern(extent * 9 + 17, 5);    // ten, a spine
+    write(root + "/small.bin", small);
+    REQUIRE(agrees());
+    write(root + "/large.bin", large);
+    REQUIRE(fs.getattr(root + "/large.bin").extents.size() > 8);
+    REQUIRE(agrees());
+    // The same content at a second path: the same extents and the same spine.
+    write(root + "/large-copy.bin", large);
+    REQUIRE(agrees());
+    const auto large_id = file_media_id(fs.getattr(root + "/large.bin"));
+    REQUIRE(fs.find_media(large_id).has_value());
+    fs.unlink(root + "/large.bin");
+    REQUIRE(agrees());
+    // The content is still held at its other path.
+    const auto survivor = fs.find_media(large_id);
+    REQUIRE(survivor.has_value());
+    CHECK(survivor->first == root + "/large-copy.bin");
+    const auto still = fs.maintenance_objects_cached();
+    for (const auto& extent : fs.getattr(root + "/large-copy.bin").extents)
+        CHECK(std::binary_search(still->live.begin(), still->live.end(), extent.id));
+
+    for (int i = 0; i < 40; ++i)
+        fs.mkdir(root + "/d" + std::to_string(i), 0755, getuid(), getgid());
+    REQUIRE(agrees());
+    write(root + "/d7/inside.bin", pattern(extent * 9, 9));
+    const auto inside_id = file_media_id(fs.getattr(root + "/d7/inside.bin"));
+    REQUIRE(fs.find_media(inside_id).has_value());
+    fs.rename(root + "/d7", root + "/moved", false);
+    REQUIRE(agrees());
+    const auto moved = fs.find_media(inside_id);
+    REQUIRE(moved.has_value());
+    CHECK(moved->first == root + "/moved/inside.bin");
+    write(root + "/small.bin", pattern(extent * 10, 11)); // overwritten, now a spine
+    REQUIRE(agrees());
+    fs.chmod(root + "/large-copy.bin", 0600);
+    REQUIRE(agrees());
+    fs.unlink(root + "/large-copy.bin");
+    fs.unlink(root + "/moved/inside.bin");
+    fs.unlink(root + "/small.bin");
+    REQUIRE(agrees());
+    CHECK(!fs.find_media(large_id).has_value());
+    CHECK(!fs.find_media(inside_id).has_value());
+
+    // A mount over the same filesystem lists what the filesystem lists,
+    // whatever is changed outside it and mixed with its own operations: on a
+    // tree, by applying what differs between one head and the next.
+    auto fuse = config.fuse;
+    fuse.spool_path = config.state_path / ("fuse-" + root.substr(1));
+    fuse.operation_journal_path = *fuse.spool_path / "operations.log";
+    auto frontend = make_fuse_frontend(fs, service.resources().memory, fuse);
+    const auto names = [](const auto& listing) {
+        std::vector<std::string> out;
+        for (const auto& item : listing)
+            out.push_back(item.first);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    const auto mount_agrees = [&](const std::string& directory) {
+        return names(frontend->readdir(directory)) == names(fs.readdir(directory));
+    };
+    const auto outside = root + "/outside";
+    CHECK(mount_agrees(root)); // the first refresh walks
+    fs.mkdir(outside, 0755, getuid(), getgid());
+    fs.mkdir(outside + "/show", 0755, getuid(), getgid());
+    for (const char* name : {"/show/e1.bin", "/show/e2.bin", "/show.nfo"})
+        fs.create_file(outside + name, 0644, getuid(), getgid());
+    CHECK(mount_agrees(outside));
+    CHECK(mount_agrees(outside + "/show"));
+    frontend->mkdir(outside + "/own", 0755, getuid(), getgid());
+    REQUIRE(frontend->wait_for_idle(20s));
+    fs.rename(outside + "/show", outside + "/renamed", false);
+    CHECK(mount_agrees(outside));
+    CHECK(mount_agrees(outside + "/renamed"));
+    CHECK(frontend->getattr(outside + "/renamed/e2.bin").type == EntryType::file);
+    fs.chmod(outside + "/renamed/e1.bin", 0600);
+    CHECK((frontend->getattr(outside + "/renamed/e1.bin").mode & 0777U) == 0600U);
+    fs.unlink(outside + "/renamed/e1.bin");
+    fs.unlink(outside + "/renamed/e2.bin");
+    fs.rmdir(outside + "/renamed");
+    fs.rmdir(outside + "/own");
+    CHECK(mount_agrees(outside));
+    CHECK(mount_agrees(root));
+    CHECK(mount_agrees("/"));
+    frontend->stop();
+    };
+    {
+        Service service(config, cluster.keys(), test_durability_window);
+        service.start();
+        node_id = service.node().node_id();
+        REQUIRE(wait_metadata_writable(service));
+        REQUIRE(!service.metadata_manager().snapshot().namespace_root.has_value());
+        check(service, "/map", false);
+        service.stop();
+    }
+    (void)migrate_state(config, cluster.keys(), {node_id});
+    Service service(config, cluster.keys(), test_durability_window);
+    service.start();
+    REQUIRE(wait_metadata_writable(service));
+    REQUIRE(service.metadata_manager().snapshot().namespace_root.has_value());
+    check(service, "/tree", true);
+    service.stop();
+}
+
 // Namespace operations that arrive while a commit is in flight are committed
 // together by the next one, on a map-held and on a tree-held namespace. One
 // that cannot apply fails alone and leaves the rest of its commit intact.
