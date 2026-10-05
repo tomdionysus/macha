@@ -2,18 +2,19 @@
 
 *2026-10-05. Approved by the operator the same day ("implement the plan").*
 
-**Status, 2026-10-05: stage 1 largely built; 0.90.3 on both nodes, 0.90.4
-building.**
+**Status, 2026-10-05: stage 1 built bar the items listed; stage 2 begun.
+0.90.6 on both nodes, 0.90.7 building.**
 
 Measured on fi-1 (both nodes on the same build, the peer across the WAN):
 
-| | 0.89.1 | 0.90.3 |
+| | 0.89.1 | 0.90.3 and later |
 |---|---|---|
 | 12 deletes sent together | 39 to 45 s in all | |
 | 30 deletes sent together | | 0.22 s each, 0.3 s the slowest |
 | one commit | 2 to 3 s | about 100 ms (tree update 10 to 20 ms) |
 | unmatched list, 711 items | 1.9 to 5.6 s | 0.28 s |
 | one unmatched item | slow (not timed) | 14 to 25 ms |
+| mount's refresh after a commit | whole tree, 0.37 s | what changed |
 
 Built:
 
@@ -35,6 +36,14 @@ Built:
 - **The mount applies a commit's diff** and lists by key range (1.2, 1.3;
   0.90.4), and **the media-id index follows the diff** (1.5; 0.90.4).
 - A commit's debug line gives its time by stage (0.90.2).
+- **Stage 2, in part**: the maintenance inventory and the release horizon
+  follow the tree diff through a census the filesystem keeps (3.1; 0.90.5);
+  the availability roll-up is carried across a head change and a tree is
+  surveyed once (3.2 in part; 0.90.6, effective from 0.90.7 where a commit's
+  claims stop counting as a storage change); media information finds files
+  through the media index (3.6 in part; 0.90.6).
+- The management API logs why a write was refused or a request failed
+  (0.90.7), which covers the provider 503s that left no trace.
 
 How this differs from the design as written: the journal has not moved. With
 the commit made local, a caller outside FUSE is answered from a durable
@@ -56,9 +65,19 @@ Not built yet:
 - The non-namespace snapshot per commit (2.6, 2.7): measured at a few
   milliseconds on fi-1 with a 2.2 MB payload, so not pressing.
 - The scanner's `namespace_signature` still calls `converged()`.
-- Stage 2 (maintenance, availability and repair per commit) and the rest of
-  stage 3 (the catalogue's whole re-encode per write, match, artwork, the
-  hint store, provider locks).
+- The rest of stage 2: the availability survey and path table are still made
+  from the root after a roll-up (3.2); repair's pass restarts on a commit
+  (3.3); claim release scans every claim (3.4); tombstones mature one at a
+  time (3.5); the catalogue scan 10 s after any namespace commit (3.6). After
+  a commit on 0.90.5 the maintenance thread still ran for 20 to 30 s at about
+  20% of a core; what of that remains on 0.90.7 is to be measured.
+- The rest of stage 3: the catalogue's whole re-encode per write (4.1, 4.2),
+  match and artwork (4.4, 4.5), the hint store (4.9), provider locks (4.6),
+  per-request catalogue scans (4.10).
+- A testing gap found and closed for what is built: a new test cluster keeps
+  its namespace as a map, so service-level tests exercise the tree paths only
+  where they migrate first (`tests/test_namespace_migration.cpp`). New
+  tree-path work needs its test there.
 
 ## Why
 

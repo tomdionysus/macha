@@ -1,7 +1,7 @@
 # Active tasks
 
-Last updated: 2026-10-05, on `experiment/object-ledger-t5` (`45cba94`). Both
-nodes run 0.89.1.
+Last updated: 2026-10-05, on `experiment/object-ledger-t5`. Both nodes run
+0.90.6; see entry 1's plan for what each 0.90.x carries.
 
 This is the ordered list of open work. `COMPLETED.md` is the ledger of
 finished work; `BACKLOG.md` holds the older P-1 to P2 sections, written
@@ -21,7 +21,9 @@ against 0.89.1.
 fast and consistent locally on every path; the cluster converges behind.
 
 - **Plan**: [local-first filesystem](2026-10-05-local-first-filesystem-plan.md).
-  Proposed, awaiting the operator's go-ahead. Three stages: the local path
+  Approved and under way; its status block says what is built, measured and
+  left. The operator's standing instruction: commit and install each slice
+  as it passes. Three stages: the local path
   (journal, view, publisher, tree splice, commit off the network); per-commit
   background work from the tree diff; the catalogue and the management API.
 - **Evidence**: [the audit](2026-10-05-whole-library-work-audit.md).
@@ -77,13 +79,17 @@ Plan: [stage 0](2026-09-29-object-ledger-implementation-plan.md). Evidence:
 ## Cluster state (2026-10-05)
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.89.1** (tarball md5
-  `01ac8fd29ec28c4ec00b06e0a04d9316`), **cluster protocol 23**, installed
-  10:18Z (fi-1) and 10:20Z (gbni-1). es-1 is offline indefinitely.
+  (10.35.1.10) run **0.90.6** (tarball md5
+  `78b67b8fff830839f00cac7b8791f78f`), **cluster protocol 23**, installed
+  14:30Z (fi-1) and 14:31Z (gbni-1). es-1 is offline indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
-- Rollback material on each node: `/root/pre-0.89.1/` (0.89.0) and
-  `/root/pre-0.89.0/` (0.87.3, with roster and sequence counter).
+- Rollback material on each node: `/root/pre-<version>/` holds the binaries
+  and config in place before that version was installed (`pre-0.90.6` back
+  to `pre-0.89.0`, which also has the roster and sequence counter).
+- fi-1's `/root/macha/build-asan` and `build-coverage` were partly
+  overwritten with macOS objects by a mis-excluded sync on 2026-10-05; their
+  linked binaries are intact, the trees need a clean rebuild before reuse.
 - `garbage_grace_ms` is 30 days on both (the absence horizon).
 - gbni-1 keeps its heap-check drop-in (`/root/heap-check.conf.keep`).
 - Observation: `/etc/macha/state/observation/observations.jsonl` on both.
