@@ -428,6 +428,27 @@ class FileSystem final : public PublicationTarget {
         MACHA_GUARDED_BY(media_index_mutex_);
     // The tree the index was built from, when the namespace is a tree.
     std::optional<ObjectId> media_index_root_ MACHA_GUARDED_BY(media_index_mutex_);
+    // What the namespace refers to, one item per reference and in order, at
+    // the tree it was last counted at. Guarded by maintenance_build_mutex_.
+    struct NamespaceCensus {
+        std::optional<ObjectId> root;
+        // DATA extents the entries name; one that two files share is here twice.
+        std::vector<ObjectId> extents;
+        // The tree's own nodes: branches and leaves once, extent spine nodes
+        // once for each entry that holds them.
+        std::vector<ObjectId> nodes;
+        size_t entries{};
+        size_t extent_count{};
+    };
+    // Held across a census: a namespace walk the first time, the tree diff
+    // after.
+    IoMutex maintenance_build_mutex_;
+    NamespaceCensus maintenance_census_ MACHA_GUARDED_BY(maintenance_build_mutex_);
+    void census_walk(const MetadataSnapshot&, NamespaceCensus&);
+    // False when the census cannot be brought to `root` from where it stands.
+    bool census_follow(const ObjectId& root, NamespaceCensus&);
+    MaintenanceObjects maintenance_objects_from(const MetadataSnapshotView&,
+                                                const NamespaceCensus&);
     Mutex maintenance_index_mutex_;
     uint64_t maintenance_index_generation_ MACHA_GUARDED_BY(maintenance_index_mutex_){};
     std::shared_ptr<const MaintenanceObjects> maintenance_index_

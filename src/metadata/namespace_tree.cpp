@@ -1881,6 +1881,103 @@ NamespaceDifferences diff_namespace_trees(const ObjectId& before, const ObjectId
     return out;
 }
 
+namespace {
+// Records what would be written, and writes nothing.
+class AddressOnlyNodeStore final : public NamespaceNodeStore {
+  public:
+    ObjectId put(std::span<const uint8_t> node) override {
+        const auto id = object_id(node);
+        ids.push_back(id);
+        return id;
+    }
+    std::optional<Bytes> get(const ObjectId&) const override {
+        return {};
+    }
+    std::vector<ObjectId> ids;
+};
+} // namespace
+
+std::vector<ObjectId> namespace_entry_spine_nodes(const FsEntry& entry,
+                                                  const NamespaceTreeLimits& limits) {
+    if (entry.extents.size() <= limits.extent_inline_max)
+        return {};
+    AddressOnlyNodeStore addresses;
+    (void)build_extent_sequence(entry.extents, addresses, limits);
+    return std::move(addresses.ids);
+}
+
+void diff_namespace_tree_nodes(const ObjectId& before, const ObjectId& after,
+                               const NamespaceNodeStore& store, std::vector<ObjectId>& added,
+                               std::vector<ObjectId>& removed) {
+    if (before == after)
+        return;
+    // Both trees, walked together. A subtree both stand at is passed over
+    // unread. A branch or leaf holds its keys, so the same node cannot stand
+    // at two places: one opened on one side only is in that tree only, once
+    // those opened on both sides are set aside.
+    struct Side {
+        std::vector<SpineItem> pending;
+        std::vector<ObjectId> opened;
+    };
+    const auto begin = [&](const ObjectId& root) {
+        Side side;
+        side.pending.push_back({Child{{}, root, 0}, read_spine_node(root, store).level, false});
+        return side;
+    };
+    const auto open = [&](Side& side) {
+        const auto item = std::move(side.pending.back());
+        side.pending.pop_back();
+        side.opened.push_back(item.child.id);
+        if (item.level == 0)
+            return;
+        auto node = read_spine_node(item.child.id, store);
+        if (node.level != item.level)
+            throw DecodeError("namespace tree node at an unexpected level");
+        for (auto child = node.children.rbegin(); child != node.children.rend(); ++child)
+            side.pending.push_back(
+                {std::move(*child), static_cast<uint8_t>(item.level - 1), false});
+    };
+    Side old_side = begin(before);
+    Side new_side = begin(after);
+    while (!old_side.pending.empty() || !new_side.pending.empty()) {
+        if (old_side.pending.empty()) {
+            open(new_side);
+            continue;
+        }
+        if (new_side.pending.empty()) {
+            open(old_side);
+            continue;
+        }
+        const auto& a = old_side.pending.back();
+        const auto& b = new_side.pending.back();
+        if (a.level == b.level && a.child.id == b.child.id) {
+            old_side.pending.pop_back();
+            new_side.pending.pop_back();
+        } else if (a.level > b.level) {
+            open(old_side);
+        } else if (b.level > a.level) {
+            open(new_side);
+        } else if (a.level > 0) {
+            open(old_side);
+            open(new_side);
+        } else if (a.child.first_key <= b.child.first_key) {
+            // Two different leaves: the one that starts first is passed.
+            open(old_side);
+        } else {
+            open(new_side);
+        }
+    }
+    for (auto* side : {&old_side, &new_side}) {
+        std::sort(side->opened.begin(), side->opened.end());
+        side->opened.erase(std::unique(side->opened.begin(), side->opened.end()),
+                           side->opened.end());
+    }
+    std::set_difference(new_side.opened.begin(), new_side.opened.end(), old_side.opened.begin(),
+                        old_side.opened.end(), std::back_inserter(added));
+    std::set_difference(old_side.opened.begin(), old_side.opened.end(), new_side.opened.begin(),
+                        new_side.opened.end(), std::back_inserter(removed));
+}
+
 NamespaceTreeMerge merge_tree_backed_heads(const MetadataSnapshot& left,
                                            const MetadataSnapshot& right,
                                            const Hash256& left_head, const Hash256& right_head,
