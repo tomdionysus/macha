@@ -18,6 +18,10 @@ catalogue root's dot in the new snapshot forms SM17 (tree) and SM18 (map);
 DLT10 carries them and an append's dot in a delta. A conflict record notes
 which alternative is in place.
 
+**Wire.** The cluster protocol version is 23: a 0.89 node and an older one
+refuse each other at the handshake, so a node being upgraded stands alone
+until its peers are upgraded too, and then they merge.
+
 **On disk.** `<state_path>/metadata/set-aside.meta` records when a head was
 set aside. `checkpoint-proof.meta` is no longer read or written.
 

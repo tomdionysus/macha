@@ -1015,9 +1015,9 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                 Lock lock(unacceptable_head_mutex_);
                 unacceptable_head_retry_at_.erase(hash);
             }
-            // This certificate may expose a second head whose common ancestry crosses
-            // a compacted boundary; revisit it so the rootless healer fetches the
-            // missing proof records now.
+            // This certificate may expose a second head whose history this
+            // node lacks; revisit it so the rootless healer fetches the
+            // missing records now.
             for (const auto& owner : history_sources) {
                 if (owner.id != node_.node_id())
                     (void)import_history_from_peer(owner, hash, frame_type);
