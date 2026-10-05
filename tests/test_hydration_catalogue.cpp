@@ -4006,6 +4006,53 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
     }
 }
 
+// A catalogue write encodes only the shards it touches, and the catalogue it
+// leaves is the one a reader loading the root from scratch finds: every item
+// in its own shard, none left behind in a shard it moved out of or was
+// removed from.
+MACHA_TEST("hydration_catalogue", test_a_catalogue_write_touches_its_own_shards_and_leaves_a_whole_catalogue) {
+    CatalogueNode node("catalogue-shards");
+    auto& catalogue = node.catalogue();
+    const auto item_of = [](int n, const std::string& title) {
+        CatalogueItem item;
+        item.id = "movie:shard:" + std::to_string(n);
+        item.kind = CatalogueKind::movie;
+        item.title = title;
+        return item;
+    };
+    const auto agrees = [&] {
+        CatalogueManager from_root(node.node(), node.node().local_state(),
+                                   node.node().metadata_server(), node.store(),
+                                   node.metadata(), node.node().ledger());
+        from_root.repair_once();
+        const auto loaded = from_root.snapshot();
+        const auto held = catalogue.snapshot();
+        CHECK(loaded.items == held.items);
+        CHECK(loaded.media_profiles == held.media_profiles);
+        CHECK(loaded.media_indexes == held.media_indexes);
+        return loaded.items == held.items;
+    };
+
+    std::vector<CatalogueItem> many;
+    for (int i = 0; i < 300; ++i)
+        many.push_back(item_of(i, "Title " + std::to_string(i)));
+    (void)catalogue.upsert_many(many);
+    REQUIRE(agrees());
+    for (const int n : {3, 77, 150, 299})
+        (void)catalogue.upsert(item_of(n, "Retitled " + std::to_string(n)));
+    REQUIRE(agrees());
+    for (const int n : {5, 77, 201})
+        CHECK(catalogue.erase("movie:shard:" + std::to_string(n)));
+    REQUIRE(agrees());
+    (void)catalogue.upsert(item_of(1000, "Added"));
+    const std::string index = R"({"status":"ok","schema_version":1,"streams":[]})";
+    catalogue.put_media_index("macha:" + std::string(64, 'd'), Bytes(index.begin(), index.end()));
+    REQUIRE(agrees());
+    CHECK(catalogue.snapshot().items.size() == 300 - 3 + 1);
+    CHECK(!catalogue.get("movie:shard:77").has_value());
+    CHECK(catalogue.get("movie:shard:150")->title == "Retitled 150");
+}
+
 MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_artwork) {
     // CatalogueApi over one node's catalogue: item edits keep files unless
     // named and validate parents; search filters before its limit; effective
