@@ -2,21 +2,39 @@
 
 *2026-10-05. Approved by the operator the same day ("implement the plan").*
 
-**Status, 2026-10-05: stage 1 partly built, as 0.90.0.**
+**Status, 2026-10-05: stage 1 largely built; 0.90.3 on both nodes, 0.90.4
+building.**
+
+Measured on fi-1 (both nodes on the same build, the peer across the WAN):
+
+| | 0.89.1 | 0.90.3 |
+|---|---|---|
+| 12 deletes sent together | 39 to 45 s in all | |
+| 30 deletes sent together | | 0.22 s each, 0.3 s the slowest |
+| one commit | 2 to 3 s | about 100 ms (tree update 10 to 20 ms) |
+| unmatched list, 711 items | 1.9 to 5.6 s | 0.28 s |
+| one unmatched item | slow (not timed) | 14 to 25 ms |
 
 Built:
 
-- The commit is local (design 3). A mutation asks no peer; a replicator
-  delivers claims and the head to every node present afterwards. This is
-  finding 2.1, and it gives every caller the contract's "acknowledge" and
-  "read" on its own: a commit is durable here when it returns and this
-  node's view (`MetadataView::local()`) shows it at once.
-- Lookups read the tree (1.1, 1.6): no whole-namespace index; stat-only
-  scans that seek and stop early.
-- The tree update splices (2.4, 2.5) and the tree diff reads only what
-  differs (the primitive stage 2 builds on).
-- The management API's global write lock is gone (2.2).
-- The working set's erasure lookups are a set (2.9, in part).
+- **The commit is local** (design 3; 0.90.0, 0.90.2, 0.90.3). A mutation asks
+  no peer: it reads this node's own head, claims on this node, writes its
+  tree nodes and catalogue shards here, stores and accepts here. A replicator
+  delivers the claims, the control objects and the head to every node
+  present afterwards. This is finding 2.1, and it gives every caller the
+  contract's "acknowledge" and "read": a commit is durable here when it
+  returns and this node's view (`MetadataView::local()`) shows it at once.
+- **Lookups read the tree** (1.1, 1.6; 0.90.0): no whole-namespace index;
+  stat-only scans that seek and stop early.
+- **The tree update splices** (2.4, 2.5; 0.90.0) and **the tree diff reads
+  only what differs**.
+- **The management API's global write lock is gone** (2.2; 0.90.0).
+- **The catalogue write is local** (4.3 in part; 0.90.3), and a conflict
+  decided for the root in place is removed (0.90.1: a defect of 0.89.0 that
+  had both nodes re-merging three catalogues every few seconds).
+- **The mount applies a commit's diff** and lists by key range (1.2, 1.3;
+  0.90.4), and **the media-id index follows the diff** (1.5; 0.90.4).
+- A commit's debug line gives its time by stage (0.90.2).
 
 How this differs from the design as written: the journal has not moved. With
 the commit made local, a caller outside FUSE is answered from a durable
@@ -26,28 +44,21 @@ front of that, for batching. What the journal would still add for other
 callers is one fsync shared across more operations; it is not needed for the
 contract.
 
-Not built yet, in the order intended:
+Not built yet:
 
-- FUSE's view (1.2, 1.3, 1.4): it still re-walks the tree after each commit
-  and scans its whole path map for a listing. The diff is ready; applying it
-  needs care where an operation is skipped or dropped after recovery, since
-  the walk is what reconciles those today.
 - Read-your-writes between FUSE and other callers: an operation FUSE has
   journalled and not yet published is not visible through the API until its
   commit lands (now a local commit, so soon).
 - Ingest and data publications still commit one operation at a time (2.3);
   each commit is now local.
-- The per-commit handling of the non-namespace snapshot (2.6, 2.7) and the
-  journal's fsyncs under the FUSE lock (2.8).
-- Request paths that still call `converged()`: `find_media`, the scanner's
-  `namespace_signature`.
-- Stages 2 and 3.
-
-Evidence: [the audit](2026-10-05-whole-library-work-audit.md) (finding numbers
-below refer to it). Builds on
-[absent-node tolerance](2026-10-05-absent-node-tolerance-design.md), which
-settled what the cluster does when a node is away; this settles what one node
-does on its own.
+- The mount's inode reclaim still scans the path map (1.4), and its journal
+  fsyncs under its global lock (2.8).
+- The non-namespace snapshot per commit (2.6, 2.7): measured at a few
+  milliseconds on fi-1 with a 2.2 MB payload, so not pressing.
+- The scanner's `namespace_signature` still calls `converged()`.
+- Stage 2 (maintenance, availability and repair per commit) and the rest of
+  stage 3 (the catalogue's whole re-encode per write, match, artwork, the
+  hint store, provider locks).
 
 ## Why
 
