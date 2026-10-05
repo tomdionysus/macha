@@ -24,8 +24,11 @@ using CatalogueRetentionSource = std::function<CatalogueRetentionObjects(const O
 
 // The release horizon at `head`, reading tree nodes from `nodes`; incomplete
 // when a catalogue root or tree node cannot be read.
+// `counted`: what the namespace at this head refers to, when it has been
+// counted already; without it the namespace is walked.
 ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNodeStore& nodes,
-                           const CatalogueRetentionSource& catalogue);
+                           const CatalogueRetentionSource& catalogue,
+                           const NamespaceReferences* counted = nullptr);
 
 class NodeHorizonBuilder final : public HorizonBuilder {
   public:

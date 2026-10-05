@@ -35,6 +35,13 @@ class FsError : public std::runtime_error {
 class FileSystem;
 class PlaybackTracker;
 
+// What a tree-backed namespace refers to: the DATA extents its entries name
+// and the tree's own nodes, each sorted and distinct.
+struct NamespaceReferences {
+    std::vector<ObjectId> extents;
+    std::vector<ObjectId> nodes;
+};
+
 struct MaintenanceObjects {
     // Sorted, unique vectors: far smaller than a tree node per extent at
     // millions of objects.
@@ -539,7 +546,11 @@ class FileSystem final : public PublicationTarget {
     std::optional<Hash256> available_namespace_signature(
         uint64_t* metadata_generation = nullptr) const;
     std::shared_ptr<const MaintenanceObjects> maintenance_objects_cached();
+    // The same, from a walk of the whole namespace.
     MaintenanceObjects maintenance_objects();
+    // What the namespace of `snapshot` refers to, from the census brought to
+    // its tree. None for a namespace that is not a tree.
+    std::optional<NamespaceReferences> namespace_references(const MetadataSnapshot& snapshot);
     DistributedStore& store() {
         return s_;
     }
