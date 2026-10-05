@@ -2681,13 +2681,16 @@ void CatalogueScanner::configure_providers() {
         return out;
     };
     providers_ = build(*provider_http_);
-    Lock editor(editor_mutex_);
-    editor_providers_ = build(*http_);
+    for (auto& seat : editor_seats_) {
+        Lock editor(seat.mutex);
+        seat.providers = build(*http_);
+    }
 }
 
-MetadataProvider* CatalogueScanner::editor_metadata(std::string_view scan_provider,
-                                                    std::string_view metadata_provider) {
-    for (const auto& provider : editor_providers_)
+MetadataProvider* CatalogueScanner::editor_metadata(
+    const std::vector<std::unique_ptr<CatalogueScanProvider>>& providers,
+    std::string_view scan_provider, std::string_view metadata_provider) {
+    for (const auto& provider : providers)
         if (provider->name() == scan_provider) return provider->metadata(metadata_provider);
     return nullptr;
 }
@@ -3033,8 +3036,9 @@ std::vector<ProviderSearchResult> CatalogueScanner::search_providers(
     const auto kind = source->probe_kind;
     std::vector<ProviderSearchResult> results;
     {
-        Lock editor(editor_mutex_);
-        auto* metadata = editor_metadata(scan_provider, metadata_provider);
+        auto& seat = editor_seat();
+        Lock editor(seat.mutex);
+        auto* metadata = editor_metadata(seat.providers, scan_provider, metadata_provider);
         if (!metadata || !metadata->supports(kind))
             throw ProviderRequestError(400, "provider_not_configured",
                                        std::string(metadata_provider) + " is not configured for " +
@@ -3097,8 +3101,9 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
     }
     std::optional<ProviderMatch> match;
     {
-        Lock editor(editor_mutex_);
-        auto* metadata = editor_metadata(scan_provider, parsed->provider);
+        auto& seat = editor_seat();
+        Lock editor(seat.mutex);
+        auto* metadata = editor_metadata(seat.providers, scan_provider, parsed->provider);
         if (!metadata || !metadata->supports(probe.kind))
             throw ProviderRequestError(400, "provider_not_configured",
                                        parsed->provider + " is not configured for " +
@@ -3186,8 +3191,9 @@ std::vector<ArtworkOption> CatalogueScanner::artwork_options(std::string_view re
         throw ProviderRequestError(400, "bad_role", "role must be " + allowed + " for this reference");
     }
     const auto scan_provider = scan_provider_for(*parsed);
-    Lock editor(editor_mutex_);
-    auto* metadata = editor_metadata(scan_provider, parsed->provider);
+    auto& seat = editor_seat();
+    Lock editor(seat.mutex);
+    auto* metadata = editor_metadata(seat.providers, scan_provider, parsed->provider);
     if (!metadata)
         throw ProviderRequestError(400, "provider_not_configured",
                                    parsed->provider + " is not configured for " +
@@ -3207,8 +3213,9 @@ std::vector<ProviderReleaseTrack> CatalogueScanner::release_tracks(std::string_v
         parse_provider_ref(std::string(provider) + ":release:" + std::string(release_id));
     if (!parsed) throw ProviderRequestError(400, "bad_ref", "the release id must be an MBID");
     const auto scan_provider = scan_provider_for(*parsed);
-    Lock editor(editor_mutex_);
-    auto* metadata = editor_metadata(scan_provider, parsed->provider);
+    auto& seat = editor_seat();
+    Lock editor(seat.mutex);
+    auto* metadata = editor_metadata(seat.providers, scan_provider, parsed->provider);
     if (!metadata || !metadata->supports(MediaProbeKind::track))
         throw ProviderRequestError(400, "provider_not_configured",
                                    parsed->provider + " is not configured for " +
