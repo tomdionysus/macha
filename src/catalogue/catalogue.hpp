@@ -80,6 +80,15 @@ struct CatalogueSnapshot {
     std::map<std::string, ObjectId, std::less<>> media_indexes;
 };
 
+// What requests look up in a catalogue by something other than an item's id,
+// built once for a snapshot.
+struct CatalogueIndexes {
+    // Each artwork object's media type.
+    std::map<ObjectId, std::string> artwork_types;
+    // The items bound to each media id.
+    std::map<std::string, std::vector<std::string>, std::less<>> media_bindings;
+};
+
 bool valid_catalogue_media_profile(std::string_view media_id,
                                    const CatalogueSnapshot::MediaProfile&);
 
@@ -179,6 +188,9 @@ class CatalogueManager {
     // commits and DATA/CONTROL store writes.
     mutable IoMutex mutation_mutex_;
     std::shared_ptr<const CatalogueSnapshot> cached_ MACHA_GUARDED_BY(mutex_);
+    // The indexes of the snapshot they were built from.
+    std::shared_ptr<const CatalogueSnapshot> indexed_ MACHA_GUARDED_BY(mutex_);
+    std::shared_ptr<const CatalogueIndexes> indexes_ MACHA_GUARDED_BY(mutex_);
     std::optional<ObjectId> cached_root_ MACHA_GUARDED_BY(mutex_);
     uint64_t cached_metadata_generation_ MACHA_GUARDED_BY(mutex_){};
     Clock::time_point cache_until_ MACHA_GUARDED_BY(mutex_){};
@@ -237,6 +249,9 @@ class CatalogueManager {
     bool refresh_needed() const;
     CatalogueStatus status() const;
     CatalogueSnapshot snapshot();
+    // The current snapshot's indexes; built on the first call after the
+    // catalogue changes.
+    std::shared_ptr<const CatalogueIndexes> indexes();
     std::shared_ptr<const CatalogueSnapshot> snapshot_view();
     // Warm, waits on nothing (cached snapshot); cold, loads from metadata and
     // the control store, which the wait guard refuses to control work.
