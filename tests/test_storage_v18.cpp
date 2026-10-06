@@ -784,7 +784,17 @@ MACHA_TEST("storage_v18", test_a_full_preferred_node_spills_data_but_not_control
     CHECK(!small.node().local_store().has(*metadata.catalogue_root));
     CHECK(!large.node().local_store().has(*metadata.catalogue_root));
 
-    REQUIRE(small.catalogue().get(item.id).has_value());
+    // The reader's view is its own head: maintenance's merge (no maintenance
+    // runs in this fixture) brings the writer's commit into it.
+    REQUIRE(wait_until([&] {
+        try {
+            small.metadata().repair_once();
+            small.catalogue().follow_head();
+            return small.catalogue().get(item.id).has_value();
+        } catch (...) {
+            return false;
+        }
+    }, 10s));
     auto fetched = small.catalogue().artwork(art.id);
     REQUIRE(fetched.has_value());
     CHECK(fetched->bytes == art_bytes);
@@ -1215,6 +1225,16 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
     // replicator claims).
     b.catalogue().repair_once();
     REQUIRE(a.node().control_store().get(root).has_value());
+    // And a's head carries the commit once maintenance's merge has run (no
+    // maintenance runs in this fixture).
+    REQUIRE(wait_until([&] {
+        try {
+            a.metadata().repair_once();
+            return a.metadata().local().snapshot->catalogue_root == root;
+        } catch (...) {
+            return false;
+        }
+    }, 10s));
     auto referenced = a.node().control_store().list();
     REQUIRE(referenced.size() >= 2);
     REQUIRE(std::find(referenced.begin(), referenced.end(), root) != referenced.end());
