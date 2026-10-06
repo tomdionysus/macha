@@ -3,7 +3,7 @@
 Status: agreed design, 2026-10-06. Not started. Supersedes
 `archive/2026-09-17-catalogue-shard-demand-load-plan.md`, whose stages are
 folded in below or dropped. The P0 stopgap (a `cache()` that refuses an
-older generation) shipped in 0.90.26; stage 3 replaces it.
+older generation) shipped in 0.90.26; stage 1 replaces it.
 
 ## The rule
 
@@ -53,7 +53,7 @@ media-binding indexes `indexes()` builds today; the list and search indexes
 of section 6) are per shard and merged, so a one-shard change updates one
 shard's entries.
 
-Residency is measured first (stage 1) and reported in catalogue status. If
+Residency is measured (stage 3) and reported in catalogue status. If
 the number says a library cannot keep its shards resident, the answer is a
 prefetch-on-install policy on the `RetainedMemoryLedger`, never a fetch on
 read. Not planned until the number says so.
@@ -115,7 +115,7 @@ then walks one ordered index instead of sorting a copy of every match.
 `clear_metadata_with_media`'s fixed-point descendant scan uses the same
 parent index.
 
-Only if stage 1's number says the derived index is too large to keep
+Only if stage 3's number says the derived index is too large to keep
 resident does it become stored objects, declared through
 `retention_objects` and `maintenance_objects`.
 
@@ -156,7 +156,7 @@ inventory's flat `outside_namespace` list that repair covers separately and
 `known_present` does not trust. Lost artwork is found only by a full walk.
 The analogue of tree holdings is holdings per shard: a shard's DATA objects,
 held and where, rolled up like a tree node's. Last, because it is new
-mechanism rather than consolidation, and it needs stage 1's residency and
+mechanism rather than consolidation, and it needs stage 3's residency and
 section 7's per-family shards.
 
 ## What gets deleted
@@ -195,8 +195,8 @@ section 7's per-family shards.
   `catalogue_root` from the head. `MetadataManager::local()` keeps the
   decoded head and re-reads only on a `heads_revision` change, so the
   decode is paid once by whoever needs the head after a commit. Measure
-  that decode on a FUSE-heavy head on gbni-1 (stage 1); if it is not
-  small, the root must be readable without a full decode.
+  that decode as part of stage 1; if it is not small, the root must be
+  readable without a full decode.
 - **Install on a root change:** proportional to changed shards, one for a
   typical edit, against all 64 today.
 - **Mutation:** copies one shard, against the whole snapshot today.
@@ -222,20 +222,24 @@ section 7's per-family shards.
 
 ## Order of work
 
-Each stage ships on its own and leaves the suite green; no stage waits on
-a later one.
+Correctness first, then cost. Each stage ships on its own and leaves the
+suite green; no stage waits on a later one.
 
-1. **Measure.** `catalogue_resident_bytes` in status, modelled on
-   `snapshot_resident_bytes`; the `local()` decode cost on gbni-1; the
-   current `load_root` time there. Numbers before shapes.
-2. **The view and `shard_changes`.** Resident per-shard `CatalogueView`;
-   `retention_objects` rewritten over `shard_changes`; `load_root` becomes
-   the first install. Behaviour unchanged; the deep copies go.
-3. **`install` and the worker.** One install point driven by head changes;
-   the polling paths, the TTL and the 0.90.26 guard deleted; the burst test
-   rewritten; the install primitive tests added.
-4. **Maintenance reduced** to wake and converge; `maintenance_repair()`
+1. **`install` and the worker**, on whole snapshots. One install point
+   driven by head changes; the polling paths, the TTL and the 0.90.26
+   guard deleted; the burst test rewritten to count installs per root; the
+   install primitive tests added. Fixes the open P0. The per-head-change
+   check reads `catalogue_root` from the head `local()` already holds
+   decoded (the non-namespace snapshot, a few milliseconds per commit,
+   ACTIVE section 4); confirmed in code as part of this stage.
+2. **Maintenance reduced** to wake and converge; `maintenance_repair()`
    removed; `catalogue_complete` as a fact.
+3. **Measure.** `catalogue_resident_bytes` in status, modelled on
+   `snapshot_resident_bytes`; install time on gbni-1, against the single
+   install point.
+4. **The view and `shard_changes`.** Resident per-shard `CatalogueView`
+   behind the install point; `retention_objects` rewritten over
+   `shard_changes`. The deep copies go.
 5. **Mutations over the view**: copy touched shards, install the successor
    directly, retry once on a moved root.
 6. **The conflict merge per shard.**
@@ -245,8 +249,7 @@ a later one.
    change, but the rolling-restart window is theirs to know.
 9. **Batched profile publication.**
 10. **Holdings for catalogue DATA**, with its own design note first.
-11. **Measure again** (stage 1's three numbers) and record both in
-    COMPLETED.
+11. **Measure again** (stage 3's numbers) and record both in COMPLETED.
 
-Stages 2 to 5 are the materialised view proper, about a day. Stages 6 to 9
-are each small once the view exists.
+Stages 1, 2, 4 and 5 are the materialised view proper, about a day.
+Stages 6 to 9 are each small once the view exists.
