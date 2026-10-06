@@ -201,6 +201,7 @@ class CatalogueManager {
     // The generation of the head the view was installed from.
     uint64_t cached_metadata_generation_ MACHA_GUARDED_BY(mutex_){};
     uint64_t installs_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t loads_ MACHA_GUARDED_BY(mutex_){};
     uint64_t last_sync_unix_ms_ MACHA_GUARDED_BY(mutex_){};
     // A successor catalogue's CONTROL objects are staged before metadata
     // references them, so an unreferenced object is reclaimable only once a
@@ -241,8 +242,12 @@ class CatalogueManager {
     // head. Reads the head itself, so a later install never sees an older
     // one. `known` is that catalogue when the caller already holds it (a
     // commit), used if `known_root` is still the head's root.
-    void install_head(const CatalogueSnapshot* known = nullptr,
+    void install_head(std::shared_ptr<const CatalogueSnapshot> known = {},
                       const std::optional<ObjectId>& known_root = {});
+    // A commit in flight: any install that finds its root at the head uses
+    // it rather than decoding what was just encoded.
+    std::shared_ptr<const CatalogueSnapshot> staged_ MACHA_GUARDED_BY(mutex_);
+    std::optional<ObjectId> staged_root_ MACHA_GUARDED_BY(mutex_);
     std::shared_ptr<const CatalogueSnapshot> current_snapshot();
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
                 const std::set<ObjectId>& old_artwork,
@@ -269,6 +274,9 @@ class CatalogueManager {
     // Views installed since start: one per root change, never one for an
     // unchanged root.
     uint64_t installs() const;
+    // Of those, the ones read and decoded from the control store rather than
+    // taken from the commit that wrote them.
+    uint64_t loads() const;
     CatalogueStatus status() const;
     CatalogueSnapshot snapshot();
     // The current snapshot's indexes; built on the first call after the
@@ -330,12 +338,12 @@ class CatalogueManager {
                            const std::set<std::string>& vanished_media = {});
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     // The maintenance inventory's catalogue half, called in order (spec A4):
-    // the head (may read the committed record when behind); the repair (may
-    // commit a root reconciliation; false on failure); the read, which only
-    // fetches missing catalogue objects into the control store.
+    // the head (may read the committed record when behind), then the read of
+    // the installed view against it, which only fetches missing catalogue
+    // objects into the control store. Complete when the installed root is
+    // the head's.
     CatalogueMaintenanceHead maintenance_head();
-    bool maintenance_repair();
-    CatalogueMaintenance maintenance_objects(const CatalogueMaintenanceHead&, bool repaired);
+    CatalogueMaintenance maintenance_objects(const CatalogueMaintenanceHead&);
     CatalogueRetentionObjects retention_objects(const std::optional<ObjectId>& old_root,
                                                  const std::optional<ObjectId>& new_root);
     // Given `sightings`, an object goes only once this node has seen it

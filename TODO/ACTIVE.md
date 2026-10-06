@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.29.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.30.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -24,10 +24,9 @@ of the burst test below, the polling refresh and its TTL, the second
 repair per pass (section 6's question, answered), and every whole-snapshot
 copy. Eleven stages, each shipping alone: correctness first (the install
 point), then measurement, then cost. Stage 1 (one install point, the
-installer) is 0.90.27. Next: stage 2, maintenance reduced. Also for stage 2:
-each local commit is decoded in full once more by the installer (82 to
-98 ms on gbni-1), which sees the head change before the committing thread
-installs what it wrote; the commit's snapshot should be the one installed.
+installer) is 0.90.27; stage 2 (maintenance reduced, no second decode of
+a commit) is 0.90.30, after the convergence fix (0.90.29). Next: stage 3,
+measure.
 
 ## 1. Failing tests and defects
 
@@ -150,7 +149,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.29**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.30**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -160,7 +159,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.29` back to
+  in place before that version was installed (`pre-0.90.30` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild

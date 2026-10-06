@@ -1,5 +1,23 @@
 # Current release
 
+## 0.90.30: the maintenance inventory reads the installed catalogue
+
+No API, wire, protocol or on-disk changes.
+
+**One catalogue repair per pass, not two.** Building the maintenance
+inventory ran the catalogue's repair a second time each pass (a conflict
+reconciliation that could commit, an install and a convergence). The
+inventory now reads the installed catalogue against the head, and its
+catalogue half is complete exactly when the installed root is the head's
+root, not when a repair happened to succeed. Destructive GC is fenced on
+that fact as before.
+
+**A commit's own catalogue is not decoded again.** The installer sees a
+commit's head change before the committing thread installs what it wrote,
+and decoded the whole catalogue from the control store each time (82 to
+98 ms per commit on gbni-1). A commit now stages its catalogue first; an
+install that finds that root at the head takes it.
+
 ## 0.90.29: catalogue convergence sends only what a node lacks
 
 No API, wire, protocol or on-disk changes.

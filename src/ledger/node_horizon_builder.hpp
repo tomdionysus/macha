@@ -36,8 +36,7 @@ class NodeHorizonBuilder final : public HorizonBuilder {
 
     std::shared_ptr<const MaintenanceObjects> namespace_objects() override;
     std::shared_ptr<const InventoryHorizon> inventory(const MaintenanceObjects&,
-                                                      const CatalogueMaintenanceHead& head,
-                                                      bool repaired) override;
+                                                      const CatalogueMaintenanceHead& head) override;
     ReleaseBuild release(const MetadataSnapshotView& head) override;
 
   private:

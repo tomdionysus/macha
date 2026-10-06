@@ -31,13 +31,12 @@ class HorizonBuilder {
     virtual std::shared_ptr<const MaintenanceObjects> namespace_objects() = 0;
 
     // The inventory at that generation: the namespace's objects and tree
-    // nodes and the catalogue's, read against `head` (captured before the catalogue's
-    // repair ran) and whether that repair succeeded. Fetches missing
-    // catalogue objects into the control store; repairs and commits nothing
-    // (spec A4).
+    // nodes and the catalogue's installed view, read against `head`.
+    // Fetches missing catalogue objects into the control store; repairs and
+    // commits nothing (spec A4).
     static constexpr Waits inventory_waits = namespace_objects_waits;
     virtual std::shared_ptr<const InventoryHorizon>
-    inventory(const MaintenanceObjects&, const CatalogueMaintenanceHead& head, bool repaired) = 0;
+    inventory(const MaintenanceObjects&, const CatalogueMaintenanceHead& head) = 0;
 
     // The release horizon at a head: its files' extents, the conflict roots,
     // every catalogue root's retained objects and the namespace tree's own

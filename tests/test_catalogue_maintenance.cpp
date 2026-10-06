@@ -51,8 +51,13 @@ struct FakeMetadataView final : MetadataView {
         MetadataDelta delta;
         change(*next, delta);
         view = MetadataSnapshotView{view->generation + 1, 0, Hash256{}, std::move(next)};
+        if (after_commit)
+            after_commit();
         return {};
     }
+    // Runs once the head has moved, before the committer returns: where the
+    // installer sees a head change.
+    std::function<void()> after_commit;
     // The head moves on with nothing changed.
     void advance() {
         view = MetadataSnapshotView{view->generation + 1, 0, Hash256{}, view->snapshot};
@@ -94,19 +99,26 @@ struct Node {
     }
 };
 
-MACHA_TEST("catalogue_maintenance", test_a_repair_that_cannot_read_metadata_reports_failure) {
+MACHA_TEST("catalogue_maintenance", test_without_metadata_nothing_installs_and_the_read_is_incomplete) {
     Node fixture;
     FakeMetadataView metadata;
     CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
-    CHECK(!catalogue.maintenance_repair());
+    bool failed = false;
+    try {
+        catalogue.follow_head();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    CHECK(failed);
+    CHECK(catalogue.installs() == 0);
     // The head taken against no metadata is not current.
     const auto head = catalogue.maintenance_head();
     CHECK(!head.current);
     CHECK(!head.root.has_value());
-    CHECK(!catalogue.maintenance_objects(head, false).complete);
+    CHECK(!catalogue.maintenance_objects(head).complete);
 }
 
-MACHA_TEST("catalogue_maintenance", test_the_read_is_complete_only_when_the_repair_succeeded) {
+MACHA_TEST("catalogue_maintenance", test_the_read_is_complete_only_when_the_view_is_at_the_head) {
     Node fixture;
     FakeMetadataView metadata;
     // An empty catalogue at the newest generation this node knows of:
@@ -117,13 +129,18 @@ MACHA_TEST("catalogue_maintenance", test_the_read_is_complete_only_when_the_repa
     CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
     const auto head = catalogue.maintenance_head();
     CHECK(head.current);
-    CHECK(catalogue.maintenance_repair());
-    CHECK(catalogue.maintenance_objects(head, true).complete);
-    CHECK(!catalogue.maintenance_objects(head, false).complete);
-    // A head that is not current never reads complete, repaired or not.
+    // Nothing installed yet.
+    CHECK(!catalogue.maintenance_objects(head).complete);
+    catalogue.follow_head();
+    CHECK(catalogue.maintenance_objects(head).complete);
+    // A head that is not current never reads complete.
     auto stale = head;
     stale.current = false;
-    CHECK(!catalogue.maintenance_objects(stale, true).complete);
+    CHECK(!catalogue.maintenance_objects(stale).complete);
+    // Nor does a head whose root the view has not installed.
+    auto moved = head;
+    moved.root = object_id(test_support::pattern(64, 9));
+    CHECK(!catalogue.maintenance_objects(moved).complete);
 }
 
 MACHA_TEST("catalogue_maintenance", test_a_head_behind_the_known_generation_reads_the_record_first) {
@@ -234,6 +251,27 @@ MACHA_TEST("catalogue_maintenance", test_a_root_that_cannot_be_read_keeps_the_vi
     CHECK(catalogue.status().root == held_root);
     CHECK(catalogue.status().error_code == "unavailable");
     REQUIRE(catalogue.get("movie:one").has_value());
+}
+
+MACHA_TEST("catalogue_maintenance", test_an_install_racing_a_commit_takes_what_it_wrote) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    catalogue.follow_head();
+    const auto loads = catalogue.loads();
+    // The installer runs between the head moving and the commit installing.
+    metadata.after_commit = [&] { catalogue.follow_head(); };
+    for (int i = 0; i < 3; ++i)
+        (void)catalogue.upsert(movie("movie:" + std::to_string(i), "Title"));
+    CHECK(catalogue.loads() == loads);
+    CHECK(catalogue.get("movie:2").has_value());
+    // A root nobody staged is read from the control store.
+    metadata.after_commit = {};
+    CatalogueManager other(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    other.follow_head();
+    CHECK(other.loads() == 1);
+    CHECK(other.get("movie:2").has_value());
 }
 
 } // namespace

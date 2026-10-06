@@ -235,8 +235,11 @@ suite green; no stage waits on a later one.
    check reads `catalogue_root` from the head `local()` already holds
    decoded (the non-namespace snapshot, a few milliseconds per commit,
    ACTIVE section 4); confirmed in code as part of this stage.
-2. **Maintenance reduced** to wake and converge; `maintenance_repair()`
-   removed; `catalogue_complete` as a fact.
+2. **Done, 0.90.30.** **Maintenance reduced**: `maintenance_repair()`
+   removed; `catalogue_complete` as a fact; a commit stages its catalogue
+   so a racing install does not decode it. Convergence offers only what a
+   node lacks (0.90.29). Maintenance's catalogue stage keeps conflict
+   reconciliation, an install (normally a no-op) and convergence.
 3. **Measure.** `catalogue_resident_bytes` in status, modelled on
    `snapshot_resident_bytes`; install time on gbni-1, against the single
    install point.
