@@ -201,6 +201,53 @@ bool AvailabilitySurvey::is_unknown(const ObjectId& id) const {
     return std::binary_search(unknown.begin(), unknown.end(), id);
 }
 
+std::optional<std::vector<ObjectId>> extents_peer_lacks(const HoldingsRollup& local,
+                                                        const NamespaceNodeStore& store,
+                                                        const HeldFn& held, PeerHoldings& peer) {
+    const auto holds_any = [&](const ObjectId& node) {
+        const auto holding = local.find(node);
+        return holding && holding->held > 0;
+    };
+    std::vector<ObjectId> lacks;
+    std::set<ObjectId> visited;
+    std::vector<ObjectId> frontier;
+    if (holds_any(local.root()))
+        frontier.push_back(local.root());
+    while (!frontier.empty()) {
+        std::vector<NodeHoldings> answers;
+        try {
+            answers = peer.ask(frontier);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+        if (answers.size() != frontier.size())
+            return std::nullopt;
+        std::vector<ObjectId> next;
+        for (size_t i = 0; i < frontier.size(); ++i) {
+            const auto& answer = answers[i];
+            if (answer.known && answer.holding.complete())
+                continue;
+            const auto children = namespace_tree_children(read_node(store, frontier[i]));
+            if (answer.children.size() != children.size())
+                return std::nullopt;
+            for (size_t c = 0; c < children.size(); ++c) {
+                const auto& child = children[c];
+                if (answer.children[c])
+                    continue;
+                if (child.extent) {
+                    if (held(child.id))
+                        lacks.push_back(child.id);
+                } else if (holds_any(child.id) && visited.insert(child.id).second) {
+                    next.push_back(child.id);
+                }
+            }
+        }
+        frontier = std::move(next);
+    }
+    sort_unique(lacks);
+    return lacks;
+}
+
 AvailabilitySurvey survey_availability(const HoldingsRollup& local,
                                        const NamespaceNodeStore& store, const HeldFn& held,
                                        std::span<PeerHoldings* const> peers,

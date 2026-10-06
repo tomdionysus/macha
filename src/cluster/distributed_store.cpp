@@ -2380,7 +2380,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                               const std::function<bool()>& should_yield,
                               uint64_t live_generation,
                               const std::function<bool(const ObjectId&)>& unavailable,
-                              std::optional<std::span<const ObjectId>> pull) {
+                              std::optional<std::span<const ObjectId>> pull,
+                              const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>&
+                                  known_present) {
     RepairResult result;
     result.complete = false;
     auto& transferred = result.bytes_transferred;
@@ -2480,13 +2482,51 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             repair_pass_spans_change_ = true;
             repair_push_resume_.reset();
         }
-        while (repair_push_window_.size() < scan_budget && !repair_push_cursor_exhausted_) {
+        // An object whose first `target` owners are known to hold it, this
+        // node among them, needs nothing: it settles without a probe and
+        // without spending the scan budget.
+        const auto settled_by_holdings = [&](const ObjectId& id) {
+            if (!known_present || (live && !std::binary_search(live->begin(), live->end(), id)))
+                return false;
+            const auto nodes = ranked(id);
+            const size_t target = std::min(n_.config().replication, nodes.size());
+            size_t keepers = 0;
+            bool kept_here = false;
+            for (const auto& peer : nodes) {
+                if (keepers >= target)
+                    break;
+                if (!has_room(peer))
+                    continue;
+                bool present = false;
+                if (peer.id == n_.node_id()) {
+                    present = local_.data().has(id);
+                    kept_here = present;
+                } else if (const auto known = known_present(peer.id, id)) {
+                    present = *known;
+                } else {
+                    return false;
+                }
+                if (!present)
+                    return false;
+                ++keepers;
+            }
+            return keepers >= target && kept_here;
+        };
+        size_t push_skipped = 0;
+        while (repair_push_window_.size() < scan_budget && !repair_push_cursor_exhausted_ &&
+               push_skipped < repair_skip_budget) {
             bool pass_complete = false;
             auto next = local_.data().next_object(repair_push_cursor_, pass_complete);
             if (!next) {
                 if (pass_complete)
                     repair_push_cursor_exhausted_ = true;
                 break;
+            }
+            if (repair_push_window_.empty() && settled_by_holdings(*next)) {
+                ++repair_push_settled_;
+                ++result.push_examined;
+                ++push_skipped;
+                continue;
             }
             repair_push_window_.push_back(*next);
         }
@@ -2505,6 +2545,11 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             for (const auto& peer : ranked(id)) {
                 if (peer.id == n_.node_id() || !has_room(peer))
                     continue;
+                if (known_present)
+                    if (const auto known = known_present(peer.id, id)) {
+                        repair_push_presence_[{peer.id, id}] = *known;
+                        continue;
+                    }
                 probe_nodes[peer.id] = peer;
                 probe_ids[peer.id].push_back(id);
             }
@@ -2749,7 +2794,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             ++result.pull_examined;
         };
         while (it != pull_list->end() && scanned_total < scan_budget &&
-               skipped < repair_pull_skip_budget) {
+               skipped < repair_skip_budget) {
             if (skipped % 1024 == 0 && yielded())
                 break;
 

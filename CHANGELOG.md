@@ -1,5 +1,19 @@
 # Current release
 
+## 0.90.24: repair pushes from what peers hold (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**Repair learns what a peer holds from the peer's own holdings.** After each
+availability survey, this node asks each peer about only the subtrees it does
+not hold whole and this node holds something under, and keeps the extents the
+peer lacks. Repair's push pass uses that instead of asking the peer about
+objects 16 at a time: an object every owner is known to hold settles without a
+question or a send, and one a peer lacks is sent without asking first. What
+is not known (an object outside the namespace, a peer that could not say, or
+holdings from an older generation than the inventory) is asked about as
+before.
+
 ## 0.90.23: repair pulls what this node lacks (experiment)
 
 No wire, protocol, API or on-disk changes.
