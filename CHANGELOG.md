@@ -1,5 +1,16 @@
 # Current release
 
+## 0.90.23: repair pulls what this node lacks (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**Repair's pull pass works from this node's holdings, not a walk.** Each
+holdings roll-up now also lists the namespace's extents this node lacks: a
+descent into only the subtrees the roll-up does not count as held whole. The
+pull pass considers that list and the catalogue's own objects, instead of
+every referenced object, so a node that lacks nothing pulls nothing and one
+that lacks much fetches exactly that.
+
 ## 0.90.22: repair does not slow itself (experiment)
 
 No wire, protocol, API or on-disk changes.

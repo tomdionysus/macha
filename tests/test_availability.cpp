@@ -295,6 +295,38 @@ MACHA_FAST_TEST("availability", test_a_rollup_refuses_a_tree_with_a_missing_node
     CHECK(refused);
 }
 
+MACHA_FAST_TEST("availability", test_missing_extents_are_exactly_what_this_node_lacks) {
+    MemoryNamespaceNodeStore store;
+    const auto entries = library(80);
+    const auto root = build_namespace_tree(entries, store, small_limits());
+    const auto all = references(entries);
+    for (const unsigned percent : {0U, 10U, 55U, 90U, 100U})
+        for (const unsigned salt : {1U, 3U, 11U}) {
+            const auto held = subset(all, percent, salt);
+            const auto rollup = HoldingsRollup::build(root, store, holds(held));
+            store.forget_reads();
+            const auto missing = missing_extents(rollup, store, holds(held));
+            std::set<ObjectId> expected;
+            for (const auto& id : all)
+                if (!held.contains(id))
+                    expected.insert(id);
+            CHECK(missing == std::vector<ObjectId>(expected.begin(), expected.end()));
+            if (percent == 100)
+                CHECK(store.reads() == 0);
+            // Never more than the subtrees not held whole.
+            CHECK(store.reads() <= rollup.nodes());
+        }
+    // Mostly held: the descent reads a fraction of the tree.
+    const std::set<ObjectId> everything(all.begin(), all.end());
+    auto most = everything;
+    most.erase(entries.at("/f1012").extents.at(3).id);
+    const auto rollup = HoldingsRollup::build(root, store, holds(most));
+    store.forget_reads();
+    const auto missing = missing_extents(rollup, store, holds(most));
+    CHECK(missing == std::vector<ObjectId>{entries.at("/f1012").extents.at(3).id});
+    CHECK(store.reads() < rollup.nodes() / 4);
+}
+
 MACHA_FAST_TEST("availability", test_a_node_describes_each_child_it_holds_whole) {
     MemoryNamespaceNodeStore store;
     const auto entries = library(40);

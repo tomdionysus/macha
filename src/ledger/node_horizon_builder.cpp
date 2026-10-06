@@ -17,9 +17,10 @@ std::shared_ptr<const InventoryHorizon> build_inventory(const MaintenanceObjects
     std::vector<ObjectId> control(catalogue.control_live.begin(), catalogue.control_live.end());
     control.insert(control.end(), namespace_objects.namespace_nodes.begin(),
                    namespace_objects.namespace_nodes.end());
-    return std::make_shared<const InventoryHorizon>(namespace_objects.metadata_generation,
-                                                    catalogue.complete, std::move(data),
-                                                    std::move(control), namespace_objects.garbage);
+    return std::make_shared<const InventoryHorizon>(
+        namespace_objects.metadata_generation, catalogue.complete, std::move(data),
+        std::move(control), namespace_objects.garbage,
+        std::vector<ObjectId>(catalogue.live.begin(), catalogue.live.end()));
 }
 
 ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNodeStore& nodes,

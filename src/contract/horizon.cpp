@@ -36,9 +36,11 @@ size_t ReferencedSets::size(RetentionClass type) const { return of(type).size();
 
 InventoryHorizon::InventoryHorizon(uint64_t generation, bool catalogue_complete,
                                    std::vector<ObjectId> data, std::vector<ObjectId> control,
-                                   const std::vector<GarbageRef>& garbage)
+                                   const std::vector<GarbageRef>& garbage,
+                                   std::vector<ObjectId> outside_namespace)
     : ReferencedSets(std::move(data), std::move(control)), generation_(generation),
-      catalogue_complete_(catalogue_complete) {
+      catalogue_complete_(catalogue_complete),
+      outside_namespace_(sorted_unique(std::move(outside_namespace))) {
     garbage_.reserve(garbage.size());
     stale_garbage_.reserve(garbage.size());
     for (const auto& candidate : garbage) {

@@ -89,6 +89,38 @@ NodeHoldings describe_holdings(const HoldingsRollup& rollup, const NamespaceNode
     return answer;
 }
 
+std::vector<ObjectId> missing_extents(const HoldingsRollup& rollup, const NamespaceNodeStore& store,
+                                      const HeldFn& held, const std::function<void()>& pause) {
+    std::vector<ObjectId> missing;
+    std::set<ObjectId> visited;
+    std::vector<ObjectId> pending;
+    const auto whole = [&](const ObjectId& node) {
+        const auto holding = rollup.find(node);
+        return holding && holding->complete();
+    };
+    if (!whole(rollup.root()))
+        pending.push_back(rollup.root());
+    while (!pending.empty()) {
+        const auto node = pending.back();
+        pending.pop_back();
+        // A subtree shared by several entries is read once.
+        if (!visited.insert(node).second)
+            continue;
+        if (pause)
+            pause();
+        for (const auto& child : namespace_tree_children(read_node(store, node))) {
+            if (child.extent) {
+                if (!held(child.id))
+                    missing.push_back(child.id);
+            } else if (!whole(child.id)) {
+                pending.push_back(child.id);
+            }
+        }
+    }
+    sort_unique(missing);
+    return missing;
+}
+
 Bytes encode_tree_holdings_request(std::span<const ObjectId> nodes) {
     if (nodes.size() > tree_holdings_max)
         throw std::invalid_argument("too many tree nodes in one holdings question");

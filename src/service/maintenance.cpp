@@ -280,6 +280,12 @@ void Maintenance::run(std::stop_token stop) {
     };
     // The tombstones before the first inventory: none.
     static const std::vector<GarbageRef> no_garbage;
+    // What repair pulls: this node's missing namespace extents, from its
+    // holdings, and the objects outside the namespace; rebuilt when either
+    // changes.
+    std::shared_ptr<const std::vector<ObjectId>> pull_missing;
+    std::shared_ptr<const InventoryHorizon> pull_inventory;
+    std::vector<ObjectId> pull_list;
 
     while (!stop.stop_requested()) {
         port_.wakeups.fetch_add(1, std::memory_order_relaxed);
@@ -669,6 +675,18 @@ void Maintenance::run(std::stop_token stop) {
                     // of synchronous control RPCs while consuming no network
                     // credit. Bound each repair slice independently.
                     constexpr size_t operation_budget = 16;
+                    const auto missing = availability_.missing_here();
+                    if (missing && inventory &&
+                        (missing != pull_missing || inventory != pull_inventory)) {
+                        const auto& outside = inventory->outside_namespace();
+                        pull_list.clear();
+                        pull_list.reserve(missing->size() + outside.size());
+                        std::set_union(missing->begin(), missing->end(), outside.begin(),
+                                       outside.end(), std::back_inserter(pull_list));
+                        pull_missing = missing;
+                        pull_inventory = inventory;
+                    }
+                    const bool pulling_listed = missing && inventory;
                     enter_stage("network-repair");
                     const auto repair_stage = Clock::now();
                     auto repair = store_.repair_step(
@@ -684,7 +702,9 @@ void Maintenance::run(std::stop_token stop) {
                         inventory ? inventory->generation() : 0,
                         // No work that cannot complete: the survey asks again
                         // when membership or storage could change the answer.
-                        [this](const ObjectId& id) { return availability_.unavailable(id); });
+                        [this](const ObjectId& id) { return availability_.unavailable(id); },
+                        pulling_listed ? std::optional<std::span<const ObjectId>>(pull_list)
+                                       : std::nullopt);
                     {
                         // Split by whether a higher class was active as the
                         // step ended: repair idle against repair on its share.

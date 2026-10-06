@@ -2379,7 +2379,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                               std::optional<std::span<const ObjectId>> live,
                               const std::function<bool()>& should_yield,
                               uint64_t live_generation,
-                              const std::function<bool(const ObjectId&)>& unavailable) {
+                              const std::function<bool(const ObjectId&)>& unavailable,
+                              std::optional<std::span<const ObjectId>> pull) {
     RepairResult result;
     result.complete = false;
     auto& transferred = result.bytes_transferred;
@@ -2406,7 +2407,14 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         repair_pass_spans_change_ = true;
     repair_live_identity_ = live_identity;
     repair_live_generation_ = live_generation;
-    if (!live || live->empty())
+    const auto pull_list = pull ? pull : live;
+    // A new list of what to pull may name objects behind the cursor.
+    const std::optional<const ObjectId*> pull_identity =
+        pull_list ? std::optional<const ObjectId*>(pull_list->data()) : std::nullopt;
+    if (pull_identity != repair_pull_identity_ && repair_pull_after_)
+        repair_pass_spans_change_ = true;
+    repair_pull_identity_ = pull_identity;
+    if (!pull_list || pull_list->empty())
         repair_pull_complete_ = true;
 
     auto reset_completed_pass = [&] {
@@ -2415,7 +2423,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         repair_push_settled_ = 0;
         repair_pull_after_.reset();
         repair_push_complete_ = false;
-        repair_pull_complete_ = !live || live->empty();
+        repair_pull_complete_ = !pull_list || pull_list->empty();
     };
 
     auto yielded = [&] {
@@ -2724,15 +2732,15 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             repair_push_complete_ = true;
     }
 
-    // Pull objects this node should own, walking the ordered live set in place
-    // with upper_bound().
-    if (!repair_pull_complete_ && live && !live->empty() && !result.credit_limited) {
+    // Pull objects this node should own, walking the ordered pull list (the
+    // live set when none is given) in place with upper_bound().
+    if (!repair_pull_complete_ && pull_list && !pull_list->empty() && !result.credit_limited) {
         auto it = repair_pull_after_
-                      ? std::upper_bound(live->begin(), live->end(), *repair_pull_after_)
-                      : live->begin();
+                      ? std::upper_bound(pull_list->begin(), pull_list->end(), *repair_pull_after_)
+                      : pull_list->begin();
         // An object that needs nothing is an index lookup: it does not count
         // against the scan budget, only against its own, far larger one, so a
-        // settled stretch of the live set is passed in one step.
+        // settled stretch of the list is passed in one step.
         size_t skipped = 0;
         const auto skip = [&](const ObjectId& id) {
             repair_pull_after_ = id;
@@ -2740,7 +2748,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             ++skipped;
             ++result.pull_examined;
         };
-        while (it != live->end() && scanned_total < scan_budget && skipped < repair_pull_skip_budget) {
+        while (it != pull_list->end() && scanned_total < scan_budget &&
+               skipped < repair_pull_skip_budget) {
             if (skipped % 1024 == 0 && yielded())
                 break;
 
@@ -2814,7 +2823,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             ++scanned_total;
             ++result.pull_examined;
         }
-        if (it == live->end()) {
+        if (it == pull_list->end()) {
             repair_pull_complete_ = true;
             repair_pull_after_.reset();
         }

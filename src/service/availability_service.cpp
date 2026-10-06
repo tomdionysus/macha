@@ -370,10 +370,14 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                                storage_events == rolled_storage_events_;
             next.rollup = HoldingsRollup::build(head_key, stored, held, pause,
                                                 carry ? &holdings->rollup : nullptr);
+            next.missing = std::make_shared<const std::vector<ObjectId>>(
+                missing_extents(next.rollup, stored, held, pause));
         } else {
             auto built = std::make_shared<MemoryNamespaceNodeStore>();
             const auto root = build_namespace_tree(head.snapshot->entries, *built);
             next.rollup = HoldingsRollup::build(root, *built, held, pause);
+            next.missing = std::make_shared<const std::vector<ObjectId>>(
+                missing_extents(next.rollup, *built, held, pause));
             next.built = std::move(built);
         }
         next.generation = head.generation;
