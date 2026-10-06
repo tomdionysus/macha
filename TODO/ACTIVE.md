@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.32.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.33.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -27,8 +27,9 @@ point), then measurement, then cost. Stage 1 (one install point, the
 installer) is 0.90.27; stage 2 (maintenance reduced, no second decode of
 a commit) is 0.90.30, after the convergence fix (0.90.29); stage 3
 (measured: 14.9 MB resident, a full load 156 ms on node-f and 328 ms on
-node-c) is 0.90.31; stage 4 (the per-shard view) is 0.90.32. Next: stage
-5, mutations copy only the shards they touch.
+node-c) is 0.90.31; stage 4 (the per-shard view) is 0.90.32; stage 5
+(writes copy only the shards they change) is 0.90.33. Next: the work-class
+item in section 3, then stage 6.
 
 ## 1. Failing tests and defects
 
@@ -89,6 +90,19 @@ node-c) is 0.90.31; stage 4 (the per-shard view) is 0.90.32. Next: stage
 
 ## 3. Replication and repair
 
+- **One definition of work class, and the API is viewer-class work**
+  (operator, 2026-10-06). The laws rank viewer, loader, background; the code
+  has three separate notions of which work is which, and they disagree:
+  DATA admission (`foreground` and `read_ahead` frames are viewers), the
+  activity clocks (what the pacer and pressure gate take as a viewer being
+  present; API requests mark nothing, so a node with someone in the editor
+  reads as idle), and the HTTP server's two worker pools (only health,
+  status, session and users on the control pool). Make it one definition,
+  used by all three, and put every API request in the viewer class: an API
+  request marks viewer activity, and API-started DATA work (artwork staged
+  and validated on a match, media indexes, a commit's retention claims)
+  carries a viewer frame, passed down from the caller since the scanner's
+  background matching shares those functions. Next after catalogue stage 5.
 - Repair is bound by the WAN link: one step sends a batch of at most two
   extents and waits for it (about 4 MB in 5 s between node-f and node-c).
   Pipelining batches, or several steps per pass, would lift it further.
@@ -151,7 +165,7 @@ From the local-first work
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.32**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.33**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -161,7 +175,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.32` back to
+  in place before that version was installed (`pre-0.90.33` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - node-f's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
