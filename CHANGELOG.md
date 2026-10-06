@@ -1,5 +1,25 @@
 # Current release
 
+## 0.90.34: commits owed to the peers cost their claims, not their snapshots
+
+No API, wire, protocol or on-disk changes.
+
+**A large import ran gbni-1 out of memory.** A 6 GB torrent finished, and
+its import made several metadata commits a second. Each commit owed to the
+other node kept two full encoded metadata snapshots (about 2.5 MB each) and
+the decoded snapshot, until the replicator had made its claims on the peer;
+those claims ran 0.8 to 2 s each over a loaded WAN, so the backlog grew by
+megabytes a commit. The node went from 1.15 GB to 2.1 GB in a minute and
+the kernel killed it (2026-10-06 21:16Z). The only bound was a count of
+1,024 commits.
+
+The claims a commit makes on the peers are now worked out once, when this
+node makes its own, and an owed commit keeps only those object ids. Only
+the newest head is kept for offering, since its history carries the rest.
+The queued claims are bounded at 32 MB of ids; past that the oldest are
+dropped, as before, and the peer's own head and repair cover them. The
+peers' share no longer decodes the parent snapshot again.
+
 ## 0.90.33: a catalogue write copies only the shards it changes
 
 No API, wire, protocol or on-disk changes.

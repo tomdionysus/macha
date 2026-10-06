@@ -2865,6 +2865,56 @@ MACHA_TEST("invariants", test_immediate_reaffirmation_flushes_provisional_genera
 #endif
 }
 
+// A burst of commits against peers that take their claims slowly: what is
+// owed is each commit's claim ids, bounded in bytes, not its snapshot. Past
+// the bound the oldest claims go; the newest head is still offered.
+MACHA_TEST("invariants", test_claims_owed_to_slow_peers_stay_within_their_bound) {
+    TestNode fixture("owed-claims-bound");
+    // 1.6 MB of claim ids a commit: twenty commits are past the 32 MB bound.
+    constexpr size_t ids_per_commit = 50000;
+    std::atomic_uint64_t made{};
+    fixture.set_publication_claims([&](const MetadataPublicationContext&) {
+        MetadataPublicationClaims claims;
+        claims.data.reserve(ids_per_commit);
+        const auto base = made.fetch_add(1) * ids_per_commit;
+        for (size_t i = 0; i < ids_per_commit; ++i) {
+            ObjectId id;
+            const auto value = base + i;
+            std::memcpy(id.bytes.data(), &value, sizeof(value));
+            claims.data.push_back(id);
+        }
+        return claims;
+    });
+    TestGate peers;
+    fixture.set_peer_retention([&](const NodeId&, uint64_t, const MetadataPublicationClaims&) {
+        peers.enter_and_wait();
+    });
+    struct Opener {
+        TestGate& gate;
+        ~Opener() { gate.open(); }
+    } open_on_exit{peers};
+    fixture.start();
+    auto& fs = fixture.filesystem();
+    auto& metadata = fixture.metadata();
+    fs.mkdir("/first", 0755, getuid(), getgid());
+    REQUIRE(peers.wait_for_entries(1, 10s));
+    for (int i = 0; i < 40; ++i)
+        fs.mkdir("/burst-" + std::to_string(i), 0755, getuid(), getgid());
+
+    const auto backlog = metadata.replication_backlog();
+    const uint64_t bound = 32ULL * 1024 * 1024;
+    CHECK(backlog.claim_bytes <= bound);
+    CHECK(backlog.claim_bytes + ids_per_commit * sizeof(ObjectId) > bound);
+    CHECK(backlog.dropped > 0);
+    CHECK(backlog.commits < 40);
+
+    peers.open();
+    REQUIRE(metadata.wait_replicated(20s));
+    const auto drained = metadata.replication_backlog();
+    CHECK(drained.commits == 0);
+    CHECK(drained.claim_bytes == 0);
+}
+
 MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_commit) {
 #if defined(__linux__)
     TestNode fixture("publication-generation");

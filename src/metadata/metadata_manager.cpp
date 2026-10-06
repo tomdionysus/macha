@@ -79,32 +79,36 @@ void MetadataManager::stop_replication() {
         replicator_.join();
 }
 
+MetadataManager::ReplicationBacklog MetadataManager::replication_backlog() const {
+    Lock lock(owed_mutex_);
+    return {owed_claims_.size(), owed_claim_bytes_, owed_dropped_.load(std::memory_order_relaxed)};
+}
+
 size_t MetadataManager::replication_pending() const {
     Lock lock(owed_mutex_);
-    return owed_.size() + (replicating_ ? 1 : 0);
+    return owed_claims_.size() + (owed_head_ ? 1 : 0) + (replicating_ ? 1 : 0);
 }
 
 bool MetadataManager::wait_replicated(std::chrono::milliseconds timeout) {
     Lock lock(owed_mutex_);
     return owed_changed_.wait_for(lock.native(), timeout, [&]() MACHA_REQUIRES(owed_mutex_) {
-        return owed_.empty() && !replicating_;
+        return owed_claims_.empty() && !owed_head_ && !replicating_;
     });
 }
 
-void MetadataManager::owe(OwedCommit commit) {
+void MetadataManager::owe(MetadataRecord head, std::optional<OwedClaims> claims) {
     {
         Lock lock(owed_mutex_);
-        owed_.push_back(std::move(commit));
-        // The newest head is always offered; only claims are shed.
-        size_t with_claims = 0;
-        for (const auto& item : owed_)
-            with_claims += item.claims ? 1 : 0;
-        for (auto it = owed_.begin(); with_claims > owed_claims_max && it != owed_.end(); ++it) {
-            if (!it->claims)
-                continue;
-            it->claims.reset();
-            --with_claims;
-            owed_dropped_.fetch_add(1, std::memory_order_relaxed);
+        // Only the newest head is offered: its history carries the others.
+        owed_head_ = std::move(head);
+        if (claims && (!claims->claims.data.empty() || !claims->claims.control.empty())) {
+            owed_claim_bytes_ += claims->claims.bytes();
+            owed_claims_.push_back(std::move(*claims));
+            while (owed_claim_bytes_ > owed_claim_bytes_max && owed_claims_.size() > 1) {
+                owed_claim_bytes_ -= owed_claims_.front().claims.bytes();
+                owed_claims_.pop_front();
+                owed_dropped_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     owed_changed_.notify_all();
@@ -112,54 +116,52 @@ void MetadataManager::owe(OwedCommit commit) {
 
 void MetadataManager::replication_loop(std::stop_token stop) {
     for (;;) {
-        std::deque<OwedCommit> batch;
+        std::deque<OwedClaims> claims;
+        std::optional<MetadataRecord> newest;
         {
             Lock lock(owed_mutex_);
             owed_changed_.wait(lock.native(), stop, [&]() MACHA_REQUIRES(owed_mutex_) {
-                return !owed_.empty();
+                return !owed_claims_.empty() || owed_head_.has_value();
             });
             if (stop.stop_requested())
                 return;
-            batch.swap(owed_);
+            claims.swap(owed_claims_);
+            owed_claim_bytes_ = 0;
+            newest.swap(owed_head_);
             replicating_ = true;
         }
         // Each commit's claims on the peers, in order, then the newest head
         // once: its history carries the commits before it.
-        for (const auto& commit : batch) {
+        for (const auto& owed : claims) {
             if (stop.stop_requested())
                 break;
-            if (!commit.claims || !publication_retention_)
+            if (!publication_retention_.peers)
                 continue;
             try {
-                publication_retention_(MetadataPublicationContext{
-                    commit.claims->origin, commit.claims->sequence, commit.claims->parent,
-                    *commit.claims->proposed,
-                    commit.claims->delta ? &*commit.claims->delta : nullptr, true});
+                publication_retention_.peers(owed.origin, owed.sequence, owed.claims);
             } catch (const std::exception& error) {
                 if (Log::enabled(LogLevel::debug))
-                    Log::debug("metadata claims on peers deferred generation=" +
-                               std::to_string(commit.record.generation) + " error=" +
-                               error.what());
+                    Log::debug("metadata claims on peers deferred sequence=" +
+                               std::to_string(owed.sequence) + " error=" + error.what());
             }
         }
-        if (!stop.stop_requested()) {
-            const auto& newest = batch.back().record;
+        if (newest && !stop.stop_requested()) {
             // To every node present, not only the copies a commit seeks:
             // nobody is waiting on this.
-            const auto acceptance = local_.replica().acceptance(newest.hash);
+            const auto acceptance = local_.replica().acceptance(newest->hash);
             for (const auto& owner : node_.membership().active()) {
                 if (!acceptance || owner.id == node_.node_id() || stop.stop_requested())
                     continue;
                 try {
-                    if (!replicate_accepted_head(owner, newest, *acceptance,
+                    if (!replicate_accepted_head(owner, *newest, *acceptance,
                                                  FrameType::read_ahead) &&
                         Log::enabled(LogLevel::debug))
                         Log::debug("metadata head offer deferred peer=" + owner.host +
-                                   " generation=" + std::to_string(newest.generation));
+                                   " generation=" + std::to_string(newest->generation));
                 } catch (const std::exception& error) {
                     if (Log::enabled(LogLevel::debug))
                         Log::debug("metadata head offer deferred peer=" + owner.host +
-                                   " generation=" + std::to_string(newest.generation) +
+                                   " generation=" + std::to_string(newest->generation) +
                                    " error=" + error.what());
                 }
             }
@@ -1287,22 +1289,22 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         // does not carry, so every reconciler still mints the same commit and
         // no earlier release here can void the claim; the head that carries
         // this node's next mutation covers it.
-        if (publication_retention_) {
+        if (publication_retention_.local) {
             const auto claim = local_.replica().reserve_mutation_dot(
                 node_.node_id(), merged.snapshot.mutation_sequences);
-            publication_retention_(MetadataPublicationContext{
+            const auto claims = publication_retention_.local(MetadataPublicationContext{
                 claim.author, claim.sequence, primary.record, merged.snapshot,
-                delta ? &*delta : nullptr, false});
+                delta ? &*delta : nullptr});
             // A merge is made off every caller's path, so the peers' share
             // is done here too, before the merge is offered to them.
-            try {
-                publication_retention_(MetadataPublicationContext{
-                    claim.author, claim.sequence, primary.record, merged.snapshot,
-                    delta ? &*delta : nullptr, true});
-            } catch (const std::exception& error) {
-                if (Log::enabled(LogLevel::debug))
-                    Log::debug("metadata merge claims on peers deferred: " +
-                               std::string(error.what()));
+            if (publication_retention_.peers) {
+                try {
+                    publication_retention_.peers(claim.author, claim.sequence, claims);
+                } catch (const std::exception& error) {
+                    if (Log::enabled(LogLevel::debug))
+                        Log::debug("metadata merge claims on peers deferred: " +
+                                   std::string(error.what()));
+                }
             }
         }
         const auto retention_ms = stage_ms();
@@ -1711,7 +1713,7 @@ MetadataRecord MetadataManager::mutate_impl(
         const auto decode_ms = stage_ms();
         const bool clear_merge_parent_topology = !snapshot.merge_parents.empty();
         if (dot && clock_covers(snapshot.mutation_sequences, *dot)) {
-            owe({current, {}});
+            owe(current, std::nullopt);
             cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
             return current;
         }
@@ -1720,7 +1722,7 @@ MetadataRecord MetadataManager::mutate_impl(
             if (clock != snapshot.mutation_sequences.end() &&
                 clock->second >= identity->sequence) {
                 // Already accepted (before a crash, or merged by a peer).
-                owe({current, {}});
+                owe(current, std::nullopt);
                 cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
                 return current;
             }
@@ -1914,10 +1916,11 @@ MetadataRecord MetadataManager::mutate_impl(
         // This node's own claims, then the commit, both on this node alone.
         // The caller is answered from here; the peers' share is owed.
         uint64_t retention_ms = 0;
-        if (publication_retention_) {
+        MetadataPublicationClaims claims;
+        if (publication_retention_.local) {
             const auto retention_started = Clock::now();
-            publication_retention_(MetadataPublicationContext{
-                origin, *sequence, current, snapshot, delta ? &*delta : nullptr, false});
+            claims = publication_retention_.local(MetadataPublicationContext{
+                origin, *sequence, current, snapshot, delta ? &*delta : nullptr});
             retention_ms = elapsed_ms(retention_started);
         }
 
@@ -1940,10 +1943,7 @@ MetadataRecord MetadataManager::mutate_impl(
 
             auto committed = std::make_shared<const MetadataSnapshot>(std::move(snapshot));
             cache_record(proposed, committed);
-            OwedCommit owed{proposed, {}};
-            owed.claims = OwedCommit::Claims{origin, *sequence, current, committed,
-                                             std::move(delta)};
-            owe(std::move(owed));
+            owe(proposed, OwedClaims{origin, *sequence, std::move(claims)});
             const auto total_ms = elapsed_ms(total_started);
             if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
                 Log::debug("metadata mutate total_ms=" + std::to_string(total_ms) +

@@ -126,7 +126,8 @@ class NodeServices {
             instruments_.lifecycle(event);
     }
     // The claims barrier run before every metadata commit is published.
-    void retain_metadata_publication(const MetadataPublicationContext&);
+    MetadataPublicationClaims retain_metadata_publication(const MetadataPublicationContext&);
+    void retain_on_peers(const NodeId& origin, uint64_t sequence, const MetadataPublicationClaims&);
 
     NodeRuntime& node_;
     NodeResources& resources_;
