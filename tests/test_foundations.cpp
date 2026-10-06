@@ -956,6 +956,14 @@ MACHA_FAST_TEST("foundations", test_config) {
     CHECK(maintenance_background_interval(maintenance_policy) == 5000ms);
     maintenance_policy.no_progress_backoff = 45000ms;
     CHECK(maintenance_background_interval(maintenance_policy) == 30000ms);
+    // Background work yields to everyone else's CPU, not its own: 0.2 s of
+    // process CPU a second, half of it the maintenance thread's, is a load of
+    // 0.1, within a 0.1 target.
+    CHECK(background_cpu_scale(0.2, 0.1, 1.0, 0.1) == 1.0);
+    CHECK(background_cpu_scale(0.2, 0.0, 1.0, 0.1) == 0.5);
+    CHECK(background_cpu_scale(0.5, 0.1, 1.0, 0.1) == 0.25);
+    CHECK(background_cpu_scale(0.1, 0.3, 1.0, 0.1) == 1.0);
+    CHECK(background_cpu_scale(5.0, 0.0, 0.0, 0.1) == 1.0);
     CHECK(std::string(message_type_name(MessageType::members)) == "members");
     CHECK(std::string(message_type_name(MessageType::get_object)) == "get_object");
 }

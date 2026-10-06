@@ -209,11 +209,22 @@ void Maintenance::maintain_garbage_metadata(const std::vector<GarbageRef>& erase
     });
 }
 
+double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds,
+                            double wall_seconds, double cpu_target) {
+    if (wall_seconds <= 0.0)
+        return 1.0;
+    const double load = std::max(0.0, process_cpu_seconds - own_cpu_seconds) / wall_seconds;
+    if (load <= cpu_target)
+        return 1.0;
+    return std::clamp(cpu_target / load, 0.0, 1.0);
+}
+
 void Maintenance::run(std::stop_token stop) {
     const auto& policy = node_.config().maintenance;
     ThreadCpuReporter cpu_reporter("macha-maint", std::chrono::seconds(5), true);
     auto last_wall = clock_->now();
     auto last_cpu = std::clock();
+    auto last_own_cpu_ns = thread_cpu_time_ns();
     uint64_t last_metadata_remote_epoch = node_.remote_metadata_epoch();
     uint64_t last_metadata_demand_epoch{};
     std::vector<NodeId> last_active_nodes;
@@ -323,11 +334,16 @@ void Maintenance::run(std::stop_token stop) {
         auto wall_seconds = std::chrono::duration<double>(now - last_wall).count();
         if (wall_seconds <= 0.0)
             wall_seconds = std::chrono::duration<double>(policy.interval).count();
+        // The load background work yields to is everyone else's: this
+        // thread's own CPU (repair, GC, the census) does not count against it.
         auto cpu_now = std::clock();
-        double cpu_seconds = static_cast<double>(cpu_now - last_cpu) / CLOCKS_PER_SEC;
-        double cpu_load = wall_seconds > 0.0 ? std::max(0.0, cpu_seconds / wall_seconds) : 0.0;
+        const auto own_cpu_ns = thread_cpu_time_ns();
+        const double own_seconds =
+            static_cast<double>(own_cpu_ns >= last_own_cpu_ns ? own_cpu_ns - last_own_cpu_ns : 0) / 1e9;
+        const double process_seconds = static_cast<double>(cpu_now - last_cpu) / CLOCKS_PER_SEC;
         last_wall = now;
         last_cpu = cpu_now;
+        last_own_cpu_ns = own_cpu_ns;
 
         auto playback_bytes = store_.take_foreground_bytes();
         auto interactive_bytes = store_.take_interactive_bytes();
@@ -361,9 +377,8 @@ void Maintenance::run(std::stop_token stop) {
         // Process CPU includes foreground filesystem/RPC work. Above the target,
         // background work loses budget continuously rather than stopping in a
         // fixed block-per-tick pattern.
-        double cpu_scale = 1.0;
-        if (cpu_load > policy.cpu_target)
-            cpu_scale = std::clamp(policy.cpu_target / cpu_load, 0.0, 1.0);
+        const double cpu_scale =
+            background_cpu_scale(process_seconds, own_seconds, wall_seconds, policy.cpu_target);
 
         double rate = bandwidth * fraction * cpu_scale;
         // Repair's byte rate does not drop with busyness; repair_share decides
