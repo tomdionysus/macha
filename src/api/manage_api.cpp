@@ -1248,7 +1248,20 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
     } catch (const CatalogueUnavailable& e) {
         return http_error(503, "catalogue_unavailable", e.what());
     } catch (const ProviderRequestError& e) {
-        return http_error(e.status, e.code, e.what());
+        auto response = http_error(e.status, e.code, e.what());
+        if (e.retry_after) {
+            // How long until the provider may answer, in the body and as
+            // Retry-After.
+            Json::Object root;
+            root["status"] = e.code;
+            root["error"] = Json::Object{{"code", e.code},
+                                         {"message", std::string(e.what())},
+                                         {"retry_after_ms", static_cast<uint64_t>(e.retry_after->count())}};
+            response = http_json(e.status, Json(std::move(root)).dump());
+            response.headers["Retry-After"] =
+                std::to_string((e.retry_after->count() + 999) / 1000);
+        }
+        return response;
     } catch (const ManualParentError& e) {
         Json::Object error{{"code", e.code}, {"message", std::string(e.what())}};
         for (const auto& [name, value] : e.fields) error[name] = value;

@@ -31,3 +31,11 @@ twice. Cursors are opaque. Clients sort for display themselves.
 | `GET /api/v1/users` | `username` |
 | `GET /api/v1/playback/sessions` | `session_id` |
 | `GET /api/v1/status/nodes` | node `id` |
+
+## Providers
+
+`503 provider_unavailable` means a metadata provider (TMDB, MusicBrainz)
+could not answer. When the node knows how long until it may, the error
+carries `retry_after_ms` and the response a `Retry-After` header. A
+MusicBrainz rate-limit answer is waited out once by the editor's request
+before it is refused.
