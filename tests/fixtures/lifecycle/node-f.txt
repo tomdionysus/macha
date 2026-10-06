@@ -5,6 +5,7 @@ start node
 start startup
 local state recovered
 services constructed
+start catalogue-installer
 start media-information
 start scanner
 start hydration
@@ -18,6 +19,7 @@ services ready
 stop catalogue-http
 cancel-io filesystem
 request_stop maintenance
+request_stop catalogue-installer
 request_stop streaming
 request_stop manage-api
 request_stop ingest
@@ -31,6 +33,7 @@ request_stop metadata-replicator
 cancel-io outbound-rpc
 stop metadata-replicator
 stop maintenance
+stop catalogue-installer
 stop streaming
 stop manage-api
 stop ingest

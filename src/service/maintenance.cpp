@@ -492,11 +492,10 @@ void Maintenance::run(std::stop_token stop) {
                 }
             }
 
-            // Catalogue GETs are memory-only, so convergence happens here: generation
-            // notices (or the short validation TTL) trigger a refresh regardless of
-            // foreground activity, keeping replica I/O off API threads.
+            // The catalogue installer follows the head; this pass offers the
+            // installed root's control objects to the nodes present.
             if (metadata_ready_for_dependants &&
-                (catalogue_dirty || catalogue_.refresh_needed()) &&
+                (catalogue_dirty || catalogue_.convergence_needed()) &&
                 (catalogue_retry_due == Clock::time_point{} || now >= catalogue_retry_due)) {
                 enter_stage("catalogue-repair");
                 const auto stage = Clock::now();
@@ -504,7 +503,7 @@ void Maintenance::run(std::stop_token stop) {
                     if (maintenance_stage_hook_)
                         maintenance_stage_hook_("catalogue-repair-begin");
                     catalogue_.repair_once();
-                    catalogue_dirty = catalogue_.refresh_needed();
+                    catalogue_dirty = false;
                     catalogue_retry_due = Clock::time_point{};
                 } catch (const std::exception& e) {
                     Log::debug("catalogue sync: " + std::string(e.what()));

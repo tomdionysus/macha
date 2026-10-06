@@ -102,7 +102,8 @@ This removes every `*current_snapshot()` deep copy (about ten sites) and
 merges item by item. With per-shard views it compares the three manifests
 and descends only into slots that differ; identical slots are taken as is.
 It is still a commit through the mutation path, producing a new head like
-any other.
+any other, made by maintenance's pass under the catalogue mutation lock (not
+by the installer, which only installs).
 
 ### 6. Indexes behind list and search, derived not stored
 
@@ -205,9 +206,11 @@ section 7's per-family shards.
 
 ## Tests
 
-- The burst test asserts installs, not repairs: at most one install per
-  distinct root adopted, so exactly one for the gated burst. A per-event
-  storm fails it; no ratio, no invented ceiling.
+- The burst test asserts installs, not repairs: at least one, and at most
+  one per distinct root the burst committed. The installer follows the head,
+  not the maintenance gate, so a burst spread over time installs several of
+  its roots in turn; the same root twice, or an install per event, fails
+  it. No ratio, no invented ceiling.
 - `install` as a deterministic primitive: same root is a no-op; an older
   target queued behind a newer one is never installed; only changed shards
   are decoded (count decodes); a missing shard parks and the previous view
@@ -225,7 +228,7 @@ section 7's per-family shards.
 Correctness first, then cost. Each stage ships on its own and leaves the
 suite green; no stage waits on a later one.
 
-1. **`install` and the worker**, on whole snapshots. One install point
+1. **Done, 0.90.27.** **`install` and the worker**, on whole snapshots. One install point
    driven by head changes; the polling paths, the TTL and the 0.90.26
    guard deleted; the burst test rewritten to count installs per root; the
    install primitive tests added. Fixes the open P0. The per-head-change
