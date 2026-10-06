@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.33.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.34.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -46,6 +46,19 @@ item in section 0, then stage 6.
 
 ## 2. Failing tests and defects
 
+- **node-c killed by the kernel for memory during a large import** (2026-10-06
+  21:16Z; 1.15 GB to 2.1 GB in a minute on a 4 GB node). Cause: each commit
+  owed to the peer held two encoded snapshots and the decoded one until its
+  claims on the peer were made, and the import made commits faster than a
+  loaded WAN took the claims. Fixed in 0.90.34: owed commits hold claim ids,
+  bounded at 32 MB, and only the newest head; a test pins the bound. Still
+  to see: node-c's memory through the next multi-file import (the Futurama
+  import had finished before the deploy). Also to do: memory per component
+  in the observation windows, which hold only total RSS, so the next spike
+  can be attributed from the record rather than from `/proc`.
+- **Shelved for the import fix:** work-class step 1 (`WorkClass` replacing
+  `MemoryClass` and the four frame-to-class mappings), in `git stash`
+  `stash@{0}`, partly written.
 - **node-c heap corruption**, three times. An ASan 0.84.0 build and
   `/root/claude-missing-extent-driver.py` are staged on node-f, not run.
   *Carried.*
@@ -174,7 +187,7 @@ From the local-first work
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.33**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.34**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -184,7 +197,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.33` back to
+  in place before that version was installed (`pre-0.90.34` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - node-f's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
