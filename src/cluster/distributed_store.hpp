@@ -153,8 +153,8 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     bool repair_push_cursor_exhausted_{};
     // Maximum concurrent repair pushes.
     static constexpr size_t repair_sends_in_flight = 8;
-    // Objects needing nothing the pull walk passes in one repair step.
-    static constexpr size_t repair_pull_skip_budget = 65536;
+    // Objects needing nothing that a push or pull walk passes in one step.
+    static constexpr size_t repair_skip_budget = 65536;
     // Objects the current push pass has settled, saved so a restart resumes
     // there (persist_repair_position), and the value to resume from.
     uint64_t repair_push_settled_{};
@@ -414,6 +414,9 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // without asking anyone, since nobody can supply it. `pull`, sorted, is
     // what the pull pass considers instead of `live`: the objects this node is
     // known to lack, so a node that lacks nothing pulls nothing.
+    // `known_present` says whether a peer holds an object without asking it,
+    // or nothing when that is not known: the push pass asks only about what
+    // it does not know, and settles at once an object every owner holds.
     uint64_t repair_once(uint64_t byte_budget = 0,
                          std::optional<std::span<const ObjectId>> live = std::nullopt);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
@@ -421,7 +424,9 @@ class DistributedStore final : public Placement, public ControlObjectSource {
                              const std::function<bool()>& should_yield = {},
                              uint64_t live_generation = 0,
                              const std::function<bool(const ObjectId&)>& unavailable = {},
-                             std::optional<std::span<const ObjectId>> pull = std::nullopt);
+                             std::optional<std::span<const ObjectId>> pull = std::nullopt,
+                             const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>&
+                                 known_present = {});
     uint64_t scrub_once(uint64_t byte_budget = 0);
     RepairDiagnostics repair_diagnostics() const;
 

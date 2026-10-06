@@ -778,6 +778,43 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_pushes_past_a_peer_with_no_room) {
 // transfer's bytes. A push waits for credit of its object's size; a pull
 // passes held objects by index, waits for an extent of credit, and the cursor
 // stays on the object it could not afford.
+// What a peer holds, known from its holdings, replaces asking it: an object
+// every owner holds settles without a probe or a send, one the peer lacks is
+// sent without a probe, and only what is not known is asked about.
+MACHA_FAST_TEST("rpc_cluster", test_repair_pushes_from_what_peers_hold_without_asking) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    std::vector<ObjectId> live;
+    for (uint8_t i = 0; i < 3; ++i) {
+        const auto bytes = pattern(64 * 1024, static_cast<uint8_t>(60 + i));
+        REQUIRE(bench.local.data().put(object_id(bytes), bytes));
+        live.push_back(object_id(bytes));
+    }
+    std::sort(live.begin(), live.end());
+    constexpr uint64_t budget = 64ULL * 1024 * 1024;
+    using Known = std::function<std::optional<bool>(const NodeId&, const ObjectId&)>;
+
+    const Known all_held = [](const NodeId&, const ObjectId&) { return std::optional<bool>(true); };
+    const auto settled = bench.store()->repair_step(budget, 16, live, {}, 0, {}, std::nullopt, all_held);
+    CHECK(settled.push_examined == live.size());
+    CHECK(peer.batch_requests.load() == 0);
+    CHECK(peer.puts.load() == 0);
+
+    const auto lacking = live[1];
+    const Known lacks_one = [&](const NodeId&, const ObjectId& id) {
+        return std::optional<bool>(id != lacking);
+    };
+    auto sender = bench.store();
+    for (int step = 0; step < 8 && peer.puts.load() == 0; ++step)
+        (void)sender->repair_step(budget, 16, live, {}, 0, {}, std::nullopt, lacks_one);
+    CHECK(peer.puts.load() == 1);
+    CHECK(peer.batch_requests.load() == 0);
+
+    const Known unknown = [](const NodeId&, const ObjectId&) { return std::optional<bool>(); };
+    (void)bench.store()->repair_step(budget, 16, live, {}, 0, {}, std::nullopt, unknown);
+    CHECK(peer.batch_requests.load() >= 1);
+}
+
 MACHA_FAST_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_with_it) {
     StoreBench bench([](Config& c) { c.replication = 2; });
     RepairPeer peer(bench);

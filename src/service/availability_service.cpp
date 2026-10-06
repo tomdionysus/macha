@@ -496,6 +496,15 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
             memo_.reset();
         else
             memo_ = std::move(made);
+        // What each peer lacks of what this node holds, from the peer's own
+        // account of its holdings.
+        PeerLacks lacks;
+        lacks.generation = holdings->generation;
+        for (size_t i = 0; i < remotes.size(); ++i)
+            if (auto found = extents_peer_lacks(*rollup, nodes, held, remotes[i]))
+                lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
+                                                     std::move(*found)));
+        peer_lacks_.publish(std::move(lacks));
         surveyed_at_ = now;
     } else {
         // Rolled up after a gain alone: what was missing is still missing,

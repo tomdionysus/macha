@@ -138,6 +138,14 @@ struct SurveyMemo {
 // could have described becomes `unknown`. Throws DecodeError if a tree node
 // this node must read is missing.
 //
+// The extents beneath the roll-up's root that this node holds and `peer` does
+// not, sorted: the peer is asked only about subtrees it does not hold whole
+// and this node holds something under. None when the peer cannot answer or
+// cannot describe a tree node it lacks, since what it holds is then unknown.
+std::optional<std::vector<ObjectId>> extents_peer_lacks(const HoldingsRollup& local,
+                                                        const NamespaceNodeStore& store,
+                                                        const HeldFn& held, PeerHoldings& peer);
+
 // `known`: a memo from a survey since which no peer's holdings have changed
 // and this node has lost nothing. A node in it is settled from it and no peer
 // is asked about it. `made` receives this survey's memo.

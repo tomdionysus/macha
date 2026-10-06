@@ -327,6 +327,44 @@ MACHA_FAST_TEST("availability", test_missing_extents_are_exactly_what_this_node_
     CHECK(store.reads() < rollup.nodes() / 4);
 }
 
+MACHA_FAST_TEST("availability", test_what_a_peer_lacks_is_exactly_what_it_does_not_hold) {
+    MemoryNamespaceNodeStore store;
+    const auto entries = library(80);
+    const auto root = build_namespace_tree(entries, store, small_limits());
+    const auto all = references(entries);
+    for (const unsigned here_percent : {0U, 40U, 100U})
+        for (const unsigned peer_percent : {0U, 30U, 90U, 100U}) {
+            const auto here = subset(all, here_percent, 2);
+            const auto there = subset(all, peer_percent, 13);
+            const auto local = HoldingsRollup::build(root, store, holds(here));
+            FakePeer peer(root, store, there);
+            const auto lacks = extents_peer_lacks(local, store, holds(here), peer);
+            REQUIRE(lacks.has_value());
+            std::set<ObjectId> expected;
+            for (const auto& id : all)
+                if (here.contains(id) && !there.contains(id))
+                    expected.insert(id);
+            CHECK(*lacks == std::vector<ObjectId>(expected.begin(), expected.end()));
+            // Nothing to offer, or a peer that holds everything: one question
+            // at most.
+            if (here_percent == 0 || peer_percent == 100)
+                CHECK(peer.asks <= 1);
+        }
+    // A peer that cannot answer leaves what it holds unknown.
+    const std::set<ObjectId> everything(all.begin(), all.end());
+    const auto local = HoldingsRollup::build(root, store, holds(everything));
+    FakePeer failing(root, store, {});
+    failing.failing = true;
+    CHECK(!extents_peer_lacks(local, store, holds(everything), failing).has_value());
+    // A peer at another tree, unable to describe this one's nodes: unknown.
+    MemoryNamespaceNodeStore other_store;
+    auto other_entries = entries;
+    other_entries.erase("/f1010");
+    const auto other_root = build_namespace_tree(other_entries, other_store, small_limits());
+    FakePeer elsewhere(other_root, other_store, {});
+    CHECK(!extents_peer_lacks(local, store, holds(everything), elsewhere).has_value());
+}
+
 MACHA_FAST_TEST("availability", test_a_node_describes_each_child_it_holds_whole) {
     MemoryNamespaceNodeStore store;
     const auto entries = library(40);
