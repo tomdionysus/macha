@@ -99,6 +99,11 @@ double score(std::string_view query, const CatalogueItem& item) {
     return 0.0;
 }
 
+uint64_t ms_since(Clock::time_point started) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
+}
+
 [[noreturn]] void revision_changed(std::string_view id, uint64_t expected, uint64_t found) {
     throw CatalogueConflict("catalogue item revision changed: " + std::string(id) + " expected " +
                             std::to_string(expected) + ", now " + std::to_string(found));
@@ -616,13 +621,21 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
         throw CatalogueUnavailable("catalogue manifest unavailable locally");
     const auto manifest = decode_catalogue_manifest(*encoded_manifest);
     CatalogueSnapshot snapshot;
+    size_t shards = 0;
+    uint64_t bytes = encoded_manifest->size();
+    uint64_t read_ms = 0;
+    const auto started = Clock::now();
     for (const auto& shard_id : manifest.shards) {
         if (!shard_id) continue;
+        const auto read_started = Clock::now();
         if (!store_.ensure_control_local(*shard_id))
             throw CatalogueUnavailable("catalogue shard unavailable: " + to_string(*shard_id));
         auto encoded_shard = local_.control().get(*shard_id);
         if (!encoded_shard)
             throw CatalogueUnavailable("catalogue shard unavailable locally: " + to_string(*shard_id));
+        read_ms += ms_since(read_started);
+        ++shards;
+        bytes += encoded_shard->size();
         auto shard = decode_catalogue(*encoded_shard);
         for (auto& [id, item] : shard.items) {
             if (!snapshot.items.emplace(id, std::move(item)).second)
@@ -637,6 +650,13 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
                 throw std::runtime_error("media index appears in multiple shards");
         }
     }
+    const auto total_ms = ms_since(started);
+    Log::debug("catalogue loaded root=" + to_string(*root).substr(0, 12) +
+               " shards=" + std::to_string(shards) + " bytes=" + std::to_string(bytes) +
+               " items=" + std::to_string(snapshot.items.size()) +
+               " profiles=" + std::to_string(snapshot.media_profiles.size()) +
+               " read_ms=" + std::to_string(read_ms) +
+               " decode_ms=" + std::to_string(total_ms - std::min(total_ms, read_ms)));
     return snapshot;
 }
 
@@ -686,10 +706,19 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
         }
 
         bool complete = true;
+        uint64_t bytes = 0;
+        const auto send_started = Clock::now();
         for (const auto& [id, encoded] : objects) {
+            bytes += encoded.size();
             if (store_.replicate_control(id, encoded) < active_nodes.size())
                 complete = false;
         }
+        Log::debug("catalogue control convergence root=" + to_string(*root).substr(0, 12) +
+                   " objects=" + std::to_string(objects.size()) +
+                   " bytes=" + std::to_string(bytes) +
+                   " nodes=" + std::to_string(active_nodes.size()) +
+                   " complete=" + (complete ? "yes" : "no") +
+                   " send_ms=" + std::to_string(ms_since(send_started)));
 
         Lock lock(mutex_);
         if (complete) {
@@ -796,19 +825,28 @@ void CatalogueManager::repair_once() {
     // At most one root conflict per pass. Disjoint item merges are automatic;
     // same-item or parent/child collisions stay durable conflicts. The merge
     // is a commit, which installs, so it is serialised with every other.
+    const auto started = Clock::now();
     bool reconciled = false;
     {
         TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
         reconciled = reconcile_catalogue_conflict(metadata_.local());
     }
+    const auto reconcile_ms = ms_since(started);
     if (!reconciled)
         install_head();
+    const auto install_ms = ms_since(started) - reconcile_ms;
     std::optional<ObjectId> root;
     {
         Lock lock(mutex_);
         root = cached_root_;
     }
     const bool converged = converge_control_replicas(root);
+    const auto total_ms = ms_since(started);
+    if (total_ms >= 1000)
+        Log::debug("catalogue repair reconcile_ms=" + std::to_string(reconcile_ms) +
+                   " install_ms=" + std::to_string(install_ms) +
+                   " converge_ms=" + std::to_string(total_ms - reconcile_ms - install_ms) +
+                   " reconciled=" + (reconciled ? "yes" : "no"));
     Lock lock(mutex_);
     if (converged) {
         error_.clear();

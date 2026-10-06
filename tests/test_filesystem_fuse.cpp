@@ -3359,9 +3359,12 @@ MACHA_TEST("filesystem_fuse", test_management_api_reports_and_acts_on_fuse_state
         service.registry().publish_fuse(frontend);
         frontend->mkdir("/status-counter", 0755, getuid(), getgid());
         REQUIRE(frontend->wait_for_idle(10s));
+        // Idle and caught up: a commit's event can reach the convergence demand
+        // after the runs it counts have completed.
         REQUIRE(wait_until([&] {
             const auto current = service.metadata_convergence_diagnostics();
-            return !current.scheduled && current.runs_scheduled == current.runs_completed;
+            return !current.scheduled && current.runs_scheduled == current.runs_completed &&
+                   current.latest_generation == service.metadata_server().known_generation();
         }));
 
         const auto response =

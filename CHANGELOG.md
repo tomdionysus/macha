@@ -1,5 +1,15 @@
 # Current release
 
+## 0.90.28: catalogue stage timing
+
+No API, wire, protocol or on-disk changes. DEBUG lines that say where a
+catalogue maintenance pass spends its time: `catalogue loaded` (shards,
+bytes, items, profiles, read and decode time of a full load),
+`catalogue control convergence` (objects, bytes, nodes and send time when
+the root's control objects are offered to the nodes present) and
+`catalogue repair` (reconcile, install and convergence time of a pass that
+took a second or more).
+
 ## 0.90.27: the catalogue view follows the head
 
 No API, wire, protocol or on-disk changes.
