@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.17.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.18.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `COMPLETED.md` (finished work),
@@ -10,15 +10,7 @@ plans, evidence and handovers; a record, not requirements). Items marked
 *carried* come from `archive/2026-10-05-ACTIVE-before-rationalisation.md`,
 which has their full text, and have not been re-checked since.
 
-## 1. Paging on every list call
-
-Operator, 2026-10-05. Designed in
-[title files and paging](2026-10-05-title-files-and-paging.md) and proposed
-to Core: `limit` and `cursor`, `next_cursor` in the answer, the whole list
-without `limit`. `GET /api/v1/catalogue/items` answers 6,764 items, 9.5 MB,
-in one response today. Announce to Core and every client before it ships.
-
-## 2. Matching
+## 1. Matching
 
 - A commit during a multi-file match sometimes waited 9 to 13 s (gbni-1,
   2026-10-05 19:10Z, every other track). Not reproduced; nothing else logged
@@ -33,7 +25,7 @@ in one response today. Announce to Core and every client before it ships.
 - Provider caches are per editor seat and lost on restart: the first track of
   each album after a restart pays the lookup and the cover again.
 
-## 3. Further optimisation (measured small; not now)
+## 2. Further optimisation (measured small; not now)
 
 From the local-first work
 ([plan](archive/2026-10-05-local-first-filesystem-plan.md)):
@@ -49,7 +41,7 @@ From the local-first work
 - The non-namespace snapshot per commit: a few milliseconds.
 - The hint store rewrites its file per change: 266 KB with 409 hints.
 
-## 4. Open from the object ledger and absent-node work
+## 3. Open from the object ledger and absent-node work
 
 - Per-peer down state in the transport; `fsync` without a deadline; the
   journal's `durability_poisoned` flag; a count of DATA objects below their
@@ -59,7 +51,7 @@ From the local-first work
 - [Cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md): a
   proposal with six questions waiting on the operator.
 
-## 5. Defects and unexplained failures
+## 4. Defects and unexplained failures
 
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
   `/root/claude-missing-extent-driver.py` are staged on fi-1, not run.
@@ -112,13 +104,13 @@ From the local-first work
   device; local maintenance budgeted from a network measurement; the 150-300%
   hysteresis band is a latch; law 1 holds by configuration only. *Carried.*
 
-## 6. Replication and repair
+## 5. Replication and repair
 
 - Say why a node counts itself busy (the pacer's active classes in status).
 - Log the resumed push position at INFO.
 - Measure pipelined pushes on an idle node, and step length on a busy HDD.
 
-## 7. Features and API
+## 6. Features and API
 
 - **The API is RESTful, all of it**: audit every route; identity resets
   become a resource (decided); `providers/artwork?ref=` and
@@ -136,7 +128,7 @@ From the local-first work
   optional node `name` (operator's call).
 - **Movie sets** and **ebooks**: later; each needs a proposal first.
 
-## 8. Waiting on the operator
+## 7. Waiting on the operator
 
 - Metadata editor B: the choice of fields.
 - Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
@@ -152,7 +144,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.17**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.18**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -162,7 +154,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.17` back to
+  in place before that version was installed (`pre-0.90.18` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild

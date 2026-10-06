@@ -2,7 +2,7 @@
 
 Last updated: 2026-10-06
 
-## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.16
+## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.18
 
 All deployed on gbni-1 and fi-1, merged to `develop` and `main` (`0c5492f`).
 Detail in `CHANGELOG.md` under each version; the plans and evidence are in
@@ -36,6 +36,11 @@ Detail in `CHANGELOG.md` under each version; the plans and evidence are in
 - **A title's files** (0.90.15): unmatch, delete by path and delete by
   content, each one call, with empty titles and parents removed
   (`2026-10-05-title-files-and-paging.md`).
+- **Paging on every list call** (0.90.18): `limit`, `cursor`, `next_cursor`;
+  lists in key order (`docs/api.md`). A page of 50 catalogue items is 89 KB
+  in 0.06 s against 9.6 MB in 0.21 s for the whole list.
+- **Configuration without dead settings** (0.90.17): two FUSE keys that did
+  nothing and an old alias removed; the example's comments rewritten.
 - **Operator housekeeping, 2026-10-05**: 103 empty directories under
   `/Movies`, `/Music` and `/TV` on gbni-1 removed; fi-1's old backend copy
   `/var/lib/macha/data.moved-20260929` deleted; repair weight 20 against 80
