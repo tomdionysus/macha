@@ -22,8 +22,9 @@ manifest change (per-family shards, growable count), batched profile
 publication, and holdings for catalogue DATA. It removes the two failures
 of the burst test below, the polling refresh and its TTL, the second
 repair per pass (section 6's question, answered), and every whole-snapshot
-copy. Eleven stages, each shipping alone; stage 1 is measurement. The
-`cache()` generation guard is 0.90.26, deployed.
+copy. Eleven stages, each shipping alone: correctness first (the install
+point), then measurement, then cost. The `cache()` generation guard is
+0.90.26, deployed.
 
 ## 1. Failing tests and defects
 
