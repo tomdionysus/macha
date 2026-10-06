@@ -165,9 +165,8 @@ From the local-first work
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
   before reuse.
-- gbni-1 runs at `log_level: ALL` for the multi-file match trace (item 2);
-  its config before that is `macha.yaml.before-trace`. Put it back to DEBUG
-  once the trace is caught.
+- Both nodes log at DEBUG. gbni-1's ALL trace for matching ended on
+  2026-10-06 (restored from `macha.yaml.before-trace` by SIGHUP).
 - gbni-1 keeps its heap-check drop-in (`/root/heap-check.conf.keep`).
 - Observation windows: `/etc/macha/state/observation/observations.jsonl` on
   both.
