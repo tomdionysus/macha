@@ -28,6 +28,14 @@ struct DistributedStoreOptions {
     std::function<void(std::string_view, std::string_view)> repair_trace;
 };
 
+// What a CONTROL offer did: `held_by` counts the nodes that hold every
+// object afterwards, the offering node included.
+struct ControlOffer {
+    size_t held_by{};
+    size_t objects_sent{};
+    uint64_t bytes_sent{};
+};
+
 class DistributedStore final : public Placement, public ControlObjectSource {
   public:
     struct ObjectBuffer {
@@ -281,6 +289,11 @@ class DistributedStore final : public Placement, public ControlObjectSource {
                                   FrameType = FrameType::control);
     bool retain_on(const NodeInfo&, RetentionClass, const std::vector<ObjectId>&,
                    const RetentionDot&);
+    // Sends `target` the objects of `ids` (sorted, unique, held here) it
+    // lacks; a peer that cannot say is sent all of them. False if any put
+    // failed. Counts what was sent into `out`.
+    bool offer_control_on(const NodeInfo& target, const std::vector<ObjectId>& ids,
+                          FrameType frame, ControlOffer& out);
     // For each object, walks its candidates in preference order collecting up
     // to `floor` present nodes, with presence checked in node-grouped
     // have_objects rounds rather than one RPC per (object, candidate).
@@ -388,7 +401,10 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // Placement: whether this node is in the object's owner set.
     bool owns(const ObjectId& id) const override { return should_own(id); }
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);
-    size_t replicate_control(const ObjectId&, std::span<const uint8_t>);
+    // Offers CONTROL objects this node holds to every other node present:
+    // each is asked what it lacks (one batched question) and sent only that.
+    // Background work, on the speculative lane.
+    ControlOffer offer_control(const std::vector<ObjectId>&);
     bool ensure_local(const ObjectId&, bool foreground = false);
     bool ensure_control_local(const ObjectId&) override;
     bool locally_available(const ObjectId&) const;

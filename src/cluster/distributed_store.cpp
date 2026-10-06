@@ -1105,48 +1105,6 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
     if (ids.empty())
         return true;
 
-    // Ask the peer what it is missing before sending anything, so a commit's
-    // cost scales with what changed, not with the namespace's size. A peer
-    // that cannot answer is sent everything.
-    auto missing_on = [&](const NodeInfo& target) {
-        std::vector<ObjectId> missing;
-        constexpr size_t probe_batch = 4096;
-        for (size_t offset = 0; offset < ids.size(); offset += probe_batch) {
-            const auto end = std::min(ids.size(), offset + probe_batch);
-            Writer writer;
-            writer.u32(static_cast<uint32_t>(end - offset));
-            for (size_t i = offset; i < end; ++i)
-                writer.fixed(ids[i].bytes);
-            try {
-                auto reply = bounded_control_call(target, MessageType::have_control_objects,
-                                                  writer.data());
-                if (reply.message.type != MessageType::have_control_objects_reply)
-                    throw std::runtime_error(reply_error_text(reply));
-                Reader reader(reply.message.payload);
-                const auto count = reader.u32();
-                if (count != end - offset)
-                    throw std::runtime_error("control presence reply count mismatch");
-                for (size_t i = offset; i < end; ++i)
-                    if (!reader.u8())
-                        missing.push_back(ids[i]);
-                reader.finish();
-            } catch (const std::exception& error) {
-                Log::debug("CONTROL presence probe peer=" + target.host +
-                           " error=" + error.what() + "; sending the whole graph");
-                return ids;
-            }
-        }
-        return missing;
-    };
-
-    // Puts to a candidate are pipelined, bounded by what the connection holds:
-    // a put occupies a writer queue slot until sent and a pending-reply slot
-    // until answered, so the limit is the smaller of the two. A quarter of it,
-    // because this graph shares the lane with heartbeats, commits and status
-    // traffic; taking more than a share of a shared budget overruns it.
-    const size_t connection_budget =
-        std::min(max_pending_rpc_requests, max_peer_outbound_messages);
-    const size_t put_window = std::max<size_t>(1, connection_budget / 4);
     auto put_graph_on = [&](const NodeInfo& target) {
         if (target.id == n_.node_id()) {
             // Not presence-filtered: LocalStore::put refreshes an existing
@@ -1159,62 +1117,8 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
             }
             return true;
         }
-        const auto missing = missing_on(target);
-        if (missing.size() != ids.size() && Log::enabled(LogLevel::debug))
-            Log::debug("CONTROL graph peer=" + target.host +
-                       " referenced=" + std::to_string(ids.size()) +
-                       " missing=" + std::to_string(missing.size()));
-        if (missing.empty())
-            return true;
-        std::vector<std::pair<AsyncRpc, size_t>> in_flight;
-        in_flight.reserve(std::min(put_window, missing.size()));
-        const auto put_started = Clock::now();
-        bool ok = true;
-        size_t bytes_sent = 0;
-        auto drain = [&] {
-            for (auto& [rpc, size] : in_flight) {
-                try {
-                    if (rpc.get().message.type == MessageType::ok)
-                        bytes_sent += size;
-                    else
-                        ok = false;
-                } catch (const std::exception& error) {
-                    Log::debug("CONTROL retention object store peer=" + target.host +
-                               " error=" + error.what());
-                    ok = false;
-                }
-            }
-            in_flight.clear();
-        };
-        for (const auto& id : missing) {
-            if (in_flight.size() >= put_window)
-                drain();
-            // Read bytes only for what is sent.
-            auto bytes = local_.control().get(id);
-            if (!bytes) {
-                for (auto& [rpc, _] : in_flight)
-                    rpc.cancel();
-                return false;
-            }
-            Writer writer;
-            writer.fixed(id.bytes);
-            writer.bytes(*bytes);
-            try {
-                in_flight.emplace_back(n_.call_async(target, MessageType::put_control_object,
-                                                     writer.data(), FrameType::control),
-                                       bytes->size());
-            } catch (const std::exception& error) {
-                Log::debug("CONTROL retention object store peer=" + target.host +
-                           " error=" + error.what());
-                for (auto& [rpc, _] : in_flight)
-                    rpc.cancel();
-                return false;
-            }
-        }
-        drain();
-        if (bytes_sent)
-            note_network(bytes_sent, Clock::now() - put_started);
-        return ok;
+        ControlOffer sent;
+        return offer_control_on(target, ids, FrameType::control, sent);
     };
 
     // Critical-path CONTROL publication claims on a few nodes, not on
@@ -2153,36 +2057,127 @@ size_t DistributedStore::replicate_all(const ObjectId& id, std::span<const uint8
     return success;
 }
 
-size_t DistributedStore::replicate_control(const ObjectId& id,
-                                             std::span<const uint8_t> data) {
-    size_t success = 0;
-    Writer writer;
-    writer.fixed(id.bytes);
-    writer.bytes(data);
-    const auto payload = writer.take();
-
-    // Every active node is a metadata/control replica; publication policy
-    // decides how many durable acknowledgements are required.
-    for (const auto& target : n_.membership().active()) {
+bool DistributedStore::offer_control_on(const NodeInfo& target, const std::vector<ObjectId>& ids,
+                                        FrameType frame, ControlOffer& out) {
+    // Ask the peer what it is missing before sending anything, so the cost
+    // scales with what changed, not with the graph's size. A peer that
+    // cannot answer is sent everything.
+    std::vector<ObjectId> missing;
+    constexpr size_t probe_batch = 4096;
+    for (size_t offset = 0; offset < ids.size(); offset += probe_batch) {
+        const auto end = std::min(ids.size(), offset + probe_batch);
+        Writer writer;
+        writer.u32(static_cast<uint32_t>(end - offset));
+        for (size_t i = offset; i < end; ++i)
+            writer.fixed(ids[i].bytes);
         try {
-            if (target.id == n_.node_id()) {
-                if (local_.control().put(id, data))
-                    ++success;
-                continue;
-            }
-
-            auto started = Clock::now();
-            auto reply = n_.call(target, MessageType::put_control_object, payload,
-                                 FrameType::speculative);
-            if (reply.message.type == MessageType::ok) {
-                ++success;
-                note_network(data.size(), Clock::now() - started);
-            }
-        } catch (const std::exception& e) {
-            Log::debug("control object write " + target.host + ": " + e.what());
+            auto reply = bounded_control_call(target, MessageType::have_control_objects,
+                                              writer.data());
+            if (reply.message.type != MessageType::have_control_objects_reply)
+                throw std::runtime_error(reply_error_text(reply));
+            Reader reader(reply.message.payload);
+            const auto count = reader.u32();
+            if (count != end - offset)
+                throw std::runtime_error("control presence reply count mismatch");
+            for (size_t i = offset; i < end; ++i)
+                if (!reader.u8())
+                    missing.push_back(ids[i]);
+            reader.finish();
+        } catch (const std::exception& error) {
+            Log::debug("CONTROL presence probe peer=" + target.host +
+                       " error=" + error.what() + "; sending the whole graph");
+            missing = ids;
+            break;
         }
     }
-    return success;
+    if (missing.size() != ids.size() && Log::enabled(LogLevel::debug))
+        Log::debug("CONTROL graph peer=" + target.host +
+                   " referenced=" + std::to_string(ids.size()) +
+                   " missing=" + std::to_string(missing.size()));
+    if (missing.empty())
+        return true;
+
+    // Puts to a peer are pipelined, bounded by what the connection holds: a
+    // put occupies a writer queue slot until sent and a pending-reply slot
+    // until answered, so the limit is the smaller of the two. A quarter of
+    // it, because this graph shares the lane with heartbeats, commits and
+    // status traffic; taking more than a share of a shared budget overruns it.
+    const size_t connection_budget =
+        std::min(max_pending_rpc_requests, max_peer_outbound_messages);
+    const size_t put_window = std::max<size_t>(1, connection_budget / 4);
+    std::vector<std::pair<AsyncRpc, size_t>> in_flight;
+    in_flight.reserve(std::min(put_window, missing.size()));
+    const auto put_started = Clock::now();
+    bool ok = true;
+    uint64_t bytes_sent = 0;
+    auto drain = [&] {
+        for (auto& [rpc, size] : in_flight) {
+            try {
+                if (rpc.get().message.type == MessageType::ok) {
+                    bytes_sent += size;
+                    ++out.objects_sent;
+                } else {
+                    ok = false;
+                }
+            } catch (const std::exception& error) {
+                Log::debug("CONTROL object store peer=" + target.host + " error=" + error.what());
+                ok = false;
+            }
+        }
+        in_flight.clear();
+    };
+    for (const auto& id : missing) {
+        if (in_flight.size() >= put_window)
+            drain();
+        // Read bytes only for what is sent.
+        auto bytes = local_.control().get(id);
+        if (!bytes) {
+            for (auto& [rpc, _] : in_flight)
+                rpc.cancel();
+            return false;
+        }
+        Writer writer;
+        writer.fixed(id.bytes);
+        writer.bytes(*bytes);
+        try {
+            in_flight.emplace_back(
+                n_.call_async(target, MessageType::put_control_object, writer.data(), frame),
+                bytes->size());
+        } catch (const std::exception& error) {
+            Log::debug("CONTROL object store peer=" + target.host + " error=" + error.what());
+            for (auto& [rpc, _] : in_flight)
+                rpc.cancel();
+            return false;
+        }
+    }
+    drain();
+    out.bytes_sent += bytes_sent;
+    if (bytes_sent)
+        note_network(bytes_sent, Clock::now() - put_started);
+    return ok;
+}
+
+ControlOffer DistributedStore::offer_control(const std::vector<ObjectId>& input) {
+    auto ids = input;
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    ControlOffer out;
+    if (std::any_of(ids.begin(), ids.end(),
+                    [&](const ObjectId& id) { return !local_.control().has(id); }))
+        return out;
+    for (const auto& target : n_.membership().active()) {
+        if (target.id == n_.node_id()) {
+            ++out.held_by;
+            continue;
+        }
+        try {
+            if (ids.empty() || offer_control_on(target, ids, FrameType::speculative, out))
+                ++out.held_by;
+        } catch (const std::exception& error) {
+            Log::debug("CONTROL offer peer=" + target.host + " error=" + error.what());
+        }
+    }
+    return out;
 }
 
 uint64_t DistributedStore::reachability_epoch() const noexcept {
