@@ -71,6 +71,11 @@ gone from here, and the old file with its full reasoning is
   profile publication (`media_information.cpp:367`) (Stage D); indexes
   behind list and search, which scan every item (`catalogue.cpp:1110`)
   (Stage E); a growable shard count (Stage F); a per-shard three-way merge.
+- **Catalogue DATA has no holdings.** Artwork and media indexes are outside
+  the tree, so they are the inventory's flat `outside_namespace` list and
+  `known_present` does not trust them; lost artwork is found only by a
+  full repair walk. The analogue of tree holdings is holdings per shard:
+  this shard's DATA objects, held and where.
 - **`GET catalogue/status` walks all artwork** and asks the store for each
   (`catalogue.cpp:896`).
 - **Clear Metadata is synchronous** and finds descendants by a fixed-point
