@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.27.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.28.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -26,14 +26,19 @@ copy. Eleven stages, each shipping alone: correctness first (the install
 point), then measurement, then cost. Stage 1 (one install point, the
 installer) is 0.90.27. Next: stage 2, maintenance reduced.
 
-Found deploying 0.90.27, for stage 2: maintenance's catalogue stage takes 14
-to 30 s on gbni-1 (`DIAG maintenance-stage stage=catalogue-repair`, every
-restart since at least 10:34Z on 2026-10-06, and between restarts, e.g.
-11:43Z and 11:47Z). Suspect, not proven: every catalogue commit resets the
-control convergence state, and the next pass offers the manifest and all 64
-shards to every node present over the WAN, though the commit already
-shipped its changed shards with its claims. Stage 2 converges only what
-`shard_changes` names, and measures it.
+**Proven 2026-10-06 (0.90.28 timing), next to fix:** maintenance's catalogue
+stage is entirely the control convergence. Each time it runs, it sends the
+manifest and all 64 shards, 65 objects and 5.4 MB, in full to every node
+present, one blocking call at a time, with no presence check: 21.8 s on
+fi-1 and 30.6 s on gbni-1 after the 0.90.28 restarts, though both nodes held
+that root. It runs at every start, after every catalogue commit (a commit
+resets the converged state), on a membership change and on each failed
+retry; the maintenance thread is blocked for the whole of it. The commit
+path already does this properly (`retain_control`: one batched
+`have_control_objects` probe, then only what is missing, with a put window);
+convergence still uses `replicate_control`. Load and decode of the whole
+catalogue is small by comparison: 56 ms on fi-1, 246 ms on gbni-1 (6,866
+items, 6,289 profiles).
 
 ## 1. Failing tests and defects
 
@@ -156,7 +161,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.27**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.28**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -166,7 +171,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.27` back to
+  in place before that version was installed (`pre-0.90.28` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
