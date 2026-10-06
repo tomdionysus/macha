@@ -2,7 +2,7 @@
 
 Last updated: 2026-10-06
 
-## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.18
+## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.19
 
 All deployed on gbni-1 and fi-1, merged to `develop` and `main` (`0c5492f`).
 Detail in `CHANGELOG.md` under each version; the plans and evidence are in
@@ -36,6 +36,10 @@ Detail in `CHANGELOG.md` under each version; the plans and evidence are in
 - **A title's files** (0.90.15): unmatch, delete by path and delete by
   content, each one call, with empty titles and parents removed
   (`2026-10-05-title-files-and-paging.md`).
+- **MusicBrainz backoff** (0.90.19): the gate waits out Retry-After (else
+  2 s doubling to 60 s); editor requests wait out up to 5 s and retry once;
+  `provider_unavailable` carries `retry_after_ms`. One rate-limit answer had
+  refused every MusicBrainz call on the node for 60 s.
 - **Paging on every list call** (0.90.18): `limit`, `cursor`, `next_cursor`;
   lists in key order (`docs/api.md`). A page of 50 catalogue items is 89 KB
   in 0.06 s against 9.6 MB in 0.21 s for the whole list.
