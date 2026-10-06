@@ -76,12 +76,23 @@ struct TorrentJob {
     // Why a stopped job waits: "extent_publication" (handed to the ingest once
     // every extent is published) or empty. Wire only.
     std::string waiting_reason;
+    // The swarm as the engine sees it. Wire only. `seeds` and `peers`: what
+    // trackers report, absent when none has said; `availability`: copies of
+    // the torrent among connected peers and this node, below 1.0 when some
+    // piece is held by none of them.
+    struct Swarm {
+        std::optional<uint64_t> seeds;
+        std::optional<uint64_t> peers;
+        double availability{};
+    };
+    std::optional<Swarm> swarm;
 };
 
 // API JSON for a torrent job, shared by the HTTP handler and the cluster RPC
 // so remote and local jobs render alike.
 Json torrent_job_api_json(const TorrentJob&);
 Json torrent_publication_json(const TorrentJob::Publication&);
+Json torrent_swarm_json(const TorrentJob::Swarm&);
 // The jobs.json shape, and the cluster RPC shape (plus the transient rates,
 // peers and ETA).
 Json torrent_job_json(const TorrentJob&);

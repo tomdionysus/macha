@@ -1306,6 +1306,11 @@ void TorrentManager::update_jobs() {
                 job.uploaded_total = status.all_time_upload > 0 ? static_cast<uint64_t>(status.all_time_upload) : 0;
                 job.peers = status.num_peers > 0 ? static_cast<unsigned>(status.num_peers) : 0;
                 job.seeds = status.num_seeds > 0 ? static_cast<unsigned>(status.num_seeds) : 0;
+                TorrentJob::Swarm swarm;
+                if (status.num_complete >= 0) swarm.seeds = static_cast<uint64_t>(status.num_complete);
+                if (status.num_incomplete >= 0) swarm.peers = static_cast<uint64_t>(status.num_incomplete);
+                swarm.availability = std::max(0.0, static_cast<double>(status.distributed_copies));
+                job.swarm = swarm;
                 if (job.download_rate && job.bytes_total >= job.bytes_completed)
                     job.eta_seconds = (job.bytes_total - job.bytes_completed + job.download_rate - 1) / job.download_rate;
                 else

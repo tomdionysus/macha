@@ -1,5 +1,16 @@
 # Current release
 
+## 0.90.20 — torrent jobs say what the swarm holds and where their ingest is (experiment)
+
+API addition: `swarm` and `ingest_node_id` on torrent jobs. No wire, protocol
+or on-disk changes beyond those fields in the cluster job view.
+
+**A torrent job reports its swarm**: the seeds and peers trackers report, and
+the availability of the torrent among connected peers. A download that stalls
+with peers but no seeds can now be told apart from one nobody can complete.
+
+**A torrent job names the node holding its ingest job** (`ingest_node_id`).
+
 ## 0.90.19 — one MusicBrainz rate-limit answer no longer refuses search for a minute (experiment)
 
 API addition: `retry_after_ms` on `provider_unavailable`. No wire, protocol or

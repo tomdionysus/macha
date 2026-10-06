@@ -2251,6 +2251,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_jobs_publication_travels_t
     job.bytes_completed = job.bytes_total;
     job.publication = TorrentJob::Publication{246, 624, 1'031'798'784, 2'607'096'508, 4200};
     job.waiting_reason = "extent_publication";
+    job.swarm = TorrentJob::Swarm{12, std::nullopt, 0.75};
     const auto wire = parse_torrent_job_wire(torrent_job_wire_json(job));
     REQUIRE(wire.publication.has_value());
     CHECK(wire.publication->published_extents == 246);
@@ -2262,16 +2263,22 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_jobs_publication_travels_t
     const auto api = torrent_job_api_json(wire);
     CHECK(api.find("publication")->find("published_extents")->asUInt64() == 246);
     CHECK(api.find("waiting_reason")->asString() == "extent_publication");
+    // The swarm, with what no tracker reported left null.
+    CHECK(api.find("swarm")->find("seeds")->asUInt64() == 12);
+    CHECK(api.find("swarm")->find("peers")->isNull());
+    CHECK(api.find("swarm")->find("availability")->asNumber() == 0.75);
     // Never persisted: a restart reports it afresh from the backend.
     const auto stored = parse_torrent_job(torrent_job_json(job));
     CHECK(!stored.publication.has_value());
     CHECK(stored.waiting_reason.empty());
+    CHECK(!stored.swarm.has_value());
     // None reported: null, never zero.
     TorrentJob quiet;
     quiet.id = "t2";
     const auto none = torrent_job_api_json(parse_torrent_job_wire(torrent_job_wire_json(quiet)));
     CHECK(none.find("publication")->isNull());
     CHECK(none.find("waiting_reason")->isNull());
+    CHECK(none.find("swarm")->isNull());
 }
 
 namespace {

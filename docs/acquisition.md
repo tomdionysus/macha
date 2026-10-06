@@ -556,6 +556,8 @@ A job with `remove_after_ms` set is removed that long after it completes -- afte
 | `eta_seconds` | integer or null | null when there is no rate to estimate from. Once linked, the ingest's |
 | `progress` | number or null | `bytes_completed / bytes_total`, capped at 1; null while `bytes_total` is 0 |
 | `ingest_job_id` | string or null | the ingest job the payload was submitted as; null until then |
+| `ingest_node_id` | string or null | the node holding that ingest job (the node that ran the torrent); null while there is none |
+| `swarm` | object or null | the swarm as the owning node's engine sees it, while it runs the torrent: `seeds` and `peers` as trackers report them (null when none has), and `availability`, the copies of the torrent among connected peers and this node; below 1.0, some piece is held by no one connected and the download cannot finish until such a peer appears |
 | `created_unix_ms`, `updated_unix_ms` | integer | milliseconds since the Unix epoch |
 | `error_code` | string or null | why the job is `blocked` or `failed`; null otherwise |
 | `error` | string or null | the English message beside `error_code` |

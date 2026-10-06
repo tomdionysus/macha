@@ -121,7 +121,7 @@ Json AcquisitionApi::request_json(const TorrentRequest& r, const std::map<NodeId
     } else {
         for (const auto* key : {"bytes_total", "bytes_completed", "download_rate", "upload_rate", "uploaded_total",
                                 "peers", "seeds", "eta_seconds", "progress", "catalogue", "publication",
-                                "waiting_reason"})
+                                "waiting_reason", "swarm"})
             out[key] = Json(nullptr);
     }
     out["id"] = r.id;
@@ -149,6 +149,13 @@ Json AcquisitionApi::request_json(const TorrentRequest& r, const std::map<NodeId
                                    ? Json(r.completed_unix_ms + *r.remove_after_ms)
                                    : Json(nullptr);
     if (!live) out["ingest_job_id"] = r.ingest_job_id.empty() ? Json(nullptr) : Json(r.ingest_job_id);
+    // The ingest job is made on the node that ran the torrent.
+    const auto ingest_id = out.find("ingest_job_id");
+    const auto ingest_node = live ? std::optional<NodeId>(live->node_id)
+                                  : r.claim ? std::optional<NodeId>(r.claim->node_id) : std::nullopt;
+    out["ingest_node_id"] = ingest_id != out.end() && !ingest_id->second.isNull() && ingest_node
+                                ? Json(to_string(*ingest_node))
+                                : Json(nullptr);
     out["error_code"] = r.error_code.empty() ? (live ? out["error_code"] : Json(nullptr)) : Json(r.error_code);
     out["error"] = r.error.empty() ? (live ? out["error"] : Json(nullptr)) : Json(r.error);
     out["created_unix_ms"] = r.created_unix_ms;
