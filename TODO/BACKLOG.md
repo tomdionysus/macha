@@ -61,25 +61,13 @@ gone from here, and the old file with its full reasoning is
 
 ## Catalogue
 
-- **The catalogue materialises everything it has.** Done: a write encodes
-  and claims only its shards (0.90.11); lists page (0.90.18). With ACTIVE
-  section 0 ([materialised view](2026-10-06-catalogue-materialised-view.md)):
-  a resident-bytes measure (Stage A); per-shard residency and reuse (half of
-  Stage C); mutations copying only the shards they touch, not the whole
-  snapshot (about ten `*current_snapshot()` sites). Left here: evicting
-  shards on demand, only if Stage A says so (the rest of Stage C); batched
-  profile publication (`media_information.cpp:367`) (Stage D); indexes
-  behind list and search, which scan every item (`catalogue.cpp:1110`)
-  (Stage E); a growable shard count (Stage F); a per-shard three-way merge.
-- **Catalogue DATA has no holdings.** Artwork and media indexes are outside
-  the tree, so they are the inventory's flat `outside_namespace` list and
-  `known_present` does not trust them; lost artwork is found only by a
-  full repair walk. The analogue of tree holdings is holdings per shard:
-  this shard's DATA objects, held and where.
+- **The catalogue's cost and residency**: the whole of it is ACTIVE
+  section 0's [plan](2026-10-06-catalogue-materialised-view.md), including
+  holdings for catalogue DATA. Nothing of it remains here.
 - **`GET catalogue/status` walks all artwork** and asks the store for each
   (`catalogue.cpp:896`).
-- **Clear Metadata is synchronous** and finds descendants by a fixed-point
-  scan (`catalogue.cpp:1409`).
+- **Clear Metadata is synchronous.** (Its descendant scan goes with the
+  plan's derived parent index.)
 - **Opaque work ids**: items are still `tmdb:movie:`/`tmdb:tv:`.
 
 ## Mount and ingest

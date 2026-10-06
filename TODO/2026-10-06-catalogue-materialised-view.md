@@ -1,7 +1,9 @@
-# The catalogue as a materialised view of the local head
+# The catalogue plan: a materialised view of the local head
 
-Status: agreed design, 2026-10-06. Not started. The P0 stopgap (a `cache()`
-that refuses an older generation) shipped in 0.90.26; this replaces it.
+Status: agreed design, 2026-10-06. Not started. Supersedes
+`archive/2026-09-17-catalogue-shard-demand-load-plan.md`, whose stages are
+folded in below or dropped. The P0 stopgap (a `cache()` that refuses an
+older generation) shipped in 0.90.26; stage 3 replaces it.
 
 ## The rule
 
@@ -10,242 +12,241 @@ head: `view = f(head.catalogue_root)`. Nothing else produces it. Two nodes
 holding the same root hold byte-identical views, and any assertion about the
 catalogue is an assertion about a root hash.
 
-This is the law the namespace already obeys. The tree is derived from the
-head, FUSE reads it, the cluster converges behind. The catalogue is the one
+This is the law the namespace already obeys. The catalogue is the one
 subsystem that keeps its own notion of "current", refreshed by polling and
 a TTL and written from two paths. Both failures of
 `test_catalogue_uses_final_state_after_coalesced_metadata_burst` are that
-exception showing through.
+exception showing through: the view stepping backwards (fi-1, 2 of 30 runs,
+`catalogue item revision changed: ... expected 6, now 5`), and a repair
+count that depends on how maintenance passes interleave with commits.
 
-## What is wrong today
+## What the tree-era work already gives the catalogue
 
-`CatalogueManager` (`src/catalogue/catalogue.cpp`) has two writers of its
-cached view:
+Built since the September plan, and reused here rather than rebuilt:
 
-- the mutation path (`upsert`, `put_artwork`, `reconcile_scanner`, ...)
-  commits, then installs the snapshot it just built via
-  `cache(committed.generation, ...)`, read from `metadata_.local()`;
-- `refresh()` polls: driven by maintenance's `catalogue_dirty`,
-  `refresh_needed()` (a `cache_until_` TTL from `metadata_cache` and the
-  server's known generation), and reads `metadata_.current()`, which can lag
-  this node's own head.
-
-Consequences:
-
-- **The view can step backwards.** A refresh reads its view before a commit
-  and caches it after, and the item just written is refused on the next call
-  with `catalogue item revision changed` (fi-1, 2 of 30 runs; proven by
-  naming both revisions in the message: `expected 6, now 5`). An editor save
-  or the scanner can get a 409 straight after a successful write.
-- **Repairs are not countable.** Maintenance runs `repair_once()` on every
-  pass while `catalogue_dirty` holds, whether or not the root moved, so the
-  number of catalogue passes a burst costs depends on how passes interleave
-  with commits (3 to 4 observed for the same burst). The test's ceiling,
-  a quarter of the node events, is an invented number and fails whenever
-  events come in under 16.
-- **Every install is a full load.** `load_root` reads and decodes all 64
-  shards and merges them, for a one-item change.
+- **Shards arrive with the commit.** A commit ships its changed control
+  objects with its claims (0.89.1); convergence is the fallback. A node
+  that received the commit holds every shard, so an install fetches only
+  when the node missed the commit.
+- **Reachability is the horizon builder.** `NodeHorizonBuilder::release`
+  asks the catalogue for each root's retained data and control
+  (`node_horizon_builder.cpp:50`); `maintenance_objects` declares the
+  manifest and shards of the cached and protected roots. Every object the
+  catalogue references is declared through these two, or GC reclaims it.
+- **`retention_objects` is already a per-shard diff** (`catalogue.cpp:1835`):
+  it decodes only shards the two manifests do not share.
+- **Commits carry the change set** (0.90.11): only changed shards are
+  encoded and claimed. **Lists page** (0.90.18).
+- **Local-first commits and `MetadataView::local()`**: this node's head is
+  always readable without a peer.
 
 ## The design
 
-1. **One install point, keyed on the root.** `install(root)`: if `root` is
-   the cached root, nothing; otherwise materialise and swap the snapshot
-   pointer. No generation bookkeeping, no dirty flag, no TTL. Today's
-   generation guard in `cache()` becomes unnecessary because there is only
-   one writer and the latest root always wins.
+### 1. The view: resident shards, shared by pointer
 
-2. **Driven by head changes, not polling.** When this node's head changes
-   (the same event FUSE wakes on, `NodeEvent::metadata`, plus every local
-   commit), the catalogue records the head's `catalogue_root` as the target
-   and wakes one worker. The worker installs whatever the target is when it
-   runs: a burst of twenty commits is one install of the final root.
-   Readers keep the old pointer until the swap; nobody waits on the worker.
-   The mutation path is the degenerate case: it already holds the decoded
-   `next` snapshot, so its install is a pointer swap with no load.
+`CatalogueView` is immutable and handed out as `shared_ptr<const>`. It holds
+the manifest and, per shard slot, a `shared_ptr<const Shard>` of decoded
+content. Two views built from roots that share a shard share the `Shard`
+object. Every shard stays resident: API reads are memory-only and never
+wait on the control store. Derived structures (the artwork-type and
+media-binding indexes `indexes()` builds today; the list and search indexes
+of section 6) are per shard and merged, so a one-shard change updates one
+shard's entries.
 
-3. **Incremental by construction.** The root is a manifest of 64
-   content-addressed shards. The view holds the decoded shard per id;
-   installing a new root decodes only the shards whose id changed and reuses
-   the rest by pointer. A single edit costs one shard. Every shard stays
-   resident, so reads stay memory-only; evicting shards (the demand-load half
-   of Stage C) waits for Stage A's measurement, see below.
+Residency is measured first (stage 1) and reported in catalogue status. If
+the number says a library cannot keep its shards resident, the answer is a
+prefetch-on-install policy on the `RetainedMemoryLedger`, never a fetch on
+read. Not planned until the number says so.
 
-4. **Maintenance keeps only real background work.** Offering the root's
-   control objects to peers (`converge_control_replicas`) runs when the root
-   or membership changes, not on every pass. The catalogue stage in
-   `maintenance.cpp` becomes: wake the worker if the head moved; converge
-   if root or membership changed.
+### 2. One install point, keyed on the root
 
-5. **Conflict reconciliation stays where it is.** `reconcile_catalogue_conflict`
-   is a commit, so it goes through the mutation path and produces a new head
-   like any other.
+`install(root)`: if `root` is the installed root, nothing. Otherwise diff
+the manifests, decode the changed shards (reusing the rest by pointer),
+build the new view, swap the pointer. The manifest diff and changed-shard
+decode are one function, `shard_changes(old_manifest, new_manifest)`, used
+by `install`, `retention_objects` and the conflict merge (section 5).
+
+No generation bookkeeping, no dirty flag, no TTL. The 0.90.26 generation
+guard is deleted: with one writer and latest-wins there is nothing to
+guard.
+
+### 3. Driven by head changes, not polling
+
+Every change of this node's head (the `NodeEvent::metadata` FUSE wakes on,
+and every local commit) records the head's `catalogue_root` as the target
+and wakes one worker. The worker installs whatever the target is when it
+runs: a burst of twenty commits is one install of the final root. Readers
+keep the old pointer until the swap; nothing waits on the worker.
+
+An install that cannot read a shard (the node missed the commit and the
+holder is away) parks, and the worker wakes again on membership or
+storage change, not per pass. Until then the previous view serves and
+status reports `catalogue_complete = false`.
+
+### 4. Mutations copy only the shards they touch
+
+A mutation starts from the installed view, copies the shards it changes,
+builds the successor view, commits it through `mutate_delta` with
+`expected_root` as now, and installs the successor view directly: no load,
+no deep copy of the snapshot. If the head's root has moved past the
+installed one, the mutation installs first (changed shards only) and
+retries once; the second attempt is against the current root by
+construction.
+
+This removes every `*current_snapshot()` deep copy (about ten sites) and
+`snapshot()` as a by-value copy (`catalogue.cpp:910`).
+
+### 5. The conflict merge compares shards first
+
+`reconcile_catalogue_conflict` loads base, left and right in full and
+merges item by item. With per-shard views it compares the three manifests
+and descends only into slots that differ; identical slots are taken as is.
+It is still a commit through the mutation path, producing a new head like
+any other.
+
+### 6. Indexes behind list and search, derived not stored
+
+`list(kind, parent)` and `search` scan every item. The index they want
+(`(kind, parent)` to ordered `(sort_title, id)`; a term to ids map) is a
+pure function of the view, so it is derived per shard at install and
+merged, not stored as objects. That keeps the format unchanged and leaves
+the horizon builder nothing new to declare. Paging already exists; a page
+then walks one ordered index instead of sorting a copy of every match.
+`clear_metadata_with_media`'s fixed-point descendant scan uses the same
+parent index.
+
+Only if stage 1's number says the derived index is too large to keep
+resident does it become stored objects, declared through
+`retention_objects` and `maintenance_objects`.
+
+### 7. One manifest change: separate shard spaces and a growable count
+
+Items, media profiles and media indexes share the 64 shards through one
+hash, so a profile publication dirties item shards. The manifest gains a
+shard vector per family, each sized from the count on the wire (so the
+count can grow; raising it is one re-root, done in the background). Old
+manifests decode unchanged. This is the only format change in the plan, so
+the two September stages that each wanted one (F and open question 2) are
+done together, once.
+
+A node not yet restarted cannot read the new manifest; it serves its last
+installed view with `catalogue_complete = false` until it is restarted.
+With two nodes and rolling-restart spacing that is minutes, and nothing
+wedges: the view stands, writes go to the restarted node. The new manifest
+is written only by new code, so the window is bounded by the restart.
+
+### 8. Batched profile publication
+
+`MediaInformationService::loop` drains its pending publications into one
+`put_media_profiles` call. One batch, one root, one install. Independent of
+everything above; small.
+
+### 9. Maintenance keeps only real background work
+
+The catalogue stage in `maintenance.cpp` becomes: wake the worker if the
+head moved; `converge_control_replicas` when the root or membership
+changed, not every pass. `maintenance_repair()` and the second repair per
+pass go. `catalogue_complete` for the inventory is a fact, installed root
+equals head root, not the outcome of a repair.
+
+### 10. Holdings for catalogue DATA
+
+Artwork and media indexes are DATA outside the tree, carried today as the
+inventory's flat `outside_namespace` list that repair covers separately and
+`known_present` does not trust. Lost artwork is found only by a full walk.
+The analogue of tree holdings is holdings per shard: a shard's DATA objects,
+held and where, rolled up like a tree node's. Last, because it is new
+mechanism rather than consolidation, and it needs stage 1's residency and
+section 7's per-family shards.
 
 ## What gets deleted
 
 - `refresh(bool)`, `refresh_needed()`, `cache_until_`,
   `cached_metadata_generation_`, the "view older than known generation,
-  defer" branch, and `catalogue_dirty` / `catalogue_retry_due` in
-  maintenance.
-- The catalogue's use of `metadata_cache`. `MetadataManager` also uses it
-  for its decoded-record cache (`metadata_manager.cpp:301`); whether that
-  use survives is a separate question, so the setting stays until it is
-  answered.
-- `test_metadata_decoded_cache_ttl_recovers_missed_notice`, if it exists
-  only to cover a missed notice the catalogue can no longer miss. Check what
-  it asserts first; it may be a MetadataManager test.
+  defer" branch, the 0.90.26 generation guard, and `catalogue_dirty` /
+  `catalogue_retry_due` in maintenance.
+- `load_root` as a merge of all 64 shards; `snapshot()` by value; every
+  `*current_snapshot()` copy.
+- `maintenance_repair()` and the inventory-time repair.
+- The catalogue's use of `metadata_cache`. `MetadataManager` keeps its own
+  use (`metadata_manager.cpp:301`); whether that survives is a separate
+  question.
+- `test_metadata_decoded_cache_ttl_recovers_missed_notice`, if it covers
+  only a missed notice the catalogue can no longer miss. Check what it
+  asserts first; it may be a `MetadataManager` test.
+
+## Dropped from the September plan
+
+- Demand-loaded shards with an LRU and fetch on read: a read could wait on
+  a WAN fetch, which breaks memory-only reads; shards arrive with the
+  commit now, so residency is the natural state.
+- Modelling the shard cache on `ReadHandle::extent`: the tree keeps no
+  resident nodes (readers construct `ControlNamespaceNodeStore::for_reading`
+  per read), and the catalogue's needs are the opposite. The view is its
+  own structure.
+- Stored index objects as the first step: derived indexes cost no format
+  change and no reachability work.
+- "Agree the paging contract first": done, 0.90.18.
+- Stage B's encoding half: done, 0.90.11.
 
 ## Cost
 
-- **Check on every head change:** a 32-byte root compare, after reading
+- **Check on every head change:** a 32-byte root compare after reading
   `catalogue_root` from the head. `MetadataManager::local()` keeps the
   decoded head and re-reads only on a `heads_revision` change, so the
-  decode is paid once by whoever needs the head after a commit. Measure that
-  decode on a FUSE-heavy head on gbni-1 before claiming it is small; if it
-  is not, the root must be readable without a full decode.
-- **Install on a root change:** proportional to changed shards, so one
-  shard for a typical edit. Today it is all 64 every time.
+  decode is paid once by whoever needs the head after a commit. Measure
+  that decode on a FUSE-heavy head on gbni-1 (stage 1); if it is not
+  small, the root must be readable without a full decode.
+- **Install on a root change:** proportional to changed shards, one for a
+  typical edit, against all 64 today.
+- **Mutation:** copies one shard, against the whole snapshot today.
 - **Serial point:** one worker, latest wins. Worst case is a peer's edit
-  appearing one install-time later than it could. Nothing blocks on it.
+  appearing one install-time later. Nothing blocks on it.
 
 ## Tests
 
 - The burst test asserts installs, not repairs: at most one install per
   distinct root adopted, so exactly one for the gated burst. A per-event
   storm fails it; no ratio, no invented ceiling.
-- A deterministic unit test on `install`: same root is a no-op; an older
+- `install` as a deterministic primitive: same root is a no-op; an older
   target queued behind a newer one is never installed; only changed shards
-  are decoded (count decodes).
-- The existing catalogue suites must pass unchanged in behaviour; the
-  revision-conflict case stays as a regression guard with the named
+  are decoded (count decodes); a missing shard parks and the previous view
+  serves.
+- `shard_changes` exhaustively: identical manifests, one slot, every slot,
+  a slot added, a slot removed, each family.
+- A mutation against a moved root installs and retries once; a second move
+  is a conflict.
+- The conflict merge: identical slots are not decoded.
+- The revision-conflict case stays as a regression guard with the named
   revisions in its message.
-
-## How it fits the planned work
-
-Checked against ACTIVE, BACKLOG, the open specs and the archived plans on
-2026-10-06.
-
-**It is the frame the September shard plan was missing.**
-[`archive/2026-09-17-catalogue-shard-demand-load-plan.md`](archive/2026-09-17-catalogue-shard-demand-load-plan.md)
-(BACKLOG Catalogue, Stages A to F) fixes the catalogue's cost; this fixes
-who installs it and when. They share one data structure, the per-shard view:
-
-- *Stage A (measure)*: unchanged, and comes first: it decides whether
-  shards must ever be evicted.
-- *Stage B (commits carry the change set)*: done in 0.90.11 for encoding.
-  The other half, mutations deep-copying the whole snapshot
-  (`*current_snapshot()`, about ten sites in BACKLOG), goes with this work:
-  a mutation copies only the shards it touches.
-- *Stage C (demand-loaded shards)*: split. Per-shard residency and reuse are
-  this design. Loading on demand with an LRU on the `RetainedMemoryLedger`
-  conflicts with memory-only reads (a read could wait on a WAN fetch of a
-  shard), so it is done only if Stage A shows the resident catalogue is too
-  big, and then with a prefetch on install, not a fetch on read.
-- *Its open question 3* (three-way merge on materialised snapshots): the
-  per-shard view gives the answer, compare shard ids and merge only the
-  shards that differ. Not required for this work; it becomes cheap after it.
-- *Stage D (batched profile publication)*: independent; a batch becomes one
-  root and so one install.
-- *Stage E (indexes for list and search)*: builds on this. `indexes()` today
-  rebuilds from the whole snapshot whenever the pointer changes; with
-  per-shard installs it can update only the changed shards' entries. Paging
-  (0.90.18) already shipped the API shape Stage E needs.
-- *Stage F (growable shard count)*: independent; a re-root is one install.
-
-**It answers an open question for the operator.** ACTIVE section 6, "the
-catalogue repair that runs twice per maintenance pass", from the T4b audit
-(`archive/object-ledger-evidence/t4/README.md`): the `catalogue-repair` stage
-and `maintenance_repair()` before the inventory each run a refresh and may
-commit a conflict reconciliation. Here both go: the view is installed from
-the head, and the inventory reads the installed view. The question closes
-without a behaviour choice.
-
-**It completes the object-ledger contracts rather than bending them.** The
-spec's A2 (readers hold snapshot handles) is the view pointer. A4 (no
-implicit side effects) is satisfied more strictly: the inventory read no
-longer repairs anything. Its catalogue completeness (`maintenance_catalogue_complete_`,
-which fences destructive GC) becomes a fact rather than an outcome: the
-installed root equals the head's root. The one effect T4b left on the read,
-fetching missing manifest or shard objects into the control store, moves
-into the install worker, which is where the audit said it belonged.
-
-**It may explain the 9 to 13 s commit waits during matching** (ACTIVE
-section 2). Unverified: every mutation runs `refresh(false)` while holding
-`catalogue.mutation`, and that refresh can run `load_root`, whose
-`ensure_control_local` may fetch shards from a peer over the WAN. With this
-design a mutation never loads under the lock; it starts from the installed
-view, and if the head's root has moved past it, it installs first (changed
-shards only) or retries. gbni-1's level-ALL trace should still be taken to
-confirm or rule it out before claiming it.
-
-**It follows the standing rules.** Local always fast (the view is the
-node's own head, no peer is waited on); pace, never gate (the install
-worker is background work under `repair_share`, readers never wait on it);
-no work that cannot complete (an install whose shard cannot be fetched parks
-until membership or storage changes, rather than retrying per pass).
-
-**Not touched by it:** the unmatched list differing by node (hints are a
-node-local store, not catalogue state); `GET catalogue/status` walking all
-artwork (Stage E territory); Clear Metadata's fixed-point descendant scan
-(wants Stage E's parent index).
-
-## The September shard plan against the tree-era code
-
-The shard plan was written against 0.43.0, before the tree cutover, the
-object ledger, claims and holdings. Checked on 2026-10-06:
-
-**Unchanged, so its stages stand.** The catalogue's own storage: a root in
-the head, a manifest of 64 content-addressed shards, `catalogue_shard(id)`;
-media indexes were added to the shard format (0022) additively. Shards are
-still read through `ensure_control_local` and the control store. The
-three-way merge is already root-based (conflicts carry base, left and right
-roots; `common_ancestor_catalogue_root`). `RetainedMemoryLedger` and
-`snapshot_resident_bytes` exist. `snapshot()` is still a full deep copy
-(`catalogue.cpp:910`).
-
-**Changed, so its assumptions do not.**
-
-1. *Shards arrive with the commit.* A commit ships its changed control
-   objects with its claims (0.89.1); convergence is the fallback. A node
-   that received the commit holds every shard, so an install fetches only
-   when the node missed the commit. This is what makes resident shards and
-   memory-only reads safe, and why the demand-load half of Stage C is the
-   wrong shape, not merely later.
-2. *Reachability is the horizon builder.* `NodeHorizonBuilder::release`
-   asks the catalogue for each root's retained data and control
-   (`node_horizon_builder.cpp:50`); `maintenance_objects` puts the manifest
-   and shards of the cached and protected roots in `control_live`. Any new
-   manifest entry (Stage E indexes, Stage F's longer vector) must be
-   declared through `retention_objects` and `maintenance_objects` or
-   control GC reclaims it.
-3. *`retention_objects` is already the per-shard diff* (`catalogue.cpp:1835`):
-   it decodes only shards the two manifests do not share. The install's
-   changed-shard decode is the same operation; write it once.
-4. *Holdings do not cover catalogue DATA.* Artwork and media indexes sit
-   outside the tree, carried as the inventory's flat `outside_namespace`
-   list, which repair covers separately and `known_present` does not trust.
-   "Artwork held by no online node" has no cheap count. Holdings per shard
-   (this shard's DATA objects: held, where) would be the analogue. Not in
-   this plan; recorded in BACKLOG.
-5. *No cache to copy.* The tree keeps no resident nodes: readers construct
-   `ControlNamespaceNodeStore::for_reading` over the control store per
-   read. The catalogue's reads must be memory-only, so the view keeps its
-   shards resident. It is its own structure.
-6. *One hash space, three families.* Items, profiles and media indexes
-   share the 64 shards, so a profile or index publication dirties item
-   shards. September's open question 2, bigger.
 
 ## Order of work
 
-1. The P0 guard in `cache()` (done, 0.90.26).
-2. Stage A: measure resident bytes (the shard-level view needs the number
-   to decide eviction later).
-3. Shard-level view with reuse; mutations copy only the shards they touch.
-4. `install(root)` plus the head-change worker; remove the polling paths.
-5. Maintenance stage reduced to wake and converge; `maintenance_repair()`
-   and its second repair per pass go.
-6. Rewrite the burst test; add the install unit test; remove the dead TTL
-   test if it is the catalogue's.
-7. Measure `local()` decode cost and `load_root` time on gbni-1 before and
-   after; record both in COMPLETED.
+Each stage ships on its own and leaves the suite green; no stage waits on
+a later one.
 
-Estimate: a day, not an hour.
+1. **Measure.** `catalogue_resident_bytes` in status, modelled on
+   `snapshot_resident_bytes`; the `local()` decode cost on gbni-1; the
+   current `load_root` time there. Numbers before shapes.
+2. **The view and `shard_changes`.** Resident per-shard `CatalogueView`;
+   `retention_objects` rewritten over `shard_changes`; `load_root` becomes
+   the first install. Behaviour unchanged; the deep copies go.
+3. **`install` and the worker.** One install point driven by head changes;
+   the polling paths, the TTL and the 0.90.26 guard deleted; the burst test
+   rewritten; the install primitive tests added.
+4. **Maintenance reduced** to wake and converge; `maintenance_repair()`
+   removed; `catalogue_complete` as a fact.
+5. **Mutations over the view**: copy touched shards, install the successor
+   directly, retry once on a moved root.
+6. **The conflict merge per shard.**
+7. **Derived indexes** for list, search and the descendant scan.
+8. **The manifest change**: per-family shard vectors with a growable
+   count. Announced to Core and every client before it ships: no API
+   change, but the rolling-restart window is theirs to know.
+9. **Batched profile publication.**
+10. **Holdings for catalogue DATA**, with its own design note first.
+11. **Measure again** (stage 1's three numbers) and record both in
+    COMPLETED.
+
+Stages 2 to 5 are the materialised view proper, about a day. Stages 6 to 9
+are each small once the view exists.
