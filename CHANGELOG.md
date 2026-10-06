@@ -1,5 +1,14 @@
 # Current release
 
+## 0.90.31: what an installed catalogue holds
+
+No API, wire, protocol or on-disk changes. A DEBUG line at each catalogue
+install, `catalogue installed`: the root and generation, whether the view
+came from the commit that wrote it or was loaded from the control store,
+items, the estimated resident bytes, the install time and the running
+install and load counts. Metadata and the catalogue estimate resident
+bytes with the same helpers.
+
 ## 0.90.30: the maintenance inventory reads the installed catalogue
 
 No API, wire, protocol or on-disk changes.

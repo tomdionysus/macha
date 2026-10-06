@@ -274,4 +274,22 @@ MACHA_TEST("catalogue_maintenance", test_an_install_racing_a_commit_takes_what_i
     CHECK(other.get("movie:2").has_value());
 }
 
+MACHA_TEST("catalogue_maintenance", test_resident_bytes_count_what_the_catalogue_holds) {
+    CatalogueSnapshot snapshot;
+    const auto empty = catalogue_resident_bytes(snapshot);
+    CHECK(empty == sizeof(CatalogueSnapshot));
+    auto item = movie("movie:one", "One");
+    snapshot.items.emplace(item.id, item);
+    const auto one = catalogue_resident_bytes(snapshot);
+    CHECK(one > empty);
+    // The baseline already counted the empty synopsis's inline buffer.
+    snapshot.items.at("movie:one").synopsis = std::string(10000, 's');
+    const auto long_synopsis = catalogue_resident_bytes(snapshot);
+    CHECK(long_synopsis >= one + 10000 - sizeof(std::string));
+    CatalogueSnapshot::MediaProfile profile;
+    profile.probe.streams.resize(4);
+    snapshot.media_profiles.emplace("media:one", profile);
+    CHECK(catalogue_resident_bytes(snapshot) >= long_synopsis + 4 * sizeof(MediaStreamInfo));
+}
+
 } // namespace
