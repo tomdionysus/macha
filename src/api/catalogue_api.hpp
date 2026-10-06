@@ -15,7 +15,6 @@ namespace macha {
 class CatalogueApi {
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
-    std::function<void(const std::vector<std::string>&)> request_media_rescan_;
     std::function<size_t(const std::vector<std::string>&)> request_media_profiles_;
     // Resolves a media profile now, at foreground priority, and persists it:
     // clients need the facts, so "no profile yet" is never an answer. Absent only
@@ -37,7 +36,6 @@ class CatalogueApi {
     using AvailabilitySource = std::function<std::shared_ptr<const AvailabilitySnapshot>()>;
     CatalogueApi(
         CatalogueManager& catalogue, CatalogueHintQueue& hints,
-        std::function<void(const std::vector<std::string>&)> request_media_rescan = {},
         std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
         std::function<std::optional<MediaProbeResult>(const std::string&)> resolve_media_profile = {},
         std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24 * 30),
@@ -45,7 +43,6 @@ class CatalogueApi {
         std::function<std::optional<Bytes>(const std::string&)> keyframe_index = {},
         AvailabilitySource availability = {})
         : catalogue_(catalogue), hints_(hints),
-          request_media_rescan_(std::move(request_media_rescan)),
           request_media_profiles_(std::move(request_media_profiles)),
           resolve_media_profile_(std::move(resolve_media_profile)),
           artwork_capability_ttl_(artwork_capability_ttl), media_size_(std::move(media_size)),

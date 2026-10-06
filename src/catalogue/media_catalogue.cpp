@@ -2785,41 +2785,6 @@ void CatalogueScanner::request_rescan() {
     rescan_requested_.store(true, std::memory_order_relaxed);
 }
 
-size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& media_ids) {
-    if (media_ids.empty())
-        return 0;
-    {
-        Lock lock(config_mutex_);
-        if (!config_.enabled)
-            return 0;
-    }
-
-    std::set<std::string> wanted(media_ids.begin(), media_ids.end());
-    std::vector<CatalogueHintSubmission> submissions;
-
-    // Enqueue only the paths of the unbound media ids, never a full rescan.
-    MetadataSnapshotView view;
-    const auto media_files = fs_.media_files(view);
-    {
-        Lock lock(config_mutex_);
-        for (const auto& [path, media_id] : media_files) {
-            if (!wanted.contains(media_id))
-                continue;
-            std::string root;
-            auto* provider = provider_for_path(path, root);
-            if (!provider || !provider->accepts_path(path))
-                continue;
-            submissions.push_back({path, "manual", media_id,
-                                   CatalogueHintPriority::manual_rescan});
-        }
-    }
-
-    const auto queued = hints_.submit_many(std::move(submissions)).size();
-    Log::debug("catalogue metadata clear targeted rematch media_ids=" +
-               std::to_string(wanted.size()) + " queued=" + std::to_string(queued));
-    return queued;
-}
-
 size_t CatalogueScanner::request_media_profiles(const std::vector<std::string>& media_ids) {
     if (media_information_)
         return media_information_->request(media_ids, MediaInformationPriority::requested,

@@ -184,6 +184,10 @@ class Service {
         wait_services_ready();
         return services_->files_api();
     }
+    ManageApi& manage_api() {
+        wait_services_ready();
+        return services_->manage_api();
+    }
     CatalogueApi& catalogue_api() {
         wait_services_ready();
         return services_->catalogue_api();

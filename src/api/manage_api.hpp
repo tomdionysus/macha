@@ -48,7 +48,8 @@ class ManageApi {
     HttpResponse handle(const HttpRequest&);
 
     // A title's files, which change the namespace, the catalogue and the
-    // unmatched list together: DELETE /api/v1/catalogue/items/{id}/media/{media_id},
+    // unmatched list together: DELETE /api/v1/catalogue/items/{id}/metadata,
+    // DELETE /api/v1/catalogue/items/{id}/media/{media_id},
     // DELETE /api/v1/files/{path} and DELETE /api/v1/files?hash=. The service
     // sends these here.
     static bool title_file_route(const HttpRequest&);

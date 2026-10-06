@@ -61,9 +61,6 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       catalogue_api_(
           catalogue_, catalogue_hints_,
           [this](const std::vector<std::string>& media_ids) {
-              scanner_.request_media_rescan(media_ids);
-          },
-          [this](const std::vector<std::string>& media_ids) {
               return scanner_.request_media_profiles(media_ids);
           },
           [this](const std::string& media_id) -> std::optional<MediaProbeResult> {

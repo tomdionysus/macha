@@ -444,8 +444,8 @@ class CatalogueScanner {
     FileSystem& fs_;
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
-    // Held across probe_unmatched()'s media probe and the namespace walks
-    // of request_media_rescan() and request_media_profiles().
+    // Held across probe_unmatched()'s media probe and the namespace walk of
+    // request_media_profiles().
     mutable IoMutex config_mutex_;
     CatalogueScannerConfig config_ MACHA_GUARDED_BY(config_mutex_);
     std::unique_ptr<HttpClient> http_;
@@ -544,8 +544,12 @@ class CatalogueScanner {
     void request_stop();
     void stop();
     void reconfigure(CatalogueScannerConfig);
+    // Whether scanning is configured on.
+    bool enabled() const {
+        Lock lock(config_mutex_);
+        return config_.enabled;
+    }
     void request_rescan();
-    size_t request_media_rescan(const std::vector<std::string>& media_ids);
     size_t request_media_profiles(const std::vector<std::string>& media_ids);
     std::vector<MediaProbeCandidate> probe_unmatched(std::string_view hint_id);
     // Match an unmatched file to a provider reference (`tmdb:movie:<id>`,

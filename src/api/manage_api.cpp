@@ -615,6 +615,19 @@ std::optional<std::pair<std::string, std::string>> unmatch_target(std::string_vi
     return std::pair{std::string(rest.substr(0, infix)), std::string(media)};
 }
 
+constexpr std::string_view metadata_suffix = "/metadata";
+
+// The item id of a Clear Metadata path, or nothing.
+std::optional<std::string> clear_metadata_target(std::string_view path) {
+    if (!path.starts_with(items_prefix) || !path.ends_with(metadata_suffix))
+        return {};
+    const auto id = path.substr(items_prefix.size(),
+                                path.size() - items_prefix.size() - metadata_suffix.size());
+    if (id.empty() || id.find('/') != std::string_view::npos)
+        return {};
+    return std::string(id);
+}
+
 std::optional<uint64_t> if_match_revision(const HttpRequest& request) {
     auto it = request.headers.find("if-match");
     if (it == request.headers.end())
@@ -642,7 +655,8 @@ bool ManageApi::title_file_route(const HttpRequest& request) {
         return false;
     if (request.path == files_root || request.path.starts_with(std::string(files_root) + "/"))
         return true;
-    return unmatch_target(request.path).has_value();
+    return unmatch_target(request.path).has_value() ||
+           clear_metadata_target(request.path).has_value();
 }
 
 HttpResponse ManageApi::title_files(const HttpRequest& request) {
@@ -651,6 +665,20 @@ HttpResponse ManageApi::title_files(const HttpRequest& request) {
         for (const auto& path : fs_.media_paths(media_id))
             hints_.put_unmatched(path, media_id);
     };
+
+    // Clear Metadata: the item and everything beneath it go, and their files
+    // go to the unmatched list to be identified by hand.
+    if (const auto item_id = clear_metadata_target(request.path)) {
+        const auto revision = if_match_revision(request);
+        if (catalogue_.definitely_absent(*item_id))
+            return http_error(404, "not_found", "catalogue item not found");
+        const auto cleared = catalogue_.clear_metadata_with_media(*item_id, revision);
+        if (!cleared.removed_items)
+            return http_error(404, "not_found", "catalogue item not found");
+        for (const auto& media_id : cleared.media_ids)
+            unmatched(media_id);
+        return {204, "application/json; charset=utf-8", {}, {}};
+    }
 
     if (const auto target = unmatch_target(request.path)) {
         const auto& [item_id, media_id] = *target;

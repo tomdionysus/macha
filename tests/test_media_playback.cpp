@@ -2131,7 +2131,7 @@ MACHA_TEST("media_playback", test_playback_probes_once_and_replays_idempotent_cr
             if (!found) return std::nullopt;
             return found->second.size;
         };
-        CatalogueApi catalogue_api(node.catalogue(), node.hints(), {}, {}, {}, std::chrono::hours(24 * 30),
+        CatalogueApi catalogue_api(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(24 * 30),
                                    media_size);
         auto profile_request = playback_request("GET", "/api/v1/catalogue/media/" + first_media_id + "/profile");
         auto response = catalogue_api.handle(profile_request);
@@ -2260,7 +2260,7 @@ MACHA_TEST("media_playback", test_playback_probes_once_and_replays_idempotent_cr
             ++queue_requests;
             return information->request(media_ids, MediaInformationPriority::requested, "media-information-api");
         };
-        CatalogueApi catalogue_api(node.catalogue(), node.hints(), {}, queue);
+        CatalogueApi catalogue_api(node.catalogue(), node.hints(), queue);
         auto pending = catalogue_api.handle(playback_request("GET", "/api/v1/catalogue/media/" + media_id + "/profile"));
         REQUIRE(pending.status == 202);
         CHECK(pending.headers.at("Retry-After") == "1");
@@ -2304,7 +2304,7 @@ MACHA_TEST("media_playback", test_playback_probes_once_and_replays_idempotent_cr
         auto pending_then_failed = [&](const std::vector<std::string>&) {
             return ++requests == 1 ? size_t{1} : size_t{0};
         };
-        CatalogueApi catalogue_api(node.catalogue(), node.hints(), {}, pending_then_failed);
+        CatalogueApi catalogue_api(node.catalogue(), node.hints(), pending_then_failed);
         REQUIRE(catalogue_api.handle(playback_request("GET", "/api/v1/catalogue/media/" + media_id + "/profile"))
                     .status == 202);
         auto engine = std::make_shared<FakeMediaEngine>();
