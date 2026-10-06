@@ -11,15 +11,30 @@ Items marked *carried* come from
 `archive/2026-10-05-ACTIVE-before-rationalisation.md` and have not been
 re-checked since.
 
+## 0. The catalogue as a materialised view of the local head
+
+Design: [`2026-10-06-catalogue-materialised-view.md`](2026-10-06-catalogue-materialised-view.md).
+The catalogue view becomes a pure function of this node's head, installed
+at one point, driven by head changes, decoded per changed shard. It removes
+the two failures of the burst test below (the view stepping backwards and
+the uncountable repair passes), the polling refresh and its TTL, and does
+BACKLOG Catalogue Stage C at the same time. Work in the order the document
+gives; step 1 (the `cache()` generation guard) is in the tree, uncommitted.
+
 ## 1. Failing tests and defects
 
-- **P0: `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`**
-  failed on fi-1 (0.90.20 suite, 2026-10-06 08:23Z, 34 ms in; then 1 of 5
-  standalone runs), `catalogue item revision changed`: node 2's
-  `put_artwork` with the revision its own `upsert` had just returned was
-  refused, so its catalogue view moved between the two calls. First failure
-  in any suite log on fi-1. Not reproduced since (0 of 12 verbose runs, 0 of
-  6 group runs on fi-1, 0 of 10 on the laptop).
+- **P0: `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`**,
+  two failures, both resolved by section 0:
+  - `catalogue item revision changed: movie:coalesced-catalogue expected 6,
+    now 5` (fi-1, 2 of 30 runs): a background `refresh()` installed an older
+    view over the one `upsert` had just cached. Guarded in `cache()` in the
+    tree (0 of 50 runs since); the proper fix is one install point.
+  - `unexpected catalogue repair count for one coalesced burst` (fi-1, 5 of
+    30 runs): the burst coalesces correctly (one follow-up run, two
+    scheduled, asserted exactly), but maintenance runs a catalogue pass
+    every iteration while dirty, so 3 to 4 passes against 14 to 24 events
+    fails the invented quarter ratio. Not to be loosened; the test is
+    rewritten to count installs per root once section 0 lands.
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
   `/root/claude-missing-extent-driver.py` are staged on fi-1, not run.
   *Carried.*

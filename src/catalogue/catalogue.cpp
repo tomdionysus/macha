@@ -99,6 +99,11 @@ double score(std::string_view query, const CatalogueItem& item) {
     return 0.0;
 }
 
+[[noreturn]] void revision_changed(std::string_view id, uint64_t expected, uint64_t found) {
+    throw CatalogueConflict("catalogue item revision changed: " + std::string(id) + " expected " +
+                            std::to_string(expected) + ", now " + std::to_string(found));
+}
+
 GarbageRef append_garbage(MetadataSnapshot& snapshot, const ObjectId& id) {
     auto existing = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
                                  [&](const GarbageRef& candidate) { return candidate.id == id; });
@@ -712,6 +717,10 @@ void CatalogueManager::cache(uint64_t metadata_generation, const MetadataSnapsho
                              CatalogueSnapshot snapshot) {
     auto cached = std::make_shared<const CatalogueSnapshot>(std::move(snapshot));
     Lock lock(mutex_);
+    // A refresh can read its view before a mutation commits and cache it
+    // after: the older generation never replaces the newer.
+    if (ready_ && cached_ && metadata_generation < cached_metadata_generation_)
+        return;
     const bool root_changed = !control_gc_root_epoch_initialized_ ||
                               cached_root_ != metadata.catalogue_root;
     cached_ = std::move(cached);
@@ -825,7 +834,7 @@ void CatalogueManager::refresh(bool converge) {
             if (ready_ && cached_root_ == metadata.catalogue_root) {
                 // The root is content-addressed: unchanged, the cached snapshot
                 // is current, whatever the generation did.
-                cached_metadata_generation_ = generation;
+                cached_metadata_generation_ = std::max(cached_metadata_generation_, generation);
                 cache_until_ = Clock::now() + node_.config().metadata_cache;
                 last_sync_unix_ms_ = unix_ms();
                 if (control_converged && *control_converged) {
@@ -1320,7 +1329,7 @@ CatalogueItem CatalogueManager::upsert(CatalogueItem item,
         throw std::runtime_error("catalogue item id is required");
     if (it != current.items.end()) {
         if (expected_revision && it->second.revision != *expected_revision)
-            throw CatalogueConflict("catalogue item revision changed");
+            revision_changed(item.id, *expected_revision, it->second.revision);
         item.revision = it->second.revision + 1;
     } else {
         if (expected_revision)
@@ -1370,7 +1379,7 @@ bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expect
     if (it == current.items.end())
         return false;
     if (expected_revision && it->second.revision != *expected_revision)
-        throw CatalogueConflict("catalogue item revision changed");
+        revision_changed(it->first, *expected_revision, it->second.revision);
     auto old_art = data_object_ids(current);
     current.items.erase(it);
     commit(expected_root, current, old_art);
@@ -1421,7 +1430,7 @@ CatalogueClearResult CatalogueManager::clear_metadata_with_media(
     if (root == current.items.end())
         return {};
     if (expected_revision && root->second.revision != *expected_revision)
-        throw CatalogueConflict("catalogue item revision changed");
+        revision_changed(root->first, *expected_revision, root->second.revision);
 
     // Removes the entity and its descendants, returning their media ids so the
     // caller can re-enrich only those files.
@@ -1477,7 +1486,7 @@ CatalogueUnbindResult CatalogueManager::unbind_media(std::optional<std::string_v
             return result;
         result.found = true;
         if (expected_revision && found->second.revision != *expected_revision)
-            throw CatalogueConflict("catalogue item revision changed");
+            revision_changed(found->first, *expected_revision, found->second.revision);
         if (std::find(found->second.media_ids.begin(), found->second.media_ids.end(), media_id) ==
             found->second.media_ids.end())
             return result;
@@ -1749,7 +1758,7 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
     if (!item)
         throw std::runtime_error("catalogue item not found");
     if (expected_revision && item->revision != *expected_revision)
-        throw CatalogueConflict("catalogue item revision changed");
+        revision_changed(item->id, *expected_revision, item->revision);
 
     CatalogueArtwork art = stage_artwork(std::move(role), std::move(mime_type), bytes);
 
