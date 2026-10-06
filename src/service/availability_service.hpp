@@ -125,6 +125,19 @@ class AvailabilityService {
         return holdings ? holdings->missing : nullptr;
     }
 
+    // Per peer, the namespace's extents this node holds and that peer lacks,
+    // sorted, as of the last survey; a peer missing from the map could not
+    // say. Repair sends these without asking about each object.
+    struct PeerLacks {
+        // The metadata generation of the tree the peers were asked about: the
+        // lists say nothing about an object added since.
+        uint64_t generation{};
+        std::map<NodeId, std::shared_ptr<const std::vector<ObjectId>>> lacks;
+    };
+    static constexpr Waits peer_lacks_waits = Waits::none;
+    static constexpr ThreadSafety peer_lacks_safety = ThreadSafety::thread_safe;
+    std::shared_ptr<const PeerLacks> peer_lacks() const { return peer_lacks_.handle(); }
+
     // Whether the last survey found no reachable node holding the extent.
     bool unavailable(const ObjectId& id) const {
         const auto current = snapshot_.handle();
@@ -171,6 +184,7 @@ class AvailabilityService {
     // What peers are answered from; replaced whole by each roll-up.
     Published<Holdings> holdings_;
     Published<AvailabilitySnapshot> snapshot_;
+    Published<PeerLacks> peer_lacks_;
 
     // The maintenance pass's own: what the last roll-up and survey saw.
     bool surveyed_{};

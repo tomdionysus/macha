@@ -687,6 +687,23 @@ void Maintenance::run(std::stop_token stop) {
                         pull_inventory = inventory;
                     }
                     const bool pulling_listed = missing && inventory;
+                    // What a peer holds, from its own account of its holdings:
+                    // known only for the namespace's objects, and only for a
+                    // peer that could say.
+                    const auto peer_lacks = availability_.peer_lacks();
+                    const auto known_present =
+                        [&](const NodeId& peer, const ObjectId& id) -> std::optional<bool> {
+                        if (!peer_lacks || !inventory ||
+                            peer_lacks->generation != inventory->generation())
+                            return std::nullopt;
+                        const auto& outside = inventory->outside_namespace();
+                        if (std::binary_search(outside.begin(), outside.end(), id))
+                            return std::nullopt;
+                        const auto found = peer_lacks->lacks.find(peer);
+                        if (found == peer_lacks->lacks.end())
+                            return std::nullopt;
+                        return !std::binary_search(found->second->begin(), found->second->end(), id);
+                    };
                     enter_stage("network-repair");
                     const auto repair_stage = Clock::now();
                     auto repair = store_.repair_step(
@@ -704,7 +721,8 @@ void Maintenance::run(std::stop_token stop) {
                         // when membership or storage could change the answer.
                         [this](const ObjectId& id) { return availability_.unavailable(id); },
                         pulling_listed ? std::optional<std::span<const ObjectId>>(pull_list)
-                                       : std::nullopt);
+                                       : std::nullopt,
+                        known_present);
                     {
                         // Split by whether a higher class was active as the
                         // step ended: repair idle against repair on its share.
