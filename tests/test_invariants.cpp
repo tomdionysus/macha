@@ -644,6 +644,25 @@ MACHA_TEST("invariants", test_a_titles_files_are_unmatched_and_deleted_one_call_
     std::tie(status, body) = call("/api/v1/files");
     CHECK(status == 400);
     CHECK(error_code(body) == "missing_hash");
+
+    // Clear Metadata: the item and everything beneath it go, and the file
+    // goes to the unmatched list as it is. No provider is asked, which would
+    // only match it badly again.
+    write_file(fs, "/Music/A/clear.flac", pattern(4096, 9));
+    const auto clear_media = file_media_id(fs.getattr("/Music/A/clear.flac"));
+    catalogue.upsert_many({item(CatalogueKind::album, "album-2", {}),
+                           item(CatalogueKind::track, "track-9", "album-2", {clear_media}, true)});
+    std::tie(status, body) = [&] {
+        auto response = manage.handle(request_for("DELETE", "/api/v1/catalogue/items/album-2/metadata"));
+        return std::pair{response.status, Json(Json::Object{})};
+    }();
+    CHECK(status == 204);
+    CHECK(!catalogue.get("album-2").has_value());
+    CHECK(!catalogue.get("track-9").has_value());
+    CHECK(unmatched_paths().contains("/Music/A/clear.flac"));
+    CHECK(hints.summary().queued == 0);
+    std::tie(status, body) = call("/api/v1/catalogue/items/missing/metadata");
+    CHECK(status == 404);
 }
 
 MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {

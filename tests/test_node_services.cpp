@@ -103,13 +103,12 @@ void with_media(Config& config) {
     config.catalogue.scanner.music.musicbrainz.enabled = false;
 }
 
-bool has_manual_hint(CatalogueHintQueue& hints, const std::string& path,
-                     const std::string& media_id) {
+bool has_unmatched_hint(CatalogueHintQueue& hints, const std::string& path,
+                        const std::string& media_id) {
     for (const auto& hint : hints.list())
-        if (hint.path == path)
-            for (const auto& origin : hint.origins)
-                if (origin.source == "manual" && origin.source_ref == media_id)
-                    return true;
+        if (hint.path == path && hint.media_id == media_id &&
+            hint.state == CatalogueHintState::no_match)
+            return true;
     return false;
 }
 
@@ -159,24 +158,6 @@ MACHA_TEST("node_services", test_a_reload_reaches_every_service_with_live_limits
     auto& services = *bench.services;
     auto& fs = services.filesystem();
     fs.mkdir("/Movies", 0755, getuid(), getgid());
-    const auto film = [&](const std::string& name, uint8_t salt) {
-        const auto path = "/Movies/" + name + ".mkv";
-        write_file(fs, path, pattern(48 * 1024, salt));
-        const auto media_id = file_media_id(fs.getattr(path));
-        CatalogueItem item;
-        item.id = "movie:" + name;
-        item.kind = CatalogueKind::movie;
-        item.title = name;
-        item.media_ids = {media_id};
-        (void)services.catalogue().upsert(item);
-        return std::pair{path, media_id};
-    };
-    const auto before = film("before", 31);
-    const auto after = film("after", 32);
-    const auto clear = [&](const std::string& name) {
-        return services.catalogue_api().handle(
-            request("DELETE", "/api/v1/catalogue/items/movie:" + name + "/metadata"));
-    };
     const auto max_sessions = [&] {
         const auto status = services.streaming().handle(request("GET", "/api/v1/playback/status"));
         REQUIRE(status.status == 200);
@@ -184,10 +165,9 @@ MACHA_TEST("node_services", test_a_reload_reaches_every_service_with_live_limits
     };
     services.start();
 
-    // As configured: no scanner to rematch a cleared item, no hydration, the
-    // staging limit as given, completed torrents kept.
-    CHECK(clear("before").status == 204);
-    CHECK(!has_manual_hint(services.catalogue_hints(), before.first, before.second));
+    // As configured: no scanner, no hydration, the staging limit as given,
+    // completed torrents kept.
+    CHECK(!services.scanner().enabled());
     CHECK(!services.hydration().hydrator().status().enabled);
     CHECK(services.ingest().staging().limit() == bench.config.ingest.staging_limit);
     CHECK(!services.cluster_jobs().default_remove_after().has_value());
@@ -201,8 +181,7 @@ MACHA_TEST("node_services", test_a_reload_reaches_every_service_with_live_limits
     updated.streaming.max_sessions = 7;
     services.reconfigure(updated);
 
-    CHECK(clear("after").status == 204);
-    CHECK(has_manual_hint(services.catalogue_hints(), after.first, after.second));
+    CHECK(services.scanner().enabled());
     CHECK(services.hydration().hydrator().status().enabled);
     CHECK(services.ingest().staging().limit() == 7ULL * 1024 * 1024);
     CHECK(services.cluster_jobs().default_remove_after() == 5min);
@@ -281,8 +260,8 @@ MACHA_TEST("node_services", test_media_routes_answer_from_this_nodes_files_and_e
     CHECK(entries.front().find("surveyed_generation")->isNull());
     CHECK(entries.front().find("extents")->isNull());
 
-    // Clearing an item's metadata queues its file, and only its file, for
-    // rematching.
+    // Clearing an item's metadata puts its file, and only its file, in the
+    // unmatched list, with no provider asked.
     write_file(fs, "/Movies/other.mkv", pattern(32 * 1024, 22));
     const auto other_id = file_media_id(fs.getattr("/Movies/other.mkv"));
     CatalogueItem item;
@@ -291,11 +270,12 @@ MACHA_TEST("node_services", test_media_routes_answer_from_this_nodes_files_and_e
     item.title = "Film";
     item.media_ids = {media_id};
     (void)services.catalogue().upsert(item);
-    CHECK(services.catalogue_api()
+    CHECK(services.manage_api()
               .handle(request("DELETE", "/api/v1/catalogue/items/movie:film/metadata"))
               .status == 204);
-    CHECK(has_manual_hint(services.catalogue_hints(), "/Movies/film.mkv", media_id));
-    CHECK(!has_manual_hint(services.catalogue_hints(), "/Movies/other.mkv", other_id));
+    CHECK(has_unmatched_hint(services.catalogue_hints(), "/Movies/film.mkv", media_id));
+    CHECK(!has_unmatched_hint(services.catalogue_hints(), "/Movies/other.mkv", other_id));
+    CHECK(services.catalogue_hints().summary().queued == 0);
 }
 
 bool has_fuse_gauges(const std::map<std::string, uint64_t>& gauges) {

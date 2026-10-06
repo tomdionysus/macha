@@ -627,32 +627,6 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
         constexpr std::string_view item_prefix = "/api/v1/catalogue/items/";
         if (request.path.starts_with(item_prefix)) {
             auto rest = std::string_view(request.path).substr(item_prefix.size());
-            auto metadata_suffix = rest.rfind("/metadata");
-            if (metadata_suffix != std::string_view::npos && metadata_suffix + 9 == rest.size() &&
-                request.method == "DELETE") {
-                auto id = url_decode(rest.substr(0, metadata_suffix));
-                const auto revision = expected_revision(request);
-                // A known-current negative answers 404 without a replica repair. If the local
-                // catalogue cannot prove it from current immutable state, fall through to the
-                // strong mutation path.
-                if (catalogue_.definitely_absent(id))
-                    return error(404, "not_found", "catalogue item not found");
-
-                auto cleared = catalogue_.clear_metadata_with_media(id, revision);
-                if (!cleared.removed_items)
-                    return error(404, "not_found", "catalogue item not found");
-                if (request_media_rescan_ && !cleared.media_ids.empty()) {
-                    try {
-                        request_media_rescan_(cleared.media_ids);
-                    } catch (const std::exception& e) {
-                        // The metadata mutation is committed; targeted rematching is recoverable
-                        // background work, with the scanner as fallback.
-                        Log::warn("catalogue metadata clear rematch enqueue failed: " +
-                                  std::string(e.what()));
-                    }
-                }
-                return {204, "application/json; charset=utf-8", {}, {}};
-            }
 
             auto artwork_suffix = rest.rfind("/artwork");
             if (artwork_suffix != std::string_view::npos && artwork_suffix + 8 == rest.size() &&
