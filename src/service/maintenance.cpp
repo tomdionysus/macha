@@ -561,20 +561,18 @@ void Maintenance::run(std::stop_token stop) {
                 auto release = ledger_.release();
                 auto objects = builder_.namespace_objects();
                 bool rebuilt_inventory = false;
-                // Rebuilding runs the catalogue's repair (maintenance_objects), held back
-                // until metadata is ready, so the catalogue never refreshes ahead of the
-                // metadata convergence it depends on; a repair-only step uses the last
-                // inventory until then.
+                // Rebuilding is held back until metadata is ready, so the inventory
+                // is never read ahead of the metadata convergence it depends on; a
+                // repair-only step uses the last inventory until then.
                 const bool repair_only = network_due && !garbage_due && !gc_due;
                 if ((!inventory || !inventory->catalogue_complete() ||
                      inventory->generation() != objects->metadata_generation) &&
                     (!inventory || !repair_only || metadata_ready_for_dependants)) {
-                    // The catalogue's repair is a step of its own (spec A4), between
-                    // the head its inventory is read against and the read.
+                    // The catalogue's half is its installed view, read against
+                    // the head; complete only when the view is at that head.
                     const auto catalogue_head = catalogue_.maintenance_head();
-                    const bool catalogue_repaired = catalogue_.maintenance_repair();
                     // The pass reads what the ledger holds, never its own copy.
-                    ledger_.publish(builder_.inventory(*objects, catalogue_head, catalogue_repaired));
+                    ledger_.publish(builder_.inventory(*objects, catalogue_head));
                     inventory = ledger_.inventory();
                     rebuilt_inventory = true;
                     observations().record("maintenance.inventory.build_us",

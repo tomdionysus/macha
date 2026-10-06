@@ -733,7 +733,7 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
         throw;
     }
 }
-void CatalogueManager::install_head(const CatalogueSnapshot* known,
+void CatalogueManager::install_head(std::shared_ptr<const CatalogueSnapshot> known,
                                     const std::optional<ObjectId>& known_root) {
     Lock install_lock(install_mutex_);
     try {
@@ -751,9 +751,20 @@ void CatalogueManager::install_head(const CatalogueSnapshot* known,
                 return;
             }
         }
-        auto installed = std::make_shared<const CatalogueSnapshot>(
-            known && known_root == root ? *known : load_root(root));
+        std::shared_ptr<const CatalogueSnapshot> installed;
+        if (known && known_root == root) {
+            installed = std::move(known);
+        } else {
+            Lock lock(mutex_);
+            if (staged_ && staged_root_ == root)
+                installed = staged_;
+        }
+        const bool loaded = !installed;
+        if (loaded)
+            installed = std::make_shared<const CatalogueSnapshot>(load_root(root));
         Lock lock(mutex_);
+        if (loaded)
+            ++loads_;
         const bool root_changed = !control_gc_root_epoch_initialized_ || cached_root_ != root;
         cached_ = std::move(installed);
         cached_root_ = root;
@@ -865,6 +876,11 @@ bool CatalogueManager::convergence_needed() const {
 uint64_t CatalogueManager::installs() const {
     Lock lock(mutex_);
     return installs_;
+}
+
+uint64_t CatalogueManager::loads() const {
+    Lock lock(mutex_);
+    return loads_;
 }
 
 std::shared_ptr<const CatalogueSnapshot> CatalogueManager::current_snapshot() {
@@ -1242,9 +1258,27 @@ void CatalogueManager::commit(
     // An unchanged root is nothing to commit, unless a conflict is being
     // decided in its favour: that decision is the commit.
     if (expected_root && *expected_root == root && !resolved_conflict) {
-        install_head(&next, root);
+        install_head(std::make_shared<const CatalogueSnapshot>(next), root);
         return;
     }
+
+    auto staged = std::make_shared<const CatalogueSnapshot>(next);
+    {
+        Lock lock(mutex_);
+        staged_ = staged;
+        staged_root_ = root;
+    }
+    struct Unstage {
+        CatalogueManager& self;
+        const std::shared_ptr<const CatalogueSnapshot>& staged;
+        ~Unstage() {
+            Lock lock(self.mutex_);
+            if (self.staged_ == staged) {
+                self.staged_.reset();
+                self.staged_root_.reset();
+            }
+        }
+    } unstage{*this, staged};
 
     // A commit may reference a control object once this node holds it. The
     // other nodes are sent it with the commit's claims, and convergence
@@ -1308,7 +1342,7 @@ void CatalogueManager::commit(
         control_converged_nodes_.clear();
         control_convergence_retry_ = {};
     }
-    install_head(&next, root);
+    install_head(staged, root);
 }
 
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,
@@ -1902,17 +1936,7 @@ CatalogueMaintenanceHead CatalogueManager::maintenance_head() {
     return head;
 }
 
-bool CatalogueManager::maintenance_repair() {
-    try {
-        repair_once();
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMaintenanceHead& head,
-                                                           bool repaired) {
+CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMaintenanceHead& head) {
     CatalogueMaintenance out;
     const auto& metadata_root = head.root;
     const auto& metadata_roots = head.roots;
@@ -1920,7 +1944,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     // A root conflict's alternatives stay durable until resolved: protect
     // their roots, manifests, shards and artwork from GC.
     out.control_live.insert(metadata_roots.begin(), metadata_roots.end());
-    bool repair_ok = repaired;
+    bool root_readable = true;
     std::optional<ObjectId> root;
     std::shared_ptr<const CatalogueSnapshot> cached;
     {
@@ -1940,7 +1964,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
                 }
             }
         } catch (...) {
-            repair_ok = false;
+            root_readable = false;
         }
     }
     bool protected_roots_complete = true;
@@ -1981,7 +2005,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     {
         Lock lock(mutex_);
         const bool root_converged = ready_ && cached_root_ == metadata_root;
-        out.complete = metadata_current && repair_ok && root_converged &&
+        out.complete = metadata_current && root_readable && root_converged &&
                        protected_roots_complete;
     }
     if (cached) {
