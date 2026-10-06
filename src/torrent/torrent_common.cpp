@@ -194,6 +194,14 @@ Json torrent_publication_json(const TorrentJob::Publication& p) {
                              {"progress_age_ms", p.progress_age_ms}});
 }
 
+Json torrent_swarm_json(const TorrentJob::Swarm& swarm) {
+    Json::Object out;
+    out["seeds"] = swarm.seeds ? Json(*swarm.seeds) : Json(nullptr);
+    out["peers"] = swarm.peers ? Json(*swarm.peers) : Json(nullptr);
+    out["availability"] = swarm.availability;
+    return Json(std::move(out));
+}
+
 Json torrent_job_api_json(const TorrentJob& job) {
     Json::Object out;
     out["id"] = job.id;
@@ -234,6 +242,7 @@ Json torrent_job_api_json(const TorrentJob& job) {
     out["error"] = job.error.empty() ? Json(nullptr) : Json(job.error);
     out["publication"] = job.publication ? torrent_publication_json(*job.publication) : Json(nullptr);
     out["waiting_reason"] = job.waiting_reason.empty() ? Json(nullptr) : Json(job.waiting_reason);
+    out["swarm"] = job.swarm ? torrent_swarm_json(*job.swarm) : Json(nullptr);
     return Json(std::move(out));
 }
 
@@ -318,6 +327,7 @@ Json torrent_job_wire_json(const TorrentJob& job) {
     out["eta_seconds"] = optional_u64(job.eta_seconds);
     out["publication"] = job.publication ? torrent_publication_json(*job.publication) : Json(nullptr);
     out["waiting_reason"] = job.waiting_reason;
+    out["swarm"] = job.swarm ? torrent_swarm_json(*job.swarm) : Json(nullptr);
     return out;
 }
 
@@ -342,6 +352,13 @@ TorrentJob parse_torrent_job_wire(const Json& value) {
         job.publication = p;
     }
     if (const auto* v = value.find("waiting_reason"); v && v->isString()) job.waiting_reason = v->asString();
+    if (const auto* v = value.find("swarm"); v && v->isObject()) {
+        TorrentJob::Swarm swarm;
+        if (const auto* f = v->find("seeds"); f && !f->isNull()) swarm.seeds = f->asUInt64();
+        if (const auto* f = v->find("peers"); f && !f->isNull()) swarm.peers = f->asUInt64();
+        if (const auto* f = v->find("availability"); f && f->isNumber()) swarm.availability = f->asNumber();
+        job.swarm = swarm;
+    }
     return job;
 }
 
