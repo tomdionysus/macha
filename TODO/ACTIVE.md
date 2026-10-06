@@ -11,7 +11,20 @@ Items marked *carried* come from
 `archive/2026-10-05-ACTIVE-before-rationalisation.md` and have not been
 re-checked since.
 
-## 0. The catalogue plan: a materialised view of the local head
+## 0. One definition of work class; the API is viewer-class work
+
+Design: [`2026-10-06-one-work-class.md`](2026-10-06-one-work-class.md).
+DATA admission, the activity clocks and the HTTP server each class work by
+their own rule and disagree; an API request marks no activity, so a node
+with someone in the editor reads as idle. One `WorkClass` (control, viewer,
+loader, background) with one mapping from the wire frame, read by all
+three; every HTTP route but the four control routes is viewer-class and
+marks a viewer present; a work context carries its allowed waits apart
+from its class; API-started DATA work carries the request's class down.
+Six steps, one to two days; two questions for the operator at the end of
+the document. Next, before catalogue stage 6.
+
+## 1. The catalogue plan: a materialised view of the local head
 
 Plan: [`2026-10-06-catalogue-materialised-view.md`](2026-10-06-catalogue-materialised-view.md),
 which supersedes the September shard plan. The catalogue view becomes a
@@ -21,7 +34,7 @@ touch, a per-shard conflict merge, derived list and search indexes, one
 manifest change (per-family shards, growable count), batched profile
 publication, and holdings for catalogue DATA. It removes the two failures
 of the burst test below, the polling refresh and its TTL, the second
-repair per pass (section 6's question, answered), and every whole-snapshot
+repair per pass (section 7's question, answered), and every whole-snapshot
 copy. Eleven stages, each shipping alone: correctness first (the install
 point), then measurement, then cost. Stage 1 (one install point, the
 installer) is 0.90.27; stage 2 (maintenance reduced, no second decode of
@@ -29,9 +42,9 @@ a commit) is 0.90.30, after the convergence fix (0.90.29); stage 3
 (measured: 14.9 MB resident, a full load 156 ms on fi-1 and 328 ms on
 gbni-1) is 0.90.31; stage 4 (the per-shard view) is 0.90.32; stage 5
 (writes copy only the shards they change) is 0.90.33. Next: the work-class
-item in section 3, then stage 6.
+item in section 0, then stage 6.
 
-## 1. Failing tests and defects
+## 2. Failing tests and defects
 
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
   `/root/claude-missing-extent-driver.py` are staged on fi-1, not run.
@@ -76,7 +89,7 @@ item in section 3, then stage 6.
   ingest would fail on; the acquisition API audit's four findings; unverified
   package names in the install docs. *Carried.*
 
-## 2. Matching
+## 3. Matching
 
 - **The first track of a match pays the provider again** (gbni-1, 0.90.29,
   2026-10-06 17:09Z): the editor had just run a provider search (1.3 s) and
@@ -88,7 +101,7 @@ item in section 3, then stage 6.
 - Provider caches are per editor seat and lost on restart: the first track of
   each album after a restart pays the lookup and the cover again.
 
-## 3. Replication and repair
+## 4. Replication and repair
 
 - **A catalogue head can reach a node before its shards do.** Under load
   (2026-10-06 20:38Z), fi-1 installed gbni-1's import commits by fetching
@@ -97,19 +110,6 @@ item in section 3, then stage 6.
   `metadata_write_copies` holders). Background, readers unaffected; check
   whether the commit's control objects should go to every node present
   before or with the head, as the convergence offer does.
-- **One definition of work class, and the API is viewer-class work**
-  (operator, 2026-10-06). The laws rank viewer, loader, background; the code
-  has three separate notions of which work is which, and they disagree:
-  DATA admission (`foreground` and `read_ahead` frames are viewers), the
-  activity clocks (what the pacer and pressure gate take as a viewer being
-  present; API requests mark nothing, so a node with someone in the editor
-  reads as idle), and the HTTP server's two worker pools (only health,
-  status, session and users on the control pool). Make it one definition,
-  used by all three, and put every API request in the viewer class: an API
-  request marks viewer activity, and API-started DATA work (artwork staged
-  and validated on a match, media indexes, a commit's retention claims)
-  carries a viewer frame, passed down from the caller since the scanner's
-  background matching shares those functions. Next after catalogue stage 5.
 - Repair is bound by the WAN link: one step sends a batch of at most two
   extents and waits for it (about 4 MB in 5 s between fi-1 and gbni-1).
   Pipelining batches, or several steps per pass, would lift it further.
@@ -122,7 +122,7 @@ item in section 3, then stage 6.
 - Say why a node counts itself busy (the pacer's active classes in status).
 - Log the resumed push position at INFO.
 
-## 4. Further optimisation (measured small; not now)
+## 5. Further optimisation (measured small; not now)
 
 From the local-first work
 ([plan](archive/2026-10-05-local-first-filesystem-plan.md)):
@@ -138,7 +138,7 @@ From the local-first work
 - The non-namespace snapshot per commit: a few milliseconds.
 - The hint store rewrites its file per change: 266 KB with 409 hints.
 
-## 5. Features and API
+## 6. Features and API
 
 - **The API is RESTful, all of it**: audit every route; identity resets
   become a resource (decided); `providers/artwork?ref=` and
@@ -156,14 +156,14 @@ From the local-first work
   optional node `name` (operator's call).
 - **Movie sets** and **ebooks**: later; each needs a proposal first.
 
-## 6. Waiting on the operator
+## 7. Waiting on the operator
 
 - Metadata editor B: the choice of fields.
 - Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
 - A `CONTRIBUTING.md` line: "A new gate may pace lower-class work; it may
   never stop it."
 - The replica's applier lifetime; fi-1's USB power. (The catalogue repair
-  that runs twice per pass is answered by section 0: both go.)
+  that runs twice per pass is answered by section 1: both go.)
 - [Cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md): a
   proposal with six questions.
 - From the backlog: anonymous access; whether a client should know a playback
