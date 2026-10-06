@@ -45,14 +45,14 @@ When a node or backend cannot admit a preferred object, writers can use the next
 
 Recovery is layered rather than global:
 
-1. **state identity** — reject non-empty state that does not carry the fresh storage-layout marker;
-2. **mount preflight** — before services start, verify the configured mountpoint; optionally remove only a stale Macha/FUSE mount;
-3. **DATA backends** — validate backend identity, rebuild accounting after unclean shutdown, reconstruct pack indexes;
-4. **namespace metadata** — recover the local checkpoint/history and accepted-head certificates, then discover/reconcile additional accepted heads from peers;
-5. **FUSE journal** — reconstruct accepted local mutations and resume publication;
-6. **catalogue control** — fetch missing manifest/shards from metadata peers and converge them;
-7. **DATA repair** — restore desired placement/replica count from an accepted live metadata view;
-8. **cache** — rebuild/discard opportunistically.
+1. **state identity** - reject non-empty state that does not carry the fresh storage-layout marker;
+2. **mount preflight** - before services start, verify the configured mountpoint; optionally remove only a stale Macha/FUSE mount;
+3. **DATA backends** - validate backend identity, rebuild accounting after unclean shutdown, reconstruct pack indexes;
+4. **namespace metadata** - recover the local checkpoint/history and accepted-head certificates, then discover/reconcile additional accepted heads from peers;
+5. **FUSE journal** - reconstruct accepted local mutations and resume publication;
+6. **catalogue control** - fetch missing manifest/shards from metadata peers and converge them;
+7. **DATA repair** - restore desired placement/replica count from an accepted live metadata view;
+8. **cache** - rebuild/discard opportunistically.
 
 No external catalogue provider is required for correctness recovery.
 

@@ -9,16 +9,16 @@ Both executables use the same `test_framework.hpp` runner. Cases self-register; 
 
 The test implementation is split by the subsystem that owns the invariant:
 
-- `test_foundations.cpp` — codecs, dependency-free configuration policy, diagnostics, placement and small pure policies;
-- `test_storage_metadata.cpp` — local/pool storage, persistent cache and metadata durability;
-- `test_rpc_cluster.cpp` — transport, admission, quorum, membership and distributed repair;
-- `test_filesystem_fuse.cpp` — MachaDFS semantics, FUSE ordering, durability and recovery;
-- `test_hydration_catalogue.cpp` — hydration, replica selection, dependency-free media recognition and catalogue state;
-- `test_media_playback.cpp` — HTTP streaming, VOD planning, timestamps and playback negotiation using an injected media engine;
-- `test_invariants.cpp` — cross-component regressions whose failure requires a real topology/lifecycle;
-- `test_models.cpp` — cheap state/property coverage over production algorithms and durable formats;
-- `test_runtime_dependencies.cpp` — concrete yaml-cpp and FFmpeg/libav adapter behaviour;
-- `test_transcode_timeline.cpp` — A/V timeline behaviour of the real transcode pipeline,
+- `test_foundations.cpp` - codecs, dependency-free configuration policy, diagnostics, placement and small pure policies;
+- `test_storage_metadata.cpp` - local/pool storage, persistent cache and metadata durability;
+- `test_rpc_cluster.cpp` - transport, admission, quorum, membership and distributed repair;
+- `test_filesystem_fuse.cpp` - MachaDFS semantics, FUSE ordering, durability and recovery;
+- `test_hydration_catalogue.cpp` - hydration, replica selection, dependency-free media recognition and catalogue state;
+- `test_media_playback.cpp` - HTTP streaming, VOD planning, timestamps and playback negotiation using an injected media engine;
+- `test_invariants.cpp` - cross-component regressions whose failure requires a real topology/lifecycle;
+- `test_models.cpp` - cheap state/property coverage over production algorithms and durable formats;
+- `test_runtime_dependencies.cpp` - concrete yaml-cpp and FFmpeg/libav adapter behaviour;
+- `test_transcode_timeline.cpp` - A/V timeline behaviour of the real transcode pipeline,
   measured from the fragments it actually publishes rather than through an injected engine.
 
 Shared deterministic infrastructure lives in `test_support.hpp` and `test_backend_support.hpp`. Prefer `TestService`, `TestNode`, `TestCluster`, `TestGate`, declarative case tables and exhaustive boundary loops over rebuilding keys, ports, state directories or ad-hoc sleeps in individual tests.

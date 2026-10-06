@@ -1,4 +1,4 @@
-# Phase 1D loaded UAT failure — 2026-08-31
+# Phase 1D loaded UAT failure: 2026-08-31
 
 ## Scope and result
 
