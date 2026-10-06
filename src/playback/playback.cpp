@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "playback/playback.hpp"
+#include "api/paging.hpp"
 #include "contract/thread_safety.hpp"
 #include "diagnostics.hpp"
 
@@ -3086,10 +3087,13 @@ struct PlaybackManager::Impl {
             max_sessions = config.max_sessions_per_account;
             max_transcodes = config.max_transcodes_per_account;
         }
+        PageQuery page;
+        if (auto bad = read_page_query(request, page)) return *bad;
         Json::Array out;
         for (const auto& session : owned) out.push_back(session_json(*session));
         Json::Object body;
         const auto held = out.size();
+        page_json(out, "session_id", page, body);
         body["items"] = std::move(out);
         // The caps, so a client can plan against them rather than meet them.
         Json::Object account_info;

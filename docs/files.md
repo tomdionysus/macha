@@ -29,12 +29,14 @@ A file or directory is:
 | `surveyed_generation`, `surveyed_unix_ms` | the metadata generation and time of the survey these came from; `null` before this node's first |
 
 A directory also carries `entries`: its direct children, each in the same
-form (without their own `entries`), in no promised order. A directory's extent
+form (without their own `entries`), by name and paged
+([API conventions](api.md#lists)). A directory's extent
 counts are the sums of everything beneath it.
 
 `?hash=` filters the collection by content identity and returns
 `{"status": "ok", "files": [...], "surveyed_generation", "surveyed_unix_ms"}`:
-one entry per path holding that content, none if no surveyed file has it.
+one entry per path holding that content, none if no surveyed file has it,
+by path and paged.
 
 Codes: `404 not_found`, `400 bad_media_id` (a hash that is not a `macha:`
 identity), `400 bad_request` (`?hash=` on anything but the collection),
