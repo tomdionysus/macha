@@ -4,6 +4,7 @@
 
 #include "codec.hpp"
 #include "log.hpp"
+#include "resident_bytes.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -524,6 +525,52 @@ std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
     return merged;
 }
 
+uint64_t catalogue_resident_bytes(const CatalogueSnapshot& snapshot) {
+    uint64_t total = sizeof(CatalogueSnapshot);
+    resident::map_nodes(total, snapshot.items);
+    for (const auto& [key, item] : snapshot.items) {
+        resident::string(total, key);
+        resident::string(total, item.id);
+        resident::string(total, item.title);
+        resident::string(total, item.sort_title);
+        resident::string(total, item.synopsis);
+        if (item.parent_id)
+            resident::string(total, *item.parent_id);
+        resident::vector(total, item.aliases);
+        for (const auto& alias : item.aliases)
+            resident::string(total, alias);
+        resident::map_nodes(total, item.external_ids);
+        for (const auto& [provider, id] : item.external_ids) {
+            resident::string(total, provider);
+            resident::string(total, id);
+        }
+        resident::vector(total, item.media_ids);
+        for (const auto& media_id : item.media_ids)
+            resident::string(total, media_id);
+        resident::vector(total, item.artwork);
+        for (const auto& art : item.artwork) {
+            resident::string(total, art.role);
+            resident::string(total, art.mime_type);
+        }
+    }
+    resident::map_nodes(total, snapshot.media_profiles);
+    for (const auto& [media_id, profile] : snapshot.media_profiles) {
+        resident::string(total, media_id);
+        resident::string(total, profile.probe.format);
+        resident::vector(total, profile.probe.streams);
+        for (const auto& stream : profile.probe.streams) {
+            resident::string(total, stream.codec);
+            resident::string(total, stream.profile);
+            resident::string(total, stream.language);
+            resident::string(total, stream.color_transfer);
+        }
+    }
+    resident::map_nodes(total, snapshot.media_indexes);
+    for (const auto& [media_id, _] : snapshot.media_indexes)
+        resident::string(total, media_id);
+    return total;
+}
+
 std::string catalogue_kind_name(CatalogueKind kind) {
     switch (kind) {
     case CatalogueKind::movie: return "movie";
@@ -736,6 +783,7 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
 void CatalogueManager::install_head(std::shared_ptr<const CatalogueSnapshot> known,
                                     const std::optional<ObjectId>& known_root) {
     Lock install_lock(install_mutex_);
+    const auto started = Clock::now();
     try {
         const auto head = metadata_.local();
         if (!head.snapshot)
@@ -779,6 +827,25 @@ void CatalogueManager::install_head(std::shared_ptr<const CatalogueSnapshot> kno
         ready_ = true;
         error_.clear();
         error_code_.clear();
+        if (Log::enabled(LogLevel::debug)) {
+            const auto view = cached_;
+            const auto installs = installs_;
+            const auto loads = loads_;
+            lock.unlock();
+            const auto install_ms = ms_since(started);
+            const auto count_started = Clock::now();
+            const auto resident = catalogue_resident_bytes(*view);
+            Log::debug("catalogue installed root=" +
+                       (root ? to_string(*root).substr(0, 12) : std::string("none")) +
+                       " generation=" + std::to_string(head.generation) +
+                       " source=" + (loaded ? "loaded" : "commit") +
+                       " items=" + std::to_string(view->items.size()) +
+                       " resident_bytes=" + std::to_string(resident) +
+                       " install_ms=" + std::to_string(install_ms) +
+                       " count_ms=" + std::to_string(ms_since(count_started)) +
+                       " installs=" + std::to_string(installs) +
+                       " loads=" + std::to_string(loads));
+        }
     } catch (const std::exception& e) {
         // The previous view keeps serving; the next head change retries.
         Lock lock(mutex_);

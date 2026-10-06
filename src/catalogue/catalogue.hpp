@@ -165,6 +165,8 @@ std::string catalogue_kind_name(CatalogueKind);
 std::optional<CatalogueKind> parse_catalogue_kind(std::string_view);
 std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapshot&,
                                                            const CatalogueItem&);
+// What a decoded catalogue holds in memory, estimated from its containers.
+uint64_t catalogue_resident_bytes(const CatalogueSnapshot&);
 
 class CatalogueConflict : public std::runtime_error {
   public:

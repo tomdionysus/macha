@@ -3,6 +3,7 @@
 #include "codec.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
+#include "resident_bytes.hpp"
 #include "startup_progress.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -35,26 +36,8 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
 constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2, JOURNAL_SEED_FULL = 3,
                   JOURNAL_COMMIT = 4;
 
-void saturated_add(uint64_t& total, uint64_t value) {
-    total = value > std::numeric_limits<uint64_t>::max() - total
-                ? std::numeric_limits<uint64_t>::max()
-                : total + value;
-}
-
-template <class Map> void account_map_nodes(uint64_t& total, const Map& values) {
-    // One node per value; four pointers cover parent/children and allocator
-    // bookkeeping beyond sizeof(value_type).
-    saturated_add(total, static_cast<uint64_t>(values.size()) *
-                             (sizeof(typename Map::value_type) + 4 * sizeof(void*)));
-}
-
-void account_string(uint64_t& total, const std::string& value) {
-    // capacity() includes allocator slack.
-    saturated_add(total, static_cast<uint64_t>(value.capacity()) + 1);
-}
-
 void account_entry_allocations(uint64_t& total, const FsEntry& entry) {
-    saturated_add(total, static_cast<uint64_t>(entry.extents.capacity()) * sizeof(ExtentRef));
+    resident::add(total, static_cast<uint64_t>(entry.extents.capacity()) * sizeof(ExtentRef));
 }
 } // namespace
 
@@ -165,44 +148,44 @@ void stamp_entry_provenance(FsEntry& entry, std::string_view path, const FsEntry
 uint64_t snapshot_resident_bytes(const MetadataSnapshot& snapshot) {
     uint64_t total = sizeof(MetadataSnapshot);
     if (snapshot.legacy_clock)
-        account_map_nodes(total, *snapshot.legacy_clock);
-    saturated_add(total, snapshot.metadata_voters.capacity() * sizeof(NodeId));
-    account_map_nodes(total, snapshot.mutation_sequences);
-    account_map_nodes(total, snapshot.metadata_participants);
-    account_map_nodes(total, snapshot.entries);
+        resident::map_nodes(total, *snapshot.legacy_clock);
+    resident::add(total, snapshot.metadata_voters.capacity() * sizeof(NodeId));
+    resident::map_nodes(total, snapshot.mutation_sequences);
+    resident::map_nodes(total, snapshot.metadata_participants);
+    resident::map_nodes(total, snapshot.entries);
     for (const auto& [path, entry] : snapshot.entries) {
-        account_string(total, path);
+        resident::string(total, path);
         account_entry_allocations(total, entry);
     }
-    saturated_add(total, snapshot.garbage.capacity() * sizeof(GarbageRef));
-    account_map_nodes(total, snapshot.node_status);
+    resident::add(total, snapshot.garbage.capacity() * sizeof(GarbageRef));
+    resident::map_nodes(total, snapshot.node_status);
     for (const auto& [_, status] : snapshot.node_status) {
-        account_string(total, status.version);
-        account_string(total, status.host);
-        account_string(total, status.failure_domain);
+        resident::string(total, status.version);
+        resident::string(total, status.host);
+        resident::string(total, status.failure_domain);
     }
-    account_map_nodes(total, snapshot.identity_resets);
-    account_map_nodes(total, snapshot.torrent_requests);
+    resident::map_nodes(total, snapshot.identity_resets);
+    resident::map_nodes(total, snapshot.torrent_requests);
     for (const auto& [id, request] : snapshot.torrent_requests) {
-        account_string(total, id);
-        account_string(total, request.id);
-        account_string(total, request.info_hash);
-        account_string(total, request.source);
-        account_string(total, request.name);
-        account_string(total, request.ingest_job_id);
-        account_string(total, request.error_code);
-        account_string(total, request.error);
+        resident::string(total, id);
+        resident::string(total, request.id);
+        resident::string(total, request.info_hash);
+        resident::string(total, request.source);
+        resident::string(total, request.name);
+        resident::string(total, request.ingest_job_id);
+        resident::string(total, request.error_code);
+        resident::string(total, request.error);
     }
     for (const auto& [key, reset] : snapshot.identity_resets) {
-        account_string(total, key);
-        account_string(total, reset.host);
-        account_string(total, reset.reason);
+        resident::string(total, key);
+        resident::string(total, reset.host);
+        resident::string(total, reset.reason);
     }
-    saturated_add(total, snapshot.merge_parents.capacity() * sizeof(Hash256));
-    account_map_nodes(total, snapshot.conflicts);
+    resident::add(total, snapshot.merge_parents.capacity() * sizeof(Hash256));
+    resident::map_nodes(total, snapshot.conflicts);
     for (const auto& [id, conflict] : snapshot.conflicts) {
-        account_string(total, id);
-        account_string(total, conflict.key);
+        resident::string(total, id);
+        resident::string(total, conflict.key);
         if (conflict.base_entry)
             account_entry_allocations(total, *conflict.base_entry);
         if (conflict.left_entry)
@@ -217,8 +200,8 @@ namespace {
 std::shared_ptr<const MetadataMaterialization>
 make_materialization(MetadataRecord record, std::shared_ptr<const MetadataSnapshot> snapshot) {
     uint64_t bytes = sizeof(MetadataMaterialization) + sizeof(Bytes) + 64;
-    saturated_add(bytes, record.payload.size());
-    saturated_add(bytes, snapshot_resident_bytes(*snapshot));
+    resident::add(bytes, record.payload.size());
+    resident::add(bytes, snapshot_resident_bytes(*snapshot));
     return std::make_shared<const MetadataMaterialization>(
         MetadataMaterialization{std::move(record), std::move(snapshot), bytes});
 }
