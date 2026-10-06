@@ -2,7 +2,7 @@
 
 Last updated: 2026-10-06
 
-## 2026-10-06 -- 0.90.26 to 0.90.27
+## 2026-10-06 -- 0.90.26 to 0.90.29
 
 - **The catalogue view never steps backwards** (P0): a background refresh
   that read its view before a commit and cached it after put the older
@@ -12,6 +12,12 @@ Last updated: 2026-10-06
   second failure (a repair count against an invented ratio, 5 of 30 on fi-1)
   went with it: 0 of 30 on fi-1, 20 of 20 on the laptop, suites green.
   Stage 1 of [the catalogue plan](2026-10-06-catalogue-materialised-view.md).
+- **Maintenance's catalogue stage: 20 to 30 s to 0.1 s** (0.90.28 measured,
+  0.90.29 fixed). Control convergence sent the manifest and all 64 shards,
+  5.4 MB, to every node without asking what it held, at every start,
+  catalogue commit and membership change, blocking the maintenance thread.
+  It now asks once and sends what is missing: fi-1 21.8 s to 103 ms, gbni-1
+  30.6 s to 82 ms, 0 bytes, on the same root.
 
 ## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.25
 
