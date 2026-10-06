@@ -240,9 +240,19 @@ suite green; no stage waits on a later one.
    so a racing install does not decode it. Convergence offers only what a
    node lacks (0.90.29). Maintenance's catalogue stage keeps conflict
    reconciliation, an install (normally a no-op) and convergence.
-3. **Measure.** `catalogue_resident_bytes` in status, modelled on
-   `snapshot_resident_bytes`; install time on gbni-1, against the single
-   install point.
+3. **Done, 0.90.31.** **Measure**, as a DEBUG line per install rather than a
+   status field (no API change for a measurement). On 2026-10-06, 6,897
+   items and 6,289 profiles, 5.4 MB encoded in 64 shards:
+   - resident 14.9 MB (about 2.2 KB per item with its profile);
+   - a full load and install 156 ms on fi-1 (read 48, decode 107) and
+     328 ms on gbni-1 (read 12, decode 316); a commit installs what it
+     wrote with no load;
+   - control convergence of a held root about 0.1 s (0.90.29).
+   Decided by these: every shard stays resident (15 MB now; about 220 MB
+   at 100,000 titles, when eviction would be reconsidered); list and search
+   indexes stay derived in memory (section 6). The per-shard view (stage 4)
+   is now worth its cost for the decode, not the memory: a one-item change
+   still decodes 64 shards (316 ms on gbni-1) where it needs one.
 4. **The view and `shard_changes`.** Resident per-shard `CatalogueView`
    behind the install point; `retention_objects` rewritten over
    `shard_changes`. The deep copies go.
