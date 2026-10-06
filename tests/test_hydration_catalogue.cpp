@@ -3,6 +3,7 @@
 #include "stepped_time.hpp"
 #include "test_backend_support.hpp"
 #include "api/acquisition_api.hpp"
+#include "api/paging.hpp"
 #include "subsystem/subsystem_abi.hpp"
 #include "subsystem/subsystem_registry.hpp"
 #include "supervised.hpp"
@@ -4051,6 +4052,122 @@ MACHA_TEST("hydration_catalogue", test_a_catalogue_write_touches_its_own_shards_
     CHECK(catalogue.snapshot().items.size() == 300 - 3 + 1);
     CHECK(!catalogue.get("movie:shard:77").has_value());
     CHECK(catalogue.get("movie:shard:150")->title == "Retitled 150");
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_a_page_resumes_after_its_cursor_and_never_repeats) {
+    const auto json_body_code = [](const HttpResponse& response) {
+        const auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
+        return body.find("error")->find("code")->asString();
+    };
+    const auto page_of = [&](std::map<std::string, std::string, std::less<>> query) {
+        HttpRequest request;
+        for (auto& [name, value] : query) request.query[name] = value;
+        PageQuery page;
+        const auto bad = read_page_query(request, page);
+        return std::pair{page, bad ? std::optional<std::string>(json_body_code(*bad)) : std::nullopt};
+    };
+    const auto key = [](const std::string& entry) -> std::string_view { return entry; };
+
+    // Without a limit, one page holds everything and says nothing follows.
+    std::vector<std::string> keys{"a", "c", "e", "g"};
+    auto range = page_range(keys, key, page_of({}).first);
+    CHECK(range.begin == 0);
+    CHECK(range.end == 4);
+    CHECK(!range.next_cursor);
+
+    // Pages of two; an entry inserted behind the cursor is not seen, one
+    // ahead of it is, and none is seen twice.
+    range = page_range(keys, key, page_of({{"limit", "2"}}).first);
+    CHECK(range.begin == 0);
+    CHECK(range.end == 2);
+    REQUIRE(range.next_cursor.has_value());
+    keys = {"a", "b", "c", "d", "e", "g"};
+    auto [next, bad] = page_of({{"limit", "2"}, {"cursor", *range.next_cursor}});
+    REQUIRE(!bad);
+    range = page_range(keys, key, next);
+    CHECK(keys[range.begin] == "d");
+    CHECK(keys[range.end - 1] == "e");
+    REQUIRE(range.next_cursor.has_value());
+    range = page_range(keys, key, page_of({{"limit", "2"}, {"cursor", *range.next_cursor}}).first);
+    CHECK(keys[range.begin] == "g");
+    CHECK(range.end == keys.size());
+    CHECK(!range.next_cursor);
+
+    // A cursor whose entry was removed still resumes after its key.
+    range = page_range(std::vector<std::string>{"a", "e"}, key,
+                       page_of({{"cursor", page_cursor("c")}}).first);
+    CHECK(range.begin == 1);
+
+    CHECK(page_of({{"limit", "0"}}).second == "bad_limit");
+    CHECK(page_of({{"limit", "1001"}}).second == "bad_limit");
+    CHECK(page_of({{"limit", "ten"}}).second == "bad_limit");
+    CHECK(page_of({{"cursor", "xyz"}}).second == "bad_cursor");
+    CHECK(page_of({{"cursor", "abc"}}).second == "bad_cursor");
+    CHECK(page_cursor_key(page_cursor("any key / \xff")) == "any key / \xff");
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_lists_page_in_key_order) {
+    CatalogueNode node("catalogue-paging");
+    CatalogueApi api(node.catalogue(), node.hints());
+    for (int i = 0; i < 25; ++i)
+        (void)node.upsert("movie:" + std::to_string(100 + i), CatalogueKind::movie,
+                          "Paging " + std::string(1, static_cast<char>('z' - i)));
+    const auto get = [&](std::string path, std::map<std::string, std::string, std::less<>> query) {
+        auto request = api_request("GET", std::move(path));
+        for (auto& [name, value] : query) request.query[name] = value;
+        auto response = api.handle(request);
+        REQUIRE(response.status == 200);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+    const auto ids = [](const Json& body) {
+        std::vector<std::string> out;
+        for (const auto& item : body.find("items")->asArray())
+            out.push_back(item.find("id")->asString());
+        return out;
+    };
+
+    // Whole, in id order, with nothing to follow.
+    const auto whole = get("/api/v1/catalogue/items", {});
+    const auto all = ids(whole);
+    CHECK(all.size() == 25);
+    CHECK(std::is_sorted(all.begin(), all.end()));
+    CHECK(whole.find("next_cursor")->isNull());
+
+    // Pages of ten give every item once, in the same order.
+    std::vector<std::string> paged;
+    std::map<std::string, std::string, std::less<>> query{{"limit", "10"}};
+    size_t pages = 0;
+    for (;;) {
+        const auto body = get("/api/v1/catalogue/items", query);
+        const auto page = ids(body);
+        CHECK(page.size() <= 10);
+        paged.insert(paged.end(), page.begin(), page.end());
+        ++pages;
+        if (body.find("next_cursor")->isNull()) break;
+        query["cursor"] = body.find("next_cursor")->asString();
+        REQUIRE(pages < 10);
+    }
+    CHECK(pages == 3);
+    CHECK(paged == all);
+
+    // Search pages through its ranking the same way.
+    std::vector<std::string> found;
+    query = {{"q", "Paging"}, {"limit", "7"}};
+    for (pages = 0;; ++pages) {
+        REQUIRE(pages < 10);
+        const auto body = get("/api/v1/catalogue/search", query);
+        const auto page = ids(body);
+        found.insert(found.end(), page.begin(), page.end());
+        if (body.find("next_cursor")->isNull()) break;
+        query["cursor"] = body.find("next_cursor")->asString();
+    }
+    auto sorted = found;
+    std::sort(sorted.begin(), sorted.end());
+    CHECK(sorted == all);
+
+    auto bad = api_request("GET", "/api/v1/catalogue/items");
+    bad.query["cursor"] = "not-hex";
+    CHECK(api.handle(bad).status == 400);
 }
 
 MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_artwork) {

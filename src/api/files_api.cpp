@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "api/files_api.hpp"
+#include "api/paging.hpp"
 
 #include "api/item_availability.hpp"
 
@@ -77,6 +78,8 @@ HttpResponse FilesApi::handle(const HttpRequest& request) {
     if (request.method != "GET")
         return http_error(405, "method_not_allowed", "the files resource is read with GET");
     const auto snapshot = availability_.snapshot();
+    PageQuery page;
+    if (auto bad = read_page_query(request, page)) return *bad;
 
     if (const auto hash = request.query.find("hash"); hash != request.query.end()) {
         if (request.path != prefix && request.path != std::string(prefix) + "/")
@@ -102,6 +105,7 @@ HttpResponse FilesApi::handle(const HttpRequest& request) {
         }
         Json::Object out;
         out["status"] = "ok";
+        page_json(files, "path", page, out);
         out["files"] = std::move(files);
         out["surveyed_generation"] = snapshot ? Json(snapshot->generation) : Json(nullptr);
         out["surveyed_unix_ms"] = snapshot ? Json(snapshot->surveyed_unix_ms) : Json(nullptr);
@@ -121,6 +125,7 @@ HttpResponse FilesApi::handle(const HttpRequest& request) {
             Json::Array entries;
             for (const auto& [name, child] : fs_.readdir(path))
                 entries.push_back(entry_json(child_path(path, name), child, snapshot.get()));
+            page_json(entries, "name", page, out);
             out["entries"] = std::move(entries);
         }
         return http_json(200, Json(std::move(out)).dump());

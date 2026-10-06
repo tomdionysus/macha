@@ -529,7 +529,8 @@ void ClusterStatusService::persistence_loop(std::stop_token stop) {
 }
 
 HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
-                                                   const std::optional<NodeId>& only) {
+                                                   const std::optional<NodeId>& only,
+                                                   const std::optional<PageQuery>& nodes_page) {
     auto* metadata_manager = sources.metadata;
     std::shared_ptr<const MetadataSnapshot> metadata;
     uint64_t metadata_generation = 0;
@@ -842,6 +843,8 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
     root["node_id"] = to_string(node_.node_id());
     root["cluster"] = std::move(cluster);
     root["startup"] = std::move(startup);
+    if (nodes_page)
+        page_json(nodes, "id", *nodes_page, root);
     root["nodes"] = std::move(nodes);
     {
         auto connectivity = public_connectivity_json(node_.public_connectivity_status());
@@ -1487,9 +1490,13 @@ HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId
 
 HttpResponse ClusterStatusService::handle(const HttpRequest& request,
                                           const StatusSources& sources) {
-    if (request.method == "GET" &&
-        (request.path == "/api/v1/status" || request.path == "/api/v1/status/nodes"))
+    if (request.method == "GET" && request.path == "/api/v1/status")
         return status_response(sources);
+    if (request.method == "GET" && request.path == "/api/v1/status/nodes") {
+        PageQuery page;
+        if (auto bad = read_page_query(request, page)) return *bad;
+        return status_response(sources, {}, page);
+    }
     if (request.method == "GET" && request.path == diagnostics_path)
         return diagnostics_response(sources);
     if (request.method == "POST" && request.path == "/api/v1/status/connectivity/check")

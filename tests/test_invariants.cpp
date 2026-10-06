@@ -573,6 +573,22 @@ MACHA_TEST("invariants", test_a_titles_files_are_unmatched_and_deleted_one_call_
         return out;
     };
 
+    // A directory lists in pages, by name.
+    {
+        std::vector<std::string> names;
+        std::map<std::string, std::string, std::less<>> query{{"path", "/Music/A"}, {"limit", "1"}};
+        for (int pages = 0;; ++pages) {
+            REQUIRE(pages < 5);
+            const auto body = body_json(manage.handle(
+                request_for("GET", "/api/v1/manage/filesystem", {}, query)));
+            REQUIRE(body.find("entries")->asArray().size() == 1);
+            names.push_back(body.find("entries")->asArray().front().find("name")->asString());
+            if (body.find("next_cursor")->isNull()) break;
+            query["cursor"] = body.find("next_cursor")->asString();
+        }
+        CHECK((names == std::vector<std::string>{"1.flac", "2.flac", "copy-of-2.flac"}));
+    }
+
     // Unmatch: the file goes to the unmatched list as it is, and nothing is
     // queued for a provider. The track goes; the album keeps its other track.
     auto [status, body] = call("/api/v1/catalogue/items/track-1/media/" + one);

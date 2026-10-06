@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "api/paging.hpp"
 #include "contract/thread_safety.hpp"
 
 #include "auth/accounts.hpp"
@@ -51,7 +52,9 @@ class ClusterStatusService {
 
     void persistence_loop(std::stop_token);
     void persist_local_status();
-    HttpResponse status_response(const StatusSources&, const std::optional<NodeId>& only = {});
+    // `nodes_page`: the nodes as a paged list (GET /api/v1/status/nodes).
+    HttpResponse status_response(const StatusSources&, const std::optional<NodeId>& only = {},
+                                 const std::optional<PageQuery>& nodes_page = {});
     // The expensive half, behind its own route: its counters sit behind most
     // subsystems' locks, some held by the busy paths an operator is investigating.
     // Ordinary polling must not pay that.

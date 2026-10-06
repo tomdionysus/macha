@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "api/users_api.hpp"
+#include "api/paging.hpp"
 
 #include "log.hpp"
 
@@ -230,10 +231,13 @@ HttpResponse UsersApi::handle(const HttpRequest& request) {
 
         if (request.path == users_root) {
             if (request.method == "GET") {
+                PageQuery page;
+                if (auto bad = read_page_query(request, page)) return *bad;
                 Json::Array out;
                 for (const auto& user : accounts_.users().list())
                     out.push_back(user_json(user, mutability(user)));
                 Json::Object body;
+                page_json(out, "username", page, body);
                 // "items" is the envelope every collection in this API uses.
                 body["items"] = std::move(out);
                 return http_json(200, Json(std::move(body)).dump());

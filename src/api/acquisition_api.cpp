@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "api/acquisition_api.hpp"
+#include "api/paging.hpp"
 
 #include "json.hpp"
 
@@ -186,6 +187,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
         }
 
         if (request.method == "GET" && request.path == "/api/v1/ingest/jobs") {
+            PageQuery page;
+            if (auto bad = read_page_query(request, page)) return *bad;
             const auto listing = jobs_.ingest_jobs();
             Json::Array jobs;
             for (const auto& entry : listing.jobs) {
@@ -194,6 +197,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 jobs.push_back(std::move(item));
             }
             Json::Object out;
+            page_json(jobs, "id", page, out);
             out["jobs"] = std::move(jobs);
             out["sources"] = sources_json(listing.sources);
             out["refresh_interval_ms"] = static_cast<uint64_t>(jobs_.refresh_interval().count());
@@ -264,12 +268,15 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
         if (request.method == "GET" && request.path == "/api/v1/torrents/jobs") {
             // The requests from this node's metadata, with each owner's live state from
             // the cluster view.
+            PageQuery page;
+            if (auto bad = read_page_query(request, page)) return *bad;
             const auto listing = jobs_.torrent_jobs();
             std::map<NodeId, uint64_t> as_of;
             for (const auto& source : listing.sources) as_of[source.node_id] = source.as_of_unix_ms;
             Json::Array jobs;
             for (const auto& r : torrents_.requests()) jobs.push_back(request_json(r, as_of));
             Json::Object out;
+            page_json(jobs, "id", page, out);
             out["jobs"] = std::move(jobs);
             out["sources"] = sources_json(listing.sources);
             out["refresh_interval_ms"] = static_cast<uint64_t>(jobs_.refresh_interval().count());

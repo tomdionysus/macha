@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "api/catalogue_api.hpp"
+#include "api/paging.hpp"
 #include "catalogue/media_information.hpp"
 #include "macha_version.hpp"
 
@@ -199,14 +200,16 @@ std::string item_json(const CatalogueItem& item, const CatalogueSnapshot& snapsh
     return out;
 }
 
+// Items [begin, end) of `items`, and the cursor of the page after them.
 std::string items_json(const std::vector<CatalogueItem>& items, const CatalogueSnapshot& snapshot,
-                       const ArtworkUrlContext& urls, const ItemAvailabilityTable& availability) {
+                       const ArtworkUrlContext& urls, const ItemAvailabilityTable& availability,
+                       size_t begin, size_t end, const std::optional<std::string>& next_cursor) {
     std::string out = "{\"items\":[";
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (i) out += ',';
+    for (size_t i = begin; i < end; ++i) {
+        if (i != begin) out += ',';
         out += item_json(items[i], snapshot, urls, availability);
     }
-    out += "]}";
+    out += "],\"next_cursor\":" + (next_cursor ? json_escape(*next_cursor) : std::string("null")) + "}";
     return out;
 }
 
@@ -439,6 +442,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
         }
 
         if (request.method == "GET" && request.path == "/api/v1/catalogue/hints") {
+            PageQuery page;
+            if (auto bad = read_page_query(request, page)) return *bad;
             Json::Array values;
             for (const auto& hint : hints_.list()) {
                 Json::Object item;
@@ -472,6 +477,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 values.emplace_back(std::move(item));
             }
             Json::Object out;
+            page_json(values, "id", page, out);
             out["hints"] = std::move(values);
             return json(200, Json(std::move(out)).dump());
         }
@@ -484,21 +490,34 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             }
             std::optional<std::string_view> parent;
             if (auto it = request.query.find("parent"); it != request.query.end()) parent = it->second;
+            PageQuery page;
+            if (auto bad = read_page_query(request, page)) return *bad;
             auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/catalogue/items"));
-            return json(200, items_json(catalogue_.list(kind, parent), *snapshot,
+            auto items = catalogue_.list(kind, parent);
+            std::sort(items.begin(), items.end(),
+                      [](const auto& a, const auto& b) { return a.id < b.id; });
+            const auto range = page_range(
+                items, [](const CatalogueItem& item) -> std::string_view { return item.id; }, page);
+            return json(200, items_json(items, *snapshot,
                                         {catalogue_.cluster_keys(), artwork_capability_ttl_},
-                                        *item_availability(snapshot)));
+                                        *item_availability(snapshot), range.begin, range.end,
+                                        range.next_cursor));
         }
 
         if (request.method == "GET" && request.path == "/api/v1/catalogue/search") {
             auto q = request.query.find("q");
             if (q == request.query.end()) return error(400, "missing_query", "q is required");
-            size_t limit = 50;
-            if (auto it = request.query.find("limit"); it != request.query.end() && !it->second.empty()) {
-                auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), limit);
-                if (ec != std::errc{} || end != it->second.data() + it->second.size() || limit > 1000)
-                    return error(400, "bad_limit", "limit must be 0..1000");
+            // Results are ranked, so the cursor is a position in the ranking.
+            PageQuery page;
+            if (auto bad = read_page_query(request, page)) return *bad;
+            const size_t limit = page.limit.value_or(50);
+            size_t offset = 0;
+            if (page.after) {
+                auto [end, ec] = std::from_chars(page.after->data(),
+                                                 page.after->data() + page.after->size(), offset);
+                if (ec != std::errc{} || end != page.after->data() + page.after->size())
+                    return error(400, "bad_cursor", "cursor is not one this server issued");
             }
             // `kind` may repeat; absent means every kind. `parent` keeps only
             // that item's children. Both filter before `limit`.
@@ -522,9 +541,14 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             };
             auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/catalogue/search"));
-            return json(200, items_json(catalogue_.search(q->second, limit, keep), *snapshot,
+            const auto found = catalogue_.search(q->second, offset + limit + 1, keep);
+            const auto begin = std::min(offset, found.size());
+            const auto end = std::min(begin + limit, found.size());
+            std::optional<std::string> next;
+            if (found.size() > end) next = page_cursor(std::to_string(end));
+            return json(200, items_json(found, *snapshot,
                                         {catalogue_.cluster_keys(), artwork_capability_ttl_},
-                                        *item_availability(snapshot)));
+                                        *item_availability(snapshot), begin, end, next));
         }
 
         constexpr std::string_view media_prefix = "/api/v1/catalogue/media/";

@@ -1,5 +1,22 @@
 # Current release
 
+## 0.90.18 — every list call pages (experiment)
+
+API change, additive except for order. No wire, protocol or on-disk changes.
+
+**Every list call takes `limit` and `cursor` and answers `next_cursor`**
+([API conventions](docs/api.md#lists)). Without `limit` a list answers in
+full, as before. A cursor is a position, so an entry added or removed between
+pages is never seen twice.
+
+**Lists come in key order.** Catalogue items are ordered by id where they were
+ordered by title; hints and unmatched files by hint id where they were ordered
+by priority; a directory's entries by name where directories came first.
+Clients sort for display.
+
+**Search's `limit` is 1 to 1000** (it accepted 0); it still defaults to 50,
+and its cursor is a position in the ranking.
+
 ## 0.90.17 — configuration without dead settings (experiment)
 
 Configuration change: three keys are gone, and a file that still sets one is
