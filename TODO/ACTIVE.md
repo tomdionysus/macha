@@ -24,7 +24,10 @@ of the burst test below, the polling refresh and its TTL, the second
 repair per pass (section 6's question, answered), and every whole-snapshot
 copy. Eleven stages, each shipping alone: correctness first (the install
 point), then measurement, then cost. Stage 1 (one install point, the
-installer) is 0.90.27. Next: stage 2, maintenance reduced.
+installer) is 0.90.27. Next: stage 2, maintenance reduced. Also for stage 2:
+each local commit is decoded in full once more by the installer (82 to
+98 ms on gbni-1), which sees the head change before the committing thread
+installs what it wrote; the commit's snapshot should be the one installed.
 
 ## 1. Failing tests and defects
 
@@ -73,14 +76,13 @@ installer) is 0.90.27. Next: stage 2, maintenance reduced.
 
 ## 2. Matching
 
-- A commit during a multi-file match sometimes waited 9 to 13 s (gbni-1,
-  2026-10-05 19:10Z, every other track). Not reproduced in a two-match test.
-  gbni-1 runs at level ALL, where the catalogue lock's waits are logged
-  (`DIAG lock-held lock=catalogue.mutation`): match an album on gbni-1 to
-  catch it. Two suspects, neither verified: a mutation's refresh under that
-  lock running a full load (gone in 0.90.27), and gbni-1 uploading the
-  whole catalogue, 5.4 MB, after every catalogue commit while matching
-  (gone in 0.90.29). Match an album to see whether the waits remain.
+- **The first track of a match pays the provider again** (gbni-1, 0.90.29,
+  2026-10-06 17:09Z): the editor had just run a provider search (1.3 s) and
+  fetched artwork options four times (1.5 to 2.1 s each), then the match
+  looked the release up again (1.4 s) and downloaded the cover again
+  (1.9 s): 4.1 s for the first track, 0 ms lookup and artwork for the
+  second. Commits took 339 and 290 ms with no lock wait: the 9 to 13 s
+  commit waits did not recur after 0.90.27 and 0.90.29.
 - Provider caches are per editor seat and lost on restart: the first track of
   each album after a restart pays the lookup and the cover again.
 
