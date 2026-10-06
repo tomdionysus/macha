@@ -42,9 +42,25 @@ struct FakeMetadataView final : MetadataView {
     MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t) override {
         throw std::runtime_error("read-only fake");
     }
-    MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>&,
+    // A commit applies to the head and makes the next generation.
+    MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>& change,
                                 size_t, std::optional<MetadataMutationIdentity>) override {
-        throw std::runtime_error("read-only fake");
+        if (!view)
+            throw std::runtime_error("metadata unavailable");
+        auto next = std::make_shared<MetadataSnapshot>(*view->snapshot);
+        MetadataDelta delta;
+        change(*next, delta);
+        view = MetadataSnapshotView{view->generation + 1, 0, Hash256{}, std::move(next)};
+        return {};
+    }
+    // The head moves on with nothing changed.
+    void advance() {
+        view = MetadataSnapshotView{view->generation + 1, 0, Hash256{}, view->snapshot};
+    }
+    void set_catalogue_root(std::optional<ObjectId> root) {
+        auto next = std::make_shared<MetadataSnapshot>(*view->snapshot);
+        next->catalogue_root = root;
+        view = MetadataSnapshotView{view->generation + 1, 0, Hash256{}, std::move(next)};
     }
     bool resolve_conflict(const std::string&, std::string_view) override { return false; }
     uint64_t conflicts_superseded() const noexcept override { return 0; }
@@ -125,6 +141,99 @@ MACHA_TEST("catalogue_maintenance", test_a_head_behind_the_known_generation_read
     const auto head = catalogue.maintenance_head();
     CHECK(head.current);
     CHECK(head.generation == known);
+}
+
+CatalogueItem movie(std::string id, std::string title) {
+    CatalogueItem item;
+    item.id = std::move(id);
+    item.kind = CatalogueKind::movie;
+    item.title = std::move(title);
+    return item;
+}
+
+MetadataSnapshotView empty_head(uint64_t generation) {
+    return MetadataSnapshotView{generation, 0, Hash256{},
+                                std::make_shared<const MetadataSnapshot>()};
+}
+
+MACHA_TEST("catalogue_maintenance", test_a_commit_installs_what_it_wrote_once) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    catalogue.follow_head();
+    const auto cold = catalogue.installs();
+    CHECK(cold == 1);
+    for (int i = 0; i < 3; ++i) {
+        const auto written = catalogue.upsert(movie("movie:one", "Title " + std::to_string(i)));
+        CHECK(catalogue.installs() == cold + 1 + static_cast<uint64_t>(i));
+        const auto read = catalogue.get("movie:one");
+        REQUIRE(read.has_value());
+        CHECK(read->revision == written.revision);
+        CHECK(catalogue.status().root == metadata.view->snapshot->catalogue_root);
+    }
+}
+
+MACHA_TEST("catalogue_maintenance", test_an_unchanged_root_is_never_installed_again) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    (void)catalogue.upsert(movie("movie:one", "One"));
+    const auto installs = catalogue.installs();
+    // New heads that leave the catalogue alone: the view stands.
+    for (int i = 0; i < 5; ++i) {
+        metadata.advance();
+        catalogue.follow_head();
+        catalogue.repair_once();
+    }
+    CHECK(catalogue.installs() == installs);
+    CHECK(catalogue.status().metadata_generation == metadata.view->generation);
+}
+
+MACHA_TEST("catalogue_maintenance", test_another_writers_commit_is_installed_on_the_next_head) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager reader(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    CatalogueManager writer(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    auto item = reader.upsert(movie("movie:one", "One"));
+    item.title = "Edited elsewhere";
+    item = writer.upsert(item, item.revision);
+    // A warm read is memory-only: the reader still serves its own view.
+    CHECK(reader.get("movie:one")->title == "One");
+    reader.follow_head();
+    const auto seen = reader.get("movie:one");
+    REQUIRE(seen.has_value());
+    CHECK(seen->title == "Edited elsewhere");
+    // Writing on from the revision just seen succeeds: the view is the head.
+    item.title = "Edited here";
+    const auto written = reader.upsert(item, seen->revision);
+    CHECK(written.revision == seen->revision + 1);
+    CHECK(reader.get("movie:one")->revision == written.revision);
+}
+
+MACHA_TEST("catalogue_maintenance", test_a_root_that_cannot_be_read_keeps_the_view_serving) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    (void)catalogue.upsert(movie("movie:one", "One"));
+    const auto installs = catalogue.installs();
+    const auto held_root = catalogue.status().root;
+    // A head naming a catalogue no node present holds.
+    metadata.set_catalogue_root(object_id(test_support::pattern(64, 7)));
+    bool failed = false;
+    try {
+        catalogue.follow_head();
+    } catch (const CatalogueUnavailable&) {
+        failed = true;
+    }
+    CHECK(failed);
+    CHECK(catalogue.installs() == installs);
+    CHECK(catalogue.status().root == held_root);
+    CHECK(catalogue.status().error_code == "unavailable");
+    REQUIRE(catalogue.get("movie:one").has_value());
 }
 
 } // namespace

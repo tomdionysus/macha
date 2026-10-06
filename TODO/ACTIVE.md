@@ -23,23 +23,11 @@ publication, and holdings for catalogue DATA. It removes the two failures
 of the burst test below, the polling refresh and its TTL, the second
 repair per pass (section 6's question, answered), and every whole-snapshot
 copy. Eleven stages, each shipping alone: correctness first (the install
-point), then measurement, then cost. The `cache()` generation guard is
-0.90.26, deployed.
+point), then measurement, then cost. Stage 1 (one install point, the
+installer) is 0.90.27. Next: stage 2, maintenance reduced.
 
 ## 1. Failing tests and defects
 
-- **P0: `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`**,
-  two failures, both resolved by section 0:
-  - `catalogue item revision changed: movie:coalesced-catalogue expected 6,
-    now 5` (fi-1, 2 of 30 runs): a background `refresh()` installed an older
-    view over the one `upsert` had just cached. Guarded in `cache()` in the
-    0.90.26 (0 of 50 runs since); the proper fix is one install point.
-  - `unexpected catalogue repair count for one coalesced burst` (fi-1, 5 of
-    30 runs): the burst coalesces correctly (one follow-up run, two
-    scheduled, asserted exactly), but maintenance runs a catalogue pass
-    every iteration while dirty, so 3 to 4 passes against 14 to 24 events
-    fails the invented quarter ratio. Not to be loosened; the test is
-    rewritten to count installs per root once section 0 lands.
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
   `/root/claude-missing-extent-driver.py` are staged on fi-1, not run.
   *Carried.*

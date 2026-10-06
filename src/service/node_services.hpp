@@ -7,6 +7,7 @@
 #include "api/catalogue_api.hpp"
 #include "api/manage_api.hpp"
 #include "catalogue/catalogue.hpp"
+#include "catalogue/catalogue_installer.hpp"
 #include "catalogue/catalogue_hints.hpp"
 #include "catalogue/media_catalogue.hpp"
 #include "catalogue/media_information.hpp"
@@ -146,6 +147,7 @@ class NodeServices {
     UnreferencedSince control_unreferenced_;
     AvailabilityService availability_;
     CatalogueManager catalogue_;
+    CatalogueInstaller catalogue_installer_;
     FileSystem filesystem_;
     CatalogueHintQueue catalogue_hints_;
     std::shared_ptr<MediaEngine> media_engine_;

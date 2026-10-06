@@ -2,6 +2,17 @@
 
 Last updated: 2026-10-06
 
+## 2026-10-06 -- 0.90.26 to 0.90.27
+
+- **The catalogue view never steps backwards** (P0): a background refresh
+  that read its view before a commit and cached it after put the older
+  catalogue back (`expected 6, now 5`, fi-1, 2 of 30 runs), so the next write
+  was refused with 409. Guarded in 0.90.26; fixed in 0.90.27 by one install
+  point that reads the head itself, driven by head changes. The burst test's
+  second failure (a repair count against an invented ratio, 5 of 30 on fi-1)
+  went with it: 0 of 30 on fi-1, 20 of 20 on the laptop, suites green.
+  Stage 1 of [the catalogue plan](2026-10-06-catalogue-materialised-view.md).
+
 ## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.25
 
 All deployed on gbni-1 and fi-1, merged to `develop` and `main` (`0c5492f`).

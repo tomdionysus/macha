@@ -640,8 +640,7 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
     return snapshot;
 }
 
-bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadata) {
-    const auto root = metadata.catalogue_root;
+bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& root) {
     std::vector<NodeId> active_nodes;
     for (const auto& node : node_.membership().active())
         active_nodes.push_back(node.id);
@@ -713,29 +712,48 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
         throw;
     }
 }
-void CatalogueManager::cache(uint64_t metadata_generation, const MetadataSnapshot& metadata,
-                             CatalogueSnapshot snapshot) {
-    auto cached = std::make_shared<const CatalogueSnapshot>(std::move(snapshot));
-    Lock lock(mutex_);
-    // A refresh can read its view before a mutation commits and cache it
-    // after: the older generation never replaces the newer.
-    if (ready_ && cached_ && metadata_generation < cached_metadata_generation_)
-        return;
-    const bool root_changed = !control_gc_root_epoch_initialized_ ||
-                              cached_root_ != metadata.catalogue_root;
-    cached_ = std::move(cached);
-    cached_root_ = metadata.catalogue_root;
-    cached_metadata_generation_ = metadata_generation;
-    cache_until_ = Clock::now() + node_.config().metadata_cache;
-    last_sync_unix_ms_ = unix_ms();
-    if (root_changed) {
-        control_gc_root_epoch_ = Clock::now();
-        ++control_gc_root_epoch_sequence_;
-        control_gc_root_epoch_initialized_ = true;
+void CatalogueManager::install_head(const CatalogueSnapshot* known,
+                                    const std::optional<ObjectId>& known_root) {
+    Lock install_lock(install_mutex_);
+    try {
+        const auto head = metadata_.local();
+        if (!head.snapshot)
+            throw CatalogueUnavailable("catalogue metadata snapshot unavailable");
+        const auto& root = head.snapshot->catalogue_root;
+        {
+            // The root is content-addressed: unchanged, the view is current,
+            // whatever the generation did.
+            Lock lock(mutex_);
+            if (ready_ && cached_root_ == root) {
+                cached_metadata_generation_ = std::max(cached_metadata_generation_, head.generation);
+                last_sync_unix_ms_ = unix_ms();
+                return;
+            }
+        }
+        auto installed = std::make_shared<const CatalogueSnapshot>(
+            known && known_root == root ? *known : load_root(root));
+        Lock lock(mutex_);
+        const bool root_changed = !control_gc_root_epoch_initialized_ || cached_root_ != root;
+        cached_ = std::move(installed);
+        cached_root_ = root;
+        cached_metadata_generation_ = head.generation;
+        last_sync_unix_ms_ = unix_ms();
+        ++installs_;
+        if (root_changed) {
+            control_gc_root_epoch_ = Clock::now();
+            ++control_gc_root_epoch_sequence_;
+            control_gc_root_epoch_initialized_ = true;
+        }
+        ready_ = true;
+        error_.clear();
+        error_code_.clear();
+    } catch (const std::exception& e) {
+        // The previous view keeps serving; the next head change retries.
+        Lock lock(mutex_);
+        error_code_ = "unavailable";
+        error_ = e.what();
+        throw;
     }
-    ready_ = true;
-    error_.clear();
-    error_code_.clear();
 }
 
 bool CatalogueManager::reconcile_catalogue_conflict(const MetadataSnapshotView& view) {
@@ -770,119 +788,70 @@ bool CatalogueManager::reconcile_catalogue_conflict(const MetadataSnapshotView& 
     return false;
 }
 
-void CatalogueManager::repair_once() {
-    refresh(true);
+void CatalogueManager::follow_head() {
+    install_head();
 }
 
-void CatalogueManager::refresh(bool converge) {
-    // Single-flight: of the API workers seeing the same notice or TTL expiry,
-    // only one does the replica I/O and decodes the new root.
-    Lock refresh_lock(refresh_mutex_);
-    try {
-        if (!converge) {
-            // A write or a read brings the catalogue to this node's own head
-            // and offers nothing to the peers: that is maintenance's pass.
-            Lock lock(mutex_);
-            if (ready_ && cached_metadata_generation_ >= metadata_server_.known_generation() &&
-                Clock::now() < cache_until_)
-                return;
-        } else {
-            Lock lock(mutex_);
-            const auto now = Clock::now();
-            if (ready_ && cached_metadata_generation_ >= metadata_server_.known_generation() &&
-                now < cache_until_ && control_converged_root_ == cached_root_) {
-                std::vector<NodeId> active_nodes;
-                for (const auto& node : node_.membership().active())
-                    active_nodes.push_back(node.id);
-                std::sort(active_nodes.begin(), active_nodes.end());
-                if (control_converged_nodes_ == active_nodes)
-                    return;
-            }
-        }
-
-        // MetadataManager owns replicated metadata reads; this consumes its
-        // decoded view. A cold manager may bootstrap it once; after that this
-        // path is memory-only.
-        auto view = metadata_.current();
-        if (!view) {
-            (void)metadata_.record();
-            view = metadata_.current();
-        }
-        if (!view)
-            throw std::runtime_error("catalogue metadata snapshot unavailable after successful read");
-
-        // A newer generation known but not yet acquired is left to
-        // MetadataManager::repair_once(); refresh_needed() stays true, so the
-        // view is adopted once metadata maintenance publishes it.
-        if (view->generation < metadata_server_.known_generation())
-            return;
-
-        // At most one root conflict per pass. Disjoint item merges are
-        // automatic; same-item or parent/child collisions stay durable conflicts.
-        if (reconcile_catalogue_conflict(*view)) {
-            view = metadata_.current();
-            if (!view)
-                return;
-        }
-
-        const auto generation = view->generation;
-        const auto& metadata = *view->snapshot;
-        const std::optional<bool> control_converged =
-            converge ? std::optional<bool>(converge_control_replicas(metadata)) : std::nullopt;
-        {
-            Lock lock(mutex_);
-            if (ready_ && cached_root_ == metadata.catalogue_root) {
-                // The root is content-addressed: unchanged, the cached snapshot
-                // is current, whatever the generation did.
-                cached_metadata_generation_ = std::max(cached_metadata_generation_, generation);
-                cache_until_ = Clock::now() + node_.config().metadata_cache;
-                last_sync_unix_ms_ = unix_ms();
-                if (control_converged && *control_converged) {
-                    error_.clear();
-                    error_code_.clear();
-                } else if (control_converged) {
-                    error_code_ = "converging";
-                    error_ = "catalogue control replicas are converging";
-                }
-                return;
-            }
-        }
-        auto snapshot = load_root(metadata.catalogue_root);
-        cache(generation, metadata, std::move(snapshot));
-    } catch (const std::exception& e) {
-        Lock lock(mutex_);
-        // A failed attempt keeps the loaded snapshot; warm reads continue on it
-        // while a later pass retries.
-        error_code_ = "unavailable";
-        error_ = e.what();
-        throw;
+void CatalogueManager::repair_once() {
+    // At most one root conflict per pass. Disjoint item merges are automatic;
+    // same-item or parent/child collisions stay durable conflicts. The merge
+    // is a commit, which installs, so it is serialised with every other.
+    bool reconciled = false;
+    {
+        TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+        reconciled = reconcile_catalogue_conflict(metadata_.local());
     }
+    if (!reconciled)
+        install_head();
+    std::optional<ObjectId> root;
+    {
+        Lock lock(mutex_);
+        root = cached_root_;
+    }
+    const bool converged = converge_control_replicas(root);
+    Lock lock(mutex_);
+    if (converged) {
+        error_.clear();
+        error_code_.clear();
+    } else {
+        error_code_ = "converging";
+        error_ = "catalogue control replicas are converging";
+    }
+}
+
+bool CatalogueManager::convergence_needed() const {
+    std::vector<NodeId> active_nodes;
+    for (const auto& node : node_.membership().active())
+        active_nodes.push_back(node.id);
+    std::sort(active_nodes.begin(), active_nodes.end());
+    Lock lock(mutex_);
+    if (!ready_)
+        return true;
+    if (control_converged_root_ == cached_root_ && control_converged_nodes_ == active_nodes)
+        return false;
+    return Clock::now() >= control_convergence_retry_;
+}
+
+uint64_t CatalogueManager::installs() const {
+    Lock lock(mutex_);
+    return installs_;
 }
 
 std::shared_ptr<const CatalogueSnapshot> CatalogueManager::current_snapshot() {
     {
         Lock lock(mutex_);
-        // Warm reads are memory-only: convergence is background work, and a GET
-        // never blocks on replica I/O for an expired TTL.
+        // Warm reads are memory-only: the view follows the head behind them.
         if (ready_ && cached_)
             return cached_;
     }
 
-    // A cold manager's first read loads a snapshot synchronously.
-    refresh(false);
+    // A cold manager's first read installs synchronously.
+    install_head();
 
     Lock lock(mutex_);
     if (!ready_ || !cached_)
         throw std::runtime_error("catalogue unavailable");
     return cached_;
-}
-
-bool CatalogueManager::refresh_needed() const {
-    Lock lock(mutex_);
-    if (!ready_ || !cached_)
-        return true;
-    return cached_metadata_generation_ < metadata_server_.known_generation() ||
-           Clock::now() >= cache_until_;
 }
 
 CatalogueStatus CatalogueManager::status() const {
@@ -1018,7 +987,7 @@ void CatalogueManager::put_media_profile(std::string media_id, MediaProbeResult 
     if (!valid_catalogue_media_profile(media_id, profile))
         throw std::invalid_argument("invalid immutable media profile");
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     if (auto it = current.media_profiles.find(media_id);
         it != current.media_profiles.end() && it->second == profile)
@@ -1037,7 +1006,7 @@ void CatalogueManager::put_media_profiles(
     std::map<std::string, MediaProbeResult, std::less<>> profiles) {
     if (profiles.empty()) return;
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     bool changed = false;
     for (auto& [media_id, probe] : profiles) {
@@ -1071,7 +1040,7 @@ void CatalogueManager::put_media_index(std::string media_id, std::span<const uin
     if (!store_.put(id, bytes, FrameType::speculative))
         throw CatalogueUnavailable("cannot store media index in distributed DATA storage");
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     if (auto it = current.media_indexes.find(media_id);
         it != current.media_indexes.end() && it->second == id)
@@ -1089,7 +1058,7 @@ void CatalogueManager::put_media_index(std::string media_id, std::span<const uin
 size_t CatalogueManager::prune_media_profiles(
     const std::set<std::string>& live_media_ids) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     const auto before = current.media_profiles.size();
     std::erase_if(current.media_profiles, [&](const auto& item) {
@@ -1243,7 +1212,7 @@ void CatalogueManager::commit(
     // An unchanged root is nothing to commit, unless a conflict is being
     // decided in its favour: that decision is the commit.
     if (expected_root && *expected_root == root && !resolved_conflict) {
-        cache(head->generation, metadata_snapshot, next);
+        install_head(&next, root);
         return;
     }
 
@@ -1303,20 +1272,19 @@ void CatalogueManager::commit(
                                    e.what());
     }
 
-    const auto committed = metadata_.local();
     {
         Lock lock(mutex_);
         control_converged_root_.reset();
         control_converged_nodes_.clear();
         control_convergence_retry_ = {};
     }
-    cache(committed.generation, *committed.snapshot, next);
+    install_head(&next, root);
 }
 
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,
                                         std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
@@ -1345,7 +1313,7 @@ CatalogueItem CatalogueManager::upsert(CatalogueItem item,
 std::vector<CatalogueItem> CatalogueManager::upsert_many(std::vector<CatalogueItem> items) {
     if (items.empty()) return {};
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
@@ -1368,7 +1336,7 @@ std::vector<CatalogueItem> CatalogueManager::upsert_many(std::vector<CatalogueIt
 
 bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
@@ -1418,7 +1386,7 @@ bool CatalogueManager::definitely_absent(std::string_view id) const {
 CatalogueClearResult CatalogueManager::clear_metadata_with_media(
     std::string_view id, std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
@@ -1470,7 +1438,7 @@ CatalogueUnbindResult CatalogueManager::unbind_media(std::optional<std::string_v
                                                      std::string_view media_id,
                                                      std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
@@ -1583,7 +1551,7 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                                          const std::map<std::string, MediaProbeResult, std::less<>>& profiles,
                                          const std::set<std::string>& vanished_media) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    refresh(false);
+    install_head();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
@@ -1918,7 +1886,6 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     CatalogueMaintenance out;
     const auto& metadata_root = head.root;
     const auto& metadata_roots = head.roots;
-    const uint64_t metadata_generation = head.generation;
     const bool metadata_current = head.current;
     // A root conflict's alternatives stay durable until resolved: protect
     // their roots, manifests, shards and artwork from GC.
@@ -1983,8 +1950,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
 
     {
         Lock lock(mutex_);
-        const bool root_converged = cached_root_ == metadata_root &&
-                                    cached_metadata_generation_ >= metadata_generation;
+        const bool root_converged = ready_ && cached_root_ == metadata_root;
         out.complete = metadata_current && repair_ok && root_converged &&
                        protected_roots_complete;
     }

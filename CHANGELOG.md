@@ -1,5 +1,29 @@
 # Current release
 
+## 0.90.27: the catalogue view follows the head
+
+No API, wire, protocol or on-disk changes.
+
+**One install point.** A node's catalogue view is now installed in one place
+only, from this node's own metadata head, and only when the head's catalogue
+root changes. A commit installs what it wrote without reading it back. A
+background installer follows every head change (`NodeEvent::metadata`): a peer's
+catalogue edit shows here as soon as it reaches this node's head, rather than
+at the next maintenance pass, and several head changes at once become one
+install of the latest. An install that cannot read the new root keeps the
+previous view serving and is tried again on the next head, membership or
+storage change.
+
+**Removed:** the polling refresh, its cache lifetime (`metadata_cache_ms` no
+longer affects the catalogue; the metadata manager still uses it) and the
+0.90.26 generation guard, which one install point makes unnecessary.
+Maintenance offers the installed root's control objects to the nodes present
+when the root or the membership changes, and decides a standing catalogue
+root conflict, serialised with every other catalogue write.
+
+The coalesced-burst test now counts installs against the distinct roots the
+burst committed, in place of a repair count against an invented ratio.
+
 ## 0.90.26: the catalogue view never steps backwards
 
 No API route, wire, protocol or on-disk changes. The English message of a
