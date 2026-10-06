@@ -1,4 +1,4 @@
-# Phase 1 three-node UAT — 2026-08-30
+# Phase 1 three-node UAT: 2026-08-30
 
 ## Purpose
 

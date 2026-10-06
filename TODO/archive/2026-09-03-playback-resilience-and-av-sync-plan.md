@@ -42,7 +42,7 @@ Peer RPCs to/from node 200 separately stalled for 5–10 seconds. This indicates
 poor transport plus needless connection churn, not permission for synchronous
 UI waits.
 
-## Phase 0 — Proof without observer distortion
+## Phase 0: Proof without observer distortion
 
 - Add an opt-in aggregate playback snapshot: first/last input and output A/V
   PTS, expected media time, maximum drift, discontinuity and repair counts, and
@@ -54,7 +54,7 @@ UI waits.
 
 Exit: the failure is reproducible and measuring it does not alter playback.
 
-## Phase 1 — One presentation timeline
+## Phase 1: One presentation timeline
 
 2026-09-05 partial progress, corrected after a live regression: shipped
 bounded drift compensation for transcoded audio after live-reproducing a real
@@ -99,7 +99,7 @@ still open.
 Exit: accumulated A/V skew stays within a defined small bound, including after
 seek, without changing response or planner semantics.
 
-## Phase 2 — Persistent, bounded HTTP transport
+## Phase 2: Persistent, bounded HTTP transport
 
 - Implement HTTP/1.1 keep-alive for Status, manifests and fragments; retain
   explicit close where requested or required.
@@ -115,7 +115,7 @@ seek, without changing response or planner semantics.
 Exit: sequential Status and fragment requests reuse TCP; dropped connections
 recover without duplicate work; control latency remains bounded.
 
-## Phase 3 — Bandwidth and buffer control
+## Phase 3: Bandwidth and buffer control
 
 - Require or infer a delivery budget. Without one, use a conservative,
   configurable poor-network default rather than unconstrained CRF.
@@ -132,7 +132,7 @@ recover without duplicate work; control latency remains bounded.
 Exit: impaired-network playback is continuous after bounded startup, output
 stays within budget, and throughput changes do not multiply sessions.
 
-## Phase 4 — Cold planning and source delivery
+## Phase 4: Cold planning and source delivery
 
 - Persist profile data and Direct/Remux evidence, including seek/index
   suitability, against immutable file identity.
@@ -146,7 +146,7 @@ stays within budget, and throughput changes do not multiply sessions.
 Exit: warm admission performs no probing reads; unavoidable cold cost is
 bounded; sequential delivery has lookahead without RSS or loader starvation.
 
-## Phase 5 — Codec cost, last
+## Phase 5: Codec cost, last
 
 - Re-measure production speed and CPU after preceding corrections.
 - Retain proven bounded decoder parallelism and the memory ledger.

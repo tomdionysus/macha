@@ -212,5 +212,5 @@ crash handling, and diagnostics. The compatibility setting no longer caps user
 publication. Phase 1B still needs an explicit in-flight-byte bound and fair
 quanta; Phase 2/4 must then eliminate repeated whole-generation work and
 pipeline immutable extent transfer. Future UAT is judged primarily by
-confirmed/retired bytes, usable-file latency, and catalogue visibility—not
+confirmed/retired bytes, usable-file latency, and catalogue visibility-not
 bytes reread.
