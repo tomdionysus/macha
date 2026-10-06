@@ -26,6 +26,15 @@ copy. Eleven stages, each shipping alone: correctness first (the install
 point), then measurement, then cost. Stage 1 (one install point, the
 installer) is 0.90.27. Next: stage 2, maintenance reduced.
 
+Found deploying 0.90.27, for stage 2: maintenance's catalogue stage takes 14
+to 30 s on gbni-1 (`DIAG maintenance-stage stage=catalogue-repair`, every
+restart since at least 10:34Z on 2026-10-06, and between restarts, e.g.
+11:43Z and 11:47Z). Suspect, not proven: every catalogue commit resets the
+control convergence state, and the next pass offers the manifest and all 64
+shards to every node present over the WAN, though the commit already
+shipped its changed shards with its claims. Stage 2 converges only what
+`shard_changes` names, and measures it.
+
 ## 1. Failing tests and defects
 
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
