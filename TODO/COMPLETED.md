@@ -2,7 +2,7 @@
 
 Last updated: 2026-10-06
 
-## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.19
+## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.24
 
 All deployed on gbni-1 and fi-1, merged to `develop` and `main` (`0c5492f`).
 Detail in `CHANGELOG.md` under each version; the plans and evidence are in
@@ -36,6 +36,14 @@ Detail in `CHANGELOG.md` under each version; the plans and evidence are in
 - **A title's files** (0.90.15): unmatch, delete by path and delete by
   content, each one call, with empty titles and parents removed
   (`2026-10-05-title-files-and-paging.md`).
+- **Repair** (0.90.21 to 0.90.24): the pull walk passes settled objects
+  without spending its budget; rebalance reads nothing with one backend;
+  repair's own CPU no longer slows it; pull works from the extents this node
+  lacks and push from what each peer lacks, both from the holdings roll-up,
+  with no per-object presence probes. fi-1 went from nothing to about
+  2.3 GB/h, gbni-1 to about 1.8-3.2 GB/h, through the day.
+- **Torrent swarm and ingest node** (0.90.20, 0.90.22): `swarm` and
+  `ingest_node_id` on torrent jobs.
 - **MusicBrainz backoff** (0.90.19): the gate waits out Retry-After (else
   2 s doubling to 60 s); editor requests wait out up to 5 s and retry once;
   `provider_unavailable` carries `retry_after_ms`. One rate-limit answer had
