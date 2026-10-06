@@ -1296,7 +1296,8 @@ void TorrentManager::update_jobs() {
 
                 auto hit = impl_->handles.find(id);
                 if (hit == impl_->handles.end()) return;
-                auto status = hit->second.status(lt::torrent_handle::query_name | lt::torrent_handle::query_accurate_download_counters);
+                auto status = hit->second.status(lt::torrent_handle::query_name | lt::torrent_handle::query_accurate_download_counters |
+                                                 lt::torrent_handle::query_distributed_copies);
                 job.name = sanitize_text(status.name, 1024);
                 if (job.info_hash.empty()) job.info_hash = info_hash_hex(status.info_hashes);
                 job.bytes_total = status.total_wanted > 0 ? static_cast<uint64_t>(status.total_wanted) : 0;

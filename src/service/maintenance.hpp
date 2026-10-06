@@ -32,6 +32,12 @@ namespace macha {
 
 std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfig&);
 
+// How much of its byte rate background work keeps under CPU load: 1 while
+// the process's CPU, less the maintenance thread's own, stays within
+// `cpu_target` of a core; otherwise cpu_target over that load.
+double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds,
+                            double wall_seconds, double cpu_target);
+
 // One decision of the maintenance pass, for the decision trace: `kind` names
 // what was decided (a gate, a claim walked, tombstones erased) and `detail`
 // says how, deterministically (ids in hex, no times).

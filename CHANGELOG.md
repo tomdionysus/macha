@@ -1,5 +1,18 @@
 # Current release
 
+## 0.90.22: repair does not slow itself (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**Background work yields to other work's CPU, not its own.** Repair's byte
+credit was scaled down whenever the whole process used more than
+`maintenance.cpu_target` of a core, and repair's own reading, decrypting and
+hashing counted toward that, so repair slowed itself to about half its rate.
+The maintenance thread's CPU no longer counts.
+
+**A torrent's `swarm.availability` is computed.** The engine was not asked for
+it, so it read 0.
+
 ## 0.90.21: repair stops crawling (experiment)
 
 No wire, protocol, API or on-disk changes.
