@@ -261,6 +261,10 @@ suite green; no stage waits on a later one.
    order (hydration's first match, the manage conflict list) state it.
    `retention_objects` already diffed per slot and is unchanged. The
    mutations' whole-catalogue copy (`merged()`) is stage 5.
+   Measured 2026-10-06 19:32Z, a torrent import on gbni-1: gbni-1 installed
+   its commit with nothing decoded; fi-1 installed it 3 s later decoding
+   one shard of 64 (72 KB, under 1 ms), where a full load was 53 ms there
+   and 316 ms on gbni-1; convergence sent nothing on either node.
 5. **Mutations over the view**: copy touched shards, install the successor
    directly, retry once on a moved root.
 6. **The conflict merge per shard.**
