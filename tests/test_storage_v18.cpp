@@ -824,6 +824,20 @@ MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable
     CHECK(passed.bytes_transferred == 0);
     CHECK(node.store().repair_diagnostics().pull_unsourceable == 0);
 
+    // Objects that need nothing do not spend the step's scan budget: a long
+    // stretch of them is passed in one step.
+    {
+        std::vector<ObjectId> settled;
+        for (int i = 0; i < 1000; ++i)
+            settled.push_back(object_id(pattern(256 + static_cast<size_t>(i), static_cast<uint8_t>(i))));
+        std::sort(settled.begin(), settled.end());
+        const auto long_pass =
+            node.store().repair_step(4ULL * 1024 * 1024, 16, settled, {}, 0, unavailable);
+        CHECK(long_pass.pull_examined == settled.size());
+        CHECK(long_pass.bytes_transferred == 0);
+        asked.clear();
+    }
+
     // Unmarked, the pass tries to source it and, with no peer, cannot.
     marked = false;
     REQUIRE(wait_until([&] {

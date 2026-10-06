@@ -153,6 +153,8 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     bool repair_push_cursor_exhausted_{};
     // Maximum concurrent repair pushes.
     static constexpr size_t repair_sends_in_flight = 8;
+    // Objects needing nothing the pull walk passes in one repair step.
+    static constexpr size_t repair_pull_skip_budget = 65536;
     // Objects the current push pass has settled, saved so a restart resumes
     // there (persist_repair_position), and the value to resume from.
     uint64_t repair_push_settled_{};
