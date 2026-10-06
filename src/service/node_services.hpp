@@ -115,6 +115,7 @@ class NodeServices {
     AcquisitionApi& acquisition_api() { return acquisition_api_; }
     CatalogueApi& catalogue_api() { return catalogue_api_; }
     ManageApi& manage_api() { return manage_api_; }
+    CatalogueScanner& scanner() { return scanner_; }
     PlaybackManager& streaming() { return streaming_; }
     SubsystemSupervisor& subsystems() { return subsystems_; }
 

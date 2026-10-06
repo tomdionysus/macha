@@ -1568,9 +1568,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), alternate_id) != twice->media_ids.end());
 
     // Clear Metadata removes the catalogue entity rather than saving an empty
-    // matched item. It also returns the exact immutable media identities that
-    // became unbound, so recovery can enqueue only those files instead of
-    // reopening every terminal/no-match hint in the library.
+    // matched item, and returns the exact media identities that became
+    // unbound, so only those files go to the unmatched list.
     auto cleared = node.catalogue().clear_metadata_with_media(
         "tmdb:movie:335984", twice->revision);
     CHECK(cleared.removed_items == 1);
@@ -1580,25 +1579,12 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     CHECK(std::find(cleared.media_ids.begin(), cleared.media_ids.end(), alternate_id) !=
           cleared.media_ids.end());
     CHECK(!node.catalogue().get("tmdb:movie:335984").has_value());
-    CHECK(scanner.request_media_rescan(cleared.media_ids) == 2);
-    CHECK(node.hints().summary().pending == 2);
-    scanner.start();
-    REQUIRE(wait_until([&] {
-        auto item = node.catalogue().get("tmdb:movie:335984");
-        return item && node.hints().summary().pending == 0;
-    }, 5s));
-    scanner.stop();
-    CHECK(std::filesystem::exists(node.config().state_path /
-                                  "catalogue" / "scanner.state"));
-    auto rematched = node.catalogue().get("tmdb:movie:335984");
-    REQUIRE(rematched.has_value());
-    CHECK(rematched->title == "Blade Runner 2049");
-    CHECK(rematched->synopsis == "A blade runner uncovers a long-buried secret.");
-    CHECK(rematched->external_ids.at("tmdb") == "335984");
-    CHECK(!rematched->external_ids.contains("macha_metadata_locked"));
-    CHECK(rematched->artwork.size() == 2);
-    CHECK(std::find(rematched->media_ids.begin(), rematched->media_ids.end(), media_id) != rematched->media_ids.end());
-    CHECK(std::find(rematched->media_ids.begin(), rematched->media_ids.end(), alternate_id) != rematched->media_ids.end());
+
+    // The scanner's match again, holding both files, for what follows.
+    auto restored = *twice;
+    restored.external_ids.erase("macha_metadata_locked");
+    restored.external_ids["macha_scanner"] = "1";
+    (void)node.catalogue().upsert(restored);
 
     // Deletion reconciles duplicate bindings one at a time and removes the
     // scanner-owned item only after the final copy goes.
@@ -4319,7 +4305,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         (void)node.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes, album.revision);
         CHECK(Config{}.catalogue.api.artwork_capability_ttl == std::chrono::hours(24 * 30));
         const std::chrono::milliseconds ttl = std::chrono::hours(24);
-        CatalogueApi signing(node.catalogue(), node.hints(), {}, {}, {}, ttl);
+        CatalogueApi signing(node.catalogue(), node.hints(), {}, {}, ttl);
         const auto artwork_url = [&](CatalogueApi& on) {
             const auto response = call(on, "GET", "/api/v1/catalogue/items/album%3Asigned-url-test");
             REQUIRE(response.status == 200);
@@ -4406,7 +4392,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         CHECK(!api.capability_request(with({})));
         // A correctly signed but expired URL is refused: expiry itself is
         // enforced. Minted through the real signing path with a 1 ms TTL.
-        CatalogueApi short_lived(node.catalogue(), node.hints(), {}, {}, {}, 1ms);
+        CatalogueApi short_lived(node.catalogue(), node.hints(), {}, {}, 1ms);
         const auto expired = signed_request(artwork_url(short_lived));
         std::this_thread::sleep_for(20ms);
         CHECK(!api.capability_request(expired));
@@ -4433,7 +4419,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
             CHECK(std::string(loaded->begin(), loaded->end()) == body);
         }
         int calls = 0;
-        CatalogueApi index_api(node.catalogue(), node.hints(), {}, {}, {}, std::chrono::hours(24 * 30), {},
+        CatalogueApi index_api(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(24 * 30), {},
                                [&](const std::string& id) -> std::optional<Bytes> {
                                    ++calls;
                                    if (id == media_id) return node.catalogue().media_index(id);
@@ -4647,23 +4633,23 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     CHECK(search_body.find("episode:test:1:1") != std::string::npos);
 
     // Clear Metadata is an atomic catalogue reset. Clearing a hierarchy parent
-    // also removes descendants so leaf media bindings cannot keep the old match
-    // alive and block a fresh scanner/provider lookup.
-    auto clear_response = api.handle({.method = "DELETE",
-                                      .path = "/api/v1/catalogue/items/show%3Atest/metadata",
-                                      .query = {},
-                                      .headers = {{"if-match", "\"rev-" + std::to_string(show.revision + 1) + "\""}},
-                                      .body = {}, .session = {}});
+    // also removes its descendants, so a leaf's binding cannot keep the old
+    // match alive.
+    const auto clear = [&](uint64_t revision) {
+        return s3.manage_api().handle(
+            {.method = "DELETE",
+             .path = "/api/v1/catalogue/items/show:test/metadata",
+             .query = {},
+             .headers = {{"if-match", "\"rev-" + std::to_string(revision) + "\""}},
+             .body = {}, .session = {}});
+    };
+    auto clear_response = clear(show.revision + 1);
     // The poster replacement did not mutate the copy of `show`; use the current
     // revision if the optimistic request raced a catalogue refresh.
     if (clear_response.status == 409) {
         auto current_show = s3.catalogue().get(show.id);
         REQUIRE(current_show.has_value());
-        clear_response = api.handle({.method = "DELETE",
-                                     .path = "/api/v1/catalogue/items/show%3Atest/metadata",
-                                     .query = {},
-                                     .headers = {{"if-match", "\"rev-" + std::to_string(current_show->revision) + "\""}},
-                                     .body = {}, .session = {}});
+        clear_response = clear(current_show->revision);
     }
     CHECK(clear_response.status == 204);
     CHECK(!s3.catalogue().get(show.id).has_value());

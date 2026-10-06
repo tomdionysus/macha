@@ -1,5 +1,18 @@
 # Current release
 
+## 0.90.25: Clear Metadata puts files in the unmatched list (experiment)
+
+API behaviour change; the route, request and answer are unchanged. No wire,
+protocol or on-disk changes.
+
+**Clear Metadata no longer rematches.** `DELETE /api/v1/catalogue/items/{id}/metadata`
+removes the item and everything beneath it, as before, and now puts each of
+their files in the unmatched list as it is, to be identified by hand. It
+queued the files for an automatic rematch, which matched them straight back,
+often to the same wrong title: a clear of "300" was rematched within the same
+second to "My Poetic Works 300 Yen". A conflict on `If-Match` is now
+`409 catalogue_conflict`, as on the other title-file routes.
+
 ## 0.90.24: repair pushes from what peers hold (experiment)
 
 No wire, protocol, API or on-disk changes.
