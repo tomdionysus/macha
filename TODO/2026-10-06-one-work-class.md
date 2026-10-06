@@ -157,7 +157,14 @@ a viewer browsing (stage 3 numbers are the baseline).
 ## Order of work
 
 1. `WorkClass` and `work_class`; arbiter and clocks on it; status callers
-   updated. No behaviour change.
+   updated. No behaviour change. With it, an audit: every DATA admission
+   (`DataResourceArbiter::acquire` and `try_acquire`) listed with the frame
+   it is given, confirming no control frame reaches one. Control's guarantee
+   is separation from DATA work, not priority within it (law 1, "a floor,
+   not a share"); a control path that entered the arbiter would queue
+   behind a running transfer. Candidate to check: the peer validity check
+   (`have_valid_objects`, `storage_server.cpp`) admits with the request's
+   frame, since validity means a decrypt.
 2. The route table classes requests; the server follows it and marks the
    clock. Behaviour change: API activity is a viewer present.
 3. `WorkContext::allowed`; API reads become viewer-class, waits none.
