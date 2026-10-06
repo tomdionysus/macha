@@ -820,6 +820,17 @@ StoragePool::MaintenanceResult
 StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
                             const std::function<bool()>& should_yield) {
     MaintenanceResult result;
+    // With one backend online there is nowhere to move anything, and checking
+    // where each object sits would read the whole store.
+    size_t online = 0;
+    for (const auto& backend : snapshot()) {
+        Lock lock(backend->mutex);
+        online += backend->online ? 1 : 0;
+    }
+    if (online < 2) {
+        result.complete = true;
+        return result;
+    }
     while (!operation_budget || result.objects < operation_budget) {
         if (should_yield && should_yield()) {
             result.yielded = true;

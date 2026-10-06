@@ -2221,6 +2221,28 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
     n1.stop();
 }
 
+MACHA_TEST("invariants", test_rebalance_reads_nothing_with_one_backend_online) {
+    // With one backend there is nowhere to move an object: rebalance says it
+    // is complete without reading the store.
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto a = t.path() / "only";
+    std::filesystem::create_directories(a);
+    const std::vector<StorageBackendConfig> backends{{a, 64ULL * 1024 * 1024}};
+    StoragePool pool(t.path() / "pool-state", random_node_id(), backends, keys.storage);
+    REQUIRE(wait_until([&] { return pool.online_backends() == 1; }));
+    for (uint8_t i = 0; i < 8; ++i) {
+        const auto bytes = pattern(4096, i);
+        REQUIRE(pool.put(object_id(bytes), bytes));
+    }
+    const auto step = pool.rebalance_step(8ULL * 1024 * 1024, 64);
+    CHECK(step.complete);
+    CHECK(step.objects == 0);
+    CHECK(step.bytes == 0);
+}
+
 MACHA_TEST("invariants", test_rebalance_never_deletes_last_valid_copy_for_corrupt_preferred_copy) {
     TempDir t;
     const auto keyfile = t.path() / "cluster.key";

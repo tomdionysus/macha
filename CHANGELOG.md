@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.21 — repair stops crawling (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**The pull walk passes settled objects without spending its budget.** A
+repair step examined at most 64 objects, one step ran per maintenance pass,
+and a pass on fi-1 took 11 to 16 s. Over a live set of about 919,000 objects,
+nearly all of them needing nothing, a pull walk took days, and repair
+transferred nothing while it lasted. An object that is not this node's, is
+already held, or is known unavailable is an index lookup and now passes
+without counting, up to 65,536 a step.
+
+**Rebalance reads nothing on a node with one backend.** It read and verified
+64 whole objects every pass, 3 to 4 s of disk on these single-disk nodes, to
+find there was nowhere to move them.
+
 ## 0.90.20 — torrent jobs say what the swarm holds and where their ingest is (experiment)
 
 API addition: `swarm` and `ingest_node_id` on torrent jobs. No wire, protocol

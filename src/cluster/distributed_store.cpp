@@ -2730,8 +2730,18 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         auto it = repair_pull_after_
                       ? std::upper_bound(live->begin(), live->end(), *repair_pull_after_)
                       : live->begin();
-        while (it != live->end() && scanned_total < scan_budget) {
-            if (yielded())
+        // An object that needs nothing is an index lookup: it does not count
+        // against the scan budget, only against its own, far larger one, so a
+        // settled stretch of the live set is passed in one step.
+        size_t skipped = 0;
+        const auto skip = [&](const ObjectId& id) {
+            repair_pull_after_ = id;
+            ++it;
+            ++skipped;
+            ++result.pull_examined;
+        };
+        while (it != live->end() && scanned_total < scan_budget && skipped < repair_pull_skip_budget) {
+            if (skipped % 1024 == 0 && yielded())
                 break;
 
             const ObjectId id = *it;
@@ -2742,10 +2752,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 local_valid = local_.data().has(id);
             }
             if (!should_own(id) || local_valid) {
-                repair_pull_after_ = id;
-                ++it;
-                ++scanned_total;
-                ++result.pull_examined;
+                skip(id);
                 continue;
             }
 
@@ -2770,10 +2777,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     observations().counter("maintenance.repair.pull_unavailable");
                 skipped.fetch_add(1, std::memory_order_relaxed);
                 trace_repair("pull " + to_string(id) + " unavailable");
-                repair_pull_after_ = id;
-                ++it;
-                ++scanned_total;
-                ++result.pull_examined;
+                skip(id);
                 continue;
             }
 
