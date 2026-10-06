@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.28.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.29.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -25,20 +25,6 @@ repair per pass (section 6's question, answered), and every whole-snapshot
 copy. Eleven stages, each shipping alone: correctness first (the install
 point), then measurement, then cost. Stage 1 (one install point, the
 installer) is 0.90.27. Next: stage 2, maintenance reduced.
-
-**Proven 2026-10-06 (0.90.28 timing), next to fix:** maintenance's catalogue
-stage is entirely the control convergence. Each time it runs, it sends the
-manifest and all 64 shards, 65 objects and 5.4 MB, in full to every node
-present, one blocking call at a time, with no presence check: 21.8 s on
-node-f and 30.6 s on node-c after the 0.90.28 restarts, though both nodes held
-that root. It runs at every start, after every catalogue commit (a commit
-resets the converged state), on a membership change and on each failed
-retry; the maintenance thread is blocked for the whole of it. The commit
-path already does this properly (`retain_control`: one batched
-`have_control_objects` probe, then only what is missing, with a put window);
-convergence still uses `replicate_control`. Load and decode of the whole
-catalogue is small by comparison: 56 ms on node-f, 246 ms on node-c (6,866
-items, 6,289 profiles).
 
 ## 1. Failing tests and defects
 
@@ -91,9 +77,10 @@ items, 6,289 profiles).
   2026-10-05 19:10Z, every other track). Not reproduced in a two-match test.
   node-c runs at level ALL, where the catalogue lock's waits are logged
   (`DIAG lock-held lock=catalogue.mutation`): match an album on node-c to
-  catch it. Suspect, unverified: a mutation's `refresh(false)` under that
-  lock running `load_root`, which can fetch shards over the WAN; section 0
-  removes that path.
+  catch it. Two suspects, neither verified: a mutation's refresh under that
+  lock running a full load (gone in 0.90.27), and node-c uploading the
+  whole catalogue, 5.4 MB, after every catalogue commit while matching
+  (gone in 0.90.29). Match an album to see whether the waits remain.
 - Provider caches are per editor seat and lost on restart: the first track of
   each album after a restart pays the lookup and the cover again.
 
@@ -161,7 +148,7 @@ From the local-first work
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.28**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.29**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -171,7 +158,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.28` back to
+  in place before that version was installed (`pre-0.90.29` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - node-f's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
