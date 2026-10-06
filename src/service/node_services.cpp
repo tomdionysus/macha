@@ -35,9 +35,14 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       // The guard reaches the catalogue, declared after this: it runs only
       // for a commit, which nothing makes before construction finishes.
       metadata_(node_, local_, metadata_server_, &store_,
-                [this](const MetadataPublicationContext& context) {
-                    retain_metadata_publication(context);
-                },
+                MetadataPublicationRetention{
+                    [this](const MetadataPublicationContext& context) {
+                        return retain_metadata_publication(context);
+                    },
+                    [this](const NodeId& origin, uint64_t sequence,
+                           const MetadataPublicationClaims& claims) {
+                        retain_on_peers(origin, sequence, claims);
+                    }},
                 steady_time_source()),
       ledger_(local_.retention(), local_.data(), local_.control()),
       data_unreferenced_(node_.config().state_path / "retention" / "unreferenced-data.bin"),
@@ -274,7 +279,8 @@ void NodeServices::stop() {
     media_information_.stop();
 }
 
-void NodeServices::retain_metadata_publication(const MetadataPublicationContext& context) {
+MetadataPublicationClaims
+NodeServices::retain_metadata_publication(const MetadataPublicationContext& context) {
     const RetentionDot dot{context.origin, context.sequence};
     std::vector<ObjectId> data;
     std::vector<ObjectId> control;
@@ -421,20 +427,6 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
     control.erase(std::unique(control.begin(), control.end()), control.end());
     collect_ms = since_ms(collect_started) - catalogue_ms;
 
-    if (context.peers) {
-        // The peers' share of a commit already accepted here. An object no
-        // node present holds is repair's to find, not a reason to stop.
-        const auto data_started = Clock::now();
-        (void)store_.retain_data(data, dot);
-        data_ms = since_ms(data_started);
-        const auto control_started = Clock::now();
-        if (!control.empty())
-            (void)store_.retain_control(control, dot, DistributedStore::ClaimScope::every_node);
-        control_ms = since_ms(control_started);
-        report("ok");
-        return;
-    }
-
     // This node's own claims, asking no peer. Only an object this commit
     // brings in that is not held here is looked for on the nodes present.
     const auto data_started = Clock::now();
@@ -464,6 +456,30 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
     }
     report("ok");
     resources_.events.notify(NodeEvent::claims);
+    return {std::move(data), std::move(control)};
+}
+
+void NodeServices::retain_on_peers(const NodeId& origin, uint64_t sequence,
+                                   const MetadataPublicationClaims& claims) {
+    // The peers' share of a commit already accepted here. An object no node
+    // present holds is repair's to find, not a reason to stop.
+    const RetentionDot dot{origin, sequence};
+    const auto ms_since = [](Clock::time_point t) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t).count());
+    };
+    const auto started = Clock::now();
+    (void)store_.retain_data(claims.data, dot);
+    const auto data_ms = ms_since(started);
+    if (!claims.control.empty())
+        (void)store_.retain_control(claims.control, dot, DistributedStore::ClaimScope::every_node);
+    const auto total_ms = ms_since(started);
+    if (total_ms >= 250 && Log::enabled(LogLevel::debug))
+        Log::debug("metadata claims on peers dot=" + to_string(origin).substr(0, 6) + ":" +
+                   std::to_string(sequence) + " total_ms=" + std::to_string(total_ms) +
+                   " data_ms=" + std::to_string(data_ms) +
+                   " data_objects=" + std::to_string(claims.data.size()) +
+                   " control_objects=" + std::to_string(claims.control.size()));
 }
 
 

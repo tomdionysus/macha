@@ -47,10 +47,22 @@ struct MetadataPublicationContext {
     const MetadataRecord& parent;
     const MetadataSnapshot& proposed;
     const MetadataDelta* delta{};
-    // False before the commit is accepted here: this node's own claims, which
-    // must hold. True afterwards, from the replicator: the peers' share,
-    // which may fail and is then owed.
-    bool peers{};
+};
+
+// What a commit's claims name: the DATA and CONTROL objects it brings in.
+// Worked out once, at the commit; the peers' share is these, not a second
+// derivation from the commit.
+struct MetadataPublicationClaims {
+    std::vector<ObjectId> data;
+    std::vector<ObjectId> control;
+    uint64_t bytes() const noexcept { return (data.size() + control.size()) * sizeof(ObjectId); }
+};
+
+// The claims barrier around a commit; see MetadataManager's constructor.
+struct MetadataPublicationRetention {
+    std::function<MetadataPublicationClaims(const MetadataPublicationContext&)> local;
+    std::function<void(const NodeId& origin, uint64_t sequence, const MetadataPublicationClaims&)>
+        peers;
 };
 
 
@@ -109,7 +121,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     // local()'s answer, and the replica head-set revision it was taken at.
     std::optional<MetadataSnapshotView> local_view_ MACHA_GUARDED_BY(cache_mutex_);
     uint64_t local_view_revision_ MACHA_GUARDED_BY(cache_mutex_){};
-    std::function<void(const MetadataPublicationContext&)> publication_retention_;
+    MetadataPublicationRetention publication_retention_;
 
     // Observational replica state: lock-free reads, no I/O. Refreshed by the
     // background repair owner.
@@ -188,30 +200,28 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
         const std::function<void(MetadataSnapshot&, MetadataDelta*)>&, bool exact_delta,
         size_t retries, std::optional<MetadataMutationIdentity> identity);
 
-    // A commit accepted here and owed to the peers: its claims on them and
-    // the head itself. The replicator delivers these in order, off every
-    // caller's path. What it cannot deliver, repair_once() does later.
-    struct OwedCommit {
-        MetadataRecord record;
-        // Absent when only the head is owed (a commit found already made).
-        struct Claims {
-            NodeId origin{};
-            uint64_t sequence{};
-            MetadataRecord parent;
-            std::shared_ptr<const MetadataSnapshot> proposed;
-            std::optional<MetadataDelta> delta;
-        };
-        std::optional<Claims> claims;
+    // What commits accepted here owe the peers: each commit's claims on
+    // them, in order, and the newest head, whose history carries the rest.
+    // The replicator delivers these off every caller's path; what it cannot
+    // deliver, repair_once() does later. An owed commit costs its claim ids,
+    // not its snapshot.
+    struct OwedClaims {
+        NodeId origin{};
+        uint64_t sequence{};
+        MetadataPublicationClaims claims;
     };
-    // Claims kept for a peer that is not taking them; past this the oldest
-    // are dropped and the peer's own head protects what it holds.
-    static constexpr size_t owed_claims_max = 1024;
+    // Claims kept for a peer that is not taking them, in claim id bytes; past
+    // this the oldest are dropped and the peer's own head protects what it
+    // holds.
+    static constexpr uint64_t owed_claim_bytes_max = 32ULL * 1024 * 1024;
     mutable Mutex owed_mutex_;
     std::condition_variable_any owed_changed_;
-    std::deque<OwedCommit> owed_ MACHA_GUARDED_BY(owed_mutex_);
+    std::deque<OwedClaims> owed_claims_ MACHA_GUARDED_BY(owed_mutex_);
+    uint64_t owed_claim_bytes_ MACHA_GUARDED_BY(owed_mutex_){};
+    std::optional<MetadataRecord> owed_head_ MACHA_GUARDED_BY(owed_mutex_);
     bool replicating_ MACHA_GUARDED_BY(owed_mutex_){};
     std::atomic_uint64_t owed_dropped_{};
-    void owe(OwedCommit);
+    void owe(MetadataRecord head, std::optional<OwedClaims> claims);
     void replication_loop(std::stop_token);
     // Accepts a commit on this node alone.
     void accept_locally(const MetadataRecord&, std::span<const uint8_t> delta, FrameType);
@@ -220,10 +230,13 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
   public:
     // `namespace_store`: where tree namespace nodes live; construction installs
     // tree-delta commit application through it (spec B2). Without it only
-    // map-backed namespaces are served. `publication_retention`: runs before
-    // each commit is published (the claims barrier: every object the new head
-    // refers to is durably claimed first).
-    using PublicationRetention = std::function<void(const MetadataPublicationContext&)>;
+    // map-backed namespaces are served. `publication_retention`: the claims
+    // barrier (every object a new head refers to is durably claimed first).
+    // `local` runs before each commit is accepted here, makes this node's
+    // claims, which must hold, and returns what they name; `peers` makes the
+    // same claims on the other nodes afterwards, from the replicator, and may
+    // fail, leaving them owed.
+    using PublicationRetention = MetadataPublicationRetention;
     // `time`: what the decoded cache's lifetime (config metadata_cache) is
     // measured by.
     MetadataManager(NodeRuntime&, LocalState&, MetadataServer&,
@@ -239,6 +252,14 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     void stop_replication();
     // Commits accepted here that the replicator has not yet offered.
     size_t replication_pending() const;
+    // What the replicator owes the peers: commits whose claims are queued,
+    // those claims' size, and claims dropped past the bound since start.
+    struct ReplicationBacklog {
+        size_t commits{};
+        uint64_t claim_bytes{};
+        uint64_t dropped{};
+    };
+    ReplicationBacklog replication_backlog() const;
     // Waits until nothing is pending; false on timeout.
     bool wait_replicated(std::chrono::milliseconds timeout);
 
