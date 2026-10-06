@@ -1,7 +1,7 @@
 # The catalogue as a materialised view of the local head
 
 Status: agreed design, 2026-10-06. Not started. The P0 stopgap (a `cache()`
-that refuses an older generation) is in the tree; this replaces it.
+that refuses an older generation) shipped in 0.90.26; this replaces it.
 
 ## The rule
 
@@ -66,9 +66,9 @@ Consequences:
 3. **Incremental by construction.** The root is a manifest of 64
    content-addressed shards. The view holds the decoded shard per id;
    installing a new root decodes only the shards whose id changed and reuses
-   the rest by pointer. A single edit costs one shard. This is BACKLOG
-   Catalogue Stage C (shards loaded on demand) done at the same time, since
-   it is the same code.
+   the rest by pointer. A single edit costs one shard. Every shard stays
+   resident, so reads stay memory-only; evicting shards (the demand-load half
+   of Stage C) waits for Stage A's measurement, see below.
 
 4. **Maintenance keeps only real background work.** Offering the root's
    control objects to peers (`converge_control_replicas`) runs when the root
@@ -119,16 +119,87 @@ Consequences:
   revision-conflict case stays as a regression guard with the named
   revisions in its message.
 
+## How it fits the planned work
+
+Checked against ACTIVE, BACKLOG, the open specs and the archived plans on
+2026-10-06.
+
+**It is the frame the September shard plan was missing.**
+[`archive/2026-09-17-catalogue-shard-demand-load-plan.md`](archive/2026-09-17-catalogue-shard-demand-load-plan.md)
+(BACKLOG Catalogue, Stages A to F) fixes the catalogue's cost; this fixes
+who installs it and when. They share one data structure, the per-shard view:
+
+- *Stage A (measure)*: unchanged, and comes first: it decides whether
+  shards must ever be evicted.
+- *Stage B (commits carry the change set)*: done in 0.90.11 for encoding.
+  The other half, mutations deep-copying the whole snapshot
+  (`*current_snapshot()`, about ten sites in BACKLOG), goes with this work:
+  a mutation copies only the shards it touches.
+- *Stage C (demand-loaded shards)*: split. Per-shard residency and reuse are
+  this design. Loading on demand with an LRU on the `RetainedMemoryLedger`
+  conflicts with memory-only reads (a read could wait on a WAN fetch of a
+  shard), so it is done only if Stage A shows the resident catalogue is too
+  big, and then with a prefetch on install, not a fetch on read.
+- *Its open question 3* (three-way merge on materialised snapshots): the
+  per-shard view gives the answer, compare shard ids and merge only the
+  shards that differ. Not required for this work; it becomes cheap after it.
+- *Stage D (batched profile publication)*: independent; a batch becomes one
+  root and so one install.
+- *Stage E (indexes for list and search)*: builds on this. `indexes()` today
+  rebuilds from the whole snapshot whenever the pointer changes; with
+  per-shard installs it can update only the changed shards' entries. Paging
+  (0.90.18) already shipped the API shape Stage E needs.
+- *Stage F (growable shard count)*: independent; a re-root is one install.
+
+**It answers an open question for the operator.** ACTIVE section 6, "the
+catalogue repair that runs twice per maintenance pass", from the T4b audit
+(`archive/object-ledger-evidence/t4/README.md`): the `catalogue-repair` stage
+and `maintenance_repair()` before the inventory each run a refresh and may
+commit a conflict reconciliation. Here both go: the view is installed from
+the head, and the inventory reads the installed view. The question closes
+without a behaviour choice.
+
+**It completes the object-ledger contracts rather than bending them.** The
+spec's A2 (readers hold snapshot handles) is the view pointer. A4 (no
+implicit side effects) is satisfied more strictly: the inventory read no
+longer repairs anything. Its catalogue completeness (`maintenance_catalogue_complete_`,
+which fences destructive GC) becomes a fact rather than an outcome: the
+installed root equals the head's root. The one effect T4b left on the read,
+fetching missing manifest or shard objects into the control store, moves
+into the install worker, which is where the audit said it belonged.
+
+**It may explain the 9 to 13 s commit waits during matching** (ACTIVE
+section 2). Unverified: every mutation runs `refresh(false)` while holding
+`catalogue.mutation`, and that refresh can run `load_root`, whose
+`ensure_control_local` may fetch shards from a peer over the WAN. With this
+design a mutation never loads under the lock; it starts from the installed
+view, and if the head's root has moved past it, it installs first (changed
+shards only) or retries. gbni-1's level-ALL trace should still be taken to
+confirm or rule it out before claiming it.
+
+**It follows the standing rules.** Local always fast (the view is the
+node's own head, no peer is waited on); pace, never gate (the install
+worker is background work under `repair_share`, readers never wait on it);
+no work that cannot complete (an install whose shard cannot be fetched parks
+until membership or storage changes, rather than retrying per pass).
+
+**Not touched by it:** the unmatched list differing by node (hints are a
+node-local store, not catalogue state); `GET catalogue/status` walking all
+artwork (Stage E territory); Clear Metadata's fixed-point descendant scan
+(wants Stage E's parent index).
+
 ## Order of work
 
-1. Commit the P0 guard in `cache()` as is (done in the tree; small and
-   correct on its own).
-2. Shard-level view with reuse (Stage C).
-3. `install(root)` plus the head-change worker; remove the polling paths.
-4. Maintenance stage reduced to wake and converge.
-5. Rewrite the burst test; add the install unit test; remove the dead TTL
+1. The P0 guard in `cache()` (done, 0.90.26).
+2. Stage A: measure resident bytes (the shard-level view needs the number
+   to decide eviction later).
+3. Shard-level view with reuse; mutations copy only the shards they touch.
+4. `install(root)` plus the head-change worker; remove the polling paths.
+5. Maintenance stage reduced to wake and converge; `maintenance_repair()`
+   and its second repair per pass go.
+6. Rewrite the burst test; add the install unit test; remove the dead TTL
    test if it is the catalogue's.
-6. Measure `local()` decode cost and `load_root` time on gbni-1 before and
+7. Measure `local()` decode cost and `load_root` time on gbni-1 before and
    after; record both in COMPLETED.
 
 Estimate: a day, not an hour.

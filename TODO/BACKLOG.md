@@ -61,13 +61,16 @@ gone from here, and the old file with its full reasoning is
 
 ## Catalogue
 
-- **The catalogue materialises everything it has.** Done: a write encodes and
-  claims only its shards (0.90.11); lists page (0.90.18). Left: a resident-bytes
-  measure (Stage A); shards loaded on demand, since `load_root` merges all 64
-  (`catalogue.cpp:604`) (Stage C); batched profile publication
-  (`media_information.cpp:367`) (Stage D); indexes behind list and search,
-  which scan every item (`catalogue.cpp:1110`) (Stage E); a growable shard
-  count (Stage F); about ten whole-snapshot copies (`*current_snapshot()`).
+- **The catalogue materialises everything it has.** Done: a write encodes
+  and claims only its shards (0.90.11); lists page (0.90.18). With ACTIVE
+  section 0 ([materialised view](2026-10-06-catalogue-materialised-view.md)):
+  a resident-bytes measure (Stage A); per-shard residency and reuse (half of
+  Stage C); mutations copying only the shards they touch, not the whole
+  snapshot (about ten `*current_snapshot()` sites). Left here: evicting
+  shards on demand, only if Stage A says so (the rest of Stage C); batched
+  profile publication (`media_information.cpp:367`) (Stage D); indexes
+  behind list and search, which scan every item (`catalogue.cpp:1110`)
+  (Stage E); a growable shard count (Stage F); a per-shard three-way merge.
 - **`GET catalogue/status` walks all artwork** and asks the store for each
   (`catalogue.cpp:896`).
 - **Clear Metadata is synchronous** and finds descendants by a fixed-point

@@ -18,8 +18,10 @@ The catalogue view becomes a pure function of this node's head, installed
 at one point, driven by head changes, decoded per changed shard. It removes
 the two failures of the burst test below (the view stepping backwards and
 the uncountable repair passes), the polling refresh and its TTL, and does
-BACKLOG Catalogue Stage C at the same time. Work in the order the document
-gives; step 1 (the `cache()` generation guard) is in the tree, uncommitted.
+the per-shard half of BACKLOG Catalogue Stage C, and closes the
+"repair twice per pass" question in section 6. Work in the order the
+document gives; step 1 (the `cache()` generation guard) is 0.90.26,
+committed, not yet deployed.
 
 ## 1. Failing tests and defects
 
@@ -28,7 +30,7 @@ gives; step 1 (the `cache()` generation guard) is in the tree, uncommitted.
   - `catalogue item revision changed: movie:coalesced-catalogue expected 6,
     now 5` (fi-1, 2 of 30 runs): a background `refresh()` installed an older
     view over the one `upsert` had just cached. Guarded in `cache()` in the
-    tree (0 of 50 runs since); the proper fix is one install point.
+    0.90.26 (0 of 50 runs since); the proper fix is one install point.
   - `unexpected catalogue repair count for one coalesced burst` (fi-1, 5 of
     30 runs): the burst coalesces correctly (one follow-up run, two
     scheduled, asserted exactly), but maintenance runs a catalogue pass
@@ -84,7 +86,9 @@ gives; step 1 (the `cache()` generation guard) is in the tree, uncommitted.
   2026-10-05 19:10Z, every other track). Not reproduced in a two-match test.
   gbni-1 runs at level ALL, where the catalogue lock's waits are logged
   (`DIAG lock-held lock=catalogue.mutation`): match an album on gbni-1 to
-  catch it.
+  catch it. Suspect, unverified: a mutation's `refresh(false)` under that
+  lock running `load_root`, which can fetch shards over the WAN; section 0
+  removes that path.
 - Provider caches are per editor seat and lost on restart: the first track of
   each album after a restart pays the lookup and the cover again.
 
@@ -142,8 +146,8 @@ From the local-first work
 - Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
 - A `CONTRIBUTING.md` line: "A new gate may pace lower-class work; it may
   never stop it."
-- The catalogue repair that runs twice per maintenance pass; the replica's
-  applier lifetime; fi-1's USB power.
+- The replica's applier lifetime; fi-1's USB power. (The catalogue repair
+  that runs twice per pass is answered by section 0: both go.)
 - [Cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md): a
   proposal with six questions.
 - From the backlog: anonymous access; whether a client should know a playback
