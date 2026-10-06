@@ -2,7 +2,7 @@
 
 Last updated: 2026-10-06
 
-## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.24
+## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.25
 
 All deployed on gbni-1 and fi-1, merged to `develop` and `main` (`0c5492f`).
 Detail in `CHANGELOG.md` under each version; the plans and evidence are in
@@ -36,6 +36,18 @@ Detail in `CHANGELOG.md` under each version; the plans and evidence are in
 - **A title's files** (0.90.15): unmatch, delete by path and delete by
   content, each one call, with empty titles and parents removed
   (`2026-10-05-title-files-and-paging.md`).
+- **Clear Metadata sends files to Unmatched** (0.90.25): no automatic
+  rematch, which had matched "300" straight back to the wrong film.
+- **The backlog verified** (2026-10-06): every section written 2026-09-05..22
+  checked against the code at 0.90.24. Done or superseded: inbound RPC before
+  it can be answered (fixed); the es-1/fi-1 metadata RPC stalls and the
+  rejoin materialisation cache (both overtaken by the tree format, local
+  commits and absent-node work); the open-writer bound (0.75.0); the catalogue
+  reacting to an unlink; the crash re-publish; readdir and `source_for`
+  scaling; node names; mixed-version sessions (protocol 23); vestigial worker
+  knobs and test hooks; representation negotiation (0.58.0). What remains is
+  in `BACKLOG.md`; the old file is
+  `archive/2026-10-06-BACKLOG-before-verification.md`.
 - **Repair** (0.90.21 to 0.90.24): the pull walk passes settled objects
   without spending its budget; rebalance reads nothing with one backend;
   repair's own CPU no longer slows it; pull works from the extents this node

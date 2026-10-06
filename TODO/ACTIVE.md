@@ -1,62 +1,25 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.24.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.25.
 
 The ordered list of open work; work top to bottom unless new evidence
-changes the order. Alongside it: `COMPLETED.md` (finished work),
-`CLIENT-CONTRACTS.md` (what the client sessions depend on), `BACKLOG.md` (the
-P-1 to P2 sections of 2026-09-05..22, not re-verified) and `archive/` (past
-plans, evidence and handovers; a record, not requirements). Items marked
-*carried* come from `archive/2026-10-05-ACTIVE-before-rationalisation.md`,
-which has their full text, and have not been re-checked since.
+changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
+verified against the code on 2026-10-06, by area), `COMPLETED.md` (finished
+work), `CLIENT-CONTRACTS.md` (what the client sessions depend on) and
+`archive/` (past plans, evidence and handovers; a record, not requirements).
+Items marked *carried* come from
+`archive/2026-10-05-ACTIVE-before-rationalisation.md` and have not been
+re-checked since.
 
-## 1. Matching
-
-- A commit during a multi-file match sometimes waited 9 to 13 s (gbni-1,
-  2026-10-05 19:10Z, every other track). Not reproduced; nothing else logged
-  in the window. The catalogue lock's waits are logged at level ALL
-  (`DIAG lock-held lock=catalogue.mutation`): run gbni-1 at ALL while an
-  album is matched to see what it waits on.
-- Provider caches are per editor seat and lost on restart: the first track of
-  each album after a restart pays the lookup and the cover again.
-
-## 2. Further optimisation (measured small; not now)
-
-From the local-first work
-([plan](archive/2026-10-05-local-first-filesystem-plan.md)):
-
-- The availability survey's memo and the followed path table apply only
-  while no peer's holdings grow; with gbni-1 importing, every survey asks from
-  the root (2,834 tree nodes, 7 round trips). A peer reporting what it gained
-  would let the memo stand.
-- Ingest and data publications commit one operation at a time: about 100 ms
-  each, so a 4 GiB copy spends about 7 s committing.
-- Repair keeps its positions after a commit and runs one more pass;
-  tombstones mature one at a time.
-- The non-namespace snapshot per commit: a few milliseconds.
-- The hint store rewrites its file per change: 266 KB with 409 hints.
-
-## 3. Open from the object ledger and absent-node work
-
-- Per-peer down state in the transport; `fsync` without a deadline; the
-  journal's `durability_poisoned` flag; a count of DATA objects below their
-  replication target; seven namespace conflicts standing from before 0.89.0.
-- The final sweep: annotated lock wrappers; coverage of the composition
-  root's components.
-- [Cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md): a
-  proposal with six questions waiting on the operator.
-
-## 4. Defects and unexplained failures
+## 1. Failing tests and defects
 
 - **P0: `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`**
   failed on fi-1 (0.90.20 suite, 2026-10-06 08:23Z, 34 ms in; then 1 of 5
   standalone runs), `catalogue item revision changed`: node 2's
   `put_artwork` with the revision its own `upsert` had just returned was
   refused, so its catalogue view moved between the two calls. First failure
-  in every 0.8x and 0.90.x suite log on fi-1; 0.90.20 touched no catalogue
-  code. Not reproduced since (0 of 12 verbose runs, 0 of 6 group runs on
-  fi-1, 0 of 10 on the laptop).
-
+  in any suite log on fi-1. Not reproduced since (0 of 12 verbose runs, 0 of
+  6 group runs on fi-1, 0 of 10 on the laptop).
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
   `/root/claude-missing-extent-driver.py` are staged on fi-1, not run.
   *Carried.*
@@ -79,16 +42,12 @@ From the local-first work
 - **An ingest dies on EAGAIN from a checkpoint commit** instead of re-basing
   on the current entry; log the conflict key when a merge records one; an
   ingest that dies when its node restarts mid-put. *Carried.*
-- **Unsourceable objects on fi-1**: `repair cannot source an object this
-  node should own`, rising with repair's pull walk; three of five random
-  films failed to read on both nodes. Probably extents lost with es-1. fi-1
-  also counts objects it cannot store while its backend is offline.
-  *Carried.*
 - **Artwork held by no online node** (60 of 296 movie posters, 2026-09-27);
   nothing re-fetches lost artwork
   ([write-up](archive/2026-09-27-missing-artwork-and-single-copy-writes.md)).
 - **The unmatched list differs by node** (771 on fi-1, 822 on gbni-1): hints
-  are node-local.
+  are node-local, so Clear Metadata and Unmatch put a file in the list of the
+  node that answered.
 - **`RPC stalled (control)`** each way at 09:47Z and 09:50Z on 2026-10-05,
   5 to 15 s without progress, then nothing.
 - **A rejoin or follower convergence retry waits out its backoff**: wake it,
@@ -99,32 +58,58 @@ From the local-first work
   transcode, and a `FUSE mount disappeared` ERROR during a restart. *Carried.*
 - **Transport backoff after a peer restart**: up to 4 s before a restarted
   peer is dialled. *Carried.*
-- **Known defects of 2026-09-24/25**: `catalogue_api` answers 503 for some
-  client errors and does not check a parent cycle; `metadata replica is still
-  recovering` and `local metadata replica unavailable` raise a bare
-  `runtime_error` an ingest would fail on; the acquisition API audit's four
-  findings; unverified package names in the install docs. *Carried.*
-- **The disk resource audit's open points**: one monitor per pool, not per
-  device; local maintenance budgeted from a network measurement; the 150-300%
-  hysteresis band is a latch; law 1 holds by configuration only. *Carried.*
+- **Known defects of 2026-09-24/25**: `metadata replica is still recovering`
+  and `local metadata replica unavailable` raise a bare `runtime_error` an
+  ingest would fail on; the acquisition API audit's four findings; unverified
+  package names in the install docs. *Carried.*
 
-## 5. Replication and repair
+## 2. Matching
 
-- Repair is bound by the WAN link now: one step sends a batch of at most two
+- A commit during a multi-file match sometimes waited 9 to 13 s (gbni-1,
+  2026-10-05 19:10Z, every other track). Not reproduced in a two-match test.
+  gbni-1 runs at level ALL, where the catalogue lock's waits are logged
+  (`DIAG lock-held lock=catalogue.mutation`): match an album on gbni-1 to
+  catch it.
+- Provider caches are per editor seat and lost on restart: the first track of
+  each album after a restart pays the lookup and the cover again.
+
+## 3. Replication and repair
+
+- Repair is bound by the WAN link: one step sends a batch of at most two
   extents and waits for it (about 4 MB in 5 s between fi-1 and gbni-1).
   Pipelining batches, or several steps per pass, would lift it further.
 - Expose the counts holdings now give: extents this node lacks, extents each
   peer lacks, extents below their replication target.
+- **Unsourceable objects on fi-1**: extents no node can supply, probably lost
+  with es-1; the survey's `unavailable` count is the measure now. *Carried.*
+- Per-peer down state in the transport; `fsync` without a deadline.
+- Seven namespace conflicts standing from before 0.89.0.
 - Say why a node counts itself busy (the pacer's active classes in status).
 - Log the resumed push position at INFO.
 
-## 6. Features and API
+## 4. Further optimisation (measured small; not now)
+
+From the local-first work
+([plan](archive/2026-10-05-local-first-filesystem-plan.md)):
+
+- The availability survey's memo and the followed path table apply only
+  while no peer's holdings grow; with gbni-1 importing, every survey asks from
+  the root (2,834 tree nodes, 7 round trips). A peer reporting what it gained
+  would let the memo stand.
+- Ingest and data publications commit one operation at a time: about 100 ms
+  each, so a 4 GiB copy spends about 7 s committing.
+- Repair keeps its positions after a commit and runs one more pass;
+  tombstones mature one at a time.
+- The non-namespace snapshot per commit: a few milliseconds.
+- The hint store rewrites its file per change: 266 KB with 409 hints.
+
+## 5. Features and API
 
 - **The API is RESTful, all of it**: audit every route; identity resets
   become a resource (decided); `providers/artwork?ref=` and
   `providers/artwork/choose` are among the routes to change.
 - **OpenAPI**: generated from a declarative route table that dispatch runs
-  from. Agreed, unstarted.
+  from, served at `/api/v1/openapi.json`. Agreed, unstarted.
 - **Core's request**: `providers/artwork` taking `item_id`; Core was to raise
   it again once the experiment ended.
 - **Per-file readability**: designed; the operator chooses where it goes.
@@ -136,7 +121,7 @@ From the local-first work
   optional node `name` (operator's call).
 - **Movie sets** and **ebooks**: later; each needs a proposal first.
 
-## 7. Waiting on the operator
+## 6. Waiting on the operator
 
 - Metadata editor B: the choice of fields.
 - Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
@@ -144,15 +129,15 @@ From the local-first work
   never stop it."
 - The catalogue repair that runs twice per maintenance pass; the replica's
   applier lifetime; fi-1's USB power.
-- `BACKLOG.md` and the older ordered items (*carried*): the namespace tree's
-  demand-loaded extent nodes and a persisted `file_media_id`; the
-  cache-sizing invariant; the metadata stall on the RPC path; the rejoin and
-  materialisation-cache P0; the loader-I/O P0.
+- [Cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md): a
+  proposal with six questions.
+- From the backlog: anonymous access; whether a client should know a playback
+  generation existed anywhere in the cluster.
 
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.24**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.25**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -162,11 +147,14 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.24` back to
+  in place before that version was installed (`pre-0.90.25` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
   before reuse.
+- gbni-1 runs at `log_level: ALL` for the multi-file match trace (item 2);
+  its config before that is `macha.yaml.before-trace`. Put it back to DEBUG
+  once the trace is caught.
 - gbni-1 keeps its heap-check drop-in (`/root/heap-check.conf.keep`).
 - Observation windows: `/etc/macha/state/observation/observations.jsonl` on
   both.
@@ -175,6 +163,8 @@ From the local-first work
   `/root/mapi.sh`, `/root/apitime.sh`, `/root/burst-delete.sh`,
   `/root/ryw-test.sh`; on gbni-1 `/root/warm-io.sh`, `/root/match-trace.sh`,
   `/root/remove-empty-dirs.py`.
+- Code lookups go through basemind (load its tools first; rescan after edits
+  and moves).
 
 ## Standing rules
 
