@@ -1,5 +1,26 @@
 # Current release
 
+## 0.90.33: a catalogue write copies only the shards it changes
+
+No API, wire, protocol or on-disk changes.
+
+**Every catalogue write copied the whole catalogue first** (about 15 MB:
+6,897 items and 6,289 media profiles), then worked out which shards it had
+changed. A write now edits a draft over the installed view: reads fall
+through to the view, a shard is copied only when the write first changes
+it, and the commit takes the copied shards as they are. A match, an edit,
+a media profile or a torrent's import copies one shard, not the catalogue.
+This covers every write: item writes, Clear Metadata, unbinding, media
+profiles and indexes, and the scanner's reconcile, which is the match path.
+
+**Released data is exact.** The DATA objects a write stops referring to
+(artwork, media indexes) are released only when no shard it left untouched
+still refers to them. A media index pruned with its media is now released;
+it was kept before.
+
+A DEBUG line per catalogue commit, `catalogue commit`, gives the shards
+touched and the prepare and publish times.
+
 ## 0.90.32: the catalogue view is held shard by shard
 
 No API, wire, protocol or on-disk changes.
