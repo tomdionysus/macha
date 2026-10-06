@@ -34,32 +34,36 @@ std::vector<ObjectId> extent_objects(const FsEntry& entry, size_t first, size_t 
     return out;
 }
 
-const CatalogueItem* find_current_catalogue_item(const CatalogueSnapshot& snapshot,
+const CatalogueItem* find_current_catalogue_item(const CatalogueView& snapshot,
                                                   const PlaybackObservation& observation) {
     const auto stable = file_media_id(observation.entry);
     const auto path_id = "path:" + observation.path;
-    for (const auto& [_, item] : snapshot.items) {
-        if (std::find(item.media_ids.begin(), item.media_ids.end(), stable) != item.media_ids.end() ||
-            std::find(item.media_ids.begin(), item.media_ids.end(), path_id) != item.media_ids.end() ||
-            std::find(item.media_ids.begin(), item.media_ids.end(), observation.path) != item.media_ids.end())
-            return &item;
+    // A file bound to more than one item: the lowest id, whatever the order
+    // the catalogue is walked in.
+    const CatalogueItem* found = nullptr;
+    for (const auto& [_, item] : snapshot.items()) {
+        if ((std::find(item.media_ids.begin(), item.media_ids.end(), stable) != item.media_ids.end() ||
+             std::find(item.media_ids.begin(), item.media_ids.end(), path_id) != item.media_ids.end() ||
+             std::find(item.media_ids.begin(), item.media_ids.end(), observation.path) != item.media_ids.end()) &&
+            (!found || item.id < found->id))
+            found = &item;
     }
-    return nullptr;
+    return found;
 }
 
-const CatalogueItem* next_episode(const CatalogueSnapshot& snapshot, const CatalogueItem& current) {
+const CatalogueItem* next_episode(const CatalogueView& snapshot, const CatalogueItem& current) {
     if (current.kind != CatalogueKind::episode)
         return nullptr;
 
     const CatalogueItem* season = nullptr;
     if (current.parent_id) {
-        auto it = snapshot.items.find(*current.parent_id);
-        if (it != snapshot.items.end() && it->second.kind == CatalogueKind::season)
-            season = &it->second;
+        const auto* parent = snapshot.item(*current.parent_id);
+        if (parent && parent->kind == CatalogueKind::season)
+            season = parent;
     }
 
     std::vector<const CatalogueItem*> same_season;
-    for (const auto& [_, candidate] : snapshot.items) {
+    for (const auto& [_, candidate] : snapshot.items()) {
         if (candidate.kind != CatalogueKind::episode)
             continue;
         if (season) {
@@ -84,7 +88,7 @@ const CatalogueItem* next_episode(const CatalogueSnapshot& snapshot, const Catal
         return nullptr;
 
     std::vector<const CatalogueItem*> seasons;
-    for (const auto& [_, candidate] : snapshot.items) {
+    for (const auto& [_, candidate] : snapshot.items()) {
         if (candidate.kind == CatalogueKind::season && candidate.parent_id == season->parent_id)
             seasons.push_back(&candidate);
     }
@@ -98,7 +102,7 @@ const CatalogueItem* next_episode(const CatalogueSnapshot& snapshot, const Catal
         return nullptr;
     for (++current_season; current_season != seasons.end(); ++current_season) {
         std::vector<const CatalogueItem*> episodes;
-        for (const auto& [_, candidate] : snapshot.items) {
+        for (const auto& [_, candidate] : snapshot.items()) {
             if (candidate.kind == CatalogueKind::episode && candidate.parent_id &&
                 *candidate.parent_id == (*current_season)->id)
                 episodes.push_back(&candidate);
@@ -111,7 +115,7 @@ const CatalogueItem* next_episode(const CatalogueSnapshot& snapshot, const Catal
     return nullptr;
 }
 
-const CatalogueItem* next_movie(const CatalogueSnapshot& snapshot, const CatalogueItem& current) {
+const CatalogueItem* next_movie(const CatalogueView& snapshot, const CatalogueItem& current) {
     if (current.kind != CatalogueKind::movie)
         return nullptr;
 
@@ -127,7 +131,7 @@ const CatalogueItem* next_movie(const CatalogueSnapshot& snapshot, const Catalog
         return nullptr;
 
     std::vector<const CatalogueItem*> movies;
-    for (const auto& [_, candidate] : snapshot.items) {
+    for (const auto& [_, candidate] : snapshot.items()) {
         if (candidate.kind != CatalogueKind::movie)
             continue;
         bool same = current.parent_id && candidate.parent_id == current.parent_id;
@@ -149,7 +153,7 @@ const CatalogueItem* next_movie(const CatalogueSnapshot& snapshot, const Catalog
     return nullptr;
 }
 
-const CatalogueItem* next_catalogue_item(const CatalogueSnapshot& snapshot,
+const CatalogueItem* next_catalogue_item(const CatalogueView& snapshot,
                                          const CatalogueItem& current) {
     if (current.kind == CatalogueKind::episode)
         return next_episode(snapshot, current);
@@ -399,7 +403,7 @@ std::vector<HydrationHint> CatalogueSequenceHintProvider::hints() {
     if (active.empty())
         return {};
 
-    std::shared_ptr<const CatalogueSnapshot> snapshot;
+    std::shared_ptr<const CatalogueView> snapshot;
     try {
         snapshot = catalogue_.snapshot_view();
     } catch (...) {

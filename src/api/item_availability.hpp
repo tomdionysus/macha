@@ -46,7 +46,7 @@ using ItemAvailabilityTable = std::map<std::string, ItemAvailability, std::less<
 
 // Every item of `catalogue` against `survey` (null: nothing surveyed). One
 // pass over the items; a pure function of the two snapshots.
-ItemAvailabilityTable item_availability(const CatalogueSnapshot& catalogue,
+ItemAvailabilityTable item_availability(const CatalogueView& catalogue,
                                         const AvailabilitySnapshot* survey);
 
 // The table for the current pair of snapshots, rebuilt only when either
@@ -54,12 +54,12 @@ ItemAvailabilityTable item_availability(const CatalogueSnapshot& catalogue,
 class ItemAvailabilityCache {
   public:
     std::shared_ptr<const ItemAvailabilityTable>
-    table(const std::shared_ptr<const CatalogueSnapshot>& catalogue,
+    table(const std::shared_ptr<const CatalogueView>& catalogue,
           const std::shared_ptr<const AvailabilitySnapshot>& survey);
 
   private:
     Mutex mutex_;
-    std::shared_ptr<const CatalogueSnapshot> catalogue_ MACHA_GUARDED_BY(mutex_);
+    std::shared_ptr<const CatalogueView> catalogue_ MACHA_GUARDED_BY(mutex_);
     std::shared_ptr<const AvailabilitySnapshot> survey_ MACHA_GUARDED_BY(mutex_);
     std::shared_ptr<const ItemAvailabilityTable> table_ MACHA_GUARDED_BY(mutex_);
 };

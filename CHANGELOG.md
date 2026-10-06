@@ -1,5 +1,22 @@
 # Current release
 
+## 0.90.32: the catalogue view is held shard by shard
+
+No API, wire, protocol or on-disk changes.
+
+**A catalogue change decodes only the shards it touched.** The installed
+catalogue is now one decoded shard per manifest slot, shared by pointer
+between views. Installing a new root decodes only the slots whose shard id
+changed and keeps the rest; a one-item change from another node decoded
+all 64 shards (316 ms on gbni-1) and now decodes one. A commit builds its
+successor from the slots it touched, found by a merge walk over the
+installed shards that hashes only the keys it adds, and keeps every other
+shard of the view it started from.
+
+A file bound to more than one item resolves to the lowest item id for
+hydration, and the manage API lists a conflict's items in id order, as
+before, now independent of the order the catalogue is walked in.
+
 ## 0.90.31: what an installed catalogue holds
 
 No API, wire, protocol or on-disk changes. A DEBUG line at each catalogue

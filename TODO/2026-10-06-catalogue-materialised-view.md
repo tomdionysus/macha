@@ -253,9 +253,14 @@ suite green; no stage waits on a later one.
    indexes stay derived in memory (section 6). The per-shard view (stage 4)
    is now worth its cost for the decode, not the memory: a one-item change
    still decodes 64 shards (316 ms on gbni-1) where it needs one.
-4. **The view and `shard_changes`.** Resident per-shard `CatalogueView`
-   behind the install point; `retention_objects` rewritten over
-   `shard_changes`. The deep copies go.
+4. **Done, 0.90.32.** **The per-shard view.** `CatalogueView`, one decoded
+   shard per slot shared by pointer; an install decodes only the slots whose
+   id changed; a commit builds its successor from the slots it touched
+   (merge walk over the view's shards, hashing only added keys). Readers
+   take lookups and unordered ranges; the two places that relied on id
+   order (hydration's first match, the manage conflict list) state it.
+   `retention_objects` already diffed per slot and is unchanged. The
+   mutations' whole-catalogue copy (`merged()`) is stage 5.
 5. **Mutations over the view**: copy touched shards, install the successor
    directly, retry once on a moved root.
 6. **The conflict merge per shard.**

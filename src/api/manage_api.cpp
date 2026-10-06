@@ -934,15 +934,17 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             std::map<std::string, std::vector<const CatalogueItem*>> bound;
             const auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/unmatched"));
-            for (const auto& [_, item] : snapshot->items) {
+            for (const auto& [_, item] : snapshot->items()) {
                 if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
                     item.kind != CatalogueKind::track)
                     continue;
                 for (const auto& media : item.media_ids) bound[media].push_back(&item);
             }
             Json::Array conflicts;
-            for (const auto& [media, holders] : bound) {
+            for (auto& [media, holders] : bound) {
                 if (holders.size() < 2) continue;
+                std::sort(holders.begin(), holders.end(),
+                          [](const auto* a, const auto* b) { return a->id < b->id; });
                 const bool one_season = std::all_of(holders.begin(), holders.end(), [&](const auto* item) {
                     return item->kind == CatalogueKind::episode && item->parent_id &&
                            item->parent_id == holders.front()->parent_id;

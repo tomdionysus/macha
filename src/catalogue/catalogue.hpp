@@ -9,6 +9,7 @@
 #include "storage/unreferenced_since.hpp"
 #include "metadata/metadata_manager.hpp"
 
+#include <array>
 #include <map>
 #include <span>
 #include <memory>
@@ -78,6 +79,103 @@ struct CatalogueSnapshot {
     std::map<std::string, MediaProfile, std::less<>> media_profiles;
     // A media's keyframe byte index: an immutable DATA object beside the profile.
     std::map<std::string, ObjectId, std::less<>> media_indexes;
+};
+
+// The catalogue is stored as a manifest of this many content-addressed
+// shards; an item, media profile or media index lives in the shard its id
+// hashes to.
+inline constexpr size_t catalogue_shard_count = 64;
+size_t catalogue_shard(std::string_view id);
+
+// A catalogue as installed: one decoded shard per manifest slot, immutable,
+// shared by pointer with every other view whose manifest names the same
+// shard. Iteration is shard by shard, not in id order.
+class CatalogueView {
+  public:
+    using Shard = CatalogueSnapshot;
+    using Shards = std::array<std::shared_ptr<const Shard>, catalogue_shard_count>;
+    using ShardIds = std::array<std::optional<ObjectId>, catalogue_shard_count>;
+
+    // Every value of one of a shard's maps, across the shards.
+    template <class Map, const Map Shard::*Member> class Range {
+      public:
+        class iterator {
+            const Shards* shards_{};
+            size_t slot_{catalogue_shard_count};
+            typename Map::const_iterator at_{};
+
+            void settle() {
+                while (slot_ < catalogue_shard_count) {
+                    const auto& shard = (*shards_)[slot_];
+                    if (shard && at_ != ((*shard).*Member).end())
+                        return;
+                    if (++slot_ < catalogue_shard_count && (*shards_)[slot_])
+                        at_ = ((*(*shards_)[slot_]).*Member).begin();
+                }
+            }
+
+          public:
+            using value_type = typename Map::value_type;
+            using reference = const value_type&;
+            using difference_type = std::ptrdiff_t;
+            iterator() = default;
+            explicit iterator(const Shards* shards) : shards_(shards), slot_(0) {
+                if ((*shards_)[0])
+                    at_ = ((*(*shards_)[0]).*Member).begin();
+                settle();
+            }
+            reference operator*() const { return *at_; }
+            const value_type* operator->() const { return &*at_; }
+            iterator& operator++() {
+                ++at_;
+                settle();
+                return *this;
+            }
+            bool operator==(const iterator& other) const {
+                return slot_ == other.slot_ && (slot_ == catalogue_shard_count || at_ == other.at_);
+            }
+        };
+        explicit Range(const Shards& shards) : shards_(&shards) {}
+        iterator begin() const { return iterator(shards_); }
+        iterator end() const { return {}; }
+
+      private:
+        const Shards* shards_;
+    };
+
+    CatalogueView() = default;
+    CatalogueView(Shards shards, ShardIds ids);
+    // A merged catalogue split into its shards, with no shard ids.
+    static CatalogueView of(const CatalogueSnapshot&);
+
+    const CatalogueItem* item(std::string_view id) const;
+    const CatalogueSnapshot::MediaProfile* media_profile(std::string_view media_id) const;
+    const ObjectId* media_index(std::string_view media_id) const;
+    size_t item_count() const noexcept { return item_count_; }
+
+    Range<std::map<std::string, CatalogueItem>, &Shard::items> items() const {
+        return Range<std::map<std::string, CatalogueItem>, &Shard::items>(shards_);
+    }
+    Range<std::map<std::string, CatalogueSnapshot::MediaProfile, std::less<>>,
+          &Shard::media_profiles>
+    media_profiles() const {
+        return Range<std::map<std::string, CatalogueSnapshot::MediaProfile, std::less<>>,
+                     &Shard::media_profiles>(shards_);
+    }
+    Range<std::map<std::string, ObjectId, std::less<>>, &Shard::media_indexes>
+    media_indexes() const {
+        return Range<std::map<std::string, ObjectId, std::less<>>, &Shard::media_indexes>(shards_);
+    }
+
+    const Shards& shards() const noexcept { return shards_; }
+    const ShardIds& shard_ids() const noexcept { return ids_; }
+    // The whole catalogue as one snapshot: a copy.
+    CatalogueSnapshot merged() const;
+
+  private:
+    Shards shards_{};
+    ShardIds ids_{};
+    size_t item_count_{};
 };
 
 // What requests look up in a catalogue by something other than an item's id,
@@ -163,10 +261,11 @@ std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
     const CatalogueSnapshot& right);
 std::string catalogue_kind_name(CatalogueKind);
 std::optional<CatalogueKind> parse_catalogue_kind(std::string_view);
-std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapshot&,
+std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueView&,
                                                            const CatalogueItem&);
 // What a decoded catalogue holds in memory, estimated from its containers.
 uint64_t catalogue_resident_bytes(const CatalogueSnapshot&);
+uint64_t catalogue_resident_bytes(const CatalogueView&);
 
 class CatalogueConflict : public std::runtime_error {
   public:
@@ -195,9 +294,9 @@ class CatalogueManager {
     // Serialises read-modify-commit; guards nothing. Held across metadata
     // commits and DATA/CONTROL store writes.
     mutable IoMutex mutation_mutex_;
-    std::shared_ptr<const CatalogueSnapshot> cached_ MACHA_GUARDED_BY(mutex_);
+    std::shared_ptr<const CatalogueView> cached_ MACHA_GUARDED_BY(mutex_);
     // The indexes of the snapshot they were built from.
-    std::shared_ptr<const CatalogueSnapshot> indexed_ MACHA_GUARDED_BY(mutex_);
+    std::shared_ptr<const CatalogueView> indexed_ MACHA_GUARDED_BY(mutex_);
     std::shared_ptr<const CatalogueIndexes> indexes_ MACHA_GUARDED_BY(mutex_);
     std::optional<ObjectId> cached_root_ MACHA_GUARDED_BY(mutex_);
     // The generation of the head the view was installed from.
@@ -237,6 +336,12 @@ class CatalogueManager {
 
     // Every DATA object the catalogue references: artwork and media indexes.
     static std::set<ObjectId> data_object_ids(const CatalogueSnapshot&);
+    static std::set<ObjectId> data_object_ids(const CatalogueView&);
+    // The catalogue at `root`, reusing each of `previous`'s shards that the
+    // root's manifest still names; `decoded` counts the shards read.
+    std::shared_ptr<const CatalogueView> load_view(const std::optional<ObjectId>& root,
+                                                   const CatalogueView* previous,
+                                                   size_t* decoded = nullptr);
     CatalogueSnapshot load_root(const std::optional<ObjectId>&);
     bool converge_control_replicas(const std::optional<ObjectId>& root);
     bool reconcile_catalogue_conflict(const MetadataSnapshotView&);
@@ -244,13 +349,13 @@ class CatalogueManager {
     // head. Reads the head itself, so a later install never sees an older
     // one. `known` is that catalogue when the caller already holds it (a
     // commit), used if `known_root` is still the head's root.
-    void install_head(std::shared_ptr<const CatalogueSnapshot> known = {},
+    void install_head(std::shared_ptr<const CatalogueView> known = {},
                       const std::optional<ObjectId>& known_root = {});
     // A commit in flight: any install that finds its root at the head uses
     // it rather than decoding what was just encoded.
-    std::shared_ptr<const CatalogueSnapshot> staged_ MACHA_GUARDED_BY(mutex_);
+    std::shared_ptr<const CatalogueView> staged_ MACHA_GUARDED_BY(mutex_);
     std::optional<ObjectId> staged_root_ MACHA_GUARDED_BY(mutex_);
-    std::shared_ptr<const CatalogueSnapshot> current_snapshot();
+    std::shared_ptr<const CatalogueView> current_snapshot();
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
                 const std::set<ObjectId>& old_artwork,
                 std::optional<Hash256> expected_namespace = std::nullopt,
@@ -284,10 +389,10 @@ class CatalogueManager {
     // The current snapshot's indexes; built on the first call after the
     // catalogue changes.
     std::shared_ptr<const CatalogueIndexes> indexes();
-    std::shared_ptr<const CatalogueSnapshot> snapshot_view();
+    std::shared_ptr<const CatalogueView> snapshot_view();
     // Warm, waits on nothing (cached snapshot); cold, loads from metadata and
     // the control store, which the wait guard refuses to control work.
-    std::shared_ptr<const CatalogueSnapshot> snapshot_view(const WorkContext&);
+    std::shared_ptr<const CatalogueView> snapshot_view(const WorkContext&);
     std::optional<CatalogueItem> get(std::string_view id);
     std::optional<MediaProbeResult> media_profile(std::string_view media_id);
     ResolvedMediaProfile resolve_media_profile(

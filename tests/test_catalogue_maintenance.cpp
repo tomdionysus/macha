@@ -7,6 +7,7 @@
 #include "metadata/namespace_tree.hpp"
 #include "test_support.hpp"
 
+#include <set>
 #include <stdexcept>
 
 using namespace macha;
@@ -290,6 +291,168 @@ MACHA_TEST("catalogue_maintenance", test_resident_bytes_count_what_the_catalogue
     profile.probe.streams.resize(4);
     snapshot.media_profiles.emplace("media:one", profile);
     CHECK(catalogue_resident_bytes(snapshot) >= long_synopsis + 4 * sizeof(MediaStreamInfo));
+}
+
+MACHA_TEST("catalogue_maintenance", test_a_view_holds_each_entry_once_in_its_shard) {
+    CatalogueSnapshot merged;
+    for (int i = 0; i < 500; ++i) {
+        auto item = movie("movie:" + std::to_string(i), "Title " + std::to_string(i));
+        merged.items.emplace(item.id, item);
+        if (i % 3 == 0) {
+            CatalogueSnapshot::MediaProfile profile;
+            profile.probe.format = "mp4";
+            merged.media_profiles.emplace("macha:" + std::to_string(i), profile);
+        }
+        if (i % 5 == 0)
+            merged.media_indexes.emplace("macha:" + std::to_string(i),
+                                         object_id(test_support::pattern(16, static_cast<uint8_t>(i))));
+    }
+    const auto view = CatalogueView::of(merged);
+    CHECK(view.item_count() == merged.items.size());
+    std::set<std::string> seen;
+    for (const auto& [id, item] : view.items()) {
+        CHECK(seen.insert(id).second);
+        CHECK(item.id == id);
+    }
+    CHECK(seen.size() == merged.items.size());
+    size_t profiles = 0, indexes = 0;
+    for (const auto& entry : view.media_profiles()) {
+        (void)entry;
+        ++profiles;
+    }
+    for (const auto& entry : view.media_indexes()) {
+        (void)entry;
+        ++indexes;
+    }
+    CHECK(profiles == merged.media_profiles.size());
+    CHECK(indexes == merged.media_indexes.size());
+    for (size_t slot = 0; slot < catalogue_shard_count; ++slot)
+        if (const auto& shard = view.shards()[slot])
+            for (const auto& [id, _] : shard->items)
+                CHECK(catalogue_shard(id) == slot);
+    REQUIRE(view.item("movie:7") != nullptr);
+    CHECK(view.item("movie:7")->title == "Title 7");
+    CHECK(view.item("movie:none") == nullptr);
+    CHECK(view.media_profile("macha:3") != nullptr);
+    CHECK(view.media_profile("macha:4") == nullptr);
+    CHECK(view.media_index("macha:5") != nullptr);
+    CHECK(view.merged().items == merged.items);
+    CHECK(view.merged().media_profiles == merged.media_profiles);
+    CHECK(view.merged().media_indexes == merged.media_indexes);
+    // An empty catalogue iterates nothing.
+    const CatalogueView empty;
+    CHECK(empty.items().begin() == empty.items().end());
+}
+
+MACHA_TEST("catalogue_maintenance", test_what_a_commit_installs_is_what_a_load_of_its_root_reads) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager writer(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    // What the writes should leave, kept apart from the catalogue's own code.
+    std::map<std::string, std::string> titles;
+    std::set<std::string> profiled;
+    std::vector<CatalogueItem> batch;
+    for (int i = 0; i < 200; ++i) {
+        batch.push_back(movie("movie:" + std::to_string(i), "Title " + std::to_string(i)));
+        titles[batch.back().id] = batch.back().title;
+    }
+    (void)writer.upsert_many(batch);
+    MediaProbeResult probe;
+    probe.format = "mp4";
+    probe.duration_seconds = 60;
+    MediaStreamInfo stream;
+    stream.index = 0;
+    stream.type = MediaStreamType::audio;
+    stream.codec = "aac";
+    probe.streams.push_back(stream);
+    uint32_t state = 7;
+    const auto next_random = [&] {
+        state = state * 1103515245u + 12345u;
+        return (state >> 8) % 200;
+    };
+    const auto matches = [&](CatalogueManager& catalogue) {
+        const auto view = catalogue.snapshot_view();
+        if (view->item_count() != titles.size())
+            return false;
+        for (const auto& [id, title] : titles) {
+            const auto* item = view->item(id);
+            if (!item || item->title != title)
+                return false;
+        }
+        size_t profiles = 0;
+        for (const auto& [media_id, _] : view->media_profiles()) {
+            if (!profiled.contains(media_id))
+                return false;
+            ++profiles;
+        }
+        return profiles == profiled.size();
+    };
+    for (int round = 0; round < 40; ++round) {
+        const auto id = "movie:" + std::to_string(next_random());
+        switch (round % 4) {
+        case 0:
+            if (auto item = writer.get(id)) {
+                item->title = "Edited " + std::to_string(round);
+                (void)writer.upsert(*item, item->revision);
+                titles[id] = item->title;
+            }
+            break;
+        case 1:
+            if (writer.erase(id))
+                titles.erase(id);
+            break;
+        case 2: {
+            const auto added = movie("movie:new-" + std::to_string(round), "New");
+            (void)writer.upsert(added);
+            titles[added.id] = added.title;
+            break;
+        }
+        case 3: {
+            const auto media_id = "macha:" + std::to_string(round);
+            writer.put_media_profile(media_id, probe);
+            profiled.insert(media_id);
+            break;
+        }
+        }
+        CatalogueManager reader(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+        reader.follow_head();
+        REQUIRE(reader.loads() == 1);
+        CHECK(matches(writer));
+        CHECK(matches(reader));
+        CHECK(writer.status().root == reader.status().root);
+    }
+}
+
+MACHA_TEST("catalogue_maintenance", test_a_load_reuses_every_shard_the_new_root_still_names) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager writer(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    CatalogueManager reader(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    std::vector<CatalogueItem> batch;
+    for (int i = 0; i < 300; ++i)
+        batch.push_back(movie("movie:" + std::to_string(i), "Title"));
+    (void)writer.upsert_many(batch);
+    reader.follow_head();
+    const auto before = reader.snapshot_view();
+    auto item = *writer.get("movie:42");
+    item.title = "Edited";
+    (void)writer.upsert(item, item.revision);
+    reader.follow_head();
+    const auto after = reader.snapshot_view();
+    const auto edited = catalogue_shard("movie:42");
+    size_t shared = 0;
+    for (size_t slot = 0; slot < catalogue_shard_count; ++slot) {
+        if (slot == edited) {
+            CHECK(after->shards()[slot] != before->shards()[slot]);
+            continue;
+        }
+        CHECK(after->shards()[slot] == before->shards()[slot]);
+        shared += after->shards()[slot] ? 1 : 0;
+    }
+    CHECK(shared > 0);
+    CHECK(after->item("movie:42")->title == "Edited");
 }
 
 } // namespace

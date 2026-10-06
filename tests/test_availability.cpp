@@ -872,7 +872,7 @@ MACHA_FAST_TEST("availability", test_items_take_their_best_file_and_sets_count_t
     item("new-e1", CatalogueKind::episode, {"macha:whole"}, "new-show");
     item("new-e2", CatalogueKind::episode, {"macha:undecided"}, "new-show");
 
-    const auto table = item_availability(catalogue, &survey);
+    const auto table = item_availability(CatalogueView::of(catalogue), &survey);
     REQUIRE(table.size() == catalogue.items.size());
     const auto status = [&](const char* id) { return table.at(id).status; };
     CHECK(status("m-whole") == Availability::complete);
@@ -895,22 +895,23 @@ MACHA_FAST_TEST("availability", test_items_take_their_best_file_and_sets_count_t
     CHECK((table.at("new-show") == ItemAvailability{Availability::unknown, 2, 1, 0, 0, 1}));
 
     // Nothing surveyed: every item is unknown, and sets still count members.
-    const auto blind = item_availability(catalogue, nullptr);
+    const auto blind = item_availability(CatalogueView::of(catalogue), nullptr);
     for (const auto& [id, entry] : blind)
         CHECK(entry.status == Availability::unknown);
     CHECK(blind.at("show").members == 3);
 
     // A parent cycle ends instead of looping.
     catalogue.items["show"].parent_id = "s1";
-    CHECK(item_availability(catalogue, &survey).size() == catalogue.items.size());
+    CHECK(item_availability(CatalogueView::of(catalogue), &survey).size() == catalogue.items.size());
 }
 
 MACHA_FAST_TEST("availability", test_the_item_table_is_rebuilt_only_when_a_snapshot_changes) {
-    auto catalogue = std::make_shared<CatalogueSnapshot>();
+    CatalogueSnapshot merged;
     CatalogueItem movie;
     movie.id = "m";
     movie.media_ids = {"macha:x"};
-    catalogue->items["m"] = movie;
+    merged.items["m"] = movie;
+    const auto catalogue = std::make_shared<const CatalogueView>(CatalogueView::of(merged));
     auto survey = std::make_shared<AvailabilitySnapshot>();
 
     ItemAvailabilityCache cache;

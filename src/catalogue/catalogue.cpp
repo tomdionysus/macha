@@ -20,7 +20,6 @@ constexpr std::array<uint8_t, 8> legacy_magic{'M', 'C', 'A', 'T', '0', '0', '1',
 constexpr std::array<uint8_t, 8> magic{'M', 'C', 'A', 'T', '0', '0', '2', '2'};
 constexpr std::array<uint8_t, 8> magic_0021{'M', 'C', 'A', 'T', '0', '0', '2', '1'};
 constexpr std::array<uint8_t, 8> manifest_magic{'M', 'C', 'R', 'O', 'O', 'T', '1', '8'};
-constexpr size_t catalogue_shard_count = 64;
 
 void optional_i32(Writer& w, const std::optional<int32_t>& value) {
     w.u8(value.has_value());
@@ -141,13 +140,6 @@ struct CatalogueManifest {
     std::array<std::optional<ObjectId>, catalogue_shard_count> shards;
 };
 
-size_t catalogue_shard(std::string_view id) {
-    const auto hash = sha256({reinterpret_cast<const uint8_t*>(id.data()), id.size()});
-    uint64_t value = 0;
-    for (size_t i = 0; i < sizeof(value); ++i)
-        value = (value << 8) | hash.bytes[i];
-    return value % catalogue_shard_count;
-}
 
 Bytes encode_catalogue_manifest(const CatalogueManifest& manifest) {
     Writer writer;
@@ -176,40 +168,65 @@ CatalogueManifest decode_catalogue_manifest(std::span<const uint8_t> bytes) {
 }
 
 // One shard of a snapshot.
-CatalogueSnapshot catalogue_shard_of(const CatalogueSnapshot& snapshot, size_t shard) {
-    CatalogueSnapshot out;
-    for (const auto& [id, item] : snapshot.items)
-        if (catalogue_shard(id) == shard)
-            out.items.emplace(id, item);
-    for (const auto& [id, profile] : snapshot.media_profiles)
-        if (catalogue_shard(id) == shard)
-            out.media_profiles.emplace(id, profile);
-    for (const auto& [id, index] : snapshot.media_indexes)
-        if (catalogue_shard(id) == shard)
-            out.media_indexes.emplace(id, index);
-    return out;
-}
-
-// Marks the shard of every key at which two maps differ.
-template <typename Map>
-void mark_changed_shards(const Map& before, const Map& after,
-                         std::array<bool, catalogue_shard_count>& changed) {
-    auto a = before.begin();
+// Walks one of a view's maps in key order (a merge of its shards, each of
+// which is sorted) against the same map of `after`, marking each slot where
+// they differ. A key only `after` holds is hashed to find its slot and kept
+// in `added`; the view's own keys carry their slot.
+template <class Map>
+void diff_slots(const std::array<const Map*, catalogue_shard_count>& before, const Map& after,
+                std::array<bool, catalogue_shard_count>& touched,
+                std::array<std::vector<typename Map::const_iterator>, catalogue_shard_count>& added) {
+    using Iterator = typename Map::const_iterator;
+    struct Cursor {
+        Iterator at, end;
+        size_t slot;
+    };
+    const auto later = [](const Cursor& x, const Cursor& y) { return y.at->first < x.at->first; };
+    std::vector<Cursor> heap;
+    heap.reserve(catalogue_shard_count);
+    for (size_t slot = 0; slot < catalogue_shard_count; ++slot)
+        if (before[slot] && !before[slot]->empty())
+            heap.push_back({before[slot]->begin(), before[slot]->end(), slot});
+    std::make_heap(heap.begin(), heap.end(), later);
+    const auto advance = [&] {
+        std::pop_heap(heap.begin(), heap.end(), later);
+        if (++heap.back().at == heap.back().end)
+            heap.pop_back();
+        else
+            std::push_heap(heap.begin(), heap.end(), later);
+    };
     auto b = after.begin();
-    while (a != before.end() || b != after.end()) {
-        if (b == after.end() || (a != before.end() && a->first < b->first)) {
-            changed[catalogue_shard(a->first)] = true;
-            ++a;
-        } else if (a == before.end() || b->first < a->first) {
-            changed[catalogue_shard(b->first)] = true;
+    while (!heap.empty() || b != after.end()) {
+        if (!heap.empty() && (b == after.end() || heap.front().at->first < b->first)) {
+            touched[heap.front().slot] = true;
+            advance();
+        } else if (heap.empty() || b->first < heap.front().at->first) {
+            const auto slot = catalogue_shard(b->first);
+            touched[slot] = true;
+            added[slot].push_back(b);
             ++b;
         } else {
-            if (!(a->second == b->second))
-                changed[catalogue_shard(a->first)] = true;
-            ++a;
+            if (!(heap.front().at->second == b->second))
+                touched[heap.front().slot] = true;
+            advance();
             ++b;
         }
     }
+}
+
+// One slot of `after`: the keys `before` held there that `after` keeps,
+// with `after`'s values, and the keys new to it.
+template <class Map>
+Map rebuild_slot(const Map* before, const Map& after,
+                 const std::vector<typename Map::const_iterator>& added) {
+    Map out;
+    if (before)
+        for (const auto& [key, _] : *before)
+            if (const auto found = after.find(key); found != after.end())
+                out.emplace_hint(out.end(), key, found->second);
+    for (const auto& entry : added)
+        out.emplace(entry->first, entry->second);
+    return out;
 }
 
 bool valid_kind(uint8_t value) {
@@ -296,6 +313,74 @@ CatalogueSnapshot::MediaProfile decode_media_profile(Reader& r) {
 }
 
 } // namespace
+
+size_t catalogue_shard(std::string_view id) {
+    const auto hash = sha256({reinterpret_cast<const uint8_t*>(id.data()), id.size()});
+    uint64_t value = 0;
+    for (size_t i = 0; i < sizeof(value); ++i)
+        value = (value << 8) | hash.bytes[i];
+    return value % catalogue_shard_count;
+}
+
+CatalogueView::CatalogueView(Shards shards, ShardIds ids)
+    : shards_(std::move(shards)), ids_(std::move(ids)) {
+    for (const auto& shard : shards_)
+        if (shard)
+            item_count_ += shard->items.size();
+}
+
+CatalogueView CatalogueView::of(const CatalogueSnapshot& snapshot) {
+    std::array<CatalogueSnapshot, catalogue_shard_count> split;
+    for (const auto& [id, item] : snapshot.items)
+        split[catalogue_shard(id)].items.emplace(id, item);
+    for (const auto& [id, profile] : snapshot.media_profiles)
+        split[catalogue_shard(id)].media_profiles.emplace(id, profile);
+    for (const auto& [id, index] : snapshot.media_indexes)
+        split[catalogue_shard(id)].media_indexes.emplace(id, index);
+    Shards shards;
+    for (size_t i = 0; i < catalogue_shard_count; ++i) {
+        auto& shard = split[i];
+        if (!shard.items.empty() || !shard.media_profiles.empty() || !shard.media_indexes.empty())
+            shards[i] = std::make_shared<const CatalogueSnapshot>(std::move(shard));
+    }
+    return CatalogueView(std::move(shards), {});
+}
+
+const CatalogueItem* CatalogueView::item(std::string_view id) const {
+    const auto& shard = shards_[catalogue_shard(id)];
+    if (!shard)
+        return nullptr;
+    const auto found = shard->items.find(std::string(id));
+    return found == shard->items.end() ? nullptr : &found->second;
+}
+
+const CatalogueSnapshot::MediaProfile* CatalogueView::media_profile(std::string_view media_id) const {
+    const auto& shard = shards_[catalogue_shard(media_id)];
+    if (!shard)
+        return nullptr;
+    const auto found = shard->media_profiles.find(media_id);
+    return found == shard->media_profiles.end() ? nullptr : &found->second;
+}
+
+const ObjectId* CatalogueView::media_index(std::string_view media_id) const {
+    const auto& shard = shards_[catalogue_shard(media_id)];
+    if (!shard)
+        return nullptr;
+    const auto found = shard->media_indexes.find(media_id);
+    return found == shard->media_indexes.end() ? nullptr : &found->second;
+}
+
+CatalogueSnapshot CatalogueView::merged() const {
+    CatalogueSnapshot out;
+    for (const auto& shard : shards_) {
+        if (!shard)
+            continue;
+        out.items.insert(shard->items.begin(), shard->items.end());
+        out.media_profiles.insert(shard->media_profiles.begin(), shard->media_profiles.end());
+        out.media_indexes.insert(shard->media_indexes.begin(), shard->media_indexes.end());
+    }
+    return out;
+}
 
 bool valid_catalogue_media_profile(
     std::string_view media_id, const CatalogueSnapshot::MediaProfile& profile) {
@@ -571,6 +656,14 @@ uint64_t catalogue_resident_bytes(const CatalogueSnapshot& snapshot) {
     return total;
 }
 
+uint64_t catalogue_resident_bytes(const CatalogueView& view) {
+    uint64_t total = sizeof(CatalogueView);
+    for (const auto& shard : view.shards())
+        if (shard)
+            resident::add(total, catalogue_resident_bytes(*shard));
+    return total;
+}
+
 std::string catalogue_kind_name(CatalogueKind kind) {
     switch (kind) {
     case CatalogueKind::movie: return "movie";
@@ -595,7 +688,7 @@ std::optional<CatalogueKind> parse_catalogue_kind(std::string_view value) {
     return {};
 }
 
-std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapshot& snapshot,
+std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueView& catalogue,
                                                            const CatalogueItem& item) {
     if (!item.artwork.empty())
         return item.artwork;
@@ -603,17 +696,17 @@ std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapsho
     if (item.kind == CatalogueKind::track) {
         if (!item.parent_id)
             return {};
-        auto parent = snapshot.items.find(*item.parent_id);
-        if (parent == snapshot.items.end() || parent->second.kind != CatalogueKind::album)
+        const auto* parent = catalogue.item(*item.parent_id);
+        if (!parent || parent->kind != CatalogueKind::album)
             return {};
-        return parent->second.artwork;
+        return parent->artwork;
     }
 
     if (item.kind != CatalogueKind::artist)
         return {};
 
     const CatalogueItem* newest = nullptr;
-    for (const auto& [_, candidate] : snapshot.items) {
+    for (const auto& [_, candidate] : catalogue.items()) {
         if (candidate.kind != CatalogueKind::album || !candidate.parent_id ||
             *candidate.parent_id != item.id || candidate.artwork.empty())
             continue;
@@ -658,22 +751,41 @@ std::set<ObjectId> CatalogueManager::data_object_ids(const CatalogueSnapshot& sn
     return ids;
 }
 
-CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& root) {
+std::set<ObjectId> CatalogueManager::data_object_ids(const CatalogueView& view) {
+    std::set<ObjectId> ids;
+    for (const auto& shard : view.shards())
+        if (shard) {
+            const auto of_shard = data_object_ids(*shard);
+            ids.insert(of_shard.begin(), of_shard.end());
+        }
+    return ids;
+}
+
+std::shared_ptr<const CatalogueView>
+CatalogueManager::load_view(const std::optional<ObjectId>& root, const CatalogueView* previous,
+                            size_t* decoded) {
     if (!root)
-        return {};
+        return std::make_shared<const CatalogueView>();
     if (!store_.ensure_control_local(*root))
         throw CatalogueUnavailable("catalogue manifest unavailable");
     auto encoded_manifest = local_.control().get(*root);
     if (!encoded_manifest)
         throw CatalogueUnavailable("catalogue manifest unavailable locally");
     const auto manifest = decode_catalogue_manifest(*encoded_manifest);
-    CatalogueSnapshot snapshot;
-    size_t shards = 0;
+    CatalogueView::Shards shards;
+    size_t read_shards = 0;
     uint64_t bytes = encoded_manifest->size();
     uint64_t read_ms = 0;
     const auto started = Clock::now();
-    for (const auto& shard_id : manifest.shards) {
-        if (!shard_id) continue;
+    for (size_t i = 0; i < catalogue_shard_count; ++i) {
+        const auto& shard_id = manifest.shards[i];
+        if (!shard_id)
+            continue;
+        // A shard the previous view decoded under the same id is that shard.
+        if (previous && previous->shard_ids()[i] == shard_id) {
+            shards[i] = previous->shards()[i];
+            continue;
+        }
         const auto read_started = Clock::now();
         if (!store_.ensure_control_local(*shard_id))
             throw CatalogueUnavailable("catalogue shard unavailable: " + to_string(*shard_id));
@@ -681,30 +793,33 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
         if (!encoded_shard)
             throw CatalogueUnavailable("catalogue shard unavailable locally: " + to_string(*shard_id));
         read_ms += ms_since(read_started);
-        ++shards;
+        ++read_shards;
         bytes += encoded_shard->size();
         auto shard = decode_catalogue(*encoded_shard);
-        for (auto& [id, item] : shard.items) {
-            if (!snapshot.items.emplace(id, std::move(item)).second)
-                throw std::runtime_error("catalogue item appears in multiple shards");
-        }
-        for (auto& [id, profile] : shard.media_profiles) {
-            if (!snapshot.media_profiles.emplace(id, std::move(profile)).second)
-                throw std::runtime_error("media profile appears in multiple shards");
-        }
-        for (auto& [id, index] : shard.media_indexes) {
-            if (!snapshot.media_indexes.emplace(id, index).second)
-                throw std::runtime_error("media index appears in multiple shards");
-        }
+        // Every key must hash to the slot that holds it, or lookups miss it.
+        const auto misplaced = [&](const auto& map) {
+            return std::any_of(map.begin(), map.end(),
+                               [&](const auto& entry) { return catalogue_shard(entry.first) != i; });
+        };
+        if (misplaced(shard.items) || misplaced(shard.media_profiles) ||
+            misplaced(shard.media_indexes))
+            throw std::runtime_error("catalogue entry in the wrong shard");
+        shards[i] = std::make_shared<const CatalogueSnapshot>(std::move(shard));
     }
+    auto view = std::make_shared<const CatalogueView>(std::move(shards), manifest.shards);
+    if (decoded)
+        *decoded = read_shards;
     const auto total_ms = ms_since(started);
     Log::debug("catalogue loaded root=" + to_string(*root).substr(0, 12) +
-               " shards=" + std::to_string(shards) + " bytes=" + std::to_string(bytes) +
-               " items=" + std::to_string(snapshot.items.size()) +
-               " profiles=" + std::to_string(snapshot.media_profiles.size()) +
+               " shards=" + std::to_string(read_shards) + " bytes=" + std::to_string(bytes) +
+               " items=" + std::to_string(view->item_count()) +
                " read_ms=" + std::to_string(read_ms) +
                " decode_ms=" + std::to_string(total_ms - std::min(total_ms, read_ms)));
-    return snapshot;
+    return view;
+}
+
+CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& root) {
+    return load_view(root, nullptr)->merged();
 }
 
 bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& root) {
@@ -780,7 +895,7 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
         throw;
     }
 }
-void CatalogueManager::install_head(std::shared_ptr<const CatalogueSnapshot> known,
+void CatalogueManager::install_head(std::shared_ptr<const CatalogueView> known,
                                     const std::optional<ObjectId>& known_root) {
     Lock install_lock(install_mutex_);
     const auto started = Clock::now();
@@ -799,17 +914,20 @@ void CatalogueManager::install_head(std::shared_ptr<const CatalogueSnapshot> kno
                 return;
             }
         }
-        std::shared_ptr<const CatalogueSnapshot> installed;
+        std::shared_ptr<const CatalogueView> installed;
+        std::shared_ptr<const CatalogueView> previous;
         if (known && known_root == root) {
             installed = std::move(known);
         } else {
             Lock lock(mutex_);
             if (staged_ && staged_root_ == root)
                 installed = staged_;
+            previous = cached_;
         }
         const bool loaded = !installed;
+        size_t decoded = 0;
         if (loaded)
-            installed = std::make_shared<const CatalogueSnapshot>(load_root(root));
+            installed = load_view(root, previous.get(), &decoded);
         Lock lock(mutex_);
         if (loaded)
             ++loads_;
@@ -839,7 +957,8 @@ void CatalogueManager::install_head(std::shared_ptr<const CatalogueSnapshot> kno
                        (root ? to_string(*root).substr(0, 12) : std::string("none")) +
                        " generation=" + std::to_string(head.generation) +
                        " source=" + (loaded ? "loaded" : "commit") +
-                       " items=" + std::to_string(view->items.size()) +
+                       " items=" + std::to_string(view->item_count()) +
+                       " decoded_shards=" + std::to_string(decoded) +
                        " resident_bytes=" + std::to_string(resident) +
                        " install_ms=" + std::to_string(install_ms) +
                        " count_ms=" + std::to_string(ms_since(count_started)) +
@@ -950,7 +1069,7 @@ uint64_t CatalogueManager::loads() const {
     return loads_;
 }
 
-std::shared_ptr<const CatalogueSnapshot> CatalogueManager::current_snapshot() {
+std::shared_ptr<const CatalogueView> CatalogueManager::current_snapshot() {
     {
         Lock lock(mutex_);
         // Warm reads are memory-only: the view follows the head behind them.
@@ -969,14 +1088,14 @@ std::shared_ptr<const CatalogueSnapshot> CatalogueManager::current_snapshot() {
 
 CatalogueStatus CatalogueManager::status() const {
     CatalogueStatus status;
-    std::shared_ptr<const CatalogueSnapshot> cached;
+    std::shared_ptr<const CatalogueView> cached;
     {
         Lock lock(mutex_);
         status.enabled = true;
         status.metadata_generation = cached_metadata_generation_;
         status.known_metadata_generation = metadata_server_.known_generation();
         status.root = cached_root_;
-        status.items = cached_ ? cached_->items.size() : 0;
+        status.items = cached_ ? cached_->item_count() : 0;
         status.ready = ready_;
         status.last_sync_unix_ms = last_sync_unix_ms_;
         status.error_code = error_code_;
@@ -988,7 +1107,7 @@ CatalogueStatus CatalogueManager::status() const {
     // which readers hold only to take the shared snapshot.
     std::set<ObjectId> art;
     if (cached)
-        for (const auto& [_, item] : cached->items)
+        for (const auto& [_, item] : cached->items())
             for (const auto& artwork : item.artwork) art.insert(artwork.id);
     status.artwork_objects = art.size();
     for (const auto& id : art)
@@ -999,14 +1118,14 @@ CatalogueStatus CatalogueManager::status() const {
 }
 
 CatalogueSnapshot CatalogueManager::snapshot() {
-    return *current_snapshot();
+    return current_snapshot()->merged();
 }
 
-std::shared_ptr<const CatalogueSnapshot> CatalogueManager::snapshot_view() {
+std::shared_ptr<const CatalogueView> CatalogueManager::snapshot_view() {
     return current_snapshot();
 }
 
-std::shared_ptr<const CatalogueSnapshot>
+std::shared_ptr<const CatalogueView>
 CatalogueManager::snapshot_view(const WorkContext& context) {
     bool warm = false;
     {
@@ -1021,16 +1140,16 @@ CatalogueManager::snapshot_view(const WorkContext& context) {
 
 std::optional<CatalogueItem> CatalogueManager::get(std::string_view id) {
     auto snapshot = current_snapshot();
-    auto it = snapshot->items.find(std::string(id));
-    return it == snapshot->items.end() ? std::optional<CatalogueItem>{} : it->second;
+    const auto* found = snapshot->item(id);
+    return found ? std::optional<CatalogueItem>{*found} : std::nullopt;
 }
 
 std::optional<MediaProbeResult> CatalogueManager::media_profile(std::string_view media_id) {
     auto snapshot = current_snapshot();
-    auto it = snapshot->media_profiles.find(std::string(media_id));
-    if (it == snapshot->media_profiles.end() || !valid_catalogue_media_profile(media_id, it->second))
+    const auto* found = snapshot->media_profile(media_id);
+    if (!found || !valid_catalogue_media_profile(media_id, *found))
         return {};
-    return it->second.probe;
+    return found->probe;
 }
 
 ResolvedMediaProfile CatalogueManager::resolve_media_profile(
@@ -1101,7 +1220,7 @@ void CatalogueManager::put_media_profile(std::string media_id, MediaProbeResult 
         throw std::invalid_argument("invalid immutable media profile");
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     if (auto it = current.media_profiles.find(media_id);
         it != current.media_profiles.end() && it->second == profile)
         return;
@@ -1120,7 +1239,7 @@ void CatalogueManager::put_media_profiles(
     if (profiles.empty()) return;
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     bool changed = false;
     for (auto& [media_id, probe] : profiles) {
         CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, std::move(probe)};
@@ -1141,9 +1260,9 @@ void CatalogueManager::put_media_profiles(
 
 std::optional<Bytes> CatalogueManager::media_index(std::string_view media_id) {
     auto snapshot = current_snapshot();
-    auto it = snapshot->media_indexes.find(media_id);
-    if (it == snapshot->media_indexes.end()) return {};
-    return store_.get(it->second, 0, FrameType::foreground);
+    const auto* found = snapshot->media_index(media_id);
+    if (!found) return {};
+    return store_.get(*found, 0, FrameType::foreground);
 }
 
 void CatalogueManager::put_media_index(std::string media_id, std::span<const uint8_t> bytes) {
@@ -1154,7 +1273,7 @@ void CatalogueManager::put_media_index(std::string media_id, std::span<const uin
         throw CatalogueUnavailable("cannot store media index in distributed DATA storage");
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     if (auto it = current.media_indexes.find(media_id);
         it != current.media_indexes.end() && it->second == id)
         return;
@@ -1172,7 +1291,7 @@ size_t CatalogueManager::prune_media_profiles(
     const std::set<std::string>& live_media_ids) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     const auto before = current.media_profiles.size();
     std::erase_if(current.media_profiles, [&](const auto& item) {
         return !live_media_ids.contains(item.first);
@@ -1202,7 +1321,7 @@ std::vector<CatalogueItem> CatalogueManager::list(std::optional<CatalogueKind> k
                                                   std::optional<std::string_view> parent) {
     auto snapshot = current_snapshot();
     std::vector<CatalogueItem> out;
-    for (const auto& [_, item] : snapshot->items) {
+    for (const auto& [_, item] : snapshot->items()) {
         if (kind && item.kind != *kind)
             continue;
         if (parent && (!item.parent_id || *item.parent_id != *parent))
@@ -1221,7 +1340,7 @@ std::vector<CatalogueItem> CatalogueManager::search(
     std::string_view query, size_t limit, const std::function<bool(const CatalogueItem&)>& keep) {
     auto snapshot = current_snapshot();
     std::vector<std::pair<double, CatalogueItem>> ranked;
-    for (const auto& [_, item] : snapshot->items) {
+    for (const auto& [_, item] : snapshot->items()) {
         if (keep && !keep(item)) continue;
         auto s = score(query, item);
         if (s > 0.0)
@@ -1287,19 +1406,55 @@ void CatalogueManager::commit(
     // catalogue at the expected root to compare against, every shard is.
     std::array<bool, catalogue_shard_count> touched;
     touched.fill(true);
+    std::shared_ptr<const CatalogueView> started_from;
     {
-        std::shared_ptr<const CatalogueSnapshot> started_from;
-        {
-            Lock lock(mutex_);
-            if (ready_ && cached_ && expected_root && cached_root_ == expected_root)
-                started_from = cached_;
+        Lock lock(mutex_);
+        if (ready_ && cached_ && expected_root && cached_root_ == expected_root)
+            started_from = cached_;
+    }
+    // The successor's shards: an untouched slot keeps the view's shard, a
+    // touched one is rebuilt from it and `next`.
+    CatalogueView::Shards shards;
+    if (started_from) {
+        touched.fill(false);
+        std::array<const std::map<std::string, CatalogueItem>*, catalogue_shard_count> items{};
+        std::array<const std::map<std::string, CatalogueSnapshot::MediaProfile, std::less<>>*,
+                   catalogue_shard_count>
+            profiles{};
+        std::array<const std::map<std::string, ObjectId, std::less<>>*, catalogue_shard_count>
+            indexes{};
+        for (size_t i = 0; i < catalogue_shard_count; ++i)
+            if (const auto& shard = started_from->shards()[i]) {
+                items[i] = &shard->items;
+                profiles[i] = &shard->media_profiles;
+                indexes[i] = &shard->media_indexes;
+            }
+        std::array<std::vector<decltype(next.items)::const_iterator>, catalogue_shard_count>
+            added_items;
+        std::array<std::vector<decltype(next.media_profiles)::const_iterator>,
+                   catalogue_shard_count>
+            added_profiles;
+        std::array<std::vector<decltype(next.media_indexes)::const_iterator>,
+                   catalogue_shard_count>
+            added_indexes;
+        diff_slots(items, next.items, touched, added_items);
+        diff_slots(profiles, next.media_profiles, touched, added_profiles);
+        diff_slots(indexes, next.media_indexes, touched, added_indexes);
+        for (size_t i = 0; i < catalogue_shard_count; ++i) {
+            if (!touched[i]) {
+                shards[i] = started_from->shards()[i];
+                continue;
+            }
+            CatalogueSnapshot shard;
+            shard.items = rebuild_slot(items[i], next.items, added_items[i]);
+            shard.media_profiles = rebuild_slot(profiles[i], next.media_profiles, added_profiles[i]);
+            shard.media_indexes = rebuild_slot(indexes[i], next.media_indexes, added_indexes[i]);
+            if (!shard.items.empty() || !shard.media_profiles.empty() ||
+                !shard.media_indexes.empty())
+                shards[i] = std::make_shared<const CatalogueSnapshot>(std::move(shard));
         }
-        if (started_from) {
-            touched.fill(false);
-            mark_changed_shards(started_from->items, next.items, touched);
-            mark_changed_shards(started_from->media_profiles, next.media_profiles, touched);
-            mark_changed_shards(started_from->media_indexes, next.media_indexes, touched);
-        }
+    } else {
+        shards = CatalogueView::of(next).shards();
     }
 
     CatalogueManifest manifest;
@@ -1310,26 +1465,25 @@ void CatalogueManager::commit(
             manifest.shards[i] = old_manifest.shards[i];
             continue;
         }
-        const auto shard = catalogue_shard_of(next, i);
-        if (shard.items.empty() && shard.media_profiles.empty() && shard.media_indexes.empty())
+        if (!shards[i])
             continue;
-        auto encoded = encode_catalogue(shard);
+        auto encoded = encode_catalogue(*shards[i]);
         const auto id = object_id(encoded);
         manifest.shards[i] = id;
         if (old_manifest.shards[i] != id)
             changed_control.push_back({id, std::move(encoded)});
     }
+    auto staged = std::make_shared<const CatalogueView>(std::move(shards), manifest.shards);
 
     auto encoded_manifest = encode_catalogue_manifest(manifest);
     const auto root = object_id(encoded_manifest);
     // An unchanged root is nothing to commit, unless a conflict is being
     // decided in its favour: that decision is the commit.
     if (expected_root && *expected_root == root && !resolved_conflict) {
-        install_head(std::make_shared<const CatalogueSnapshot>(next), root);
+        install_head(staged, root);
         return;
     }
 
-    auto staged = std::make_shared<const CatalogueSnapshot>(next);
     {
         Lock lock(mutex_);
         staged_ = staged;
@@ -1337,7 +1491,7 @@ void CatalogueManager::commit(
     }
     struct Unstage {
         CatalogueManager& self;
-        const std::shared_ptr<const CatalogueSnapshot>& staged;
+        const std::shared_ptr<const CatalogueView>& staged;
         ~Unstage() {
             Lock lock(self.mutex_);
             if (self.staged_ == staged) {
@@ -1416,7 +1570,7 @@ CatalogueItem CatalogueManager::upsert(CatalogueItem item,
                                         std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     std::optional<ObjectId> expected_root;
     {
         Lock lock(mutex_);
@@ -1445,7 +1599,7 @@ std::vector<CatalogueItem> CatalogueManager::upsert_many(std::vector<CatalogueIt
     if (items.empty()) return {};
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     std::optional<ObjectId> expected_root;
     {
         Lock lock(mutex_);
@@ -1468,7 +1622,7 @@ std::vector<CatalogueItem> CatalogueManager::upsert_many(std::vector<CatalogueIt
 bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     std::optional<ObjectId> expected_root;
     {
         Lock lock(mutex_);
@@ -1492,7 +1646,7 @@ bool CatalogueManager::definitely_absent(std::string_view id) const {
         Lock lock(mutex_);
         if (!ready_ || !cached_)
             return false;
-        if (cached_->items.contains(std::string(id)))
+        if (cached_->item(id))
             return false;
         cached_root = cached_root_;
         cached_generation = cached_metadata_generation_;
@@ -1518,7 +1672,7 @@ CatalogueClearResult CatalogueManager::clear_metadata_with_media(
     std::string_view id, std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     std::optional<ObjectId> expected_root;
     {
         Lock lock(mutex_);
@@ -1570,7 +1724,7 @@ CatalogueUnbindResult CatalogueManager::unbind_media(std::optional<std::string_v
                                                      std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     std::optional<ObjectId> expected_root;
     {
         Lock lock(mutex_);
@@ -1683,7 +1837,7 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                                          const std::set<std::string>& vanished_media) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = *current_snapshot();
+    auto current = current_snapshot()->merged();
     std::optional<ObjectId> expected_root;
     {
         Lock lock(mutex_);
@@ -1883,7 +2037,7 @@ std::shared_ptr<const CatalogueIndexes> CatalogueManager::indexes() {
             return indexes_;
     }
     auto built = std::make_shared<CatalogueIndexes>();
-    for (const auto& [id, item] : current->items) {
+    for (const auto& [id, item] : current->items()) {
         for (const auto& art : item.artwork)
             built->artwork_types.emplace(art.id, art.mime_type);
         for (const auto& media_id : item.media_ids)
@@ -2013,7 +2167,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     out.control_live.insert(metadata_roots.begin(), metadata_roots.end());
     bool root_readable = true;
     std::optional<ObjectId> root;
-    std::shared_ptr<const CatalogueSnapshot> cached;
+    std::shared_ptr<const CatalogueView> cached;
     {
         Lock lock(mutex_);
         root = cached_root_;
