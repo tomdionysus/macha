@@ -318,6 +318,8 @@ maintenance:
   # Both 1..10000.
   foreground_weight: 95
   repair_weight: 5
+  # Share of a core other work may use before background work slows; the
+  # maintenance thread's own CPU does not count.
   cpu_target: 0.10
   # Background DATA operations at once. 0 is half the hardware threads.
   background_concurrency: 0
