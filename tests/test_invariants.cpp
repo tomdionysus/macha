@@ -907,9 +907,31 @@ MACHA_TEST("invariants", test_provider_release_tracks) {
         CHECK(error_code(body) == "provider_not_found");
     }
     {
-        // MusicBrainz failing makes the gate back off: the next release is
-        // refused without a request. The client is told the provider is
-        // unavailable, never why.
+        // One rate-limit answer is waited out: the editor's request tries
+        // again after the Retry-After MusicBrainz gave, and succeeds.
+        auto http = std::make_unique<FakeHttpClient>();
+        auto* http_ptr = http.get();
+        http->add_once("musicbrainz.org/ws/2/release/", 503, "slow down", std::chrono::seconds(1));
+        http->add("musicbrainz.org/ws/2/release/" + release, 200, "application/json",
+                  R"JSON({"id":")JSON" + release + R"JSON(","title":"Once","media":[
+                      {"position":1,"tracks":[{"position":1,"title":"Only",
+                       "recording":{"id":"aaaaaaaa-0000-4000-8000-000000000009","title":"Only"}}]}]})JSON");
+        auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())),
+                                     std::move(http));
+        ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
+                         bench.hints(), *scanner);
+        const auto started = std::chrono::steady_clock::now();
+        auto [status, body] = get(manage, tracks_path(release));
+        CHECK(status == 200);
+        CHECK(http_ptr->requests() == 2);
+        CHECK(std::chrono::steady_clock::now() - started >= 1s);
+    }
+    {
+        // MusicBrainz down: the editor waits out the first backoff (2 s) and
+        // tries once more, then is refused with how long to wait; the next
+        // request waits out a backoff it can (4 s) and tries once; past that
+        // (8 s) a request is refused without asking. The client is told the
+        // provider is unavailable and when to try again, never why.
         auto http = std::make_unique<FakeHttpClient>();
         auto* http_ptr = http.get();
         http->add("musicbrainz.org/ws/2/release/", 503, "text/plain", "down");
@@ -917,13 +939,24 @@ MACHA_TEST("invariants", test_provider_release_tracks) {
                                      std::move(http));
         ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
                          bench.hints(), *scanner);
-        for (const auto& id : {release, other}) {
-            auto [status, body] = get(manage, tracks_path(id));
-            CHECK(status == 503);
+        const auto refused = [&](const std::string& id) {
+            const auto response = manage.handle(request_for("GET", tracks_path(id)));
+            const auto body = body_json(response);
+            CHECK(response.status == 503);
             CHECK(error_code(body) == "provider_unavailable");
             CHECK(error_message(body) == "Provider unavailable");
-        }
-        CHECK(http_ptr->requests() == 1);
+            REQUIRE(body.find("error")->find("retry_after_ms") != nullptr);
+            CHECK(response.headers.contains("Retry-After"));
+            return body.find("error")->find("retry_after_ms")->asUInt64();
+        };
+        CHECK(refused(release) == 4000);
+        CHECK(http_ptr->requests() == 2);
+        CHECK(refused(other) == 8000);
+        CHECK(http_ptr->requests() == 3);
+        const auto left = refused(release);
+        CHECK(left > 5000);
+        CHECK(left <= 8000);
+        CHECK(http_ptr->requests() == 3);
     }
     {
         auto config = provider_scanner_config(write_token(bench.path()));

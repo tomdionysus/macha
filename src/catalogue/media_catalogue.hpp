@@ -114,6 +114,8 @@ struct RemoteHttpResponse {
     long status{};
     std::string content_type;
     Bytes body;
+    // Retry-After, when given in seconds.
+    std::optional<std::chrono::milliseconds> retry_after;
 };
 
 class HttpClient {
@@ -146,25 +148,36 @@ class CurlHttpClient final : public HttpClient {
 struct ProviderRequestError : std::runtime_error {
     int status;
     std::string code;
-    ProviderRequestError(int http_status, std::string error_code, const std::string& message)
-        : std::runtime_error(message), status(http_status), code(std::move(error_code)) {}
+    // When a provider said, or this node knows, how long until it can answer.
+    std::optional<std::chrono::milliseconds> retry_after;
+    ProviderRequestError(int http_status, std::string error_code, const std::string& message,
+                         std::optional<std::chrono::milliseconds> retry = {})
+        : std::runtime_error(message), status(http_status), code(std::move(error_code)),
+          retry_after(retry) {}
 };
 
-// A provider that could not answer, as the client is told: the code and
-// "Provider unavailable". The reason is logged here, not sent.
+// A provider that could not answer, as the client is told: the code,
+// "Provider unavailable" and, when known, how long until it may. The reason is
+// logged here, not sent.
 ProviderRequestError provider_unavailable(std::string_view provider, std::string_view reason);
+ProviderRequestError provider_unavailable(std::string_view provider, const std::exception& error);
 
 // MusicBrainz allows one request a second per client: every MusicBrainzProvider
-// on a node shares this gate and its backoff.
+// on a node shares this gate and its backoff. After a failure or a rate-limit
+// answer the gate backs off for the Retry-After MusicBrainz gives, else for
+// `backoff_first`, doubling to `backoff_max`; a success resets it.
 struct MusicBrainzGate {
     // The least time between two requests.
     const std::chrono::steady_clock::duration interval;
+    static constexpr std::chrono::seconds backoff_first{2};
+    static constexpr std::chrono::seconds backoff_max{60};
     explicit MusicBrainzGate(std::chrono::steady_clock::duration interval = std::chrono::seconds(1))
         : interval(interval) {}
     // Held across the pacing sleep and the MusicBrainz HTTP request.
     IoMutex mutex;
     std::chrono::steady_clock::time_point last_request MACHA_GUARDED_BY(mutex){};
     std::chrono::steady_clock::time_point unavailable_until MACHA_GUARDED_BY(mutex){};
+    std::chrono::steady_clock::duration backoff MACHA_GUARDED_BY(mutex){};
 };
 
 // The numbers a provider reference needs to name one playable item: a TV
@@ -278,6 +291,7 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::map<std::string, std::optional<std::string>> cover_cache_;
     size_t cache_bytes_{};
     std::shared_ptr<MusicBrainzGate> gate_;
+    bool interactive_{};
 
     Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
     std::optional<Json> release_by_id(std::string_view);
@@ -286,8 +300,12 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::optional<std::string> cover_url(std::string_view release_id);
 
   public:
+    // An interactive provider (the editor's) waits out a backoff of up to
+    // `interactive_wait_max` and tries a failed request once more; a
+    // background one is refused at once.
+    static constexpr std::chrono::seconds interactive_wait_max{5};
     MusicBrainzProvider(HttpClient&, CatalogueMusicBrainzConfig,
-                        std::shared_ptr<MusicBrainzGate> gate = {});
+                        std::shared_ptr<MusicBrainzGate> gate = {}, bool interactive = false);
     std::string_view name() const noexcept override { return "musicbrainz"; }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
@@ -397,7 +415,8 @@ class MusicScanProvider final : public CatalogueScanProvider {
   public:
     MusicScanProvider(HttpClient&, CatalogueMusicProviderConfig,
                       size_t max_artwork_bytes = 16 * 1024 * 1024,
-                      std::shared_ptr<MusicBrainzGate> musicbrainz_gate = {});
+                      std::shared_ptr<MusicBrainzGate> musicbrainz_gate = {},
+                      bool interactive = false);
     std::string_view name() const noexcept override { return "music"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
     bool accepts_path(std::string_view path) const noexcept override;

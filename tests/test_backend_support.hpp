@@ -322,6 +322,7 @@ class FakeHttpClient final : public HttpClient {
         RemoteHttpResponse response;
     };
     std::vector<Route> routes_;
+    std::vector<Route> once_;
     std::atomic_size_t requests_{};
     mutable std::mutex urls_mutex_;
     std::vector<std::string> urls_;
@@ -343,19 +344,34 @@ class FakeHttpClient final : public HttpClient {
     }
     void add_bytes(std::string contains, long status, std::string content_type, Bytes body) {
         routes_.push_back({std::move(contains),
-                           RemoteHttpResponse{status, std::move(content_type), std::move(body)}});
+                           RemoteHttpResponse{status, std::move(content_type), std::move(body), {}}});
+    }
+    // Answered once, before any route, by the first request containing
+    // `contains`.
+    void add_once(std::string contains, long status, std::string body,
+                  std::optional<std::chrono::milliseconds> retry_after = {}) {
+        std::lock_guard lock(urls_mutex_);
+        once_.push_back({std::move(contains),
+                         RemoteHttpResponse{status, "text/plain",
+                                            Bytes(body.begin(), body.end()), retry_after}});
     }
     RemoteHttpResponse get(std::string_view url, const std::vector<std::string>&, size_t) override {
         requests_.fetch_add(1);
         {
             std::lock_guard lock(urls_mutex_);
             urls_.emplace_back(url);
+            for (auto once = once_.begin(); once != once_.end(); ++once)
+                if (url.find(once->contains) != std::string_view::npos) {
+                    auto response = std::move(once->response);
+                    once_.erase(once);
+                    return response;
+                }
         }
         for (const auto& route : routes_) {
             if (url.find(route.contains) != std::string_view::npos)
                 return route.response;
         }
-        return RemoteHttpResponse{404, "text/plain", {}};
+        return RemoteHttpResponse{404, "text/plain", {}, {}};
     }
 };
 

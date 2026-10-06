@@ -1097,6 +1097,29 @@ size_t curl_write(char* ptr, size_t size, size_t nmemb, void* opaque) {
     return bytes;
 }
 
+// Keeps Retry-After when it is given in seconds.
+size_t curl_header(char* buffer, size_t size, size_t nitems, void* opaque) {
+    auto* retry_after = static_cast<std::optional<std::chrono::milliseconds>*>(opaque);
+    const auto bytes = size * nitems;
+    std::string_view line(buffer, bytes);
+    constexpr std::string_view name = "retry-after:";
+    if (line.size() > name.size()) {
+        bool match = true;
+        for (size_t i = 0; i < name.size() && match; ++i)
+            match = std::tolower(static_cast<unsigned char>(line[i])) == name[i];
+        if (match) {
+            auto value = line.substr(name.size());
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                value.remove_prefix(1);
+            uint64_t seconds = 0;
+            const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), seconds);
+            if (ec == std::errc{} && end != value.data() && seconds <= 86400)
+                *retry_after = std::chrono::seconds(seconds);
+        }
+    }
+    return bytes;
+}
+
 int curl_cancelled(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
     auto* stop = static_cast<std::atomic_bool*>(opaque);
     return stop && stop->load(std::memory_order_relaxed) ? 1 : 0;
@@ -1415,6 +1438,8 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &stop_requested_);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &sink);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, curl_header);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &out.retry_after);
     std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_guard(
         nullptr, curl_slist_free_all);
     for (const auto& header : headers) {
@@ -1802,9 +1827,10 @@ std::vector<ArtworkOption> TmdbProvider::artwork_options(std::string_view kind,
 }
 
 MusicBrainzProvider::MusicBrainzProvider(HttpClient& http, CatalogueMusicBrainzConfig config,
-                                         std::shared_ptr<MusicBrainzGate> gate)
+                                         std::shared_ptr<MusicBrainzGate> gate, bool interactive)
     : http_(http), config_(std::move(config)),
-      gate_(gate ? std::move(gate) : std::make_shared<MusicBrainzGate>()) {}
+      gate_(gate ? std::move(gate) : std::make_shared<MusicBrainzGate>()),
+      interactive_(interactive) {}
 
 bool MusicBrainzProvider::supports(MediaProbeKind kind) const {
     return config_.enabled && kind == MediaProbeKind::track;
@@ -1812,47 +1838,82 @@ bool MusicBrainzProvider::supports(MediaProbeKind kind) const {
 
 Json MusicBrainzProvider::api(std::string_view path,
                               const std::vector<std::pair<std::string, std::string>>& query) {
-    Lock gate(gate_->mutex);
-    const auto now = std::chrono::steady_clock::now();
-    if (gate_->unavailable_until > now)
-        throw ProviderTemporarilyUnavailable("musicbrainz", "MusicBrainz is backing off after a failure");
-
-    if (gate_->last_request != std::chrono::steady_clock::time_point{}) {
-        const auto due = gate_->last_request + gate_->interval;
-        while (std::chrono::steady_clock::now() < due) {
+    using std::chrono::steady_clock;
+    const auto milliseconds = [](steady_clock::duration value) {
+        return std::chrono::ceil<std::chrono::milliseconds>(value);
+    };
+    // Sleeps until `until`, a slice at a time, so a stop is noticed.
+    const auto wait_until = [&](steady_clock::time_point until) {
+        while (steady_clock::now() < until) {
             if (http_.stop_requested())
                 throw std::runtime_error("MusicBrainz request cancelled");
-            const auto remaining = due - std::chrono::steady_clock::now();
-            const auto slice = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::milliseconds(50));
-            std::this_thread::sleep_for(std::min(remaining, slice));
+            std::this_thread::sleep_for(
+                std::min<steady_clock::duration>(until - steady_clock::now(),
+                                                 std::chrono::milliseconds(50)));
         }
-    }
+    };
+    Lock gate(gate_->mutex);
+    // The gate backs off after a failure; the editor waits out a short one.
+    const auto backing_off = [&]() MACHA_REQUIRES(gate_->mutex) {
+        const auto left = gate_->unavailable_until - steady_clock::now();
+        if (left <= steady_clock::duration::zero())
+            return;
+        if (!interactive_ || left > interactive_wait_max)
+            throw ProviderTemporarilyUnavailable(
+                "musicbrainz", "MusicBrainz is backing off after a failure", milliseconds(left));
+        wait_until(gate_->unavailable_until);
+    };
+    const auto failed = [&](std::optional<std::chrono::milliseconds> retry_after)
+                            MACHA_REQUIRES(gate_->mutex) {
+        gate_->backoff = gate_->backoff == steady_clock::duration::zero()
+                             ? steady_clock::duration(MusicBrainzGate::backoff_first)
+                             : std::min<steady_clock::duration>(gate_->backoff * 2,
+                                                                MusicBrainzGate::backoff_max);
+        const steady_clock::duration wait =
+            retry_after ? steady_clock::duration(*retry_after) : gate_->backoff;
+        gate_->unavailable_until = steady_clock::now() + wait;
+        return milliseconds(wait);
+    };
+
     auto ua = std::string("Macha/") + std::string(kServerVersion) + " (" + config_.contact + ")";
     auto q = query;
     q.emplace_back("fmt", "json");
-    RemoteHttpResponse response;
-    try {
-        response = http_.get(query_url("https://musicbrainz.org/ws/2" + std::string(path), q),
-                             {"Accept: application/json", "User-Agent: " + ua});
-    } catch (const ProviderBudgetExhausted&) {
-        throw;
-    } catch (const std::exception& e) {
-        gate_->unavailable_until = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-        throw ProviderTemporarilyUnavailable(
-            "musicbrainz", "MusicBrainz transport unavailable: " + std::string(e.what()));
+    const auto url = query_url("https://musicbrainz.org/ws/2" + std::string(path), q);
+    for (int attempt = 0;; ++attempt) {
+        backing_off();
+        if (gate_->last_request != steady_clock::time_point{})
+            wait_until(gate_->last_request + gate_->interval);
+        // The editor tries once more after a failure it can wait out.
+        const bool again = interactive_ && attempt == 0;
+        RemoteHttpResponse response;
+        try {
+            response = http_.get(url, {"Accept: application/json", "User-Agent: " + ua});
+        } catch (const ProviderBudgetExhausted&) {
+            throw;
+        } catch (const std::exception& e) {
+            gate_->last_request = steady_clock::now();
+            const auto wait = failed({});
+            if (again && wait <= interactive_wait_max)
+                continue;
+            throw ProviderTemporarilyUnavailable(
+                "musicbrainz", "MusicBrainz transport unavailable: " + std::string(e.what()), wait);
+        }
+        gate_->last_request = steady_clock::now();
+        if (transient_provider_status(response.status)) {
+            const auto wait = failed(response.retry_after);
+            if (again && wait <= interactive_wait_max)
+                continue;
+            throw ProviderTemporarilyUnavailable(
+                "musicbrainz", "MusicBrainz returned HTTP " + std::to_string(response.status), wait);
+        }
+        gate_->backoff = {};
+        if (response.status == 404)
+            throw ProviderRecordNotFound("MusicBrainz has no record at " + std::string(path));
+        if (response.status != 200)
+            throw std::runtime_error("MusicBrainz returned HTTP " + std::to_string(response.status));
+        return Json::parse(std::string_view(reinterpret_cast<const char*>(response.body.data()),
+                                            response.body.size()));
     }
-    gate_->last_request = std::chrono::steady_clock::now();
-    if (transient_provider_status(response.status)) {
-        gate_->unavailable_until = gate_->last_request + std::chrono::seconds(60);
-        throw ProviderTemporarilyUnavailable(
-            "musicbrainz", "MusicBrainz returned HTTP " + std::to_string(response.status));
-    }
-    if (response.status == 404)
-        throw ProviderRecordNotFound("MusicBrainz has no record at " + std::string(path));
-    if (response.status != 200)
-        throw std::runtime_error("MusicBrainz returned HTTP " + std::to_string(response.status));
-    return Json::parse(std::string_view(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
 }
 
 std::optional<Json> MusicBrainzProvider::release_by_id(std::string_view release_id) {
@@ -2579,11 +2640,12 @@ MediaProbeFile TvScanProvider::probe_file(
 
 MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderConfig config,
                                      size_t max_artwork_bytes,
-                                     std::shared_ptr<MusicBrainzGate> musicbrainz_gate)
+                                     std::shared_ptr<MusicBrainzGate> musicbrainz_gate,
+                                     bool interactive)
     : roots_(std::move(config.roots)), max_artwork_bytes_(max_artwork_bytes) {
     if (config.musicbrainz.enabled)
         metadata_.push_back(std::make_unique<MusicBrainzProvider>(
-            http, std::move(config.musicbrainz), std::move(musicbrainz_gate)));
+            http, std::move(config.musicbrainz), std::move(musicbrainz_gate), interactive));
     if (config.discogs.enabled) {
         try {
             metadata_.push_back(std::make_unique<DiscogsProvider>(http, std::move(config.discogs)));
@@ -2669,7 +2731,7 @@ CatalogueScanner::CatalogueScanner(NodeRuntime& node, MetadataServer& metadata_s
 CatalogueScanner::~CatalogueScanner() { stop(); }
 
 void CatalogueScanner::configure_providers() {
-    auto build = [&](HttpClient& http) MACHA_REQUIRES(config_mutex_) {
+    auto build = [&](HttpClient& http, bool interactive) MACHA_REQUIRES(config_mutex_) {
         std::vector<std::unique_ptr<CatalogueScanProvider>> out;
         if (config_.movies.enabled)
             out.push_back(std::make_unique<MovieScanProvider>(http, config_.movies));
@@ -2677,13 +2739,13 @@ void CatalogueScanner::configure_providers() {
             out.push_back(std::make_unique<TvScanProvider>(http, config_.tv));
         if (config_.music.enabled)
             out.push_back(std::make_unique<MusicScanProvider>(
-                http, config_.music, config_.max_artwork_bytes, musicbrainz_gate_));
+                http, config_.music, config_.max_artwork_bytes, musicbrainz_gate_, interactive));
         return out;
     };
-    providers_ = build(*provider_http_);
+    providers_ = build(*provider_http_, false);
     for (auto& seat : editor_seats_) {
         Lock editor(seat.mutex);
-        seat.providers = build(*http_);
+        seat.providers = build(*http_, true);
     }
 }
 
@@ -2930,6 +2992,13 @@ ProviderRequestError provider_unavailable(std::string_view provider, std::string
     return ProviderRequestError(503, "provider_unavailable", "Provider unavailable");
 }
 
+ProviderRequestError provider_unavailable(std::string_view provider, const std::exception& error) {
+    auto refused = provider_unavailable(provider, std::string_view(error.what()));
+    if (const auto* temporary = dynamic_cast<const ProviderTemporarilyUnavailable*>(&error))
+        refused.retry_after = temporary->retry_after();
+    return refused;
+}
+
 namespace {
 void add_artwork(CatalogueItem& item, CatalogueArtwork art) {
     const bool duplicate =
@@ -3092,7 +3161,7 @@ std::vector<ProviderSearchResult> CatalogueScanner::search_providers(
         try {
             results = metadata->search(query);
         } catch (const std::exception& e) {
-            throw provider_unavailable(metadata_provider, e.what());
+            throw provider_unavailable(metadata_provider, e);
         }
     }
     for (auto& result : results)
@@ -3168,7 +3237,7 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
         } catch (const ProviderRecordNotFound&) {
             // No match: answered below as provider_not_found.
         } catch (const std::exception& e) {
-            throw provider_unavailable(parsed->provider, e.what());
+            throw provider_unavailable(parsed->provider, e);
         }
     }
     if (!match)
@@ -3284,7 +3353,7 @@ std::vector<ArtworkOption> CatalogueScanner::artwork_options(std::string_view re
     } catch (const ProviderRecordNotFound& e) {
         throw ProviderRequestError(404, "provider_not_found", e.what());
     } catch (const std::exception& e) {
-        throw provider_unavailable(parsed->provider, e.what());
+        throw provider_unavailable(parsed->provider, e);
     }
 }
 
@@ -3306,7 +3375,7 @@ std::vector<ProviderReleaseTrack> CatalogueScanner::release_tracks(std::string_v
     } catch (const ProviderRecordNotFound& e) {
         throw ProviderRequestError(404, "provider_not_found", e.what());
     } catch (const std::exception& e) {
-        throw provider_unavailable(parsed->provider, e.what());
+        throw provider_unavailable(parsed->provider, e);
     }
 }
 
