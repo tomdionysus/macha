@@ -1,5 +1,24 @@
 # Current release
 
+## 0.90.19 — one MusicBrainz rate-limit answer no longer refuses search for a minute (experiment)
+
+API addition: `retry_after_ms` on `provider_unavailable`. No wire, protocol or
+on-disk changes.
+
+**The MusicBrainz gate backs off as MusicBrainz asks.** After a failure or a
+rate-limit answer it waits for the Retry-After MusicBrainz gives, else 2 s,
+doubling to 60 s; a success resets it. It refused every MusicBrainz request on
+the node for 60 s after any one failure.
+
+**The editor waits out a short backoff.** An editor request (search, match,
+release tracks, artwork) waits out a backoff of up to 5 s and tries a failed
+request once more. Background matching is refused at once and defers, as
+before.
+
+**`provider_unavailable` says when to try again**: `retry_after_ms` in the
+error and a `Retry-After` header, when the node knows
+([API conventions](docs/api.md#providers)).
+
 ## 0.90.18 — every list call pages (experiment)
 
 API change, additive except for order. No wire, protocol or on-disk changes.
