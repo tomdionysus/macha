@@ -113,8 +113,8 @@ membership changes or a storage backend comes or goes; the routes below act
 on it sooner.
 
 - `GET /api/v1/manage/filesystem/parked-publications` → `{"parked": [{inode, path, error_code, error_message, attempts, failing_for_ms, parked_for_ms, pending_bytes}]}`
-- `POST /api/v1/manage/filesystem/parked-publications/{inode}/retry` — reset the retry budget and re-queue the publication (`204`; `409 not_parked` if that inode is not parked).
-- `POST /api/v1/manage/filesystem/parked-publications/{inode}/abandon` — drop the unpublished generation from the spool, exactly as a corrupt spool record is dropped (`204`; `409 not_parked` if not parked).
+- `POST /api/v1/manage/filesystem/parked-publications/{inode}/retry` - reset the retry budget and re-queue the publication (`204`; `409 not_parked` if that inode is not parked).
+- `POST /api/v1/manage/filesystem/parked-publications/{inode}/abandon` - drop the unpublished generation from the spool, exactly as a corrupt spool record is dropped (`204`; `409 not_parked` if not parked).
 
 `diagnostics.filesystem.parked_publications` and
 `diagnostics.filesystem.publication_retries_backed_off` in `GET /api/v1/status`
@@ -129,13 +129,13 @@ greater dot), which is what the namespace serves, and records both
 alternatives as a first-class conflict. A
 conflict leaves the snapshot in one of two ways: a later mutation of its
 subject decides it (any write to or removal of the path, or a new catalogue
-root — the later write *is* the resolution, and the record is pruned at the
+root - the later write *is* the resolution, and the record is pruned at the
 next commit or merge), or an operator resolves it here. A resolution is
 itself a change of the subject, even when it keeps the value in place, so a
 head that has not seen it does not bring the conflict back.
 
-- `GET /api/v1/manage/metadata/conflicts` → `{"generation": N, "conflicts": [{id, kind: "namespace_entry"|"catalogue_root", key, installed: "left"|"base", left_head, right_head, base, left, right}]}` — `installed` names the alternative the namespace holds until the conflict is decided. It is `left` for a conflict recorded by a merge, whose `left` is the value in place, `right` the other alternative and `base` `null`. It is `base` only for a record made by an older build, whose `base` is the common-ancestor value then in place. For a namespace entry `base`/`left`/`right` are `{type, size, mtime_ns, version, extents}` or `null` (absent); for a catalogue root they are object ids or `null`. `left_head` and `right_head` are all zeros on a namespace-entry conflict recorded by a merge.
-- `POST /api/v1/manage/metadata/conflicts/{id}/resolve?choice=left|right|base` — installs that alternative for the subject and drops the record in one metadata commit; `choice=base` on a record whose `base` is `null` removes the path, or clears the catalogue root (`204`; `409 not_standing` if the conflict is no longer standing; `400 bad_choice`). Both routes answer `503 metadata_unavailable` while no metadata snapshot is available.
+- `GET /api/v1/manage/metadata/conflicts` → `{"generation": N, "conflicts": [{id, kind: "namespace_entry"|"catalogue_root", key, installed: "left"|"base", left_head, right_head, base, left, right}]}` - `installed` names the alternative the namespace holds until the conflict is decided. It is `left` for a conflict recorded by a merge, whose `left` is the value in place, `right` the other alternative and `base` `null`. It is `base` only for a record made by an older build, whose `base` is the common-ancestor value then in place. For a namespace entry `base`/`left`/`right` are `{type, size, mtime_ns, version, extents}` or `null` (absent); for a catalogue root they are object ids or `null`. `left_head` and `right_head` are all zeros on a namespace-entry conflict recorded by a merge.
+- `POST /api/v1/manage/metadata/conflicts/{id}/resolve?choice=left|right|base` - installs that alternative for the subject and drops the record in one metadata commit; `choice=base` on a record whose `base` is `null` removes the path, or clears the catalogue root (`204`; `409 not_standing` if the conflict is no longer standing; `400 bad_choice`). Both routes answer `503 metadata_unavailable` while no metadata snapshot is available.
 
 `diagnostics.metadata.{conflicts, namespace_conflicts, catalogue_conflicts}`
 in `GET /api/v1/status` are the standing counts;
@@ -172,7 +172,7 @@ The tombstone is a freshness boundary. Pre-reset gossip cannot recreate the inva
 
 Every HTTP route requires a session bearer token from `POST /api/v1/session`. The only routes reachable without one are that route itself, `GET /api/v1/health`, the web client's static files, and capability URLs that carry their own authority in the path or query (playback stream URLs and signed artwork URLs). A session carries the roles of the account behind it, and each route is gated on those roles in one place before dispatch. Hiding a section in a client is presentation; the gate is the enforcement.
 
-Roles are capabilities rather than a ladder — importing does not imply managing, and managing does not imply handing out accounts. There are exactly two implications: `importer`, `manager` and `manage_users` each imply `media_viewer`, and `media_viewer` implies `view_status`.
+Roles are capabilities rather than a ladder - importing does not imply managing, and managing does not imply handing out accounts. There are exactly two implications: `importer`, `manager` and `manage_users` each imply `media_viewer`, and `media_viewer` implies `view_status`.
 
 | role | grants |
 | --- | --- |
@@ -182,20 +182,20 @@ Roles are capabilities rather than a ladder — importing does not imply managin
 | `manager` | files, namespaces, catalogue edits and matches, identity-association reset, status connectivity checks |
 | `manage_users` | add, edit and remove accounts |
 
-`view_status` is the weakest capability: everything implies it, it implies nothing, and it is grantable on its own. That is what makes cluster health independently addressable — an operator who wants it visible to unauthenticated visitors grants the `anonymous` account `view_status` and nothing else, while an account granted nothing at all cannot see health either. Implication is resolved when a session is minted rather than when the account is written, so a change to these rules reaches accounts created before it without a migration.
+`view_status` is the weakest capability: everything implies it, it implies nothing, and it is grantable on its own. That is what makes cluster health independently addressable - an operator who wants it visible to unauthenticated visitors grants the `anonymous` account `view_status` and nothing else, while an account granted nothing at all cannot see health either. Implication is resolved when a session is minted rather than when the account is written, so a change to these rules reaches accounts created before it without a migration.
 
-Two accounts exist on every cluster. `root` holds every role; `anonymous` is what an unauthenticated visitor is, and holds `media_viewer` at first. Neither can be renamed or deleted, and `anonymous` has no password and cannot be given one (`409 no_password`); in every other respect they are ordinary accounts. Anonymous access is controlled by editing the `anonymous` account's roles, not by configuration, so it takes effect on the next session rather than on restart — this is what decides what a television, which cannot practically type a password, is able to reach. `session.allow_anonymous: false` turns the mechanism off entirely.
+Two accounts exist on every cluster. `root` holds every role; `anonymous` is what an unauthenticated visitor is, and holds `media_viewer` at first. Neither can be renamed or deleted, and `anonymous` has no password and cannot be given one (`409 no_password`); in every other respect they are ordinary accounts. Anonymous access is controlled by editing the `anonymous` account's roles, not by configuration, so it takes effect on the next session rather than on restart - this is what decides what a television, which cannot practically type a password, is able to reach. `session.allow_anonymous: false` turns the mechanism off entirely.
 
-At least one account always holds `manage_users`. Removing the role from the last account that has it, or deleting that account, is refused with `last_user_manager` — `root` included, whose roles are otherwise ordinary. The rule is about the role, not any particular account, so it moves as the role moves.
+At least one account always holds `manage_users`. Removing the role from the last account that has it, or deleting that account, is refused with `last_user_manager` - `root` included, whose roles are otherwise ordinary. The rule is about the role, not any particular account, so it moves as the role moves.
 
 ### Routes
 
-- `GET /api/v1/users` — list. Credentials are write-only: this and every other route returns account records without password material.
-- `POST /api/v1/users` — `{username, password, roles}`.
-- `GET|PATCH|DELETE /api/v1/users/{id}` — `PATCH` accepts `password` and/or `roles`.
-- `GET|PATCH /api/v1/users/me` — anyone's own account. `PATCH` accepts `password` only; a `roles` change here is `403`, since otherwise it would be an escalation route for every account. Changing your own password returns a fresh session in the same response (`token`, `token_type`, `session_id`), so you are not signed out by your own change. An anonymous session has no account here and gets `404 no_account`.
+- `GET /api/v1/users` - list. Credentials are write-only: this and every other route returns account records without password material.
+- `POST /api/v1/users` - `{username, password, roles}`.
+- `GET|PATCH|DELETE /api/v1/users/{id}` - `PATCH` accepts `password` and/or `roles`.
+- `GET|PATCH /api/v1/users/me` - anyone's own account. `PATCH` accepts `password` only; a `roles` change here is `403`, since otherwise it would be an escalation route for every account. Changing your own password returns a fresh session in the same response (`token`, `token_type`, `session_id`), so you are not signed out by your own change. An anonymous session has no account here and gets `404 no_account`.
 
-Every user record carries a `mutable` block stating what may be changed about it — `rename`, `delete`, `set_password`, `set_roles`, and `required_roles` for roles pinned to that account. Read it rather than testing the username: a client that hardcodes `root` breaks the moment these names are configurable, and disables the wrong controls everywhere at once.
+Every user record carries a `mutable` block stating what may be changed about it - `rename`, `delete`, `set_password`, `set_roles`, and `required_roles` for roles pinned to that account. Read it rather than testing the username: a client that hardcodes `root` breaks the moment these names are configurable, and disables the wrong controls everywhere at once.
 
 A password change, a role change or a deletion retires every session that account had minted, on every node, as the record propagates. A role change does this deliberately: a session carries the roles it was minted with, so a demotion that left them alive would not take effect until they expired.
 
@@ -203,7 +203,7 @@ A password change, a role change or a deletion retires every session that accoun
 
 A node founding a new cluster creates both accounts on first start and writes root's generated password to `<state_path>/initial-root-password`, mode 0600.
 
-A node with bootstrap peers is joining rather than founding, so it creates neither. If the cluster it joins holds no accounts, it starts with an empty user table, which means nothing can sign in — the node says so at startup and reports `accounts_initialised: false` in `GET /api/v1/status`. Stop one node and run:
+A node with bootstrap peers is joining rather than founding, so it creates neither. If the cluster it joins holds no accounts, it starts with an empty user table, which means nothing can sign in - the node says so at startup and reports `accounts_initialised: false` in `GET /api/v1/status`. Stop one node and run:
 
 ```
 macha-users <state_path> <cluster.key> init
@@ -217,4 +217,4 @@ If root's password is lost and no `manage_users` account can sign in, reset it t
 macha-users <state_path> <cluster.key> passwd root
 ```
 
-Recovery is deliberately offline only, through `macha-users` on a stopped node. An online recovery key or endpoint would have to be presentable without an account to be useful, which means a standing unauthenticated path to the most privileged account in the cluster; and anyone able to use it already has root on a node, where the command above does the same job. `macha-users` itself is not a weakness: it needs the node's state directory and the cluster key, which is root on a node — and that party already holds every byte in the cluster.
+Recovery is deliberately offline only, through `macha-users` on a stopped node. An online recovery key or endpoint would have to be presentable without an account to be useful, which means a standing unauthenticated path to the most privileged account in the cluster; and anyone able to use it already has root on a node, where the command above does the same job. `macha-users` itself is not a weakness: it needs the node's state directory and the cluster key, which is root on a node - and that party already holds every byte in the cluster.

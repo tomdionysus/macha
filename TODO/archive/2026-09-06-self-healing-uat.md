@@ -1,11 +1,11 @@
-# Self-healing disciplines — UAT record
+# Self-healing disciplines: UAT record
 
 Companion to `2026-09-06-self-healing-disciplines-plan.md`. One section per
 discipline: the failure as it happened on the cluster before, the fix, and
 the same scenario replayed live after, with the journal lines that prove it.
 Load is `rsync` from `/mnt/diskA` (read-only) into each node's FUSE mount.
 
-## Discipline 1 — re-derive, don't assert (0.29.0)
+## Discipline 1: re-derive, don't assert (0.29.0)
 
 ### Before (2026-09-06, 0.28.3)
 
@@ -36,7 +36,7 @@ epoch change present=N/N`; no `quorum unavailable` that is not immediately
 re-derived; the file reaches its full size on gbni-2.
 
 Observed, run 1 (19:26–19:44, first 0.29.0 cut): the es-1 restart landed
-on a barrier in flight — `outcome="remote-transport: send: Broken pipe"` —
+on a barrier in flight - `outcome="remote-transport: send: Broken pipe"` -
 and that cut treated a transport failure as a loss and replayed the UAT
 file from its spool. Fixed the same hour (transient vs definitive, see
 CHANGELOG). Then, unplanned and on the real workload: *Pulp Fiction* (inode
@@ -54,7 +54,7 @@ retried `epoch changed` forever.
 
 Known remaining cost, seen while deploying the final cut: restarting the
 *writer* itself (gbni-1 at 19:48, Pulp Fiction at 99%) recovers the
-publication from the spool and re-puts from its last durable checkpoint —
+publication from the spool and re-puts from its last durable checkpoint -
 it resumed at ~4.1 GB of 13.9 GB, ~121 extent quorums in the first three
 minutes, all for objects the peers already hold. A peer restart now costs
 nothing; a writer restart costs a re-send. The fix is the present-content
@@ -73,7 +73,7 @@ gbni-1:
 es-1: `object durability re-derived after epoch change present=4/4
 expected=714c3b85 current=1ecb27ac`, its refusal log showing the batch had
 accumulated tokens from four dead epochs (`714c3b85`, `bc7f524c`,
-`a193421c`, `93d93d9b`) across the three restarts — all re-stamped.
+`a193421c`, `93d93d9b`) across the three restarts - all re-stamped.
 
 Totals for the run: `re-derived=3 quorum-unavail=2 retries=1 replays=0
 re-put=0 ERR=0`; 515 extent quorums; the file at its full size on gbni-2
@@ -93,13 +93,13 @@ publication, and it does not re-send a byte.
   after the ENOENT re-derivation; was 1/4 failing)
 - `filesystem_fuse/test_fuse_terminal_recovery_failure_is_not_readmitted` (0/10)
 
-## Discipline 2 — one work-item policy (0.30.0)
+## Discipline 2: one work-item policy (0.30.0)
 
 Three habits in one discipline: a retry with no budget, a wait with no
 progress condition, and a startup gate on elapsed time. Each has its own
 before/after below.
 
-### 2a. Publication retry — before (2026-09-06 20:59–21:02, 0.29.0 on gbni-1)
+### 2a. Publication retry: before (2026-09-06 20:59–21:02, 0.29.0 on gbni-1)
 
 Scenario (`/root/uat/d2-before.sh` on gbni-1): `rsync --inplace` of
 `Blade.Runner.2049…mp4` (3.3 GB) into `/mnt/machamedia/UAT/d2-before/`;
@@ -110,7 +110,7 @@ untouched (no peer is restarted).
 Observed: for the first 64 s the in-flight barrier waited on the peers
 (nothing logged). Once membership marked them dead the publication failed
 with `quorum unavailable … outcome="remote-not-sent"` and the writer
-retried it on the fixed 100 ms sleep — **a flat 10 attempts/s, 254 retries
+retried it on the fixed 100 ms sleep - **a flat 10 attempts/s, 254 retries
 of the same inode in the remaining 26 s**, 550 log lines in the window,
 peak 21 lines/s. There is no backoff, no budget, no operator signal: had
 the rule stayed, so would the loop, forever, at 10/s, holding one of the
@@ -124,7 +124,7 @@ the next attempt succeeded and the file published normally.
 … ×254, 10/s, until 21:01:57
 ```
 
-### 2a. Publication retry — after (2026-09-06 21:04–, 0.30.0 on all nodes)
+### 2a. Publication retry: after (2026-09-06 21:04–, 0.30.0 on all nodes)
 
 Same scenario (`/root/uat/d2-after.sh`), same file, same 90 s `nft reject`
 isolation of gbni-1 from both peers, with gbni-1 configured for a small
@@ -155,9 +155,9 @@ first failure:
 ```
 
 89 log lines in the window (550 before). After the rule was removed the
-parked inodes stayed parked — that is the point: the fault may have
+parked inodes stayed parked - that is the point: the fault may have
 cleared, but nine failures in 23 s is the operator's call, not a reason to
-spin — and the API showed them:
+spin - and the API showed them:
 
 ```
 GET /api/v1/manage/filesystem/parked-publications
@@ -170,8 +170,8 @@ diagnostics.filesystem: parked_publications=2 publication_retries_backed_off=16
 
 Then, with both inodes parked, a second rsync (`Ghostbusters.1984…mkv`,
 3,697,566,500 bytes) into the same directory at 21:06:57 → 21:10:52; it
-published normally while the parked pair sat in the spool — full size on
-gbni-2 at 21:16, `data_publications_completed` 2 → 4 — while gbni-2's copy
+published normally while the parked pair sat in the spool - full size on
+gbni-2 at 21:16, `data_publications_completed` 2 → 4 - while gbni-2's copy
 of the parked `d2-after/Blade.Runner…mp4` stayed at **0 bytes**. One
 `POST …/parked-publications/16565/retry` (`204`, log `FUSE data publication
 retry requested by operator inode=16565`) at 21:14:33 released the first;
@@ -179,7 +179,7 @@ by 21:34 `parked_publications=1`, `spool_bytes` had fallen to exactly the
 second inode's 3.5 GB. `POST …/18307/retry` at 21:35 released the second
 (a second POST for the same inode answers `409 not_parked`). By 21:50:21:
 `parked_publications=0 data_publications_completed=5 spool_bytes=183039231`
-(the pre-run baseline), and all three files at full size on gbni-2 —
+(the pre-run baseline), and all three files at full size on gbni-2 -
 `d2-before/Blade.Runner…` 3,348,105,554 at 21:22, `d2-after/Blade.Runner…`
 3,348,105,554 at 21:42, `Ghostbusters…` 3,697,566,500 at 21:16. Zero
 `ERROR` lines for the whole run. gbni-1's UAT-only budget was then removed
@@ -195,7 +195,7 @@ operator can release or abandon it through the API.
 Before (0.29.0): the plan doc's 150–230 s `accept_metadata_commit` stalls
 of 2026-09-06 afternoon, and during the before-run above es-1 logged
 `RPC stalled (control) peer=377ce5b1bd86 message=members … no_progress_ms=30000;
-request remains active while peer health is monitored` — the call had no
+request remains active while peer health is monitored` - the call had no
 deadline of its own; only `dead_after` ending the session freed it.
 
 After (0.30.0), during the after-run's isolation, gbni-2:
@@ -212,8 +212,8 @@ and es-1 the same ladder to `deadline_ms=30000` (there `dead_after` won the
 race by a few hundred ms and closed the session first). The stall notice
 now names the deadline it is counting down to, the call fails with a
 distinct transient error, and the caller (bootstrap) retries under its own
-policy. The case the deadline exists for — a peer that answers heartbeats
-but never answers the call, which `dead_after` can never catch — cannot be
+policy. The case the deadline exists for - a peer that answers heartbeats
+but never answers the call, which `dead_after` can never catch - cannot be
 injected on the live cluster without a code hook; it is what
 `rpc_cluster/test_rpc_call_fails_after_no_progress_deadline` exercises
 (handler parks on a gate, call fails inside 300 ms with the same message).
@@ -232,7 +232,7 @@ replaying its 132 MB journal, which 0.28.3 had already made linear), so the
 gate is not stressed on today's cluster; the slow-but-progressing case is
 proven by `rpc_cluster/test_service_startup_gate_waits_while_recovery_progresses`
 (recovery held at the `data-storage` stage for 3 s under a 1.2 s gate with
-the progress counter ticking — no kill; ticking stops — killed inside 2 s).
+the progress counter ticking - no kill; ticking stops - killed inside 2 s).
 
 ### Tests
 
@@ -241,25 +241,25 @@ the progress counter ticking — no kill; ticking stops — killed inside 2 s).
 - `rpc_cluster/test_rpc_call_fails_after_no_progress_deadline`
 - suite 345/345
 
-## Discipline 3 — recover by resolving (0.31.0)
+## Discipline 3: recover by resolving (0.31.0)
 
-### Before (2026-09-06, 0.30.0 — the same on every boot since Sep 4/5)
+### Before (2026-09-06, 0.30.0: the same on every boot since Sep 4/5)
 
 Every start replays the same durable state, so anything recovery refuses
 it refuses on every boot. Both writer nodes had been carrying this for
 days:
 
-gbni-1, boot 21:50:42 (0.30.0) — 23 `WARN` lines in the first 20 s:
+gbni-1, boot 21:50:42 (0.30.0) - 23 `WARN` lines in the first 20 s:
 ```
 21:50:45 WARN FUSE journal recovery accepted data completion without published prefix inode=904 sequence=1496 frame_offset=21387307
-… ×20 (inodes 904…1901, 11340, 11351 — the same twenty frames, every boot)
+… ×20 (inodes 904…1901, 11340, 11351 - the same twenty frames, every boot)
 21:50:47 WARN recovered durable FUSE operations pending=702 namespace=0 inodes=2
 21:50:47 WARN FUSE async data publication failed inode=922 error=missing
 21:50:47 WARN FUSE async data publication failed inode=5806 error=missing
 ```
 `/etc/macha/fuse-operations.log` 131,912,072 bytes (re-parsed on every
 boot); `/mnt/diskB/spool/inode-922.spool` 183,038,542 bytes dated Sep 5
-11:43 and `inode-5806.spool` 689 bytes — the whole of gbni-1's steady-state
+11:43 and `inode-5806.spool` 689 bytes - the whole of gbni-1's steady-state
 `spool_bytes=183039231`.
 
 es-1, boot 22:03:21 CEST (0.30.0):
@@ -269,14 +269,14 @@ es-1, boot 22:03:21 CEST (0.30.0):
 22:03:26 WARN FUSE async data publication failed inode=2333 error=missing
 ```
 journal 218,767,658 bytes; `/mnt/diskB/spool/inode-2333.spool`
-**6,028,175,014 bytes dated Sep 4 17:55** — 22,997 pending write
+**6,028,175,014 bytes dated Sep 4 17:55** - 22,997 pending write
 operations for a file that had left the namespace two days earlier.
 
 Mechanism: the file was written through FUSE and then removed (or renamed
 over) cluster-side before its data published. On each boot
 `resume_recovered_data` republishes it, `open_write` answers `ENOENT`,
 `publication_path_may_still_appear()` correctly says no, and the loop's
-terminal branch poisoned the inode "until an operator acts" — with no
+terminal branch poisoned the inode "until an operator acts" - with no
 operator action defined. The pending operations kept
 `durable_pending_operations > 0`, so the journal could never reset and
 grew without bound, and its twenty benign done-without-published frames
@@ -286,7 +286,7 @@ were re-warned each start.
 
 Nothing was done on either node except installing 0.31.0 and restarting.
 
-gbni-1, first boot — 5 `WARN` lines (was 23):
+gbni-1, first boot - 5 `WARN` lines (was 23):
 ```
 22:52:27 Started … 22:52:29 local services ready
 22:52:31 WARN recovered durable FUSE operations pending=702 namespace=0 inodes=2 skipped_frames=0 done_without_published=20
@@ -299,7 +299,7 @@ Immediately after: `/etc/macha/fuse-operations.log` **8 bytes** (was
 131,912,072), `inode-922.spool` and `inode-5806.spool` gone (the two
 `*.orphan.*` files from Sep 1–2 are untouched, as designed).
 
-es-1, first boot — 3 `WARN` lines (was 3, but different ones):
+es-1, first boot - 3 `WARN` lines (was 3, but different ones):
 ```
 23:53:07 Started … 23:53:11 local services ready
 23:53:15 WARN recovered durable FUSE operations pending=22997 namespace=0 inodes=1 skipped_frames=0 done_without_published=1
@@ -314,7 +314,7 @@ journal **8 bytes** (was 218,767,658); `/mnt/diskB/spool` empty (was
 
 What was abandoned, checked against the live namespace from gbni-2's
 mount: `/TV/Ted Lasso/` does not exist at all, and `…/Allo Allo 1984
-Season 5/` has no `S5e05` file — both trees were removed by the operator
+Season 5/` has no `S5e05` file - both trees were removed by the operator
 after the writes were accepted and before they published. The abandoned
 bytes were writes to files that no longer exist; nothing visible changed.
 The `last_path` in the WARN is exactly what an operator needs to confirm
@@ -328,26 +328,26 @@ the next boot was silent.
 ### Tests
 
 - `filesystem_fuse/test_fuse_journal_fuzz_every_frame_mutation_still_starts`
-  — 9 frames × {truncate after, drop, duplicate, corrupt} = 36 restarts,
+  - 9 frames × {truncate after, drop, duplicate, corrupt} = 36 restarts,
   the frontend starts every time; mid-journal corruption quarantines the
   tail and counts the bytes.
 - `filesystem_fuse/test_fuse_recovery_abandons_publication_for_file_removed_from_namespace`
-  — the 922/2333 case: first boot abandons, journal resets, second boot
+  - the 922/2333 case: first boot abandons, journal resets, second boot
   reports nothing.
 - `filesystem_fuse/test_fuse_durable_journal_skips_unbacked_data_done`
   (was `…_rejects_…`: a marker with no operation behind it is skipped).
 - `filesystem_fuse/test_fuse_journal_frame_scanner_exhaustive_tail_model`
   (mid-journal corruption is reported, not thrown).
 - `storage_metadata/test_metadata_journal_mid_frame_corruption_truncates_not_reseeds`
-  — one flipped byte in the first of two journal frames: journal truncated
+  - one flipped byte in the first of two journal frames: journal truncated
   and tail quarantined, checkpoint/history/heads untouched, replica usable.
 - suite 348/348.
 
-## Discipline 4 — compact history out of the hot path (0.32.0)
+## Discipline 4: compact history out of the hot path (0.32.0)
 
 ### Measuring first (2026-09-06 23:30, gbni-2, `macha-metadata-dump --stats`)
 
-The plan was written on the morning's premise — 270k tombstones making
+The plan was written on the morning's premise - 270k tombstones making
 15 MB snapshots. The tool built for this discipline says what the
 production head (gen 9903) actually was:
 
@@ -358,7 +358,7 @@ conflicts: namespace_entry=49 catalogue_root=67 identical_alternatives=0 distinc
 per_entry_bytes=1330 per_entry_bytes_excluding_extents=316
 ```
 
-So: 76% extent tables (the data map — 36,083 × 49 B, not compressible
+So: 76% extent tables (the data map - 36,083 × 49 B, not compressible
 without a manifest redesign), **14% standing conflicts nobody knew about**,
 1% tombstones (GC consumes them after `garbage_grace`). The plan's per-node
 retirement log is not justified by the data and was not built; the
@@ -369,7 +369,7 @@ What *was* costing: every merge delta carried the whole conflict set
 (`history_body=delta history_bytes=335961`, twice in three hours), and 4 of
 es-1's last 5 reconciliations were **full frames of 5.4–7.7 MB** each
 (`history_body=full history_bytes=7749233`), replicated to every node and
-across the WAN — because the merge canonicalises tombstones by ObjectId,
+across the WAN - because the merge canonicalises tombstones by ObjectId,
 the primary parent's vector was in append order, and DLT5/6 could not
 express a reorder, so `metadata_delta()` gave up.
 
@@ -382,8 +382,8 @@ diagnostics.metadata: conflicts 116 → 10, conflicts_superseded=106, tombstones
 metadata mutate mode=delta delta_bytes=162 snapshot_bytes=2261657
 ```
 
-106 of the 116 were decided long ago — 49 media paths one writer had since
-republished, 67 catalogue roots the scanner had moved past — and left the
+106 of the 116 were decided long ago - 49 media paths one writer had since
+republished, 67 catalogue roots the scanner had moved past - and left the
 snapshot in one commit. The 10 that remain are genuine: e.g.
 `/Music/Avicii/Stories/08 City Lights.mp3` left = 15,601,728 B v5, right =
 12,845,056 B v4 (two writers, two different partial generations). The API
@@ -397,7 +397,7 @@ diagnostics.metadata: conflicts=9 conflicts_resolved=1
 ```
 
 Snapshot on gbni-2 after that: `encoded_bytes=2261698 conflicts=10
-conflicts_bytes=277468` (the ten survivors are the big ones — alternatives
+conflicts_bytes=277468` (the ten survivors are the big ones - alternatives
 with extent tables). A same-content rule (same bytes at the same path,
 differing only in version/mtime, as two rsync writers of duplicate media
 produce) was added the same night so those never become conflicts again.
@@ -427,15 +427,15 @@ Result, from each node's journal over the whole window:
 | | gbni-1 (writer) | gbni-2 (replica) | es-1 (writer, restarted twice) |
 |---|---|---|---|
 | ERROR / WARN | 0 / 1 | 0 / 0 | 0 / 0 |
-| durability re-derived after peer restart | `reasserted=355 absent=0` ×2 | — | `present=355/355` ×2 |
+| durability re-derived after peer restart | `reasserted=355 absent=0` ×2 | - | `present=355/355` ×2 |
 | quorum unavailable / replays / parked / abandoned | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
 | publication retries (backed off) | 4 | 0 | 0 |
 | RPC no-progress cancellations / skipped journal frames | 0 / 0 | 0 / 0 | 0 / 0 |
-| metadata mutations | 11, all `mode=delta` | — | 9, all `mode=delta` |
+| metadata mutations | 11, all `mode=delta` | - | 9, all `mode=delta` |
 | reconciliation | `history_body=delta history_bytes=277 conflicts=0 standing=9` | same | same |
 
 The one WARN is gbni-1's own restart mid-publication: `recovered durable
-FUSE operations pending=16221 namespace=0 inodes=2` — it resumed both
+FUSE operations pending=16221 namespace=0 inodes=2` - it resumed both
 files from its spool and finished them (a writer restart still re-sends
 from its last durable checkpoint; the present-content skip plan is the
 follow-up, unchanged since discipline 1). All four files are at their
@@ -446,16 +446,16 @@ growth), 9 standing conflicts (the operator's), 439 tombstones; history
 
 Against the plan's acceptance list:
 
-- **no wedges** — five restarts, two of them of a writer, zero
+- **no wedges** - five restarts, two of them of a writer, zero
   `quorum unavailable`, zero parked, zero abandoned, every node ready in
   ≤ 2 s; before the programme one peer restart stranded every in-flight
   publication forever;
-- **no re-sent extents on a peer restart** — 355 extents on es-1 re-stamped
+- **no re-sent extents on a peer restart** - 355 extents on es-1 re-stamped
   twice, `absent=0`, none re-put;
-- **bounded retries visible in Status** — 4 backed-off retries on gbni-1,
+- **bounded retries visible in Status** - 4 backed-off retries on gbni-1,
   each logged with its delay, `parked_publications=0`;
-- **sub-10 s restarts** — 1–2 s;
-- **compact history** — the reconciliation was a **277-byte delta**
+- **sub-10 s restarts** - 1–2 s;
+- **compact history** - the reconciliation was a **277-byte delta**
   (335,961 bytes, or a 5–8 MB full frame, on 2026-09-06), every mutation a
   delta, and the snapshot's size is its entries.
 
@@ -466,11 +466,11 @@ and the restarts that produced six P0s in one afternoon on 2026-09-06.**
 
 The operator's test: both nodes rsync their entire `/mnt/diskA` (gbni-1
 6.1 TB / 15,500 files; es-1 2.4 TB / 6,350 files) into the real namespace
-roots, concurrently — "the first thing a new user does". Judged on: secure,
+roots, concurrently - "the first thing a new user does". Judged on: secure,
 replicated, quick to access, stable, good neighbour; and on throughput
 against what the hardware could do. Sources are read-only throughout.
 
-### Iteration 1 — died at 30 % of Music on gbni-1 (02:11:45)
+### Iteration 1: died at 30 % of Music on gbni-1 (02:11:45)
 
 `rsync: write failed on ".../03 Eddie, Are You Kidding_.m4a": Resource
 temporarily unavailable (11)`, then Movies and TV each died on their first
@@ -493,54 +493,54 @@ blocking contract and pass.
 
 Also seen in the same window, filed for the next iteration: metadata
 mutations of 15–21 s on gbni-1 (`metadata mutate total_ms=21735`) while
-es-1's own import saturated the WAN — the write floor W=2 waiting on a
+es-1's own import saturated the WAN - the write floor W=2 waiting on a
 replica behind a congested link; and `slow-fuse op=truncate` bursts from
 rsync's create/truncate/rename pattern on thousands of small files.
 
-### Iteration 2 — namespace commits one op at a time; publication starved (02:30–03:30)
+### Iteration 2: namespace commits one op at a time; publication starved (02:30–03:30)
 
 After 0.32.1 gbni-1 showed `data_publications_started=114 completed=0`
 for minutes with all eight publication threads parked and the full 256 MB
 in-flight budget held. gdb: every thread in `replay_data_quantum` waiting on
-`namespace_cv` — for the namespace op that names its file. Status:
+`namespace_cv` - for the namespace op that names its file. Status:
 `namespace_publication_batches=1677` for `namespace_operations_batched=1723`
-— **one op per metadata commit**, ~3/s cluster-wide, 1,690 Music ops queued.
+- **one op per metadata commit**, ~3/s cluster-wide, 1,690 Music ops queued.
 `namespace_batch_compatible()` only batched runs of one kind and never
 renames; rsync's create-temp / utimens / rename per file never batches.
 Reconciliation churn followed (8 merges in 2 min: every one of those
 commits raced es-1's).
 
-Fix (0.32.2): identity batches — see CHANGELOG. 73 rsync-pattern ops
+Fix (0.32.2): identity batches - see CHANGELOG. 73 rsync-pattern ops
 recover into one commit (test). Immediate mitigation: gbni-1's import
 reordered to Movies → TV → Music so watchable large media is not queued
 behind thousands of small-file ops.
 
 Second finding in the same window, from a read-only dry run over the
 already-imported Music (`rsync -ani /mnt/diskA/Music/ /mnt/machamedia/Music/`):
-**474 files `>f..t......`** — same size, wrong mtime — the next pass would
+**474 files `>f..t......`** - same size, wrong mtime - the next pass would
 re-copy them. Cause: the asynchronous data publication committed the
 write's timestamp over the utimens rsync had set after the writes
 (`commit_file`'s "explicit mtime" heuristic only sees a utimens applied
 while the handle is open; the FUSE writer opens after). Fixed in 0.32.2
 (explicit committed mtime from the inode; recovery order). The 83
 `.d..t` directories are dirs whose rsync run was killed before it set their
-times — expected, cheap on the next pass.
+times - expected, cheap on the next pass.
 
 Also measured while here (for the next iteration, not fixed yet):
-- metadata mutations of 195 s (es-1) and 284 s (gbni-1) — silent windows
+- metadata mutations of 195 s (es-1) and 284 s (gbni-1) - silent windows
   with `retention claim peer=10.34.1.50 error=control RPC deadline exceeded`
   and control-lane `peer closed`/reconnect churn: the control lane shares
   the saturated WAN with the bulk data lane and gets no priority;
-- `publish_commit` tries replicas in NodeId order, not proximity — gbni-1
+- `publish_commit` tries replicas in NodeId order, not proximity - gbni-1
   may try es-1 (WAN) before gbni-2 (LAN) for every commit;
 - viewer path via the playback API on gbni-2: session 6–9 s, transcode
   segments at ~0.7 MB/s (CPU-bound), and a mid-file segment request that
   did not return in 90 s for either film (seek); the UI session is
   measuring the real player;
 - es-1 logs 25 `media information prune deferred: catalogue unavailable`
-  WARNs in one boot minute — one line would do.
+  WARNs in one boot minute - one line would do.
 
-### Iteration 3 — a restart was a write outage; status was unreachable (04:17–04:49 CEST, es-1)
+### Iteration 3: a restart was a write outage; status was unreachable (04:17–04:49 CEST, es-1)
 
 After the 0.32.2 restart es-1's `/api/v1/status` stopped answering
 (`http=000` after 40 s), its import made no progress and gbni-1's
@@ -570,11 +570,11 @@ What is deliberately left from the programme itself (all filed, none blocking):
 - writer-restart re-send (present-content skip);
 - journal compaction while busy (journal resets only when idle;
   `max_operation_journal_bytes` bounds it);
-- extent tables are 79% of the snapshot — a compact contiguous-extent
+- extent tables are 79% of the snapshot - a compact contiguous-extent
   encoding could roughly halve it; not a habit, an optimisation;
 - the 9 standing conflicts want a human (two different rips at one path).
 
-### Iteration 4 — writes before the mount went to the host disk (13:25 CEST, es-1)
+### Iteration 4: writes before the mount went to the host disk (13:25 CEST, es-1)
 
 es-1's 11:38 import restart began 25 s after the daemon; the mount comes up
 ~30 s after start, so rsync's generator walked the bare `/mnt/machamedia`
@@ -592,7 +592,7 @@ directory whose rsync exits non-zero. The operator removed the stray
 copies; es-1's daemon reported `mountpoint_stray_entries=1` until then and
 0 after, verified from the status API by the UI session on all three nodes.
 
-### Iteration 5 — "WAN control-lane starvation", measured (operator priority, 14:05–15:50 CEST)
+### Iteration 5: "WAN control-lane starvation", measured (operator priority, 14:05–15:50 CEST)
 
 Operator: "WAN control-lane starvation is paramount." The symptom on
 record: 195–284 s metadata mutations, `control RPC deadline exceeded`,
@@ -608,7 +608,7 @@ reconnect churn. Measured first, from both ends of the link:
 The link's queue was ~30 ms of the seconds. The rest was inside Macha,
 one layer at a time, each layer instrumented before it was changed:
 
-1. **0.32.7 — a remote retention claim is not a re-read.** The
+1. **0.32.7 - a remote retention claim is not a re-read.** The
    replica-side `retain_objects` handler still `valid()`-re-read every
    extent of every claimed file, serially, inside the writer's mutation;
    a quantum commit re-claims the whole file. Now `has()` with no DATA
@@ -618,19 +618,19 @@ one layer at a time, each layer instrumented before it was changed:
    fan-out ≤ 0.6 s everywhere; `retention_ms`/`publish_ms` on the mutate
    line and `mutation_*` in status showed the rest was the writer's own
    barrier (1 s steady, 4–15 s after restarts).
-2. **0.32.8 — the barrier fans out in parallel and names its phase.**
+2. **0.32.8 - the barrier fans out in parallel and names its phase.**
    Per-node claims concurrently; no 4 MB loader lease per id for an index
    lookup; `DATA retention barrier … scan_ms= short= fallback_claims=`.
-   `peer_latency_ms` samples heartbeat pings only — sampling every call
+   `peer_latency_ms` samples heartbeat pings only - sampling every call
    let payload/handler time make gbni-1 read its wireless neighbour at
    114 ms against 4 ms the other way (the operator confirmed gbni-2 is on
    flaky wifi: latency on this rig is directional by design).
-3. **0.32.9 — presence is remembered, not stat'ed.** The barrier line
+3. **0.32.9 - presence is remembered, not stat'ed.** The barrier line
    read `ids=3201 scan_ms=16048` then `scan_ms=261`: a cold-dentry `stat`
    per extent on the import-saturated disk, ~5 ms each. `LocalStore` now
    keeps an in-memory set of loose objects it installed or has seen. The
    whole barrier logs `decode/collect/catalogue/data/control` phases.
-4. **0.32.10 — CONTROL puts go together, to the nearest replica.** The
+4. **0.32.10 - CONTROL puts go together, to the nearest replica.** The
    phase line on both writers: `control_ms=4247–4546 control_objects=65`,
    all else < 30 ms. `retain_control` pushed the catalogue graph one
    object per round trip to candidates in NodeId order (65 × 65 ms across
@@ -645,7 +645,7 @@ cold-cache presence scan after each restart (2.6–8 s once per file).
 
 Also on record from this pass, not changed:
 - both writers run `min_write_replicas: 1`: a put is durable on one copy
-  and the second is background repair — the mechanism of finding #6, and
+  and the second is background repair - the mechanism of finding #6, and
   what "replicated" currently means at write time;
 - capacity placement gives the writer no guaranteed local copy of what it
   publishes;
@@ -656,7 +656,7 @@ Also on record from this pass, not changed:
   time, ≥ 5 min apart, after checking for playback activity, and three
   restarts were deferred by that check.
 
-## 0.32.17 deploy — the media profile answers with facts (2026-09-07 21:15–22:20)
+## 0.32.17 deploy: the media profile answers with facts (2026-09-07 21:15–22:20)
 
 Deployed to gbni-1 (staged tree built on gbni-2, relayed via the operator
 workstation because gbni-2 has no layer-3 path) and es-1 (built in place,
@@ -679,7 +679,7 @@ transcode_audio}` all true. `direct` and `remux` both copy hevc + eac3 at
 6 channels; `remux` with `audio: transcode` gives copy/hevc + aac stereo;
 `transcode` gives h264 + aac. A request with no mode is a 400. `operations`
 is computed on the answering node from that node's build against that
-file's streams — per node and per source, never cluster-wide.
+file's streams - per node and per source, never cluster-wide.
 
 The import wrapper took `rc=11` on both writers at the restart and retried
 into attempt 4 on its own; both rsyncs are running again.
@@ -690,7 +690,7 @@ gbni-2 is associated at −46 dBm with SSH working, but has no layer-3 path:
 it cannot reach the gateway, gbni-1, es-1 or the internet, and gbni-1
 cannot reach it either. An ARP flush did not recover it. Its catalogue is
 one item behind, `dd` of a film through its mount returns 0 bytes, and the
-profile endpoint answers `422 profile_failed — open media: Input/output
+profile endpoint answers `422 profile_failed - open media: Input/output
 error` for anything whose data is not already local.
 
 That answer is wrong in kind, not just in circumstance. "This node cannot
@@ -701,7 +701,7 @@ as a distinct retryable status, and keep `profile_failed` for a source that
 opened and would not parse. Deciding the status code and error name is an
 interface call, so it is held for the operator.
 
-## 0.32.19 / 0.33.0 — what a remux actually emits (2026-09-07 22:00–23:00)
+## 0.32.19 / 0.33.0: what a remux actually emits (2026-09-07 22:00–23:00)
 
 The client session asked for the emitted segments to be ffprobed rather
 than the 201 trusted. That found two faults in code that had passed every
@@ -734,14 +734,14 @@ codec change did not ask for a downmix.
 Enumerated against a live node before and after. Two were the damaging
 ones: `remux` with a re-encoded stream was accepted and reported back as a
 transcode, and `transcode` with both streams copied was accepted and
-reported back as a remux — so the reported mode was not evidence of
+reported back as a remux - so the reported mode was not evidence of
 anything, which is the ground several hours of client-side diagnosis stood
 on. `direct` silently ignored `max_height` and `max_bitrate`. After
 0.33.0: 0 disagreements on gbni-2 and es-1.
 
 Eliminated by measurement, for the Samsung investigation: we write `hvc1`,
 not `hev1` (init segment bytes, offset 457, no `hev1` present), and `ec-3`
-for E-AC-3. MPEG-TS emission works with both streams copied — HEVC Main 10
+for E-AC-3. MPEG-TS emission works with both streams copied - HEVC Main 10
 and E-AC-3 5.1 untouched, boundaries aligned with the fMP4 ones.
 
 **gbni-2 recovered by reboot.** Confirmed healthy afterwards: gateway,

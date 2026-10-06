@@ -1,4 +1,4 @@
-# Structural runtime remediation — first implementation checkpoint
+# Structural runtime remediation: first implementation checkpoint
 
 Status: local checkpoint complete; guarded UAT failed the retained-memory gate
 

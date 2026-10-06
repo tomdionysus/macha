@@ -5,7 +5,7 @@ Date: 2026-09-08
 Operator decision, taken after a design discussion the same day: transformed
 playback should serve a **complete VOD playlist immediately**, and make the
 wait for not-yet-produced media the server's problem, bounded and safe. The
-growing EVENT playlist is wanted eventually, but not now — a stable, fully
+growing EVENT playlist is wanted eventually, but not now - a stable, fully
 planned, bounded playlist comes first.
 
 ## Why, honestly
@@ -18,14 +18,14 @@ maximum of 5,506,272 ms on the exact session reported as broken; past-frontier
 seeks already work through `PATCH seek_ms`, and the failing measurement had
 set `video.currentTime` directly, bypassing the client's own seek path. A
 follow-up hypothesis that the observed `levelLoadError` was an hls.js
-`levelLoadingTimeOut` was also retracted — hls.js reports an expired deadline
+`levelLoadingTimeOut` was also retracted - hls.js reports an expired deadline
 as `levelLoadTimeOut`, a distinct value, and the log says `levelLoadError`.
 
 So none of the originally reported symptoms justify this change, and the
 record should not pretend otherwise. What justifies it is separate:
 
 - **It is the spec-correct form.** HLS VOD playlists are complete and closed.
-  Our duration is known — we probed it. `EVENT` is for live-to-VOD recording
+  Our duration is known - we probed it. `EVENT` is for live-to-VOD recording
   where the duration genuinely is not yet known.
 - **It is what comparable just-in-time servers do.** Plex, Jellyfin and Emby
   all compute a complete playlist from known runtime and segment length before
@@ -34,7 +34,7 @@ record should not pretend otherwise. What justifies it is separate:
 - **It removes the playlist poll.** With `ENDLIST` present, hls.js stops
   polling entirely: one fetch per session instead of hundreds. That removes a
   continuous stream of opportunities for a level-load failure to be read as
-  node health — the one part of the UI session's report that survives, and
+  node health - the one part of the UI session's report that survives, and
   which is still unexplained (a `levelLoadError` with no HTTP status on either
   side; every poll captured returned 200 and the node's journal recorded no
   404 or 503 all day).
@@ -46,7 +46,7 @@ record should not pretend otherwise. What justifies it is separate:
 What this change explicitly does **not** fix: the 43–47 s cold first segment
 on DTS/TrueHD sources. That is over every client timeout, so no amount of
 holding rescues it. It is tracked separately as its own P0 and is not a
-prerequisite for this work — but neither should this work be described as
+prerequisite for this work - but neither should this work be described as
 improving it.
 
 **Retracted 2026-09-08, after this plan shipped.** That 43–47 s figure was
@@ -56,7 +56,7 @@ with no server change, the same title's first segment is 3.5 s. There is no
 DTS/TrueHD decode problem, and the paragraph above should be read as a
 correctly-scoped disclaimer about a fault that turned out not to exist rather
 than as a description of one. The deadline reasoning it cites was separately
-wrong too — `fragLoadingTimeOut` is deprecated and inert; see phase 4.
+wrong too - `fragLoadingTimeOut` is deprecated and inert; see phase 4.
 
 ## What 0.36.0 already established
 
@@ -100,7 +100,7 @@ carried.
 
 `MediaSegmentStore::wait_object` currently returns immediately for any
 non-segment name (`if (!parsed) return object(name);`), so `init.mp4` would
-answer 404 the instant the playlist is served early — the client asks for it
+answer 404 the instant the playlist is served early - the client asks for it
 before the first `moof` has been written. Extend the wait to cover init
 publication so there is a single hold path for anything a client can request,
 rather than a special case per object kind.
@@ -117,7 +117,7 @@ a hold:
    authorised to reach and a request outside it is one nothing is working
    toward.
 2. **Per-session holds.** At most `streaming.max_session_holds` (default 2)
-   outstanding per session — one in flight plus one prefetch. This alone kills
+   outstanding per session - one in flight plus one prefetch. This alone kills
    the 0.32.14 scenario: a native player that queues thirty requests gets one
    hold and twenty-nine immediate refusals, instead of thirty sequential waits
    on the encoder.
@@ -130,8 +130,8 @@ request we refused to serve.
 
 ### Why the global budget exists, and what changes when the server goes async
 
-`HttpServer` uses a fixed worker pool — `catalogue.api.workers`, 16 on the
-cluster — shared by every route: Status, catalogue, manage and playback alike.
+`HttpServer` uses a fixed worker pool - `catalogue.api.workers`, 16 on the
+cluster - shared by every route: Status, catalogue, manage and playback alike.
 A held request occupies one of those workers for the whole of its wait. With
 `max_sessions: 8` and an 8-segment window, the unbounded worst case is 64 held
 requests against 16 workers, and a single deeply prefetching player can take
@@ -140,14 +140,14 @@ traffic, which is a direct governing-law-1 violation. This is very likely part
 of what the 98 s black screen actually was: not only the player waiting on the
 encoder, but the pool exhausted while it did.
 
-It is also the honest caveat on "this is what Plex and Jellyfin do". They do —
+It is also the honest caveat on "this is what Plex and Jellyfin do". They do -
 on async runtimes, where a held request costs a continuation and not a thread.
 Ours costs a thread. The pattern is right; our runtime does not give it away.
 
 **Build it so async is an improvement, not a rewrite.** The rule is that a
 hold must be an *explicitly admitted resource*, acquired before waiting and
 released after, in the shape `DataResourceArbiter` credit and
-`RetainedMemoryLedger` leases already use here — never an implicit consequence
+`RetainedMemoryLedger` leases already use here - never an implicit consequence
 of a thread happening to block. Then:
 
 - the admission policy above is pure and unchanged under async;
@@ -166,13 +166,13 @@ a 16-thread pool. Under async the constraint becomes memory and fairness, and
 the natural value is much larger. That is the main reason the default is
 conservative today, and steady-state playback on a 4-core node transcoding at
 roughly real time will sit at the frontier often, so holds are the normal case
-rather than the exception — this cap will bind in ordinary use, and going
+rather than the exception - this cap will bind in ordinary use, and going
 async is what lifts it.
 
 ### The refusal
 
-- **Not `404`.** The resource is not absent — the playlist promises it exists
-  — it is not ready. 404 invites an intermediary to cache it and some players
+- **Not `404`.** The resource is not absent - the playlist promises it exists
+  - it is not ready. 404 invites an intermediary to cache it and some players
   treat it as terminal.
 - `Retry-After: 1` and `Cache-Control: no-store`.
 - A distinct error code (`segment_not_ready`) from the existing
@@ -184,7 +184,7 @@ the refusal was `503`. It is **`500 segment_not_ready`**, and `stream_failed`
 keeps `503`. Two findings from the client sessions forced it, in order.
 
 First, the code cannot be read where it matters. hls.js's `XhrLoader` surfaces
-a failed fragment as `{code: xhr.status, text: xhr.statusText}` — the JSON body
+a failed fragment as `{code: xhr.status, text: xhr.statusText}` - the JSON body
 is absent from the error event and `response.data` is `undefined`. A header is
 no better: reachable only through `networkDetails`, the raw `XMLHttpRequest`,
 which is undocumented coupling that breaks outright if the default loader ever
@@ -194,21 +194,21 @@ the one field every loader reports identically.
 Second, given that, `503` is the wrong status to carry "hold". Every proxy,
 tunnel and load balancer emits `503` when a service is genuinely down. A client
 taught that `503` means "not made yet, stay on this node" reads a dead node as
-a healthy one and never fails over — silent, not self-correcting, and hardest
+a healthy one and never fails over - silent, not self-correcting, and hardest
 to diagnose precisely where an intermediary makes it most likely. The inverse
 error, misreading an infrastructure `500` as a hold, costs one pointless retry.
 The faults are not symmetric. `500` is origin-generated in practice, so it is
 the status nothing else on the path emits.
 
-Checked rather than assumed: nothing currently fronts the nodes — all three
-serve `:7438` directly — but haproxy is installed and running on es-1, the
+Checked rather than assumed: nothing currently fronts the nodes - all three
+serve `:7438` directly - but haproxy is installed and running on es-1, the
 WAN-facing node, with a stock config and no bound frontends. The hazard is one
 configuration change away rather than hypothetical.
 
 Both statuses stay in 5xx deliberately: hls.js's `retryForHttpStatus()` returns
 false for 4xx and status 0, so a 4xx would stop its retries outright. And
-`Retry-After` is inert on the fragment path — hls.js reads that header only in
-its content-steering loader, on 429 — so it is sent because it is correct HTTP,
+`Retry-After` is inert on the fragment path - hls.js reads that header only in
+its content-steering loader, on 429 - so it is sent because it is correct HTTP,
 not because the design depends on it.
 
 ## Client contract change
@@ -217,7 +217,7 @@ The four client sessions (UI, `@machafoundation/core` NPM package, React Native,
 must expect:
 
 - the media playlist arrives complete with `ENDLIST` on first fetch and does
-  not change afterwards — no polling required or useful;
+  not change afterwards - no polling required or useful;
 - a fragment or init request may answer `503 segment_not_ready` with
   `Retry-After`, meaning "not yet, retry", and this must **not** be weighed as
   node health or count toward failover;
@@ -268,7 +268,7 @@ default.
 - [x] **5. Rewrite the three EVENT regressions.** `test_media_playlist_waits_
   for_the_first_fragment`, `test_media_segment_store_backpressure_and_spill`
   and `test_segment_store_mpegts_mode_has_no_init_and_ts_names` currently
-  assert the 0.32.14 contract. They are not deleted — they are re-expressed
+  assert the 0.32.14 contract. They are not deleted - they are re-expressed
   against the mechanism that now guards the same incident: a deeply
   prefetching client must not be able to occupy the node.
 - [x] **6. Full suite plus `test_transcode_timeline.cpp`, then deploy all
@@ -296,7 +296,7 @@ default.
   cannot be written until the fragment is complete, so there is no meaningful
   prefix to send early. The standard answer is smaller independently
   deliverable parts, which is a feature rather than a refactor. The seam is
-  fine — `HttpBodySource` already exists — but do not plan on partial delivery
+  fine - `HttpBodySource` already exists - but do not plan on partial delivery
   of a single fMP4 fragment.
 - **Async `HttpServer`.** See the note above; wanted, not now. **2026-09-15:**
   now planned as

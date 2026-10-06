@@ -2,8 +2,8 @@
 
 Date: 2026-09-21, the afternoon of the 0.48.0 cutover
 
-Status: **Analysis. No code changed.** Four client sessions — core, web,
-Android TV and mobile — smoke-tested the live cluster within hours of the
+Status: **Analysis. No code changed.** Four client sessions - core, web,
+Android TV and mobile - smoke-tested the live cluster within hours of the
 deploy and reported sixteen findings between them. This deduplicates them,
 separates what is ours from what is not, and analyses the three that are real.
 
@@ -47,7 +47,7 @@ of which method=POST (create)       : 0
 ```
 
 Every client saw it and every client described it as a seek problem, which is
-correct but incomplete — a large seek *is* a `PATCH`. What none of them could
+correct but incomplete - a large seek *is* a `PATCH`. What none of them could
 see is that **creation never fails this way.** A cold pipeline built from
 nothing, on the same node, from the same WAN-fetched bytes, makes its first
 fragment inside the 15 s budget. A pipeline built to replace a running one
@@ -69,7 +69,7 @@ try {
 ```
 
 The comment is explicit that a handover window exists in which both pipelines
-are alive. That is deliberate and it is right — the old generation must keep
+are alive. That is deliberate and it is right - the old generation must keep
 serving until the new one can, or a seek would tear the picture down. But it
 means **the replacement's first fragment is produced while the outgoing
 pipeline is still holding decoder threads, retained memory and, on fi-1, the
@@ -80,19 +80,19 @@ reads from local disk and wins its race easily. On fi-1, which owns nothing
 (`hosts_extents: false`), *both* pipelines pull 4 MiB stripes across the WAN at
 a measured 772-3431 ms each. The startup budget is 15 s. Two pipelines
 competing for one WAN link, with one of them seeking to a cold position, is
-enough to miss it — and the evidence says it misses it reliably.
+enough to miss it - and the evidence says it misses it reliably.
 
 **Confidence.** The 8/8 PATCH split is measured and is not an artefact: the
 same node served 18 successful creates in the last 30 minutes alone. The
 contention mechanism is inferred from the code and the WAN timings, not
 instrumented. The way to settle it is a PATCH seek on es-1 or gbni-1, which own
-their extents — if the timeout is WAN contention it should not reproduce there.
+their extents - if the timeout is WAN contention it should not reproduce there.
 **That experiment has not been run** and it is the first thing to do.
 
 **Why it is not simply "raise `startup_timeout_ms` on fi-1".** That treats the
 symptom and it makes the viewer wait longer before being told the same thing.
 The interesting question is whether the outgoing pipeline should be draining
-WAN bandwidth at all once its replacement is committed — governing law 2 says
+WAN bandwidth at all once its replacement is committed - governing law 2 says
 do not make the viewer wait, and here the viewer is waiting behind a generation
 they have already abandoned.
 
@@ -121,13 +121,13 @@ half an hour.
 
 **The part that is genuinely ours to answer.** A physical pipeline is reclaimed
 after `pipeline_idle_ms`, 60 seconds, precisely because no stream request has
-arrived — the server has already concluded the session is not being watched.
+arrived - the server has already concluded the session is not being watched.
 That same evidence is not permitted to release the transcode entitlement, which
 survives it by a factor of thirty. The documented contract
 (`docs/streaming.md`) says a logical session keeps its entitlement "through
 Direct/Remux/Transcode changes and physical idle-pipeline reclamation, then
 releases it exactly once on DELETE or session expiry", and the reason is sound
-— an entitlement that evaporated on reclamation would make resume-after-pause
+- an entitlement that evaporated on reclamation would make resume-after-pause
 fail against a busy node. But on a node admitting **one** transcode, the cost
 of that guarantee is the whole node.
 
@@ -154,10 +154,10 @@ full"* can state the per-account number and cannot state the other.
 
 Already filed; the web client sharpened it and asked a direct question.
 
-The asymmetry, stated once: the **account**-scoped refusal — where walking is
-pointless, since every node answers identically — carries full axes, states
+The asymmetry, stated once: the **account**-scoped refusal - where walking is
+pointless, since every node answers identically - carries full axes, states
 limit and live count, and publishes its limit for every node. The
-**node**-scoped refusal — the one case where walking is right — carries no axes
+**node**-scoped refusal - the one case where walking is right - carries no axes
 at all and its limit is on no payload anywhere.
 
 **The web client's question, which needs the operator:** should the refusal
@@ -167,7 +167,7 @@ walks on update, so a viewer's explicit mode choice is silently not applied.
 
 A proposed answer, not yet decided: **yes, and the difference is real.** On
 create, "this node cannot" means try another node. On update the session
-*lives* on this node, so walking means abandoning it and rebuilding elsewhere —
+*lives* on this node, so walking means abandoning it and rebuilding elsewhere -
 a failover, not a retry. The useful alternative on the update path is a
 different *instruction* against the same node: remux rather than transcode, a
 lower height. So the update-path refusal wants `alternative_may_succeed: true`
@@ -190,7 +190,7 @@ just the example config.
 
 **The account cap disables itself silently.** It is enforced inside
 `if (config.max_sessions_per_account)`, so unset or zero means the refusal
-never fires — and a node that never refuses is indistinguishable from a client
+never fires - and a node that never refuses is indistinguishable from a client
 that handles the refusal correctly. A cap test can pass having tested nothing.
 All three live nodes carry `32` explicitly, verified against the pre-change
 backups, so the cap phase is not affected.
@@ -214,7 +214,7 @@ to be corrected *to them*.
 Four things, from independent sessions, and they cover most of what 0.48.0
 changed:
 
-- **`410 generation_superseded` is classified correctly** by the web client —
+- **`410 generation_superseded` is classified correctly** by the web client -
   no cluster walk, no node marked, classification via
   `playbackFailureKindForStatus` rather than a status list.
 - **The create-path walk works.** Mobile had a create refused by fi-1 with
@@ -222,7 +222,7 @@ changed:
   correct, no healthy node charged.
 - **The transcode limit refuses cleanly**, reaching the viewer as a readable
   sentence without tearing playback down.
-- **All three nodes serve 0.48.0 and TEL3 is on the wire** — the new per-node
+- **All three nodes serve 0.48.0 and TEL3 is on the wire** - the new per-node
   playback fields were read back off `GET /api/v1/status` by Android TV, which
   is the field-level proof the cutover did not take.
 
@@ -232,7 +232,7 @@ changed:
    "supersession is too expensive" from "fi-1 cannot do this over the WAN".
    Everything about finding 1 depends on the answer and nothing should be
    changed before it.
-2. **Decide the entitlement question** in finding 2 — should reclamation
+2. **Decide the entitlement question** in finding 2 - should reclamation
    release a transcode entitlement when the node is at its limit?
 3. **Decide the create/update axes question** in finding 4; the web client is
    waiting on it.

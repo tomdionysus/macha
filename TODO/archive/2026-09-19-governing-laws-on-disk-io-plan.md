@@ -21,8 +21,8 @@ does not enter this object"*, and `DataWorkContext` (`:20`) says *"CONTROL
 deliberately remains outside this pool on its independently reserved
 transport/executors."*
 
-That reasoning is sound for every resource the arbiter actually models — queue
-slots, worker threads, bytes in flight — and false for the one it does not.
+That reasoning is sound for every resource the arbiter actually models - queue
+slots, worker threads, bytes in flight - and false for the one it does not.
 Keeping control out of a pool protects control **only when the pool is the
 contended resource.** The disk is contended, is shared by every class, and is
 modelled nowhere. Control is not protected by exclusion from the arbiter; it is
@@ -34,9 +34,9 @@ Two corollaries worth stating plainly, because both were assumed otherwise:
   `data_viewer_reserve_bytes` (32 M) bound how many bytes are in flight. A node
   can sit inside both and have a disk queue seconds deep. Adding a
   `data_control_reserve_bytes` would do nothing at all, because control never
-  takes a lease — that is the wrong shape and should not be built.
+  takes a lease - that is the wrong shape and should not be built.
 - **A concurrency ceiling is not a throughput bound.**
-  `background_concurrency` resolves to `max(1, nproc/2)` — two on this node.
+  `background_concurrency` resolves to `max(1, nproc/2)` - two on this node.
   Two concurrent extent writes are sufficient to saturate the disk.
 
 ## The primitive that does not exist
@@ -75,14 +75,14 @@ route answered in 3.3 ms while the sdb1 route took 7.8 seconds, in the same
 window.
 
 So this is **not** worker starvation, **not** lane contention, and **not** the
-reactor — 0.43.0 already closed those, and five days of zero `reactor stall`
+reactor - 0.43.0 already closed those, and five days of zero `reactor stall`
 lines plus these numbers confirm it. It is contention for one physical device,
 between loader writes and interactive reads, with nothing arbitrating.
 
 **Law 1 is already enforced everywhere it can be**, because control touches no
 disk. The law that is broken is **law 2**, on the DATA backend.
 
-## Stage 1 — Law 2: an interactive read does not queue behind a bulk write
+## Stage 1: Law 2: an interactive read does not queue behind a bulk write
 
 **Rule: loader and speculative writes yield the DATA backend to reads a person
 is waiting for. No other class of work may be the reason a viewer's read
@@ -103,7 +103,7 @@ waits.**
   classes are never gated by pressure: if the disk is slow, they get all of it.
 - The existing `data_viewer_reserve_bytes` stays. It reserves viewer *bytes* at
   admission; this reserves viewer *latency* at the device. They compose, and
-  neither substitutes for the other — a viewer holding byte credit still queued
+  neither substitutes for the other - a viewer holding byte credit still queued
   behind a 17-second write, which is the whole finding.
 
 Config, under `dht:` beside the existing data knobs:
@@ -116,7 +116,7 @@ dht:
 ```
 
 **Acceptance.** Re-run the 8 GB ingest with the harness probing a route that
-reads the DATA backend — artwork, a playback segment, or `manage/unmatched`,
+reads the DATA backend - artwork, a playback segment, or `manage/unmatched`,
 all three of which aborted on 2026-09-19. That route's p99 stays under 250 ms
 and no request exceeds 1 s, with zero `CD--` terminations, for the whole
 ingest. The ingest still completes, at reduced throughput. Control and the
@@ -125,10 +125,10 @@ NVMe-backed data route must not regress from the figures in the table above.
 **The acceptance probe needs credentials** and the harness does not have them:
 `anonymous` holds no roles, so every DATA-backed route it could reach is a 403.
 Either a probe account with `media_viewer`, or a signed artwork URL, has to be
-supplied before this stage can be proved. The `web.root` probe cannot do it —
+supplied before this stage can be proved. The `web.root` probe cannot do it -
 being on the other disk is exactly what made it useful here.
 
-## Stage 2 — Law 2: the viewer keeps its service time
+## Stage 2: Law 2: the viewer keeps its service time
 
 **Rule: no other class may be the reason a viewer waits on the disk.**
 
@@ -142,8 +142,8 @@ session `PATCH` are in the `CD--` list beside the control routes.
   (`waiting_viewers_ > 0` or any viewer lease is live).
 - Viewer work itself is never gated by pressure. If the disk is slow, the
   viewer gets all of it.
-- The existing byte reserve stays. It solves a different problem — admission
-  when the budget is full — and the two compose.
+- The existing byte reserve stays. It solves a different problem - admission
+  when the budget is full - and the two compose.
 
 **Acceptance.** With one transcode session and a concurrent ingest, viewer
 extent reads hold p95 under a stated bound and `viewer_waits` does not rise
@@ -151,7 +151,7 @@ with ingest depth. The bounded-exceptions contract in `docs/streaming.md`
 still holds: the only waits a viewer sees are its own frontier and its own
 holds.
 
-## Stage 3 — Law 3: the loader is bounded, never stopped
+## Stage 3: Law 3: the loader is bounded, never stopped
 
 **Rule: loader work yields, and keeps going. "Not yet" must not become
 "forever".**
@@ -174,7 +174,7 @@ is a wedge, and a node that never finishes an ingest is a different outage.
 consumed by pacing. A node under maximum pressure still retires spool bytes at
 a measurable non-zero rate.
 
-## Stage 4 — Make it legible
+## Stage 4: Make it legible
 
 Nothing above is trustworthy if an operator cannot see it working.
 
@@ -183,7 +183,7 @@ Nothing above is trustworthy if an operator cannot see it working.
   `speculative_admissions_paced`.
 - One `INFO` line per pressure-state transition, naming the observed and
   target service time. Transition-only, following the
-  `metadata availability changed` precedent — never per-decision.
+  `metadata availability changed` precedent - never per-decision.
 - Document in `docs/configuration.md` beside the existing reserves, and in
   `docs/operations.md` as the law-1 mechanism on disk. The
   [governing laws](../../ARCHITECTURE.md#governing-laws) table gains its fourth

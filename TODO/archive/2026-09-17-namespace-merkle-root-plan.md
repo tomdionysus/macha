@@ -28,12 +28,12 @@ commit re-serialises and re-hashes the library, and nothing can be demand-loaded
 because the whole structure must be materialised to produce the hash.
 
 This is the first thing, ahead of the existing P0 list, because it is not a
-defect in a feature — it is the storage model failing its own scale target.
+defect in a feature - it is the storage model failing its own scale target.
 
 ## How this was found
 
 It was not looked for. The session began with "do the AV libraries Macha uses
-offer a cropdetect function?" — a small feature question about auto-detecting
+offer a cropdetect function?" - a small feature question about auto-detecting
 letterbox bars. That went: cropdetect lives in libavfilter, which Macha does not
 link; the cost is decode, not the filter; keyframe-only sampling makes the cost
 trivial; the result belongs in the catalogue media profile; storing it means
@@ -53,8 +53,8 @@ the corrections matter:
 - The catalogue was described as "one blob" whose backfill would write ~4 GB. It
   is sharded 64 ways (`src/catalogue.cpp:20`), shards are content-addressed, and
   `commit` replicates only shards whose id changed (`:1070-1071`). The figure was
-  wrong by roughly 64x. The real catalogue cost is CPU — a full re-shard,
-  re-encode and re-hash per mutation — not replication bytes.
+  wrong by roughly 64x. The real catalogue cost is CPU - a full re-shard,
+  re-encode and re-hash per mutation - not replication bytes.
 - The namespace residency estimate (~1 GB at 10,000 files) was correct and was
   then retracted as overreach, on the strength of the `SharedBytes` comment at
   `src/metadata.hpp:129-133` scoping the design at "hundreds of megabytes". The
@@ -82,7 +82,7 @@ cursors across scheduler slices; they never rebuild complete object vectors"
 (`src/distributed_store.hpp:238-241`).
 
 And yet `maintenance_objects_cached` (`src/filesystem.cpp:2392-2455`) still
-builds the complete live-object vector that `repair_step` is handed — walking
+builds the complete live-object vector that `repair_step` is handed - walking
 every entry, pushing every non-hole extent id into a `std::vector<ObjectId>`,
 then sorting and deduplicating it. The iteration was fixed; the input was not.
 At 100 TB that vector is ~26 million ids, roughly **840 MB, transient, on a
@@ -105,7 +105,7 @@ resident. `MetadataManager` separately caches the **decoded** form and hands it
 out as `MetadataSnapshotView::snapshot`.
 
 `MetadataSnapshot::entries` is `std::map<std::string, FsEntry>` over the whole
-namespace (`src/metadata.hpp:110`). There is no partitioning anywhere — no
+namespace (`src/metadata.hpp:110`). There is no partitioning anywhere - no
 per-node subset, no shard. The config comment is explicit: "Every node is
 metadata-capable; this is a write durability floor, not a voter count or
 convergence target." The edge node confirms it is deliberate: fi-1 runs
@@ -141,7 +141,7 @@ instinct was right and hit the wall of the data structure.
 
 ### A single file write costs several full traversals
 
-Every namespace write path goes through `mutate_delta` — `commit_file`
+Every namespace write path goes through `mutate_delta` - `commit_file`
 (`src/filesystem.cpp:2250`) and `apply_namespace_batch` (`:1815`, behind
 mkdir/rmdir/create/unlink/rename/chmod/chown/utimens). `mutate_delta`
 (`src/metadata_manager.cpp:1872-1878`) calls `mutate_impl` with
@@ -152,13 +152,13 @@ Per mutation, in `mutate_impl` (`src/metadata_manager.cpp:1622`):
 | Step | Site | Cost |
 |---|---|---|
 | `decode_snapshot(current.payload)` | `:1669` | full parse, full allocation |
-| `before.emplace(snapshot)` | `:1698-1700` | **skipped** — `exact_delta` is true on every namespace write |
+| `before.emplace(snapshot)` | `:1698-1700` | **skipped** - `exact_delta` is true on every namespace write |
 | `encode_snapshot` | commit tail | full serialise |
 | `metadata_hash` | `src/metadata.cpp:1334` | full SHA-256 over the payload |
 | `decoded_cache_->entries != decoded->entries` | `src/metadata_manager.cpp:228` | full element-wise compare of every entry and extent vector |
 
 Four full traversals per file write. The `before` copy is already avoided on the
-paths that matter — an earlier draft of this plan listed removing it as a win
+paths that matter - an earlier draft of this plan listed removing it as a win
 and that was wrong.
 
 The comparison at `:228` is load-bearing, not incidental: a catalogue-only
@@ -170,7 +170,7 @@ The delta machinery, by contrast, is already the right shape and shows the
 intended direction. `record_entry_change` (`src/metadata.cpp:483-501`) detects
 the pure-append case and ships only the new extents rather than the whole entry;
 `apply_metadata_delta_in_place` (`:1242`) applies without rebuilding. Ship the
-change, not the state — already established, just not for the snapshot itself.
+change, not the state - already established, just not for the snapshot itself.
 
 ## The arithmetic
 
@@ -178,7 +178,7 @@ From `snapshot_resident_bytes`' own accounting rules (`src/metadata.cpp:55-91`),
 so these are the numbers the code itself would report.
 
 `account_map_nodes` (`:37-43`) charges `sizeof(value_type) + 4*sizeof(void*)` per
-entry — the comment is careful about this: "Standard tree implementations
+entry - the comment is careful about this: "Standard tree implementations
 allocate one node per value. Four pointers covers parent/children plus
 allocator/alignment bookkeeping without pretending that
 `sizeof(map::value_type)` describes the allocation." For
@@ -205,13 +205,13 @@ so **~100 bytes per file**.
 | 8 GB (film-heavy) | 160 TB | ~2.2 GB | ~4.2 GB |
 
 At ~14 MB per TB, **one decoded snapshot fills the entire 128 MiB materialisation
-budget at about 9 TB of library** — roughly 1,800 films. Far below the target.
+budget at about 9 TB of library** - roughly 1,800 films. Far below the target.
 
 Caveats: struct sizes are derived from the declarations and should be confirmed
 against `sizeof` on the actual build (Pi is 64-bit ARM, same layout expected, but
 check). `capacity()` may exceed `size()` on the extent vectors after growth,
 moving the real number up rather than down. And whether the head is exempt from
-LRU eviction was not established by reading — `MetadataReplicaDiagnostics`
+LRU eviction was not established by reading - `MetadataReplicaDiagnostics`
 (`src/metadata.hpp:415-431`) already exposes
 `materialization_cache_hits`/`misses`/`evictions`/`bytes`/`limit_bytes`, so a node
 with a real library answers it in one request. Do that before sizing anything.
@@ -254,7 +254,7 @@ needs, including its bug:
 
 That is a one-level Merkle structure with dirty-node detection, shipped and
 working. Its defect is that it re-shards and re-encodes *everything* to discover
-which one shard changed — O(catalogue) per mutation to find an O(1) change. The
+which one shard changed - O(catalogue) per mutation to find an O(1) change. The
 namespace wants this structure, deeper, with the change set carried in rather
 than rediscovered.
 
@@ -263,20 +263,20 @@ Concretely: the record payload becomes the non-entry fields plus a
 control store, keyed by path. Consequences:
 
 - `metadata_hash` over a few hundred bytes instead of a gigabyte
-- a commit updates one path-to-root chain — O(log n) per changed path
+- a commit updates one path-to-root chain - O(log n) per changed path
 - `metadata_namespace_signature` (`:4587-4611`) becomes a root comparison, and so
   does `cache_record`'s `entries != entries` witness (`src/metadata_manager.cpp:228`)
 - the journal and `history.log` stop carrying namespace-sized payloads
 - nothing forces materialisation, so demand-loading becomes possible rather than
   being a separate project
 - extent lists become their own nodes, fetched when a file is opened and not
-  otherwise — which is the whole of the residency problem, since extents are
+  otherwise - which is the whole of the residency problem, since extents are
   needed only for reading content and for `file_media_id`
 
 Point lookups (`getattr`, `src/filesystem.cpp:1612-1621`) and prefix scans
 (`readdir`, `:1622-1644`) read stat data and never touch `entry.extents`. A
 resident stat-only cache keeps the FUSE hot path entirely in memory, so "as fast
-as it is now" is not a target to hit — it is unchanged.
+as it is now" is not a target to hit - it is unchanged.
 
 ## Stage A results (measured 2026-09-17)
 
@@ -379,7 +379,7 @@ not a target-scale one.
 Raised by the operator on 2026-09-21 while reviewing an unrelated codec change;
 the numbers below are Stage A's, not new measurements.
 
-`MetadataRecord::payload` is a `SharedBytes` (`src/metadata.hpp:134-160`) — a
+`MetadataRecord::payload` is a `SharedBytes` (`src/metadata.hpp:134-160`) - a
 `shared_ptr<const Bytes>` over immutable backing storage, existing precisely so
 that copying a record does not duplicate "hundreds of megabytes on large media
 namespaces". Then `MetadataManager` holds `cache_`, the record with its payload,
@@ -387,14 +387,14 @@ namespaces". Then `MetadataManager` holds `cache_`, the record with its payload,
 (`src/metadata_manager.cpp:224-229`).
 
 Stage A measured what that costs: at 1.618 TiB of library one materialisation
-is **47 MB — 26 MB decoded plus a 21 MB encoded payload resident alongside
+is **47 MB - 26 MB decoded plus a 21 MB encoded payload resident alongside
 it**, 97% of it extent references. The decoded form owns copies of bytes that
 are already resident, already refcounted and already immutable three fields
 away in the same object.
 
 **The boundary is drawn in the wrong place.** Today it is "bytes in, owned
-objects out". But a metadata record is immutable and content-addressed — its
-identity *is* the SHA-256 over those exact bytes — so the bytes are the
+objects out". But a metadata record is immutable and content-addressed - its
+identity *is* the SHA-256 over those exact bytes - so the bytes are the
 authoritative resident form. The natural boundary is **"a record owns its
 bytes; a decoded view is a projection over them"**, with lifetime held by the
 existing `SharedBytes` refcount rather than by copying. The anchor this needs
@@ -413,7 +413,7 @@ What makes it genuinely hard, recorded so it is not underestimated:
   from a payload: every mutation builds new ones, so a snapshot becomes a
   mixture of borrowed and owned keys and something has to own that distinction.
 - **`mutate_delta` rebases.** A view over payload *N* must survive becoming
-  payload *N+1*, or be rebuilt — and rebuilding per commit is the cost this
+  payload *N+1*, or be rebuilt - and rebuilding per commit is the cost this
   plan exists to remove.
 - **The keepalive becomes load-bearing.** The payload is retained incidentally
   today. Under borrowing it is retained *because something points into it*, so
@@ -428,7 +428,7 @@ What makes it genuinely hard, recorded so it is not underestimated:
 
 ## Stages
 
-**Stage A — establish the real numbers. DONE 2026-09-17. See "Stage A results".**
+**Stage A - establish the real numbers. DONE 2026-09-17. See "Stage A results".**
 
 ## Stage B progress (2026-09-17)
 
@@ -480,8 +480,8 @@ Asked directly by the operator, and worth answering in numbers rather than by
 repeating the headline ratio.
 
 **First, what has actually been gained so far: almost nothing, and it is
-important not to pretend otherwise.** The tree is unreachable — nothing in the
-running system writes to it or reads from it — so no viewer and no node has
+important not to pretend otherwise.** The tree is unreachable - nothing in the
+running system writes to it or reads from it - so no viewer and no node has
 benefited from Stage B. The 2,096x is a *projection*: it measures what a commit
 would cost if Stage C rewired the commit path, on a structure nothing yet
 commits to. It is trustworthy as a projection because it was measured against
@@ -504,7 +504,7 @@ decoded (21 MB encoded against 26 MB decoded at 1.618 TiB). Extrapolated:
 
 At target, touching one file re-serialises and re-hashes **1.25 GB** and ships
 it to two peers. On Pi-class hardware that is seconds of CPU and gigabytes of
-network **per file touched**. That is not slow, it is inoperable — which is why
+network **per file touched**. That is not slow, it is inoperable - which is why
 this sits at P-1 rather than among the performance items, and why no amount of
 tuning reaches it: the record payload *is* the namespace and its identity is a
 hash over those bytes.
@@ -521,7 +521,7 @@ ingest, today, on hardware that browns out under load.
 
 ### The cost worth pricing is blast radius, not hours
 
-Stage B's remainder — SM14 and the stat-only path — is small and safe, because
+Stage B's remainder - SM14 and the stat-only path - is small and safe, because
 it stays dead code until something points at it. **Stage C is the dangerous
 one.** It turns `metadata_namespace_signature` and `cache_record`'s
 `entries != entries` witness (`src/metadata_manager.cpp:228`) into root
@@ -531,19 +531,19 @@ which is precisely the failure that produced the 2026-09-06 quarantines.
 **Stage C should therefore get the treatment the seek contract got: the
 invariant written down as a contract before any code is changed**, and
 history-independence tested adversarially rather than assumed. Today supplied
-the argument for that — six tests over generated namespaces missed a
+the argument for that - six tests over generated namespaces missed a
 1-in-65,536 condition that the real head hit on the first attempt.
 
 ### The measurement that sharpens this, now taken (2026-09-21)
 
 **56.2 ms of CPU per namespace write, on es-1, measured against the live
-head** — `encode_snapshot` 41.4 ms plus SHA-256 14.7 ms over 22,525,100 bytes,
+head** - `encode_snapshot` 41.4 ms plus SHA-256 14.7 ms over 22,525,100 bytes,
 via `macha-metadata-dump --tree`. It is a **floor**: it excludes the
 `decode_snapshot` on the way in, the element-wise `entries != entries`
 comparison, and replicating the result to two peers.
 
-Against the thresholds set before it was taken — 200 ms would mean a
-present-tense problem, 20 ms a pure investment — **56 ms lands in between, and
+Against the thresholds set before it was taken - 200 ms would mean a
+present-tense problem, 20 ms a pure investment - **56 ms lands in between, and
 the honest reading is nearer the second.** One interactive write costing 56 ms
 of CPU is not something a viewer or an operator will notice.
 
@@ -578,13 +578,13 @@ nothing is written to the record, the history or the control store.
 | tree | 3,865 nodes, 19,924,256 bytes, 169 leaves, 10 branches, 3,963 extent nodes, depth 4 |
 | largest node | 50,184 bytes |
 | **one mtime change, median file (16 extents)** | **4 nodes rewritten, 10,745 bytes** |
-| **the same write today** | **22,525,100 bytes — the whole namespace, re-serialised and re-hashed** |
+| **the same write today** | **22,525,100 bytes - the whole namespace, re-serialised and re-hashed** |
 
 **That is the number the plan turns on: 10,745 bytes against 22,525,100, a
 2,096x reduction for one ordinary write**, on a namespace of 1.6 TiB. The
-generated figures in "Stage B progress" above predicted the shape correctly —
+generated figures in "Stage B progress" above predicted the shape correctly -
 largest node under 64 KB (50,184 measured), a handful of nodes per change (4
-measured against "<= 12") — so nothing about the design needed revisiting.
+measured against "<= 12") - so nothing about the design needed revisiting.
 
 **The build threw on the real namespace first time, and the bug was real.**
 
@@ -593,14 +593,14 @@ namespace tree spine made no progress: level=1 keyed=0 children=2 parents=2 targ
 ```
 
 An **extent** spine with exactly two chunks whose two content addresses both hit
-a 1-in-256 boundary — a 1-in-65,536 event per multi-chunk file, which across
+a 1-in-256 boundary - a 1-in-65,536 event per multi-chunk file, which across
 4,808 entries is unremarkable. Six tests on generated namespaces never produced
 it. The guard treated "this level made no reduction" as "this would loop
 forever" and aborted.
 
 It would not have looped: each level hashes different bytes, so the next one
 reduces with probability 1 - (1/target)^n. But "terminates almost surely" is
-not a guarantee, so the fix makes progress unconditional instead — a level that
+not a guarantee, so the fix makes progress unconditional instead - a level that
 fails to reduce is rebuilt ignoring the boundary test and packing by the count
 cap, which takes n children to at most ceil(n/maximum) < n parents for n >= 2.
 
@@ -619,10 +619,10 @@ What Stage B still owed at that point -- **the SM14 record shape and
 `decode_snapshot` dispatch alongside SM13** -- is done, and has its own section
 below. The other three were already done:
 
-- ~~a fuzz case~~ — `test_a_corrupt_node_is_refused_rather_than_trusted`, which
+- ~~a fuzz case~~ - `test_a_corrupt_node_is_refused_rather_than_trusted`, which
   flips a bit at every seventh byte of every node and requires the reader to
   refuse or cope rather than crash or hang.
-- ~~a stat-only read path that provably fetches no extent nodes~~ —
+- ~~a stat-only read path that provably fetches no extent nodes~~ -
   `namespace_tree_lookup(..., with_extents = false)`, proved by counting reads
   through the store rather than asserted:
   `test_a_stat_only_lookup_fetches_no_extent_nodes` builds 200 films with
@@ -636,7 +636,7 @@ below. The other three were already done:
   leaf of 32 films that is dozens of node reads to answer a `getattr` that
   needs none. The decision is now made after the key is parsed, so a scan pays
   nothing for the entries it discards.
-- ~~the `macha-metadata-dump` mode~~ — `--tree`, and the figures above are off
+- ~~the `macha-metadata-dump` mode~~ - `--tree`, and the figures above are off
   the live head.
 
 ## Stage B: the SM14 record shape (2026-09-21)
@@ -710,7 +710,7 @@ that does not know the magic refuses the payload as `bad snapshot`. The cluster
 can run this build and never produce one. Making it authoritative is Stage C,
 and the migration that cuts over is Stage E.
 
-**Stage B — the Merkle namespace, behind a new snapshot version.** Define the
+**Stage B - the Merkle namespace, behind a new snapshot version.** Define the
 tree, node encoding and root. `decode_snapshot` already carries SM5 through SM13
 (`src/metadata.cpp:643-656`), `encode_snapshot_v7`/`v8` (`:283-345`) exist
 specifically to reproduce historical byte-exact encodings for journal replay, and
@@ -825,18 +825,18 @@ What Stage C still owes:
   like the write floor, or nothing until the migration itself -- is still open
   and belongs with Stage E rather than here.
 
-**Stage C — the commit path.** `mutate_impl` stops decoding the whole snapshot,
+**Stage C - the commit path.** `mutate_impl` stops decoding the whole snapshot,
 mutates the tree, updates the root. `apply_metadata_delta_in_place` becomes a
 tree operation. The change set is carried into the commit rather than
-rediscovered — the mistake the catalogue's `commit` makes, not repeated.
+rediscovered - the mistake the catalogue's `commit` makes, not repeated.
 `WriteHandle` already demonstrates the habit at file scope: `ChangedRange` with
 `note_changed_range` and `range_changed` (`src/filesystem.hpp:189-193`,
 `src/filesystem.cpp:615-636`) exists so unchanged extents are never copied merely
 to discover they are unchanged. Same instinct, applied to the namespace.
 
-**Stage D — demand-loaded extents.** The pattern already exists in
+**Stage D - demand-loaded extents.** The pattern already exists in
 `ReadHandle::extent` (`src/filesystem.cpp:173-208`): fetch one extent on demand,
-cache exactly one, and — note the comment at `:184-186` — release the previous
+cache exactly one, and - note the comment at `:184-186` - release the previous
 before reserving the replacement "so a two-buffer handoff cannot consume the
 viewer headroom indefinitely". Extent-list nodes want the same treatment with a
 bounded cache. That cache should be a `RetainedMemoryLedger` client
@@ -844,19 +844,19 @@ bounded cache. That cache should be a `RetainedMemoryLedger` client
 leases and shedding) rather than a private LRU, so it participates in the same
 pressure accounting as everything else. `file_media_id`
 (`src/filesystem.cpp:2001-2017`) hashes the whole extent list and is a pure
-function of immutable content — persist it rather than recomputing it, or the
+function of immutable content - persist it rather than recomputing it, or the
 media-index rebuild re-reads the library.
 
-**Stage E — the migration.** See below.
+**Stage E - the migration.** See below.
 
-**Stage F — the dependent O(N) work**, cheap once B-D land and pointless before.
+**Stage F - the dependent O(N) work**, cheap once B-D land and pointless before.
 
 ## Migration: a re-root, not a rebuild
 
 The namespace content is not the identity. Paths, stat fields and 32-byte
 `ObjectId`s are data; those ObjectIds address content in the object store, which
 no metadata format change touches. Every extent stays where it is and keeps its
-id. **The library survives.** What is discarded at the cut is ancestry —
+id. **The library survives.** What is discarded at the cut is ancestry -
 metadata history before the boundary, old acceptance certificates (signed over
 old-scheme hashes), and the ability to roll back past it. History serves
 reconciliation and repair, not serving files.
@@ -867,7 +867,7 @@ checkpoint/journal/history/heads, install the seed as both `cur_` and
 `committed_`, reset the checkpoint, rebuild history from it. And both `seed()`
 (`:4362`) and `remember_committed()` (`:4404`) carry
 `const bool fresh = committed_.generation <= 1;`, which bypasses the ancestry
-checks — so a freshly re-rooted replica accepts a record with no shared history.
+checks - so a freshly re-rooted replica accepts a record with no shared history.
 
 **It is not a migration primitive as it stands.** `recover_from_seed` sets
 `recovery_required_ = true` and the comment is explicit that a cache seed "cannot
@@ -879,7 +879,7 @@ The codebase already has the vocabulary for exactly that kind of precondition.
 `metadata_branch_floor` and `retention_baseline_complete`
 (`src/metadata.hpp:93-103`) are a durably-established cluster-wide condition that
 must hold before a destructive operation (retention release, reachability GC) is
-permitted — "no participant may subsequently author from an ancestor/sibling
+permitted - "no participant may subsequently author from an ancestor/sibling
 behind this floor". `mutate_impl` gates on an analogous policy transition,
 refusing with "metadata write-floor transition is not durably accepted"
 (`:1670-1671`). The migration authority grant should be built in that shape, not
@@ -897,16 +897,16 @@ fi-1 behind CGNAT, sequence carefully.
 ## What this does NOT fix
 
 All separately O(N), all surviving the re-root untouched, all on the same 100 TB.
-Several are already recorded under "P1 — Scaling cliffs" and should be read as
+Several are already recorded under "P1 - Scaling cliffs" and should be read as
 dependent on this work rather than independent of it:
 
-- **`maintenance_objects_cached`** (`src/filesystem.cpp:2392-2455`) — the
+- **`maintenance_objects_cached`** (`src/filesystem.cpp:2392-2455`) - the
   ~840 MB live-object vector described at the top of this plan. `repair_step`
   already refuses to rebuild complete vectors; this is the one still handed to
   it. A Merkle tree over extents is the primitive that makes reachability
   incremental, so it becomes tractable after Stage B and not before.
 - **FUSE `readdir`** (`src/fuse_frontend.cpp:5349-5356`) walks every known inode
-  and filters by parent, per listing — while `FileSystem::NamespaceIndex` already
+  and filters by parent, per listing - while `FileSystem::NamespaceIndex` already
   maintains a parent→children map the frontend does not use
   (`src/filesystem.cpp:1633-1642` shows the right shape). Already the top entry
   under P1 scaling cliffs, independent of storage format, fixable now.
@@ -917,7 +917,7 @@ dependent on this work rather than independent of it:
   `*current_snapshot()` by value (`:829-831`), and eight mutation sites opening
   with `auto current = *current_snapshot();` then re-encoding all 64 shards.
   Already recorded under P1 scaling cliffs. It also has no equivalent of
-  `snapshot_resident_bytes` — `profile_weight`
+  `snapshot_resident_bytes` - `profile_weight`
   (`src/media_information.cpp:40-46`) measures only the pending publication
   queue, so nothing currently knows what a catalogue costs in memory. The
   catalogue wants the same treatment the namespace is getting here, and is the
@@ -927,12 +927,12 @@ dependent on this work rather than independent of it:
 
 1. **`extent_size` as a cheap orthogonal lever.** Everything above scales with
    extent count, which is `library_bytes / extent_size`. At 4 MiB, 100 TB is
-   ~26M extents; at 16 MiB it is ~6.5M — 4x less of everything. The usual cost is
+   ~26M extents; at 16 MiB it is ~6.5M - 4x less of everything. The usual cost is
    read amplification on small random reads, which barely registers for
    sequential media. No asymptotic change, but every constant moves 4x for a
    config change. Applies only to newly written files. `extent_size` appears both
    in node config (`src/filesystem.hpp:439` reads `n_.config().extent_size`) and
-   in `MetadataSnapshot` as cluster policy (`src/metadata.hpp:82`) — establish how
+   in `MetadataSnapshot` as cluster policy (`src/metadata.hpp:82`) - establish how
    those interact before touching it.
 2. **Tree shape and fanout.** Path-keyed radix/B-tree versus hash-keyed.
    `catalogue_shard` (`src/catalogue.cpp:131-136`) hashes ids, which balances well
@@ -940,8 +940,8 @@ dependent on this work rather than independent of it:
    which argues for path keying with an explicit fanout bound. Media libraries are
    deeply nested and unbalanced, so the bound matters.
 3. **Where tree nodes live.** Reusing the existing content-addressed control
-   store — the path catalogue shards already take, via `replicate_control` and
-   `ensure_control_local` — means no new dependency on the Pi nodes and inherits
+   store - the path catalogue shards already take, via `replicate_control` and
+   `ensure_control_local` - means no new dependency on the Pi nodes and inherits
    replication, repair and GC. The alternative (LMDB or similar) is more
    conventional but adds a dependency and a second durability model. Prefer the
    existing store unless Stage A shows a reason not to.

@@ -103,11 +103,11 @@ under `diagnostics.filesystem` in `GET /api/v1/status`:
 |---|---|---|
 | a frame that does not fit the state so far (duplicated marker, marker whose operation is gone, non-monotonic sequence, unknown record type, undecodable payload) | skipped | `journal_recovery_skipped_frames` |
 | a checksum failure before EOF (middle-of-journal corruption) | the tail from that frame is copied to `<journal>.corrupt.<ts>.<pid>` and truncated; the prefix is recovered; spools for operations in the tail are preserved as orphans | `journal_recovery_quarantined_bytes` |
-| an incomplete or checksum-invalid final frame (torn append) | trimmed | — |
+| an incomplete or checksum-invalid final frame (torn append) | trimmed | - |
 | an operation whose inode has no descriptor | retired with journaled `done`/`abandoned` markers; its spool is preserved as an orphan | `recovery_dropped_operations` |
-| a spool shorter than its journal, or missing | that generation is abandoned; the file keeps its last published content | — (`dropped FUSE spool generation` line) |
-| a publication whose file is no longer in the accepted namespace | abandoned (journaled, spool retired) — live or recovered | `publications_abandoned` |
-| two inodes resolving to one path | the newer keeps the path; the other is re-journaled without it | — |
+| a spool shorter than its journal, or missing | that generation is abandoned; the file keeps its last published content | - (`dropped FUSE spool generation` line) |
+| a publication whose file is no longer in the accepted namespace | abandoned (journaled, spool retired) - live or recovered | `publications_abandoned` |
+| two inodes resolving to one path | the newer keeps the path; the other is re-journaled without it | - |
 
 A non-zero counter after a restart is worth a look at the `WARN` lines it
 came with, but it is not an outage: the node is up and the rest of the
@@ -116,7 +116,7 @@ kept (within `fuse.max_orphan_bytes`) for diagnosis and can be deleted once
 understood.
 
 The metadata journal follows the same rule: a frame that fails
-authentication or does not fit the CAS chain ends the replayable prefix —
+authentication or does not fit the CAS chain ends the replayable prefix -
 that tail is quarantined and truncated like a torn append, and the replica
 starts from the state before it. A metadata history frame that cannot be
 authenticated or decoded is skipped (`metadata history skipped frames`) and
@@ -275,7 +275,7 @@ dedicated metadata executor. All other CONTROL messages use the ordinary control
 executor; object work remains on the priority-aware DATA executors.
 
 DATA execution priority is viewer foreground, viewer read-ahead, user loader,
-then speculative maintenance — laws 2 and 3 as an execution order. Durable FUSE
+then speculative maintenance - laws 2 and 3 as an execution order. Durable FUSE
 spool publication uses the loader class even when its journal records were
 reconstructed after restart. Recovery provenance affects replay validation and
 cache policy, not scheduling priority: work the user asked for does not become
@@ -289,7 +289,7 @@ the server: BitTorrent acquisition
 (`<libdir>/macha/plugins/libmacha-fuse.so`). The directory scanned is
 `plugin_path`, which defaults to this build's private plugin directory, and
 every module is checked against the running core's build stamp (project
-version plus git commit) before it is called — a plugin from a different
+version plus git commit) before it is called - a plugin from a different
 build is refused and logged rather than loaded.
 
 Only the libfuse adapter is in the FUSE plugin. The frontend that owns the
@@ -366,9 +366,9 @@ tokens: `(node, durability epoch, domain, generation, backend instance)`. The
 epoch is fresh for every process and the backend instance for every reopen,
 so a token can only be *checked* by the incarnation that issued it. A token
 that outlived its incarnation is not a failure: the writer's barrier sends the
-object ids to the peer, the peer answers from its disk — an object present
+object ids to the peer, the peer answers from its disk - an object present
 after a restart is durable, because the pack index is rebuilt from the packs
-on open and the probe flushes the current incarnation before replying — and
+on open and the probe flushes the current incarnation before replying - and
 hands out fresh tokens. Journal evidence on the writer:
 `object durability re-derived after incarnation change reasserted=N absent=M
 peers=P`; on the peer: `object durability re-derived after epoch change
@@ -501,8 +501,8 @@ reachability, which is not itself a lie during a node's own local recovery;
 the separate `phase` field (`starting`, `recovering`, `ready`, or `unknown`
 without trustworthy telemetry) is the truthful signal for whether an online
 peer's numbers can be trusted yet. This is what stops a node's own in-progress
-recovery — which legitimately reports zero capacity/usage before its local
-storage is ready — from briefly looking like real data loss in the cluster
+recovery - which legitimately reports zero capacity/usage before its local
+storage is ready - from briefly looking like real data loss in the cluster
 aggregate; `cluster.conditions` reports "one or more online nodes are still
 recovering" for that window instead.
 

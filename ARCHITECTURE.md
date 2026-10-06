@@ -44,7 +44,7 @@ from being counted against the others.
 **Law 2's two sanctioned waits.** Law 2 is not absolute in the sense that a
 viewer never blocks on anything; it is absolute in the sense that no *other
 class of work* may be the reason a viewer blocks. Where a viewer genuinely
-waits — a request beyond the produced frontier, a held segment — the wait is on
+waits - a request beyond the produced frontier, a held segment - the wait is on
 production that viewer itself demanded, it is bounded by configuration, and the
 bound is published to the client. Those two cases are documented as such in
 [Streaming](docs/streaming.md); they are the exceptions, and they are not

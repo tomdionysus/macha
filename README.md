@@ -4,7 +4,7 @@
 
 *v0.90.21*
 
-*Macha — Old Irish /ˈmˠaxə/ — approximately “MAKH-uh”*
+*Macha - Old Irish /ˈmˠaxə/ - approximately “MAKH-uh”*
 
 Macha is a C++20 distributed filesystem (MachaDFS) and media server for large,
 mostly immutable video and music libraries. Files are split into encrypted
@@ -19,7 +19,7 @@ holds in full.
 
 ## This repository, and what sits around it
 
-This repository is **the node** — the daemon that stores, replicates and serves
+This repository is **the node** - the daemon that stores, replicates and serves
 media. The `macha` binary is the server: DFS, catalogue, HTTP API and playback
 engine. The FUSE mount and BitTorrent acquisition are
 [subsystem plugins](docs/operations.md#subsystem-plugins) it loads at start,
@@ -38,14 +38,14 @@ worth understanding before changing either side:
 > them against its own decoder, and instructs.
 
 So the node works from media facts and the client's instruction alone, and
-refuses only what is impossible or misdescribed — never what a client said
+refuses only what is impossible or misdescribed - never what a client said
 it could not play. Whether a device can decode what it asked for is the
 client's business. [Streaming](docs/streaming.md) is the normative statement of
 that contract, including the error codes and the reasoning behind them; treat
 it as the interface document when working on either side.
 
 Because clients decide, they carry real logic, and a shared TypeScript core
-(`@machafoundation/core`) implements the parts every player needs — node discovery and
+(`@machafoundation/core`) implements the parts every player needs - node discovery and
 ranking, session lifecycle, playback negotiation. Phone and TV players build on
 that core. A change to the wire shape, an error code or a default is a change
 to those projects too, and is worth saying out loud rather than leaving to be
@@ -73,7 +73,7 @@ decision; the fourth is a veto over all of them rather than a rank among them:
    make another viewer wait.
 3. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
    Viewer Wait.**
-4. **Thou Shalt Not Shoot Thyself In The Foot** — no operation, code path or
+4. **Thou Shalt Not Shoot Thyself In The Foot** - no operation, code path or
    subsystem may leave the node in a state it cannot recover from on its own.
    The test: if this goes wrong on the node furthest away, does it come back
    without me?
@@ -92,13 +92,13 @@ says how each one applies in the node.
 
 Three explicit storage classes, with separate durability rules:
 
-- **DATA** — media extents, artwork, subtitles and other immutable payload.
+- **DATA** - media extents, artwork, subtitles and other immutable payload.
   Placed by the DHT across eligible node/backend capacity; a full preferred
   owner falls through to the next deterministic candidate.
-- **CONTROL/METADATA** — namespace metadata and catalogue manifests/shards.
+- **CONTROL/METADATA** - namespace metadata and catalogue manifests/shards.
   Dedicated priority storage, and any node accepts a write on its own, so
   ordinary DATA quota can never block them.
-- **CACHE** — opportunistic, non-authoritative copies. Cache contents never
+- **CACHE** - opportunistic, non-authoritative copies. Cache contents never
   satisfy DATA or metadata durability.
 
 Every known node is metadata-capable and any node accepts a write on its own:
@@ -133,7 +133,7 @@ sudo make -C build install
 
 On Linux this installs the executables, the private `libmacha_core` library
 and plugins under `lib/macha`, a `macha.service` unit, the documentation and an
-initial `/etc/macha/macha.yaml` — copied from
+initial `/etc/macha/macha.yaml` - copied from
 [`macha.yaml.example`](macha.yaml.example) only when no configuration exists,
 so upgrades never overwrite operator changes. Edit it, create the referenced
 storage/cache/state/spool paths and the cluster key, then start the service.

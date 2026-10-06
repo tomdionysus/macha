@@ -29,7 +29,7 @@ controls, platform capabilities and local playback intent.
 **The server serves facts; the client negotiates.** The server states what a
 title is, what its streams are and what operations it can perform. Choosing
 between Direct Play, remux and transcode is the client's, made from its own
-measured capabilities — and it is made in `@machafoundation/core` rather than in
+measured capabilities - and it is made in `@machafoundation/core` rather than in
 any one client, so every client decides the same way from the same facts. The
 server obeys the result; it does not pick on the client's behalf.
 
@@ -91,8 +91,8 @@ preloaded or embedded.
   at all.
 - **A viewer** is someone watching or listening right now: playback startup,
   reads, seeks and transport.
-- **A loader** is durable work the user asked for — FUSE publication, ingest,
-  acquisition — which must finish but need not finish first.
+- **A loader** is durable work the user asked for - FUSE publication, ingest,
+  acquisition - which must finish but need not finish first.
 - **Speculative** work is everything nobody is waiting for: read-ahead beyond
   demand, maintenance, repair, diagnostics.
 
@@ -127,7 +127,7 @@ preloaded or embedded.
    subordinate to law 2: loader work yields to a viewer rather than negotiating
    with one.
 4. **Thou Shalt Not Shoot Thyself In The Foot.** No operation, code path or
-   subsystem may leave the node — or the client — in a state it cannot recover
+   subsystem may leave the node - or the client - in a state it cannot recover
    from on its own. It is different in kind from the three above: laws 1-3
    decide who goes first, this one decides what may not be done **at any
    priority**. It is a veto over all three and where it conflicts it wins,
@@ -142,7 +142,7 @@ preloaded or embedded.
    - it loses data that was already acknowledged;
    - it cannot be stopped or restarted cleanly, so the ordinary remedy is
      unavailable;
-   - it degrades without bound and offers no path back — a loop that will not
+   - it degrades without bound and offers no path back - a loop that will not
      finish, a queue that will not drain, a budget that cannot admit one item.
 
    The last is the easiest to ship by accident and the hardest to see, because

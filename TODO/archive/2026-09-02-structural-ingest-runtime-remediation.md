@@ -73,7 +73,7 @@ coalescing.
   references, not absence from one currently available branch.
 - Diagnostics are aggregate and rate-limited on hot paths.
 
-## Phase 0 — deterministic proof and ownership accounting
+## Phase 0: deterministic proof and ownership accounting
 
 - [x] Add an append-verify analogue which builds a large pending write history
   and repeatedly reads the growing destination. Record operations examined,
@@ -94,7 +94,7 @@ Exit gate: the current implementation fails the targeted amplification and
 priority tests for the expected reasons, and all material retained owners are
 visible in diagnostics.
 
-## Phase 1 — object-store concurrency and idempotence
+## Phase 1: object-store concurrency and idempotence
 
 - [x] Split store metadata/index protection from physical I/O and crypto. Use
   short critical sections, immutable index snapshots where useful, and
@@ -132,7 +132,7 @@ Exit gate: unrelated object operations run concurrently; duplicate puts do no
 payload read/decrypt/rewrite; viewer/control latency remains bounded under
 loader saturation; crash durability and integrity tests remain unchanged.
 
-## Phase 2 — indexed FUSE overlay and bounded operation metadata
+## Phase 2: indexed FUSE overlay and bounded operation metadata
 
 - [x] Keep the append-only journal as crash authority, but build a compact
   per-inode interval overlay for runtime reads and publication.
@@ -156,7 +156,7 @@ Exit gate: append-verify work grows linearly with bytes transferred rather than
 quadratically with historical write count; pending metadata reaches a stable
 bound; restart replay produces the identical visible file.
 
-## Phase 3 — process-wide retained-memory governance
+## Phase 3: process-wide retained-memory governance
 
 - [ ] Introduce one ownership ledger/budget for actual retained heap across
   loader/viewer payloads, RPC frames, extent tasks, publication cursors,
@@ -182,7 +182,7 @@ Exit gate: deterministic saturation tests and a multi-file loaded run reach a
 stable RSS plateau on a 4 GiB node without swap growth, OOM, lost work or viewer
 regression.
 
-## Phase 4 — mutation and publication amplification
+## Phase 4: mutation and publication amplification
 
 - [ ] Add a publication commit coordinator which combines ready compatible file
   manifest updates into bounded metadata deltas without weakening per-file WAL,
@@ -197,7 +197,7 @@ regression.
 Exit gate: many completed files require substantially fewer metadata generations
 and convergence cycles, with exact crash/restart and dependency-chain tests.
 
-## Phase 5 — incremental metadata representation
+## Phase 5: incremental metadata representation
 
 - [ ] Replace whole-snapshot mutation copies with persistent/copy-on-write state
   and incremental canonical hashing/encoding, or an equivalent representation
@@ -212,7 +212,7 @@ Exit gate: tiny mutations and ordinary sibling reconciliation have bounded
 incremental CPU/memory cost independent of total library size; compatibility,
 partition and recovery matrices pass.
 
-## Phase 6 — causally safe media-profile lifecycle
+## Phase 6: causally safe media-profile lifecycle
 
 - [ ] Maintain immutable-media reference changes incrementally from accepted
   file additions/removals rather than scanning the complete library on every
@@ -228,7 +228,7 @@ Exit gate: branch lag cannot delete a live profile; metadata notices cause work
 proportional to relevant file changes; profile lifecycle remains asynchronous,
 deduplicated and restart safe.
 
-## Phase 7 — global priority and diagnostics closeout
+## Phase 7: global priority and diagnostics closeout
 
 - [ ] Audit every executor, mutex, disk/crypto operation, RPC wait, durability
   barrier, metadata mutation, catalogue job and maintenance job for explicit

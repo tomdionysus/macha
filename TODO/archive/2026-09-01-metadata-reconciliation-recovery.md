@@ -1,4 +1,4 @@
-# Metadata reconciliation recovery — 2026-09-01
+# Metadata reconciliation recovery: 2026-09-01
 
 ## Incident
 

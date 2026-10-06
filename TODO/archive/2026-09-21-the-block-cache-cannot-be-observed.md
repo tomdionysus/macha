@@ -8,12 +8,12 @@ served a viewer 154 remote reads in 40 minutes.** No code has been changed.
 **The finding is not that the cache is broken. It is that nothing in this
 system could tell us if it were.** The entire observable surface of
 `PersistentBlockCache` is a function of *writes*. Hits, misses and evictions
-are invisible — to telemetry, to the status API, to the logs in the common
+are invisible - to telemetry, to the status API, to the logs in the common
 case, and to the test suite. A cache that stores perfectly and has never
 served a single byte back would report **identically** to one working
 flawlessly, on every surface this project has.
 
-That is why the honest title is "may never have worked". Not an accusation —
+That is why the honest title is "may never have worked". Not an accusation -
 an admission that the question is currently unanswerable, which is worse than
 a known defect because no amount of operating the system will surface it.
 
@@ -40,7 +40,7 @@ written", never "how much has been read". A node reporting a 90%-full cache is
 telling you nothing about whether that cache is doing its job.
 
 **3. No test asserts a block-cache read-back.** The only cache-hit assertions
-in the suite are for a *different* cache — `materialization_cache_hits`, the
+in the suite are for a *different* cache - `materialization_cache_hits`, the
 metadata materialisation cache (`tests/test_storage_metadata.cpp:2232-2234`,
 `tests/test_invariants.cpp:822`). Five test files touch the block cache and
 none of them pins that a read was served from it.
@@ -49,7 +49,7 @@ none of them pins that a read was served from it.
 that matters.** `log_playback_read` in `DistributedStore::get_shared` fires
 only when the read is foreground **and took ≥250 ms**. A cache hit off local
 disk is fast, so *a working cache is silent by construction*. The absence of
-`source=cache` in a journal is therefore not evidence of anything — which is
+`source=cache` in a journal is therefore not evidence of anything - which is
 precisely the trap this investigation fell into before catching itself.
 
 ## What is known to work
@@ -94,8 +94,8 @@ files:
 A 10 GiB cache holds roughly **16 titles at the median, 9 at the mean, 5 at
 p90**. Exactly one file in 1,427 exceeds the whole cache.
 
-**So the P-1 invariant — a cache must never be smaller than one unit of its
-own work — is satisfied here**, comfortably. This is *not* a second instance
+**So the P-1 invariant - a cache must never be smaller than one unit of its
+own work - is satisfied here**, comfortably. This is *not* a second instance
 of that failure, and recording it as one would have sent the next reader after
 the wrong thing. The arithmetic was right; the input was fabricated. Check the
 library before sizing a cache against it.
@@ -104,15 +104,15 @@ library before sizing a cache against it.
 
 fi-1 has `hosts_extents: false`. It owns no extents and is never a DATA
 fallback holder. **The block cache is the entire reason it can serve media at
-all** — every read either hits that cache or crosses the WAN to es-1 or
+all** - every read either hits that cache or crosses the WAN to es-1 or
 gbni-1, measured at 772-3431 ms per 4 MiB stripe. On a node that stores media,
 a dead cache is a performance regression. On this one it is the difference
 between an edge node and a proxy with extra steps.
 
 Observed on fi-1 in one 40-minute window: **154 foreground reads went
 `source=remote`**, roughly 616 MB across the WAN for a single viewer. There is
-an innocent explanation — a first watch of new content is necessarily all-miss
-— and no way at present to distinguish it from a cache that is never
+an innocent explanation - a first watch of new content is necessarily all-miss
+- and no way at present to distinguish it from a cache that is never
 consulted successfully.
 
 ## What to do
@@ -130,7 +130,7 @@ consulted successfully.
 4. **Pin a block-cache read-back in the test suite.** Write an object, evict
    the local copy, read it, assert it came from the cache. There is currently
    no test that would fail if `get` always returned empty.
-5. **Then, and only then**, revisit fi-1's latency — including whether
+5. **Then, and only then**, revisit fi-1's latency - including whether
    hydration is running at all. It is configured `enabled: true` with both the
    `read_ahead` and `current_file` engines and logged **nothing** in 40
    minutes, which is either silence by design or a second dead mechanism. With
@@ -150,13 +150,13 @@ node["cache"] = bytes_pair(effective.cache_used, effective.cache_capacity);
 ```
 
 That is the place. It becomes used, capacity, **hits, misses, evictions,
-entries** — the same four the materialisation cache already keeps. They ride
+entries** - the same four the materialisation cache already keeps. They ride
 `NodeTelemetry` exactly as `cache_capacity` and `cache_used` do now
 (`src/cluster.cpp:1614-1619`).
 
 **Why every node, not just the local one.** The same argument that put the
 playback budgets on the per-node block in 0.48.0, and it is stronger here.
-fi-1 is the node whose cache matters most and it is behind CGNAT — it cannot
+fi-1 is the node whose cache matters most and it is behind CGNAT - it cannot
 be reached directly, and an operator will be looking at es-1. A cache-health
 figure that is only ever about the node you happened to ask is no use for the
 node you actually need to know about.
@@ -195,9 +195,9 @@ exists to expose. Sum bytes if useful; keep hit rates per node.
 This does not need instrumentation to get a first answer. On fi-1, read one
 media file through FUSE twice and compare wall-clock:
 
-- **Second read much faster** — the cache serves reads, and the finding is
+- **Second read much faster** - the cache serves reads, and the finding is
   narrowed to "unobservable" rather than "possibly dead".
-- **Second read the same speed** — the cache has never been serving, and this
+- **Second read the same speed** - the cache has never been serving, and this
   becomes a P0 with a known blast radius: every edge-node read since the cache
   was introduced.
 

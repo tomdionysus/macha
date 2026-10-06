@@ -1,7 +1,7 @@
 # Loader disk I/O starves control and viewer traffic
 
 Status: found 2026-09-19 on es-1 (corvus-es-1, 0.46.2), live, during an
-ordinary ingest. Not a regression — no mechanism to prevent it has ever
+ordinary ingest. Not a regression - no mechanism to prevent it has ever
 existed. In progress now.
 
 ## What was reported
@@ -43,7 +43,7 @@ timeout firing:
 3719ms  PATCH /api/v1/playback/sessions/…
 ```
 
-**Attribution corrected 2026-09-20 by measurement — see the plan.** These are
+**Attribution corrected 2026-09-20 by measurement - see the plan.** These are
 not all the same failure, and the original reading of this list was wrong:
 
 | route | aborts | reads the DATA backend? |
@@ -69,7 +69,7 @@ reproduction at 86% iowait.
 
 For scale: over the same six hours `/api/v1/health` was 1,165 calls under
 10 ms with a 1.66 s worst case, and `/api/v1/status` 629 × 200 with 13 calls
-in the 1–5 s band. The failure is a tail, not a floor — but it is a tail the
+in the 1–5 s band. The failure is a tail, not a floor - but it is a tail the
 node manufactures.
 
 ## Why nothing stopped it
@@ -81,10 +81,10 @@ Law 1 is enforced in three resources and absent from a fourth.
 | memory | yes | `control_memory_reserve_bytes` (64 M), beside viewer and loader reserves |
 | HTTP threads | yes | separate control lane (`control_workers`) |
 | RPC execution | yes | fast-control allow-list (`ping`, `members` only) |
-| **disk I/O** | **no** | only `data_viewer_reserve_bytes` (32 M) — a *viewer* reserve, not a control one |
+| **disk I/O** | **no** | only `data_viewer_reserve_bytes` (32 M) - a *viewer* reserve, not a control one |
 
 - `maintenance.max_bandwidth`, `busy_bandwidth_fraction` and
-  `idle_bandwidth_fraction` bound **maintenance only** — repair, rebalance,
+  `idle_bandwidth_fraction` bound **maintenance only** - repair, rebalance,
   GC, scrub. Ingest and FUSE publication are bandwidth-unbounded by design.
 - `dht.background_concurrency` bounds *concurrent operations*
   (`max(1, nproc/2)`, so 2 here), which is not a throughput or a latency
@@ -149,13 +149,13 @@ disk I/O at all.**
 
 What it does do, per call, on a route a dashboard polls every 10 s:
 
-- builds a `std::set<ObjectId>` over every artwork reference in the catalogue —
+- builds a `std::set<ObjectId>` over every artwork reference in the catalogue -
   an allocation and a tree insert each;
 - takes a per-object mutex **and** the shared `LocalStore::m_` for every one of
   them.
 
 So the cost is CPU, allocation and **lock contention on the same mutex the
-ingest is holding continuously** — which is a far better explanation for this
+ingest is holding continuously** - which is a far better explanation for this
 route recording the three longest aborts (9,881 ms, 7,890 ms, 7,886 ms) than
 disk ever was, and it points the fix somewhere completely different.
 

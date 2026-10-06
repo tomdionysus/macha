@@ -55,7 +55,7 @@ mutation workload; it does not explain the multi-gigabyte retained heap.
 5. A crash or reboot must automatically recover the Macha FUSE mount and rejoin
    the existing generation without genesis or manual cleanup.
 
-## Phase 0 — measurement and deterministic reproduction
+## Phase 0: measurement and deterministic reproduction
 
 - [x] Correct `runtime.rss_bytes`, which previously reported lifetime peak
   `ru_maxrss`; it now reports current resident memory on Linux and macOS.
@@ -76,7 +76,7 @@ mutation workload; it does not explain the multi-gigabyte retained heap.
 Checkpoint: diagnostics reproduce both retained-history and merge-frame
 amplification, and tests fail for the intended bounds.
 
-## Phase 1 — disk-backed, byte-bounded history
+## Phase 1: disk-backed, byte-bounded history
 
 - [x] Replace `std::map<Hash256, MetadataHistoryEntry>` payload retention with a
   compact authenticated index containing only generation, hash, predecessor,
@@ -116,7 +116,7 @@ Tests:
 Checkpoint: deploy only after the complete metadata, RPC, restart and corruption
 matrix passes. Measure cold-start and steady RSS on one non-critical node.
 
-## Phase 2 — delta-encode reconciliation history
+## Phase 2: delta-encode reconciliation history
 
 - [x] Compute the exact delta from the deterministic primary parent to the
   merged snapshot and pass it to history publication whenever it is smaller
@@ -141,7 +141,7 @@ Tests:
 Checkpoint: repeat a loaded namespace/publication burst and verify history
 growth tracks useful changes rather than full snapshot size.
 
-## Phase 3 — safe distributed checkpoint and ancestry floor
+## Phase 3: safe distributed checkpoint and ancestry floor
 
 - [ ] Design an authenticated checkpoint proposal naming the exact accepted
   head set, checkpoint record, ancestry floor and participant/policy epoch.
@@ -168,7 +168,7 @@ Tests:
 
 Checkpoint: only then re-enable automatic history compaction.
 
-## Phase 4 — crash recovery and operational guardrails
+## Phase 4: crash recovery and operational guardrails
 
 - [x] Move stale Macha FUSE detection/recovery ahead of any operation which
   dereferences or creates the configured mount path. Retain fail-closed refusal

@@ -348,7 +348,7 @@ Add short dated notes here rather than leaving important choices only in chat hi
 - Metadata executor queue bounds, priority policy, shutdown semantics, and backpressure error behaviour.
 - Any on-disk or wire-format change and its compatibility story.
 
-### 2026-08-30 — Phase 2 deletion/backlog batching decisions
+### 2026-08-30: Phase 2 deletion/backlog batching decisions
 
 - Namespace batches default to 256 operations and 256 KiB of encoded operation
   data; both are configurable under `fuse`.
@@ -388,13 +388,13 @@ Each future session should:
 
 ## Session log
 
-### 2026-08-30 — planning
+### 2026-08-30: planning
 
 - Confirmed the live cost is replicated metadata reconstruction/acceptance rather than physical pathname deletion.
 - Defined protocol-compatible work in five phases: measurement, materialization reuse, namespace batching, event coalescing, and RPC isolation, followed by integrated validation.
 - No production code changed and no tests were run while creating this plan.
 
-### 2026-08-30 — Phase 0 diagnostic foundation
+### 2026-08-30: Phase 0 diagnostic foundation
 
 - Added monotonic FUSE status counters for namespace admission/recovery/publication
   and successful operation-journal append durability work.
@@ -408,7 +408,7 @@ Each future session should:
 - Detailed implementation and continuation notes:
   `TODO/archive/2026-08-30-phase-0-diagnostic-foundation.md`.
 
-### 2026-08-30 — Phase 1 bounded record materialization
+### 2026-08-30: Phase 1 bounded record materialization
 
 - Added a bounded LRU-style cache of validated historical `MetadataRecord`
   materializations, keyed by immutable commit hash.
@@ -426,7 +426,7 @@ Each future session should:
 - Detailed implementation and continuation notes:
   `TODO/archive/2026-08-30-phase-1-bounded-record-materialization.md`.
 
-### 2026-08-30 — Phase 1 shared decoded materialization
+### 2026-08-30: Phase 1 shared decoded materialization
 
 - Extended each bounded cache value to hold one immutable shared record and its
   decoded snapshot.
@@ -445,7 +445,7 @@ Each future session should:
 - Detailed implementation, continuation, and UAT notes:
   `TODO/archive/2026-08-30-phase-1-shared-decoded-materialization.md`.
 
-### 2026-08-30 — Phase 2 bounded namespace publication
+### 2026-08-30: Phase 2 bounded namespace publication
 
 - Added configurable operation-count and encoded-byte bounds to the
   event-driven FUSE namespace worker.
@@ -466,7 +466,7 @@ Each future session should:
 - Detailed implementation, continuation, and UAT notes:
   `TODO/archive/2026-08-30-phase-2-namespace-batching.md`.
 
-### 2026-08-30 — Phase 2 three-node deletion UAT
+### 2026-08-30: Phase 2 three-node deletion UAT
 
 - Created 1,000 empty files in a uniquely named disposable directory through
   the live FUSE mount, then deleted the exact directory with `rm -rf`.

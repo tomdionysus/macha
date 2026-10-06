@@ -5,7 +5,7 @@ Date: 2026-09-09 (evening handover)
 Written for a fresh session picking this up cold. Two defects behind the
 recurring es-1 livelock were found and fixed today and are deployed; a third
 is unfixed, well characterised, and is where to start. Read the "already
-refuted" section before forming a hypothesis — three plausible ones are
+refuted" section before forming a hypothesis - three plausible ones are
 already dead, with measurements.
 
 ## Cluster state as of handover
@@ -28,7 +28,7 @@ it was wedged, so governing law 2 is intact).
 
 **1. Reassembly starvation (was the whole "telemetry cannot cross" story).**
 `MessageAssembler` could not get a lease to reassemble an inbound frame, threw
-`process retained-memory RPC reassembly saturated`, and killed the channel —
+`process retained-memory RPC reassembly saturated`, and killed the channel -
 ~1/second on es-1. Every peer channel died 1–2 s after connecting, so requests
 re-dialled constantly (~25 new connections per 70 s) and telemetry, the only
 consumer that never dials, appeared to vanish. Fixed with a bounded
@@ -53,7 +53,7 @@ so `data_work.hpp`'s wait took the `cv_.wait(...)` branch and blocked forever.
 All eight commit workers sat in
 `data_loop → replay_data_quantum → WriteHandle::write → ensure_buffer_memory →
 RetainedMemoryLedger::acquire`, holding memory and waiting for more. Nothing
-failed, so the 0.30.0 retry-and-park discipline could never see it — which is
+failed, so the 0.30.0 retry-and-park discipline could never see it - which is
 the gap `ACTIVE.md` describes in words as "the work never fails, it simply
 never completes".
 
@@ -105,14 +105,14 @@ still held. The hypothesis to test first: each failed-then-retried publication
 leaves its leases behind, so the retry loop *is* the accumulation. If true,
 the fix is release-on-failure, not another budget.
 
-## Already refuted — do not re-run these
+## Already refuted: do not re-run these
 
 1. **"It is a network/WAN fault."** There is no WAN concept in Macha; the path
    is two WireGuard hops and an EC2 channel. Path MTU is 1420 against a 1500
    interface, but PMTU is learned correctly (`mss:1368 pmtu:1420` on live
    sockets) and small request/reply traffic was always fine. The millions of
-   `TcpOutRsts`/`TCPTimeouts` on es-1 are **system-wide on a busy host** —
-   the high-volume sockets are Plex on `:32400`, idle for hours — and are not
+   `TcpOutRsts`/`TCPTimeouts` on es-1 are **system-wide on a busy host** -
+   the high-volume sockets are Plex on `:32400`, idle for hours - and are not
    Macha's.
 2. **"Telemetry gossip is broken."** It was a symptom. Gossip is no-dial, so it
    was the only consumer that could not paper over dead channels by
@@ -138,7 +138,7 @@ Read `diagnostics.retained_memory.owners`, `diagnostics.filesystem`
 (`data_publications_started/completed`, `parked_publications`,
 `spool_publish_rate_bytes_per_second`) and `diagnostics.rpc_transport`.
 Thread stacks: `gdb -p $(systemctl show -p MainPID --value macha.service)
--batch -ex "thread apply all bt 14"` — libmacha_core has symbols.
+-batch -ex "thread apply all bt 14"` - libmacha_core has symbols.
 
 A node with no `web:` section answers **401 at `/`** for an unauthenticated
 request. That is the auth gate, not a fault, and it misled an operator today.
@@ -155,7 +155,7 @@ request. That is the auth gate, not a fault, and it misled an operator today.
 - **Cataloguer fixes deployed and half-verified.** `Blade Runner 2049` now
   matches `tmdb:movie:335984`; one music track matched through the new
   undecorated-title fallback. Three retried music tracks left the unmatched
-  list without appearing in the catalogue — still unexplained, and 58 music
+  list without appearing in the catalogue - still unexplained, and 58 music
   files remain unmatched.
 - **The reassembly reserve's rule-1 ordering has only been weakly tested live**,
   because es-1 has had no viewers competing for the ledger while wedged.

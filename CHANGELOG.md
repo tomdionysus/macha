@@ -1,6 +1,6 @@
 # Current release
 
-## 0.90.21 — repair stops crawling (experiment)
+## 0.90.21: repair stops crawling (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -16,7 +16,7 @@ without counting, up to 65,536 a step.
 64 whole objects every pass, 3 to 4 s of disk on these single-disk nodes, to
 find there was nowhere to move them.
 
-## 0.90.20 — torrent jobs say what the swarm holds and where their ingest is (experiment)
+## 0.90.20: torrent jobs say what the swarm holds and where their ingest is (experiment)
 
 API addition: `swarm` and `ingest_node_id` on torrent jobs. No wire, protocol
 or on-disk changes beyond those fields in the cluster job view.
@@ -27,7 +27,7 @@ with peers but no seeds can now be told apart from one nobody can complete.
 
 **A torrent job names the node holding its ingest job** (`ingest_node_id`).
 
-## 0.90.19 — one MusicBrainz rate-limit answer no longer refuses search for a minute (experiment)
+## 0.90.19: one MusicBrainz rate-limit answer no longer refuses search for a minute (experiment)
 
 API addition: `retry_after_ms` on `provider_unavailable`. No wire, protocol or
 on-disk changes.
@@ -46,7 +46,7 @@ before.
 error and a `Retry-After` header, when the node knows
 ([API conventions](docs/api.md#providers)).
 
-## 0.90.18 — every list call pages (experiment)
+## 0.90.18: every list call pages (experiment)
 
 API change, additive except for order. No wire, protocol or on-disk changes.
 
@@ -63,7 +63,7 @@ Clients sort for display.
 **Search's `limit` is 1 to 1000** (it accepted 0); it still defaults to 50,
 and its cursor is a position in the ranking.
 
-## 0.90.17 — configuration without dead settings (experiment)
+## 0.90.17: configuration without dead settings (experiment)
 
 Configuration change: three keys are gone, and a file that still sets one is
 refused at startup as an unknown key. No wire, protocol, API or on-disk
@@ -79,7 +79,7 @@ work, bounded by `commit_workers`.
 **The example configuration's comments describe the system as it is**, without
 history.
 
-## 0.90.16 — an album's tracks share one provider lookup (experiment)
+## 0.90.16: an album's tracks share one provider lookup (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -91,7 +91,7 @@ cover looked up again, 1.2 to 1.8 s per track. A call now takes the set chosen
 by its record, which has the release cached; other records spread over the
 other sets.
 
-## 0.90.15 — a title's files: unmatch and delete (experiment)
+## 0.90.15: a title's files: unmatch and delete (experiment)
 
 New API routes; nothing removed or changed. No wire, protocol or on-disk
 changes.
@@ -110,7 +110,7 @@ once.
 season, show, album or artist above it left with no children, whether the
 scanner or a person made it. Each call is one catalogue commit.
 
-## 0.90.14 — a matched album's cover is not fetched again (experiment)
+## 0.90.14: a matched album's cover is not fetched again (experiment)
 
 No wire, protocol or on-disk changes. One API change in wording only.
 
@@ -125,7 +125,7 @@ code is still `provider_unavailable`; the message no longer passes on internal
 reasons such as the MusicBrainz gate's backoff ("circuit open"). The reason is
 logged with the provider.
 
-## 0.90.13 — the mount commits without waiting for a viewer (experiment)
+## 0.90.13: the mount commits without waiting for a viewer (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -139,7 +139,7 @@ viewer's share paces the bytes.
 **The unmatched list checks each file once**, through the media index and a
 stat-only read, where it read every file's whole extent list twice.
 
-## 0.90.12 — the survey, the path table and discovery follow the change (experiment)
+## 0.90.12: the survey, the path table and discovery follow the change (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -167,7 +167,7 @@ the provider gave.
 **A provider's artwork options are kept for ten minutes**, so choosing one of
 the options just listed does not ask the provider for the list again.
 
-## 0.90.11 — a catalogue write touches its own shards (experiment)
+## 0.90.11: a catalogue write touches its own shards (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -193,7 +193,7 @@ moved, each under the mount's global lock; the operation's sync covers the
 descriptors written just before it. Reclaiming an unlinked inode looks its
 path up where it scanned every path.
 
-## 0.90.10 — a match waits for no other node (experiment)
+## 0.90.10: a match waits for no other node (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -215,7 +215,7 @@ artwork downloads, the durability barrier and the commit.
 On 0.90.9 a match took 3.5 and 8.6 seconds and an artwork choice 16, measured
 on fi-1.
 
-## 0.90.9 — the metadata editor's provider calls run side by side (experiment)
+## 0.90.9: the metadata editor's provider calls run side by side (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -230,7 +230,7 @@ rate gate, one a second.
 **The catalogue scanner reads this node's own head** when it checks whether
 the namespace has changed, and asks no peer.
 
-## 0.90.8 — keyframe indexes survive a catalogue reload (experiment)
+## 0.90.8: keyframe indexes survive a catalogue reload (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -250,7 +250,7 @@ the two roots do not share.
 newly referenced image was fetched whole to prove it existed, including one
 stored a moment before.
 
-## 0.90.7 — a commit is not a storage change; refused writes are logged (experiment)
+## 0.90.7: a commit is not a storage change; refused writes are logged (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -267,7 +267,7 @@ journal: the reason went to the client only. A refused write, and any request
 that fails here or upstream, is logged with its status, code and message
 (`manage API DELETE ... status=409 ...`), at WARN for a 5xx.
 
-## 0.90.6 — availability and media information stop re-reading the namespace (experiment)
+## 0.90.6: availability and media information stop re-reading the namespace (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -289,7 +289,7 @@ prune that follows every metadata change each walked the whole namespace,
 hashing every file's extent list. They ask the filesystem's index, which
 follows the tree.
 
-## 0.90.5 — maintenance follows the tree from one head to the next (experiment)
+## 0.90.5: maintenance follows the tree from one head to the next (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -305,7 +305,7 @@ of the entries that changed. The release horizon is handed the census in
 place of its own walks. The whole namespace is walked the first time, and
 again if the census and the trees ever disagree, which is logged.
 
-## 0.90.4 — the mount and the media index follow a commit's changes (experiment)
+## 0.90.4: the mount and the media index follow a commit's changes (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -331,7 +331,7 @@ of content: an id resolves while any copy remains and stops resolving when
 the last one goes, where before an id for content no longer in the namespace
 went on resolving until the next rebuild.
 
-## 0.90.3 — a catalogue write is made on this node alone (experiment)
+## 0.90.3: a catalogue write is made on this node alone (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -348,7 +348,7 @@ arrive fetches them from the node that holds them, as before.
 `dht.metadata_write_copies` now governs only the copies a merge commit seeks
 before it is accepted.
 
-## 0.90.2 — a commit's tree nodes are written on this node alone (experiment)
+## 0.90.2: a commit's tree nodes are written on this node alone (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -364,7 +364,7 @@ delta, as they already did.
 decoding it, applying the change, updating the tree, pruning conflicts,
 encoding, claims and storing, each in milliseconds.
 
-## 0.90.1 — a catalogue conflict decided for the root in place is removed (experiment)
+## 0.90.1: a catalogue conflict decided for the root in place is removed (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -383,7 +383,7 @@ not the order of events. A decision made by the author with the lesser id
 could then be taken for no decision when merged with a head still carrying
 the conflict, and the conflict came back.
 
-## 0.90.0 — a commit is made on the node that receives it (experiment)
+## 0.90.0: a commit is made on the node that receives it (experiment)
 
 No wire, protocol or on-disk format changes, and no API route or payload
 changes. One behaviour that clients can observe changes: see the first item.
@@ -434,7 +434,7 @@ heads costs what differs between them and the depth of the tree.
 renames and matches sent together run together, and namespace changes among
 them share commits.
 
-## 0.89.1 — bulk namespace changes share commits; claims stop asking about what is not there (experiment)
+## 0.89.1: bulk namespace changes share commits; claims stop asking about what is not there (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -460,7 +460,7 @@ file in that leaf, changed or not: about 280 objects for a one-file delete
 in a large directory. It now claims only the lists the leaf's counterpart
 did not already name.
 
-## 0.89.0 — two heads merge from what they hold (experiment)
+## 0.89.0: two heads merge from what they hold (experiment)
 
 A reconciliation no longer needs the common ancestor of the heads it joins,
 so history no longer decides whether a merge can be made. Each namespace
@@ -536,7 +536,7 @@ an empty map by the next mutation, which dropped records still undecided and
 kept decided ones whose ancestor was absent. Conflicts are now read from the
 namespace as the mutation leaves it.
 
-## 0.88.0 — a node carries on when another never returns (experiment)
+## 0.88.0: a node carries on when another never returns (experiment)
 
 Any node may disappear at any time and may never come back. Writes and
 deletes now proceed with the nodes that are present, reclamation and merging
@@ -651,7 +651,7 @@ than merged; merging it exactly needs the namespace format change planned
 next. History truncation still requires every known node to agree, which now
 resolves itself once an absent node is forgotten.
 
-## 0.87.3 — a peer that answered is not declared dead by a late reader (experiment)
+## 0.87.3: a peer that answered is not declared dead by a late reader (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -667,7 +667,7 @@ starts when its ping is placed, not when the pass began.
 and the case index, so two test runs on one machine, which can share a
 port block, can no longer join each other's clusters.
 
-## 0.87.2 — a session or account change is not dropped on a busy moment (experiment)
+## 0.87.2: a session or account change is not dropped on a busy moment (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -682,7 +682,7 @@ waits on a peer), and a push that could not be queued for every peer wakes
 the gossip loop, which retries at its one-second floor instead of a tick
 later.
 
-## 0.87.1 — a reconciliation says where its time went (experiment)
+## 0.87.1: a reconciliation says where its time went (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -690,7 +690,7 @@ The `metadata histories reconciled` log line gains `materialise_ms`,
 `merge_ms`, `tree_ms`, `encode_ms` and `publish_ms`: the stages of the time
 a reconciliation holds its lock.
 
-## 0.87.0 — a merge commit is published as a delta (experiment)
+## 0.87.0: a merge commit is published as a delta (experiment)
 
 No wire, protocol, API or on-disk format changes: the delta is the form
 ordinary commits already use, and a replica that cannot apply one is sent
@@ -704,7 +704,7 @@ held its lock at 0.85.0. The tree merge now applies onto the primary
 parent's tree, and its changes are the commit's delta. The reconcile log
 line says `history_body=delta` and its size.
 
-## 0.86.0 — a release's tracks, and what is pacing repair (experiment)
+## 0.86.0: a release's tracks, and what is pacing repair (experiment)
 
 No wire, protocol or on-disk changes. Two additions to what the API sends.
 
@@ -725,7 +725,7 @@ maintenance pass (`playback`, `mounted_filesystem`, `loader`,
 **The durability batch window is passed from the root** as a constructor
 parameter (500 ms, as before); it has no configuration key.
 
-## 0.85.0 — reconciliation merges trees by what differs (experiment)
+## 0.85.0: reconciliation merges trees by what differs (experiment)
 
 No wire, protocol, API or on-disk changes; a merge commit is the commit
 0.84.1 would make, so nodes on either version reconcile to the same head.
@@ -761,7 +761,7 @@ fakes at their constructor seams, with stepped time where code decides by
 elapsed time (`TimeSource`, `ClusterNode`, `StartupStallGate`,
 telemetry's `Now`): 725 cases became 499.
 
-## 0.84.1 — reconciliation is timed (experiment)
+## 0.84.1: reconciliation is timed (experiment)
 
 No wire, protocol, API or on-disk changes.
 
@@ -773,7 +773,7 @@ for the lock to reconcile or to read the result records
 under load at 0.84.0, where a background reader's reconciliation held a
 FUSE commit for 54 s.
 
-## 0.84.0 — availability is the last known answer, not `unknown` (experiment)
+## 0.84.0: availability is the last known answer, not `unknown` (experiment)
 
 No wire format or protocol changes. New on-disk file
 `<state_path>/availability/last-survey.bin`; 0.83.0 ignores it, so either
@@ -788,7 +788,7 @@ from the last survey that decided them, matched by content identity, never
 lowering a count of unavailable extents found now. `unknown` is left for
 files no survey has decided. The response shape is unchanged.
 
-## 0.83.0 — every catalogue item says how much of it can be played (experiment)
+## 0.83.0: every catalogue item says how much of it can be played (experiment)
 
 No wire format, protocol or on-disk format changes; either node can go
 back to 0.82.0 by reinstalling it.
@@ -820,7 +820,7 @@ roll-up that began while the index was still filling read the disk once
 per extent and took four minutes on a large store; it now starts when the
 index is ready and takes seconds.
 
-## 0.82.0 — what the cluster holds, by Merkle descent (experiment)
+## 0.82.0: what the cluster holds, by Merkle descent (experiment)
 
 The object ledger experiment's first consumer. One new cluster message
 (`tree_holdings`); no on-disk format changes. A node on 0.82.0 asks only
@@ -868,7 +868,7 @@ claim store, whether a staged object is claimed; object stores count their
 losses, so anything derived from what a store held can tell it has been
 overtaken.
 
-## 0.81.0 — S: every lock checked by the compiler (experiment)
+## 0.81.0: S: every lock checked by the compiler (experiment)
 
 The object ledger experiment's final sweep, begun. No wire format, protocol
 or on-disk format changes; either node can go back to 0.80.0 (or earlier)
@@ -891,7 +891,7 @@ network I/O is marked as one. The check found these faults, now fixed:
 - A node learning of itself from a peer, and a failed startup's error
   message, were each read outside the lock that guards them.
 
-## 0.80.0 — T5: contracts say what they wait on (experiment)
+## 0.80.0: T5: contracts say what they wait on (experiment)
 
 The object ledger experiment's T5, completed. No wire format, protocol or
 on-disk format changes; either node can go back to 0.79.0 (or earlier) by
@@ -923,7 +923,7 @@ node's configuration, id and membership rather than the node; every
 storage, claim, ledger, metadata and horizon contract declares what each
 operation waits on and who may call it.
 
-## 0.79.0 — T5: accounts are their own part (experiment)
+## 0.79.0: T5: accounts are their own part (experiment)
 
 The object ledger experiment's T5, continued. No wire format, protocol or
 on-disk format changes; either node can go back to 0.78.0 (or earlier) by
@@ -940,7 +940,7 @@ the first-account creation on a founding node belong to an Accounts part
 the node's root builds; Status, the session and users APIs and request
 authentication use it.
 
-## 0.78.0 — T5: the root owns local state; the node is the control plane (experiment)
+## 0.78.0: T5: the root owns local state; the node is the control plane (experiment)
 
 The object ledger experiment's T5, continued. No wire format, protocol or
 on-disk format changes; either node can go back to 0.77.0 (or earlier) by
@@ -959,7 +959,7 @@ the node keeps identity, transport, membership, accounts, telemetry and
 connectivity. Status reports the same startup fields from the root's record
 of recovery.
 
-## 0.77.0 — T5: the replica and the stores are served by their own parts (experiment)
+## 0.77.0: T5: the replica and the stores are served by their own parts (experiment)
 
 The object ledger experiment's T5, continued. No wire format, protocol or
 on-disk format changes; either node can go back to 0.76.0 or 0.75.0 by
@@ -980,7 +980,7 @@ preload) and the stores' serving side (handlers and the periodic refresh of
 their advertised figures) are their own parts, built from the node's
 recovered state.
 
-## 0.76.0 — T5: the node's parts move into the root (experiment)
+## 0.76.0: T5: the node's parts move into the root (experiment)
 
 The object ledger experiment's T5 so far: parts that lived inside the node
 are now built, owned and stopped by the node's root, and handed to whoever
@@ -1019,7 +1019,7 @@ node identity is a value the root builds; local-state figures are
 advertised to the control plane. Every code comment was cut to describe
 the code as it is.
 
-## 0.75.0 — The object ledger experiment through T4, and T5's first step (experiment)
+## 0.75.0: The object ledger experiment through T4, and T5's first step (experiment)
 
 The object ledger experiment's first deploy since 0.74.0 (T0): its steps T1
 to T4 and the first of T5's, judged in-process until now, and two FUSE
@@ -1054,7 +1054,7 @@ builder, the metadata contract, the catalogue's repair split out of the
 maintenance inventory, a resumable namespace walk, and
 `macha-metadata-dump --entries-check`.
 
-## 0.74.0 — The node measures itself to a local file (experiment)
+## 0.74.0: The node measures itself to a local file (experiment)
 
 The object ledger experiment's first version (T0 in
 `TODO/archive/2026-09-29-object-ledger-implementation-plan.md`): the code of 0.73.2
@@ -1077,7 +1077,7 @@ progress, and startup, recovery and shutdown times.
 Nothing here reaches a response body. The one visible difference is that
 Status `threads` lists the recorder's supervised thread, `observation`.
 
-## 0.73.2 — The torrent listing no longer waits on a peer (development)
+## 0.73.2: The torrent listing no longer waits on a peer (development)
 
 `GET /api/v1/torrents/jobs` took 0.6-1.7 s on fi-1 while `/torrents/status`
 and `/torrents/nodes` answered in under a millisecond. Stack traces taken
@@ -1096,7 +1096,7 @@ commit leaves more than one accepted head appears after the next background
 convergence rather than immediately. The coordinator's own passes still
 refresh.
 
-## 0.73.1 — Repair sends several objects at once and keeps its place (development)
+## 0.73.1: Repair sends several objects at once and keeps its place (development)
 
 On 0.73.0 with `idle_bandwidth_fraction: 0.9`, gbni-1 moved ~500 KB/s to
 fi-1 with full credit, no credit stops and a link that carried at least
@@ -1124,7 +1124,7 @@ The push pass's position is saved to
 pass, and at stop) and resumed after a restart by skipping that many objects
 by index.
 
-## 0.73.0 — Repair uses the link it has; nodes report their traffic by class (development)
+## 0.73.0: Repair uses the link it has; nodes report their traffic by class (development)
 
 On 0.72.1 with `idle_bandwidth_fraction: 0.5`, gbni-1's repair moved about
 10 KB/s to fi-1 over a path measured at 1.3 MB/s. In 185 s it ran 24 steps,
@@ -1173,7 +1173,7 @@ API addition (announce to Core and every client):
   `window_ms` and the rates are `null` on a node's first sample after start.
   Only Macha's traffic between nodes; HTTP to clients is not in it.
 
-## 0.72.1 — Held retention claims no longer spend repair's credit (development)
+## 0.72.1: Held retention claims no longer spend repair's credit (development)
 
 Deployed with `idle_bandwidth_fraction: 0.5`, 0.72.0 still moved no bytes on
 either node, with the credit at 0. The retention-claim walk, which runs ahead
@@ -1195,7 +1195,7 @@ The rebuild runs the catalogue's own repair, which the maintenance pass holds
 back until metadata is ready. Since 0.72.0 ran a step on every pass, that
 refreshed the catalogue ahead of the convergence it depends on.
 
-## 0.72.0 — Repair credit pays for transfers, not for finding them (development)
+## 0.72.0: Repair credit pays for transfers, not for finding them (development)
 
 **Repair no longer waits for credit before looking.** Repair earns transfer
 credit at `idle_bandwidth_fraction` of the measured link, and until now a
@@ -1218,7 +1218,7 @@ Diagnostics: `diagnostics.repair.pass_gates.credit` now counts steps that ran
 and stopped at a transfer the credit did not yet cover; `ran` counts every
 step. `share` and `quiescent` are as before.
 
-## 0.71.0 — Torrents can be added paused; a finished download shows its publication progress (development)
+## 0.71.0: Torrents can be added paused; a finished download shows its publication progress (development)
 
 **A finished download says what it is waiting for.** A torrent that has
 finished downloading is handed to the ingest only once all its verified
@@ -1245,7 +1245,7 @@ API additions (announce to Core and every client):
   published_bytes, bytes, progress_age_ms} or null; a live field under
   `live_as_of_unix_ms`) and `waiting_reason` (`extent_publication` or null).
 
-## 0.70.0 — Transcode rate facts; node names (development)
+## 0.70.0: Transcode rate facts; node names (development)
 
 **A node states how fast it has transcoded each kind of source.** Every
 transcode generation that produced at least a minute of media records its
@@ -1270,7 +1270,7 @@ API additions (announce to Core and every client):
 - Each `nodes[]` entry gains `node_name` (string, or `null` when the node has
   none; telemetry field 43).
 
-## 0.69.0 — Playback start reports progress (`start=async`) (development)
+## 0.69.0: Playback start reports progress (`start=async`) (development)
 
 **A start reports its progress and fails only when progress stops.** Opt-in
 per request: `?start=async` on a create or a `PATCH` answers `202` once the
@@ -1308,7 +1308,7 @@ API additions (announce to Core and every client):
   `startup_no_progress_ms`, `start_wait_max_ms`, `start_failed_retention_ms`
   (telemetry fields 39-41); `GET /api/v1/playback/status` carries the same.
 
-## 0.68.0 — Keyframe byte index for Direct Play (development)
+## 0.68.0: Keyframe byte index for Direct Play (development)
 
 **A Direct Play file's keyframe byte index.** A browser playing a file
 directly reports what it has buffered by mapping bytes to time linearly,
@@ -1331,7 +1331,7 @@ API additions (announce to Core and every client):
   `400 bad_media_id`, `404 not_found`, `422 keyframes_not_supported`,
   `422 keyframes_failed`.
 
-## 0.67.0 — Per-account transcode bound; metadata editor API (development)
+## 0.67.0: Per-account transcode bound; metadata editor API (development)
 
 **One account can no longer take every transcode slot on a node.**
 Transcode entitlements are per session, so an account could open sessions
@@ -1437,7 +1437,7 @@ API additions (announce to Core and every client):
 - Each node's `playback` budgets in `GET /api/v1/status` gain
   `max_transcodes_per_account` (telemetry field 38; older peers skip it).
 
-## 0.66.0 — Catalogue ignore terms; torrent jobs saved on change; shutdown order, simultaneous connects, ingest clear, empty objects (development)
+## 0.66.0: Catalogue ignore terms; torrent jobs saved on change; shutdown order, simultaneous connects, ingest clear, empty objects (development)
 
 **The cataloguer skips release samples.** `catalogue.scanner.ignore_terms`
 (default `[sample]`) lists words that keep a file out of the catalogue: a file
@@ -1515,7 +1515,7 @@ stats, or the startup accounting scan that finds one now removes it and
 reports the object absent, so repair fetches a good copy; before, a reopened
 store reported it present by name and every read of it failed.
 
-## 0.65.0 — Unknown configuration keys are refused; playback headers moved into the body (development)
+## 0.65.0: Unknown configuration keys are refused; playback headers moved into the body (development)
 
 Three custom headers had crept into playback:
 
@@ -1538,7 +1538,7 @@ Tests and documentation describe current behaviour only: tests that checked
 removed code stayed removed are gone, and the documentation no longer
 recounts superseded behaviour.
 
-## 0.64.2 — Import destinations ignore case (development)
+## 0.64.2: Import destinations ignore case (development)
 
 **A lowercase release made a second folder for one film.** The 720p
 Martian was imported into `/Movies/the martian (2015)/` beside `/Movies/The
@@ -1556,7 +1556,7 @@ are one name to anyone browsing, and to Windows, which Macha will run on.
 Case folding here is ASCII; the namespace-wide case policy the Windows port
 needs is not yet designed.
 
-## 0.64.1 — Prompt replication sends only where there is room (development)
+## 0.64.1: Prompt replication sends only where there is room (development)
 
 **gbni-1 was pushing about 2 MB/s of refused writes into fi-1.** Prompt
 replication -- the loop that copies each new object to a second owner at
@@ -1573,7 +1573,7 @@ touched fi-1 paid for it.
 - `diagnostics.prompt_replication` (`GET /api/v1/status/diagnostics`):
   `queued`, `copies`, `failures`, `skipped_no_room`, `dropped`.
 
-## 0.64.0 — Torrents belong to the cluster (development)
+## 0.64.0: Torrents belong to the cluster (development)
 
 **Cluster protocol 22: every node upgrades together.** The metadata snapshot
 now carries torrent requests (SM15/SM16, DLT9), which a protocol-21 node
@@ -1634,7 +1634,7 @@ Found watching the day's imports, fixed:
 - **Clearing a job keeps its failed catalogue hints**, the record that a file
   was never catalogued.
 
-## 0.63.0 — A faulted thread runs again or says why not; one job per torrent (development)
+## 0.63.0: A faulted thread runs again or says why not; one job per torrent (development)
 
 **The torrent worker died on gbni-1 on 2026-09-26 and nothing noticed.** A
 torrent had been added twice. libtorrent keys a torrent by its info hash and
@@ -1679,7 +1679,7 @@ API changes: new `409 torrent_already_added` on `POST /api/v1/torrents/jobs`;
 new job `error_code`s `duplicate_torrent` and `torrent_fault`; new `threads`
 array in `GET /api/v1/status`.
 
-## 0.62.3 — Why repair did not run is visible (development)
+## 0.62.3: Why repair did not run is visible (development)
 
 After 0.62.2 gbni-1's repair examined nothing at all, while the maintenance
 thread spent each pass in metadata convergence with fi-1 (about 19 s a run
@@ -1692,7 +1692,7 @@ Test-only: the cluster torrent-visibility case now waits for node 2's torrent
 subsystem before acting through it; it answered 503 "torrent subsystem is not
 available on this node" when it was still starting. 60/60 on fi-1 after.
 
-## 0.62.2 — A released torrent is not held by its own resume data; repair progress is visible (development)
+## 0.62.2: A released torrent is not held by its own resume data; repair progress is visible (development)
 
 **Smallville stayed held after 0.62.1.** Resume data restores the flags it was
 saved with, so a torrent saved while held came back paused and not
@@ -1708,7 +1708,7 @@ Correction to 0.62.1's notes: the probes and puts fi-1 kept receiving were
 mostly an import's own writes (every new extent goes to both owners), not
 repair; 0.62.1's skip covers repair only.
 
-## 0.62.1 — Repair skips a peer with no room; a staging-blocked torrent is not held at start (development)
+## 0.62.1: Repair skips a peer with no room; a staging-blocked torrent is not held at start (development)
 
 **Repair spent its whole budget on a full peer.** With repair's local check
 cheap in 0.62.0, the push pass reached fi-1: a 10G store with 81 bytes free,
@@ -1726,7 +1726,7 @@ check once its size is known, as before 0.61.0.
 
 Nothing on the wire changes.
 
-## 0.62.0 — Repair reaches what is missing; a failed torrent follows its resumed ingest (development)
+## 0.62.0: Repair reaches what is missing; a failed torrent follows its resumed ingest (development)
 
 **Repair read every extent it already had.** To decide "this node holds it",
 both repair passes read, decrypted and hashed the whole extent under a DATA
@@ -1749,7 +1749,7 @@ wakes for it.
 Nothing on the wire changes; a torrent job may now leave `failed` without a
 torrent action.
 
-## 0.61.0 — Torrents no longer re-check everything on restart, and paused means paused (development)
+## 0.61.0: Torrents no longer re-check everything on restart, and paused means paused (development)
 
 **After a restart, torrents sat in `verifying` with no progress and no ETA.**
 gbni-1, 2026-09-25: the disk backend was re-hashing a paused torrent's staged
@@ -1775,7 +1775,7 @@ it for what would have been about an hour.
   check (libtorrent checks one at a time). `verifying` is now only the check
   in progress, with `eta_seconds` estimated from the check's own rate.
 
-## 0.60.0 — Close a session from a page that is going away; leaving transcode frees the slot (development)
+## 0.60.0: Close a session from a page that is going away; leaving transcode frees the slot (development)
 
 **A page reload left its session, and the node's transcode slot, held.**
 A browser unloading a page does not complete a preflighted request, and a
@@ -1801,7 +1801,7 @@ transcode slot while watching and refused everyone else (fi-1, 2026-09-25
   same logical viewer keeps it, as with the idle release. Switching back
   reacquires it and may be refused `resource_limit`, as any `PATCH` may.
 
-## 0.59.0 — Replica repair is paced, never stopped (development)
+## 0.59.0: Replica repair is paced, never stopped (development)
 
 **Repair stopped whenever the node was busy, and gbni-1 was always busy.**
 From 0.53.0, any loader byte in the 2 s quiet window counted as busy, and a
@@ -1830,7 +1830,7 @@ on both nodes.
 
 Nothing changes on the wire.
 
-## 0.58.3 — Two files of one ingest job never share a destination (development)
+## 0.58.3: Two files of one ingest job never share a destination (development)
 
 **Rome's ingest failed `destination_conflict` on every retry.** The planner
 checked only the filesystem for a collision, so two source files of one job
@@ -1846,7 +1846,7 @@ second failed once the first was in (gbni-1, 2026-09-25, job `b0f01a83`).
 
 Nothing changes on the wire.
 
-## 0.58.2 — Torrent jobs carry their info_hash; search results backed by a .torrent can be started (development)
+## 0.58.2: Torrent jobs carry their info_hash; search results backed by a .torrent can be started (development)
 
 - **`info_hash` is set.** It was declared, serialised and persisted, and never
   assigned, so every torrent job reported `null`. It is now taken from
@@ -1867,7 +1867,7 @@ torrent was removed, has the same stack as the two shutdown aborts:
 `publisher()` -> `file_storage::file_path` on a freed torrent. 0.58.1, which
 removes that read, has been live on both nodes since 07:26Z.
 
-## 0.58.1 — A torrent's publisher no longer reads a torrent that has gone (development)
+## 0.58.1: A torrent's publisher no longer reads a torrent that has gone (development)
 
 **gbni-1 aborted on every service stop and crashed repeatedly on
 2026-09-24.** Two core dumps, captured once core files were enabled, show the
@@ -1895,7 +1895,7 @@ dropped, and it is then released. The test fails against 0.58.0. Two of the
 day's five crashes followed a finished torrent's removal within two seconds;
 whether the other three were this too, the next core will say.
 
-## 0.58.0 — The server plays what it is told and chooses nothing (development)
+## 0.58.0: The server plays what it is told and chooses nothing (development)
 
 Operator, 2026-09-24: **"The server supplies facts, operations, then does what
 it's told."** Playback is by `media_id`: a catalogue item is a title, its
@@ -1940,7 +1940,7 @@ On 2026-09-24 gbni-1 failed an ingest with "namespace node could not reach
 the metadata durability floor" while its only peer restarted. It was a bare
 `runtime_error`, so 0.57.0's block-and-retry did not apply; it now does.
 
-## 0.57.0 — A torrent is imported once it is published, and a metadata outage no longer kills an ingest (development)
+## 0.57.0: A torrent is imported once it is published, and a metadata outage no longer kills an ingest (development)
 
 Finishes stage 2 of `TODO/archive/2026-09-23-torrent-disk-backend-plan.md`, and
 ships the three fixes that plan promised with stage 1.
@@ -1992,7 +1992,7 @@ last longer or appear where they did not:
   `error_code` `metadata_unavailable` and recover by itself, where before it
   became `failed`.
 
-## 0.56.0 — Every response has a status code; codes are primary (development)
+## 0.56.0: Every response has a status code; codes are primary (development)
 
 Operator rule, 2026-09-24: **every response carries a snake_case status code,
 success included. Normal flow has the code and no message. Errors and warnings
@@ -2052,7 +2052,7 @@ for sorting and presentation; the server sends data and codes.
 A cluster-wide torrent add between peers now carries `error_code` too, so a
 refusal on the far node reaches the client as the same code.
 
-## 0.55.1 — Extent publication does not depend on piece alerts (development)
+## 0.55.1: Extent publication does not depend on piece alerts (development)
 
 **On its first real torrent, stage 2 stopped publishing at 162 of 436 extents
 and never resumed** (Trainspotting, gbni-1, 2026-09-24). The download
@@ -2076,7 +2076,7 @@ again publishes nothing twice (tested).
 the backend logs `torrent extents all published save_path=... extents=N` when
 a torrent's last extent is published.
 
-## 0.55.0 — A torrent's extents are published as they verify (development)
+## 0.55.0: A torrent's extents are published as they verify (development)
 
 Stage 2 of `TODO/archive/2026-09-23-torrent-disk-backend-plan.md`. **The torrent's
 disk backend now publishes each file-relative extent of the payload to the
@@ -2112,7 +2112,7 @@ Watch for: `ingest adopted published extents` against `could not adopt ...
 copying instead`. If publication falls behind a fast download, files still
 incomplete when it finishes are copied as before.
 
-## 0.54.1 — Artwork is downloaded once, not once a day (development)
+## 0.54.1: Artwork is downloaded once, not once a day (development)
 
 **Every artwork URL changed at UTC midnight, and every browser downloaded every
 poster again the next day.** The signed artwork URL's expiry is rounded to a
@@ -2137,7 +2137,7 @@ removes the daily expiry and the re-downloads. **It does not change how long
 a cold read takes.** That read waits behind loader I/O on a busy DATA disk
 (the loader-I/O item in `TODO/ACTIVE.md`), which is still open.
 
-## 0.54.0 — The torrent's disk I/O is macha's disk I/O (development)
+## 0.54.0: The torrent's disk I/O is macha's disk I/O (development)
 
 **libtorrent now does its file I/O through a disk backend of macha's own, and
 every read, write and hash it performs is admitted by the DATA arbiter at
@@ -2191,7 +2191,7 @@ payload is byte-identical, every admission was loader class, every credit
 came back, and delete left no payload and no open descriptor. 200/200 on
 es-1. It links libtorrent, which `macha_core` and `macha-tests` never do.
 
-## 0.53.2 — The torrent alert stream has its own log level (development)
+## 0.53.2: The torrent alert stream has its own log level (development)
 
 **`torrent.log_level`.** With the process at `DEBUG`, libtorrent's DHT and
 tracker alerts were 99,088 of the 99,187 lines in gbni-1's journal -- 99.9% --
@@ -2205,7 +2205,7 @@ torrent and DHT log categories. Like the ffmpeg bridge it emits past the
 process filter, so a node at `INFO` can still turn it on. Applies live on
 reconfigure.
 
-## 0.53.1 — A commit publishes what changed, not what exists (development)
+## 0.53.1: A commit publishes what changed, not what exists (development)
 
 **Every metadata commit re-uploaded its entire control graph to every peer, on
 every commit, whether or not the peer already held it.** `retain_control`
@@ -2220,8 +2220,8 @@ commits, pushed 5,469 control objects to peers, and grew the control store by
 zero objects.** Over two hours it pushed 8,924 against a store holding 4,162.
 All of it was already on both ends.
 
-It is the same defect 0.51.0 fixed on the replication path — "a node already
-present is not re-replicated" — which was never applied here.
+It is the same defect 0.51.0 fixed on the replication path - "a node already
+present is not re-replicated" - which was never applied here.
 
 A commit now asks each peer which of the referenced objects it is missing and
 sends only those, over a new CONTROL-plane `have_control_objects` message.
@@ -2246,11 +2246,11 @@ traffic.
 
 **And three `catch` blocks on the RPC path were discarding the reason a call
 failed**, so a self-inflicted concurrency limit reported itself as
-`no canonical RPC route to peer` — a dead network link. `peer outbound queue
+`no canonical RPC route to peer` - a dead network link. `peer outbound queue
 full` had never once been logged on any node in the cluster. The reason now
 travels with the error.
 
-## 0.53.0 — The disk resource manager, audited (development)
+## 0.53.0: The disk resource manager, audited (development)
 
 The operator called a gate on this mechanism after it had been wrong twice in
 one afternoon, and the audit found it wrong in five more places. Everything
@@ -2261,13 +2261,13 @@ cluster yet.
 model exists to replace was still live on the read path.**
 `StoragePool::get()` starts its timer before the read, because a read's size
 is only known once it has succeeded, and the `DiskServiceTimer::note_bytes()`
-call that exists for exactly that purpose was never written — anywhere in the
+call that exists for exactly that purpose was never written - anywhere in the
 tree. Every read was therefore judged against the fixed 25 ms per-operation
 overhead alone, with no per-MiB allowance at all: precisely the 0.51.0 bug
 that 0.52.0 was supposed to have removed, surviving inside the fix for it.
 
 Measured on es-1 while auditing: `sdb` serving 53.7 reads/s at 240 KB average
-and 30.9 ms average service — a healthy spinner — and the node had entered and
+and 30.9 ms average service - a healthy spinner - and the node had entered and
 left pressure **twelve times in the thirty-four minutes** since it started
 0.52.0, clamping an operator's torrent download each time, with nothing being
 watched anywhere on the cluster. `test_a_read_is_measured_with_the_bytes_it_returned`
@@ -2275,8 +2275,8 @@ drives real objects through a real pool and fails without the call.
 
 **The torrent rate clamp never had law 3's second clause.**
 `TorrentManager::follow_device_pressure()` clamped the download rate whenever
-the device was pressured. An acquisition is durable work the user asked for —
-loader class — so it yields to a slow device only when a viewer would
+the device was pressured. An acquisition is durable work the user asked for -
+loader class - so it yields to a slow device only when a viewer would
 otherwise wait for it. The arbiter was corrected for this in 0.52.0 and this
 path was not, which is what produced those twelve log lines.
 
@@ -2292,7 +2292,7 @@ not see it.
 decision was `playback_busy || interactive_busy`, fed by clocks that only
 `foreground` and `read_ahead` writes touch. An ingest is loader-class and fed
 neither, so a node importing 36 GB reported itself idle and handed maintenance
-its idle share of the spindle the import was waiting on — with
+its idle share of the spindle the import was waiting on - with
 `busy_bandwidth_fraction: 0.0` already set and unable to help. There is now a
 loader activity clock beside the two viewer ones, fed from the loader read and
 write paths, and consulted by the busy predicate, all four slice-yield
@@ -2302,7 +2302,7 @@ key off those, and conflating them would make an import look like a viewer.
 
 **A viewer between two extents is still a viewer.** "Viewer present" in the
 arbiter meant byte credit held at that instant, and playback does not hold
-credit between extents — so every gap in a stream readmitted the loader at full
+credit between extents - so every gap in a stream readmitted the loader at full
 concurrency, and the viewer's next read queued behind the extent write the gap
 had just let in. The arbiter now also consults the activity clock over
 `maintenance.foreground_quiet`, which is the window the rest of the system
@@ -2320,7 +2320,7 @@ whole reason a single-sample trip exists beside the moving average.
 **An operator can now see what the throttle cost.** `pressure_refusals` joins
 `device_pressure_onsets` on `/api/v1/status`. The counter had existed as a
 private member since the gate shipped, incremented nowhere and reported
-nowhere — which is why "is this node being throttled or is it unwell" could
+nowhere - which is why "is this node being throttled or is it unwell" could
 not be answered during the 2026-09-22 incident. `DataWorkContext::records_activity()`
 was dead in the same way and is removed.
 
@@ -2328,11 +2328,11 @@ was dead in the same way and is removed.
 recorded in `TODO/ACTIVE.md`: law 2 has no admission path to a delayed viewer
 read; law 1 holds on the hardware (control on NVMe, DATA on the spinner, on all
 three nodes) but by configuration rather than by construction; law 4 does not
-wedge, though the 150–300% hysteresis band is a latch. Two things stay open —
+wedge, though the 150–300% hysteresis band is a latch. Two things stay open -
 one monitor covers a whole `StoragePool` rather than one device, and local disk
 maintenance is still budgeted from a network bandwidth measurement.
 
-## 0.52.0 — The catalogue comes back, and disk pressure means something (development)
+## 0.52.0: The catalogue comes back, and disk pressure means something (development)
 
 Everything here fixes something 0.51.0 broke or got wrong on the live cluster
 within the hour. Recorded in the order it hurt.
@@ -2348,8 +2348,8 @@ upserts and the standing conflict set explicitly.
 
 **Disk pressure was measured against a number that had been invented rather
 than derived.** `io_pressure_target_ms: 50` compared the total time of every
-operation against one threshold, so a 4 MiB extent write — 100–200 ms on a
-healthy spinning disk — read as pressure. A node declared itself in trouble
+operation against one threshold, so a 4 MiB extent write - 100–200 ms on a
+healthy spinning disk - read as pressure. A node declared itself in trouble
 nine seconds after boot and stayed there, which held an operator's 36 GB import
 to one background lease and about 2 MB/s for an afternoon while nothing was
 being watched.
@@ -2364,14 +2364,14 @@ expectation. Setting `io_pressure_slowdown_percent: 0` disables the mechanism.
 **A single catastrophic operation trips pressure on its own**
 (`io_pressure_outlier_ms`, 2 s). The tests caught this before it shipped: the
 17.7 s extent write that prompted this whole line of work moves the ratio from
-19% to 237% against fifty healthy samples — *under* the 300% line. The ratio
+19% to 237% against fifty healthy samples - *under* the 300% line. The ratio
 catches sustained degradation and would have let the founding case through.
 
 **Law 3 is enforced instead of flattened.** "Thou Shalt Not Make The
 Ingester/Loader Wait, Unless It Would Make The Viewer Wait." 0.51.0 made the
 loader yield whenever the device was slow, with no viewer anywhere. Now the
-loader yields only when a viewer is present — waiting for credit or holding it
-— and gets its concurrency back the moment the viewer leaves. Speculative work
+loader yields only when a viewer is present - waiting for credit or holding it
+- and gets its concurrency back the moment the viewer leaves. Speculative work
 still yields on pressure alone: it sits below the loader and nobody is waiting
 for it. A viewer is never gated by pressure at all.
 
@@ -2380,12 +2380,12 @@ for it. A viewer is never gated by pressure at all.
 latency cannot be judged without knowing the size of the operations behind it.
 
 
-## 0.51.0 — The namespace tree is protected from the collector, and a slow disk stops being invisible (development)
+## 0.51.0: The namespace tree is protected from the collector, and a slow disk stops being invisible (development)
 
 **The namespace tree was collectable.** Found on the live cluster six hours
 after the cutover: the control-store live set was built from catalogue roots
 alone, and nothing walked `namespace_root`. Every tree node holding the
-namespace — the nodes that say where every file lives — was, to reachability
+namespace - the nodes that say where every file lives - was, to reachability
 GC, an unreferenced control object waiting out its grace, on all three nodes.
 It had not bitten only because `garbage_grace_ms` had been raised to 30 days
 that afternoon as a migration safety net. That accident was the whole margin.
@@ -2399,7 +2399,7 @@ catalogue shards do, found by a parallel walk that never reads a subtree both
 roots share and over-collects only in the safe direction.
 
 **A commit replicates the nodes it wrote, not the nodes it touched.** An ingest
-was crawling at 1.8 MB/s on a node at 0.5 load and 2% iowait — 2.6 hours for a
+was crawling at 1.8 MB/s on a node at 0.5 load and 2% iowait - 2.6 hours for a
 36 GB import with nothing saturated. A commit re-chunks the spine, so it put
 about a dozen nodes of which all but the changed leaf and its path were
 byte-identical to what was already stored, and each was replicated
@@ -2427,8 +2427,8 @@ unreachable target is a 409 with the reason, never a quiet local download.
 
 
 **Nothing measured disk service time.** Every bound on DATA work was declared
-up front — bytes in flight, concurrent operations, a maintenance bandwidth
-fraction — and none was derived from the device. That is how one ordinary
+up front - bytes in flight, concurrent operations, a maintenance bandwidth
+fraction - and none was derived from the device. That is how one ordinary
 ingest took a node to 91% iowait with single 4 MiB extent writes at **17.7 s**
 and twelve aborted client requests, while every byte budget was satisfied. The
 bookkeeping was right and the disk was gone.
@@ -2439,13 +2439,13 @@ an EWMA with hysteresis, fed from `StoragePool`'s `put`, `put_deferred` and
 timer thread. It sits on the pool rather than in `LocalStore` because the
 contended thing is the physical DATA backends: the control store is a different
 device and must not be gated by their pressure, which is exactly what the
-2026-09-20 measurements turned on — 3.3 ms on NVMe against 7.8 s on sdb1, same
+2026-09-20 measurements turned on - 3.3 ms on NVMe against 7.8 s on sdb1, same
 lane, same workers, same moment.
 
 **DATA admission consults it.** While a device is pressured, loader and
 speculative admission for it is held to `io_pressure_min_background` leases.
 **A viewer is never gated by pressure**: if the disk is slow, the person waiting
-on it gets all of it. Law 3 is kept — bounded, never stopped — so a loader that
+on it gets all of it. Law 3 is kept - bounded, never stopped - so a loader that
 is itself the reason the disk is busy drains at a trickle instead of
 deadlocking on its own publication.
 
@@ -2482,12 +2482,12 @@ the wrong shape. A live torrent download is the right shape, and that test is
 next rather than claimed.
 
 
-## 0.50.1 — What the cutover found in its first two minutes (development)
+## 0.50.1: What the cutover found in its first two minutes (development)
 
 **The live cluster was re-rooted onto the tree at 12:41Z on 2026-09-22**, all
 three nodes, generation 35503 becoming 35504: a 22.79 MiB record becoming
 3.97 KiB over 5,221 entries and 473,923 extents. All three computed the
-identical record independently — same head, same tree root, same record hash,
+identical record independently - same head, same tree root, same record hash,
 on three machines in three countries with no coordination between them. Both
 defects below were found by watching the result rather than by reasoning about
 it, and both are fixed here.
@@ -2496,8 +2496,8 @@ it, and both are fixed here.
 migrated head, adopted the namespace once, and then never saw another: a
 directory created on es-1 was in gbni-1's metadata, at the same root, and
 absent from its mount. Both witnesses that answer "has the namespace changed"
-compared entry maps — `MetadataManager`'s cache witness and
-`metadata_namespace_signature` — and under SM14 both maps are empty, so every
+compared entry maps - `MetadataManager`'s cache witness and
+`metadata_namespace_signature` - and under SM14 both maps are empty, so every
 change reported as no change. A mount that stops seeing remote writes, and a
 catalogue that stops discovering them, silently and permanently. Both now
 compare the root, which is what the design was for: the namespace's identity is
@@ -2508,7 +2508,7 @@ cheaper than the map comparison it replaces.
 rejected; retrying full record` warnings in the first minute, one per commit.
 The replica keeps a delta body only if replaying it reproduces the record byte
 for byte, and that replay re-encodes the successor through the delta-versioned
-encoder, which reached for the SM13 encoder — which refuses a namespace root.
+encoder, which reached for the SM13 encoder - which refuses a namespace root.
 The fallback to a full record is correct and did its job; it is also not the
 point of having deltas. Tree-backed successors now encode as SM14.
 
@@ -2519,7 +2519,7 @@ its mount. The first one in particular was invisible from the node doing the
 writing, because that node's FUSE frontend already had the change locally.
 
 
-## 0.50.0 — The namespace can be re-rooted onto the tree (development)
+## 0.50.0: The namespace can be re-rooted onto the tree (development)
 
 **`macha-namespace-migrate` re-roots one stopped node's namespace onto the
 content-addressed Merkle tree, and a node that has been migrated serves and
@@ -2586,7 +2586,7 @@ have. The previous checkpoint, journal, history, heads and acceptance proof are
 quarantined under `.pre-migration.<ns>` rather than deleted.
 
 
-## 0.49.1 — The namespace read and written through one door (development)
+## 0.49.1: The namespace read and written through one door (development)
 
 **Nothing in this release is reachable in production, and that is deliberate.**
 0.49.0 added the SM14 record shape; this adds the machinery that a record with
@@ -2644,7 +2644,7 @@ to stat data needs an audit of what callers do with the entry rather than what
 the FUSE path does with it.
 
 
-## 0.49.0 — A record that points at the namespace (development)
+## 0.49.0: A record that points at the namespace (development)
 
 **The metadata record can now be a pointer to the namespace rather than the
 namespace itself.** SM14 carries the non-entry fields plus a 32-byte
@@ -2672,7 +2672,7 @@ over to it is the one after that.
 the mixed state rather than resolving it: `encode_snapshot` will not drop a
 root it has no field for, and `encode_snapshot_v14` will not drop entries it
 would leave behind. The failure being designed out is publishing an empty
-namespace under a valid-looking hash — durable, silent, and indistinguishable
+namespace under a valid-looking hash - durable, silent, and indistinguishable
 from a library that was deleted.
 
 **The "missing root" check moved to the reader that holds a node store.**
@@ -2683,8 +2683,8 @@ check would reintroduce exactly the materialisation this removes, so
 
 The acceptance is a byte-exact round trip. A snapshot with garbage, node
 status, identity resets, merge parents, the write floor, the participant
-roster, the branch floor and the retention baseline all populated — detached,
-encoded as SM14, decoded, reattached — re-encodes to the original SM13 payload
+roster, the branch floor and the retention baseline all populated - detached,
+encoded as SM14, decoded, reattached - re-encodes to the original SM13 payload
 byte for byte, which covers every field without enumerating them. Separately,
 and proved by counting store reads rather than asserted: a `getattr` answered
 from a decoded SM14 record reads at most `depth` nodes, fetches no extent
@@ -2698,22 +2698,22 @@ field and moving the namespace out of the record are two decisions, and only
 one of them belongs to this work.
 
 The SM14 garbage reserve is bounded by `Reader::remaining()` rather than by
-the count in the payload — the same defect the node decoder carried and which
+the count in the payload - the same defect the node decoder carried and which
 reading it, not fuzzing it, found.
 
 
-## 0.48.2 — Things a node can say about itself (development)
+## 0.48.2: Things a node can say about itself (development)
 
 **Timestamps in the journal are UTC and say so.** Every line now reads
 `2026-09-21 18:45:44Z` instead of node-local time with no offset. This cluster
-spans timezones by design — es-1 on CEST, fi-1 on EEST, gbni-1 on BST — so
+spans timezones by design - es-1 on CEST, fi-1 on EEST, gbni-1 on BST - so
 every cross-node correlation is a subtraction between two journals, done by
 hand, usually during an incident. On 2026-09-21 that cost an hour: `18:45:44`
 on es-1 and `19:45:44` on a client's screen were the same instant, and only a
 recognisable event sequence made it cheap to spot. The operator's ruling the
 same day: *"Macha absolutely needs to handle multiple timezones across sites.
 They WILL be in different timezones. We should be using hard Zulu, UTC."* The
-wire was already unambiguous — everything on it is `*_unix_ms` — so this is
+wire was already unambiguous - everything on it is `*_unix_ms` - so this is
 the half people read catching up.
 
 **The block cache reports what it has done, not only how full it is.** `hits`,
@@ -2722,7 +2722,7 @@ block of `GET /api/v1/status`.
 
 Until now `blocks()` was the entire observable surface of that cache and it
 counts writes alone, so a cache that had never returned a single byte reported
-identically to one working perfectly — on telemetry, on the status API and in
+identically to one working perfectly - on telemetry, on the status API and in
 the logs alike. Answering "is it serving anything?" took an hour of manual
 measurement against a live node. It matters most where there is least to see:
 on a node with `hosts_extents: false` the block cache is the only reason it can
@@ -2747,7 +2747,7 @@ exists to expose.
 root, matching the `id` already in `nodes[]`. A client configured with one
 address polls this and gets a cluster snapshot in which nothing says which of
 those nodes produced the response, so a machine reached by two addresses is
-counted as two nodes — live on this cluster, `http://10.44.1.50:7438` and
+counted as two nodes - live on this cluster, `http://10.44.1.50:7438` and
 `https://macnessa.macha.network` are both gbni-1. Anything grouping by node
 double-counts it, a failover can "move" to the machine it just left, and a node
 selector offers the same box twice. `api_endpoint` cannot serve the purpose,
@@ -2755,7 +2755,7 @@ because it is the node's own advertised name, which by definition differs from
 the address the client used in exactly the case that matters.
 
 
-## 0.48.1 — What testing 0.48.0 found (development)
+## 0.48.1: What testing 0.48.0 found (development)
 
 Every item here is a defect in 0.48.0 that its own testing exposed, found in
 one afternoon of four client sessions exercising the new routes against the
@@ -2765,8 +2765,8 @@ live cluster. 0.48.0 itself is unchanged and stays as released.
 **A transcode entitlement is released after five minutes with no stream
 activity, instead of being held until the session is erased.** This one
 predates 0.48.0 and was merely found by testing it: the entitlement outlived
-its own pipeline by `session_idle_ms` — thirty minutes against sixty
-seconds — so on a node where `max_video_transcodes` is 1, one client that
+its own pipeline by `session_idle_ms` - thirty minutes against sixty
+seconds - so on a node where `max_video_transcodes` is 1, one client that
 crashed, was force-stopped or was reaped in the background closed that node to
 transcoding for everybody for half an hour. Measured on fi-1 on 2026-09-21: 57
 session creates, zero deletes, and three separate client sessions refused a
@@ -2781,7 +2781,7 @@ outlives it and it never fires at all.
 contract clients need.** Polling a session keeps the session alive and is
 deliberately not evidence that anyone still wants media, which is the question
 the entitlement answers. So: **to hold a transcode slot across a pause, ask for
-a stream object inside the window — fetching the playlist is enough and costs
+a stream object inside the window - fetching the playlist is enough and costs
 no media bytes.** A viewer paused for longer loses the entitlement and
 reacquires it on resume, where it may be refused. The session itself is
 untouched: id, position, plan and capability all survive to `session_idle_ms`.
@@ -2794,11 +2794,11 @@ that outage was none of those.
 
 **`resource_limit` carries failure axes at last, and they differ by path.** It
 carried none at all, which left the one refusal a client can act on as the one
-saying least — the account cap beside it states scope, health and its own
+saying least - the account cap beside it states scope, health and its own
 limit. On **create** it is now `scope: node`: no session exists yet, so trying
 another node costs nothing and is right. On **update** it is `scope: request`,
 because the session already exists here and is still serving its current
-generation — walking would mean abandoning something that works to rebuild it
+generation - walking would mean abandoning something that works to rebuild it
 elsewhere, and a client cannot take a session with it. Both carry
 `node_healthy: true` and `alternative_may_succeed: true`; on the update path
 the alternative is a different instruction against this same node, a remux
@@ -2807,7 +2807,7 @@ instead of a transcode or a lower height.
 **Two more fields reach the per-node `playback` block of
 `GET /api/v1/status`.** `transcode_entitlement_idle_ms`, so a client can time
 its keep-alive against the node it is actually on rather than a hardcoded
-guess. And `max_sessions`, the node-wide cap — 0.48.0 published the per-account
+guess. And `max_sessions`, the node-wide cap - 0.48.0 published the per-account
 half and not this one, which left a client able to say "another screen on this
 account is playing" and unable to say "this node is full". Both are additive
 under TEL3 and an older node simply omits them.
@@ -2823,11 +2823,11 @@ contradicting it.
 
 **Keep `max_sessions` above `max_sessions_per_account` on every node.**
 Otherwise the node-wide limit refuses first and the distinction between the two
-429s — which mean opposite things to a client — is lost in the one case it
+429s - which mean opposite things to a client - is lost in the one case it
 exists for.
 
 
-## 0.48.0 — A playback session is a resource (development)
+## 0.48.0: A playback session is a resource (development)
 
 **This release breaks the client contract on purpose, and there is no
 dual-serve window.** Every node is under our control, there is no fallback to
@@ -2839,13 +2839,13 @@ to `/api/v1/playback/sessions` creates a member every time, and returns `201`
 with a `Location`. Two `POST`s on one token are now two live sessions with
 different ids, both streaming. Before, the server keyed a session on the
 authenticated API session and a second `POST` silently superseded whatever that
-token was playing — which is not what `POST` to a collection means, and is why
+token was playing - which is not what `POST` to a collection means, and is why
 a client could not hand a viewer's playback from one device to another.
 
 **`GET /api/v1/playback/sessions` lists the caller's own sessions**, under
 `items`. This is the piece that unblocks handover: it did not exist, and
 without it a client that lost an id could not find its own session again. It
-lists that caller's sessions on that node and nothing else — there is no
+lists that caller's sessions on that node and nothing else - there is no
 cluster-wide listing, because a session is a resource of the node producing it.
 
 **The stream moved under the session it belongs to.**
@@ -2867,7 +2867,7 @@ hold on one node; over it, creation is refused `429` with code
 **`account_session_limit`**, `scope: request`, `node_healthy: true`, and both
 the limit and the caller's live count stated. This is not an optional extra.
 `max_sessions` is node-wide only, and the one-session-per-bearer rule had been
-doing the per-account job by accident — removing it without a cap is exactly
+doing the per-account job by accident - removing it without a cap is exactly
 the media DoS that governs this design. Transcode entitlements share the cap's
 key, so splitting one viewer into several sessions does not multiply them.
 
@@ -2878,13 +2878,13 @@ would walk to. Charging every healthy node it tries turns one account hitting
 its own cap into a cluster that looks like it is failing.
 
 **Keep `max_sessions` above `max_sessions_per_account`.** Otherwise the
-node-wide limit refuses first and the account cap can never be reached — which
+node-wide limit refuses first and the account cap can never be reached - which
 loses the distinction above in the one case it exists for. The shipped example
 config now pairs 64 node-wide with 32 per account; the compiled defaults are 8
 and 32, so a node running the default `max_sessions` must raise it.
 
 **A superseded generation answers `410 generation_superseded`.** It carries
-`scope: request`, `node_healthy: true` and `alternative_may_succeed: true` —
+`scope: request`, `node_healthy: true` and `alternative_may_succeed: true` -
 this node is healthy, and a different request against this same node works.
 Held back from 0.47.0 until macha-client-core shipped tolerance, because core
 maps an unrecognised fragment status to `unknown` and reads `unknown` as
@@ -2894,7 +2894,7 @@ so no client is ever pointed at a node whose statuses it cannot classify.
 
 Before this, a replaced generation and a segment index that never existed
 shared one `404`. Under the new routes a superseded generation stops being
-exotic — every regenerate, mode switch and rebuilding seek makes one — so the
+exotic - every regenerate, mode switch and rebuilding seek makes one - so the
 old behaviour would have turned a routine event into evidence against a healthy
 node. A generation *above* the current one still answers `404`: nothing here
 ever produced it.
@@ -2910,7 +2910,7 @@ it is self-healing and does not recur.
 The format it replaces worked between peers of one version and broke across
 two, which is the only time a wire format matters. Fields were appended in
 order and optional trailing ones were detected by asking whether any bytes
-remained — which, in a set of up to 64 records on the gossip path, is the next
+remained - which, in a set of up to 64 records on the gossip path, is the next
 record. One added field cost a mixed-version cluster every multi-node telemetry
 set it exchanged. Tags also buy smaller packets, since a default-valued field
 is now omitted entirely.
@@ -2920,8 +2920,8 @@ is now omitted entirely.
 `session_idle_ms`. A client learns them about every node it might fail over to
 rather than only the one it is talking to, and stops holding private copies of
 this node's configuration. The account's live **count** is deliberately not
-there — it is the most perishable number this API carries and that payload is
-cached — so it appears only where it is computed live: on creation, on the
+there - it is the most perishable number this API carries and that payload is
+cached - so it appears only where it is computed live: on creation, on the
 listing, and on the refusal.
 
 **Security review of the whole `/api/v1/playback` prefix**, with four fixes:
@@ -2929,7 +2929,7 @@ listing, and on the refusal.
 - **The session control routes had no ownership check.** `GET`, `PATCH` and
   `DELETE` looked a session up by id and acted on it without asking who was
   calling, so any authenticated account that learned an id could read, re-seek
-  or delete another viewer's session mid-film — and free their cap slots.
+  or delete another viewer's session mid-film - and free their cap slots.
   Latent before, because an id was only ever known to the client that made it;
   practical now that a listing hands ids out. All three check ownership and
   answer **404, not 403**: whether an id exists here is not something one
@@ -2941,12 +2941,12 @@ listing, and on the refusal.
   sessions past it.
 - **The authentication exemption and the router disagreed about what a stream
   URL is.** The exemption matched `/stream/` anywhere after the session id
-  while the router required it as the next segment — a path exempt from the
+  while the router required it as the next segment - a path exempt from the
   bearer but routed elsewhere is an authentication bypass. Both now call one
   `parse_stream_route`.
 - **Idempotency keys were a global namespace.** Any account could occupy
   another's key (`retry-1` is not hard to guess) and turn its legitimate retry
-  into a `409` — a targeted denial of the retry path, which is the path a
+  into a `409` - a targeted denial of the retry path, which is the path a
   client is on when something has already gone wrong. Keys are now scoped per
   account.
 
@@ -2957,14 +2957,14 @@ why this was recorded rather than rushed, but the compare costs the same either
 way.
 
 **`GET /api/v1/playback/status` exposes node aggregates to any `media_viewer`**
-— session count, transcode load, cached probe bytes, and now the cap limit.
+- session count, transcode load, cached probe bytes, and now the cap limit.
 This is a deliberate disclosure, accepted for a household system and useful to
 clients, recorded here so it is a decision rather than a discovery.
 
 **The shared codec stops copying what it only reads.** `view()` and
 `view_bytes()` return a borrowed span rather than a `Bytes`; `raw()` and
 `bytes()` keep copying, because plenty of callers hand the result onwards and
-a span into an RPC payload must not outlive the decode — the borrow is opt-in
+a span into an RPC payload must not outlive the decode - the borrow is opt-in
 at the call site that knows its own lifetime. `string()` went through an
 intermediate `Bytes` and copied twice, which is not free across the thousands
 of names in a metadata snapshot. Telemetry decode now borrows throughout: at
@@ -2972,7 +2972,7 @@ up to 64 records, one allocation per record became none. What owns its storage
 and outlives the buffer still copies once, into the thing that owns it.
 
 
-## 0.47.0 — How fast this node is actually producing (development)
+## 0.47.0: How fast this node is actually producing (development)
 
 **A client can now tell whether a handover would close the gap before the
 viewer reaches it, from one response.** `stream.production` is on the playback
@@ -3020,7 +3020,7 @@ waiting for its viewer.
 Documented in `docs/streaming.md` under "How fast this generation is
 producing".
 
-## 0.46.3 — The laws the code already obeyed (development)
+## 0.46.3: The laws the code already obeyed (development)
 
 **Three laws order every scheduling decision in this system and none of them
 were written down anywhere a reader could reach.** They were stated once, in
@@ -3099,7 +3099,7 @@ inversion in `validate_config` is the other half and is not in this release.
 
 Documentation only. No behaviour changed and no code touched.
 
-## 0.46.2 — The budgets a node will admit to (development)
+## 0.46.2: The budgets a node will admit to (development)
 
 **A client had to guess how long this node would take, and guessed low.** Core
 carried `GENERATION_ATTEMPT_BUDGET_MS = 12000` against a hardcoded guess at our
@@ -3163,7 +3163,7 @@ verification is done -- and the recorded client contract said the same wrong
 thing. Both now describe the route as it behaves, and the rule that still holds
 is stated separately: no node identity, no topology, no configuration.
 
-## 0.46.1 — The profiles a restart used to throw away (development)
+## 0.46.1: The profiles a restart used to throw away (development)
 
 **A media profile computed but not yet published was discarded on shutdown.**
 `PlaybackManager::stop()` requests the publisher thread to stop and joins it;
@@ -3217,7 +3217,7 @@ produced failures in three runs out of twelve. Four other tests share the
 `metadata replica set forming` race and are not fixed here; the helper they
 need now exists.
 
-## 0.46.0 — A seek goes where it was asked to go (development)
+## 0.46.0: A seek goes where it was asked to go (development)
 
 **A seek no longer starts after the position it was asked for.** A remux seek
 started *later* than the request, by up to 9.3 s, always forward: the planner
@@ -3229,8 +3229,8 @@ viewer has actually reached, it deletes content mid-playback.
 
 Measured on 2026-09-17 against es-1 and fi-1, remux, a 3,951,957 ms title:
 asked for 2,027,092 ms the node started at 2,028,903; asked for 908,791 it
-started at 918,085. The alignment is deterministic — asked for 2,926,000 the
-node returned 2,934,933 to 147 consecutive requests over 33.3 s — so a client
+started at 918,085. The alignment is deterministic - asked for 2,926,000 the
+node returned 2,934,933 to 147 consecutive requests over 33.3 s - so a client
 bound that rejects a start more than one segment ahead cannot make progress.
 That is how this became a livelock rather than an inconvenience. It was
 confirmed independently of any server log: the browser's media element reported
@@ -3246,10 +3246,10 @@ though it were what was asked for.
 **Three flat fields on the playback session payload**, present on create and on
 every `PATCH`, all milliseconds on the title's timeline:
 
-- `seek_ms` — where the generation's media actually begins. This is exactly
+- `seek_ms` - where the generation's media actually begins. This is exactly
   what the field has always meant, so no existing client changes behaviour.
-- `seek_offset_ms` — how far into that generation the requested position sits.
-- `seek_requested_ms` — the position the server honoured, after clamping to
+- `seek_offset_ms` - how far into that generation the requested position sits.
+- `seek_requested_ms` - the position the server honoured, after clamping to
   `[0, duration - 1 ms]`.
 
 The invariant is `seek_ms + seek_offset_ms == seek_requested_ms`, exactly, in
@@ -3257,7 +3257,7 @@ integer milliseconds, with no tolerance and no rounding slack. `seek_offset_ms`
 is never negative, so a generation always contains the position asked for.
 `seek_requested_ms` exists because an exact invariant is only useful if a client
 can act on it being violated, and without it a client cannot distinguish a
-violation from an ordinary clamp near the end of a title — those want opposite
+violation from an ordinary clamp near the end of a title - those want opposite
 handling. Core's phrasing for the rule it keeps rediscovering: an unanswered
 question must not read as an answer.
 
@@ -3270,9 +3270,9 @@ when the mode can be frame-accurate, and a client that wants a cheap,
 exactly-aligned seek asks for a position that already is a keyframe.
 
 **The transcode paths stop snapping entirely.** They snapped forward to spare
-the decoder its pre-roll on slow software decode. The pre-roll is still paid —
+the decoder its pre-roll on slow software decode. The pre-roll is still paid -
 the decoder seeks back to the preceding keyframe and discards frames before the
-origin — but it is the price of asking for a non-keyframe and it is the
+origin - but it is the price of asking for a non-keyframe and it is the
 client's to pay, whereas snapping lost content. `nearest_keyframe_at_or_after`
 is gone.
 
@@ -3281,7 +3281,7 @@ back to transcode where no keyframe at or before the request existed. The
 operator rejected that outright, and correctly: it is the same second-guessing
 as moving the seek, and it would trade picture quality and CPU for a case the
 client did not ask about. Where the index names no keyframe at or before the
-request, the baseline is 0 and the offset carries the whole request — a
+request, the baseline is 0 and the offset carries the whole request - a
 decodable stream's first sample is necessarily a sync sample, so a copy can
 always begin at the beginning; the index simply did not name it. In practice
 unreachable, since a file's first frame is virtually always indexed; it exists
@@ -3291,7 +3291,7 @@ so the invariant needs no escape hatch.
 index's shape is now logged on a plan that succeeds, not only on one that is
 rejected: entries, longest gap, median gap. `video_keyframe_seconds` reads the
 demuxer's index, which for Matroska is the Cues, and Cues are not obliged to
-name every keyframe — so an observed spread is an upper bound on the true GOP,
+name every keyframe - so an observed spread is an upper bound on the true GOP,
 and offsets clustering well below the indexed gaps mean the Cues are sparse
 rather than the GOP long. Separately, the seek fast path declined silently:
 across a whole day on es-1 there were zero `seek fast-path` lines and nothing
@@ -3303,12 +3303,12 @@ taken on the live cluster, and `indexed_plan`'s 90 s fragment and tail bounds
 are whole-file, so a sparser GOP anywhere in a long title can reject a seek
 point that would play perfectly well. The transcode branch of `reseek_hls_vod`
 already carried a comment warning of exactly that; it was never applied to the
-remux branch. Named as a decline reason rather than asserted as the cause — the
+remux branch. Named as a decline reason rather than asserted as the cause - the
 diagnostics above will settle it. Measured cost while it is broken: 147
 `session-update` calls in 34.7 s, 34.68 s of cumulative server time, ~4.2/s on
 a node also serving viewers, none of them individually slow.
 
-## 0.45.0 — The look-ahead the node actually has (development)
+## 0.45.0: The look-ahead the node actually has (development)
 
 **The playback session now says how far ahead of the viewer it is producing.**
 `stream.look_ahead_ms` is on the session payload from `POST
@@ -3331,18 +3331,18 @@ refused at the frontier for the difference.
 was.** On es-1, where the freeze was measured, `max_ahead_segments` is
 explicitly 8 and `segment_duration_ms` 4000, so the client's assumed constant
 was correct and the frontier really was 32 s wide. The client used the right
-number and arrived past the frontier anyway. Those call for different fixes —
+number and arrived past the frontier anyway. Those call for different fixes -
 "the client had the wrong constant" is fixed by putting the value on the wire,
 "the client arrived past a correctly-read frontier" is fixed in the client's
-recovery path — and both were needed. Recorded because the first draft of this
+recovery path - and both were needed. Recorded because the first draft of this
 entry conflated them, and the distinction is the more useful half.
 
 The bug: a client recovering a reaped play session created a replacement, held
 it 28 s while the viewer played out its buffer, and then asked for the fragment
 at the position the viewer had reached. Measured on es-1 at 12,749 ms of frozen
 picture. Nothing was wrong with the node. Creation already starts the pipeline
-— `create` calls `start_pipeline` before it answers, and blocks on the first
-fragment, 1,924 ms in the captured trace — and the generation was still warm
+- `create` calls `start_pipeline` before it answers, and blocks on the first
+fragment, 1,924 ms in the captured trace - and the generation was still warm
 after the hold. But warming fragment 0 authorises production only as far as
 fragment 8, the viewer arrived past that, and the node encoded its way forward
 at roughly real time: 6.27 s and 7.59 s for single fragments, refused with
@@ -3354,8 +3354,8 @@ in step with ours, and the derived figure stays meaningful if this bound ever
 stops being counted in segments.
 
 **`docs/configuration.md` now documents the fragment-production knobs at all**
-— `segment_duration_ms`, `max_ahead_segments`, `segment_hold_window`,
-`segment_memory_bytes`, `max_session_holds` and `max_concurrent_holds` — with
+- `segment_duration_ms`, `max_ahead_segments`, `segment_hold_window`,
+`segment_memory_bytes`, `max_session_holds` and `max_concurrent_holds` - with
 what the look-ahead is, why the hold window matches it, and that
 `hold_timed_out` is a retryable `500` with `Retry-After: 1` rather than a
 `404`: the playlist has already promised the fragment exists, and a `404`
@@ -3364,7 +3364,7 @@ invites an intermediary to cache the absence.
 Nothing about production timing, admission or the transcode entitlement
 changed. This release adds a field and a page of documentation.
 
-## 0.44.0 — The bytes that never needed to be on the wire (development)
+## 0.44.0: The bytes that never needed to be on the wire (development)
 
 **The HTTP server compresses what it sends.** It did not, at all: there was no
 `Content-Encoding` on any response, and the `Accept-Encoding` every browser
@@ -3372,7 +3372,7 @@ sends on every request was parsed into the header map and then ignored. A web
 client bundle and a catalogue listing both went out in full, on every request,
 including to clients on the other end of a WAN link.
 
-Text responses are now gzipped on a lane worker — JSON from the API, and the
+Text responses are now gzipped on a lane worker - JSON from the API, and the
 client's HTML, CSS and JavaScript. Typical listings and bundles fall to
 between a quarter and a third of their size. Compression happens on the
 compute pool and never on the reactor, which may not do CPU work on a
@@ -3382,7 +3382,7 @@ and `Content-Length` is already the compressed length.
 **Media is deliberately untouched, and that is the point.** An extent, a
 transcoded fragment and a direct-play range are already compressed, they are
 served through a body source rather than a byte buffer, and the reactor sends
-them straight from resident memory with no copy and no pool hop — the path
+them straight from resident memory with no copy and no pool hop - the path
 0.43.0 exists to provide. Only a complete in-memory body of a compressible
 type is ever eligible, so that path is bit-for-bit what it was. Ranged and
 `304` responses are excluded outright, images, fonts and wasm by type.
@@ -3393,7 +3393,7 @@ none, an asset up to `compression_max_asset_bytes` is compressed on demand
 instead, so a node gets the win without waiting on a client release. The two
 representations never share an entity tag: one tag for two different bodies
 lets a cache hand a client bytes it cannot read and makes a `304` a lie. The
-API's own `rev-N` tags are left exactly alone — those are `If-Match`
+API's own `rev-N` tags are left exactly alone - those are `If-Match`
 concurrency tokens a client sends back on a write, not cache validators, and
 the suffix convention other servers use would have corrupted them. Every
 compressible response carries `Vary: Accept-Encoding` whether or not it was
@@ -3403,17 +3403,17 @@ All of it is configurable under `catalogue.api`: `compression`,
 `compression_min_bytes`, `compression_level` and
 `compression_max_asset_bytes`. A node behind a proxy that already compresses
 sets `compression: false`, which is a supported deployment rather than a
-degraded one — some nodes are exposed directly and some are not, so the server
+degraded one - some nodes are exposed directly and some are not, so the server
 has to be correct either way. `responses_compressed` and
 `compression_bytes_saved` in the diagnostics route say what it is doing.
 
-## 0.43.1 — The namespace stops paying for slots it never fills (development)
+## 0.43.1: The namespace stops paying for slots it never fills (development)
 
 **A decoded namespace no longer carries up to 2x allocator slack in its extent
 vectors.** `entry(Reader&)` filled each entry's extent list with `push_back` and
 no `reserve`, so every vector sat wherever geometric growth had last doubled it.
 Measured on es-1 (1.618 TiB of library, 4,808 entries): **610,567 extent slots
-holding 424,222 extents** — 10.4 MB of empty slots in a 36 MB snapshot. That
+holding 424,222 extents** - 10.4 MB of empty slots in a 36 MB snapshot. That
 slack is permanent rather than transient, because the current and committed
 materialisations are pinned in the replica's cache and exempt from its eviction
 budget (`src/metadata.cpp:3203`), so it is resident on every node for as long as
@@ -3427,9 +3427,9 @@ is roughly 640 MB per node. No encoding changed, no format version moved and no
 migration is involved: the same bytes decode to the same snapshot, in less
 memory.
 
-`macha-metadata-dump --stats` now also reports what a head actually costs —
+`macha-metadata-dump --stats` now also reports what a head actually costs -
 decoded bytes, encoded payload, extent slots against extents in use, the
-relevant `sizeof`s, and bytes per TiB of library — and `snapshot_resident_bytes`
+relevant `sizeof`s, and bytes per TiB of library - and `snapshot_resident_bytes`
 is exposed from `metadata.hpp` so the tool charges exactly what the
 materialisation cache charges. This is the measurement behind Stage A of
 `TODO/archive/2026-09-17-namespace-merkle-root-plan.md`, which the same numbers say is
@@ -3449,10 +3449,10 @@ it. Test configurations now set an engaged but empty path, which is the only way
 to say "builtin subsystems only".
 
 The quickstart now names the build dependencies as a copyable command per
-distribution — Debian/Ubuntu, Fedora and macOS (Homebrew) — instead of describing
+distribution - Debian/Ubuntu, Fedora and macOS (Homebrew) - instead of describing
 them in prose and leaving the package names to the reader.
 
-## 0.43.0 — The HTTP server without a thread per connection (development)
+## 0.43.0: The HTTP server without a thread per connection (development)
 
 **The API is served by one reactor thread that owns every socket and never
 waits, two bounded pools that only compute, and continuations for the
@@ -3588,7 +3588,7 @@ deliberately: `sendfile`, a second reactor, HTTP/2, in-process TLS, and the
 RPC transport, which is also thread-per-connection and could take the same
 design later.
 
-## 0.42.1 — The health route says what it is (development)
+## 0.42.1: The health route says what it is (development)
 
 **`GET /api/v1/health` now identifies the server.** The body gains a
 `service` field, the literal string `macha`, and a `version`, alongside the
@@ -3604,7 +3604,7 @@ and identification is what a client needs when a person types an address into
 an endpoint box, or when a web build probes its own origin for an API. The
 case that prompted this: macha-client's own deployment requires the web host
 to serve `index.html` for unknown application paths, so a host serving the
-client but *not* running Macha answers this route with `200 text/html` — and
+client but *not* running Macha answers this route with `200 text/html` - and
 core's `checkEndpointConfiguration`, which confirms an endpoint on
 `response.ok` alone, would adopt it and then fail every call against a pile of
 HTML. Core already ships an `unconfirmed` result meaning "reached, but it did
@@ -3622,21 +3622,21 @@ no build, on the grounds that it needs no token and so tells an
 unauthenticated caller which known defects apply. The decision taken, and the
 reason, are recorded at `health_response()` and in that test rather than left
 to be rediscovered: `service` already names the product, and anyone reading
-that will try the known Macha exploits regardless — the version narrows which
+that will try the known Macha exploits regardless - the version narrows which
 one they reach for, not whether they try. What it genuinely buys an attacker
 is a way to index *unpatched* hosts at scale, which is a mass-scanner's
 economics and not this project's threat model.
 
 What stays out is the cluster's shape: no node id, no topology, no
 capacities. That is what `view_status` is for. A client must gate on `service`
-alone — asserting on `version` would break it every release — and the client
+alone - asserting on `version` would break it every release - and the client
 team has confirmed it does.
 
 Nothing else about the route changed: still no session and no role (it is the
 first bearer-auth exemption, checked ahead of the readiness gate), still the
 same three states with `200` for `ok` and `503` for `starting` and `failed`,
 still the cluster-wide CORS headers with `Access-Control-Allow-Origin: *`, and
-still no `Cache-Control` — clients should keep sending `no-store`.
+still no `Cache-Control` - clients should keep sending `no-store`.
 
 Mixed fleets need no flag day. The route itself dates from 0.38.5 (before that
 a node answers `401`, because auth runs ahead of routing, which is not
@@ -3645,9 +3645,9 @@ identification and simply will not be adopted), and the client rule is "if
 
 Tested end to end against a real `Service` over HTTP with no bearer token, in
 both the starting and the serving state, using the existing control-plane
-startup gate to catch the `503` — the state that is otherwise never exercised.
+startup gate to catch the `503` - the state that is otherwise never exercised.
 
-## 0.42.0 — Nodes that cannot be connected to (development)
+## 0.42.0: Nodes that cannot be connected to (development)
 
 **A node behind CGNAT is a full participant, and an edge node can store
 nothing.** Two node properties, `network.inbound_capable` and
@@ -3741,7 +3741,7 @@ runtime_dependencies. Still open from the plan: whether a draining node's
 unretained objects; the publication path is the next thing to exercise), and
 the cluster UAT on fi-1.
 
-## 0.41.1 — The writer's garbage collector wakes up (development)
+## 0.41.1: The writer's garbage collector wakes up (development)
 
 **Superseded catalogue artwork is now reclaimed on the node that wrote it.**
 0.41.0 shipped this as a P0 storage leak with the evidence but not the cause:
@@ -3795,12 +3795,12 @@ failing three assertions at once after `wait_for_idle(30s)` returned true
 (1 in 2,646 case-runs). Test-only API today, but the quiescence primitive
 most of the FUSE suite waits on.
 
-## 0.41.0 — FUSE cannot take the node down any more (development)
+## 0.41.0: FUSE cannot take the node down any more (development)
 
 **The mount is a supervised subsystem, and a failure in it is now a failure of
 the mount.** `FuseFrontend`'s constructor replays the durable operation
 journal. When that threw, it threw into `main()`'s outermost `catch`, which
-logged and exited the process — metadata, RPC, the HTTP API and playback
+logged and exited the process - metadata, RPC, the HTTP API and playback
 included, none of which had anything to do with the mount. That is not a
 hypothetical: a 0.24.3 bug in `skip_blocked_namespace_operation()`'s journal
 bookkeeping crash-looped `corvus-es-1` 49 times before anyone could read why.
@@ -3821,14 +3821,14 @@ did about it was call for service shutdown and return exit code 8 for systemd
 to restart the whole node. It now reports a subsystem fault, and the supervisor
 rebuilds the mount in place: `restart_count` climbs, `last_fault` names the
 cause, and nothing else on the node is interrupted. A mount that keeps dying
-walks into `disabled` rather than remounting forever — `RetryState::succeeded()`
+walks into `disabled` rather than remounting forever - `RetryState::succeeded()`
 deliberately keeps its failure window, so a clean start between faults resets
 the backoff without resetting the budget. The covered mountpoint stays
 non-writable across the whole cycle.
 
 **`SIGHUP` configuration reload works on a mounted node.** `main()` ran the
 FUSE event loop on its own thread whenever a mount was configured, so libfuse's
-signal handlers — not Macha's — owned `SIGINT`/`SIGTERM`/`SIGHUP`, and reload
+signal handlers - not Macha's - owned `SIGINT`/`SIGTERM`/`SIGHUP`, and reload
 was silently unavailable on precisely the nodes that mount. `main()` is now an
 unconditional `sigwait` loop in every configuration, the mask installed before
 `Service` exists so every thread it starts inherits it, libfuse's own workers
@@ -3844,7 +3844,7 @@ it, and on a supervised thread it would have held shutdown for just as long. It
 now takes the supervisor's stop token and a new
 `fuse.initial_namespace_timeout_ms` (default 10 minutes; 0 restores the old
 unbounded wait). It bounds "no metadata has arrived at all", not "recovery is
-slow" — the 2026-09-06 lesson, where a 120 s elapsed-time gate turned a
+slow" - the 2026-09-06 lesson, where a 120 s elapsed-time gate turned a
 progressing five-minute replay into a crash loop, is why nothing else on the
 startup path is timed against it.
 
@@ -3856,7 +3856,7 @@ stamp. Copy `bin/macha`, `lib/macha/libmacha_core.*` and `lib/macha/plugins/`
 together and verify hashes across all of them. The boundary is libfuse alone:
 `FuseFrontend`, the journal and the mountpoint helpers are core's own code and
 stay in `libmacha_core`, so the plugin file decides whether this node can
-*mount*, not whether it has a filesystem. `fuse_stub.cpp` is deleted — plugin
+*mount*, not whether it has a filesystem. `fuse_stub.cpp` is deleted - plugin
 absence is capability absence, with nothing compiled in to stand for it.
 
 **`RpcServer::stop` no longer runs queued requests during shutdown.** The
@@ -3923,8 +3923,8 @@ anything guarded it, recorded once per process: a second mount attempt finds
 the directory deliberately non-writable, and recording *that* as the original
 would have made a later clean unmount fail it closed permanently.
 
-Gated by `fuse_subsystem/*` — construction fault, mount loss and rebuild, clean
-stop, declining without a mount path or a driver, and the real `dlopen` path —
+Gated by `fuse_subsystem/*` - construction fault, mount loss and rebuild, clean
+stop, declining without a mount path or a driver, and the real `dlopen` path -
 plus `subsystem_supervisor/*` for post-start faults, builtins, and stopping
 while a factory is still blocked. libfuse sits behind a `FuseMountDriver`
 interface so all of that runs without a kernel mount, which is why the mount
@@ -3936,14 +3936,14 @@ detail in `TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md`. That plan
 Stage A and Stage B both landed here. Its Phase 3 audit item was struck as
 already satisfied by Phase 0.
 
-## 0.40.1 — Repair says what it cannot reach (development)
+## 0.40.1: Repair says what it cannot reach (development)
 
 **An object no node can supply is now counted and named, instead of passed
 over in silence.** `DistributedStore::repair_step()` contained no `Log::` call
 of any kind. Its pull side asks for each object this node should own and does
 not have; when no peer answers with the bytes, it moved on without a word, on
-every pass, forever. That is precisely the shape of an unavailable extent —
-the live namespace still references it and nothing in the cluster holds it —
+every pass, forever. That is precisely the shape of an unavailable extent -
+the live namespace still references it and nothing in the cluster holds it -
 and it is the question an operator actually has after a node leaves, which
 until now could not be answered from the running system at all: Status carries
 `convergence`, `data_store`, `retained_memory` and the rest, and nothing about
@@ -3951,7 +3951,7 @@ object availability.
 
 `diagnostics.repair` now reports `unsourceable_objects`, a cumulative count,
 alongside `unsourceable_sample`, up to 32 distinct object ids, and
-`local_unreadable_objects` — the other silent case, where this node's own store
+`local_unreadable_objects` - the other silent case, where this node's own store
 listed an object in its cursor and then could not read it back, which is what a
 failing disk looks like from up here. A warning names the object and the running
 total, rate-limited to one line a minute per kind: a cluster that has genuinely
@@ -3971,12 +3971,12 @@ at 32 behind a leaf mutex that holds nothing else, and the log call happens
 outside it. Nothing new walks the namespace or the store.
 
 Gated by `test_repair_counts_an_object_no_peer_can_supply`, which also pins that
-an object that *is* present is never reported as unsourceable — a counter that
-cries wolf is worse than none — and that repeated passes over the same
+an object that *is* present is never reported as unsourceable - a counter that
+cries wolf is worse than none - and that repeated passes over the same
 unobtainable object do not grow the sample. Neutering the call fails it at the
 wait.
 
-## 0.40.0 — Five operator decisions, and artwork that can finally be cached
+## 0.40.0: Five operator decisions, and artwork that can finally be cached
 
 Five operator decisions taken on 2026-09-13, each of which had been sitting in
 `TODO/ACTIVE.md` as a question rather than as work.
@@ -3986,14 +3986,14 @@ signed artwork capability URL is now quantized to a bucket of the configured
 TTL instead of being minted from the instant of signing. A browser keys its
 cache on the full URL including the query, so a fresh `exp` meant a fresh cache
 key: every catalogue read produced a different URL for the same poster, at
-millisecond granularity, for every item — twice per item, since `artwork` and
-`effective_artwork` are both emitted — and the `public, max-age=86400,
+millisecond granularity, for every item - twice per item, since `artwork` and
+`effective_artwork` are both emitted - and the `public, max-age=86400,
 immutable` header the artwork response has always sent was therefore never once
 consulted. Posters were re-fetched over the network on every page load, and two
 client teams independently built the same id-to-URL memo to work around it. The
 expiry now rounds up to the bucket *after* next rather than to the next one, so
 the URL is byte-identical for every request inside a bucket while its remaining
-validity is always at least the configured TTL and at most twice it — a naive
+validity is always at least the configured TTL and at most twice it - a naive
 boundary would have given a URL minted just before one a lifetime of almost
 nothing, invisibly to the client holding it. Gated by
 `test_catalogue_artwork_url_is_stable_so_it_can_be_cached`, which also pins that
@@ -4005,7 +4005,7 @@ or two" cannot have been a bucket expiring, and still has an unmeasured cause.
 **An abandoned playback session no longer holds a transcode slot for half an
 hour.** The video/audio transcode entitlement lives on the session, not on the
 pipeline, so reclaiming an idle engine at `pipeline_idle` only made an
-abandoned session cheap — it went on holding the slot until the session itself
+abandoned session cheap - it went on holding the slot until the session itself
 expired at `session_idle`, 30 minutes, and with `max_video_transcodes: 1` that
 closed the node to transcoding for the whole of it while the node looked
 perfectly healthy. No client-side fix reaches this: a suspended app's closing
@@ -4017,7 +4017,7 @@ Direct Play body is enough to earn the full `session_idle` permanently, so a
 paused or seeking player is never evicted by this clock, and both clocks run
 from the session's last interaction of any kind, so a client that is still
 polling or PATCHing is never evicted either. `stream_touched` could not answer
-the question on its own — it is set at construction and reset by every
+the question on its own - it is set at construction and reset by every
 `start_pipeline()`, so it says "not recently" and never "not ever". The reaper
 takes the lesser of the two budgets, so an unused session can never outlive a
 used one whatever the configuration says. `playback/status` reports
@@ -4034,7 +4034,7 @@ The envelope is now pinned by a test.
 
 **FUSE traffic is loader traffic, and the code no longer pretends otherwise.**
 `FuseFrontend::note_viewer_activity()` was declared, documented as "called by
-the kernel adapter before viewer-critical open/read callbacks", defined — and
+the kernel adapter before viewer-critical open/read callbacks", defined - and
 called by nothing but tests. Reads through the mount open with
 `FrameType::loader` unconditionally, and the operator confirmed that is correct:
 a mount is a convenience and an import path, not a viewer, and the viewer
@@ -4048,7 +4048,7 @@ in the build referenced it, and its only remaining function was to misinform
 anyone who ran `shasum -c` against it.
 
 The version was opened because 0.39.1 removed a field from a
-response that clients poll — `diagnostics` is no longer on `/api/v1/status` —
+response that clients poll - `diagnostics` is no longer on `/api/v1/status` -
 and that is a breaking, client-visible change which a patch number understated.
 Pre-1.0, it earns the minor. The next piece of work starts from this number.
 
@@ -4059,11 +4059,11 @@ was deliberately not done.
 
 Where the 0.39 line ended up, deployed to gbni-1 and es-1 and verified live:
 
-- `/api/v1/health` — unauthenticated liveness, and the contract every client
+- `/api/v1/health` - unauthenticated liveness, and the contract every client
   now probes.
-- `/api/v1/status` — `view_status`, and lightweight: no diagnostics tree.
-- `/api/v1/status/diagnostics` — the same tree as before, on its own route.
-- `anonymous` — no password, cannot be given one, and a roles-less anonymous
+- `/api/v1/status` - `view_status`, and lightweight: no diagnostics tree.
+- `/api/v1/status/diagnostics` - the same tree as before, on its own route.
+- `anonymous` - no password, cannot be given one, and a roles-less anonymous
   account mints a session that grants nothing rather than being reported as
   anonymous access switched off.
 - A torn pack tail truncates instead of taking an 8 TB backend offline.
@@ -4071,11 +4071,11 @@ Where the 0.39 line ended up, deployed to gbni-1 and es-1 and verified live:
 gbni-2 has none of it. It is four releases behind, its sshd offers password
 authentication only, and it needs console access.
 
-## 0.39.1 — Polling Status no longer pays for diagnostics (development)
+## 0.39.1: Polling Status no longer pays for diagnostics (development)
 
 `/api/v1/status` computed and returned the whole `diagnostics` tree on every
 call. Clients poll that route. Measured against the live cluster, diagnostics
-was **10,091 of 14,914 bytes — 68% of the payload** — but the bytes are the
+was **10,091 of 14,914 bytes - 68% of the payload** - but the bytes are the
 small half of the problem. Reaching those numbers means touching most of the
 node's subsystems: the RPC client and the RPC server, the storage pool, the
 retained-memory ledger, the data-resource arbiter, the metadata replica, the
@@ -4085,15 +4085,15 @@ in the first place. A poll had no business taking any of them.
 
 - **`GET /api/v1/status` is now the lightweight view**: `cluster`, `nodes`,
   `startup`, `connectivity`, `subsystems`. Membership, telemetry and readiness
-  the node already holds decoded — a handful of short mutexes, no I/O, no
+  the node already holds decoded - a handful of short mutexes, no I/O, no
   network, and not one diagnostics lock.
 - **`GET /api/v1/status/diagnostics` is the expensive half**, unchanged in
   content and shape (`{"diagnostics": {...}, "generated_at_unix_ms": ...}`).
   Same `view_status` role as the rest of the status tree.
 - The lightweight response carries **`diagnostics_endpoint`** naming that
   route. A client that was reading `diagnostics` from `/api/v1/status` would
-  otherwise get `undefined` and no explanation — the silent-nothing failure
-  this project has been bitten by before — so the pointer travels with the
+  otherwise get `undefined` and no explanation - the silent-nothing failure
+  this project has been bitten by before - so the pointer travels with the
   payload rather than living only in this file.
 
 This is also an experiment with a result either way. If Status is still
@@ -4104,31 +4104,31 @@ not inside the handler, and the next place to look is the HTTP worker pool:
 one on an idle connection.
 
 - Tests: `test_status_is_light_and_diagnostics_have_their_own_route` asserts
-  the split by what the polled route *touches* rather than by how big it is —
-  no diagnostics-owned field is reachable through it — and that the new route
+  the split by what the polled route *touches* rather than by how big it is -
+  no diagnostics-owned field is reachable through it - and that the new route
   is not swallowed by the `/api/v1/status/nodes/` prefix beside it. Four
   existing tests moved their diagnostics assertions to the new route via a
   shared `status_diagnostics_response()` helper.
 
-## 0.39.0 — A line under the 0.38 series (development)
+## 0.39.0: A line under the 0.38 series (development)
 
 No code change. 0.38.3–0.38.5 were written, deployed and verified against the
 live cluster in one sitting, and they are coherent enough to name as a series:
 **a node no longer loses a disk, an account, or its own diagnostic screen to a
 question nobody had thought to ask it.**
 
-- **0.38.3** — one torn 125-byte pack tail no longer takes an 8 TB backend
+- **0.38.3** - one torn 125-byte pack tail no longer takes an 8 TB backend
   offline. Found live: gbni-1 had been advertising 0 G while holding 685 GiB.
-- **0.38.4** — `anonymous` has no password and cannot be given one, closing a
+- **0.38.4** - `anonymous` has no password and cannot be given one, closing a
   path by which any unauthenticated visitor could mint themselves a credentialed
   session that outlived `allow_anonymous: false`. An anonymous account with no
   roles now mints a session that grants nothing, instead of being reported as
   anonymous access being switched off.
-- **0.38.5** — cluster health became a capability (`view_status`) rather than an
+- **0.38.5** - cluster health became a capability (`view_status`) rather than an
   ungated route, and liveness got a route of its own (`/api/v1/health`).
 
-Deployed to gbni-1 and es-1. **gbni-2 is stranded on 0.38.1** — its sshd offers
-password authentication only and needs console access — so it carries none of
+Deployed to gbni-1 and es-1. **gbni-2 is stranded on 0.38.1** - its sshd offers
+password authentication only and needs console access - so it carries none of
 the above and is the one node where `/api/v1/status` is ungated, `anonymous`
 can still be given a password, and `/api/v1/health` 404s.
 
@@ -4137,22 +4137,22 @@ lightweight status view from the expensive diagnostics tree, which changes the
 shape of a response every client polls, and that is better started from a named
 boundary than from the middle of a run.
 
-## 0.38.5 — Cluster health is a capability, and liveness is its own route (development)
+## 0.38.5: Cluster health is a capability, and liveness is its own route (development)
 
 `/api/v1/status` carried no role. The argument for that was sound as far as it
-went — an importer watching an ingest is the person who most needs to know
+went - an importer watching an ingest is the person who most needs to know
 whether the cluster is healthy, and gating the diagnostic screen behind
 `manager` takes it away at exactly the moment it earns its place. What it could
-not express is the other case: a session the cluster granted *nothing* — a
+not express is the other case: a session the cluster granted *nothing* - a
 roles-less `anonymous` session, which 0.38.4 made a legitimate and useful state
-— was still shown the node roster, every node's capacity and usage, the
+- was still shown the node roster, every node's capacity and usage, the
 metadata generation, subsystem states and the whole diagnostics tree.
 
 **New role `view_status`**, and the status routes now require it. The old
 argument is kept as an implication rather than as an absent gate: every
 capability implies `view_status`, exactly as every capability already implied
 `media_viewer`, so no account that could see health before loses it. It is the
-weakest capability — implied by everything, implying nothing — so granting it
+weakest capability - implied by everything, implying nothing - so granting it
 alone is how an operator makes cluster health public without handing out media.
 An account granted nothing has it too: nothing.
 
@@ -4171,7 +4171,7 @@ An account granted nothing has it too: nothing.
 **New route `GET /api/v1/health`**, unauthenticated and role-free, for the
 things that were reaching for `/api/v1/status` to answer a question it was
 never the right route for: is this node serving. `200 {"status":"ok"}` when it
-is, `503 {"status":"starting"}` or `{"status":"failed"}` when it is not — the
+is, `503 {"status":"starting"}` or `{"status":"failed"}` when it is not - the
 HTTP status carries the same answer as the body, so a probe that parses nothing
 still works. It deliberately reports nothing else: it is reachable wherever the
 API is reachable, by anyone, so it carries no version, no node identity and no
@@ -4181,7 +4181,7 @@ the capability that says so.
 One ordering bug fixed in passing: `handle_http` dispatched Status *before* the
 role gate ran, so a `required_role()` entry for it would have been unreachable
 had one existed. Status now dispatches after the gate, and still ahead of the
-services-ready check — a node that is still recovering is exactly when it is
+services-ready check - a node that is still recovering is exactly when it is
 asked what is wrong.
 
 - Tests: `test_status_needs_view_status_and_health_needs_nothing` (roles-less
@@ -4194,7 +4194,7 @@ asked what is wrong.
 - **Clients must stop using `/api/v1/status` as a health check.** It now needs
   a session *and* a role; `/api/v1/health` needs neither.
 
-## 0.38.4 — Anonymous has no password, and no roles is not the same as disabled (development)
+## 0.38.4: Anonymous has no password, and no roles is not the same as disabled (development)
 
 Two things about the `anonymous` account were wrong, and they were the same
 mistake seen from different sides: treating it as an ordinary account that
@@ -4205,7 +4205,7 @@ ever reached without credentials.
 `session.allow_anonymous: false` guards the no-credentials mint path only. The
 username/password path never consulted it, so anyone who knew the anonymous
 account's password could `POST /api/v1/session` as `anonymous` and receive a
-session carrying its roles **with anonymous access switched off** — and that
+session carrying its roles **with anonymous access switched off** - and that
 session was an ordinary bound one, so it outlived the switch.
 
 Nobody knew that password, because genesis generated a random one and told no
@@ -4217,8 +4217,8 @@ back a fresh token. **Any unauthenticated visitor could give the anonymous
 account a password of their choosing and then log in as it.** That is the hole;
 the pointless random password was the thing that made it look harmless.
 
-So anonymous now has no credential at all — `kdf` 0, no salt, no hash, via the
-new `UserStore::create_without_password` — and:
+So anonymous now has no credential at all - `kdf` 0, no salt, no hash, via the
+new `UserStore::create_without_password` - and:
 
 - `UserStore::verify` refuses the `anonymous` username outright, through the
   same dummy-KDF path as an unknown user so the refusal is not distinguishable
@@ -4226,7 +4226,7 @@ new `UserStore::create_without_password` — and:
   already carries inert, with no migration and no write: the record can keep
   its old hash, and nothing will ever reach it.
 - `UserStore::update` refuses a password change on anonymous, so the API, the
-  CLI and any future caller are all covered by one rule in one place — the
+  CLI and any future caller are all covered by one rule in one place - the
   same discipline as the last-user-manager check beside it.
 - `UsersApi` returns `409 no_password` and reports `mutable.set_password:
   false`, so a client does not draw a field the server will refuse.
@@ -4237,13 +4237,13 @@ Roles stay entirely ordinary on anonymous: they are the only control over what
 an unauthenticated visitor may do.
 
 **An anonymous account with no roles now mints a session that grants nothing.**
-It previously reported `403 anonymous_disabled` — the same answer as anonymous
+It previously reported `403 anonymous_disabled` - the same answer as anonymous
 access being switched off. Those are different states and a cluster may
 legitimately be in either: "visitors may connect but may do nothing" is how a
 registered-users-only deployment is expressed, and the client needs the empty
 role list to know to put a login in front of the viewer. Conflating them told
 the client "log in" when the truthful answer was "you are in, and this cluster
-grants visitors nothing" — and since the client had no session at all, every
+grants visitors nothing" - and since the client had no session at all, every
 subsequent request 401'd and the symptom read as an unreachable cluster.
 `disabled` now means `allow_anonymous: false`, or no anonymous account on this
 node, and nothing else. Found by the web client session against gbni-1 after
@@ -4258,7 +4258,7 @@ the operator removed `media_viewer` from anonymous.
 - Also removes a dead sealing helper in `tools/users_admin.cpp` that every
   mutation has routed through `UserStore` since 0.38.0.
 
-## 0.38.3 — A bad pack record no longer takes the backend offline (development)
+## 0.38.3: A bad pack record no longer takes the backend offline (development)
 
 gbni-1 ran for a day advertising 0 G of storage. Its 8 TB DATA backend had
 gone offline at start-up over one record in one 29 MB pack:
@@ -4269,14 +4269,14 @@ WARN storage backend offline /mnt/diskB: corrupt pack header at
 INFO node data storage ready used=0 capacity=0
 ```
 
-Exactly 125 bytes — one pack header's length — followed the last good record,
+Exactly 125 bytes - one pack header's length - followed the last good record,
 and they did not decode. That is what a power loss leaves when it lands
 between the pack `write()` and the durability domain's `syncfs`: ext4 commits
 the file's new length while the block that was to hold the header is
 zero-filled or partial. Nothing past that point was ever acknowledged, so the
 tail holds no data the cluster was told it had. Recovery handled two torn-tail
-shapes — fewer bytes than a header, and a header whose payload runs past the
-end — and truncated both; a header that was *present but undecodable* threw
+shapes - fewer bytes than a header, and a header whose payload runs past the
+end - and truncated both; a header that was *present but undecodable* threw
 instead, the `LocalStore` constructor failed, and the pool marked the backend
 offline. The node then reported data storage *ready* with `capacity=0`, and
 the node loop's periodic re-probe re-ran the same recovery into the same throw
@@ -4290,7 +4290,7 @@ that one pack in bounded chunks:
 
 - **Nothing decodable follows:** a torn tail. Truncated and logged like the
   other two shapes (`truncated undecodable pack tail … zero_header=0|1`).
-- **A decodable record follows:** damage inside the pack — bit rot, an
+- **A decodable record follows:** damage inside the pack - bit rot, an
   external edit. Truncating would discard the live records behind it and
   refusing the pack would take the whole backend offline over one record.
   The unreadable span is skipped and counted as dead bytes for compaction,
@@ -4310,14 +4310,14 @@ once the disk answers again.
   once held.
 - Tests: `test_pack_recovery_truncates_undecodable_header_at_tail` (a
   zero-filled header, a garbage header, and a garbage header with a partial
-  payload — all truncate to the intact boundary and the pack stays writable),
+  payload - all truncate to the intact boundary and the pack stays writable),
   `test_pack_recovery_skips_unreadable_region_before_live_records` (a flipped
   checksum byte in the middle record: nothing truncated, neighbours live, the
   lost object re-storable, compaction reclaims the span).
 - Nothing was done to gbni-1's pack by hand. Deploying this release and
   restarting the node is the repair: recovery truncates the tail itself.
 
-## 0.38.2 — libtorrent's port mapping is stated, not assumed (development)
+## 0.38.2: libtorrent's port mapping is stated, not assumed (development)
 
 libtorrent maps its own listen port with UPnP and NAT-PMP, and both default to
 on inside libtorrent. Macha set `enable_dht` and `enable_lsd` from
@@ -4326,7 +4326,7 @@ regardless of what the rest of the configuration said: a node with
 `network.upnp.enabled: false` still had libtorrent mapping 6881, which no
 setting mentioned and nothing could refuse.
 
-New `torrent.upnp` and `torrent.natpmp`, both defaulting to true — which is
+New `torrent.upnp` and `torrent.natpmp`, both defaulting to true - which is
 what libtorrent was doing anyway, so no node changes behaviour. The point is
 that it is now refusable, and visible to anyone reading the configuration.
 
@@ -4339,18 +4339,18 @@ Found while diagnosing torrents that loaded and then froze. The freeze itself
 was `torrent_listen_interfaces()` handing libtorrent the node's advertised
 address after that address became a public DNS name: `listen_interfaces` takes
 an IP or a device, never a hostname, so the session bound nothing at all and
-sat in `dl metadata` for ever with no error — the same silence 0.37.2 was
+sat in `dl metadata` for ever with no error - the same silence 0.37.2 was
 written to remove, from a new cause. Two nodes were unwedged by setting
 `torrent.listen_interfaces` explicitly; the derivation itself is not yet
 fixed.
 
-## 0.38.1 — Version bump (development)
+## 0.38.1: Version bump (development)
 
 No functional change since 0.38.0. The version is incremented so the build
 running on the cluster is distinguishable from the one 0.38.0 first described,
 which matters while nodes are being rolled forward at different times.
 
-## 0.38.0 — Cluster users, passwords and roles; login works on a node that is alone (development)
+## 0.38.0: Cluster users, passwords and roles; login works on a node that is alone (development)
 
 Macha had sessions but no people. Every session carried a `roles` list and a
 `session_has_role()` helper that nothing called, so one bearer token granted
@@ -4529,14 +4529,14 @@ New: `session.allow_anonymous`, `session.max_users`,
 tombstones and a table hash, so cross-node convergence is visible the way
 `metadata_generation` is.
 
-## 0.37.2 — The torrent engine binds a routable interface, and says so when it cannot (development)
+## 0.37.2: The torrent engine binds a routable interface, and says so when it cannot (development)
 
 Two magnets sat in `metadata` on gbni-2 for hours with `peers: 0`, `seeds: 0`
 and an empty `error`. Nothing was failing; there was simply no socket that
 could reach anything. libtorrent's default `listen_interfaces`
 (`0.0.0.0:port,[::]:port`) is expanded by its own device enumeration, and on
 these nodes that binds `eth0` and loopback but never `wlan0`. gbni-2's `eth0`
-is `NO-CARRIER` — it is the wireless node — so its session held `127.0.0.1:6881`
+is `NO-CARRIER` - it is the wireless node - so its session held `127.0.0.1:6881`
 and `[::1]:6881` and nothing else. es-1 and gbni-1 were unaffected only because
 their `eth0` is live. A restart did not help: the binding is deterministic, not
 a startup race.
@@ -4548,7 +4548,7 @@ a startup race.
   defaults to 6881 and is validated nonzero. The decision is
   `torrent_listen_interfaces()` in `macha_core`, not the plugin, so it is
   testable without libtorrent.
-- **The plugin never consumed libtorrent alerts at all** — no `pop_alerts`, no
+- **The plugin never consumed libtorrent alerts at all** - no `pop_alerts`, no
   alert mask, anywhere. A session that bound nothing usable, failed to
   bootstrap DHT, or was refused by every tracker reported precisely nothing:
   the journal held one "plugin loaded" line and the API's `error` field stayed
@@ -4557,10 +4557,10 @@ a startup race.
   `set_alert_notify` wakes the worker, so a settled manager still drains.
 - A session holding only loopback sockets is reported once, plainly, as a
   configuration fault. It is a static property known at startup and it
-  invalidates every job on the node at once — the difference between "this will
+  invalidates every job on the node at once - the difference between "this will
   never work" and "this is slow", which nothing previously distinguished.
 
-## 0.37.1 — A publication with a stale basis replays instead of retrying forever (development)
+## 0.37.1: A publication with a stale basis replays instead of retrying forever (development)
 
 Two hours after 0.37.0 went out, gbni-1 had one inode that had failed **68
 consecutive times** and could never succeed. `parked_publications` read 0,
@@ -4572,8 +4572,8 @@ to line up, and all three are fixed here.
 
 - **A stale basis is now replayable, not retryable.** `commit_file` rejects a
   commit when the entry has moved past the basis the handle captured
-  (`filesystem.cpp:2248`). For a publication that rejection is permanent — the
-  retry keeps the same writer — so it now reports `ESTALE`, which the frontend
+  (`filesystem.cpp:2248`). For a publication that rejection is permanent - the
+  retry keeps the same writer - so it now reports `ESTALE`, which the frontend
   already handles by dropping the writer and replaying the generation from the
   spool against current state. Foreground handles keep `EAGAIN`: they stay
   open, the content genuinely did change under them, and retrying is
@@ -4586,13 +4586,13 @@ to line up, and all three are fixed here.
   construction. `RetryPolicy` gains `max_failing_duration` (default 1 h): an
   item that has not succeeded once within it parks, however sparsely it is
   retried, measured over the current unbroken run rather than its whole
-  history. This is deliberately *not* `failure_window` — that answers "is this
+  history. This is deliberately *not* `failure_window` - that answers "is this
   flapping?", this answers "is this ever going to work?", and tying them
   together would park every publication whenever the wireless node or the WAN
   link is out for longer than the flap window. Settable per policy from YAML.
 - **A long failure run is now visible.** Crossing ten consecutive failures logs
   WARN with inode, path, run length and error, repeating every twenty
-  thereafter, and increments `publications_retrying_persistently` — reported on
+  thereafter, and increments `publications_retrying_persistently` - reported on
   `diagnostics.filesystem`. Non-zero means a file is failing repeatedly but has
   not yet exhausted its budget: the state that was previously invisible.
 
@@ -4601,14 +4601,14 @@ asserts the pre-fix policy survives 400 failures across 3.3 simulated hours
 without parking, which is the hole itself. The stale-basis test was confirmed
 to fail against the old `commit_file`.
 
-## 0.37.0 — Background metadata repair no longer wedges the node's writes; ingest runs concurrently (development)
+## 0.37.0: Background metadata repair no longer wedges the node's writes; ingest runs concurrently (development)
 
 On 2026-09-10 es-1 had six torrent ingests all reading `queued`, nothing
 running, staging at 3.78 GB of 500 GB, and `cluster.health` saying `healthy`.
 A backtrace showed the ingest worker inside `WriteHandle::commit` blocked on
 `MetadataManager::mutation_mutex_`, together with nine other threads. The
 holder was the maintenance thread: `repair_once()` took that mutex and then,
-still holding it, replicated the accepted head to every peer — a blocking RPC
+still holding it, replicated the accepted head to every peer - a blocking RPC
 per history hash per peer. One peer that stopped answering turned a background
 convergence pass into a stall of every local metadata mutation.
 
@@ -4619,7 +4619,7 @@ convergence pass into a stall of every local metadata mutation.
   After re-taking the lock the pass re-validates that the head it selected is
   still current and abandons itself otherwise, so the baseline commit can never
   build generation+1 on a superseded parent. Discovery and `publish_commit`
-  still RPC under the lock — a write *is* its replication — and those calls are
+  still RPC under the lock - a write *is* its replication - and those calls are
   bounded by the control no-progress deadline.
 - Ingest was strictly serial: one worker, `process_job()` to completion before
   the next. It now runs a pool bounded by `ingest.max_concurrent_jobs`
@@ -4627,14 +4627,14 @@ convergence pass into a stall of every local metadata mutation.
   selects them; catalogue-completion polling has its own thread so busy
   importers cannot starve it; show/pause/resume/cancel/clear are unchanged.
   `GET /api/v1/ingest/status` gains `concurrency.{max_jobs,active_jobs,
-  peak_active_jobs}` — without it a queue stalled behind one wedged job is
+  peak_active_jobs}` - without it a queue stalled behind one wedged job is
   indistinguishable from an idle one.
 - `WriteHandle::drain_one_extent` could wait forever: `put_impl` spilled a
   silent replica after `write_stall` and sought a replacement, but the spilled
   put still counted as unfinished, so with no replacement available the loop
   spun at 1 ms indefinitely. The extent put now carries the pipeline's
-  `DataWorkContext` and fails — retryably, into the existing backoff-and-park
-  discipline — once nothing in the pipeline has moved for the no-progress
+  `DataWorkContext` and fails - retryably, into the existing backoff-and-park
+  discipline - once nothing in the pipeline has moved for the no-progress
   budget. Slow-but-moving transfers re-arm the window; only a put where nothing
   at all advances fails.
 - A test-only silent-peer fixture, `RpcClient::stall_peer_for_tests`
@@ -4647,7 +4647,7 @@ convergence pass into a stall of every local metadata mutation.
   the two sibling commits cached one sibling; every reader returned it
   unmerged). It now runs with no cache TTL and measures what its name says.
 
-## 0.36.9 — Bound how many files may hold a publication writer at once (development)
+## 0.36.9: Bound how many files may hold a publication writer at once (development)
 
 es-1 held 515,899,392 bytes of publication-owned retained memory for hours,
 byte-identical across restarts, at 99.7% of the durable-lower budget, with 137
@@ -4663,21 +4663,21 @@ those leases for as long as it is retained: one extent buffer being filled,
 plus the pipeline. A yield that does not land on an extent boundary leaves one
 behind, and publication scheduling is otherwise breadth-first, so the number of
 writers holding partial state is simply the width of the backlog. At a 4 MiB
-extent, 492 MiB is 123 such leases — against three running workers that can
+extent, 492 MiB is 123 such leases - against three running workers that can
 hold at most three each. Then every writer needed one more extent and none
 could release one: hold-and-wait. Any budget fills the same way, which is why
 no budget helped.
 
 - **`fuse.publication_max_open_writers`** bounds how many inodes may hold a
   writer, derived so all of them can hold their worst case inside
-  `runtime.loader_memory_reserve_bytes` — `loader_reserve / (extent_size +
+  `runtime.loader_memory_reserve_bytes` - `loader_reserve / (extent_size +
   publication_pipeline_bytes)`, never below `commit_workers`. A writer waiting
   on the ledger is then only ever waiting for control/viewer work, which
   releases. Past the bound the scheduler is depth-first over the already-open
   set, which is what drains a backlog anyway.
 - **The no-progress deadline watched the wrong counter.**
   `data_publication_quanta` increments when a quantum is *admitted*, and on a
-  wedged node a failure frees a slot which admits the next file — so every
+  wedged node a failure frees a slot which admits the next file - so every
   failure re-armed every other waiter's window, and the deadline serialised
   into one failure per budget instead of failing every stuck worker. That is
   the "different inode every 30 s, always `attempts=1`" log shape. It now
@@ -4700,9 +4700,9 @@ byte confirmed, with no failures and nothing parked.
 
 Not fixed here and still live: `WriteHandle::drain_one_extent` waits on its
 extent future with no deadline and no cancellation check, so a stalled put
-blocks publication silently — the same shape one layer down.
+blocks publication silently - the same shape one layer down.
 
-## 0.36.8 — A wedged publication pipeline can fail, retry and park (development)
+## 0.36.8: A wedged publication pipeline can fail, retry and park (development)
 
 Two defects left a node publishing nothing for hours while reporting itself
 healthy, with `parked_publications` reading 0 and the spool draining at 0 B/s.
@@ -4711,7 +4711,7 @@ healthy, with `parked_publications` reading 0 and the spool draining at 0 B/s.
 lease to reassemble an inbound frame, threw `process retained-memory RPC
 reassembly saturated` and killed the channel, about once a second. Every peer
 channel died 1–2 s after connecting, so requests re-dialled constantly and
-telemetry — the only consumer that never dials — appeared to vanish, which is
+telemetry - the only consumer that never dials - appeared to vanish, which is
 why this first looked like a network fault. The loop is closed: publication
 holds its bytes until a peer confirms the write, that confirmation arrives as a
 frame which must be reassembled into the same ledger, and the reassembly is
@@ -4739,13 +4739,13 @@ old unbounded wait.
 Measured before → after: saturation events ~1/s → 0; canonical connections
 oscillating 0↔2 → stable; peer telemetry age climbing past 700 s → 1.2–4.7 s.
 
-## 0.36.7 — A node stays visible while it is busy, and two title parsers stop lying (development)
+## 0.36.7: A node stays visible while it is busy, and two title parsers stop lying (development)
 
 Three unrelated faults found the same day, all of them things the operator
 could see and the software could not explain.
 
 **Peer telemetry was blanked rather than labelled.** `node_json()` populated
-`runtime` only for a sample fresher than `max(heartbeat * 3, 5s)` — 15s here —
+`runtime` only for a sample fresher than `max(heartbeat * 3, 5s)` - 15s here -
 so one sample crossing that line removed `uptime_ms`, `rss_bytes`, `load1`,
 `process_cpu_percent`, `cpu_cores`, `memory_total_bytes`, `peers_*` and
 `rpc_connections_*` in a single step, leaving `"runtime": {}`. On the live
@@ -4770,13 +4770,13 @@ notification (at most 64 KiB, while the writer holds under 1 MiB pending) may
 queue behind existing work. It stays on the SPECULATIVE class and the writer
 still picks the most urgent frame first, so none of this can delay operational
 RPC. The cadence is now `network.telemetry_interval_ms`, default 10s, and a
-demand-driven wake still publishes sooner but never more than once a second —
+demand-driven wake still publishes sooner but never more than once a second -
 without that floor the loop had no minimum spacing at all, since its wait
 returns whenever a peer observation moves the demand counter.
 
 **"Blade Runner 2049" was catalogued as "Blade Runner", and rejected.** Any
 `19xx`/`20xx` in a filename was read as the release year, so the search title
-was truncated and the only candidate TMDB returned — the 1982 film — failed
+was truncated and the only candidate TMDB returned - the 1982 film - failed
 the year comparison. A number the calendar has not reached is title text, and
 both year scanners now say so; `strip_release_noise` also learned `hdrip`,
 `xvid`, `divx` and `brrip`, without which the title kept its release tags.
@@ -4786,14 +4786,14 @@ unmatched music files reported "no metadata provider match after 4
 candidates": `(feat. …)`, `(Live)`, `(Spotify Bonus Tracks)` and the like went
 into the MusicBrainz query verbatim and returned no results at all, and the
 acceptance threshold of 120 needs an exact agreement on both title and artist
-— which the provider's own credit style ("Avicii feat. Sandro Cavazza" against
+- which the provider's own credit style ("Avicii feat. Sandro Cavazza" against
 a path saying "Avicii") denied. The decorated title is still tried first,
 since a remix or live cut is a genuinely distinct recording; an undecorated
 search is the fallback when the precise one finds nothing, scoring 85 against
 an exact 100, and a primary-artist agreement scores 70. A title-only
 agreement still lands at 95 and is still refused.
 
-## 0.36.6 — Status reports how much RAM a node has (development)
+## 0.36.6: Status reports how much RAM a node has (development)
 
 `runtime.memory_total_bytes` joins `cpu_cores` in the node payload. The
 closest existing field was the wrong quantity by orders of magnitude:
@@ -4803,17 +4803,17 @@ have been plausibly and badly wrong.
 
 - **Total, not available.** On Linux "available" is dominated by page cache,
   so a node that has just served a large file looks starved while being
-  perfectly healthy — and serving large files is the entire workload here.
+  perfectly healthy - and serving large files is the entire workload here.
 - **Display only.** Nothing schedules or ranks on it, deliberately: total RAM
   would prefer a large thrashing node over a small idle one.
 - Omitted when it cannot be determined, so a consumer renders "unknown"
-  rather than a node claiming to have no memory — the same rule `cpu_cores`
+  rather than a node claiming to have no memory - the same rule `cpu_cores`
   follows.
 - An optional trailing telemetry field, so a node that has not been upgraded
   simply does not report one and needs no coordination during a rolling
   upgrade.
 
-## 0.36.5 — Coverage that measures something (development)
+## 0.36.5: Coverage that measures something (development)
 
 `MACHA_TEST_COVERAGE` had been in `CMakeLists.txt` for some time and had never
 produced a report. It could not: two independent faults, either of which alone
@@ -4822,13 +4822,13 @@ was enough.
 - **It did not link.** `macha_core` was given the coverage compile flags but
   not the link flags, in both the GCC and the Clang branch, so the shared
   library referenced the profile runtime and never resolved it. That is why
-  the repository contains no coverage artifact of any kind — not that nobody
+  the repository contains no coverage artifact of any kind - not that nobody
   had bothered, but that nobody could.
 - **It recorded nothing.** With linking fixed, the first full run reported
   **0.0% across every file the main suite touches, with 377 tests passing**.
   Every case runs in a forked child, and `child_run` leaves through
-  `std::_Exit` — correctly, since that is what stops a forked child flushing
-  buffers inherited from the parent — but counters are written by an `atexit`
+  `std::_Exit` - correctly, since that is what stops a forked child flushing
+  buffers inherited from the parent - but counters are written by an `atexit`
   handler, so a child that never runs one records nothing at all. The children
   now reset counters on entry and dump them before `_Exit`, compiled in only
   under coverage. The reset matters as much as the dump: a child inherits the
@@ -4855,7 +4855,7 @@ since instrumentation here is a per-target property rather than the
 whole-program one a sanitizer needs, so plugin-only code reads as uncovered
 whether it is tested or not.
 
-## 0.36.4 — One API endpoint, stated rather than guessed (development)
+## 0.36.4: One API endpoint, stated rather than guessed (development)
 
 **Breaking, and not detectable by looking for a field.** `nodes[].api_host`
 and `nodes[].api_port` are removed from `/api/v1/status` and replaced by
@@ -4864,7 +4864,7 @@ indistinguishable from an old node that never reported it, which is why this
 carries a version bump: clients cannot sniff for it.
 
 The pair could not express a scheme, so a client discovering peers had to
-invent one — `@machafoundation/core` hardcoded `http://`. That is wrong in both
+invent one - `@machafoundation/core` hardcoded `http://`. That is wrong in both
 directions on a TLS deployment: a browser on an HTTPS page blocks every
 discovered peer as mixed content, and a native client sends plaintext to a
 node the viewer deliberately put behind TLS.
@@ -4877,7 +4877,7 @@ node the viewer deliberately put behind TLS.
   the scheme nor the port of the outer address is derivable from the bind.
 - A path is rejected at startup with an explicit error. Fronting a node at a
   subpath is not a supported deployment, and the failure it would otherwise
-  produce is silent — a client treating the endpoint as an origin drops the
+  produce is silent - a client treating the endpoint as an origin drops the
   path and 404s against a node that looks correctly configured, in the one
   deployment that has a proxy.
 - Unset defaults to `http://` this node's resolved RPC advertise address and
@@ -4893,7 +4893,7 @@ node the viewer deliberately put behind TLS.
 separate plane that is never proxied, and they have a live consumer in the
 identity-association reset.
 
-## 0.36.3 — Status says how many cores a node has (development)
+## 0.36.3: Status says how many cores a node has (development)
 
 `load1` and `process_cpu_percent` are both per-core quantities, and this
 cluster is deliberately non-uniform hardware. A `load1` of 2.67 is a
@@ -4905,7 +4905,7 @@ compared between nodes.
 - `runtime.cpu_cores` now reports the node's hardware thread count, so a
   consumer can divide by it and get figures that mean the same thing
   everywhere. Requested by the web and React Native client sessions, which
-  want to stop handing a transcode to a node that is already saturated —
+  want to stop handing a transcode to a node that is already saturated -
   the client spent an afternoon routing every session to the slowest node in
   the cluster and producing measurements that described the routing rather
   than the server.
@@ -4916,7 +4916,7 @@ compared between nodes.
   position during a rolling upgrade, which is exactly when reading a core
   count out of whatever bytes followed would matter.
 
-## 0.36.2 — A complete playlist, and a wait that cannot wedge the node (development)
+## 0.36.2: A complete playlist, and a wait that cannot wedge the node (development)
 
 Two changes that were made together but are independent of each other: the
 media playlist becomes a complete VOD list with bounded holds behind it, and
@@ -4924,20 +4924,20 @@ the retained-memory ledger stops charging RPC reassembly against the budget
 that reassembly exists to release.
 
 **The playlist.** `media.m3u8` is now a complete `#EXT-X-PLAYLIST-TYPE:VOD`
-list — every planned fragment, closed with `#EXT-X-ENDLIST`, served on the
+list - every planned fragment, closed with `#EXT-X-ENDLIST`, served on the
 first fetch with no readiness gate and byte-identical on every later fetch of
 the same generation. The duration is known because the source was probed, so
 this is the spec-correct form, and with `ENDLIST` present a player stops
 polling: one playlist fetch per generation instead of hundreds.
 
-`EXTINF` is the plan rather than the measured length, necessarily — an
+`EXTINF` is the plan rather than the measured length, necessarily - an
 unproduced fragment has no measured length and a VOD list may not be revised.
 That is only honest because 0.36.1 made the plan predict the output exactly;
 confirmed client-side on a 1,748-fragment title whose declared durations sum
 to the film's duration, with fragment 0 declaring 2 s and delivering 1.96 s.
 
 **The wait.** Because the playlist promises fragments that do not exist yet, a
-request for one is held rather than refused — as an explicitly acquired
+request for one is held rather than refused - as an explicitly acquired
 resource, never an implicit blocked thread, so an async `HttpServer` would be
 an improvement rather than a rewrite. Three tests in order: beyond
 `segment_hold_window` nothing is working toward the fragment; past
@@ -4963,7 +4963,7 @@ ms read timeout) rather than from documentation, which was wrong twice.
 write, and that confirmation arrives as an RPC message which must first be
 reassembled into the same ledger. Charged against the same durable-lower
 budget the two meet: publication fills it, reassembly is refused, the peer
-channel drops, so nothing confirms and nothing is released — and a restart
+channel drops, so nothing confirms and nothing is released - and a restart
 re-enters it within minutes, because publication resumes from the spool.
 Observed live: 508 MB held of a 512 MB budget, 49,680 reassembly refusals, a
 576-byte FUSE admission waiting 35 minutes, telemetry 18 minutes stale in both
@@ -4973,7 +4973,7 @@ and viewer reserves still apply and `MessageAssembler` already bounds
 incomplete reassembly independently. After the fix the affected node confirmed
 40.6 GB and drained its spool from 1.72 GB to 122 MB with no further refusals.
 
-## 0.36.1 — A transcode's first fragment is the short one it planned (development)
+## 0.36.1: A transcode's first fragment is the short one it planned (development)
 
 The early `moov` flush was switched off whenever any stream was transcoded,
 because it was driven from the demux copy loop and a transcoded stream's
@@ -4993,12 +4993,12 @@ twice its planned media.
 - `tests/test_transcode_timeline.cpp` gains the invariant this establishes:
   one fragment per planned entry, and a first fragment that is the short one
   it was planned as. It is the prerequisite for serving a complete playlist
-  before anything is published — a plan that cannot predict its own output
+  before anything is published - a plan that cannot predict its own output
   makes such a playlist wrong from its first line. That work is designed but
   not started: see
   `TODO/archive/2026-09-08-bounded-vod-playlist-and-segment-holds.md`.
 
-## 0.36.0 — The playlist says what the fragment holds (development)
+## 0.36.0: The playlist says what the fragment holds (development)
 
 Deployed to all three cluster nodes on 2026-09-08: gbni-1, gbni-2 and es-1
 run an identical binary, verified by hash, with the torrent plugin loading on
@@ -5056,7 +5056,7 @@ its first run.
   spurious timeout would hide the report the run existed to produce. The full
   suite is green under `address,undefined` with no sanitizer or leak report.
 
-## 0.35.0 — Serve the web client at the root (development)
+## 0.35.0: Serve the web client at the root (development)
 
 A node can now serve the built web client itself, so the client and the API
 it talks to are one origin and there is no second server to deploy,
@@ -5091,7 +5091,7 @@ configure or keep in step.
   does not exist answers `503 web_client_unavailable` rather than 404, and
   starts serving as soon as the files appear.
 
-## 0.34.0 — The playback contract says what it did
+## 0.34.0: The playback contract says what it did
 
 Collects the night's playback work into one release. Four defects, each
 found by comparing two sides' idea of the same fact rather than by reading
@@ -5109,7 +5109,7 @@ silent (2026-09-07/08).
 - A refusal says why (`reason`), and the mode table is enforced rather
   than reinterpreted -- see 0.32.18 and 0.33.0.
 
-## 0.33.4 — Naming a mode restates the whole transform (development)
+## 0.33.4: Naming a mode restates the whole transform (development)
 
 A session update naming only `mode` was refused for a contradiction the
 server assembled itself. The per-stream and quality instructions stored at
@@ -5129,7 +5129,7 @@ them back to the browse screen (found by the UI session, 2026-09-08).
   what the session was created as.
 - Creating a session is unaffected: there is nothing to clear.
 
-## 0.33.3 — AAC transcodes carry a channel configuration browsers can parse (development)
+## 0.33.3: AAC transcodes carry a channel configuration browsers can parse (development)
 
 A regression from 0.32.19, found by the UI session and reproduced on Silo
 S03E01. Keeping the source's channel layout on the AAC encoder was right in
@@ -5161,7 +5161,7 @@ means the web client and the Android/Google TV host (2026-09-08).
 - A runtime test asks this build's own encoder for every channel count from
   1 to 8 and fails if any answers with `channelConfiguration` 0.
 
-## 0.33.2 — One file for the container vocabulary (development)
+## 0.33.2: One file for the container vocabulary (development)
 
 Answering a client's question about `output.container` turned up a source
 this server serves and declines to name: the catalogue admits `.avi`,
@@ -5186,7 +5186,7 @@ different pieces of work (2026-09-07).
   the two lists becoming one; playback already served both. No file in the
   library has either extension.
 
-## 0.33.1 — Say which container was actually served (development)
+## 0.33.1: Say which container was actually served (development)
 
 MPEG-TS turned out to be the only carriage a 2017 Samsung would play:
 copied HEVC black-screened in fragmented MP4 on its native player and was
@@ -5209,7 +5209,7 @@ being able to check (2026-09-07).
 - A VOD planning or subtitle deadline reports `source_read_timed_out`
   instead of arriving with no reason attached.
 
-## 0.33.0 — A mode must describe what it is doing (development)
+## 0.33.0: A mode must describe what it is doing (development)
 
 The operator's ruling on the legal permutations, enforced. `direct` and
 `remux` copy every stream; `transcode` re-encodes at least one and may copy
@@ -5231,7 +5231,7 @@ mode other than the one requested (2026-09-07).
   into the question they ask about a *different* mode, which would have
   answered "remux unavailable" for a session that had a `max_height` set.
 
-## 0.32.19 — The first fragment is one segment, and a transcode is not a downmix (development)
+## 0.32.19: The first fragment is one segment, and a transcode is not a downmix (development)
 
 Two faults found by ffprobing what a remux actually emits, rather than
 trusting the 201 (2026-09-07).
@@ -5253,7 +5253,7 @@ trusting the 201 (2026-09-07).
   only if the encoder refuses the layout. A client that asked for a codec
   change did not ask for a downmix.
 
-## 0.32.18 — A failure says which failure it was (development)
+## 0.32.18: A failure says which failure it was (development)
 
 A node that has lost its path to the cluster can still open its API and
 still fail to read a single byte of a film. Until now that came back
@@ -5273,7 +5273,7 @@ another node" from "stop asking anyone" (2026-09-07, gbni-2 partitioned).
   `404`. It reports the media it could read and lists the rest under
   `unavailable`, each with its own reason.
 
-## 0.32.17 — The catalogue media profile answers with facts, not 503 (development)
+## 0.32.17: The catalogue media profile answers with facts, not 503 (development)
 
 The profile endpoint answered `503 profile_unavailable` whenever no profile
 had been persisted yet, which made "nobody has looked at this file" look
@@ -5286,7 +5286,7 @@ title nobody had played was unplayable until a background worker got to it.
 - Both priority classes hold: a profile already scanned is returned from
   the persisted copy, and a viewer never waits on background work.
 
-## 0.32.16 — Remove client capabilities from the API (development)
+## 0.32.16: Remove client capabilities from the API (development)
 
 The server had been deciding how to play media on the client's behalf,
 which is not a server function. It reports what the media is and performs
@@ -5300,7 +5300,7 @@ what it is told.
   compatibility (schema 3), so the client can choose on the facts that
   actually decide the question.
 
-## 0.32.15 — Matroska direct play, and a codec list per delivery path (development)
+## 0.32.15: Matroska direct play, and a codec list per delivery path (development)
 
 The operator's TV decodes HEVC through its media element and fails it
 through MediaSource, and `MediaSource.isTypeSupported` lies about it, so no
@@ -5323,7 +5323,7 @@ into fMP4 and failed to decode (2026-09-07).
   `direct` by default was getting raw Matroska it had not claimed to read,
   and the failure surfaced only as a decode error.
 
-## 0.32.14 — The media playlist grows with the encoder (development)
+## 0.32.14: The media playlist grows with the encoder (development)
 
 Operator's TV after a mode switch (2026-09-07): "preparing new stream"
 cleared in ~7 s, then black for 1 min 38 s. The media playlist was a VOD
@@ -5351,7 +5351,7 @@ read ahead (UI session measurement: 30 fragments ≈ the 98 s).
   Fragment boundaries are the same planned cuts as fMP4 (one segment per
   flush before a keyframe).
 
-## 0.32.13 — The writer keeps a copy and the second one is prompt; a background effort ceiling (development)
+## 0.32.13: The writer keeps a copy and the second one is prompt; a background effort ceiling (development)
 
 Operator decisions after the import findings (2026-09-07): keep
 `min_write_replicas: 1` but make "replicated" a matter of minutes, not of
@@ -5386,7 +5386,7 @@ external CPU quota; stop cold claims after restarts; statfs must not read 0.
   does not report it (Matroska HEVC), so a 10-bit source no longer relies
   on the transfer alone for the negotiation gate.
 
-## 0.32.12 — A master playlist that says what is in the fragments; 10-bit and HDR are not "hevc" (development)
+## 0.32.12: A master playlist that says what is in the fragments; 10-bit and HDR are not "hevc" (development)
 
 Operator report via the UI session (2026-09-07): on a 2016 Samsung TV
 (hls.js 1.6 over MSE on Chromium 47) a Dolby Vision profile 8 title broke
@@ -5429,7 +5429,7 @@ anywhere, and it had listed `hevc` for a 10-bit PQ source.
   the muxer path handles them; the UI session's two-capability-set check
   (with and without `eac3`) is the acceptance test.
 
-## 0.32.11 — Remux is allowed to have long fragments; transcode uses the cores it has (development)
+## 0.32.11: Remux is allowed to have long fragments; transcode uses the cores it has (development)
 
 Viewer path, measured first (2026-09-07, all three nodes, 24 h of logs):
 every VOD plan was a software transcode. Remux was tried for HEVC titles
@@ -5457,7 +5457,7 @@ segment-density rule.
   representation change at a new position no longer re-opens, re-probes and
   re-indexes the container.
 
-## 0.32.10 — CONTROL retention puts go together, to the nearest replica (development)
+## 0.32.10: CONTROL retention puts go together, to the nearest replica (development)
 
 0.32.9's phase line on gbni-1: `metadata retention barrier total_ms=4286
 decode_ms=13 collect_ms=1 catalogue_ms=25 data_ms=0 control_ms=4247
@@ -5474,7 +5474,7 @@ to es-1 across the WAN, 65 ms each, inside every catalogue mutation.
 - `CONTROL retention claim objects=… required=… tried=… retained=…
   total_ms=…` is logged at debug when the claim takes 250 ms or more.
 
-## 0.32.9 — Presence is remembered, not stat'ed; the barrier names its phase (development)
+## 0.32.9: Presence is remembered, not stat'ed; the barrier names its phase (development)
 
 0.32.8's barrier line on gbni-1: `DATA retention barrier ids=3201 nodes=1
 total_ms=16317 scan_ms=16048 short=0` for one quantum commit of a 16 GB
@@ -5498,7 +5498,7 @@ background repair. That is the mechanism of finding #6 (a writer's death
 strands its recent data) and it makes "replicated" a promise repair keeps
 later, not the write.
 
-## 0.32.8 — The writer's retention barrier fans out in parallel and measures itself (development)
+## 0.32.8: The writer's retention barrier fans out in parallel and measures itself (development)
 
 After 0.32.7 the replica-side claim handler read 0 ms and commit fan-out
 under 0.6 s on every node, and the `retention_ms` breakdown showed the
@@ -5527,7 +5527,7 @@ writer's put can be two remote replicas and its viewers read across the WAN;
 and re-claiming every extent of a file per quantum grows the retention
 journal quadratically over a large file's import.
 
-## 0.32.7 — A remote retention claim is not a re-read; commits go to the nearest replica first (development)
+## 0.32.7: A remote retention claim is not a re-read; commits go to the nearest replica first (development)
 
 The "WAN control-lane starvation" of the full-library import (195-284 s
 metadata mutations, `control RPC deadline exceeded`, reconnect churn,
@@ -5561,7 +5561,7 @@ Still open in this area: congestion-aware pacing of the DATA lane against
 control-lane RTT (the link itself was not the bottleneck this time), and the
 retention journal growth of re-claiming whole files per quantum.
 
-## 0.32.6 — Append-extents deltas, and the covered mountpoint is no longer a trap (development)
+## 0.32.6: Append-extents deltas, and the covered mountpoint is no longer a trap (development)
 
 Two findings from the full-library import (2026-09-07).
 
@@ -5594,13 +5594,13 @@ cleared the directory's mode bits after mounting, which root ignores.
 - The post-mount mode guard skips chmod when the flag is in place (chmod on
   an immutable inode fails, which would have refused the mount).
 
-## 0.32.5 — Spool pacing credits drained quanta, not only retired files (development)
+## 0.32.5: Spool pacing credits drained quanta, not only retired files (development)
 
 Sixth import finding (2026-09-07 10:30, es-1): while a multi-GB file
 published quantum by quantum nothing *retired* from the spool, so the
 whole-file retirement rate sample never refreshed; the last small sample
-(46 KB/s) stood and the importer's writes were paced to it — 0.3 MB/s on
-a link and disk good for 8 — although the spool drained 32 MB at a time.
+(46 KB/s) stood and the importer's writes were paced to it - 0.3 MB/s on
+a link and disk good for 8 - although the spool drained 32 MB at a time.
 The drained-quantum credit (`note_spool_publication_progress`) was only
 consulted before the first sample existed.
 
@@ -5613,14 +5613,14 @@ re-sends the file's whole extent table in its metadata delta (105 KB per
 32 MB quantum for a 13.9 GB file; 124 MB of history per node in 35 min).
 An append-extents delta operation (DLT8) is the fix and is next.
 
-## 0.32.4 — Publications no longer serialize behind one WAN-bound commit (development)
+## 0.32.4: Publications no longer serialize behind one WAN-bound commit (development)
 
 Fifth finding from the full-library import (2026-09-07 04:00, gbni-1):
 after 0.32.3 the store was fine but gbni-1 still published nine extents in
 ten minutes with a full spool; six of its eight publication threads sat on
 `FileSystem::open_writes_mutex_`, which `commit_write` (and `open_write`'s
 truncation, and every namespace batch) held across a whole cluster metadata
-commit — seconds each with the WAN in the path — so a node's publications
+commit - seconds each with the WAN in the path - so a node's publications
 committed one at a time regardless of `commit_workers`.
 
 - `open_writes_mutex_` now protects only the handle registry and each
@@ -5631,12 +5631,12 @@ committed one at a time regardless of `commit_workers`.
   caught by the commit's own entry check (`removed while open`), the caller
   retries, and rename's fix-up has updated the path by then.
 
-## 0.32.3 — A restart is not a write outage; a retention claim is not a re-read (development)
+## 0.32.3: A restart is not a write outage; a retention claim is not a re-read (development)
 
 Third and fourth findings from the full-library import (2026-09-07 04:17–04:45,
 es-1): after a restart the object store walked its whole tree to reconcile
 accounting (4 min on gbni-1, 25+ min on es-1 with the import saturating
-the disk) and **every put waited for it** — the spool replay, the import
+the disk) and **every put waited for it** - the spool replay, the import
 and gbni-1's retention claims to es-1 all stalled, and gbni-1's data
 publications queued behind the metadata mutation waiting on that claim.
 Meanwhile every metadata mutation's retention step re-read, decrypted and
@@ -5654,11 +5654,11 @@ answer for 40 s.
   only pack compaction waits for the exact figure. The walk's total replaces
   the estimate, keeping the larger of the two.
 - **A local retention claim checks presence, not content.** `retain_on`
-  uses `has()` — the same contract discipline 1 wrote down for durability —
+  uses `has()` - the same contract discipline 1 wrote down for durability -
   instead of the full `valid()` re-read of every extent; the scrub is where
   later corruption is found.
 
-## 0.32.2 — Namespace batches under an identity; utimens survives publication (development)
+## 0.32.2: Namespace batches under an identity; utimens survives publication (development)
 
 Two more findings from the full-library import (2026-09-07 02:30–03:30):
 
@@ -5692,13 +5692,13 @@ Two more findings from the full-library import (2026-09-07 02:30–03:30):
   `test_fuse_utimens_after_write_survives_async_publication`; journal
   accounting in three batching tests updated for the identity record.
 
-## 0.32.1 — A FUSE write waits for admission; it never returns EAGAIN (development)
+## 0.32.1: A FUSE write waits for admission; it never returns EAGAIN (development)
 
 Found in the first hour of the full-library import (2026-09-07 02:11, gbni-1,
 4 GB node): publication held 500 MB of the 768 MB process memory budget
 while 21,000 small-file operations were pending, six write admissions
 timed out at the 5 s request deadline, the mount returned `EAGAIN` to
-`write(2)`, and rsync — correctly — aborted the whole import
+`write(2)`, and rsync - correctly - aborted the whole import
 (`write failed on "…/03 Eddie, Are You Kidding_.m4a": Resource temporarily
 unavailable (11)`). The budget would have been released moments later by
 publication completing.
@@ -5711,7 +5711,7 @@ publication completing.
 - Counters: `write_admission_waits`, `process_memory_admission_waits`
   (alongside the existing `operation_metadata_waits`).
 
-## 0.32.0 — Compact history out of the hot path: DLT7, canonical tombstones, conflicts that leave (development)
+## 0.32.0: Compact history out of the hot path: DLT7, canonical tombstones, conflicts that leave (development)
 
 Discipline 4 of `TODO/archive/2026-09-06-self-healing-disciplines-plan.md`, scoped
 by measurement rather than by the plan's premise. `macha-metadata-dump
@@ -5732,7 +5732,7 @@ retirement log is not justified by the data and is not built.
 - **Canonical tombstone order.** DLT7's third flag sorts the tombstone
   vector by ObjectId after applying the edits. Reconciliation always
   produced that order while the primary parent's vector was in append
-  order, and pre-DLT7 deltas could not reorder retained tombstones — the
+  order, and pre-DLT7 deltas could not reorder retained tombstones - the
   cause of the full-frame reconciliations. `MetadataManager` canonicalises
   the vector on every mutation (one-time re-sort of a legacy snapshot, then
   stays sorted), so merges are deltas.
@@ -5744,7 +5744,7 @@ retirement log is not justified by the data and is not built.
   reconciliation log line gains `superseded=N standing=N`).
 - **Same bytes are not a conflict.** Two branches that wrote the same
   content to the same path (type, mode, ownership, size and extents equal;
-  mtime/version may differ — two rsync writers publishing duplicate media)
+  mtime/version may differ - two rsync writers publishing duplicate media)
   merge to the deterministic lesser representation instead of a conflict,
   and a pre-0.32 record of that shape settles the same way at pruning.
 - **Conflicts are visible and resolvable.** `diagnostics.metadata.{conflicts,
@@ -5760,22 +5760,22 @@ retirement log is not justified by the data and is not built.
   `test_metadata_superseded_conflicts_leave_the_snapshot`; the two DLT6
   tests now expect DLT7 without the conflict set.
 
-## 0.31.0 — Recovery resolves, it does not refuse (development)
+## 0.31.0: Recovery resolves, it does not refuse (development)
 
 Discipline 3 of `TODO/archive/2026-09-06-self-healing-disciplines-plan.md`. Local
 durable state is replayed on every start, so anything recovery *refuses*
 it refuses forever: the node either restarts in a loop or re-raises the
 same fault on every boot. Found on the cluster on 2026-09-06: gbni-1
 (inode 922, 183 MB) and es-1 (inode 2333, 6 GB) had a recovered
-publication whose file had left the namespace — `error=missing` on every
+publication whose file had left the namespace - `error=missing` on every
 boot, the inode poisoned, the spool kept, and the operation journal pinned
 open at 132 MB / 178 MB and re-parsed each start, with twenty benign
 `accepted data completion without published prefix` WARNs each time.
 
 - **FUSE operation journal loader never refuses a frame.** A frame that
-  does not fit the state so far — duplicated marker, marker whose
+  does not fit the state so far - duplicated marker, marker whose
   operation is gone, non-monotonic sequence, unknown record type, undecodable
-  payload — is skipped and counted (`journal_recovery_skipped_frames`), with
+  payload - is skipped and counted (`journal_recovery_skipped_frames`), with
   one `WARN` per distinct reason. A re-journaled inode descriptor now
   replaces the earlier one instead of being a fatal duplicate. A checksum
   failure before EOF (durable middle-of-journal corruption) quarantines the
@@ -5797,8 +5797,8 @@ open at 132 MB / 178 MB and re-parsed each start, with twenty benign
   loser with the current epoch before re-journaling it, so the re-journal
   was a no-op and the collision was re-resolved on every boot.
 - **Metadata journal:** a frame that fails authentication or does not fit
-  the CAS chain anywhere in the file ends the replayable prefix — the tail
-  is quarantined and truncated like a torn append — instead of throwing out
+  the CAS chain anywhere in the file ends the replayable prefix - the tail
+  is quarantined and truncated like a torn append - instead of throwing out
   of the constructor and quarantining *every* metadata file (checkpoint,
   history, heads) over one frame. **Metadata history:** a frame that cannot
   be authenticated or decoded is skipped and counted; dependent heads are
@@ -5813,7 +5813,7 @@ open at 132 MB / 178 MB and re-parsed each start, with twenty benign
   (was `..._rejects_...`), `test_metadata_journal_mid_frame_corruption_truncates_not_reseeds`;
   the scanner model test now expects `corrupt_frame_offset`.
 
-## 0.30.0 — "Not yet" never becomes "forever": retry budgets, parking, progress gates (development)
+## 0.30.0: "Not yet" never becomes "forever": retry budgets, parking, progress gates (development)
 
 Discipline 2 of `TODO/archive/2026-09-06-self-healing-disciplines-plan.md`. Every
 "try again later" in the daemon now has either a budget or a progress
@@ -5825,8 +5825,8 @@ killed by the 120 s startup gate eight times in a row while replaying a
 health is monitored" for 150–230 s.
 
 - **`RetryPolicy` / `RetryState`** (`retry_policy.hpp`): one shared budget
-  shape — `max_failures_in_window`, `failure_window`, exponential
-  `initial_backoff`→`max_backoff` — used by the subsystem supervisor (whose
+  shape - `max_failures_in_window`, `failure_window`, exponential
+  `initial_backoff`→`max_backoff` - used by the subsystem supervisor (whose
   `SubsystemRetryPolicy` is now an alias) and everything below.
 - **FUSE data publication backs off, then parks.** Each inode carries its
   own `RetryState`; a transient failure re-queues it after a per-inode
@@ -5867,12 +5867,12 @@ health is monitored" for 150–230 s.
 - Renamed `FuseFrontend::abandon_corrupt_data` → `abandon_data` (it is also
   the operator abandon path now).
 
-## 0.29.0 — Durability is re-derived from disk, not asserted from a dead token (development)
+## 0.29.0: Durability is re-derived from disk, not asserted from a dead token (development)
 
 Discipline 1 of `TODO/archive/2026-09-06-self-healing-disciplines-plan.md`. The
 proven 2026-09-06 wedge: gbni-1 had placed 13 extents of a 13.9 GB file on
 es-1; es-1 was restarted; from then on every barrier gbni-1 ran was refused
-with `storage durability epoch changed` and retried, at ~35/s, forever — the
+with `storage durability epoch changed` and retried, at ~35/s, forever - the
 batch named a placement token that died with es-1's process, while the bytes
 sat on es-1's disk the whole time. Restarting *any* node did this to every
 in-flight publication elsewhere that had already touched it.
@@ -5883,8 +5883,8 @@ in-flight publication elsewhere that had already touched it.
   the holding backend on its current incarnation, and replies with the
   present ids and fresh `(epoch, domain, generation, backend_instance)`
   tokens. Without ids (a pre-0.29 requester) it refuses as before.
-- **Client.** `DistributedStore::durability_barrier(DurabilityBatch&)` —
-  now non-const — probes every peer whose replica answered `epoch changed`
+- **Client.** `DistributedStore::durability_barrier(DurabilityBatch&)` -
+  now non-const - probes every peer whose replica answered `epoch changed`
   (and re-derives locally when its own backend was reopened), re-stamps the
   batch in place so the next barrier is ordinary, and reports only the ids a
   peer genuinely no longer holds through the new `unsatisfiable` out-param.
@@ -5892,10 +5892,10 @@ in-flight publication elsewhere that had already touched it.
 - **Writer.** `WriteHandle::commit()` re-puts an unsatisfiable extent from a
   local copy when there is one, and otherwise fails with `ESTALE`, which the
   FUSE frontend treats as "discard the provisional writer and replay this
-  generation from the spool" — the WAL is the one place the bytes are
+  generation from the spool" - the WAL is the one place the bytes are
   guaranteed to be. The same dead batch is never retried.
 - Durability contract, written down: an object present on a node after a
-  restart is durable — the pack index is rebuilt from disk on open and the
+  restart is durable - the pack index is rebuilt from disk on open and the
   probe flushes the current incarnation before answering. See
   `docs/operations.md`, "Durability tokens and restarts".
 - Tests: `storage_v18/test_durability_barrier_rederives_placement_after_peer_restart`
@@ -5905,7 +5905,7 @@ in-flight publication elsewhere that had already touched it.
 - **Same discipline, FUSE side.** A data publication that hits ENOENT used to
   decide "race or dead file?" from the inode's own bookkeeping, and could
   poison the inode as terminal while a rename it had not yet learned about
-  was landing — one run in four of
+  was landing - one run in four of
   `test_fuse_durable_journal_recovers_ordered_mutations`, the extra barrier
   work having widened an old window. It now re-derives the answer: retry
   while any namespace op is in flight/queued/unconfirmed or the inode's
@@ -5913,8 +5913,8 @@ in-flight publication elsewhere that had already touched it.
   genuinely gone from the accepted namespace (which
   `test_fuse_terminal_recovery_failure_is_not_readmitted` still requires).
   Terminal publication failures now log at WARN, not DEBUG.
-- **Transient is not lost.** The first live run re-put — then replayed from
-  the spool — a file's extents because the barrier ran during the six
+- **Transient is not lost.** The first live run re-put - then replayed from
+  the spool - a file's extents because the barrier ran during the six
   seconds es-1 was restarting and got `send: Broken pipe`. A barrier now
   reports an id as unsatisfiable only when every failed replica answered
   *definitively* (absent after probe, unknown peer, reopened local backend);
@@ -5922,11 +5922,11 @@ in-flight publication elsewhere that had already touched it.
   again". `test_durability_barrier_treats_an_unreachable_peer_as_transient`;
   the failure line carries `transient=yes|no`.
 
-## 0.28.3 — Linear tombstone replay; a node could not start after 0.28.2 (development)
+## 0.28.3: Linear tombstone replay; a node could not start after 0.28.2 (development)
 
 Found by 0.28.2 itself. Until this morning a conflict-free merge delta was
 always rejected and stored as a 15 MB full snapshot, so cold replay never
-applied one. 0.28.2 made those deltas replayable — and gbni-1, restarted a
+applied one. 0.28.2 made those deltas replayable - and gbni-1, restarted a
 few hours later with two accepted heads whose chains contained merge deltas,
 never came up again: `service startup stalled after 120000ms …
 metadata=recovering`, eight times in a row. `gdb` put the recovery thread in
@@ -5945,13 +5945,13 @@ apply_metadata_delta_in_place` for the whole 120 s.
   new ones append in delta order) and the exact-reconstruction checks that
   gate every stored delta still hold byte-for-byte.
 - Regression: `storage_metadata/test_metadata_delta_tombstone_edits_are_linear`
-  — a 200 k-tombstone snapshot with a 60 k-edit delta must replay in bounded
+  - a 200 k-tombstone snapshot with a 60 k-edit delta must replay in bounded
   time and match a naive reference on the same edits.
 - **Second start blocker, hidden behind the first.** Once the replay was
   fast, gbni-1 came up, then exited two seconds later, every 7 s:
   `FUSE journal recovery produced duplicate namespace path
   /TV/Big.Mistakes.S01E01…mkv`, thrown from `initialise_namespace()` on a
-  durable journal — so deterministic, and the node could never return.
+  durable journal - so deterministic, and the node could never return.
   Recovery now resolves two inodes on one path the way a live rename-over
   does (a journaled inode outranks a snapshot-seeded one; between journaled
   ones the later namespace sequence wins; the loser is detached, keeps its
@@ -5959,7 +5959,7 @@ apply_metadata_delta_in_place` for the whole 120 s.
   On gbni-1 the WARN named the pair: `kept_inode=11240 seq=3803` (the file
   as re-written this afternoon) versus `detached_inode=7270 seq=2758` (the
   same path's earlier inode, still holding a 398 MB unpublished spool from
-  03:56) — a create-over whose displaced inode kept the path in its journal
+  03:56) - a create-over whose displaced inode kept the path in its journal
   descriptor. Why the displacing op did not transform it at recovery is not
   yet known. No unit test yet: the collision needs a hand-built journal, and
   the live journal (backed up) is the reproduction.
@@ -5968,7 +5968,7 @@ apply_metadata_delta_in_place` for the whole 120 s.
   `macha.yaml.bak-20260906-startup`); remove once 0.28.3 is on the node.
   Its FUSE journal is backed up as `/etc/macha/fuse-operations.log.bak-20260906-dup`.
 
-## 0.28.2 — Compact deltas for merges and the write after them (development)
+## 0.28.2: Compact deltas for merges and the write after them (development)
 
 `WARN local metadata delta rejected; retrying full record generation=N` had
 been firing on every node for days, and the 0.27.0 theory that it was an
@@ -5976,7 +5976,7 @@ evicted parent did not survive contact with the 0.28.0 processes. The 24 h
 journal on gbni-1 split perfectly: every `histories reconciled …
 history_body=delta conflicts=0` was preceded by the WARN, no `conflicts=1`
 or `full` reconciliation ever was. `macha-metadata-dump --all` then showed
-the same merges stored as 15 MB `full` frames on the *peers* too — peer
+the same merges stored as 15 MB `full` frames on the *peers* too - peer
 rejection only logs at DEBUG, which is why the incident note believed peers
 accepted them.
 
@@ -5986,7 +5986,7 @@ accepted them.
   changes `merge_parents` but leaves `conflicts` as they were, so
   `metadata_delta()` sent only the former; the replay dropped the standing
   conflict, the exact-reconstruction check in `MetadataReplica::store_commit()`
-  failed, and every replica — local and remote — fell back to the full
+  failed, and every replica - local and remote - fell back to the full
   snapshot. With a standing conflict set (the cluster has had one for days)
   that was every conflict-free merge, ~60 a day, 15 MB × 3 replicas each.
 - **Fix.** `metadata_delta()` sets both replacements or neither, and
@@ -6001,7 +6001,7 @@ accepted them.
   and the exact-delta (`mutate_delta`) callers.
 - `MetadataReplica::store_commit()` logs why a delta body was rejected at
   DEBUG (`parent-not-materialized`, `succession`, `payload-mismatch`,
-  `identity-mismatch`) — the full-body fallback used to leave no trace.
+  `identity-mismatch`) - the full-body fallback used to leave no trace.
 
 ### FUSE mount could stop adopting the cluster namespace, permanently
 
@@ -6018,7 +6018,7 @@ two hours and across three restarts. Every namespace queue counter was clean.
   adoption of everything, forever. The instrumented build said so in six
   seconds: `FUSE namespace refresh deferred reason=unconfirmed`. On rollout
   the recovery log named the culprits: gbni-1 `seq=149 kind=chmod`, and
-  es-1 — which nobody had suspected — `seq=1170 kind=create`, each parked
+  es-1 - which nobody had suspected - `seq=1170 kind=create`, each parked
   on a 20–40 k-op data backlog. Two of three mounts were stale.
 - **Fix.** A published marker means the backend held the op durable at the
   metadata write floor, which always includes this node's replica, so
@@ -6032,7 +6032,7 @@ two hours and across three restarts. Every namespace queue counter was clean.
   the head op's identity, `view-not-newer`, `queue-race`) and each adoption
   (`FUSE namespace adopted revision=… generation=… new=… detached=…`);
   `/api/v1/status` `filesystem` diagnostics gain
-  `namespace_refreshed_revision` / `namespace_available_revision` —
+  `namespace_refreshed_revision` / `namespace_available_revision` -
   refreshed < available is the definition of a stale mount.
 - Regression:
   `filesystem_fuse/test_fuse_recovery_retires_published_namespace_op_whose_effect_was_superseded`.
@@ -6042,13 +6042,13 @@ two hours and across three restarts. Every namespace queue counter was clean.
   `rpc_cluster/test_service_same_generation_sibling_notice_triggers_reconciliation`
   now also asserts the write after the merge is stored as a delta.
 
-## 0.28.1 — Say when a subsystem plugin loads (development)
+## 0.28.1: Say when a subsystem plugin loads (development)
 
 Found by deploying 0.28.0: the successful load was the only outcome the
 supervisor did not log. Refusals, faults and non-plugin files each had a line;
 a plugin that loaded and started had none, so confirming that a freshly
 deployed `libmacha-torrent.so` had actually been picked up meant reading
-`/proc/<pid>/maps` — `GET /api/v1/status` needs an authenticated call, which
+`/proc/<pid>/maps` - `GET /api/v1/status` needs an authenticated call, which
 is not what you reach for at 2am.
 
 - `SubsystemSupervisor` now logs `subsystem plugin '<name>' loaded and running
@@ -6062,19 +6062,19 @@ is not what you reach for at 2am.
   `std::unique_lock` with only `<shared_mutex>` included. libc++ provides it
   transitively, libstdc++ does not, so every cluster node failed to compile.
 
-## 0.28.0 — BitTorrent acquisition moves into a real plugin (`libmacha-torrent`) (development)
+## 0.28.0: BitTorrent acquisition moves into a real plugin (`libmacha-torrent`) (development)
 
 Phase 1 of `TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md`. The download
 engine and its whole libtorrent linkage now live in a `dlopen`'d module
 instead of inside `macha_core`, so whether a node can acquire over BitTorrent
-is a runtime fact — the plugin file is present or it isn't — rather than a
+is a runtime fact - the plugin file is present or it isn't - rather than a
 property of how the binary was compiled. **Deployment change: installs now
 ship `<libdir>/macha/plugins/libmacha-torrent.so` alongside the executable
 and `libmacha_core`; a node that gets only the new binary loses torrent
 support until the plugin is copied too.**
 
 - **Split.** `torrent.cpp` became `torrent_common.cpp` (core: job value types,
-  the API/wire JSON, the URI sanitisers and the Torznab search client — none
+  the API/wire JSON, the URI sanitisers and the Torznab search client - none
   of which touch libtorrent) and `torrent_manager.cpp` + `torrent_plugin.cpp`
   (the plugin). Core addresses the engine through the new abstract
   `TorrentService` (`torrent.hpp`) only; `TorrentManager` is no longer
@@ -6096,16 +6096,16 @@ support until the plugin is copied too.**
   the Torznab client is core's own. `build_available` in
   `/api/v1/torrents/status` keeps its name and now answers the runtime
   question. Config validation no longer rejects `torrent.enabled` on a build
-  without libtorrent — that is no longer a build-time fact.
+  without libtorrent - that is no longer a build-time fact.
 - **No `dlclose`.** Unmapping a plugin invalidates everything of it that
-  outlives the instance — a `shared_ptr`'s deleter and control block, a
+  outlives the instance - a `shared_ptr`'s deleter and control block, a
   vtable, a `std::function`. Closing the library on supervisor stop segfaulted
   `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`
   on exactly that: the last `shared_ptr<TorrentService>` released after the
   unmap. Handles are now kept for the process lifetime (a restart after a
   fault re-creates the instance from the still-loaded library); loading a new
   *build* of a plugin without restarting remains out of scope. A library with
-  no entry symbol is still closed immediately — nothing of it was ever called.
+  no entry symbol is still closed immediately - nothing of it was ever called.
 - **Tests** load the real module through the real entry symbol, never a
   linked-in `TorrentManager`: `hydration_catalogue/test_torrent_failed_ingest_retry_and_pause_intent`
   drives the plugin's `Subsystem` directly (it must act on restored state
@@ -6117,7 +6117,7 @@ support until the plugin is copied too.**
 
 FUSE is unchanged and still linked into the executable; that is Phase 2.
 
-## 0.27.0 — Root cause of "accepted metadata head cannot be reconstructed", fixed; broken heads now repaired live instead of quarantined (development)
+## 0.27.0: Root cause of "accepted metadata head cannot be reconstructed", fixed; broken heads now repaired live instead of quarantined (development)
 
 The 0.26.1/0.26.2 outage was bounded but not explained. This release pins the
 cause from the quarantined on-disk state of every affected node, removes it,
@@ -6204,7 +6204,7 @@ clusters keep working, they just cannot repair *from* an old peer.
   history.log reached 25 GB on gbni-2. Separate issue; see
   `TODO/archive/2026-09-06-unreconstructable-accepted-head-retry-storm-incident.md`.
 
-## 0.26.2 — Bound the second, separate retry storm from the same 0.26.1 failure mode (development)
+## 0.26.2: Bound the second, separate retry storm from the same 0.26.1 failure mode (development)
 
 Found while writing up 0.26.1's own follow-up notes, not by further live
 reproduction: a *second*, independent code path hits the same "cannot accept
@@ -6235,7 +6235,7 @@ fix.
   test suite passes unchanged; this fix is verified by code reading and the
   same live incident's log evidence, not by a new automated test.
 
-## 0.26.1 — Bound retry storms from an unreconstructable accepted metadata head (development)
+## 0.26.1: Bound retry storms from an unreconstructable accepted metadata head (development)
 
 Fixes a live 2026-09-06 incident found while stress-testing 0.26.0 with
 deliberate concurrent multi-origin writes (movies from one node, TV from
@@ -6287,7 +6287,7 @@ similar at 2-47 times/second.
   (`MetadataReplica::set_force_unreconstructable_for_tests`) and proves
   reconstruction is attempted once, not on every subsequent call.
 
-## 0.26.0 — Batch and cheapen DATA retention-check presence probes, fixing a serial-decrypt/RPC scaling cliff (development)
+## 0.26.0: Batch and cheapen DATA retention-check presence probes, fixing a serial-decrypt/RPC scaling cliff (development)
 
 Fixes the live 2026-09-06 `corvus-es-1` incident: a bulk movie rsync froze
 data publication for minutes, pinned the maintenance thread near 100% CPU,
@@ -6323,7 +6323,7 @@ cause, evidence and phased fix are in
   per-extent `have_object` path for that peer -- degraded speed during a
   rolling upgrade, not a correctness or availability issue.
 
-## 0.25.0 — Foundation for subsystem crash isolation: a mandatory thread guard, a shared macha_core, and a dlopen'd plugin loader (development)
+## 0.25.0: Foundation for subsystem crash isolation: a mandatory thread guard, a shared macha_core, and a dlopen'd plugin loader (development)
 
 Phase 0 of `TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md`, the design
 response to 0.24.4's `corvus-es-1` crash-loop (an uncaught exception during
@@ -6379,7 +6379,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   obsolete-key error instead of being silently ignored. Every deployed
   node's `macha.yaml` needs this key moved before upgrading.
 
-## 0.24.4 — Fix a crash-loop introduced by 0.24.3's namespace-skip escape hatch (development)
+## 0.24.4: Fix a crash-loop introduced by 0.24.3's namespace-skip escape hatch (development)
 
 - Fixed a same-night regression in 0.24.3's `skip_blocked_namespace_operation()`:
   it journals a `namespace_done` marker for an operation that was
@@ -6397,7 +6397,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   terminal state alongside "confirmed published." Regression:
   `test_fuse_journal_replays_operator_skipped_op_without_a_published_marker`.
 
-## 0.24.3 — Fix ingest job resurrection, a metadata data race, and a wedged FUSE namespace queue (development)
+## 0.24.3: Fix ingest job resurrection, a metadata data race, and a wedged FUSE namespace queue (development)
 
 - Fixed cleared ingest jobs resurrecting: seven sites in `src/ingest.cpp` read
   or wrote `jobs_[job.id]` via `operator[]`, which default-constructs a fresh
@@ -6434,7 +6434,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   actual root cause of that incident was operator error (an interrupted
   `rm -rf /mnt/machamedia`, recovered from ext4 backups), not a Macha bug.
 
-## 0.24.2 — Fix status() blocking on a contended subtitle-cache lock (development)
+## 0.24.2: Fix status() blocking on a contended subtitle-cache lock (development)
 
 - Fixed `PlaybackManager::status()` taking each session's subtitle-cache
   mutex while still holding the global session mutex, and doing so with a
@@ -6449,7 +6449,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   that `public_stream_response` does not hold the global mutex across libav
   work as previously suspected -- see `TODO/ACTIVE.md` item 2.
 
-## 0.24.1 — Fix false-consensus metadata history compaction, add conflict-preserving manual repair (development)
+## 0.24.1: Fix false-consensus metadata history compaction, add conflict-preserving manual repair (development)
 
 - Fixed a real production incident: `NodeRuntime::accept_history_checkpoint_proposal()`
   acked a history-compaction floor proposal unconditionally, with no check that
@@ -6488,7 +6488,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   separate storage class from the metadata/namespace layer this incident
   affected, and were confirmed untouched on disk throughout.
 
-## 0.24.0 — Cluster session/auth subsystem, replacing the old viewer-session headers (development)
+## 0.24.0: Cluster session/auth subsystem, replacing the old viewer-session headers (development)
 
 - Added a real `/api/v1/session` REST resource: `POST` mints a bearer-token
   session (anonymous-only for now, empty credentials), `GET` introspects the
@@ -6534,7 +6534,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   returns `std::nullopt` (surfaced as `429 too_many_sessions`) once the local
   cap is reached.
 
-## 0.23.11 — Snap transcode seeks to source keyframes, cutting seek startup cost (development)
+## 0.23.11: Snap transcode seeks to source keyframes, cutting seek startup cost (development)
 
 - Live-measured a seek deep into a transcoded HEVC Main10 title costing
   ~7s to first fragment versus ~2s from position zero. Root cause: for
@@ -6570,7 +6570,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   pipeline during handover on constrained hardware -- a separate, likely
   larger effect for real-world scrubbing, not addressed here.
 
-## 0.23.10 — Fix seek/generation-replacement stall on stale segment requests (development)
+## 0.23.10: Fix seek/generation-replacement stall on stale segment requests (development)
 
 - Live-diagnosed via a real seek into Apollo 13 on a running node: a segment
   request against a superseded generation (e.g. client read-ahead, or a
@@ -6603,18 +6603,18 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   real-time production. This fix addresses the confirmed stall either way;
   whether it resolves the original report remains to be observed live.
 
-## 0.23.9 — Fix audible pitch shift introduced by 0.23.8's drift correction (development)
+## 0.23.9: Fix audible pitch shift introduced by 0.23.8's drift correction (development)
 
 - 0.23.8's `swr_set_compensation()`-based correction genuinely worked (bounded
   drift as measured), but the correction mechanism itself was wrong: nudging
   the resample ratio changes pitch, and no bound on that rate is small enough
-  to be inaudible to a sensitive listener — reported live as an unacceptable,
+  to be inaudible to a sensitive listener - reported live as an unacceptable,
   clearly audible pitch shift. That mechanism has been removed entirely
   (`maintain_audio_drift_compensation()`, `swr_set_compensation()`, and its
   supporting counters are gone).
 - Replacement: enable libswresample's own built-in correction directly
   (`av_opt_set_double(swr, "async", 1, 0)` plus `swr_next_pts()` fed the real
-  source PTS each frame) — the same machinery behind ffmpeg's own `-async 1`
+  source PTS each frame) - the same machinery behind ffmpeg's own `-async 1`
   and the `aresample` filter's default behaviour. This corrects by injecting
   silence or dropping samples (`swr_inject_silence()`/`swr_drop_output()`),
   never by changing the resample ratio: `max_soft_comp` (the opt-in
@@ -6624,20 +6624,20 @@ plugin migration is Phase 1/2); this release only lays the foundation.
 - This replacement had its own near-miss during development: an initial
   attempt tried to avoid overflowing `swr_next_pts()`'s required
   `AVRational{1, in_rate*out_rate}` denominator by dividing it by
-  `gcd(in_rate, out_rate)` — but that unit is a unit fraction (numerator 1)
+  `gcd(in_rate, out_rate)` - but that unit is a unit fraction (numerator 1)
   and a unit fraction cannot be reduced by any GCD (`gcd(1, N)` is always 1).
   The result was silently ~48000x too coarse for the common 48kHz -> 48kHz
   case, which made libswresample believe it was catastrophically far ahead
   and drop nearly all audio (measured: 5 packets survived an 8-minute
   capture). Caught in local verification before reaching any node clients
   actually watch on. Fixed by rescaling into the safe `1/in_rate` unit first,
-  then multiplying by `out_rate` as plain `int64_t` arithmetic — never
+  then multiplying by `out_rate` as plain `int64_t` arithmetic - never
   constructing the overflow-prone `AVRational` at all, matching the pattern
   ffmpeg's own `libavfilter/af_aresample.c` uses.
 - Re-verified against the same real title after the fix: audio packet count
   and duration are healthy across a full 8-minute capture (no dropped audio),
   and the audio/video offset still oscillates within roughly ±15ms instead of
-  growing unbounded — same drift-correction quality as 0.23.8's measurement,
+  growing unbounded - same drift-correction quality as 0.23.8's measurement,
   now via a mechanism that cannot shift pitch.
 - Same known gap as 0.23.8: no automated regression test yet for the real
   (non-stub) transcode audio path; both this fix and the incident it fixes
@@ -6645,18 +6645,18 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   that harness (Phase 0 of the resilience plan) would have caught both the
   pitch shift and the near-total-silence regression before either shipped.
 
-## 0.23.8 — Bounded audio drift compensation for transcoded playback (development)
+## 0.23.8: Bounded audio drift compensation for transcoded playback (development)
 
 - Transcoded audio's presentation clock (`StreamPipeline::audio_next_pts` in
   `src/media_engine.cpp`) was a free-running sample counter, seeded from the
   real source timestamp once at pipeline start and never re-anchored
-  afterward — unlike video, which re-derives its PTS from the real source
+  afterward - unlike video, which re-derives its PTS from the real source
   timestamp on every single frame. Any systematic mismatch between resampled
   output sample count and real elapsed source duration (resampler rounding,
   EAC3 frame timing, channel downmix) compounded without bound for the life
   of the stream. Measured live against a real title (EAC3 5.1 -> AAC stereo):
   ~0.4ms drift per second, extrapolating to hundreds of ms over a feature-length
-  film — matches user reports of audible desync a few minutes into playback.
+  film - matches user reports of audible desync a few minutes into playback.
 - Fix: `maintain_audio_drift_compensation()` periodically compares the
   running produced-sample count against the expected count derived from the
   current frame's real source PTS, and uses `swr_set_compensation()` to
@@ -6668,14 +6668,14 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   ±15ms across an 8-minute sample instead of growing monotonically, well
   under the threshold where A/V desync becomes perceptible.
 - Known gap: no automated regression test exists yet for the real (non-stub)
-  transcode audio path — `macha-tests` links a stub media engine
+  transcode audio path - `macha-tests` links a stub media engine
   (`src/media_metadata_stub.cpp`) for speed, and this fix is verified only by
   live measurement against production content, not a deterministic CI case.
   Building that harness is exactly the Phase 0 exit criterion already
   described in `TODO/archive/2026-09-03-playback-resilience-and-av-sync-plan.md`;
   tracked there rather than duplicated here.
 
-## 0.23.7 — Per-node advertised API address fixes any-node Direct Play failover (development)
+## 0.23.7: Per-node advertised API address fixes any-node Direct Play failover (development)
 
 - `GET /api/v1/status` now reports `api_host`/`api_port` on every entry in
   `nodes[]`: where clients should reach that node's HTTP/catalogue API,
@@ -6696,10 +6696,10 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   (`NodeTelemetry`) so nodes mid-rollout on the previous version keep
   interoperating; older peers simply don't report `api_host`/`api_port` yet.
 
-## 0.23.6 — Safe distributed checkpoint and metadata-history compaction (development)
+## 0.23.6: Safe distributed checkpoint and metadata-history compaction (development)
 
-- `MetadataReplica::compact_history_if_safe()` — an existing, tested local
-  primitive that re-roots `history.log` at the sole committed accepted head —
+- `MetadataReplica::compact_history_if_safe()` - an existing, tested local
+  primitive that re-roots `history.log` at the sole committed accepted head -
   is now actually called in production, gated behind a new cluster-wide
   distributed checkpoint protocol. Previously it had zero callers: a
   generation-only safety check was known to be unsafe (a returning accepted
@@ -6711,7 +6711,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   / `commit_history_floor` RPCs, new durable `checkpoint-proof.meta` per
   replica). Compaction only fires once every durably-known participant has
   durably acknowledged the exact same accepted-head hash as the new ancestry
-  floor — mirrors the existing `all_known_reachable()` gate already used for
+  floor - mirrors the existing `all_known_reachable()` gate already used for
   destructive object GC. A restart only ever trusts a proof that still
   validates against the replica's current committed head.
 - A returning node whose own compaction floor has since been pruned
@@ -6722,14 +6722,14 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   `history.log` files (from the previously-unbounded retention) shrink back
   to a single root record once the cluster completes its first round.
 
-## 0.23.5 — Cluster-wide ingest/torrent job visibility and control (development)
+## 0.23.5: Cluster-wide ingest/torrent job visibility and control (development)
 
 - `GET /api/v1/ingest/jobs` and `GET /api/v1/torrents/jobs` (list and
   single-job) now answer with every job in the cluster, not just the jobs
   owned by the node the client happened to talk to. Each job is tagged with
   its owning `node_id`. Implemented as an on-demand RPC survey of active
   peers (new `get_ingest_jobs`/`get_torrent_jobs` wire messages), not
-  replication — a peer that can't be reached is skipped, not fatal to the
+  replication - a peer that can't be reached is skipped, not fatal to the
   request.
 - `POST .../jobs/{id}/{pause,resume,retry,cancel,clear}` now works
   regardless of which node's API receives the request: if the job isn't
@@ -6740,10 +6740,10 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   job can't perform that action in its current state) are preserved
   cluster-wide.
 - No client-visible API surface changed beyond the new `node_id` field on
-  each job — existing UIs keep working unmodified, just with complete
+  each job - existing UIs keep working unmodified, just with complete
   visibility instead of a partial, node-dependent view.
 
-## 0.23.4 — Signed artwork capability URLs (development)
+## 0.23.4: Signed artwork capability URLs (development)
 
 - Embed a signed, short-lived capability URL (`?exp=...&sig=...`, HMAC'd with
   the cluster auth key) directly on each artwork reference in catalogue
@@ -6754,7 +6754,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   embedded authorization rather than requiring a separate header. Unlike the
   session-scoped stream token, artwork has no session to anchor a validity
   window to, so the expiry is explicit and carried in the URL; default TTL is
-  24h, configurable via `catalogue.api.artwork_capability_ttl_ms` — long
+  24h, configurable via `catalogue.api.artwork_capability_ttl_ms` - long
   enough that normal browsing/caching isn't disrupted, with an expired URL
   recovered by simply re-fetching the catalogue item. The existing
   header-authenticated `GET /api/v1/catalogue/artwork/{id}` endpoint is
@@ -6765,7 +6765,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   `Cache-Control: public, max-age=<ttl>, immutable`, since the id is a
   content hash and the bytes it names never change.
 
-## 0.23.3 — HTTP keep-alive, honest Status telemetry, and metadata/startup reliability (development)
+## 0.23.3: HTTP keep-alive, honest Status telemetry, and metadata/startup reliability (development)
 
 - Implement bounded HTTP/1.1 keep-alive for the catalogue/media API server
   instead of closing every connection: reused connections are bounded by
@@ -6780,8 +6780,8 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   arbitrarily old RSS/CPU/load/capacity numbers as authoritative merely
   because a sample was once observed.
 - Add a truthful per-node `phase` (`starting`, `recovering`, `ready`) to
-  telemetry so a node's own in-progress local recovery — which legitimately
-  reports zero capacity/usage before its storage is ready — is no longer
+  telemetry so a node's own in-progress local recovery - which legitimately
+  reports zero capacity/usage before its storage is ready - is no longer
   indistinguishable on the wire from a genuinely empty node. A recovering
   peer now reports `state: "online"` (control-plane reachable, which is
   true) with `phase: "recovering"` and non-authoritative storage/cache
@@ -6805,7 +6805,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
 - Bound `Service::wait_services_ready()`, which previously waited on local
   startup with no timeout at all: a rare (reproduced at roughly 1-in-30
   startups under stress) internal stall below the readiness/subsystem
-  construction path — one that neither completes nor throws — could hang a
+  construction path - one that neither completes nor throws - could hang a
   node forever with no diagnostic and no way for the process supervisor to
   intervene, since systemd's `Restart=on-failure` only ever triggers once a
   process actually exits. Add configurable `service_startup_timeout_ms`
@@ -6814,12 +6814,12 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   exception unwind, which would try to join a startup thread that may be
   permanently blocked and hang identically in `stop()`. Restart-driven
   recovery replay on the next boot is what actually resolves the stalled
-  state. The root cause of the underlying rare stall itself — a suspected
-  lock or lost wakeup somewhere in subsystem construction/start — was not
+  state. The root cause of the underlying rare stall itself - a suspected
+  lock or lost wakeup somewhere in subsystem construction/start - was not
   pinned down and remains open; this bounds its worst-case impact rather than
   eliminating it.
 
-## 0.23.1 — bounded FUSE recovery failure (development)
+## 0.23.1: bounded FUSE recovery failure (development)
 
 - Stop terminal asynchronous publication failures from being immediately
   re-admitted as deferred work. A journal-restored inode whose accepted
@@ -6830,7 +6830,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   namespace removal, proving exactly one terminal attempt, scheduler quiescence,
   and continued access to unrelated files.
 
-## 0.22.2 — metadata reconciliation recovery (development)
+## 0.22.2: metadata reconciliation recovery (development)
 
 - Reject compact metadata deltas which cannot reproduce the exact immutable
   snapshot byte ordering, including reconciliation which canonicalises an
@@ -6845,7 +6845,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   capacity totals while preserving an explicit per-node `state: "retired"`
   audit response.
 
-## 0.21.0 — asynchronous node startup (development)
+## 0.21.0: asynchronous node startup (development)
 
 - Bring the RPC control plane and status API online before local backend recovery.
 - Report startup/readiness independently from cluster reachability and storage availability.
@@ -6861,7 +6861,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   throughput, and saturation blocks writers rather than returning logical
   `ENOSPC`.
 
-## 0.19.0 — metadata replica availability
+## 0.19.0: metadata replica availability
 
 - Replace fixed metadata-voter placement with all-node metadata replication. Every active node is eligible to durably store namespace and catalogue-control metadata.
 - Add `dht.metadata_min_write_replicas`: the literal number of distinct active metadata replicas which must durably store an immutable commit before it may be accepted. Legacy `dht.metadata_replicas` remains a migration-only alias and maps its old voter count to the equivalent former majority write floor.
@@ -6884,7 +6884,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
 - Keep legacy accepted-head certificates readable during upgrade while preventing a protocol-20 branch from downgrading to legacy authority, and route background maintenance through the same virgin-cluster policy fencing as foreground discovery.
 - Split dependency-free backend tests from concrete yaml-cpp/FFmpeg runtime-adapter tests so storage, cluster, filesystem, catalogue and playback policy coverage can build and run on constrained development hosts; add `run-tests.sh` to execute every test binary present in a build tree.
 
-## 0.18.2 — cluster status telemetry
+## 0.18.2: cluster status telemetry
 
 - Add optional UPnP IGD public port mapping, AWS external-IP fallback, boot/manual public endpoint self-probing, runtime advertised endpoint updates, and Status API diagnostics.
 
@@ -6898,12 +6898,12 @@ plugin migration is Phase 1/2); this release only lays the foundation.
 - Fence catalogue CONTROL-store GC to the metadata generation used to build its reachability inventory, so a concurrent catalogue commit cannot have a newly-published manifest/shard deleted by a stale maintenance live-set (including with zero garbage grace).
 - Protect the data-before-metadata catalogue publication window on every metadata voter: CONTROL GC will not reclaim objects written after that voter observed its current catalogue root, so newly staged manifests/shards survive until the successor root is committed and observed even when `garbage_grace` is zero.
 
-## 0.18.1 — acquisition recovery
+## 0.18.1: acquisition recovery
 
 - Add an explicit torrent retry action for completed downloads whose linked ingest job failed, reusing the existing persisted ingest job and staging payload without redownloading.
 - Keep an operator-paused torrent paused until explicit resume instead of allowing a stale libtorrent status sample to overwrite the Macha job state.
 
-## 0.18.0 — storage correctness reset
+## 0.18.0: storage correctness reset
 
 0.18.0 defines a fresh on-disk/storage contract and intentionally does not migrate an existing Macha namespace.
 

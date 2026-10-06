@@ -33,7 +33,7 @@ tail, not a failing disk.
 1. `StoragePool::activate` (`src/storage_pool.cpp:136`) constructs the
    `LocalStore` for the backend at `:235`.
 2. The `LocalStore` constructor calls `rebuild_pack_index_locked(true)`
-   before anything else (`src/local_store.cpp:297`) — the packed index is
+   before anything else (`src/local_store.cpp:297`) - the packed index is
    deliberately derived from the append-only pack files at every start.
 3. `rebuild_pack_index_locked` walks every pack record by record. It handles
    two torn-tail shapes when `truncate_incomplete_tail` is set:
@@ -41,9 +41,9 @@ tail, not a failing disk.
    - a header that decodes but whose payload runs past EOF → truncate and
      stop (`:777-782`).
 
-   A header that is **present but undecodable** — `decode_pack_header`
+   A header that is **present but undecodable** - `decode_pack_header`
    returns nothing because the magic, checksum or field ranges fail
-   (`:145-177`) — **throws unconditionally, ignoring the flag** (`:772-776`).
+   (`:145-177`) - **throws unconditionally, ignoring the flag** (`:772-776`).
 4. The exception leaves the constructor; `activate` catches it at
    `src/storage_pool.cpp:270` and calls `deactivate`, which marks the backend
    offline and logs the WARN above (`:110-134`).
@@ -52,8 +52,8 @@ tail, not a failing disk.
    backends that are `configured && token_known` (`:992-1009`), so the
    node's capacity is 0. `NodeRuntime::recover_storage` publishes that as the
    node's advertised storage (`src/cluster.cpp:380-389`) and marks data
-   storage *ready* — the node reports itself healthy with nothing to store on.
-6. **The node does re-probe the backend — every heartbeat — and it fails
+   storage *ready* - the node reports itself healthy with nothing to store on.
+6. **The node does re-probe the backend - every heartbeat - and it fails
    the same way each time.** `NodeRuntime::loop` calls `local_->refresh()` on
    every iteration (`src/cluster.cpp:1595`), which re-runs `activate` on every
    configured backend. Each attempt constructs a fresh `LocalStore`, meets the
@@ -66,13 +66,13 @@ tail, not a failing disk.
 
 Placement consequence: with gbni-1 at 0 capacity and es-1 down, replication 2
 has one eligible target. Objects are on both reachable nodes or neither, never
-exactly one — the pattern the client reported.
+exactly one - the pattern the client reported.
 
 ## Why the tail looks like this
 
 The writer (`append_pack_record_locked`, `src/local_store.cpp:586-668`)
-appends a record as two `write()` calls on an `O_APPEND` fd — the 125-byte
-header (`:627`), then the payload (`:628`) — and never syncs the pack itself.
+appends a record as two `write()` calls on an `O_APPEND` fd - the 125-byte
+header (`:627`), then the payload (`:628`) - and never syncs the pack itself.
 Durability is the `DurabilityDomain`'s job: on Linux it is one `syncfs` over
 the filesystem (`src/durability_domain.cpp:153-181`), issued after the
 mutation registers a generation (`complete_mutation`, `:87-100`), and a put
@@ -84,7 +84,7 @@ the inode's new size while the block that was to hold the header is either
 zero-filled or holds whatever the interrupted write left. Result: the file
 is extended by the header's length, but the bytes there are not a header.
 That is exactly this pack's shape, and it is the *expected* outcome of a
-power interruption on this node — the same class of event behind the
+power interruption on this node - the same class of event behind the
 2026-09-08 undervolt work.
 
 **No acknowledged data is in that tail.** A generation is awarded only after
@@ -101,10 +101,10 @@ else says the header was partially written. Either is handled by the fix.
 
 ## Why the writer's own rollback did not save it
 
-`append_pack_record_locked` rolls back a *failed* append — ENOSPC, EIO, short
-write — by truncating to the pre-append offset (`:633-651`). That path runs in
+`append_pack_record_locked` rolls back a *failed* append - ENOSPC, EIO, short
+write - by truncating to the pre-append offset (`:633-651`). That path runs in
 the live process. Power loss gives it no chance to run; that case is, by the
-comment at `:638`, explicitly delegated to restart recovery — which is the
+comment at `:638`, explicitly delegated to restart recovery - which is the
 code that does not handle it.
 
 ## The defect, stated precisely
@@ -115,12 +115,12 @@ behind a torn record (the rollback path either restores the boundary or
 abandons the pack, `:639-651`), an undecodable header followed by no
 decodable record is a torn tail and should be truncated exactly like the
 other two torn-tail shapes. An undecodable header **followed by** decodable
-records is something else — bit rot, a media fault, an external edit — and
+records is something else - bit rot, a media fault, an external edit - and
 must not be truncated, because truncation there would silently discard the
 valid records after it.
 
 The existing regression test, `test_pack_recovery_discards_incomplete_tail_record`
-(`tests/test_storage_v18.cpp:642`), appends 23 bytes — fewer than a header —
+(`tests/test_storage_v18.cpp:642`), appends 23 bytes - fewer than a header -
 and so exercises only the first branch. No test appends a header's worth of
 garbage.
 
@@ -151,7 +151,7 @@ In `rebuild_pack_index_locked`, when `decode_pack_header` fails:
   absent from this backend; `has()` is false, so the cluster repairs them
   from replicas, and a re-put of the same object works. A `pack_remove`
   tombstone lost in the span can resurrect an earlier record of that object
-  until GC reaches it — bounded and benign, and recorded in the changelog.
+  until GC reaches it - bounded and benign, and recorded in the changelog.
 
 A genuine read error (`pra_exact` failing) still throws: that is a disk not
 answering, and the existing heartbeat re-probe brings the backend back when
@@ -168,7 +168,7 @@ Diagnostics: `LocalStoreDiagnostics` gains `pack_recovery_truncated_tails`,
   objects, then append exactly 125 zero bytes. Reopen: both objects readable,
   pack back to its intact size. Repeat with 125 non-zero random bytes, and
   with 125 + 40 000 bytes (undecodable header plus a partial garbage payload)
-  — all three truncate to the intact size.
+  - all three truncate to the intact size.
 - `test_pack_recovery_skips_unreadable_region_before_live_records`: three
   packed objects; flip one byte in the *second* record's checksum. Reopen:
   nothing truncated, first and third readable, second absent, diagnostics
@@ -183,7 +183,7 @@ a comment deriving it, as the existing test hardcodes its 23 bytes.
 
 Entry under a new `0.38.3` heading; the bump goes in the same commit per the
 release convention relayed on 2026-09-13 (still unconfirmed, but harmless to
-follow here). Run the suite on a node, not only on macOS, before shipping —
+follow here). Run the suite on a node, not only on macOS, before shipping -
 0.38.0's two GCC-only failures are the reason.
 
 ## How gbni-1 heals

@@ -15,7 +15,7 @@ fuse:
   mount_path: /srv/media
 ```
 
-`state_path` contains node identity, namespace metadata state, maintenance state and—unless overridden—the metadata control-object store. `key_file` must contain the same secret material on every node in a cluster. `fuse.mount_path` is optional; omit it to run without a FUSE mount.
+`state_path` contains node identity, namespace metadata state, maintenance state and-unless overridden-the metadata control-object store. `key_file` must contain the same secret material on every node in a cluster. `fuse.mount_path` is optional; omit it to run without a FUSE mount.
 
 A fresh state namespace is required. Non-empty unversioned state is refused.
 
@@ -310,7 +310,7 @@ When false, any existing Macha mount is a hard startup error.
 
 `fail_closed_mountpoint` guards the host directory the mount covers during the
 20-40 s between services starting and the mount coming up. On Linux Macha sets
-`chattr +i` on that directory, so nothing — root included — can write into it
+`chattr +i` on that directory, so nothing - root included - can write into it
 while no mount is present; otherwise anything writing to the mount path in that
 window fills the host's own disk with files the mount then hides.
 
@@ -443,7 +443,7 @@ storage backend comes or goes. An operator can also resolve it with
 `POST .../parked-publications/<inode>/retry` (fresh budget)
 or `POST .../parked-publications/<inode>/abandon` (drops the unpublished
 generation, exactly as a corrupt spool record would be dropped). Parking is
-never applied to definitive failures — those are handled at once — nor to the
+never applied to definitive failures - those are handled at once - nor to the
 namespace queue, which is ordered and therefore cannot skip an entry: on
 budget exhaustion it reports the blocking operation as `EAGAIN` in
 `namespace_blocked_op` and keeps retrying at the ceiling backoff.
@@ -548,7 +548,7 @@ transcode capacity after a client disappears on an unreliable network without
 shortening the logical session lifetime.
 
 `session_unused_idle_ms` (120 s) applies only to a session that has **never**
-served a stream object — no playlist, fragment, subtitle or Direct Play body.
+served a stream object - no playlist, fragment, subtitle or Direct Play body.
 The condition is "never used", not "not used recently": one stream request of
 any kind earns the full `session_idle_ms` permanently, so a paused or seeking
 player is never evicted by this clock. Both clocks run from the session's last
@@ -732,7 +732,7 @@ Validated ranges: `workers` 1..256, `control_workers` 1..64,
 
 The server is one reactor thread that owns every socket, plus two pools of threads that only compute (see `docs/streaming.md`, "Public HTTP behaviour"). `workers` is the data lane: catalogue, playback, web assets, and every body read that can block on a disk or a replica. `control_workers` is the control lane: health, status, session and account routes, so they are answered while the data lane is saturated. `max_connections` bounds open connections; an idle kept-alive connection is a descriptor and a small struct, not a thread. `max_queued_requests` bounds how many requests may wait for a lane worker before the reactor answers `503 overloaded` with `Retry-After: 1`. `staging_chunks` is how many `stream_chunk_bytes` chunks a streaming response may hold ahead of a slow client, so streaming memory is at most connections × `staging_chunks` × `stream_chunk_bytes`. A handler slower than `slow_request_threshold_ms` is logged with its route; a reactor pass longer than `reactor_stall_threshold_ms` is counted in diagnostics as a stall, which should never happen.
 
-`compression` gzips text responses on the way out: JSON from the API, and the web client's HTML, CSS and JavaScript. It applies only to complete in-memory bodies above `compression_min_bytes` (at least 64), and only for a client whose `Accept-Encoding` asks for it. Media is never compressed — it is already compressed, it is streamed rather than buffered, and the reactor sends it from resident memory without a copy. Neither are images, fonts or wasm, for the same reason. `compression_level` is the zlib level, 1 to 9; 1 gives most of the ratio for a fraction of the CPU, which is what a Pi-class node wants. Every compressible response carries `Vary: Accept-Encoding` whether or not it was compressed, so a shared cache keys the two representations apart.
+`compression` gzips text responses on the way out: JSON from the API, and the web client's HTML, CSS and JavaScript. It applies only to complete in-memory bodies above `compression_min_bytes` (at least 64), and only for a client whose `Accept-Encoding` asks for it. Media is never compressed - it is already compressed, it is streamed rather than buffered, and the reactor sends it from resident memory without a copy. Neither are images, fonts or wasm, for the same reason. `compression_level` is the zlib level, 1 to 9; 1 gives most of the ratio for a fraction of the CPU, which is what a Pi-class node wants. Every compressible response carries `Vary: Accept-Encoding` whether or not it was compressed, so a shared cache keys the two representations apart.
 
 For the web client, a precompressed file sitting next to the asset (`app.js.gz` beside `app.js`) is preferred and costs no CPU per request. When the client build did not produce one, an asset up to `compression_max_asset_bytes` (at most `64M`) is compressed on demand instead; larger ones are streamed unchanged. The compressed and uncompressed forms of an asset never share an entity tag, so revalidation cannot return the wrong one.
 
@@ -778,13 +778,13 @@ web:
 
 A path that names a file under `root` is served as that file, with a content type from its extension, an `ETag`, and `Cache-Control: public, max-age=3600`. Every other path is answered with the index document under `Cache-Control: no-cache`, so a deep link like `/library/artist/x` reaches the client, which resolves the route itself once it has loaded. The index is revalidated on every load because it names the current asset bundle; without that a deploy stays invisible until the browser decides otherwise.
 
-**The API namespace is never served from here.** Everything under `/api` — not merely `/api/v1` — remains the server's, including its `404`s: a client asking for an endpoint that does not exist is told so in JSON rather than handed an HTML page its parser will choke on. Reserving the whole prefix means a later API version cannot be silently swallowed by the client's fallback.
+**The API namespace is never served from here.** Everything under `/api` - not merely `/api/v1` - remains the server's, including its `404`s: a client asking for an endpoint that does not exist is told so in JSON rather than handed an HTML page its parser will choke on. Reserving the whole prefix means a later API version cannot be silently swallowed by the client's fallback.
 
 Client assets are served without a bearer token, since a browser has none until the client has loaded and asked for one. `root` must therefore contain only material meant to be public. Nothing outside it is reachable: request paths are checked one segment at a time and a segment that is empty, `.`, `..`, or begins with a dot is refused, so a request can neither climb out of the root nor read build leftovers such as `.env` or `.git`. A refused path falls through to the index rather than to a `404`, so probing cannot be used to learn whether a file exists.
 
 The client is served while local services are still recovering, because it is static files and depends on none of them. That is deliberate: the client loads and shows what `/api/v1/status` reports, rather than failing to load at all during a recovery.
 
-A node configured with a `root` that does not exist, or one with no index document, answers `503 web_client_unavailable` rather than `404` — a misconfigured node says so instead of pretending the route was never there, and starts serving as soon as the files appear, without a restart.
+A node configured with a `root` that does not exist, or one with no index document, answers `503 web_client_unavailable` rather than `404` - a misconfigured node says so instead of pretending the route was never there, and starts serving as soon as the files appear, without a restart.
 
 ## Logging
 

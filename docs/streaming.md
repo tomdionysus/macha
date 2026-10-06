@@ -6,9 +6,9 @@ The client names the mode: `preferences.mode` is required on every session, and 
 
 ## Modes
 
-1. **direct** — the original file over HTTP byte ranges, exactly as stored: no container change and no re-encode;
-2. **remux** — every elementary stream copied into an HLS container;
-3. **transcode** — at least one stream re-encoded (H.264 video, AAC audio) into an HLS container. An AAC encode keeps the source's channel layout: a codec change is not a downmix.
+1. **direct** - the original file over HTTP byte ranges, exactly as stored: no container change and no re-encode;
+2. **remux** - every elementary stream copied into an HLS container;
+3. **transcode** - at least one stream re-encoded (H.264 video, AAC audio) into an HLS container. An AAC encode keeps the source's channel layout: a codec change is not a downmix.
 
 The per-stream instructions name what happens to each stream:
 
@@ -59,8 +59,8 @@ So "copy the video, re-encode the audio" is `{"mode": "transcode", "video": "cop
 
 - a missing or unknown `mode`, or an unknown `video`/`audio`/`container` value;
 - `direct` with a stream set to `transcode`, or with any `max_height`/`max_bitrate`;
-- `remux` with a stream set to `transcode`, or with a `max_bitrate` or a `max_height` below the source height — a quality change is a re-encode, and remux copies;
-- `transcode` with both streams copied — nothing is being re-encoded, so it is a remux or a direct;
+- `remux` with a stream set to `transcode`, or with a `max_bitrate` or a `max_height` below the source height - a quality change is a re-encode, and remux copies;
+- `transcode` with both streams copied - nothing is being re-encoded, so it is a remux or a direct;
 - a copy into a container that cannot carry that codec (fragmented MP4 carries H.264, HEVC and AV1 video, and AAC, AC-3, E-AC-3 and Opus audio);
 - a transcode when the node has no encoder for the target.
 
@@ -131,13 +131,13 @@ A transformed session is served as a master playlist (`master.m3u8`: one `EXT-X-
 
 `EXTINF` is the plan rather than the measured length, necessarily: an unproduced fragment has no measured length, and a VOD playlist must be immutable across fetches, so a produced fragment cannot be described differently from an unproduced one. That is only honest because the pipeline emits exactly one fragment per planned entry; `tests/test_transcode_timeline.cpp` gates it by measuring every declared duration against the media the fragment really carries.
 
-Because the playlist promises fragments that do not exist yet, a request for one is held rather than refused — but only as an explicitly admitted resource, under three independent tests applied in order. A request beyond `segment_hold_window` fragments of the produced frontier is refused: nothing is working toward it. A session already holding `max_session_holds` requests is refused, which is what stops a deeply prefetching player queueing thirty requests against the encoder. A node already holding `max_concurrent_holds` requests is refused. Any of those is an immediate answer, never a wait, and a refused request does not raise the producer demand watermark — noting an index the server declined to serve would authorise production to run toward it. An admitted hold waits up to `segment_timeout_ms`.
+Because the playlist promises fragments that do not exist yet, a request for one is held rather than refused - but only as an explicitly admitted resource, under three independent tests applied in order. A request beyond `segment_hold_window` fragments of the produced frontier is refused: nothing is working toward it. A session already holding `max_session_holds` requests is refused, which is what stops a deeply prefetching player queueing thirty requests against the encoder. A node already holding `max_concurrent_holds` requests is refused. Any of those is an immediate answer, never a wait, and a refused request does not raise the producer demand watermark - noting an index the server declined to serve would authorise production to run toward it. An admitted hold waits up to `segment_timeout_ms`.
 
-A refusal is `500` with error code `segment_not_ready`, `Retry-After: 1` and `Cache-Control: no-store` — never `404`. `error.reason` says which test refused it: `beyond_hold_window`, `session_hold_limit`, `hold_budget_exhausted`, or `hold_timed_out` for an admitted hold whose `segment_timeout_ms` ran out. The resource is not absent, since the playlist promises it exists; it is not ready, and a `404` invites an intermediary to cache the miss while some players treat it as terminal. A broken generation is `503 stream_failed`.
+A refusal is `500` with error code `segment_not_ready`, `Retry-After: 1` and `Cache-Control: no-store` - never `404`. `error.reason` says which test refused it: `beyond_hold_window`, `session_hold_limit`, `hold_budget_exhausted`, or `hold_timed_out` for an admitted hold whose `segment_timeout_ms` ran out. The resource is not absent, since the playlist promises it exists; it is not ready, and a `404` invites an intermediary to cache the miss while some players treat it as terminal. A broken generation is `503 stream_failed`.
 
-The assignment is deliberately the inverse of what the HTTP spec suggests, and a client must not "correct" it. Many players expose only the status code on a fragment error — not the body, not the headers — so the status has to carry the meaning on its own. `503` cannot: every proxy and load balancer emits it when a service is down, so a client taught that `503` means "hold, stay here" would read a dead node as a healthy one and never fail over. Misreading an infrastructure `500` as a hold costs one wasted retry instead. Both stay 5xx because a 4xx stops most players retrying at all. `init.mp4` takes the same hold path as a fragment.
+The assignment is deliberately the inverse of what the HTTP spec suggests, and a client must not "correct" it. Many players expose only the status code on a fragment error - not the body, not the headers - so the status has to carry the meaning on its own. `503` cannot: every proxy and load balancer emits it when a service is down, so a client taught that `503` means "hold, stay here" would read a dead node as a healthy one and never fail over. Misreading an infrastructure `500` as a hold costs one wasted retry instead. Both stay 5xx because a 4xx stops most players retrying at all. `init.mp4` takes the same hold path as a fragment.
 
-`segment_timeout_ms` must stay below the client's time-to-first-byte deadline. A held request sends no bytes, so a client that gives up first never sees the refusal and takes its timeout path, which retries hard and then fails — worse than not holding at all. The tightest deadline among the clients in use is 8 s, so the 6000 default clears it with margin and **8000 is a hard ceiling on this knob**. Read the deadline out of the client artifact before changing it: the published documentation for these clients has been wrong about which setting governs.
+`segment_timeout_ms` must stay below the client's time-to-first-byte deadline. A held request sends no bytes, so a client that gives up first never sees the refusal and takes its timeout path, which retries hard and then fails - worse than not holding at all. The tightest deadline among the clients in use is 8 s, so the 6000 default clears it with margin and **8000 is a hard ceiling on this knob**. Read the deadline out of the client artifact before changing it: the published documentation for these clients has been wrong about which setting governs.
 
 A held request costs no thread. The handler asks the segment store for the object and, in the same locked step, subscribes to the next publication if it is absent; it then hands the server a deferral -- what it is waiting for, its deadline, and the admitted hold -- and returns. The server parks the connection and re-runs the handler when the store publishes or the deadline passes. `max_concurrent_holds` (64) is therefore a fairness and memory bound rather than a worker-thread ration: it bounds how many requests may be waiting on encoders at once across every session. Steady-state playback on a four-core node transcoding at roughly real time sits at the frontier often, so holds are the ordinary case rather than the exception.
 
@@ -224,8 +224,8 @@ refused. The bound is `segment_timeout_ms`, published per node on
 
 In both cases the wait is on production that this viewer itself demanded, which
 is the distinction that matters: the work in front of it is its own. A change
-that makes a viewer wait on anything else — a publication, a repair, a scrub, a
-catalogue scan — is a law-2 violation however favourable its throughput numbers
+that makes a viewer wait on anything else - a publication, a repair, a scrub, a
+catalogue scan - is a law-2 violation however favourable its throughput numbers
 are.
 
 Publication traffic has its own loader transport class below viewer foreground
@@ -243,7 +243,7 @@ Connections are HTTP/1.1 keep-alive by default, reused for up to `keep_alive_max
 
 Session creation and control require the session bearer token from `POST /api/v1/session`. Returned stream URLs use a separate high-entropy capability in the path so native players can fetch direct files, playlists and fragments without the bearer token. Stream capabilities expire with the playback session.
 
-Every JSON object response carries a top-level snake_case `status`: `"ok"` on success, unless the handler states its own. An error's `status` is its `error.code`, except the two playback errors built outside the common envelope — `account_session_limit` and the `playback_*_failed` stage errors — whose `status` is `"error"`. Branch on `error.code`, which is present on every error. Stream bodies, `204` and non-JSON responses carry no `status`.
+Every JSON object response carries a top-level snake_case `status`: `"ok"` on success, unless the handler states its own. An error's `status` is its `error.code`, except the two playback errors built outside the common envelope - `account_session_limit` and the `playback_*_failed` stage errors - whose `status` is `"error"`. Branch on `error.code`, which is present on every error. Stream bodies, `204` and non-JSON responses carry no `status`.
 
 ## Status
 
@@ -273,24 +273,24 @@ A client must bound its own attempt on a node against the budgets that node enfo
 }
 ```
 
-- **`startup_timeout_ms`** — how long this node may take to bring a transformed generation's first fragment up (`streaming.startup_timeout_ms`).
-- **`segment_timeout_ms`** — how long it holds a request for a fragment that is not ready yet (`streaming.segment_timeout_ms`).
-- **`pipeline_idle_ms`** — how long a physical remux/transcode pipeline survives without valid current-generation traffic (`streaming.pipeline_idle_ms`).
-- **`session_idle_ms`** — how long a logical session survives without control or valid stream activity (`streaming.session_idle_ms`). This is also how long a session abandoned on an unreachable node keeps its slot.
-- **`max_sessions_per_account`** — the per-account cap, described under [what one account may hold](#what-one-account-may-hold-on-one-node). The limit only; the live count is never here.
-- **`max_transcodes_per_account`** — how many of one account's sessions may hold a transcode entitlement on this node, described in the same section. The limit only.
-- **`max_sessions`** — the node-wide session cap, every account together. Its refusal is `resource_limit` and means something different from the one above: this node is full, rather than this account is.
-- **`transcode_entitlement_idle_ms`** — how long a session may hold a transcode entitlement with no stream activity before the node releases it. See [keeping a transcode slot across a pause](#keeping-a-transcode-slot-across-a-pause).
-- **`startup_no_progress_ms`**, **`start_wait_max_ms`**, **`start_failed_retention_ms`** — the `start=async` budgets, described under [starting without blocking](#starting-without-blocking-startasync). Their absence means the node does not offer `start=async`.
-- **`transcode_rates`** — what this node has sustained transcoding each kind of source it has actually transcoded: `[{kind, codec, bit_depth, height_class, rate, observations, concurrent}]`. `kind` is `video` (keyed by the source video stream's codec, bit depth and height class: 576, 720, 1080, 1440, 2160, 4320) or `audio` (an audio-only transcode, keyed by the source audio codec; no `bit_depth` or `height_class`). `rate` is the median of the node's last 16 finished generations' produced over producing media time, parked time excluded, over generations that produced at least a minute of media: below `1.0` the node did not keep up with that kind of source. `concurrent` is the median number of transcodes running on the node when those were taken. Measured, never estimated, and kept across restarts; a kind the node has never transcoded is absent, never guessed. A client matches its candidate file's profile to a class before choosing to transcode it on that node.
+- **`startup_timeout_ms`** - how long this node may take to bring a transformed generation's first fragment up (`streaming.startup_timeout_ms`).
+- **`segment_timeout_ms`** - how long it holds a request for a fragment that is not ready yet (`streaming.segment_timeout_ms`).
+- **`pipeline_idle_ms`** - how long a physical remux/transcode pipeline survives without valid current-generation traffic (`streaming.pipeline_idle_ms`).
+- **`session_idle_ms`** - how long a logical session survives without control or valid stream activity (`streaming.session_idle_ms`). This is also how long a session abandoned on an unreachable node keeps its slot.
+- **`max_sessions_per_account`** - the per-account cap, described under [what one account may hold](#what-one-account-may-hold-on-one-node). The limit only; the live count is never here.
+- **`max_transcodes_per_account`** - how many of one account's sessions may hold a transcode entitlement on this node, described in the same section. The limit only.
+- **`max_sessions`** - the node-wide session cap, every account together. Its refusal is `resource_limit` and means something different from the one above: this node is full, rather than this account is.
+- **`transcode_entitlement_idle_ms`** - how long a session may hold a transcode entitlement with no stream activity before the node releases it. See [keeping a transcode slot across a pause](#keeping-a-transcode-slot-across-a-pause).
+- **`startup_no_progress_ms`**, **`start_wait_max_ms`**, **`start_failed_retention_ms`** - the `start=async` budgets, described under [starting without blocking](#starting-without-blocking-startasync). Their absence means the node does not offer `start=async`.
+- **`transcode_rates`** - what this node has sustained transcoding each kind of source it has actually transcoded: `[{kind, codec, bit_depth, height_class, rate, observations, concurrent}]`. `kind` is `video` (keyed by the source video stream's codec, bit depth and height class: 576, 720, 1080, 1440, 2160, 4320) or `audio` (an audio-only transcode, keyed by the source audio codec; no `bit_depth` or `height_class`). `rate` is the median of the node's last 16 finished generations' produced over producing media time, parked time excluded, over generations that produced at least a minute of media: below `1.0` the node did not keep up with that kind of source. `concurrent` is the median number of transcodes running on the node when those were taken. Measured, never estimated, and kept across restarts; a kind the node has never transcoded is absent, never guessed. A client matches its candidate file's profile to a class before choosing to transcode it on that node.
 
 These are each node's statement about **itself**, relayed like `load1` and `cpu_cores`. Each node reports only its own figures, because streaming configuration stays on the node it belongs to and telemetry does not relay it. A client that needs a worst case across the nodes it might use composes it from these, because only the client knows which nodes those are.
 
-They are **not** on the session payload, unlike `stream.look_ahead_ms`. That field is needed during playback, once a session exists; these bound the request that creates the session, so a client cannot learn them from the response it is timing out on — and a node it has never used would never report them at all.
+They are **not** on the session payload, unlike `stream.look_ahead_ms`. That field is needed during playback, once a session exists; these bound the request that creates the session, so a client cannot learn them from the response it is timing out on - and a node it has never used would never report them at all.
 
 **Absence means the node cannot say**, never a default: a node with `streaming.enabled` false omits them rather than reporting zero. A client must fall back to its own conservative bound and must never shorten a budget on the strength of a missing field, nor substitute another node's figure, which is a fact about that node.
 
-The two directions of error are not symmetric. A client budget longer than the node's merely waits longer than necessary. A budget shorter than it abandons the node inside its own entitlement, discards a transcode that was about to succeed, and starts the identical encode elsewhere — manufacturing a viewer-visible failure out of a node that was working. Read the figure rather than guessing it, and err long.
+The two directions of error are not symmetric. A client budget longer than the node's merely waits longer than necessary. A budget shorter than it abandons the node inside its own entitlement, discards a transcode that was about to succeed, and starts the identical encode elsewhere - manufacturing a viewer-visible failure out of a node that was working. Read the figure rather than guessing it, and err long.
 
 Every value here applies on a live `reload_config` without a restart, so a client should refresh rather than cache once, and treat a cached figure as a floor rather than a settled fact.
 
@@ -323,8 +323,8 @@ header:
 POST /api/v1/playback/sessions?idempotency_key=<opaque key>
 ```
 
-Reuse one key for one logical creation attempt — after a timeout, disconnect
-or failover — and the same key with the same request replays the same session,
+Reuse one key for one logical creation attempt - after a timeout, disconnect
+or failover - and the same key with the same request replays the same session,
 capability and `generation` rather than creating another. The same key with a
 *different* request returns `409 idempotency_conflict`. A retry that arrives
 while the first creation is still running waits for it, and answers
@@ -365,14 +365,14 @@ entitlement and may succeed on this node.
 
 **Those two fields matter as much as the status.** An account-scoped refusal
 is identical on every node, so a client must not walk the cluster looking for
-one that will accept — and must not charge the refusing node's health for it.
+one that will accept - and must not charge the refusing node's health for it.
 That is the difference between this and the node-wide `max_sessions`, whose
 `429` is node-scoped and *is* worth taking elsewhere.
 
 The count is deliberately absent from `GET /api/v1/status`, which clients
-cache. It is the most perishable number this API carries — it moves whenever
+cache. It is the most perishable number this API carries - it moves whenever
 anyone on the account starts or stops anything, on a device neither end can
-see — so it appears only where it is computed live: on creation, on the
+see - so it appears only where it is computed live: on creation, on the
 listing, and on the refusal. The **limit** is on `/api/v1/status` for every
 node, because a client planning a failover needs it about nodes it has not
 talked to yet.
@@ -381,7 +381,7 @@ Budget for it honestly. A coordinator-driven client holds a live session plus
 a standby per viewer and transiently three during a failover; a client that
 adopts a session through the listing holds two by design; and an abandoned
 session cannot always be deleted, because the `DELETE`'s target is often the
-node that just became unreachable — that session holds its slot until
+node that just became unreachable - that session holds its slot until
 `session_idle_ms` expires it.
 
 Session admission first reads the immutable media profile from cluster metadata,
@@ -397,12 +397,12 @@ timeout or disconnect.
 
 **A paused session loses its transcode entitlement after
 `transcode_entitlement_idle_ms` of no stream activity, and reacquires it on
-resume — where it may be refused.** The session itself is untouched: its id,
+resume - where it may be refused.** The session itself is untouched: its id,
 position, plan and capability all survive to `session_idle_ms`. What a long
 pause risks is the *slot*, not the place.
 
 **To hold the slot, ask for a stream object inside that window.** Fetching the
-playlist is enough and costs no media bytes — any request on the stream path
+playlist is enough and costs no media bytes - any request on the stream path
 refreshes the session's stream activity. Polling the session with
 `GET /api/v1/playback/sessions/{id}` does **not**: it keeps the session alive
 but is deliberately not stream activity, because "has this session asked for
@@ -416,7 +416,7 @@ failure it was trying to avoid. Absent means the node does not say, so keep a
 conservative local bound and never lengthen one on a missing field.
 
 **Why this exists.** Holding the entitlement for the life of the session
-would let it outlive its own pipeline by `session_idle_ms` — thirty minutes
+would let it outlive its own pipeline by `session_idle_ms` - thirty minutes
 against sixty seconds. On a node where `max_video_transcodes` is 1, one client
 that crashed, was force-stopped or was reaped in the background would close
 that node to transcoding for everybody for half an hour. A refusal after a long
@@ -424,7 +424,7 @@ pause is visible, attributable and recoverable; that outage would be none of
 those.
 
 **If refused on resume**, the `429` carries `scope: request` on the update
-path — do not walk the cluster, the session is pinned to this node — with
+path - do not walk the cluster, the session is pinned to this node - with
 `alternative_may_succeed: true`. A remux, or a lower `max_height`, will
 usually start immediately.
 
@@ -442,7 +442,7 @@ to exactly one:
 
 **The stream is a subresource of the session it belongs to.** The capability
 sits immediately before the part it authorises, and it stays in the path
-rather than moving to a header because it is a capability, not a credential —
+rather than moving to a header because it is a capability, not a credential -
 media players fetch segments without application headers.
 
 When a generation is superseded its producing pipeline is stopped and its
@@ -453,23 +453,23 @@ the stream capability survive; only the generation changes.
 
 So the effect on a client is: any read-ahead it had queued against the old
 generation fails, and it must take the new `stream.url` from the response that
-caused the supersession and resume from there. Content is not lost — the new
-generation contains the position that was asked for — but the client's own
+caused the supersession and resume from there. Content is not lost - the new
+generation contains the position that was asked for - but the client's own
 buffer of pending requests is invalidated and must be reissued.
 
 **The three statuses on the stream path mean three different things, and a
 client must not collapse them:**
 
-- **`500 segment_not_ready`** — the fragment exists in this generation but is
+- **`500 segment_not_ready`** - the fragment exists in this generation but is
   not produced yet. Wait and retry. Deliberately never a `404`.
-- **`410 generation_superseded`** — the generation existed here and was
+- **`410 generation_superseded`** - the generation existed here and was
   replaced. Permanent. Stop retrying, re-read the session, use the new
   `stream.url`. The refusal carries `scope: request`, `node_healthy: true` and
   `alternative_may_succeed: true`: **this node is healthy and a different
-  request against it will work.** Do not walk the cluster — no other node has
+  request against it will work.** Do not walk the cluster - no other node has
   this session, so a walk collects the same refusal from every node it tries
   and charges each one for it.
-- **`404 not_found`** — nothing here ever produced that: a generation above
+- **`404 not_found`** - nothing here ever produced that: a generation above
   the current one, an unknown session, or a bad capability.
 
 Keeping `410` apart from `404` is what lets a client tell a routine
@@ -581,9 +581,9 @@ The server does what it is told. It does not change the mode a client asked for,
 
 Three flat fields on the session payload, present on create and on every `PATCH`, all milliseconds on the title's timeline:
 
-- **`seek_ms`** — where the generation's media actually begins: the first sample the client receives. This is exactly what the field has always meant, so a client that reads only it is unaffected.
-- **`seek_offset_ms`** — how far into that generation the requested position sits.
-- **`seek_requested_ms`** — the position the server honoured, after clamping to `[0, duration - 1 ms]`.
+- **`seek_ms`** - where the generation's media actually begins: the first sample the client receives. This is exactly what the field has always meant, so a client that reads only it is unaffected.
+- **`seek_offset_ms`** - how far into that generation the requested position sits.
+- **`seek_requested_ms`** - the position the server honoured, after clamping to `[0, duration - 1 ms]`.
 
 The invariant, exactly, in integer milliseconds, with no tolerance and no rounding slack:
 
@@ -658,7 +658,7 @@ DELETE /api/v1/playback/sessions/{id}
 for**, and it is what makes handover between clients on one account possible:
 it answers under `items`, like every other collection here, plus the `account`
 block. It lists exactly the caller's own sessions on this node and nothing
-else. Listing is per node — a session is a resource of the node producing
+else. Listing is per node - a session is a resource of the node producing
 it, and each node enumerates only its own.
 
 **A session belongs to one account, and the control routes enforce it.** An
@@ -736,7 +736,7 @@ A direct MP4 can be assigned directly to a normal HTML `<video>` element. For tr
 
 ## Resource limits and cleanup
 
-`max_sessions`, `max_sessions_per_account`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. `max_sessions` bounds the node; `max_sessions_per_account` bounds one account on it, and its refusal is the distinct `account_session_limit` described above, because a client must treat the two differently. Transcode entitlements belong to a session: each session created is its own logical viewer, which a `PATCH` replacement inherits, so two sessions transcoding hold two entitlements even on one account. Transcode limits count those entitlements, not seeks, replacement generations or physical encoder processes. Once acquired, a logical session retains its entitlement through changes that still transcode, and releases it on DELETE or the page-exit close, on session expiry, **after `transcode_entitlement_idle_ms` with no stream activity**, or **when a `PATCH` leaves transcode**: a session switched to direct or remux gives up its video entitlement, and one whose audio is no longer transcoded gives up its audio entitlement. Switching back to transcode reacquires it like any other `PATCH`, and may then be refused with `resource_limit`. The release is per session: it clears only what that logical viewer holds, and is skipped while another session record still shares the same logical viewer. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. `video_transcodes` and `audio_transcodes` in status report those admission entitlements; `running_video_transcode_pipelines` and `running_audio_transcode_pipelines` separately report live physical encoders. Hitting a limit returns HTTP 429, and **the two 429s are not interchangeable**. `account_session_limit` and `account_transcode_limit` are identical on every node, so a client must not walk the cluster on them. `resource_limit` is this node's property, and its failure axes differ by path: on **create** it is `scope: node` — another node may have capacity, so walking is right — while on **update** it is `scope: request`, because the session already exists here and walking would mean abandoning a generation that is still serving. Both carry `node_healthy: true` and `alternative_may_succeed: true`: on the update path the alternative is a different instruction against this same node, such as remux instead of transcode or a lower `max_height`. In every case the viewer's current playback is untouched by the refusal. Malformed/incompatible playback requests return `400 bad_playback_request`, a copy the segment container cannot carry returns `422 copy_not_supported`, missing media/session state returns 404, a superseded generation returns 410, and media-engine failures return 503 (422 when the source is `source_unsupported`). Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` (and `reason` when the engine gave one) in the `error` object; `trace` correlates with the `playback[trace]` server logs.
+`max_sessions`, `max_sessions_per_account`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. `max_sessions` bounds the node; `max_sessions_per_account` bounds one account on it, and its refusal is the distinct `account_session_limit` described above, because a client must treat the two differently. Transcode entitlements belong to a session: each session created is its own logical viewer, which a `PATCH` replacement inherits, so two sessions transcoding hold two entitlements even on one account. Transcode limits count those entitlements, not seeks, replacement generations or physical encoder processes. Once acquired, a logical session retains its entitlement through changes that still transcode, and releases it on DELETE or the page-exit close, on session expiry, **after `transcode_entitlement_idle_ms` with no stream activity**, or **when a `PATCH` leaves transcode**: a session switched to direct or remux gives up its video entitlement, and one whose audio is no longer transcoded gives up its audio entitlement. Switching back to transcode reacquires it like any other `PATCH`, and may then be refused with `resource_limit`. The release is per session: it clears only what that logical viewer holds, and is skipped while another session record still shares the same logical viewer. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. `video_transcodes` and `audio_transcodes` in status report those admission entitlements; `running_video_transcode_pipelines` and `running_audio_transcode_pipelines` separately report live physical encoders. Hitting a limit returns HTTP 429, and **the two 429s are not interchangeable**. `account_session_limit` and `account_transcode_limit` are identical on every node, so a client must not walk the cluster on them. `resource_limit` is this node's property, and its failure axes differ by path: on **create** it is `scope: node` - another node may have capacity, so walking is right - while on **update** it is `scope: request`, because the session already exists here and walking would mean abandoning a generation that is still serving. Both carry `node_healthy: true` and `alternative_may_succeed: true`: on the update path the alternative is a different instruction against this same node, such as remux instead of transcode or a lower `max_height`. In every case the viewer's current playback is untouched by the refusal. Malformed/incompatible playback requests return `400 bad_playback_request`, a copy the segment container cannot carry returns `422 copy_not_supported`, missing media/session state returns 404, a superseded generation returns 410, and media-engine failures return 503 (422 when the source is `source_unsupported`). Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` (and `reason` when the engine gave one) in the `error` object; `trace` correlates with the `playback[trace]` server logs.
 
 Logical sessions expire after `session_idle_ms` without control or valid
 current-generation stream activity. Expiry cancels the in-process pipeline and
@@ -747,7 +747,7 @@ A session that has never served a stream object expires instead after the much
 shorter `session_unused_idle_ms` (120 seconds by default), because the
 transcode entitlement is held by the session rather than by the pipeline and is
 therefore not released by idle-pipeline reclamation. One stream request of any
-kind — playlist, fragment, subtitle or Direct Play body — moves the session to
+kind - playlist, fragment, subtitle or Direct Play body - moves the session to
 the full `session_idle_ms` for the rest of its life, so a paused or seeking
 player is never subject to the shorter clock.
 

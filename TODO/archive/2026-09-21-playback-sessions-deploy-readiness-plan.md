@@ -22,11 +22,11 @@ everything around the code: the release is unversioned, the docs describe the
 old behaviour, two items the plan calls for are undecided, and all three
 external gates are open.
 
-## Decisions the operator owns — all three taken 2026-09-21
+## Decisions the operator owns: all three taken 2026-09-21
 
 Taken on the recommendations, on the operator's instruction to execute this
 plan. Each is now recorded in the release rather than living here: (1) `410`
-is shipped, and is **mandatory on both the server and core before deploy** —
+is shipped, and is **mandatory on both the server and core before deploy** -
 restated by the operator on 2026-09-21 and not subject to reopening; (2) the
 example config and reference pair 64 node-wide with 32 per account, and the
 live nodes still need raising; (3) the `playback/status` disclosure is
@@ -94,7 +94,7 @@ Everything here is in-tree, needs no one else, and can be done today.
   optional field safely") as closed by TEL3 and move it to `COMPLETED.md`;
   note in the resource plan that the cap key is settled as per-account
   (its line 288 still says "open decision"); record decision 3.
-- [x] **Full suite on es-1 — 484/484, zero failures.** Run 2026-09-21 13:30
+- [x] **Full suite on es-1 - 484/484, zero failures.** Run 2026-09-21 13:30
   on the operator's word that nothing is currently production. Tree rsynced
   and verified identical by md5 (`src/playback.cpp`,
   `tests/test_media_playback.cpp`), built clean in 3m04s at `-j3`, log kept at
@@ -102,11 +102,11 @@ Everything here is in-tree, needs no one else, and can be done today.
   `aarch64`, glibc 2.41. The new case,
   `media_playback/test_a_superseded_generation_is_gone_and_a_future_one_never_existed`,
   passed at 136 ms. **Nothing was installed and the service was not
-  restarted** — this was a build and a test run, not a deploy. The laptop had
+  restarted** - this was a build and a test run, not a deploy. The laptop had
   also given 484/484, but that has never been evidence for this project.
-- [x] **Commit on `develop`** — `60d794e`. `README.md` was left unstaged; its
+- [x] **Commit on `develop`** - `60d794e`. `README.md` was left unstaged; its
   change is unrelated to this release.
-- [x] **Tag `0.48.0`** — the tag names the tree that went green on es-1.
+- [x] **Tag `0.48.0`** - the tag names the tree that went green on es-1.
 
 ## Phase B: the client side (core drives; this repository waits)
 
@@ -122,7 +122,7 @@ mobile (confirmed 2026-09-21) and drives the sequence.
   every node's cap limit is on `/api/v1/status`; `410` if decision 1 is yes;
   and the expected A85 "plays, no sound" on Direct Play, which predates all
   of this.
-- [x] **Core tolerance — NOT A GATE, and never was.** The clients link the
+- [x] **Core tolerance - NOT A GATE, and never was.** The clients link the
   local core working tree directly (`file:../macha-ts`), so they compile
   against the tolerance the moment it is in that tree, which core confirms it
   is. There is no publish, no version pin and no client release to wait for;
@@ -145,8 +145,8 @@ mobile (confirmed 2026-09-21) and drives the sequence.
     underneath. Core disassembled `DefaultLoadErrorHandlingPolicy` from the
     Gradle-cached AARs (byte-identical across media3 1.8.0 and 1.9.0):
     `isEligibleForFallback` returns true for `InvalidResponseCodeException`
-    with status in {403, 404, 410, 416, 500, 503} — **404 and 410 sit in the
-    same set with no branch between them** — and `getRetryDelayMsFor` gives
+    with status in {403, 404, 410, 416, 500, 503} - **404 and 410 sit in the
+    same set with no branch between them** - and `getRetryDelayMsFor` gives
     do-not-retry only for five non-HTTP causes, so both fall through to the
     same `min(errorCount * 1000, 5000)` backoff.
   - **Nothing classifies on the message text**, which is the only thing that
@@ -157,7 +157,7 @@ mobile (confirmed 2026-09-21) and drives the sequence.
   - **The failover path is status-blind and already harmful today.** On
     `status === 'error'` the provider calls `failoverSource` unconditionally,
     which picks a replacement node and **records the failure so ranking learns
-    from it** — a healthy node charged for answering honestly, which is
+    from it** - a healthy node charged for answering honestly, which is
     precisely what the `410` axes exist to prevent. But it does that *today*
     on the `404`, by the client's own comment at `PlaybackProvider.tsx:641`.
     Same event, same blind failover, same charge. The status swap changes
@@ -168,7 +168,7 @@ mobile (confirmed 2026-09-21) and drives the sequence.
 
   **Severity correction, 2026-09-21, after the verdict above.** Core
   understated what this costs a mobile viewer and corrected itself against its
-  own interest. It first described the outcome as a reload — picture stops,
+  own interest. It first described the outcome as a reload - picture stops,
   failover runs, playback resumes at the same position. The mobile session
   then corrected its own account: **failover on that client does not recover
   at all**, so a `410` on the mode-switch path takes a viewer who was watching
@@ -177,9 +177,9 @@ mobile (confirmed 2026-09-21) and drives the sequence.
   mobile session, superseding a 2026-09-08 device note in that repo that had
   failover working but not seamless. Core has not verified it and says it
   cannot from here, because it is a device behaviour rather than something
-  readable in a tree. **The regression verdict is unchanged** — mobile's
+  readable in a tree. **The regression verdict is unchanged** - mobile's
   failover is equally broken under today's `404`, on a path that never
-  consults the status — so this enlarges the pre-existing hole rather than
+  consults the status - so this enlarges the pre-existing hole rather than
   reopening the cutover decision. What it does change is how the mode-switch
   remedy reads on that client: the marker on `applyUpdate` is not protection
   against waste, it is the difference between a mode switch that works and one
@@ -193,15 +193,15 @@ mobile (confirmed 2026-09-21) and drives the sequence.
      itself an unresolved contradiction: the A85 took a segment `500` as
      fatal on first occurrence on 2026-09-13, which the disassembly says
      should have been retried with backoff. Its reconciliation is explicitly
-     recorded as a guess. It cuts symmetrically — a `404` and a `410` reach it
+     recorded as a guess. It cuts symmetrically - a `404` and a `410` reach it
      as the same `InvalidResponseCodeException`, so it cannot single out
-     `410` — but it bounds the confidence above.
+     `410` - but it bounds the confidence above.
 
 ## Phase C: cluster preparation (can overlap Phase B)
 
 - [ ] **Web bundle to `/etc/macha/web` on all three nodes.** This one is
   real, and it is the one place where a *built artefact* lags the linked
-  source tree — do not confuse it with the core package above, which is not
+  source tree - do not confuse it with the core package above, which is not
   a gate. Core's account, 2026-09-21:
   - The deployed `index-BGrNH6KR.js` is the 0.17.2 bundle and has no `410`
     handling.
@@ -210,13 +210,13 @@ mobile (confirmed 2026-09-21) and drives the sequence.
     released 0.17.3 bundle does not have it either.
   - Exactly one tolerant artefact exists: `dist/assets/index-NDVfpduh.js`,
     624,128 bytes, built 2026-09-21 12:12 from develop against the linked
-    core. `dist/` is gitignored, so it is in no commit and no tag — a local
+    core. `dist/` is gitignored, so it is in no commit and no tag - a local
     file on one machine.
   - **It is current, and a rebuild is NOT required** (core, correcting itself
     2026-09-21 after first reporting it five commits stale). It was built
     against core `5aa3f6f` and carries the 10 s floor: the web client session
     re-ran the build against core's current tree and got a **byte-identical**
-    output — same name, same 624,128 bytes, `cmp` clean — and core verified
+    output - same name, same 624,128 bytes, `cmp` clean - and core verified
     the other half independently, `macha-ts/dist/playback/PlaybackCoordinator.js`
     built 12:10 from src at 12:09 carrying `ALTERNATE_RECOVERY_WINDOW_MS =
     10_000` with the 8 s transcode window beside it. So the 12:12 client build
@@ -227,7 +227,7 @@ mobile (confirmed 2026-09-21) and drives the sequence.
 
   **DONE 2026-09-21 13:34** (each node's local time; 11:34 UTC). The web
   client session deployed `index-NDVfpduh.js` to all three nodes, two minutes
-  before the server cutover at :36 — so the ordering came out as intended,
+  before the server cutover at :36 - so the ordering came out as intended,
   bundle first and routes second. All three `index.html` now reference it.
   Verified served: `index.html` is `Cache-Control: no-cache` and the bundle
   name is content-hashed, so a client picks it up on the next load; the
@@ -237,13 +237,13 @@ mobile (confirmed 2026-09-21) and drives the sequence.
   **Owner, confirmed by core 2026-09-21: the web client session builds it and
   the operator authorises the deploy. Not the server session, and not core.**
   The procedure is in macha-client's own notes: `npm run build`, then rsync
-  `dist/` into **`/etc/macha/web`** on each node — *not* `/var/lib/macha/web`
-  — files owned `1000:50`, `index` served `no-cache` so a deploy shows on the
+  `dist/` into **`/etc/macha/web`** on each node - *not* `/var/lib/macha/web`
+  - files owned `1000:50`, `index` served `no-cache` so a deploy shows on the
   next load without a restart. That is the pattern 0.17.2 followed on
   2026-09-20. Core has passed all of this to the web client session directly,
   including that its `develop`-only `410` branch is absent from the released
   0.17.3.
-- [x] **Config on all three nodes — DONE 2026-09-21 13:34, by this session,
+- [x] **Config on all three nodes - DONE 2026-09-21 13:34, by this session,
   immediately before the cutover.** All three now carry `max_sessions: 64` and
   `max_sessions_per_account: 32` explicitly, backed up as
   `macha.yaml.bak-0.47.0` (the backups show the old `max_sessions: 8` and no
@@ -259,13 +259,13 @@ mobile (confirmed 2026-09-21) and drives the sequence.
   `reload_config` on one node before touching the other two.
 - [x] **Tarball targets confirmed**: `aarch64` and glibc 2.41 on all three.
 
-## Phase D: cutover — DONE 2026-09-21, all three nodes together
+## Phase D: cutover: DONE 2026-09-21, all three nodes together
 
 Executed on the operator's instruction. Built on es-1 from the tagged tree,
 staged with `DESTDIR`, tarball `/tmp/macha-0.48.0.tgz` (3,293,529 bytes, md5
 `89d88eb5a1a1cb6341d944810e5dabb0`) shipped to fi-1 and gbni-1 and md5-verified
 on each. Zero playback traffic on any node beforehand. All three stopped,
-installed and started within the same minute — not rolling, because TEL3
+installed and started within the same minute - not rolling, because TEL3
 excludes a straggler from gossip rather than misreading it.
 
 Verified after: all three report `0.48.0`; **exactly one** `persisted telemetry
@@ -277,7 +277,7 @@ metadata writable at generation **33038**, `replicas=3/3 required=2`. A
 One item from the list below was **not** done: verifying the new per-node
 `playback` fields through `GET /api/v1/status`, because that route needs a
 bearer token and the anonymous account no longer carries `view_status`. TEL3
-is flowing — the nodes converged and gossip is healthy — but the field-level
+is flowing - the nodes converged and gossip is healthy - but the field-level
 proof was not taken. Worth doing during the joint test.
 
 Original checklist:
@@ -320,13 +320,13 @@ live cluster. Reading the code does not count.
 - [ ] **Ownership.** One account's id, presented by another account, answers
   `404` on `GET`, `PATCH` and `DELETE`, and its stream URL answers nothing
   useful with or without the token.
-- [ ] **The account cap, observed. The blocker that was here is LIFTED** —
+- [ ] **The account cap, observed. The blocker that was here is LIFTED** -
   the raise happened at 13:34 on 2026-09-21, before the cutover, and all three
   nodes run 64/32. This test can run whenever the joint test runs.
   *Kept because the trap recurs whenever a node is rebuilt from bare
   defaults:* at `max_sessions: 8` under a per-account cap of 32 the only `429`
   provokable is the **node-scoped** one, and the mobile client's
-  `classifyCreateRefusal` treats that as fatal by design — so the test would
+  `classifyCreateRefusal` treats that as fatal by design - so the test would
   look like mobile's cap handling failing when it is correct. Check both
   numbers on the node before running it.
   Method: drop `max_sessions_per_account` to `2` on fi-1 alone, live
@@ -352,7 +352,7 @@ live cluster. Reading the code does not count.
   contradiction, since it exercises the same error path.
 - [ ] **Watch whether mobile charges a healthy node.** Its failover is
   status-blind and records the failure against ranking on any playback error.
-  Expected to be unchanged from today, not improved — confirm it is not worse,
+  Expected to be unchanged from today, not improved - confirm it is not worse,
   and size the client fix from what is seen.
 - **Two routing notes for whoever drives this** (core, 2026-09-21):
   - **Do not try to reach the account cap through mobile's failover path.**

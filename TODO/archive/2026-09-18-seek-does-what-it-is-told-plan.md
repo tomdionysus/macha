@@ -68,12 +68,12 @@ this became a livelock rather than an inconvenience.
 Three fields on the playback session payload, flat and additive, present on
 create and on every `PATCH`. All are milliseconds on the title's timeline.
 
-- **`seek_ms`** — the baseline: where the generation's media actually begins,
+- **`seek_ms`** - the baseline: where the generation's media actually begins,
   the first sample the client receives. **This is exactly what the field means
   today**, so no existing client changes behaviour.
-- **`seek_offset_ms`** — how far into that generation the requested position
+- **`seek_offset_ms`** - how far into that generation the requested position
   sits.
-- **`seek_requested_ms`** — the position the server honoured, after clamping to
+- **`seek_requested_ms`** - the position the server honoured, after clamping to
   `[0, duration - 1 ms]`.
 
 The invariant:
@@ -88,7 +88,7 @@ asked for and nothing between the request and the stream start can go missing.
 
 `seek_requested_ms` exists because an exact invariant is only useful if a client
 can act on it being violated, and without it a client cannot distinguish a
-violation from a clamp near the end of a title. Those want opposite handling —
+violation from a clamp near the end of a title. Those want opposite handling -
 one is a defect worth surfacing, the other is ordinary. Core's phrasing for the
 rule it keeps rediscovering: an unanswered question must not read as an answer.
 
@@ -114,7 +114,7 @@ The offset is therefore zero exactly when the mode can be frame-accurate.
 **The mode is never substituted.** A remux request stays remux, including when
 its keyframe situation is awkward. An earlier draft of this plan had remux fall
 back to transcode when no keyframe at or before the request existed; the
-operator rejected that outright, and correctly — it is the same second-guessing
+operator rejected that outright, and correctly - it is the same second-guessing
 as moving the seek, and it would trade picture quality and CPU for a case the
 client did not ask about.
 
@@ -130,7 +130,7 @@ client did not ask about.
   necessarily a sync sample, so a copy can always start at the beginning; the
   index simply did not name it. Mode preserved, invariant preserved, nothing
   lost. In practice unreachable, since a file's first frame is virtually always
-  indexed — it exists so the invariant needs no escape hatch.
+  indexed - it exists so the invariant needs no escape hatch.
 
 ## What changes
 
@@ -155,7 +155,7 @@ Two things this investigation needed and the server could not say:
 
 - **Cue density on a successful plan.** `video_keyframe_seconds`
   (`src/media_engine.cpp:430`) reads the demuxer's index, which for Matroska is
-  the Cues — and Cues are not obliged to name every keyframe. So the observed
+  the Cues - and Cues are not obliged to name every keyframe. So the observed
   spread is the distance between *indexed* entries, an upper bound on the true
   GOP. Only the reject path logs anything today (`:1764-1768`). Log the shape on
   success too: entries, longest gap, median gap. If the measured offsets cluster
@@ -163,13 +163,13 @@ Two things this investigation needed and the server could not say:
 - **Why the seek fast path was declined.** `reuse_seek_session`
   (`src/playback.cpp:1513`) logs at INFO on success and says nothing on failure.
   Across a whole day on es-1 there are **zero** `seek fast-path` lines, so it is
-  never taken — but nothing records whether `seek_only` was false or
+  never taken - but nothing records whether `seek_only` was false or
   `reseek_hls_vod` declined. Name the failing precondition.
 
 ## The fast path is separately broken, and it is probably ours
 
 Not part of this change, but found by it and worth its own item. The client's
-seek `PATCH` sends preferences that compare equal to the stored record —
+seek `PATCH` sends preferences that compare equal to the stored record -
 `subtitle_language` is a plain `std::string` defaulting to `""`, so the client's
 `""` matches, and `optional_int` maps a null `subtitle_stream` to `nullopt`,
 which is what a subtitles-off session already holds. So `seek_only` should be
@@ -180,7 +180,7 @@ The remaining branch is `reseek_hls_vod` declining. For remux it re-runs
 whose longest fragment or tail exceeds 90 s. The transcode branch of that same
 function carries a comment warning the check "can spuriously reject an otherwise
 perfectly usable seek point if any other part of a long file has a sparser GOP"
-(`src/media_engine_common.cpp:56-59`) — that warning describes the remux
+(`src/media_engine_common.cpp:56-59`) - that warning describes the remux
 branch's behaviour and was never applied to it.
 
 Not asserted as the cause: it is the branch that remains, not a proof. The
@@ -197,7 +197,7 @@ Both reviewed the shape before it was written and both accepted it.
   `absolute - session.seekMs`, with `seekMs` already meaning where the media
   begins. `seek_offset_ms` is the number it derives on the next line and can
   stop deriving. Its `activationPosition` returns undefined when the request is
-  before the generation's start — the branch that livelocked — and the invariant
+  before the generation's start - the branch that livelocked - and the invariant
   makes that state unreachable, so the branch is deleted rather than tuned. Core
   asked for `seek_requested_ms` and will type all three as `number | undefined`,
   since an older node omits them.

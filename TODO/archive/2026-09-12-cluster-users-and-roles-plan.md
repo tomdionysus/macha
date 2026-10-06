@@ -18,7 +18,7 @@ is built around, in the operator's words:
   revoked winning ties (`src/session.cpp:165-182`).
 - Every node holds the full session replica; `validate()` is one shared-lock
   map lookup (`src/session.hpp:52`). `session.cpp` includes only `codec`,
-  `crypto`, `durable_file` and `log` — no metadata, no catalogue.
+  `crypto`, `durable_file` and `log` - no metadata, no catalogue.
 - Session creation is exempt from the readiness gate by design:
   `src/service.cpp:349` ("must be exempt regardless of local readiness") and
   `src/cluster.hpp:84-86` (control plane is constructed before any storage or
@@ -27,7 +27,7 @@ is built around, in the operator's words:
   `AnonymousCredentialValidator` refuses any non-empty credentials.
 - `session_has_role()` exists and has zero production callers.
 
-So the auth path is already independent of `MetadataAvailability` — a node
+So the auth path is already independent of `MetadataAvailability` - a node
 whose metadata is `read_only` or `unavailable` (`src/metadata_manager.hpp:33`)
 still mints sessions today. The user store must be built to the same rule:
 **it depends on the control plane and the local disk, and on nothing else.**
@@ -39,18 +39,18 @@ couple login to the subsystem most likely to be sick when you need to log in.
 1. **Login blocks on synchronous peer RPC.** `propagate_session`
    (`src/cluster.cpp:1387-1402`) loops over `members_.active()` serially and
    each `call()` runs to `control_no_progress_deadline` = 30 s
-   (`src/config.hpp:654`). A peer marked active but not answering — gbni-2 on
-   flaky wifi — stalls `POST /api/v1/session` for up to 30 s per such peer,
+   (`src/config.hpp:654`). A peer marked active but not answering - gbni-2 on
+   flaky wifi - stalls `POST /api/v1/session` for up to 30 s per such peer,
    and `SessionApi::handle` calls it before responding
    (`src/session_api.cpp:70`). The local write has already happened by then
    and the gossip tick (`src/cluster.cpp:1327-1336`) is the documented
    backstop, so the response never needed to wait.
-2. **Session persistence is idle-deferred** — `sessions().persist()` runs
+2. **Session persistence is idle-deferred** - `sessions().persist()` runs
    only after 30 s with no foreground/read-ahead activity
    (`src/status_api.cpp:379-384`). Right for observational state; wrong for a
    credential store. Users get write-through persistence and do not share
    this policy.
-3. **The gossip backstop carries a window, not a table** —
+3. **The gossip backstop carries a window, not a table** -
    `sessions_.recent(gossip_ttl, 64)` (`src/cluster.cpp:772`). A node offline
    longer than `gossip_ttl` never learns what it missed. Acceptable for
    sessions (a client re-mints); never acceptable for users.
@@ -72,7 +72,7 @@ login stops depending on reaching the node that first authenticated you.
 > come back from a stale replica.
 
 > **A credential change invalidates every session it minted, everywhere,
-> by replicating one fact** — the user record — rather than by enumerating
+> by replicating one fact** - the user record - rather than by enumerating
 > sessions.
 
 ## Design
@@ -99,7 +99,7 @@ struct UserRecord {
 };
 ```
 
-Password hashing is scrypt via `EVP_PBE_scrypt` — already in the OpenSSL
+Password hashing is scrypt via `EVP_PBE_scrypt` - already in the OpenSSL
 Macha links (`CMakeLists.txt:131`; `<openssl/evp.h>` is included in
 `crypto.cpp:8`). Argon2id needs OpenSSL 3.2, which the Debian nodes do not
 have. Parameters N=2^15, r=8, p=1 (~32 MiB, ~50–100 ms on a Pi 4) as the
@@ -117,25 +117,25 @@ and differs from it in exactly the places the discussion identified:
 - **No eviction.** `max_users{4096}` is a corruption guard enforced at
   `create()`; `apply()` refuses beyond it at `Log::warn`, never `debug`, and
   never drops an existing record to admit a new one. Tombstones are retained
-  indefinitely — they are ~100 bytes and users are rarely deleted; retention
+  indefinitely - they are ~100 bytes and users are rarely deleted; retention
   bounded by age is exactly the resurrection bug this store must not have.
 - **Write-through persistence.** Every local mutation and every remote
   `apply()` that changed state rewrites `state_path/users/users.bin` via
   `durable_replace_file` before returning. The file is the whole table (tiny)
   under magic `MACHUSR1`, sealed with `aes_gcm_seal` under
-  `derive(master, "macha/users/v1")` — the same HKDF pattern as `auth` and
-  `storage` (`src/crypto.cpp:114-115`) — with the magic as AAD. This is the
+  `derive(master, "macha/users/v1")` - the same HKDF pattern as `auth` and
+  `storage` (`src/crypto.cpp:114-115`) - with the magic as AAD. This is the
   only place password hashes touch disk, and es-1's disk is outside the
   house. Per `SECURITY.md:3` the cluster key already grants everything, so
   sealing does not change the trust model; it covers a stolen or discarded
   drive.
 - **Load** tolerates a missing file (empty table) and, like sessions
-  (`src/session.cpp:115-120`), warns and starts empty on an undecodable one —
+  (`src/session.cpp:115-120`), warns and starts empty on an undecodable one -
   the cluster is the source of truth and a node must never fail to start
   over its user cache. Unlike sessions, an undecodable file is renamed aside
   (`users.bin.corrupt.<ts>`) rather than overwritten, so it can be examined.
 
-### Replication — asynchronous by construction
+### Replication: asynchronous by construction
 
 New `MessageType::user_sync = 41` / `user_sync_reply = 119`. Payload is
 always the **full table**: at tens of records it is smaller than the
@@ -144,7 +144,7 @@ telemetry set already broadcast every tick.
 - **On mutation:** `apply()` locally, persist, then
   `client_.broadcast_best_effort({user_sync, encode_users(all)},
   FrameType::speculative)` (`src/net.cpp:2555`). This queues on usable
-  control-lane connections and returns — it never dials, never blocks, and
+  control-lane connections and returns - it never dials, never blocks, and
   returns 0 when the client mutex is busy. The request path never calls
   `NodeRuntime::call()`.
 - **Periodic:** the same broadcast on every gossip tick, beside the existing
@@ -169,8 +169,8 @@ rest.
 
 `AuthSession` gains `std::string user_id` (empty for anonymous) and
 `uint64_t credential_generation`. The HTTP authenticator (`src/http.cpp:456`,
-the `authenticate_` callback) becomes: session lookup, then — only when
-`user_id` is non-empty — a `UserStore` lookup checking the user is not a
+the `authenticate_` callback) becomes: session lookup, then - only when
+`user_id` is non-empty - a `UserStore` lookup checking the user is not a
 tombstone and `session.credential_generation == user.credential_generation`.
 Two O(1) shared-lock reads instead of one; the "no other locks taken"
 comment on `validate()` is updated to say so.
@@ -222,12 +222,12 @@ session carries `{"admin","operator","viewer"}`. The gate stays one call.
 |------------|-------------------------------------------------------------|
 | `viewer`   | every GET, playback, own session (`/api/v1/session`), own record (`PATCH /api/v1/users/me`) |
 | `operator` | mutating catalogue routes (`src/catalogue_api.cpp:464,494,520,530`); `/api/v1/manage/**` except identity-association reset |
-| `admin`    | identity-association reset (`src/manage_api.cpp:554,580` — cluster-wide destructive, can be wildcard); `/api/v1/users/**` |
+| `admin`    | identity-association reset (`src/manage_api.cpp:554,580` - cluster-wide destructive, can be wildcard); `/api/v1/users/**` |
 | `anonymous`| marker only; grants nothing by itself                       |
 
 `SessionConfig::anonymous_roles` defaults to
-`{"anonymous","viewer","operator"}` in releases A/B — **no behaviour
-change** — and to `{"anonymous","viewer"}` in release C. Operators who want
+`{"anonymous","viewer","operator"}` in releases A/B - **no behaviour
+change** - and to `{"anonymous","viewer"}` in release C. Operators who want
 no anonymous access at all set it empty.
 
 The gate is one function, `required_role(const HttpRequest&)`, called from
@@ -244,7 +244,7 @@ GET    /api/v1/users/{id}
 PATCH  /api/v1/users/{id}            {password?, roles?}
 DELETE /api/v1/users/{id}            → tombstone; 204
 GET    /api/v1/users/me              (viewer)
-PATCH  /api/v1/users/me              {password} (viewer) — response carries a
+PATCH  /api/v1/users/me              {password} (viewer) - response carries a
                                      fresh session so the caller is not
                                      logged out by their own change
 ```
@@ -268,7 +268,7 @@ macha-users <state_path> <cluster.key> list
 
 Reads the password from the terminal, never from argv. Writes
 `users.bin` directly; **the node must be stopped**, since a running daemon
-would overwrite the file from its own copy — the tool refuses if the
+would overwrite the file from its own copy - the tool refuses if the
 daemon's state lock is held. Root on the box already holds the cluster key,
 so this grants nothing new. The first admin is created during the release-B
 rolling restart, on one node; it replicates on start.
@@ -295,20 +295,20 @@ and `lockouts`.
 
 ## Releases
 
-**A — 0.38.0: asynchronous propagation and the gate, no behaviour change.**
+**A - 0.38.0: asynchronous propagation and the gate, no behaviour change.**
 `propagate_session` becomes `broadcast_best_effort`; `session_sync` inbound
 unchanged. `decode_sessions` accepts SES1 and SES2, emits SES1. `required_role`
 gate lands with `anonymous_roles` granting everything it grants today.
 `CredentialValidator` returns `ValidatedCredentials`. Two-node runtime test
 asserting `POST /api/v1/session` returns in under one second with an
-unreachable-but-active peer configured — the test that fails on today's code.
+unreachable-but-active peer configured - the test that fails on today's code.
 
-**B — 0.39.0: users.** `UserStore`, `user_sync`, sealed write-through
+**B - 0.39.0: users.** `UserStore`, `user_sync`, sealed write-through
 persistence, `PasswordCredentialValidator`, the users API, `macha-users`,
 status fields, `docs/management.md` and `docs/configuration.md`. Sessions
 emit SES2. First admin created on one node during the rolling restart.
 
-**C — 0.40.0: anonymous becomes read-only.** `anonymous_roles` default →
+**C - 0.40.0: anonymous becomes read-only.** `anonymous_roles` default →
 `{"anonymous","viewer"}`. `SECURITY.md` rewritten: the shared-key model is
 unchanged for nodes; HTTP now has per-person identity and tiers.
 `ACTIVE.md` P0 authorization item closed.
@@ -343,7 +343,7 @@ Runtime (`MACHA_TEST`, pattern of `test_session_cluster_propagation`,
   the tombstone within 3 ticks and never accepted the live record.
 - n2 stopped; create user on n2's replica via `macha-users`; start n2 → n1
   learns it.
-- **alone:** n1 with n2 configured and unreachable — login with a password
+- **alone:** n1 with n2 configured and unreachable - login with a password
   returns 201 in < 1 s; the session validates on n1 immediately.
 - password change on n1 while n2 is partitioned; n2's copy of the old
   session keeps working until the partition heals, then fails within 3
@@ -351,11 +351,11 @@ Runtime (`MACHA_TEST`, pattern of `test_session_cluster_propagation`,
 
 ## Out of scope, named so it is not discovered
 
-- Online cluster-key rotation (`SECURITY.md:43`) — unchanged.
+- Online cluster-key rotation (`SECURITY.md:43`) - unchanged.
 - Per-user resource limits or per-user playback quotas.
-- Wildcard CORS (`ACTIVE.md`, same P0 section) — separate item, unchanged
+- Wildcard CORS (`ACTIVE.md`, same P0 section) - separate item, unchanged
   by this work.
-- The macha-ts login UI — contract above; the client is its own repo.
+- The macha-ts login UI - contract above; the client is its own repo.
 
 ---
 

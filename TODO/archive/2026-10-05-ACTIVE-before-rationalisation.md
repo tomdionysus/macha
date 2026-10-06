@@ -659,24 +659,24 @@ a fact.**
    carries the arithmetic that justified the work: 56 ms of CPU per namespace
    write before the tree, ~3.1 s at the 100 TB target.
 1. **The other P-1, the cache-sizing invariant.** Still open, and note that
-   the block-cache item under it was falsified and downgraded on 2026-09-21 —
+   the block-cache item under it was falsified and downgraded on 2026-09-21 -
    the cache works, it just could not be observed, and now can be.
 2. **The metadata-stall P0.** Its read-only blink was root-caused and fixed on
    2026-09-21 (a hung health probe was given the whole liveness budget); the
    stall that provokes it is still unexplained. Making an ingest survive a
    read-only window shipped in 0.57.0 (`MetadataNotReady` blocks and retries
    instead of failing the job).
-3. The **rejoin/cache P0** after it — worked around on all three nodes on
+3. The **rejoin/cache P0** after it - worked around on all three nodes on
    2026-09-20, not fixed, and the concrete instance of the first P-1.
 4. The **loader-I/O P0**. The node starves its own viewer I/O with loader
    work: one ingest took es-1 to 91% iowait and aborted twelve client requests
    at ~8 s. Governing law 2 is violated on the DATA backend, and no
-   configuration available prevents it. **Its reproduction is blocked** — read
+   configuration available prevents it. **Its reproduction is blocked** - read
    that item's first bullet before attempting one.
 5. The **P0 cluster section**. The live cluster is **three** nodes as of
    2026-09-20 evening, **all on 0.47.0** and converged at generation 31663:
    es-1, fi-1 and gbni-1. gbni-2 is defunct and the operator expects it to stay
-   that way for some months (2026-09-20) — do not include it in a deploy, do
+   that way for some months (2026-09-20) - do not include it in a deploy, do
    not wait for it, and do not treat its absence as an incident. Removing a
    node is something the system does not really support, and that is the first
    item there.
@@ -712,7 +712,7 @@ asked for it on 2026-09-07 and upgraded it to "soon" on 2026-09-13. Generate it
 from the route table at build time so it cannot drift.
 
 2026-09-13 (evening): rationalisation pass for a new session. Twenty-three
-completed items were moved to `COMPLETED.md` in full rather than summarised —
+completed items were moved to `COMPLETED.md` in full rather than summarised -
 in several cases the reasoning *is* the record: a retraction, an option the
 operator declined, a measurement that disproved the thing it was taken to
 support. Before moving them, open remainders buried inside completed items were
@@ -733,18 +733,18 @@ of that pass:
   were moved to `COMPLETED.md`.
 - Items this file called open that code inspection shows are now partially
   shipped were reworded rather than re-litigated from scratch.
-- A new **P0 — Verified correctness defects** section and a new
-  **P0 — Security hardening** section were added: these are concrete bugs and
+- A new **P0 - Verified correctness defects** section and a new
+  **P0 - Security hardening** section were added: these are concrete bugs and
   a concrete exposure found by reading the actual code, not carried over from
-  older docs. Nothing in `src/` carries a `TODO`/`FIXME` marker — the entire
+  older docs. Nothing in `src/` carries a `TODO`/`FIXME` marker - the entire
   informal backlog that would normally live in comments instead had to be
   found as verified behaviour.
-- A new **P1 — Scaling cliffs** and **P2 — Code health / error-handling
+- A new **P1 - Scaling cliffs** and **P2 - Code health / error-handling
   consistency** section record real, verified-but-not-yet-urgent debt (the
   system is small today; several of these are O(N) or O(N²) patterns that are
   invisible at current scale and will not stay invisible).
 - This pass is still not exhaustive for the 73 dated plan docs in this
-  directory — see the "Documentation hygiene" item under P2 for the specific
+  directory - see the "Documentation hygiene" item under P2 for the specific
   staleness this audit found in those docs, root docs, and `CHANGELOG.md`.
 
 2026-09-08: pruning pass. Every remaining item was re-checked against current
@@ -755,7 +755,7 @@ were reworded down to what is actually still open rather than left carrying a
 history that reads as work. What went, and why:
 
 - The self-healing programme (0.29.0–0.32.0) and its `[x]` durability-wedge
-  finding: shipped. Its three sub-items went with it — the publication hot
+  finding: shipped. Its three sub-items went with it - the publication hot
   loop is now under `RetryPolicy` backoff and parking (0.30.0), and the 120 s
   startup gate is now a no-progress gate (`startup_progress.hpp`,
   `service_startup_no_progress_ms`, 0.30.0). Only the duplicate-path cause
@@ -803,16 +803,16 @@ has done all along** (core, 2026-09-21). This is not a contract and not a
 request; it is a standing client defect the server session needs to know
 about, because it shapes what node-health evidence from a mobile viewer is
 worth. macha-client-rn has no status-to-kind mapping at the player layer at
-all — playback errors arrive through expo-video's `statusChange` as a message
-string with no code — so on `status === 'error'` the provider calls
+all - playback errors arrive through expo-video's `statusChange` as a message
+string with no code - so on `status === 'error'` the provider calls
 `failoverSource` unconditionally, picks another node, and **records a failure
 against the node it left**. A routine superseded generation therefore costs a
 healthy node a mark in that client's ranking.
 
 `410`'s axes (`node_healthy: true`, `alternative_may_succeed: true`) exist to
 prevent exactly this and mobile cannot read them. **0.48.0 does not cause it
-and does not worsen it** — mobile is equally blind to the `404` it gets today,
-and core verified there is no status-dependent branch anywhere on that path —
+and does not worsen it** - mobile is equally blind to the `404` it gets today,
+and core verified there is no status-dependent branch anywhere on that path -
 but the release makes it legible. Two consequences worth holding:
 
 - **Do not read a mobile client's endpoint-failure record as evidence about a
@@ -851,7 +851,7 @@ cross-session and will not be in the next session's context.
 - **A role-less session gets `403` from `/api/v1/status`, never a reduced
   payload.** There is no reduced-view code path; the gate is above the handler.
   Two client reports of "200 with an empty roster" were gbni-2 (ungated 0.38.1)
-  misattributed to gbni-1 — see the endpoint-attribution note below.
+  misattributed to gbni-1 - see the endpoint-attribution note below.
 - **`/api/v1/status` no longer carries `diagnostics`** (0.39.1). Core never
   typed that block, so it is unaffected; a client whose Status screen reads
   diagnostics needs `/api/v1/status/diagnostics`.
@@ -892,7 +892,7 @@ cross-session and will not be in the next session's context.
   frame-accurate, so a client wanting a cheap aligned seek asks for a position
   that already is a keyframe. Core types all three as `number | undefined`
   because an older node omits them, and deletes its `activationPosition`
-  undefined branch — the invariant makes that state unreachable.
+  undefined branch - the invariant makes that state unreachable.
 - **A node reports the playback budgets it enforces** (0.46.2) on the per-node
   entries of `GET /api/v1/status`, in a `playback` object beside `runtime`:
   `startup_timeout_ms` and `segment_timeout_ms`. They are each node's statement
@@ -949,7 +949,7 @@ cross-session and will not be in the next session's context.
 - **A signed artwork URL is stable for up to 24 hours and valid for 24-48.**
   From 0.40.0 `exp` is quantized to a bucket of the TTL, rounded up to the
   bucket *after* next: `(now / ttl + 2) * ttl`. The invariant is "always between
-  one and two TTLs", not "between 24 and 48 hours" — the bucket *is* the TTL, so
+  one and two TTLs", not "between 24 and 48 hours" - the bucket *is* the TTL, so
   reconfiguring `artwork_capability_ttl` moves the bound with it. With the
   default 24 h TTL this lands on a UTC midnight, because the bucket is a
   multiple of 86,400,000 ms from the epoch and the epoch is itself a UTC
@@ -976,7 +976,7 @@ cross-session and will not be in the next session's context.
 ## Deployment rule
 
 Build once, ship the artefacts. Build on fi-1 (es-1 is offline), run the full suite
-there, stage with `DESTDIR`, and ship the tarball — `bin/macha`,
+there, stage with `DESTDIR`, and ship the tarball - `bin/macha`,
 `lib/macha/libmacha_core.*` and `lib/macha/plugins/` together, never the
 executable alone. Verify `uname -m`, `ldd --version` and the tarball hash on
 each target. Never compile on gbni-1.

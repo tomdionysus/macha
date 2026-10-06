@@ -18,16 +18,16 @@ has done all along** (core, 2026-09-21). This is not a contract and not a
 request; it is a standing client defect the server session needs to know
 about, because it shapes what node-health evidence from a mobile viewer is
 worth. macha-client-rn has no status-to-kind mapping at the player layer at
-all — playback errors arrive through expo-video's `statusChange` as a message
-string with no code — so on `status === 'error'` the provider calls
+all - playback errors arrive through expo-video's `statusChange` as a message
+string with no code - so on `status === 'error'` the provider calls
 `failoverSource` unconditionally, picks another node, and **records a failure
 against the node it left**. A routine superseded generation therefore costs a
 healthy node a mark in that client's ranking.
 
 `410`'s axes (`node_healthy: true`, `alternative_may_succeed: true`) exist to
 prevent exactly this and mobile cannot read them. **0.48.0 does not cause it
-and does not worsen it** — mobile is equally blind to the `404` it gets today,
-and core verified there is no status-dependent branch anywhere on that path —
+and does not worsen it** - mobile is equally blind to the `404` it gets today,
+and core verified there is no status-dependent branch anywhere on that path -
 but the release makes it legible. Two consequences worth holding:
 
 - **Do not read a mobile client's endpoint-failure record as evidence about a
@@ -66,7 +66,7 @@ cross-session and will not be in the next session's context.
 - **A role-less session gets `403` from `/api/v1/status`, never a reduced
   payload.** There is no reduced-view code path; the gate is above the handler.
   Two client reports of "200 with an empty roster" were gbni-2 (ungated 0.38.1)
-  misattributed to gbni-1 — see the endpoint-attribution note below.
+  misattributed to gbni-1 - see the endpoint-attribution note below.
 - **`/api/v1/status` no longer carries `diagnostics`** (0.39.1). Core never
   typed that block, so it is unaffected; a client whose Status screen reads
   diagnostics needs `/api/v1/status/diagnostics`.
@@ -107,7 +107,7 @@ cross-session and will not be in the next session's context.
   frame-accurate, so a client wanting a cheap aligned seek asks for a position
   that already is a keyframe. Core types all three as `number | undefined`
   because an older node omits them, and deletes its `activationPosition`
-  undefined branch — the invariant makes that state unreachable.
+  undefined branch - the invariant makes that state unreachable.
 - **A node reports the playback budgets it enforces** (0.46.2) on the per-node
   entries of `GET /api/v1/status`, in a `playback` object beside `runtime`:
   `startup_timeout_ms` and `segment_timeout_ms`. They are each node's statement
@@ -164,7 +164,7 @@ cross-session and will not be in the next session's context.
 - **A signed artwork URL is stable for up to 24 hours and valid for 24-48.**
   From 0.40.0 `exp` is quantized to a bucket of the TTL, rounded up to the
   bucket *after* next: `(now / ttl + 2) * ttl`. The invariant is "always between
-  one and two TTLs", not "between 24 and 48 hours" — the bucket *is* the TTL, so
+  one and two TTLs", not "between 24 and 48 hours" - the bucket *is* the TTL, so
   reconfiguring `artwork_capability_ttl` moves the bound with it. With the
   default 24 h TTL this lands on a UTC midnight, because the bucket is a
   multiple of 86,400,000 ms from the epoch and the epoch is itself a UTC

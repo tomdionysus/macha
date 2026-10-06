@@ -7,7 +7,7 @@ Supersedes nothing; it reframes several open ACTIVE.md items as one programme.
 
 2026-09-06 produced six P0-class defects in one afternoon of ordinary load
 (two concurrent rsync writers, a dozen routine restarts). Every one was real,
-root-caused and fixed (0.28.2, 0.28.3) — and every one was only visible once
+root-caused and fixed (0.28.2, 0.28.3) - and every one was only visible once
 the previous one was fixed. That is the signature of a system whose failures
 do not fail loudly, and it is why the day felt like whack-a-mole. The list:
 
@@ -99,7 +99,7 @@ interval and no RPC waits without a deadline.
 
 - Extract `SubsystemRetryPolicy` into a general `RetryPolicy` (initial
   backoff, ceiling, failures-in-window, park). Apply to: FUSE data publication
-  (`replay_data_quantum` retries — today a fixed 100 ms), FUSE namespace
+  (`replay_data_quantum` retries - today a fixed 100 ms), FUSE namespace
   publication (today 50 ms → 5 s, no park except operator skip), the
   `namespace advanced` and `retention floor` paths, and `repair_once`.
 - Parked items surface in `/api/v1/status` `filesystem.parked` with inode,
@@ -131,9 +131,9 @@ they resolve, log the pair, re-journal the outcome, and count it in Status.
 
 - Inventory every `throw` in the two recovery paths (`fuse_frontend.cpp`
   3921–4080, `metadata.cpp` `load_history`/`load_heads`/`reconcile_recovery`)
-  and classify: *resolvable* (duplicate path — done in 0.28.3; orphan spool;
+  and classify: *resolvable* (duplicate path - done in 0.28.3; orphan spool;
   done-marker without op; delta whose parent is a peer's), *degradable*
-  (unreplayable head — keep certificate, repair live, done in 0.26/0.27) or
+  (unreplayable head - keep certificate, repair live, done in 0.26/0.27) or
   *genuinely fatal* (key mismatch, header corruption). Only the last may throw.
 - Hand-built-journal test fixture so each resolvable case has a regression
   (today's duplicate-path fix ships without one for exactly this lack).
@@ -158,7 +158,7 @@ replicated structures.
   tombstone to be *findable*, not carried in every generation).
 - Conflicts: resolved conflicts leave the snapshot; unresolved ones are
   capped and surfaced (Status + `manage` API) so a standing set of 300 KB
-  cannot silently persist — today nobody knows the cluster has one.
+  cannot silently persist - today nobody knows the cluster has one.
 - DLT7 (presence flags) so a merge delta carries only what changed
   (`2026-09-06-dlt7-presence-flags-for-branch-topology.md`).
 - Reconciliation frequency: two writers today merge on almost every commit.
@@ -176,7 +176,7 @@ change).
 
 1 → 2 → 3 → 4. 1 and 2 are each roughly a day and unblock the cluster's daily
 use; 3 is a week with the fuzz fixture; 4 is the largest and the one that
-matters most for the next month — start its design while 1–3 ship. Do not
+matters most for the next month - start its design while 1–3 ship. Do not
 ship 4 without 3: a format change with refuse-to-start recovery is how today
 happened.
 

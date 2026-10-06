@@ -25,7 +25,7 @@ the durable-lower budget to the last whole extent, which is why the number is
 byte-identical across restarts.
 
 Those 123 leases are **not** held by the eight (on es-1, three: 96M / 32M)
-running workers — they can hold at most 3 each (1 buffer + 2 pipelined). They
+running workers - they can hold at most 3 each (1 buffer + 2 pipelined). They
 are held by writers retained on inodes that are *not running*:
 
 1. `yield_quantum` (`src/fuse_frontend.cpp:3465-3475`) drains pipelined
@@ -45,7 +45,7 @@ are held by writers retained on inodes that are *not running*:
 
 Nothing about the ledger's gate ordering or any budget setting changes this.
 Any budget fills the same way because the number of writers holding partial
-state is unbounded — it is the breadth of the backlog.
+state is unbounded - it is the breadth of the backlog.
 
 Two secondary defects found on the way:
 
@@ -54,18 +54,18 @@ Two secondary defects found on the way:
   (`src/fuse_frontend.cpp:3854`) and is the counter `ensure_buffer_memory`
   polls (`:3435`). Every failure frees a slot, a fresh inode is admitted, and
   every other waiter's 30 s window re-arms. With three slots that is exactly
-  one failure per 30 s, round-robin, always a fresh inode with `attempts=1` —
+  one failure per 30 s, round-robin, always a fresh inode with `attempts=1` -
   the log shape the continuation note called "the strongest clue" is this
   artefact.
 - **`drain_one_extent` waits forever.** `flush()` (`src/filesystem.cpp:439`)
   spins on `drain_one_extent`, which blocks in `future::get()` with no
   deadline and no cancellation check. If an extent put stalls, publication
-  blocks there silently — the same "never fails, never completes" shape one
+  blocks there silently - the same "never fails, never completes" shape one
   layer down. Not what es-1 is doing now, but live.
 
 Rejected: dropping the writer on `EAGAIN` (the continuation note's
-"release-on-failure"). It frees nothing today — the failing writers hold
-nothing — and when a holder is eventually re-admitted and fails, dropping it
+"release-on-failure"). It frees nothing today - the failing writers hold
+nothing - and when a holder is eventually re-admitted and fails, dropping it
 discards the generation cursor, so a multi-GB file replays from spool byte
 zero. Under contention that is strictly worse than the current state.
 
@@ -106,7 +106,7 @@ is the fixture shape to copy:
 
 Expected on the current tree: hangs until the idle timeout, with
 `owners.publication` pinned at the durable-lower budget. If it does **not**
-hang, the diagnosis above is incomplete — stop and re-examine before building
+hang, the diagnosis above is incomplete - stop and re-examine before building
 the fix (the split of the 123 leases between yielded and failed writers was
 inferred from code, not measured; gdb on es-1 can count `WriteHandle`
 instances and their `buffer_.size()` / `pending_extents_.size()` if needed).
@@ -135,7 +135,7 @@ instances and their `buffer_.size()` / `pending_extents_.size()` if needed).
   closed-file `find_if`, in the retirement-score candidate loop, and in the
   final `data_queue.begin()` fallback. Inodes with writers are always
   admissible, so once the cap is reached the scheduler is depth-first over
-  the open set until one completes — which is the point.
+  the open set until one completes - which is the point.
 - Because `runnable_data_locked` is the wait predicate for `data_loop`, an
   inadmissible queue must not spin: the existing `data_cv.wait` on
   `runnable_data_available_locked` covers it provided every
@@ -146,7 +146,7 @@ instances and their `buffer_.size()` / `pending_extents_.size()` if needed).
 ### 2. Count progress, not admissions
 
 - `FileSystem` gains `std::atomic_uint64_t publication_progress_` (or the
-  frontend's counter is passed as a non-const pointer — pick whichever keeps
+  frontend's counter is passed as a non-const pointer - pick whichever keeps
   `DataWorkContext` simple). `WriteHandle::drain_one_extent` increments it
   after `pending_extents_.pop_front()`; `commit()` increments it once more.
 - `replay_data_quantum` (`:3434-3436`) passes that counter as the progress
@@ -168,7 +168,7 @@ no-progress budget against the progress counter from step 2. On expiry throw
 path's `!pending.result.valid()` relaunch logic is unchanged and a still-valid
 future is simply waited on again. Test needs a `stall_extent_put_for_tests`
 hook in `DistributedStore`; if that is more than a few lines, defer this step
-to its own change — it is not what es-1 is stuck on.
+to its own change - it is not what es-1 is stuck on.
 
 ### 4. Diagnostics
 
@@ -186,7 +186,7 @@ to its own change — it is not what es-1 is stuck on.
 ### 6. Deploy and verify
 
 Check playback sessions first (rolling restarts vs viewers). Deploy to es-1
-first — it is the node that reproduces.
+first - it is the node that reproduces.
 
 - Revert es-1's config drift: remove `fuse.publication_inflight_bytes: 96M`
   and its comment block from `/etc/macha/macha.yaml` (backup
@@ -259,7 +259,7 @@ New tests: `test_fuse_publication_backlog_wider_than_ledger_completes`,
 ## Decision points for Tom
 
 - **Cap formula.** `max(commit_workers, loader_reserve / per_writer_worst)`
-  gives es-1 `max(8, 64M / 12M = 5) = 8` — worst case 96 MiB against a
+  gives es-1 `max(8, 64M / 12M = 5) = 8` - worst case 96 MiB against a
   536 MiB durable-lower, fine. An alternative is a fraction of durable-lower
   (e.g. half → 22 on es-1), which allows more breadth but ties the bound to
   headroom that `fuse_operation` and speculative work also draw on. I lean to

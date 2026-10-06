@@ -1,4 +1,4 @@
-# Structural runtime remediation — first guarded UAT
+# Structural runtime remediation: first guarded UAT
 
 Status: **failed safely at the retained-memory stop gate**
 

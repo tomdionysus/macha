@@ -20,7 +20,7 @@ converged (25722/25723). Each node's own `/api/v1/status`:
 
 Every WAN pair is blank; only the two LAN nodes see each other. The samples
 are ~4.9 minutes old against a 15 s freshness window, so this is not "a bit
-late" — telemetry stopped arriving and nothing retried.
+late" - telemetry stopped arriving and nothing retried.
 
 ## Three separate causes
 
@@ -58,7 +58,7 @@ for it. A healthy node reads as generation 0 in the UI.
 **3. Telemetry gossip is idle-gated, best-effort, and never retries.**
 `NodeRuntime::telemetry_loop` (cluster.cpp:1279) broadcasts only when the
 node has been free of foreground *and* read-ahead work for 2 s, and then
-only via `broadcast_best_effort(..., FrameType::speculative)` — "no-dial,
+only via `broadcast_best_effort(..., FrameType::speculative)` - "no-dial,
 no-wait", admitted only if routing and the per-peer outbound lock are
 immediately free. A tick that cannot be admitted is dropped, not queued.
 
@@ -76,7 +76,7 @@ freshness half shipped in 0.23.3.
 
 **1. Keep the runtime figures when the sample is stale.** Gate `runtime` on
 `live && online` rather than on `effective.authoritative && online`. Leave
-storage/cache/`storage_backends_online` exactly as they are — those stay
+storage/cache/`storage_backends_online` exactly as they are - those stay
 unavailable when stale, because they are the ones a consumer would sum. The
 existing regression
 `test_status_marks_stale_peer_telemetry_as_unavailable_not_live` asserts the
@@ -90,7 +90,7 @@ the larger one; fall back to the durable last-known value only when neither
 membership nor telemetry carries anything.
 
 **3. Make peer visibility survive a busy node.** Operator decision,
-2026-09-09: "telemetry data is important" — remove or loosen the gates that
+2026-09-09: "telemetry data is important" - remove or loosen the gates that
 suppress it. A CONTROL-class variant was written first and then reverted on
 the operator's instruction: the gates, not the class, are what made
 telemetry late, and SPECULATIVE keeps gossip out of the 64 MiB control
@@ -106,15 +106,15 @@ priority 1 ahead of foreground reads. Implemented as:
   (previously a hardcoded 5 s), documented in `docs/configuration.md` as the
   knob that decides how stale a peer's figures can be in another node's
   Status.
-- A demand-driven wake — a readiness transition or any peer observation —
+- A demand-driven wake - a readiness transition or any peer observation -
   still publishes sooner than that cadence, but **no more than once per
   second**. Without that floor the loop had no minimum spacing at all: its
   wait returns immediately whenever the demand counter moves, and demand is
   bumped on every `members_.observe()`, so a reconnecting peer could have
   turned this into a send loop. Local sampling still runs on every wake, so a
   phase change is published promptly.
-- `try_notify()` — both the outbound `PeerConnection` and the inbound
-  `RpcServer` session copy — no longer requires an entirely idle writer for a
+- `try_notify()` - both the outbound `PeerConnection` and the inbound
+  `RpcServer` session copy - no longer requires an entirely idle writer for a
   *small* notification. A payload of at most `max_notify_payload_bytes`
   (64 KiB) may queue while the writer's pending payload is under
   `max_notify_backlog_bytes` (1 MiB); anything larger still waits for an idle
@@ -133,7 +133,7 @@ it (32.4–34.3 s).
 caps it at `250ms * 2^min(failures-1, 4)` = **4 s**, and
 `RpcClient::connection()` already exempts an established route: backoff
 applies only to creating a new TCP connection. So es-1's continuous
-`peer in retry backoff` stream is not a long lockout being served — it is a
+`peer in retry backoff` stream is not a long lockout being served - it is a
 dial that fails, backs off 4 s, and fails again, every few seconds, while
 raw TCP to :7437 connects in both directions and ping is 69–72 ms. Exempting
 telemetry from a 4 s window would have bought nothing. **The open question
@@ -158,7 +158,7 @@ connections arriving from `10.255.34.1` while es-1 advertises
   the UI session on 2026-09-09).
 - A node under load still gossips: `live_age_ms` for a busy peer stays within
   a few heartbeats rather than growing to minutes. Verified on the cluster
-  rather than in a unit test — forcing a genuinely busy writer on loopback is
+  rather than in a unit test - forcing a genuinely busy writer on loopback is
   not deterministic enough to assert on, so the tests cover the class being
   legal and delivered in both route directions, and the bounded-backlog rule
   is proven by the live measurement.

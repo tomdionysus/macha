@@ -180,11 +180,11 @@ Two new named cases, both reproducible on clean `HEAD`:
 
 - **`storage_v18/test_durability_barrier_reports_objects_a_restarted_peer_lost`**
   and **`storage_v18/test_durability_barrier_rederives_placement_after_peer_restart`**
-  — macOS, roughly 1-in-2 per run across the pair, often both in the same run.
+  - macOS, roughly 1-in-2 per run across the pair, often both in the same run.
   The highest-rate cases known on any platform; they were not on the list
   before because previous sweeps were run after the FUSE work, not on a
   pristine tree.
-- **`rpc_cluster/test_rpc_v15_bidirectional_and_deduplication`** — es-1,
+- **`rpc_cluster/test_rpc_v15_bidirectional_and_deduplication`** - es-1,
   ~1-in-8, fails in 12 ms, which points at a connection/port race rather than a
   timeout.
 
@@ -192,7 +192,7 @@ Neither is a "known flake" to be waved past; both are the next piece of work
 under this plan.
 
 A pristine `HEAD` (69a02ee) tree is built and left at `/root/macha-baseline` on
-es-1 for exactly this comparison — `./build/macha-tests` there is 0.43.0 with no
+es-1 for exactly this comparison - `./build/macha-tests` there is 0.43.0 with no
 local changes, so a rate can be re-measured against it without spending 25
 minutes rebuilding first. Rebuild it from a laptop with
 `git archive HEAD | ssh root@10.34.1.50 'tar x -C /root/macha-baseline'` if it
@@ -207,7 +207,7 @@ plugins and must "never" use the installed default. But `NodeRuntime` runs every
 `Config` through `normalize_config`, which fills an *absent* `plugin_path` with
 the installed directory (`src/config_base.cpp:553-554`). So every `TestService`
 and `TestNode` on a machine with Macha installed was dlopening
-`/usr/lib/macha/plugins/libmacha-{torrent,fuse}.so` — testing whatever is
+`/usr/lib/macha/plugins/libmacha-{torrent,fuse}.so` - testing whatever is
 deployed on the build box rather than the build under test, and paying a
 libtorrent dlopen in every isolated case, both of which the comment existed to
 prevent.
@@ -218,7 +218,7 @@ build to 0.43.1 against an installed 0.43.0 surfaced it as
 core=0.43.1+unknown; refusing to load (partial deploy?)`.
 
 Fixed by setting `c.plugin_path` to an *engaged but empty* path, which is the
-only way to say "builtin subsystems only" — `normalize_config` skips an engaged
+only way to say "builtin subsystems only" - `normalize_config` skips an engaged
 optional and `Service` maps an empty path to `<builtin>`
 (`src/service.cpp:99`). Note this did **not** explain the failures above: the
 es-1 run that failed most recently had zero plugin mismatches.

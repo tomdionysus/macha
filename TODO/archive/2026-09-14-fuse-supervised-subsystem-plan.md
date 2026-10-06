@@ -11,9 +11,9 @@ changes *what moves where*, and in what order, after sizing the work against
 the code as it is at 0.40.1.
 
 Owns the P0 in `ACTIVE.md`: "A hard failure in one subsystem takes down the
-entire macha process — foundation shipped in 0.25.0, FUSE/Torrent migration
+entire macha process - foundation shipped in 0.25.0, FUSE/Torrent migration
 still open." Torrent is done (0.28.0). This is the FUSE half, and the P0
-closes when Stage A ships and passes UAT — Stage B is runtime optionality,
+closes when Stage A ships and passes UAT - Stage B is runtime optionality,
 not crash isolation, and the 2026-09-05 plan says so itself ("the plugin half
 is not required for that guarantee").
 
@@ -27,8 +27,8 @@ The split is not where that sentence implies:
   `macha_core`; `fuse_adapter.cpp` (the kernel op table, `run_fuse`, the
   mount watchdog, `CoveredMountpointGuard`) is compiled into the `macha`
   executable only (`CMakeLists.txt:404-447`), with `fuse_stub.cpp` standing in
-  when FUSE3 is absent. `FuseFrontend` — the 6,732-line class whose
-  constructor crash-looped es-1 — is pure C++ over `FileSystem` with no
+  when FUSE3 is absent. `FuseFrontend` - the 6,732-line class whose
+  constructor crash-looped es-1 - is pure C++ over `FileSystem` with no
   libfuse dependency, which is exactly why `tests/test_filesystem_fuse.cpp`
   (4,785 lines) can drive it without a kernel mount.
 - **The lifecycle is inverted relative to every other subsystem.**
@@ -36,8 +36,8 @@ The split is not where that sentence implies:
   constructs `FuseFrontend` (`:537`, where journal replay happens), installs
   libfuse's own SIGINT/SIGTERM/SIGHUP handlers (`:566`), runs `fuse_loop_mt`
   (`:637`), and returns a process exit code (3-8) that `main.cpp:52-61` hands
-  to the OS. `main.cpp:41-46` only blocks service signals — and `:64-81` only
-  runs the `sigwait` loop with SIGHUP config reload — when there is *no*
+  to the OS. `main.cpp:41-46` only blocks service signals - and `:64-81` only
+  runs the `sigwait` loop with SIGHUP config reload - when there is *no*
   mount. A mounted node therefore cannot hot-reload config at all: SIGHUP
   reaches libfuse's handler and exits the mount loop.
 - **Mount loss is a process shutdown today.** The watchdog (`:584-634`) and
@@ -53,7 +53,7 @@ The split is not where that sentence implies:
   Torrent, by contrast, publishes itself into `SubsystemRegistry`
   (`src/torrent_plugin.cpp:33`) and core looks it up per call.
 - **`SubsystemContext` cannot host FUSE yet.** It carries `config`, `node`,
-  `ingest`, `registry` (`src/subsystem.hpp:40-45`) — no `FileSystem`, no
+  `ingest`, `registry` (`src/subsystem.hpp:40-45`) - no `FileSystem`, no
   hydrator. `FuseFrontend` needs the first; `run_fuse` registers the
   frontend as a `HydrationHintProvider` with the second (`fuse_adapter.cpp:564`).
 - **The supervisor cannot see a subsystem die after `start()`.**
@@ -106,7 +106,7 @@ The split is not where that sentence implies:
    (b) `FuseFrontend`'s consumers in core (`Service`, `ClusterStatusService`)
    keep concrete types, so no abstract `FuseService` and no relocation of the
    110-field `FuseFrontendDiagnostics`; (c) `tests/test_filesystem_fuse.cpp`
-   keeps linking `macha_core` and constructing `FuseFrontend` directly — the
+   keeps linking `macha_core` and constructing `FuseFrontend` directly - the
    biggest hidden cost in the original Phase 2 disappears. The 2026-09-05
    plan's invariant still holds: no `libmacha-fuse.so` on disk means no
    mount capability at runtime, and `fuse_stub.cpp` is deleted.
@@ -122,7 +122,7 @@ The split is not where that sentence implies:
 5. **The constructor wait gets a stop token.** `wait_for_initial_namespace`
    is made cancellable as part of Stage A, because Stage A is what makes the
    hang reachable from `Service::stop()`. Bounding it (fault after N seconds
-   → `faulted`, retried) is folded in too — the supervisor turns "silent
+   → `faulted`, retried) is folded in too - the supervisor turns "silent
    forever" into a visible state for free.
 
 ## Design
@@ -134,20 +134,20 @@ executable next to `fuse_adapter.cpp` (it needs libfuse); Stage B moves both
 into the module.
 
 - **`create(context)`** (the plugin entry / builtin factory): declines with
-  no instance when `config.fuse.mount_path` is unset — same "not a fault"
+  no instance when `config.fuse.mount_path` is unset - same "not a fault"
   path as `torrent.enabled == false` (`torrent_plugin.cpp:58-65`), so Status
   says `unavailable`. Otherwise runs mountpoint preparation
   (`prepare_fuse_mountpoint`, moved out of `main.cpp:29-32`; idempotent, and
   `unmount_if_mounted` is exactly what a retry after an unexpected loss
   needs) and constructs `FuseFrontend(filesystem, config, stop_token)`. A
   throw here is a construction fault: the supervisor logs, backs off,
-  retries, disables — the process does not notice.
+  retries, disables - the process does not notice.
 - **`start()`**: registers the frontend with the hydrator and the registry,
   then spawns the mount thread under `run_supervised("fuse-mount", ...)`.
   The thread body is `run_fuse` minus signal handlers, minus
   `request_shutdown`, minus exit codes: `fuse_new` → `fuse_mount` → guard
-  `protect()` → `fuse_loop_mt` → unmount → destroy. Any failure — mount
-  refused, watchdog-detected loss, loop returning an error — calls the fault
+  `protect()` → `fuse_loop_mt` → unmount → destroy. Any failure - mount
+  refused, watchdog-detected loss, loop returning an error - calls the fault
   sink (below) with a reason and returns. Mount-loss handling keeps
   `filesystem.request_io_cancellation()` so in-flight FUSE requests fail
   closed; the next attempt's `reset_io_cancellation()` already exists at
@@ -182,13 +182,13 @@ for tests or remove it.
 ### Context and registry
 
 - `SubsystemContext` gains `FileSystem* filesystem` and
-  `HydrationManager* hydration` (or `CacheHydrator*` — whichever
+  `HydrationManager* hydration` (or `CacheHydrator*` - whichever
   `add_provider` lives on). Both exist by the time `subsystems_.start()` runs
   at the end of `initialise_services`; `Service::stop()` already stops
   subsystems before hydration/ingest (`service.cpp:739-742`), so the
   destruction order is right without changes.
 - `SubsystemRegistry` gains `publish_fuse(std::shared_ptr<FuseFrontend>)`,
-  `withdraw_fuse(const FuseFrontend*)`, `fuse()` — the concrete class, per
+  `withdraw_fuse(const FuseFrontend*)`, `fuse()` - the concrete class, per
   decision 2. `Service::attach_fuse_frontend` and `fuse_frontend_` go away;
   `blocked_namespace_operation`/`skip_blocked_namespace_operation`/
   `parked_publications` call `registry_.fuse()` and answer "none" when it is
@@ -196,7 +196,7 @@ for tests or remove it.
   `Service` constructor with a provider that does the same lookup, next to
   `attach_subsystem_diagnostics` (`service.cpp:103`). The `shared_ptr`
   lookup is what makes a restart safe for a caller already inside a handler
-  — the lesson from Phase 1.
+  - the lesson from Phase 1.
 
 ### `main.cpp`
 
@@ -220,12 +220,12 @@ non-writable until a later attempt stops cleanly. With the immutable flag
 `wait_for_initial_namespace` polls the token and throws `FsError(EINTR)` on
 stop, and throws a distinct "metadata not ready within
 `fuse.initial_namespace_timeout`" after a configurable bound (default
-generous — minutes, not seconds; the 2026-09-06 lesson about elapsed-time
+generous - minutes, not seconds; the 2026-09-06 lesson about elapsed-time
 gates applies, so the bound is on *no metadata at all*, not on slow
 progress). Either throw is a construction fault to the supervisor. Existing
 `FuseFrontend` callers in tests pass a default token.
 
-## Stage A — supervised in place (shipped in 0.41.0)
+## Stage A: supervised in place (shipped in 0.41.0)
 
 - [x] `Subsystem::attach_fault_sink`; `run_entry` waits on fault-or-stop and
   recycles the instance through the existing backoff/disable path.
@@ -271,7 +271,7 @@ progress). Either throw is a construction fault to the supervisor. Existing
   loses "FUSE is still linked into the executable"; CHANGELOG entry;
   `macha.yaml.example` documents `fuse.initial_namespace_timeout`.
 
-## Stage B — `libmacha-fuse` (shipped in 0.41.0)
+## Stage B: `libmacha-fuse` (shipped in 0.41.0)
 
 - [x] `add_library(macha-fuse MODULE src/fuse_adapter.cpp src/fuse_plugin.cpp)`
   mirroring `macha-torrent`: built only when FUSE3 is found, links
@@ -290,7 +290,7 @@ progress). Either throw is a construction fault to the supervisor. Existing
 - [x] Tests: `MACHA_TEST_FUSE_PLUGIN` next to `MACHA_TEST_TORRENT_PLUGIN`
   (`CMakeLists.txt:511-515`); one Service-level test that points
   `plugin_path` at the build tree and sees `subsystems.libmacha-fuse` go
-  `unavailable` (no `mount_path`) — the dlopen, entry-symbol and
+  `unavailable` (no `mount_path`) - the dlopen, entry-symbol and
   build-identity path is otherwise covered by the existing supervisor tests.
   The Stage A regressions keep running against the builtin factory through
   the driver double, so they do not need a kernel or a dlopen.
@@ -302,13 +302,13 @@ progress). Either throw is a construction fault to the supervisor. Existing
   script in this repo that does, and deployment is hand-run rsync. A node
   that receives `macha` + `libmacha_core` without the new plugin loses its
   mount silently until someone reads Status.
-- [ ] **Still open (cluster UAT):** partial-deploy — ship a `libmacha-fuse`
+- [ ] **Still open (cluster UAT):** partial-deploy - ship a `libmacha-fuse`
   from a different build and confirm Status shows `disabled` with the
   mismatch in `last_fault` and the node otherwise serves. The refusal path
   itself is covered by `subsystem_supervisor/test_subsystem_supervisor_refuses_a_mismatched_plugin`;
   what is not covered is a real node in that state.
 
-## UAT (cluster, both stages) — outstanding
+## UAT (cluster, both stages): outstanding
 
 Rolling, viewers checked first (`feedback-rolling-restart-viewers`). With
 gbni-1 dark and gbni-2 unreachable from the current site, es-1 is the only

@@ -1,4 +1,4 @@
-# Phase 2 three-node deletion UAT — 2026-08-30
+# Phase 2 three-node deletion UAT: 2026-08-30
 
 ## Purpose
 
