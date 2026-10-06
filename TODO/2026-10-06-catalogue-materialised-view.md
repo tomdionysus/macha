@@ -188,6 +188,52 @@ node-local store, not catalogue state); `GET catalogue/status` walking all
 artwork (Stage E territory); Clear Metadata's fixed-point descendant scan
 (wants Stage E's parent index).
 
+## The September shard plan against the tree-era code
+
+The shard plan was written against 0.43.0, before the tree cutover, the
+object ledger, claims and holdings. Checked on 2026-10-06:
+
+**Unchanged, so its stages stand.** The catalogue's own storage: a root in
+the head, a manifest of 64 content-addressed shards, `catalogue_shard(id)`;
+media indexes were added to the shard format (0022) additively. Shards are
+still read through `ensure_control_local` and the control store. The
+three-way merge is already root-based (conflicts carry base, left and right
+roots; `common_ancestor_catalogue_root`). `RetainedMemoryLedger` and
+`snapshot_resident_bytes` exist. `snapshot()` is still a full deep copy
+(`catalogue.cpp:910`).
+
+**Changed, so its assumptions do not.**
+
+1. *Shards arrive with the commit.* A commit ships its changed control
+   objects with its claims (0.89.1); convergence is the fallback. A node
+   that received the commit holds every shard, so an install fetches only
+   when the node missed the commit. This is what makes resident shards and
+   memory-only reads safe, and why the demand-load half of Stage C is the
+   wrong shape, not merely later.
+2. *Reachability is the horizon builder.* `NodeHorizonBuilder::release`
+   asks the catalogue for each root's retained data and control
+   (`node_horizon_builder.cpp:50`); `maintenance_objects` puts the manifest
+   and shards of the cached and protected roots in `control_live`. Any new
+   manifest entry (Stage E indexes, Stage F's longer vector) must be
+   declared through `retention_objects` and `maintenance_objects` or
+   control GC reclaims it.
+3. *`retention_objects` is already the per-shard diff* (`catalogue.cpp:1835`):
+   it decodes only shards the two manifests do not share. The install's
+   changed-shard decode is the same operation; write it once.
+4. *Holdings do not cover catalogue DATA.* Artwork and media indexes sit
+   outside the tree, carried as the inventory's flat `outside_namespace`
+   list, which repair covers separately and `known_present` does not trust.
+   "Artwork held by no online node" has no cheap count. Holdings per shard
+   (this shard's DATA objects: held, where) would be the analogue. Not in
+   this plan; recorded in BACKLOG.
+5. *No cache to copy.* The tree keeps no resident nodes: readers construct
+   `ControlNamespaceNodeStore::for_reading` over the control store per
+   read. The catalogue's reads must be memory-only, so the view keeps its
+   shards resident. It is its own structure.
+6. *One hash space, three families.* Items, profiles and media indexes
+   share the 64 shards, so a profile or index publication dirties item
+   shards. September's open question 2, bigger.
+
 ## Order of work
 
 1. The P0 guard in `cache()` (done, 0.90.26).
