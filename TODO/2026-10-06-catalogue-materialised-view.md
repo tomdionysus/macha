@@ -272,6 +272,14 @@ suite green; no stage waits on a later one.
    is left only in `snapshot()` and conflict reconciliation. Retrying on a
    moved root was not needed: a mutation installs the head first under the
    mutation lock, as before.
+   Measured 2026-10-06 20:38Z under load (20+ torrents, two viewers):
+   gbni-1's import commits touched 1 shard each, prepare 0 ms, publish 80
+   to 297 ms (the metadata commit), against 290 to 339 ms per matched track
+   idle with the whole-catalogue copy. fi-1 installed 3 roots for gbni-1's 5
+   commits (latest wins), decoding 3, then 1, then 1 shard (0 to 3 ms), but
+   read 0.9 to 4.6 s fetching those shards from gbni-1 over the loaded WAN:
+   the head arrived before the shards it names. Background; no reader
+   waited. Recorded in ACTIVE.
 6. **The conflict merge per shard.**
 7. **Derived indexes** for list, search and the descendant scan.
 8. **The manifest change**: per-family shard vectors with a growable

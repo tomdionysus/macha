@@ -90,6 +90,13 @@ item in section 3, then stage 6.
 
 ## 3. Replication and repair
 
+- **A catalogue head can reach a node before its shards do.** Under load
+  (2026-10-06 20:38Z), fi-1 installed gbni-1's import commits by fetching
+  the changed shards over the WAN, 0.9 to 4.6 s each, so the commit's
+  claims had not delivered them first (its claim scope stops at
+  `metadata_write_copies` holders). Background, readers unaffected; check
+  whether the commit's control objects should go to every node present
+  before or with the head, as the convergence offer does.
 - **One definition of work class, and the API is viewer-class work**
   (operator, 2026-10-06). The laws rank viewer, loader, background; the code
   has three separate notions of which work is which, and they disagree:
