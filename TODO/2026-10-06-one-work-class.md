@@ -13,6 +13,45 @@ laws do not name is background). Every subsystem that admits, paces,
 schedules or measures work reads that one class. None keeps its own notion
 of which work is which.
 
+## Control is non-interference, not a lane
+
+Nothing may interfere with control (law 1). Its own RPC lane, HTTP pool and
+object store are necessary and not sufficient: control shares the CPU, the
+disk, the network link, memory and locks with data work, and any of them
+can make it wait. Each shared resource needs its own guarantee, and the
+audit in step 1 covers each:
+
+- **Admission**: no control path enters the DATA arbiter (below).
+- **Network**: a saturated link delays control frames whatever lane they
+  are on. Evidence 2026-10-06 20:38Z: fi-1 fetched gbni-1's new catalogue
+  shards, control objects on the control lane, at 0.9 to 4.6 s each while
+  the WAN carried 20 torrents and repair. A law 1 defect. Control needs a
+  bandwidth reserve the pacer keeps free (`repair_share` and the torrent
+  rate know their own sending; the reserve is what they must not use), or
+  priority on the socket, not just a lane.
+- **Disk**: known gap, recorded in memory as the I/O control-reserve gap
+  (es-1, 2026-09-19: ingest starved health). Law 1 has no disk-I/O reserve;
+  the pressure gate throttles loaders by measured service time, which is
+  after the fact. The control store's reads and the metadata replica's
+  commits need a reserve, not a share.
+- **CPU**: background hashing, encryption, encoding and decode run on
+  thread pools; control handlers must not wait for a pool slot those
+  occupy. The reactor and the control pool are already separate threads;
+  the audit checks what the control handlers call into.
+- **Locks**: a control path must never wait on a mutex that data work holds
+  across I/O. The `Mutex`/`IoMutex` split exists for this; the audit checks
+  every lock a control-class request takes against who else holds it and
+  for how long (the end-of-T5 audit did this for the five ledger contracts;
+  the HTTP control routes and the metadata server's handlers are not yet
+  covered).
+- **Memory**: the retained-memory ledger sheds lower classes first; control
+  allocations must not be what waits.
+
+Each resource gets a reserve or a priority, and a measurement that shows
+control latency flat under full data load (the torrents-plus-viewers load
+of 2026-10-06 is the test). Where a resource has no reserve today, that is
+recorded as a law 1 defect in ACTIVE, not deferred as optimisation.
+
 ## What the code does today
 
 Three places class work, each by its own rule, and they disagree:

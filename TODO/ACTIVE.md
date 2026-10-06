@@ -103,13 +103,15 @@ item in section 0, then stage 6.
 
 ## 4. Replication and repair
 
-- **A catalogue head can reach a node before its shards do.** Under load
-  (2026-10-06 20:38Z), fi-1 installed gbni-1's import commits by fetching
-  the changed shards over the WAN, 0.9 to 4.6 s each, so the commit's
-  claims had not delivered them first (its claim scope stops at
-  `metadata_write_copies` holders). Background, readers unaffected; check
-  whether the commit's control objects should go to every node present
-  before or with the head, as the convergence offer does.
+- **Control objects crossed a saturated WAN at 0.9 to 4.6 s each: a law 1
+  defect.** Under load (2026-10-06 20:38Z), fi-1 fetched gbni-1's new
+  catalogue shards, control objects on the control lane, at 0.9 to 4.6 s
+  while the link carried 20 torrents and repair. Two parts: the commit's
+  claims had not delivered the shards (claim scope stops at
+  `metadata_write_copies` holders), and control has no bandwidth reserve on
+  the link. The second is the work-class design's network item (section
+  0); the first, whether a commit's control objects go to every node
+  present with the head, goes with it.
 - Repair is bound by the WAN link: one step sends a batch of at most two
   extents and waits for it (about 4 MB in 5 s between fi-1 and gbni-1).
   Pipelining batches, or several steps per pass, would lift it further.
