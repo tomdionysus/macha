@@ -37,12 +37,16 @@
 
 namespace macha::test_support {
 
-// The catalogue's half of a maintenance inventory, taken as the pass takes it:
-// head, repair, then read.
+// The catalogue's half of a maintenance inventory: the head, then the read.
+// With no installer behind these fixtures, the view is brought to the head
+// first, as the installer would have.
 inline CatalogueMaintenance maintenance_inventory(CatalogueManager& catalogue) {
     const auto head = catalogue.maintenance_head();
-    const bool repaired = catalogue.maintenance_repair();
-    return catalogue.maintenance_objects(head, repaired);
+    try {
+        catalogue.follow_head();
+    } catch (...) {
+    }
+    return catalogue.maintenance_objects(head);
 }
 
 using namespace std::chrono_literals;
