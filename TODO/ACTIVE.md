@@ -48,6 +48,15 @@ From the local-first work
 
 ## 4. Defects and unexplained failures
 
+- **P0: `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`**
+  failed on fi-1 (0.90.20 suite, 2026-10-06 08:23Z, 34 ms in; then 1 of 5
+  standalone runs), `catalogue item revision changed`: node 2's
+  `put_artwork` with the revision its own `upsert` had just returned was
+  refused, so its catalogue view moved between the two calls. First failure
+  in every 0.8x and 0.90.x suite log on fi-1; 0.90.20 touched no catalogue
+  code. Not reproduced since (0 of 12 verbose runs, 0 of 6 group runs on
+  fi-1, 0 of 10 on the laptop).
+
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
   `/root/claude-missing-extent-driver.py` are staged on fi-1, not run.
   *Carried.*
