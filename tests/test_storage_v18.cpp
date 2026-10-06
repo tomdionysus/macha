@@ -836,6 +836,21 @@ MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable
         CHECK(long_pass.pull_examined == settled.size());
         CHECK(long_pass.bytes_transferred == 0);
         asked.clear();
+
+        // Given what this node lacks, pull considers only that, however large
+        // the live set beside it.
+        std::vector<ObjectId> lacking{settled[10], settled[500]};
+        std::sort(lacking.begin(), lacking.end());
+        const auto listed = node.store().repair_step(4ULL * 1024 * 1024, 16, settled, {}, 0,
+                                                     unavailable, lacking);
+        CHECK(listed.pull_examined == lacking.size());
+        CHECK(asked == lacking);
+        asked.clear();
+        // Lacking nothing, pull does nothing.
+        const auto none = node.store().repair_step(4ULL * 1024 * 1024, 16, settled, {}, 0,
+                                                   unavailable, std::vector<ObjectId>{});
+        CHECK(none.pull_examined == 0);
+        CHECK(asked.empty());
     }
 
     // Unmarked, the pass tries to source it and, with no peer, cannot.

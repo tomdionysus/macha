@@ -81,6 +81,14 @@ NodeHoldings describe_holdings(const HoldingsRollup& rollup, const NamespaceNode
 // The wire form of a question (tree node ids) and its answers. A question
 // carries at most tree_holdings_max ids. Decoding throws DecodeError.
 inline constexpr size_t tree_holdings_max = 2048;
+// The extents beneath the roll-up's root this node does not hold, sorted and
+// unique: a descent into only the subtrees the roll-up does not count as held
+// whole, so a node that holds everything reads one node. `pause` is called
+// between tree nodes. Throws DecodeError if a node cannot be read.
+std::vector<ObjectId> missing_extents(const HoldingsRollup&, const NamespaceNodeStore&,
+                                      const HeldFn& held,
+                                      const std::function<void()>& pause = {});
+
 Bytes encode_tree_holdings_request(std::span<const ObjectId> nodes);
 std::vector<ObjectId> decode_tree_holdings_request(std::span<const uint8_t>);
 Bytes encode_tree_holdings_reply(std::span<const NodeHoldings> answers);

@@ -168,6 +168,7 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // The live set's identity when no generation is given: its data, or none
     // for no live set.
     std::optional<const ObjectId*> repair_live_identity_;
+    std::optional<const ObjectId*> repair_pull_identity_;
     uint64_t repair_live_generation_{};
     bool repair_push_complete_{};
     bool repair_pull_complete_{};
@@ -410,14 +411,17 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // repair_position file the push pass resumes there after a restart
     // (saved at most every 30 s and at each pass end). An object `unavailable`
     // names is one no reachable node holds: the pull pass moves past it
-    // without asking anyone, since nobody can supply it.
+    // without asking anyone, since nobody can supply it. `pull`, sorted, is
+    // what the pull pass considers instead of `live`: the objects this node is
+    // known to lack, so a node that lacks nothing pulls nothing.
     uint64_t repair_once(uint64_t byte_budget = 0,
                          std::optional<std::span<const ObjectId>> live = std::nullopt);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
                              std::optional<std::span<const ObjectId>> live = std::nullopt,
                              const std::function<bool()>& should_yield = {},
                              uint64_t live_generation = 0,
-                             const std::function<bool(const ObjectId&)>& unavailable = {});
+                             const std::function<bool(const ObjectId&)>& unavailable = {},
+                             std::optional<std::span<const ObjectId>> pull = std::nullopt);
     uint64_t scrub_once(uint64_t byte_budget = 0);
     RepairDiagnostics repair_diagnostics() const;
 

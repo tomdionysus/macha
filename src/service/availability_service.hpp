@@ -115,6 +115,16 @@ class AvailabilityService {
     // its duty cycle deferred, or a peer to ask again. The pass wakes for it.
     std::optional<Clock::time_point> due() const noexcept { return due_; }
 
+    // The namespace's extents this node lacked at the last roll-up, sorted;
+    // null before the first. Repair pulls from this rather than walking every
+    // referenced extent. A pointer copy.
+    static constexpr Waits missing_here_waits = Waits::none;
+    static constexpr ThreadSafety missing_here_safety = ThreadSafety::thread_safe;
+    std::shared_ptr<const std::vector<ObjectId>> missing_here() const {
+        const auto holdings = holdings_.handle();
+        return holdings ? holdings->missing : nullptr;
+    }
+
     // Whether the last survey found no reachable node holding the extent.
     bool unavailable(const ObjectId& id) const {
         const auto current = snapshot_.handle();
@@ -155,6 +165,8 @@ class AvailabilityService {
         // the same one.
         uint64_t generation{};
         std::shared_ptr<const MetadataSnapshot> snapshot;
+        // The namespace's extents this node lacked at the roll-up, sorted.
+        std::shared_ptr<const std::vector<ObjectId>> missing;
     };
     // What peers are answered from; replaced whole by each roll-up.
     Published<Holdings> holdings_;
