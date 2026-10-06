@@ -45,6 +45,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       availability_(node_, local_, store_, ledger_, resources_.events, routes_,
                     node_.config().state_path / "availability" / "last-survey.bin"),
       catalogue_(node_, local_, metadata_server_, store_, metadata_, ledger_),
+      catalogue_installer_(catalogue_, resources_.events),
       filesystem_(node_.config(), node_.node_id(), node_.membership(), local_, metadata_server_,
                   store_, metadata_, resources_.memory, &playback_),
       catalogue_hints_(node_.config().state_path), media_engine_(media_engine_for(node_.config())),
@@ -172,6 +173,8 @@ NodeServices::~NodeServices() {
 
 void NodeServices::start() {
     started_ = true;
+    note("start catalogue-installer");
+    catalogue_installer_.start();
     note("start media-information");
     media_information_.start();
     note("start scanner");
@@ -216,6 +219,8 @@ void NodeServices::request_stop() {
     filesystem_.request_io_cancellation();
     note("request_stop maintenance");
     maintenance_.request_stop();
+    note("request_stop catalogue-installer");
+    catalogue_installer_.request_stop();
     note("request_stop streaming");
     streaming_.request_stop();
     note("request_stop manage-api");
@@ -253,6 +258,8 @@ void NodeServices::stop() {
     metadata_.stop_replication();
     note("stop maintenance");
     maintenance_.stop();
+    note("stop catalogue-installer");
+    catalogue_installer_.stop();
     note("stop streaming");
     streaming_.stop();
     note("stop manage-api");

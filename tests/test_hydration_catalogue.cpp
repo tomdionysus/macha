@@ -3473,10 +3473,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     CHECK(available_after_fuse->generation == available_before_fuse->generation);
 
     // Warm reads must remain memory-only even when a newer generation is known.
-    // The serving API may briefly return the previous coherent snapshot while its
-    // background/control-plane worker converges; it must not perform quorum I/O
-    // on the request thread. refresh_needed() is the hand-off to that worker.
-    CHECK(catalogue2.refresh_needed());
+    // The serving API may briefly return the previous coherent snapshot while the
+    // installer follows the head; a read never installs.
+    const auto installs_before = catalogue2.installs();
     auto still_cached = catalogue2.get(first.id);
     REQUIRE(still_cached.has_value());
     CHECK(still_cached->title == first.title);
@@ -3484,6 +3483,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     const auto after_read = catalogue2.status();
     CHECK(after_read.metadata_generation == stale.metadata_generation);
     CHECK(after_read.known_metadata_generation >= writer_status.metadata_generation);
+    CHECK(catalogue2.installs() == installs_before);
 
     // Simulate the Service control-plane pass. It must converge the immutable root
     // and atomically publish the replacement snapshot for subsequent API reads.
@@ -3495,7 +3495,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     const auto after = catalogue2.status();
     CHECK(after.metadata_generation >= writer_status.metadata_generation);
     CHECK(after.metadata_generation == after.known_metadata_generation);
-    CHECK(!catalogue2.refresh_needed());
+    // One root change, one install.
+    CHECK(catalogue2.installs() == installs_before + 1);
     CHECK(frontend->getattr("/").type == EntryType::directory);
     auto available_after_repair = metadata2.available_snapshot_view();
     REQUIRE(available_after_repair.has_value());
@@ -4689,7 +4690,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     TestGate metadata_gate;
     std::atomic_bool gate_metadata{};
     std::atomic_bool gate_once{};
-    std::atomic_uint64_t catalogue_repairs{};
     // Convergence counters as each metadata run begins once the gate is set:
     // the first is the gated run, the second the burst's follow-up.
     std::atomic<Service*> observed{nullptr};
@@ -4706,8 +4706,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             gate_metadata.load(std::memory_order_acquire) &&
             !gate_once.exchange(true, std::memory_order_acq_rel)) {
             metadata_gate.enter_and_wait();
-        } else if (stage == "catalogue-repair-begin") {
-            catalogue_repairs.fetch_add(1, std::memory_order_relaxed);
         }
     });
     observed.store(&s1, std::memory_order_release);
@@ -4745,6 +4743,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             return false;
         }
     }, 10s));
+    // The baseline is s1 at s2's root, artwork included: the title alone
+    // arrives a commit earlier.
+    REQUIRE(wait_until([&] {
+        return s1.catalogue().status().root == s2.catalogue().status().root;
+    }, 10s));
     // The baseline must be the snapshot that satisfied quiescence: a second
     // sample can catch a newly scheduled run and put every delta off by one.
     ConvergenceDemandDiagnostics convergence_before{};
@@ -4761,11 +4764,15 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     };
     const auto events_before = convergence_events();
 
-    const auto repairs_before = catalogue_repairs.load(std::memory_order_acquire);
+    const auto installs_before = s1.catalogue().installs();
+    // Every catalogue root the burst commits on s2: s1 installs each at most
+    // once, and the latest of several at once.
+    std::set<std::optional<ObjectId>> burst_roots;
     gate_metadata.store(true, std::memory_order_release);
 
     item.title = "Intermediate Catalogue Title";
     item = s2.catalogue().upsert(item, item.revision);
+    burst_roots.insert(s2.catalogue().status().root);
     REQUIRE(metadata_gate.wait_for_entries(1, 5s));
 
     std::vector<ObjectId> superseded{initial_art.id};
@@ -4774,9 +4781,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         item.title = index == 4 ? "Final Catalogue Title"
                                 : "Intermediate Catalogue Title " + std::to_string(index);
         item = s2.catalogue().upsert(item, item.revision);
+        burst_roots.insert(s2.catalogue().status().root);
         auto bytes = pattern(32 * 1024 + index, static_cast<uint8_t>(41 + index));
         auto art = s2.catalogue().put_artwork(
             item.id, "poster", "image/jpeg", bytes, item.revision);
+        burst_roots.insert(s2.catalogue().status().root);
         if (index < 4)
             superseded.push_back(art.id);
         else {
@@ -4789,12 +4798,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     REQUIRE(wait_until([&] {
         return s1.metadata_server().known_generation() >= final_generation;
     }, 5s));
-    // Not "no catalogue repair yet": the gate stops s1's repair pass, not its
-    // committed generation, because publish_commit accepts commits on replicas
-    // directly, so Service::loop may repair under the gate. Coalescing is
-    // asserted at the end over the whole window, gate included.
-    const auto gated_repairs = catalogue_repairs.load(std::memory_order_acquire);
-
     metadata_gate.open();
     const bool final_state_ready = wait_until([&] {
         try {
@@ -4877,23 +4880,18 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             " follow_up_scheduled=" + std::to_string(follow_up.runs_scheduled) +
             " follow_up_completed=" + std::to_string(follow_up.runs_completed) +
             " events=" + std::to_string(events_delta) +
-            " repairs_before=" + std::to_string(repairs_before) + " repairs_after=" +
-            std::to_string(catalogue_repairs.load(std::memory_order_acquire)));
+            " installs=" + std::to_string(s1.catalogue().installs() - installs_before));
     }
-    // Nine catalogue mutations, arriving as ~20 node events, must not become
-    // ~20 catalogue repairs. A quarter of the demand events is a
-    // generous ceiling on "coalesced" and still far below a per-event storm.
-    // Not pinned to exactly one: each convergence run that advances the
-    // committed generation correctly dirties the catalogue, and whether the
-    // burst lands in the gated run or is split across it and its follow-up is
-    // a timing accident.
-    const auto repairs_after = catalogue_repairs.load(std::memory_order_acquire);
-    const auto repairs_delta = repairs_after - repairs_before;
-    if (repairs_delta < 1 || repairs_delta * 4 > events_delta) {
+    // The installer follows s1's head, not its maintenance pass: the gate
+    // does not hold it. Each install is of a root the burst committed, never
+    // the same root twice, so the burst costs at most one install per root
+    // and at least one.
+    const auto installs_delta = s1.catalogue().installs() - installs_before;
+    if (installs_delta < 1 || installs_delta > burst_roots.size()) {
         throw std::runtime_error(
-            "unexpected catalogue repair count for one coalesced burst: repairs_before=" +
-            std::to_string(repairs_before) + " repairs_after=" + std::to_string(repairs_after) +
-            " gated_repairs=" + std::to_string(gated_repairs) +
+            "unexpected catalogue install count for one burst: installs=" +
+            std::to_string(installs_delta) +
+            " burst_roots=" + std::to_string(burst_roots.size()) +
             " scheduled_delta=" + std::to_string(scheduled_delta) +
             " completed_delta=" + std::to_string(completed_delta) +
             " events=" + std::to_string(events_delta));
@@ -4983,7 +4981,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             " s1_artwork_objects=" + std::to_string(status1.artwork_objects) +
             " s2_catalogue_generation=" + std::to_string(status2.metadata_generation) +
             " s2_artwork_objects=" + std::to_string(status2.artwork_objects) +
-            " repairs_delta=" + std::to_string(repairs_delta) +
+            " installs_delta=" + std::to_string(installs_delta) +
             " reclaimed_eventually=" + (eventually ? "yes" : "no") +
             " total_ms=" + std::to_string(total_ms));
     }

@@ -187,12 +187,9 @@ class CatalogueManager {
     MetadataView& metadata_;
     // Held across control-store reads and removals in control_gc_step().
     mutable IoMutex mutex_;
-    // Single-flight refresh; guards nothing. Held across metadata reads and
-    // control replica fetches.
-    mutable IoMutex refresh_mutex_;
-    // Brings the catalogue to this node's head; with `converge`, also offers
-    // its control objects to every node present.
-    void refresh(bool converge);
+    // One install at a time; guards nothing. Held across the head read and
+    // the control store reads that load a new root.
+    mutable IoMutex install_mutex_;
     // Serialises read-modify-commit; guards nothing. Held across metadata
     // commits and DATA/CONTROL store writes.
     mutable IoMutex mutation_mutex_;
@@ -201,8 +198,9 @@ class CatalogueManager {
     std::shared_ptr<const CatalogueSnapshot> indexed_ MACHA_GUARDED_BY(mutex_);
     std::shared_ptr<const CatalogueIndexes> indexes_ MACHA_GUARDED_BY(mutex_);
     std::optional<ObjectId> cached_root_ MACHA_GUARDED_BY(mutex_);
+    // The generation of the head the view was installed from.
     uint64_t cached_metadata_generation_ MACHA_GUARDED_BY(mutex_){};
-    Clock::time_point cache_until_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t installs_ MACHA_GUARDED_BY(mutex_){};
     uint64_t last_sync_unix_ms_ MACHA_GUARDED_BY(mutex_){};
     // A successor catalogue's CONTROL objects are staged before metadata
     // references them, so an unreferenced object is reclaimable only once a
@@ -237,9 +235,14 @@ class CatalogueManager {
     // Every DATA object the catalogue references: artwork and media indexes.
     static std::set<ObjectId> data_object_ids(const CatalogueSnapshot&);
     CatalogueSnapshot load_root(const std::optional<ObjectId>&);
-    bool converge_control_replicas(const MetadataSnapshot&);
+    bool converge_control_replicas(const std::optional<ObjectId>& root);
     bool reconcile_catalogue_conflict(const MetadataSnapshotView&);
-    void cache(uint64_t metadata_generation, const MetadataSnapshot&, CatalogueSnapshot);
+    // The one install point: the view becomes the catalogue at this node's
+    // head. Reads the head itself, so a later install never sees an older
+    // one. `known` is that catalogue when the caller already holds it (a
+    // commit), used if `known_root` is still the head's root.
+    void install_head(const CatalogueSnapshot* known = nullptr,
+                      const std::optional<ObjectId>& known_root = {});
     std::shared_ptr<const CatalogueSnapshot> current_snapshot();
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
                 const std::set<ObjectId>& old_artwork,
@@ -252,10 +255,20 @@ class CatalogueManager {
 
     const ClusterKeys& cluster_keys() const noexcept { return node_.keys(); }
 
-    // Brings the catalogue to the head and offers its control objects to every
-    // node present: maintenance's pass.
+    // Installs the catalogue at this node's head: what a head change asks
+    // for.
+    void follow_head();
+    // Maintenance's pass: decides a standing catalogue root conflict, if any
+    // (a commit), installs the head, and offers the installed root's control
+    // objects to every node present.
     void repair_once();
-    bool refresh_needed() const;
+    // Whether the installed root's control objects are yet to be offered to
+    // the nodes present (or nothing is installed); false while a failed
+    // offer waits out its retry.
+    bool convergence_needed() const;
+    // Views installed since start: one per root change, never one for an
+    // unchanged root.
+    uint64_t installs() const;
     CatalogueStatus status() const;
     CatalogueSnapshot snapshot();
     // The current snapshot's indexes; built on the first call after the
