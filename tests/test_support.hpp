@@ -416,6 +416,8 @@ class TestNode {
     std::unique_ptr<BareNode> node_;
     std::unique_ptr<DistributedStore> store_;
     std::function<void(const MetadataPublicationContext&)> publication_guard_;
+    std::function<MetadataPublicationClaims(const MetadataPublicationContext&)> publication_claims_;
+    std::function<void(const NodeId&, uint64_t, const MetadataPublicationClaims&)> peer_retention_;
     std::unique_ptr<MetadataManager> metadata_;
     std::unique_ptr<FileSystem> filesystem_;
     bool started_{};
@@ -460,6 +462,16 @@ class TestNode {
     void set_publication_guard(std::function<void(const MetadataPublicationContext&)> guard) {
         publication_guard_ = std::move(guard);
     }
+    // What each commit's claims name (none unless set), and the peers' share
+    // the replicator makes of them. Set before start.
+    void set_publication_claims(
+        std::function<MetadataPublicationClaims(const MetadataPublicationContext&)> claims) {
+        publication_claims_ = std::move(claims);
+    }
+    void set_peer_retention(
+        std::function<void(const NodeId&, uint64_t, const MetadataPublicationClaims&)> peers) {
+        peer_retention_ = std::move(peers);
+    }
 
     BareNode& wait_ready() {
         REQUIRE(node_);
@@ -470,10 +482,19 @@ class TestNode {
                                                         node_->resources.data,
                                                         node_->resources.memory, node_->resources.events);
             metadata_ = std::make_unique<MetadataManager>(
-                *node_, node_->local_state(), node_->metadata_server(), nullptr, [this](const MetadataPublicationContext& context) {
-                    if (publication_guard_)
-                        publication_guard_(context);
-                });
+                *node_, node_->local_state(), node_->metadata_server(), nullptr,
+                MetadataPublicationRetention{
+                    [this](const MetadataPublicationContext& context) {
+                        if (publication_guard_)
+                            publication_guard_(context);
+                        return publication_claims_ ? publication_claims_(context)
+                                                   : MetadataPublicationClaims{};
+                    },
+                    [this](const NodeId& origin, uint64_t sequence,
+                           const MetadataPublicationClaims& claims) {
+                        if (peer_retention_)
+                            peer_retention_(origin, sequence, claims);
+                    }});
             filesystem_ = std::make_unique<FileSystem>(node_->config(), node_->node_id(), node_->membership(), node_->local_state(), node_->metadata_server(), *store_, *metadata_,
                                                        node_->resources.memory);
         }
