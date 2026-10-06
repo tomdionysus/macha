@@ -31,7 +31,7 @@ class CatalogueApi {
     ItemAvailabilityCache item_availability_;
     // The per-item table for this catalogue snapshot and the last survey.
     std::shared_ptr<const ItemAvailabilityTable>
-    item_availability(const std::shared_ptr<const CatalogueSnapshot>&);
+    item_availability(const std::shared_ptr<const CatalogueView>&);
   public:
     using AvailabilitySource = std::function<std::shared_ptr<const AvailabilitySnapshot>()>;
     CatalogueApi(

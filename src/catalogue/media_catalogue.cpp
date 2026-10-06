@@ -3490,7 +3490,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     const auto media_id = file_media_id(entry);
     auto existing = catalogue_.snapshot_view();
     std::vector<std::string> existing_ids;
-    for (const auto& [id, item] : existing->items) {
+    for (const auto& [id, item] : existing->items()) {
         if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) != item.media_ids.end())
             existing_ids.push_back(id);
     }
@@ -3519,14 +3519,13 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     // needs an online lookup.
     std::optional<CatalogueItem> artwork_target;
     if (!existing_ids.empty()) {
-        for (const auto& [id, item] : existing->items) {
+        for (const auto& [id, item] : existing->items()) {
             if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) == item.media_ids.end())
                 continue;
             if (!probed.artwork.empty()) {
                 if (item.kind == CatalogueKind::track && item.parent_id) {
-                    if (auto parent = existing->items.find(*item.parent_id);
-                        parent != existing->items.end())
-                        artwork_target = parent->second;
+                    if (const auto* parent = existing->item(*item.parent_id))
+                        artwork_target = *parent;
                 } else {
                     artwork_target = item;
                 }
@@ -3656,10 +3655,10 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     }
 
     const auto locked = [&](std::string_view item_id) {
-        auto old = existing->items.find(std::string(item_id));
-        if (old == existing->items.end()) return false;
-        const auto lock = old->second.external_ids.find("macha_metadata_locked");
-        return lock != old->second.external_ids.end() && lock->second == "1";
+        const auto* old = existing->item(item_id);
+        if (!old) return false;
+        const auto lock = old->external_ids.find("macha_metadata_locked");
+        return lock != old->external_ids.end() && lock->second == "1";
     };
     if (!stage_remote_artwork(match, locked, stop, config.max_artwork_bytes, artwork_batch))
         return {};
@@ -3893,7 +3892,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
 
     auto existing = catalogue_.snapshot_view();
     std::set<std::string> bound;
-    for (const auto& [_, item] : existing->items)
+    for (const auto& [_, item] : existing->items())
         bound.insert(item.media_ids.begin(), item.media_ids.end());
 
     std::set<std::string> active_media_ids;
@@ -3924,7 +3923,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
     // in the same snapshot, and only those found nowhere are dropped.
     std::set<std::string> vanished_media;
     if (complete_scan) {
-        for (const auto& [_, item] : existing->items) {
+        for (const auto& [_, item] : existing->items()) {
             auto marker = item.external_ids.find("macha_scanner");
             if (marker != item.external_ids.end() && marker->second == "1") continue;
             for (const auto& media : item.media_ids)

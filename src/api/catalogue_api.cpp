@@ -161,7 +161,7 @@ std::string availability_json(const CatalogueItem& item, const ItemAvailabilityT
            ",\"unknown\":" + std::to_string(entry.unknown) + "}";
 }
 
-std::string item_json(const CatalogueItem& item, const CatalogueSnapshot& snapshot,
+std::string item_json(const CatalogueItem& item, const CatalogueView& snapshot,
                       const ArtworkUrlContext& urls, const ItemAvailabilityTable& availability) {
     std::string out = "{";
     out += "\"id\":" + json_escape(item.id);
@@ -201,7 +201,7 @@ std::string item_json(const CatalogueItem& item, const CatalogueSnapshot& snapsh
 }
 
 // Items [begin, end) of `items`, and the cursor of the page after them.
-std::string items_json(const std::vector<CatalogueItem>& items, const CatalogueSnapshot& snapshot,
+std::string items_json(const std::vector<CatalogueItem>& items, const CatalogueView& snapshot,
                        const ArtworkUrlContext& urls, const ItemAvailabilityTable& availability,
                        size_t begin, size_t end, const std::optional<std::string>& next_cursor) {
     std::string out = "{\"items\":[";
@@ -420,7 +420,7 @@ std::string url_decode(std::string_view value) {
 } // namespace
 
 std::shared_ptr<const ItemAvailabilityTable>
-CatalogueApi::item_availability(const std::shared_ptr<const CatalogueSnapshot>& snapshot) {
+CatalogueApi::item_availability(const std::shared_ptr<const CatalogueView>& snapshot) {
     return item_availability_.table(snapshot, availability_ ? availability_() : nullptr);
 }
 

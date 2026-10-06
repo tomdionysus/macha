@@ -3701,23 +3701,24 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_effective_music_artwork_re
     compilation.year = 2026;
     compilation.artwork = {compilation_art};
     snapshot.items.emplace(compilation.id, compilation);
+    const auto view = CatalogueView::of(snapshot);
 
-    CHECK(effective_catalogue_artwork(snapshot, artist) ==
+    CHECK(effective_catalogue_artwork(view, artist) ==
           std::vector<CatalogueArtwork>{newest_a_art});
-    CHECK(effective_catalogue_artwork(snapshot, track) == std::vector<CatalogueArtwork>{old_art});
-    CHECK(effective_catalogue_artwork(snapshot, explicit_track) ==
+    CHECK(effective_catalogue_artwork(view, track) == std::vector<CatalogueArtwork>{old_art});
+    CHECK(effective_catalogue_artwork(view, explicit_track) ==
           std::vector<CatalogueArtwork>{track_art});
-    CHECK(effective_catalogue_artwork(snapshot, bare_track).empty());
-    CHECK(effective_catalogue_artwork(snapshot, newer_bare).empty());
+    CHECK(effective_catalogue_artwork(view, bare_track).empty());
+    CHECK(effective_catalogue_artwork(view, newer_bare).empty());
 
     CatalogueItem explicit_artist = artist;
     explicit_artist.artwork = {explicit_artist_art};
-    CHECK(effective_catalogue_artwork(snapshot, explicit_artist) ==
+    CHECK(effective_catalogue_artwork(view, explicit_artist) ==
           std::vector<CatalogueArtwork>{explicit_artist_art});
 
     // Compilation artwork does not leak across track-artist relationships: only
     // albums whose release/album artist is this direct catalogue parent qualify.
-    CHECK(effective_catalogue_artwork(snapshot, artist) !=
+    CHECK(effective_catalogue_artwork(view, artist) !=
           std::vector<CatalogueArtwork>{compilation_art});
     CHECK(artist.artwork.empty());
     CHECK(track.artwork.empty());

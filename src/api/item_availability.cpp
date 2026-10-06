@@ -90,12 +90,12 @@ Availability availability_of(const PathAvailability* facts) noexcept {
     return Availability::complete;
 }
 
-ItemAvailabilityTable item_availability(const CatalogueSnapshot& catalogue,
+ItemAvailabilityTable item_availability(const CatalogueView& catalogue,
                                         const AvailabilitySnapshot* survey) {
     ItemAvailabilityTable table;
     // Items with files: the best of their files.
     std::vector<const CatalogueItem*> with_files;
-    for (const auto& [id, item] : catalogue.items) {
+    for (const auto& [id, item] : catalogue.items()) {
         auto& entry = table[id];
         if (item.media_ids.empty())
             continue;
@@ -113,12 +113,12 @@ ItemAvailabilityTable item_availability(const CatalogueSnapshot& catalogue,
     for (const auto* item : with_files) {
         const auto own = table.at(item->id).status;
         const CatalogueItem* at = item;
-        for (size_t depth = 0; at->parent_id && depth < catalogue.items.size(); ++depth) {
-            const auto parent = catalogue.items.find(*at->parent_id);
-            if (parent == catalogue.items.end())
+        for (size_t depth = 0; at->parent_id && depth < catalogue.item_count(); ++depth) {
+            const auto* parent = catalogue.item(*at->parent_id);
+            if (!parent)
                 break;
-            count(table[parent->first], own);
-            at = &parent->second;
+            count(table[parent->id], own);
+            at = parent;
         }
     }
     for (auto& [id, entry] : table)
@@ -128,7 +128,7 @@ ItemAvailabilityTable item_availability(const CatalogueSnapshot& catalogue,
 }
 
 std::shared_ptr<const ItemAvailabilityTable>
-ItemAvailabilityCache::table(const std::shared_ptr<const CatalogueSnapshot>& catalogue,
+ItemAvailabilityCache::table(const std::shared_ptr<const CatalogueView>& catalogue,
                              const std::shared_ptr<const AvailabilitySnapshot>& survey) {
     Lock lock(mutex_);
     if (!table_ || catalogue_ != catalogue || survey_ != survey) {
