@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.18.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.19.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `COMPLETED.md` (finished work),
@@ -17,11 +17,6 @@ which has their full text, and have not been re-checked since.
   in the window. The catalogue lock's waits are logged at level ALL
   (`DIAG lock-held lock=catalogue.mutation`): run node-c at ALL while an
   album is matched to see what it waits on.
-- MusicBrainz answering 503 shuts the node's MusicBrainz gate for 60 s, so
-  one rate-limit answer refuses every search for a minute. Proposed: wait for
-  `Retry-After` (or a few seconds) and retry an interactive request once; back
-  off only background matching; `provider_unavailable` with `retry_after_ms`.
-  Discogs has the same gate.
 - Provider caches are per editor seat and lost on restart: the first track of
   each album after a restart pays the lookup and the cover again.
 
@@ -144,7 +139,7 @@ From the local-first work
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.18**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.19**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -154,7 +149,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.18` back to
+  in place before that version was installed (`pre-0.90.19` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - node-f's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
