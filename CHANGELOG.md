@@ -1,5 +1,24 @@
 # Current release
 
+## 0.90.26: the catalogue view never steps backwards
+
+No API route, wire, protocol or on-disk changes. The English message of a
+revision conflict changes; its code does not.
+
+**A write could be refused straight after a successful one.** A node's
+catalogue view is installed by two paths: a mutation caches what it
+committed, and a background refresh caches what it read. A refresh that read
+its view before a commit and cached it after put the older catalogue back,
+so the next write with the revision just returned was refused as
+`catalogue item revision changed` (409). The view now never installs an
+older metadata generation than the one it holds.
+
+**Revision conflicts name the item and both revisions:**
+`catalogue item revision changed: <id> expected N, now M`.
+
+The plan that replaces the two install paths with one is
+`TODO/2026-10-06-catalogue-materialised-view.md`.
+
 ## 0.90.25: Clear Metadata puts files in the unmatched list (experiment)
 
 API behaviour change; the route, request and answer are unchanged. No wire,
