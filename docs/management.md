@@ -4,7 +4,7 @@
 
 ## Unmatched media
 
-`GET /api/v1/manage/unmatched` returns only terminal semantic `no_match` records that still resolve to the same immutable `macha:` media identity. Deferred provider outages, queued work, active matching, files outside configured catalogue roots, and stale paths are not presented as files requiring manual matching. The response is `{count, items, conflicts}`; each item's `result` is the code the scanner recorded (for example `no_provider_match`, `no_media_candidate` or `media_not_live`), not a sentence. `conflicts` lists every file bound to more than one movie, episode or track, as `{media_id, item_ids}`, except a multi-episode file bound to several episodes of one season.
+`GET /api/v1/manage/unmatched` returns only terminal semantic `no_match` records that still resolve to the same immutable `macha:` media identity. Deferred provider outages, queued work, active matching, files outside configured catalogue roots, and stale paths are not presented as files requiring manual matching. The response is `{count, items, conflicts, next_cursor}`, paged as every list is ([API conventions](api.md#lists)), with `count` the whole list; each item's `result` is the code the scanner recorded (for example `no_provider_match`, `no_media_candidate` or `media_not_live`), not a sentence. `conflicts` lists every file bound to more than one movie, episode or track, as `{media_id, item_ids}`, except a multi-episode file bound to several episodes of one season.
 
 For one unmatched record:
 

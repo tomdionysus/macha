@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "api/manage_api.hpp"
+#include "api/paging.hpp"
 
 #include "crypto.hpp"
 #include "json.hpp"
@@ -890,6 +891,8 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
         }
 
         if (request.method == "GET" && request.path == "/api/v1/manage/unmatched") {
+            PageQuery page;
+            if (auto bad = read_page_query(request, page)) return *bad;
             Json::Array items;
             for (const auto& hint : hints_.list()) {
                 if (hint.state != CatalogueHintState::no_match || hint.media_id.empty()) continue;
@@ -923,6 +926,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             }
             Json::Object out;
             out["count"] = static_cast<uint64_t>(items.size());
+            page_json(items, "id", page, out);
             out["items"] = std::move(items);
             out["conflicts"] = std::move(conflicts);
             return http_json(200, Json(std::move(out)).dump());
@@ -1173,6 +1177,8 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
         }
 
         if (request.method == "GET" && request.path == "/api/v1/manage/filesystem") {
+            PageQuery page;
+            if (auto bad = read_page_query(request, page)) return *bad;
             const auto path = normalize_path(request.query.contains("path") ? request.query.at("path") : "/");
             auto directory = fs_.getattr(path);
             if (directory.type != EntryType::directory)
@@ -1191,15 +1197,10 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             Json::Array entries;
             for (const auto& [name, entry] : fs_.readdir(path))
                 entries.push_back(fs_entry_json(entry_path(path, name), name, entry, bindings));
-            std::sort(entries.begin(), entries.end(), [](const Json& a, const Json& b) {
-                const auto ta = a.find("type")->asString();
-                const auto tb = b.find("type")->asString();
-                if (ta != tb) return ta == "directory";
-                return a.find("name")->asString() < b.find("name")->asString();
-            });
             Json::Object out;
             out["path"] = path;
             out["parent"] = path == "/" ? Json(nullptr) : Json(parent_path(path));
+            page_json(entries, "name", page, out);
             out["entries"] = std::move(entries);
             return http_json(200, Json(std::move(out)).dump());
         }
