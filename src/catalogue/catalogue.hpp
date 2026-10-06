@@ -279,6 +279,11 @@ class CatalogueUnavailable : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A write's copy of the installed catalogue: reads fall through to the view,
+// and a shard is copied only when the write first changes it. Defined in
+// catalogue.cpp; only the manager makes one.
+class CatalogueDraft;
+
 class CatalogueManager {
     NodeRuntime& node_;
     LocalState& local_;
@@ -356,6 +361,24 @@ class CatalogueManager {
     std::shared_ptr<const CatalogueView> staged_ MACHA_GUARDED_BY(mutex_);
     std::optional<ObjectId> staged_root_ MACHA_GUARDED_BY(mutex_);
     std::shared_ptr<const CatalogueView> current_snapshot();
+    // The installed root and view, read together, and a draft over that view.
+    std::pair<std::optional<ObjectId>, std::shared_ptr<const CatalogueView>> installed() const;
+    // A write's successor: its shards, the slots it touched, the DATA objects
+    // it newly references and those nothing in it references any more.
+    struct PreparedCommit {
+        CatalogueView::Shards shards;
+        std::array<bool, catalogue_shard_count> touched{};
+        std::set<ObjectId> added;
+        std::set<ObjectId> released;
+    };
+    static PreparedCommit prepare(CatalogueDraft&& draft);
+    PreparedCommit prepare(const std::optional<ObjectId>& expected_root,
+                           const CatalogueSnapshot& next, const std::set<ObjectId>& old_artwork);
+    void publish(const std::optional<ObjectId>& expected_root, PreparedCommit&& prepared,
+                 std::optional<Hash256> expected_namespace,
+                 std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict);
+    void commit(const std::optional<ObjectId>& expected_root, CatalogueDraft&& draft,
+                std::optional<Hash256> expected_namespace = std::nullopt);
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
                 const std::set<ObjectId>& old_artwork,
                 std::optional<Hash256> expected_namespace = std::nullopt,

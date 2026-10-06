@@ -455,4 +455,63 @@ MACHA_TEST("catalogue_maintenance", test_a_load_reuses_every_shard_the_new_root_
     CHECK(after->item("movie:42")->title == "Edited");
 }
 
+MACHA_TEST("catalogue_maintenance", test_a_write_shares_every_shard_it_did_not_touch) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    std::vector<CatalogueItem> batch;
+    for (int i = 0; i < 300; ++i)
+        batch.push_back(movie("movie:" + std::to_string(i), "Title"));
+    (void)catalogue.upsert_many(batch);
+    const auto before = catalogue.snapshot_view();
+    auto item = *catalogue.get("movie:7");
+    item.title = "Edited";
+    (void)catalogue.upsert(item, item.revision);
+    const auto after = catalogue.snapshot_view();
+    const auto edited = catalogue_shard("movie:7");
+    for (size_t slot = 0; slot < catalogue_shard_count; ++slot) {
+        if (slot == edited)
+            CHECK(after->shards()[slot] != before->shards()[slot]);
+        else
+            CHECK(after->shards()[slot] == before->shards()[slot]);
+    }
+    CHECK(after->item("movie:7")->title == "Edited");
+}
+
+MACHA_TEST("catalogue_maintenance", test_data_is_released_only_when_nothing_refers_to_it) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    const auto released = [&](const ObjectId& id) {
+        const auto& garbage = metadata.view->snapshot->garbage;
+        return std::any_of(garbage.begin(), garbage.end(),
+                           [&](const GarbageRef& entry) { return entry.id == id; });
+    };
+    // Two items in different shards sharing one poster.
+    std::string a = "movie:a", b = "movie:b";
+    for (int i = 0; catalogue_shard(a) == catalogue_shard(b); ++i)
+        b = "movie:b" + std::to_string(i);
+    const auto poster = catalogue.stage_artwork("poster", "image/jpeg", test_support::pattern(4096, 5));
+    auto first = movie(a, "A");
+    first.artwork = {poster};
+    auto second = movie(b, "B");
+    second.artwork = {poster};
+    (void)catalogue.upsert_many({first, second});
+    CHECK(!released(poster.id));
+    // Still referred to from the other shard.
+    CHECK(catalogue.erase(a));
+    CHECK(!released(poster.id));
+    CHECK(catalogue.erase(b));
+    CHECK(released(poster.id));
+
+    // A media index pruned with its media is released as well.
+    const auto index = test_support::pattern(1024, 6);
+    catalogue.put_media_index("macha:gone", index);
+    CHECK(!released(object_id(index)));
+    (void)catalogue.prune_media_profiles({});
+    CHECK(released(object_id(index)));
+}
+
 } // namespace

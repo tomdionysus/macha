@@ -265,8 +265,13 @@ suite green; no stage waits on a later one.
    its commit with nothing decoded; fi-1 installed it 3 s later decoding
    one shard of 64 (72 KB, under 1 ms), where a full load was 53 ms there
    and 316 ms on gbni-1; convergence sent nothing on either node.
-5. **Mutations over the view**: copy touched shards, install the successor
-   directly, retry once on a moved root.
+5. **Done, 0.90.33.** **Mutations over the view**: every write edits a
+   `CatalogueDraft` (copy-on-write per shard over the installed view) and
+   commits the copied shards; released DATA is computed from the touched
+   shards and checked against the untouched ones. The whole-catalogue copy
+   is left only in `snapshot()` and conflict reconciliation. Retrying on a
+   moved root was not needed: a mutation installs the head first under the
+   mutation lock, as before.
 6. **The conflict merge per shard.**
 7. **Derived indexes** for list, search and the descendant scan.
 8. **The manifest change**: per-family shard vectors with a growable

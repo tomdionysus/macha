@@ -382,6 +382,125 @@ CatalogueSnapshot CatalogueView::merged() const {
     return out;
 }
 
+class CatalogueDraft {
+  public:
+    explicit CatalogueDraft(std::shared_ptr<const CatalogueView> base) : base_(std::move(base)) {}
+    CatalogueDraft(CatalogueDraft&&) = default;
+    CatalogueDraft& operator=(CatalogueDraft&&) = default;
+
+    const std::shared_ptr<const CatalogueView>& base() const noexcept { return base_; }
+
+    const CatalogueItem* item(std::string_view id) const {
+        const auto* shard = read(catalogue_shard(id));
+        if (!shard)
+            return nullptr;
+        const auto found = shard->items.find(std::string(id));
+        return found == shard->items.end() ? nullptr : &found->second;
+    }
+    // The item, in this draft's own copy of its shard; none if absent.
+    CatalogueItem* edit_item(std::string_view id) {
+        if (!item(id))
+            return nullptr;
+        return &write(catalogue_shard(id)).items.at(std::string(id));
+    }
+    void put(CatalogueItem item) {
+        auto& shard = write(catalogue_shard(item.id));
+        auto key = item.id;
+        shard.items.insert_or_assign(std::move(key), std::move(item));
+    }
+    bool erase(std::string_view id) {
+        if (!item(id))
+            return false;
+        write(catalogue_shard(id)).items.erase(std::string(id));
+        return true;
+    }
+
+    const CatalogueSnapshot::MediaProfile* media_profile(std::string_view media_id) const {
+        const auto* shard = read(catalogue_shard(media_id));
+        if (!shard)
+            return nullptr;
+        const auto found = shard->media_profiles.find(media_id);
+        return found == shard->media_profiles.end() ? nullptr : &found->second;
+    }
+    void put_media_profile(std::string media_id, CatalogueSnapshot::MediaProfile profile) {
+        auto& shard = write(catalogue_shard(media_id));
+        shard.media_profiles.insert_or_assign(std::move(media_id), std::move(profile));
+    }
+    bool erase_media_profile(std::string_view media_id) {
+        if (!media_profile(media_id))
+            return false;
+        auto& profiles = write(catalogue_shard(media_id)).media_profiles;
+        profiles.erase(profiles.find(media_id));
+        return true;
+    }
+
+    const ObjectId* media_index(std::string_view media_id) const {
+        const auto* shard = read(catalogue_shard(media_id));
+        if (!shard)
+            return nullptr;
+        const auto found = shard->media_indexes.find(media_id);
+        return found == shard->media_indexes.end() ? nullptr : &found->second;
+    }
+    void put_media_index(std::string media_id, ObjectId index) {
+        auto& shard = write(catalogue_shard(media_id));
+        shard.media_indexes.insert_or_assign(std::move(media_id), index);
+    }
+    bool erase_media_index(std::string_view media_id) {
+        if (!media_index(media_id))
+            return false;
+        auto& indexes = write(catalogue_shard(media_id)).media_indexes;
+        indexes.erase(indexes.find(media_id));
+        return true;
+    }
+
+    // Every entry as the draft now has it, shard by shard. The callback may
+    // not change the draft; collect, then change.
+    template <class F> void for_each_item(F&& f) const {
+        for (size_t slot = 0; slot < catalogue_shard_count; ++slot)
+            if (const auto* shard = read(slot))
+                for (const auto& [id, item] : shard->items)
+                    f(id, item);
+    }
+    template <class F> void for_each_media_profile(F&& f) const {
+        for (size_t slot = 0; slot < catalogue_shard_count; ++slot)
+            if (const auto* shard = read(slot))
+                for (const auto& [id, profile] : shard->media_profiles)
+                    f(id, profile);
+    }
+    template <class F> void for_each_media_index(F&& f) const {
+        for (size_t slot = 0; slot < catalogue_shard_count; ++slot)
+            if (const auto* shard = read(slot))
+                for (const auto& [id, index] : shard->media_indexes)
+                    f(id, index);
+    }
+
+    bool written(size_t slot) const noexcept { return written_[slot].has_value(); }
+    // The written shard, none if the write left it empty.
+    std::shared_ptr<const CatalogueSnapshot> take(size_t slot) {
+        auto& shard = *written_[slot];
+        if (shard.items.empty() && shard.media_profiles.empty() && shard.media_indexes.empty())
+            return nullptr;
+        return std::make_shared<const CatalogueSnapshot>(std::move(shard));
+    }
+
+  private:
+    const CatalogueSnapshot* read(size_t slot) const {
+        if (written_[slot])
+            return &*written_[slot];
+        return base_ ? base_->shards()[slot].get() : nullptr;
+    }
+    CatalogueSnapshot& write(size_t slot) {
+        if (!written_[slot]) {
+            const auto* base = base_ ? base_->shards()[slot].get() : nullptr;
+            written_[slot] = base ? *base : CatalogueSnapshot{};
+        }
+        return *written_[slot];
+    }
+
+    std::shared_ptr<const CatalogueView> base_;
+    std::array<std::optional<CatalogueSnapshot>, catalogue_shard_count> written_;
+};
+
 bool valid_catalogue_media_profile(
     std::string_view media_id, const CatalogueSnapshot::MediaProfile& profile) {
     if (!media_id.starts_with("macha:") || profile.schema_version < 1 ||
@@ -1220,18 +1339,12 @@ void CatalogueManager::put_media_profile(std::string media_id, MediaProbeResult 
         throw std::invalid_argument("invalid immutable media profile");
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = current_snapshot()->merged();
-    if (auto it = current.media_profiles.find(media_id);
-        it != current.media_profiles.end() && it->second == profile)
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
+    if (const auto* found = current.media_profile(media_id); found && *found == profile)
         return;
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
-    auto old_art = data_object_ids(current);
-    current.media_profiles[std::move(media_id)] = std::move(profile);
-    commit(expected_root, current, old_art);
+    current.put_media_profile(std::move(media_id), std::move(profile));
+    commit(expected_root, std::move(current));
 }
 
 void CatalogueManager::put_media_profiles(
@@ -1239,23 +1352,19 @@ void CatalogueManager::put_media_profiles(
     if (profiles.empty()) return;
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = current_snapshot()->merged();
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
     bool changed = false;
     for (auto& [media_id, probe] : profiles) {
         CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, std::move(probe)};
         if (!valid_catalogue_media_profile(media_id, profile)) continue;
-        auto it = current.media_profiles.find(media_id);
-        if (it != current.media_profiles.end() && it->second == profile) continue;
-        current.media_profiles[media_id] = std::move(profile);
+        if (const auto* found = current.media_profile(media_id); found && *found == profile)
+            continue;
+        current.put_media_profile(media_id, std::move(profile));
         changed = true;
     }
     if (!changed) return;
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
-    commit(expected_root, current, data_object_ids(current));
+    commit(expected_root, std::move(current));
 }
 
 std::optional<Bytes> CatalogueManager::media_index(std::string_view media_id) {
@@ -1273,48 +1382,43 @@ void CatalogueManager::put_media_index(std::string media_id, std::span<const uin
         throw CatalogueUnavailable("cannot store media index in distributed DATA storage");
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = current_snapshot()->merged();
-    if (auto it = current.media_indexes.find(media_id);
-        it != current.media_indexes.end() && it->second == id)
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
+    if (const auto* found = current.media_index(media_id); found && *found == id)
         return;
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
-    auto old_data = data_object_ids(current);
-    current.media_indexes[std::move(media_id)] = id;
-    commit(expected_root, current, old_data);
+    current.put_media_index(std::move(media_id), id);
+    commit(expected_root, std::move(current));
 }
 
 size_t CatalogueManager::prune_media_profiles(
     const std::set<std::string>& live_media_ids) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = current_snapshot()->merged();
-    const auto before = current.media_profiles.size();
-    std::erase_if(current.media_profiles, [&](const auto& item) {
-        return !live_media_ids.contains(item.first);
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
+    std::vector<std::string> profiles;
+    std::vector<std::string> indexes;
+    current.for_each_media_profile([&](const std::string& media_id, const auto&) {
+        if (!live_media_ids.contains(media_id))
+            profiles.push_back(media_id);
     });
-    const auto removed = before - current.media_profiles.size();
-    const auto indexes_before = current.media_indexes.size();
-    std::erase_if(current.media_indexes, [&](const auto& item) {
-        return !live_media_ids.contains(item.first);
+    current.for_each_media_index([&](const std::string& media_id, const auto&) {
+        if (!live_media_ids.contains(media_id))
+            indexes.push_back(media_id);
     });
-    if (!removed && indexes_before == current.media_indexes.size()) return 0;
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
-    commit(expected_root, current, data_object_ids(current));
+    if (profiles.empty() && indexes.empty()) return 0;
+    for (const auto& media_id : profiles)
+        current.erase_media_profile(media_id);
+    for (const auto& media_id : indexes)
+        current.erase_media_index(media_id);
+    commit(expected_root, std::move(current));
     {
         Lock lock(media_profile_mutex_);
         std::erase_if(resolved_media_profiles_, [&](const auto& item) {
             return !live_media_ids.contains(item.first);
         });
     }
-    return removed;
+    return profiles.size();
 }
 
 std::vector<CatalogueItem> CatalogueManager::list(std::optional<CatalogueKind> kind,
@@ -1359,9 +1463,133 @@ std::vector<CatalogueItem> CatalogueManager::search(
     return out;
 }
 
+std::pair<std::optional<ObjectId>, std::shared_ptr<const CatalogueView>>
+CatalogueManager::installed() const {
+    Lock lock(mutex_);
+    return {cached_root_, cached_};
+}
+
+CatalogueManager::PreparedCommit CatalogueManager::prepare(CatalogueDraft&& draft) {
+    PreparedCommit out;
+    const auto& base = draft.base();
+    std::set<ObjectId> before;
+    std::set<ObjectId> after;
+    for (size_t slot = 0; slot < catalogue_shard_count; ++slot) {
+        const auto& was = base ? base->shards()[slot] : nullptr;
+        if (!draft.written(slot)) {
+            out.shards[slot] = was;
+            continue;
+        }
+        out.touched[slot] = true;
+        if (was) {
+            const auto ids = data_object_ids(*was);
+            before.insert(ids.begin(), ids.end());
+        }
+        out.shards[slot] = draft.take(slot);
+        if (out.shards[slot]) {
+            const auto ids = data_object_ids(*out.shards[slot]);
+            after.insert(ids.begin(), ids.end());
+        }
+    }
+    std::set_difference(after.begin(), after.end(), before.begin(), before.end(),
+                        std::inserter(out.added, out.added.end()));
+    std::set_difference(before.begin(), before.end(), after.begin(), after.end(),
+                        std::inserter(out.released, out.released.end()));
+    // An object a touched shard let go of is released only if no untouched
+    // shard still refers to it.
+    if (!out.released.empty())
+        for (size_t slot = 0; slot < catalogue_shard_count && !out.released.empty(); ++slot)
+            if (!out.touched[slot] && out.shards[slot])
+                for (const auto& id : data_object_ids(*out.shards[slot]))
+                    out.released.erase(id);
+    return out;
+}
+
+CatalogueManager::PreparedCommit CatalogueManager::prepare(const std::optional<ObjectId>& expected_root,
+                                                           const CatalogueSnapshot& next,
+                                                           const std::set<ObjectId>& old_artwork) {
+    PreparedCommit out;
+    const auto new_artwork = data_object_ids(next);
+    std::set_difference(new_artwork.begin(), new_artwork.end(), old_artwork.begin(),
+                        old_artwork.end(), std::inserter(out.added, out.added.end()));
+    std::set_difference(old_artwork.begin(), old_artwork.end(), new_artwork.begin(),
+                        new_artwork.end(), std::inserter(out.released, out.released.end()));
+
+    // Which shards this write touches: those holding a key at which `next`
+    // differs from the catalogue it started from. The rest keep the view's
+    // shard and are neither built nor encoded. Without the catalogue at the
+    // expected root to compare against, every shard is.
+    out.touched.fill(true);
+    std::shared_ptr<const CatalogueView> started_from;
+    {
+        Lock lock(mutex_);
+        if (ready_ && cached_ && expected_root && cached_root_ == expected_root)
+            started_from = cached_;
+    }
+    if (!started_from) {
+        out.shards = CatalogueView::of(next).shards();
+        return out;
+    }
+    out.touched.fill(false);
+    std::array<const std::map<std::string, CatalogueItem>*, catalogue_shard_count> items{};
+    std::array<const std::map<std::string, CatalogueSnapshot::MediaProfile, std::less<>>*,
+               catalogue_shard_count>
+        profiles{};
+    std::array<const std::map<std::string, ObjectId, std::less<>>*, catalogue_shard_count>
+        indexes{};
+    for (size_t i = 0; i < catalogue_shard_count; ++i)
+        if (const auto& shard = started_from->shards()[i]) {
+            items[i] = &shard->items;
+            profiles[i] = &shard->media_profiles;
+            indexes[i] = &shard->media_indexes;
+        }
+    std::array<std::vector<decltype(next.items)::const_iterator>, catalogue_shard_count>
+        added_items;
+    std::array<std::vector<decltype(next.media_profiles)::const_iterator>, catalogue_shard_count>
+        added_profiles;
+    std::array<std::vector<decltype(next.media_indexes)::const_iterator>, catalogue_shard_count>
+        added_indexes;
+    diff_slots(items, next.items, out.touched, added_items);
+    diff_slots(profiles, next.media_profiles, out.touched, added_profiles);
+    diff_slots(indexes, next.media_indexes, out.touched, added_indexes);
+    for (size_t i = 0; i < catalogue_shard_count; ++i) {
+        if (!out.touched[i]) {
+            out.shards[i] = started_from->shards()[i];
+            continue;
+        }
+        CatalogueSnapshot shard;
+        shard.items = rebuild_slot(items[i], next.items, added_items[i]);
+        shard.media_profiles = rebuild_slot(profiles[i], next.media_profiles, added_profiles[i]);
+        shard.media_indexes = rebuild_slot(indexes[i], next.media_indexes, added_indexes[i]);
+        if (!shard.items.empty() || !shard.media_profiles.empty() || !shard.media_indexes.empty())
+            out.shards[i] = std::make_shared<const CatalogueSnapshot>(std::move(shard));
+    }
+    return out;
+}
+
+void CatalogueManager::commit(const std::optional<ObjectId>& expected_root, CatalogueDraft&& draft,
+                              std::optional<Hash256> expected_namespace) {
+    const auto started = Clock::now();
+    auto prepared = prepare(std::move(draft));
+    const auto prepare_ms = ms_since(started);
+    const auto touched = std::count(prepared.touched.begin(), prepared.touched.end(), true);
+    publish(expected_root, std::move(prepared), expected_namespace, std::nullopt);
+    Log::debug("catalogue commit touched=" + std::to_string(touched) +
+               " prepare_ms=" + std::to_string(prepare_ms) +
+               " publish_ms=" + std::to_string(ms_since(started) - prepare_ms));
+}
+
 void CatalogueManager::commit(
     const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
     const std::set<ObjectId>& old_artwork, std::optional<Hash256> expected_namespace,
+    std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict) {
+    publish(expected_root, prepare(expected_root, next, old_artwork), expected_namespace,
+            std::move(resolved_conflict));
+}
+
+void CatalogueManager::publish(
+    const std::optional<ObjectId>& expected_root, PreparedCommit&& prepared,
+    std::optional<Hash256> expected_namespace,
     std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict) {
     // This node's own head: a catalogue write asks no peer what the head is.
     std::optional<MetadataSnapshotView> head;
@@ -1377,12 +1605,9 @@ void CatalogueManager::commit(
         metadata_namespace_signature(metadata_snapshot) != *expected_namespace)
         throw CatalogueConflict("namespace changed during catalogue reconciliation");
 
-    const auto new_artwork = data_object_ids(next);
-
     // Artwork is ordinary immutable DATA. Only new references are validated;
     // unchanged ones were proven by the committed catalogue.
-    for (const auto& id : new_artwork) {
-        if (old_artwork.contains(id)) continue;
+    for (const auto& id : prepared.added) {
         // Held here is enough; only one that is not is fetched to prove it
         // exists somewhere.
         if (local_.data().has(id)) continue;
@@ -1400,80 +1625,24 @@ void CatalogueManager::commit(
         old_manifest = decode_catalogue_manifest(*encoded);
     }
 
-    // Which shards this write touches: those holding a key at which `next`
-    // differs from the catalogue it started from. The rest keep the object
-    // the old manifest names and are neither built nor encoded. Without the
-    // catalogue at the expected root to compare against, every shard is.
-    std::array<bool, catalogue_shard_count> touched;
-    touched.fill(true);
-    std::shared_ptr<const CatalogueView> started_from;
-    {
-        Lock lock(mutex_);
-        if (ready_ && cached_ && expected_root && cached_root_ == expected_root)
-            started_from = cached_;
-    }
-    // The successor's shards: an untouched slot keeps the view's shard, a
-    // touched one is rebuilt from it and `next`.
-    CatalogueView::Shards shards;
-    if (started_from) {
-        touched.fill(false);
-        std::array<const std::map<std::string, CatalogueItem>*, catalogue_shard_count> items{};
-        std::array<const std::map<std::string, CatalogueSnapshot::MediaProfile, std::less<>>*,
-                   catalogue_shard_count>
-            profiles{};
-        std::array<const std::map<std::string, ObjectId, std::less<>>*, catalogue_shard_count>
-            indexes{};
-        for (size_t i = 0; i < catalogue_shard_count; ++i)
-            if (const auto& shard = started_from->shards()[i]) {
-                items[i] = &shard->items;
-                profiles[i] = &shard->media_profiles;
-                indexes[i] = &shard->media_indexes;
-            }
-        std::array<std::vector<decltype(next.items)::const_iterator>, catalogue_shard_count>
-            added_items;
-        std::array<std::vector<decltype(next.media_profiles)::const_iterator>,
-                   catalogue_shard_count>
-            added_profiles;
-        std::array<std::vector<decltype(next.media_indexes)::const_iterator>,
-                   catalogue_shard_count>
-            added_indexes;
-        diff_slots(items, next.items, touched, added_items);
-        diff_slots(profiles, next.media_profiles, touched, added_profiles);
-        diff_slots(indexes, next.media_indexes, touched, added_indexes);
-        for (size_t i = 0; i < catalogue_shard_count; ++i) {
-            if (!touched[i]) {
-                shards[i] = started_from->shards()[i];
-                continue;
-            }
-            CatalogueSnapshot shard;
-            shard.items = rebuild_slot(items[i], next.items, added_items[i]);
-            shard.media_profiles = rebuild_slot(profiles[i], next.media_profiles, added_profiles[i]);
-            shard.media_indexes = rebuild_slot(indexes[i], next.media_indexes, added_indexes[i]);
-            if (!shard.items.empty() || !shard.media_profiles.empty() ||
-                !shard.media_indexes.empty())
-                shards[i] = std::make_shared<const CatalogueSnapshot>(std::move(shard));
-        }
-    } else {
-        shards = CatalogueView::of(next).shards();
-    }
-
     CatalogueManifest manifest;
     std::vector<std::pair<ObjectId, Bytes>> changed_control;
     changed_control.reserve(catalogue_shard_count + 1);
     for (size_t i = 0; i < catalogue_shard_count; ++i) {
-        if (!touched[i]) {
+        if (!prepared.touched[i]) {
             manifest.shards[i] = old_manifest.shards[i];
             continue;
         }
-        if (!shards[i])
+        if (!prepared.shards[i])
             continue;
-        auto encoded = encode_catalogue(*shards[i]);
+        auto encoded = encode_catalogue(*prepared.shards[i]);
         const auto id = object_id(encoded);
         manifest.shards[i] = id;
         if (old_manifest.shards[i] != id)
             changed_control.push_back({id, std::move(encoded)});
     }
-    auto staged = std::make_shared<const CatalogueView>(std::move(shards), manifest.shards);
+    auto staged =
+        std::make_shared<const CatalogueView>(std::move(prepared.shards), manifest.shards);
 
     auto encoded_manifest = encode_catalogue_manifest(manifest);
     const auto root = object_id(encoded_manifest);
@@ -1511,6 +1680,7 @@ void CatalogueManager::commit(
     if (!local_.control().put(root, encoded_manifest))
         throw CatalogueUnavailable("catalogue manifest could not be stored");
 
+    const auto& released = prepared.released;
     try {
         if (resolved_conflict) {
             // mutate_delta: a tree-backed namespace has no entry map to diff,
@@ -1530,9 +1700,8 @@ void CatalogueManager::commit(
                 delta.catalogue_root = root;
                 // The delta carries the conflict set; a replay infers nothing.
                 delta.replace_conflicts = metadata.conflicts;
-                for (const auto& id : old_artwork)
-                    if (!new_artwork.contains(id))
-                        record_garbage_upsert(delta, append_garbage(metadata, id));
+                for (const auto& id : released)
+                    record_garbage_upsert(delta, append_garbage(metadata, id));
             });
         } else {
             metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
@@ -1544,10 +1713,8 @@ void CatalogueManager::commit(
                 metadata.catalogue_root = root;
                 delta.catalogue = CatalogueDelta::set;
                 delta.catalogue_root = root;
-                for (const auto& id : old_artwork) {
-                    if (!new_artwork.contains(id))
-                        record_garbage_upsert(delta, append_garbage(metadata, id));
-                }
+                for (const auto& id : released)
+                    record_garbage_upsert(delta, append_garbage(metadata, id));
             });
         }
     } catch (const CatalogueConflict&) {
@@ -1568,30 +1735,24 @@ void CatalogueManager::commit(
 
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,
                                         std::optional<uint64_t> expected_revision) {
-    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    install_head();
-    auto current = current_snapshot()->merged();
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
-    auto old_art = data_object_ids(current);
-    auto it = current.items.find(item.id);
     if (item.id.empty())
         throw std::runtime_error("catalogue item id is required");
-    if (it != current.items.end()) {
-        if (expected_revision && it->second.revision != *expected_revision)
-            revision_changed(item.id, *expected_revision, it->second.revision);
-        item.revision = it->second.revision + 1;
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    install_head();
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
+    if (const auto* existing = current.item(item.id)) {
+        if (expected_revision && existing->revision != *expected_revision)
+            revision_changed(item.id, *expected_revision, existing->revision);
+        item.revision = existing->revision + 1;
     } else {
         if (expected_revision)
             throw CatalogueConflict("catalogue item does not exist");
         item.revision = 1;
     }
     item.updated_ns = wall_time_ns();
-    current.items[item.id] = item;
-    commit(expected_root, current, old_art);
+    current.put(item);
+    commit(expected_root, std::move(current));
     return item;
 }
 
@@ -1599,43 +1760,33 @@ std::vector<CatalogueItem> CatalogueManager::upsert_many(std::vector<CatalogueIt
     if (items.empty()) return {};
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = current_snapshot()->merged();
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
-    auto old_art = data_object_ids(current);
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
     const auto updated_ns = wall_time_ns();
     for (auto& item : items) {
         if (item.id.empty())
             throw std::runtime_error("catalogue item id is required");
-        auto it = current.items.find(item.id);
-        item.revision = it == current.items.end() ? 1 : it->second.revision + 1;
+        const auto* existing = current.item(item.id);
+        item.revision = existing ? existing->revision + 1 : 1;
         item.updated_ns = updated_ns;
-        current.items[item.id] = item;
+        current.put(item);
     }
-    commit(expected_root, current, old_art);
+    commit(expected_root, std::move(current));
     return items;
 }
 
 bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = current_snapshot()->merged();
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
-    auto it = current.items.find(std::string(id));
-    if (it == current.items.end())
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
+    const auto* existing = current.item(id);
+    if (!existing)
         return false;
-    if (expected_revision && it->second.revision != *expected_revision)
-        revision_changed(it->first, *expected_revision, it->second.revision);
-    auto old_art = data_object_ids(current);
-    current.items.erase(it);
-    commit(expected_root, current, old_art);
+    if (expected_revision && existing->revision != *expected_revision)
+        revision_changed(existing->id, *expected_revision, existing->revision);
+    current.erase(id);
+    commit(expected_root, std::move(current));
     return true;
 }
 
@@ -1672,46 +1823,39 @@ CatalogueClearResult CatalogueManager::clear_metadata_with_media(
     std::string_view id, std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = current_snapshot()->merged();
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
 
-    auto root = current.items.find(std::string(id));
-    if (root == current.items.end())
+    const auto* root = current.item(id);
+    if (!root)
         return {};
-    if (expected_revision && root->second.revision != *expected_revision)
-        revision_changed(root->first, *expected_revision, root->second.revision);
+    if (expected_revision && root->revision != *expected_revision)
+        revision_changed(root->id, *expected_revision, root->revision);
 
     // Removes the entity and its descendants, returning their media ids so the
     // caller can re-enrich only those files.
-    std::set<std::string> removed_ids{root->first};
+    std::set<std::string> removed_ids{root->id};
     bool grew = true;
     while (grew) {
         grew = false;
-        for (const auto& [candidate_id, candidate] : current.items) {
+        current.for_each_item([&](const std::string& candidate_id, const CatalogueItem& candidate) {
             if (removed_ids.contains(candidate_id) || !candidate.parent_id)
-                continue;
+                return;
             if (removed_ids.contains(*candidate.parent_id)) {
                 removed_ids.insert(candidate_id);
                 grew = true;
             }
-        }
+        });
     }
 
     std::set<std::string> media_ids;
-    for (const auto& remove_id : removed_ids) {
-        auto item = current.items.find(remove_id);
-        if (item != current.items.end())
-            media_ids.insert(item->second.media_ids.begin(), item->second.media_ids.end());
-    }
-
-    auto old_art = data_object_ids(current);
     for (const auto& remove_id : removed_ids)
-        current.items.erase(remove_id);
-    commit(expected_root, current, old_art);
+        if (const auto* item = current.item(remove_id))
+            media_ids.insert(item->media_ids.begin(), item->media_ids.end());
+
+    for (const auto& remove_id : removed_ids)
+        current.erase(remove_id);
+    commit(expected_root, std::move(current));
 
     CatalogueClearResult result;
     result.removed_items = removed_ids.size();
@@ -1724,42 +1868,38 @@ CatalogueUnbindResult CatalogueManager::unbind_media(std::optional<std::string_v
                                                      std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = current_snapshot()->merged();
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
 
     CatalogueUnbindResult result;
     std::vector<std::string> unbound;
     if (item_id) {
-        const auto found = current.items.find(std::string(*item_id));
-        if (found == current.items.end())
+        const auto* found = current.item(*item_id);
+        if (!found)
             return result;
         result.found = true;
-        if (expected_revision && found->second.revision != *expected_revision)
-            revision_changed(found->first, *expected_revision, found->second.revision);
-        if (std::find(found->second.media_ids.begin(), found->second.media_ids.end(), media_id) ==
-            found->second.media_ids.end())
+        if (expected_revision && found->revision != *expected_revision)
+            revision_changed(found->id, *expected_revision, found->revision);
+        if (std::find(found->media_ids.begin(), found->media_ids.end(), media_id) ==
+            found->media_ids.end())
             return result;
-        unbound.push_back(found->first);
+        unbound.push_back(found->id);
     } else {
         result.found = true;
-        for (const auto& [id, item] : current.items)
+        current.for_each_item([&](const std::string& id, const CatalogueItem& item) {
             if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) !=
                 item.media_ids.end())
                 unbound.push_back(id);
+        });
         if (unbound.empty())
             return result;
     }
     result.bound = true;
 
-    auto old_art = data_object_ids(current);
     const auto now = wall_time_ns();
     std::vector<std::string> emptied;
     for (const auto& id : unbound) {
-        auto& item = current.items.at(id);
+        auto& item = *current.edit_item(id);
         std::erase(item.media_ids, std::string(media_id));
         ++item.revision;
         item.updated_ns = now;
@@ -1773,26 +1913,26 @@ CatalogueUnbindResult CatalogueManager::unbind_media(std::optional<std::string_v
     while (!emptied.empty()) {
         const auto id = emptied.back();
         emptied.pop_back();
-        const auto found = current.items.find(id);
-        if (found == current.items.end())
+        const auto* found = current.item(id);
+        if (!found)
             continue;
-        const auto parent = found->second.parent_id;
-        current.items.erase(found);
+        const auto parent = found->parent_id;
+        current.erase(id);
         result.removed_ids.push_back(id);
         if (!parent)
             continue;
-        const bool has_child =
-            std::any_of(current.items.begin(), current.items.end(), [&](const auto& pair) {
-                return pair.second.parent_id && *pair.second.parent_id == *parent;
-            });
-        const auto above = current.items.find(*parent);
-        if (!has_child && above != current.items.end() && above->second.media_ids.empty())
+        bool has_child = false;
+        current.for_each_item([&](const std::string&, const CatalogueItem& candidate) {
+            has_child = has_child || (candidate.parent_id && *candidate.parent_id == *parent);
+        });
+        const auto* above = current.item(*parent);
+        if (!has_child && above && above->media_ids.empty())
             emptied.push_back(*parent);
     }
-    commit(expected_root, current, old_art);
     if (item_id)
-        if (const auto kept = current.items.find(std::string(*item_id)); kept != current.items.end())
-            result.item = kept->second;
+        if (const auto* kept = current.item(*item_id))
+            result.item = *kept;
+    commit(expected_root, std::move(current));
     std::sort(result.removed_ids.begin(), result.removed_ids.end());
     return result;
 }
@@ -1837,21 +1977,16 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                                          const std::set<std::string>& vanished_media) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
-    auto current = current_snapshot()->merged();
-    std::optional<ObjectId> expected_root;
-    {
-        Lock lock(mutex_);
-        expected_root = cached_root_;
-    }
-    auto old_art = data_object_ids(current);
+    auto [expected_root, view] = installed();
+    CatalogueDraft current(view);
     bool changed = false;
 
     for (const auto& [media_id, probe] : profiles) {
         CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, probe};
         if (!valid_catalogue_media_profile(media_id, profile)) continue;
-        auto it = current.media_profiles.find(media_id);
-        if (it != current.media_profiles.end() && it->second == profile) continue;
-        current.media_profiles[media_id] = std::move(profile);
+        if (const auto* found = current.media_profile(media_id); found && *found == profile)
+            continue;
+        current.put_media_profile(media_id, std::move(profile));
         changed = true;
     }
 
@@ -1867,33 +2002,32 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
 
     for (auto item : discovered) {
         item.external_ids["macha_scanner"] = "1";
-        auto it = current.items.find(item.id);
-        if (it != current.items.end()) {
-            const auto manual = it->second.external_ids.find("macha_metadata_locked");
+        if (const auto* existing = current.item(item.id)) {
+            const auto manual = existing->external_ids.find("macha_metadata_locked");
             const bool metadata_locked =
-                manual != it->second.external_ids.end() && manual->second == "1";
+                manual != existing->external_ids.end() && manual->second == "1";
             if (metadata_locked) {
                 // A user-edited item keeps its descriptive metadata; its media
                 // bindings are still reconciled.
-                auto preserved = it->second;
+                auto preserved = *existing;
                 preserved.media_ids.insert(preserved.media_ids.end(), item.media_ids.begin(),
                                            item.media_ids.end());
                 std::sort(preserved.media_ids.begin(), preserved.media_ids.end());
                 preserved.media_ids.erase(
                     std::unique(preserved.media_ids.begin(), preserved.media_ids.end()),
                     preserved.media_ids.end());
-                if (preserved.media_ids == it->second.media_ids)
+                if (preserved.media_ids == existing->media_ids)
                     continue;
                 ++preserved.revision;
                 preserved.updated_ns = wall_time_ns();
-                current.items[item.id] = std::move(preserved);
+                current.put(std::move(preserved));
                 changed = true;
                 continue;
             }
             // Scanner artwork is a candidate set, not one slot per role: known
             // objects are kept unless resupplied, so an embedded cover and a
             // provider cover coexist.
-            for (const auto& art : it->second.artwork) {
+            for (const auto& art : existing->artwork) {
                 const bool already_present = std::any_of(
                     item.artwork.begin(), item.artwork.end(), [&](const auto& candidate) {
                         return candidate.role == art.role && candidate.id == art.id;
@@ -1902,103 +2036,99 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
             }
             // A match may be another file of a known item: keep existing
             // bindings; vanished ones are removed below.
-            item.media_ids.insert(item.media_ids.end(), it->second.media_ids.begin(),
-                                  it->second.media_ids.end());
+            item.media_ids.insert(item.media_ids.end(), existing->media_ids.begin(),
+                                  existing->media_ids.end());
             std::sort(item.media_ids.begin(), item.media_ids.end());
             item.media_ids.erase(std::unique(item.media_ids.begin(), item.media_ids.end()),
                                  item.media_ids.end());
-            item.revision = it->second.revision;
-            item.updated_ns = it->second.updated_ns;
-            if (same_content(item, it->second))
+            item.revision = existing->revision;
+            item.updated_ns = existing->updated_ns;
+            if (same_content(item, *existing))
                 continue;
-            item.revision = it->second.revision + 1;
+            item.revision = existing->revision + 1;
         } else {
             item.revision = 1;
         }
         item.updated_ns = wall_time_ns();
-        current.items[item.id] = std::move(item);
+        current.put(std::move(item));
         changed = true;
     }
 
     if (prune_missing) {
-        // Only scanner-owned leaf bindings are reconciled; manual entries are
-        // never removed.
-        for (auto& [_, item] : current.items) {
-            auto marker = item.external_ids.find("macha_scanner");
-            if (marker == item.external_ids.end() || marker->second != "1")
-                continue;
-            if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
-                item.kind != CatalogueKind::track)
-                continue;
-            auto before = item.media_ids.size();
-            std::erase_if(item.media_ids, [&](const std::string& media) {
-                return !active_media_ids.contains(media);
-            });
-            if (item.media_ids.size() != before) {
-                ++item.revision;
-                item.updated_ns = wall_time_ns();
-                changed = true;
-            }
-        }
-
-        // A manual item may bind a file outside the catalogue roots, so it
-        // loses only files gone from the namespace altogether.
-        if (!vanished_media.empty()) {
-            for (auto& [_, item] : current.items) {
-                auto marker = item.external_ids.find("macha_scanner");
-                if (marker != item.external_ids.end() && marker->second == "1") continue;
-                const auto before = item.media_ids.size();
-                std::erase_if(item.media_ids, [&](const std::string& media) {
-                    return vanished_media.contains(media);
+        const auto scanner_made = [](const CatalogueItem& item) {
+            const auto marker = item.external_ids.find("macha_scanner");
+            return marker != item.external_ids.end() && marker->second == "1";
+        };
+        const auto leaf = [](const CatalogueItem& item) {
+            return item.kind == CatalogueKind::movie || item.kind == CatalogueKind::episode ||
+                   item.kind == CatalogueKind::track;
+        };
+        // Only scanner-owned leaf bindings are reconciled; a manual item may
+        // bind a file outside the catalogue roots, so it loses only files gone
+        // from the namespace altogether.
+        std::vector<std::string> rebind;
+        current.for_each_item([&](const std::string& id, const CatalogueItem& item) {
+            const bool scanner = scanner_made(item);
+            if (scanner && !leaf(item))
+                return;
+            if (!scanner && vanished_media.empty())
+                return;
+            const bool loses = std::any_of(
+                item.media_ids.begin(), item.media_ids.end(), [&](const std::string& media) {
+                    return scanner ? !active_media_ids.contains(media)
+                                   : vanished_media.contains(media);
                 });
-                if (item.media_ids.size() != before) {
-                    ++item.revision;
-                    item.updated_ns = wall_time_ns();
-                    changed = true;
-                }
-            }
+            if (loses)
+                rebind.push_back(id);
+        });
+        for (const auto& id : rebind) {
+            auto& item = *current.edit_item(id);
+            const bool scanner = scanner_made(item);
+            std::erase_if(item.media_ids, [&](const std::string& media) {
+                return scanner ? !active_media_ids.contains(media) : vanished_media.contains(media);
+            });
+            ++item.revision;
+            item.updated_ns = wall_time_ns();
+            changed = true;
         }
 
-        for (auto it = current.items.begin(); it != current.items.end();) {
-            const auto marker = it->second.external_ids.find("macha_scanner");
-            const bool scanner = marker != it->second.external_ids.end() && marker->second == "1";
-            const bool leaf = it->second.kind == CatalogueKind::movie ||
-                              it->second.kind == CatalogueKind::episode ||
-                              it->second.kind == CatalogueKind::track;
-            if (scanner && leaf && it->second.media_ids.empty()) {
-                it = current.items.erase(it);
-                changed = true;
-            } else ++it;
+        std::vector<std::string> emptied;
+        current.for_each_item([&](const std::string& id, const CatalogueItem& item) {
+            if (scanner_made(item) && leaf(item) && item.media_ids.empty())
+                emptied.push_back(id);
+        });
+        for (const auto& id : emptied) {
+            current.erase(id);
+            changed = true;
         }
 
         // Bottom-up removal of empty scanner-created hierarchy nodes.
+        const auto parent_kind = [](const CatalogueItem& item) {
+            return item.kind == CatalogueKind::show || item.kind == CatalogueKind::season ||
+                   item.kind == CatalogueKind::artist || item.kind == CatalogueKind::album;
+        };
         bool removed = true;
         while (removed) {
             removed = false;
-            for (auto it = current.items.begin(); it != current.items.end();) {
-                const auto marker = it->second.external_ids.find("macha_scanner");
-                const bool scanner = marker != it->second.external_ids.end() && marker->second == "1";
-                const bool parent_kind = it->second.kind == CatalogueKind::show ||
-                                         it->second.kind == CatalogueKind::season ||
-                                         it->second.kind == CatalogueKind::artist ||
-                                         it->second.kind == CatalogueKind::album;
-                if (!scanner || !parent_kind) { ++it; continue; }
-                const auto id = it->second.id;
-                const bool has_child = std::any_of(current.items.begin(), current.items.end(),
-                                                   [&](const auto& pair) {
-                                                       return pair.second.parent_id &&
-                                                              *pair.second.parent_id == id;
-                                                   });
-                if (!has_child) {
-                    it = current.items.erase(it);
-                    changed = removed = true;
-                } else ++it;
+            std::set<std::string> parents;
+            current.for_each_item([&](const std::string&, const CatalogueItem& item) {
+                if (item.parent_id)
+                    parents.insert(*item.parent_id);
+            });
+            std::vector<std::string> childless;
+            current.for_each_item([&](const std::string& id, const CatalogueItem& item) {
+                if (scanner_made(item) && parent_kind(item) && !parents.contains(id))
+                    childless.push_back(id);
+            });
+            for (const auto& id : childless) {
+                current.erase(id);
+                changed = removed = true;
             }
         }
     }
 
     if (changed)
-        commit(expected_root, current, old_art, expected_namespace);
+        commit(expected_root, std::move(current), expected_namespace);
 }
 
 CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::string role,
