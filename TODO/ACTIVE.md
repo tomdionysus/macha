@@ -11,17 +11,19 @@ Items marked *carried* come from
 `archive/2026-10-05-ACTIVE-before-rationalisation.md` and have not been
 re-checked since.
 
-## 0. The catalogue as a materialised view of the local head
+## 0. The catalogue plan: a materialised view of the local head
 
-Design: [`2026-10-06-catalogue-materialised-view.md`](2026-10-06-catalogue-materialised-view.md).
-The catalogue view becomes a pure function of this node's head, installed
-at one point, driven by head changes, decoded per changed shard. It removes
-the two failures of the burst test below (the view stepping backwards and
-the uncountable repair passes), the polling refresh and its TTL, and does
-the per-shard half of BACKLOG Catalogue Stage C, and closes the
-"repair twice per pass" question in section 6. Work in the order the
-document gives; step 1 (the `cache()` generation guard) is 0.90.26,
-committed, not yet deployed.
+Plan: [`2026-10-06-catalogue-materialised-view.md`](2026-10-06-catalogue-materialised-view.md),
+which supersedes the September shard plan. The catalogue view becomes a
+pure function of this node's head: resident per-shard view, one install
+point driven by head changes, mutations copying only the shards they
+touch, a per-shard conflict merge, derived list and search indexes, one
+manifest change (per-family shards, growable count), batched profile
+publication, and holdings for catalogue DATA. It removes the two failures
+of the burst test below, the polling refresh and its TTL, the second
+repair per pass (section 6's question, answered), and every whole-snapshot
+copy. Eleven stages, each shipping alone; stage 1 is measurement. The
+`cache()` generation guard is 0.90.26, committed, not yet deployed.
 
 ## 1. Failing tests and defects
 
