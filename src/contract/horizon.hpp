@@ -41,20 +41,27 @@ class InventoryHorizon : public ReferencedSets {
     // `garbage` is every tombstone the namespace walk found; one whose id is
     // still referenced as data is stale (its object came back to life), the
     // rest collectable. Both lists keep the given order.
+    // `outside_namespace`: the DATA objects among `data` that the namespace
+    // does not refer to (catalogue artwork), kept apart so repair can cover
+    // them without walking the namespace's.
     InventoryHorizon(uint64_t generation, bool catalogue_complete, std::vector<ObjectId> data,
-                     std::vector<ObjectId> control, const std::vector<GarbageRef>& garbage);
+                     std::vector<ObjectId> control, const std::vector<GarbageRef>& garbage,
+                     std::vector<ObjectId> outside_namespace = {});
 
     // The stamp: the generation the inventory was built at.
     uint64_t generation() const noexcept { return generation_; }
     bool catalogue_complete() const noexcept { return catalogue_complete_; }
     const std::vector<GarbageRef>& garbage() const noexcept { return garbage_; }
     const std::vector<GarbageRef>& stale_garbage() const noexcept { return stale_garbage_; }
+    // Sorted and unique.
+    const std::vector<ObjectId>& outside_namespace() const noexcept { return outside_namespace_; }
 
   private:
     uint64_t generation_;
     bool catalogue_complete_;
     std::vector<GarbageRef> garbage_;
     std::vector<GarbageRef> stale_garbage_;
+    std::vector<ObjectId> outside_namespace_;
 };
 
 // The retention release horizon at the sole accepted head: what claims are
