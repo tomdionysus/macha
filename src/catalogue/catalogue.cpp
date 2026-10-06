@@ -690,35 +690,27 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
             throw CatalogueUnavailable("catalogue manifest unavailable locally for control repair");
         const auto manifest = decode_catalogue_manifest(*encoded_manifest);
 
-        std::vector<std::pair<ObjectId, Bytes>> objects;
+        std::vector<ObjectId> objects{*root};
         objects.reserve(catalogue_shard_count + 1);
-        objects.push_back({*root, std::move(*encoded_manifest)});
         for (const auto& shard_id : manifest.shards) {
             if (!shard_id) continue;
             if (!store_.ensure_control_local(*shard_id))
                 throw CatalogueUnavailable("catalogue shard unavailable for control repair: " +
                                            to_string(*shard_id));
-            auto encoded = local_.control().get(*shard_id);
-            if (!encoded)
-                throw CatalogueUnavailable("catalogue shard unavailable locally for control repair: " +
-                                           to_string(*shard_id));
-            objects.push_back({*shard_id, std::move(*encoded)});
+            objects.push_back(*shard_id);
         }
 
-        bool complete = true;
-        uint64_t bytes = 0;
-        const auto send_started = Clock::now();
-        for (const auto& [id, encoded] : objects) {
-            bytes += encoded.size();
-            if (store_.replicate_control(id, encoded) < active_nodes.size())
-                complete = false;
-        }
+        // Each node present is asked what it lacks and sent only that.
+        const auto offer_started = Clock::now();
+        const auto offer = store_.offer_control(objects);
+        const bool complete = offer.held_by >= active_nodes.size();
         Log::debug("catalogue control convergence root=" + to_string(*root).substr(0, 12) +
                    " objects=" + std::to_string(objects.size()) +
-                   " bytes=" + std::to_string(bytes) +
+                   " sent=" + std::to_string(offer.objects_sent) +
+                   " bytes=" + std::to_string(offer.bytes_sent) +
                    " nodes=" + std::to_string(active_nodes.size()) +
                    " complete=" + (complete ? "yes" : "no") +
-                   " send_ms=" + std::to_string(ms_since(send_started)));
+                   " ms=" + std::to_string(ms_since(offer_started)));
 
         Lock lock(mutex_);
         if (complete) {

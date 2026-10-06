@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.29: catalogue convergence sends only what a node lacks
+
+No API, wire, protocol or on-disk changes.
+
+**Maintenance's catalogue stage took 20 to 30 s and sent 5.4 MB each time.**
+Offering the catalogue's control objects to the other nodes sent the
+manifest and every shard, in full, one blocking call at a time, without
+asking what the node already held: 65 objects and 5.4 MB, 21.8 s on fi-1
+and 30.6 s on gbni-1, at every start, after every catalogue commit and on
+each membership change, with the maintenance thread blocked throughout.
+It now asks each node what it lacks in one batched question and sends only
+that, pipelined, as background work: a node that already holds the
+catalogue costs one round trip. The commit path's claims do the same, from
+the same code. The `catalogue control convergence` DEBUG line now reports
+the objects and bytes sent.
+
 ## 0.90.28: catalogue stage timing
 
 No API, wire, protocol or on-disk changes. DEBUG lines that say where a

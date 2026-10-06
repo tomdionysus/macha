@@ -1189,6 +1189,49 @@ MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget
         CHECK(b.node().control_store().has(ids[i]));
 }
 
+// A CONTROL offer asks each node what it lacks and sends only that: a graph
+// the peer already holds costs one question and no bytes.
+MACHA_TEST("storage_v18", test_a_control_offer_sends_only_what_the_peer_lacks) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto a_port = free_port();
+    const auto b_port = free_port();
+    auto a_config = storage_node_config(cluster, "offer-a", a_port, 8ULL * 1024 * 1024, 1, 2);
+    auto b_config = storage_node_config(cluster, "offer-b", b_port, 8ULL * 1024 * 1024, 1, 2,
+                                        {{"127.0.0.1", a_port}});
+    StorageClusterNode a(std::move(a_config), cluster.keys());
+    StorageClusterNode b(std::move(b_config), cluster.keys());
+    a.start();
+    b.start();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 5s));
+
+    const auto held = pattern(64 * 1024, 31);
+    const auto lacking = pattern(64 * 1024, 32);
+    const auto held_id = object_id(held);
+    const auto lacking_id = object_id(lacking);
+    REQUIRE(a.node().control_store().put(held_id, held));
+    REQUIRE(a.node().control_store().put(lacking_id, lacking));
+    REQUIRE(b.node().control_store().put(held_id, held));
+
+    const auto first = a.store().offer_control({held_id, lacking_id});
+    CHECK(first.held_by == 2);
+    CHECK(first.objects_sent == 1);
+    CHECK(first.bytes_sent == lacking.size());
+    CHECK(b.node().control_store().valid(lacking_id));
+
+    const auto again = a.store().offer_control({held_id, lacking_id});
+    CHECK(again.held_by == 2);
+    CHECK(again.objects_sent == 0);
+    CHECK(again.bytes_sent == 0);
+
+    // What this node does not hold is not offered.
+    const auto absent = a.store().offer_control({object_id(pattern(64, 33))});
+    CHECK(absent.held_by == 0);
+    CHECK(absent.objects_sent == 0);
+}
+
 MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_replica) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
