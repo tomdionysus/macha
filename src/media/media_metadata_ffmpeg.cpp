@@ -236,7 +236,8 @@ void apply_embedded_music_metadata_impl(FileSystem& fs, std::string_view path, c
                                         MediaProbe& probe,
                                         std::vector<LocalArtworkCandidate>& artwork,
                                         size_t max_artwork_bytes) {
-    auto handle = fs.open_read(entry, std::string(path), false, FrameType::read_ahead);
+    // The scanner's own reading: background work, not a viewer's.
+    auto handle = fs.open_read(entry, std::string(path), false, FrameType::speculative);
     AudioMetadataRead state{std::move(handle), entry.size, 0};
     constexpr int buffer_size = 64 * 1024;
     auto* buffer = static_cast<uint8_t*>(av_malloc(buffer_size));

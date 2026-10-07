@@ -54,17 +54,6 @@ constexpr size_t frame_header_size = 28;
 constexpr uint8_t frame_first = 0x01;
 constexpr uint8_t frame_last = 0x02;
 
-MemoryClass retained_memory_class(FrameType frame_type) {
-    switch (frame_type) {
-    case FrameType::control: return MemoryClass::control;
-    case FrameType::foreground:
-    case FrameType::read_ahead: return MemoryClass::viewer;
-    case FrameType::loader: return MemoryClass::loader;
-    case FrameType::speculative: return MemoryClass::speculative;
-    }
-    return MemoryClass::speculative;
-}
-
 bool reset_invalidates_node_reference(const std::map<std::string, IdentityAssociationReset>& resets,
                                       const NodeInfo& node) {
     for (const auto& [_, reset] : resets) {
@@ -496,7 +485,7 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
         std::shared_ptr<std::vector<RetainedMemoryLedger::Lease>> memory;
         if (retained_memory_) {
             auto lease = retained_memory_->try_acquire(
-                retained_memory_class(fragment.frame_type), MemoryOwner::rpc_frame,
+                work_class(fragment.frame_type), MemoryOwner::rpc_frame,
                 fragment.payload.size() + sizeof(RetainedMemoryLedger::Lease));
             if (!lease)
                 throw std::runtime_error("process retained-memory RPC reassembly saturated");
@@ -539,7 +528,7 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
         throw std::runtime_error("incomplete RPC reassembly budget exceeded");
     if (retained_memory_) {
         auto memory = retained_memory_->try_acquire(
-            retained_memory_class(found->second.frame_type), MemoryOwner::rpc_frame,
+            work_class(found->second.frame_type), MemoryOwner::rpc_frame,
             fragment.payload.size() + sizeof(RetainedMemoryLedger::Lease));
         if (!memory)
             throw std::runtime_error("process retained-memory RPC reassembly saturated");
@@ -1270,7 +1259,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         std::optional<RetainedMemoryLedger::Lease> memory;
         if (retained_memory_) {
             memory = retained_memory_->try_acquire(
-                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
+                work_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
             if (!memory)
                 throw std::runtime_error("process retained-memory RPC admission saturated");
@@ -1790,7 +1779,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         std::optional<RetainedMemoryLedger::Lease> memory;
         if (retained_memory_) {
             memory = retained_memory_->try_acquire(
-                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
+                work_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
             if (!memory)
                 return false;
@@ -3230,7 +3219,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         std::optional<RetainedMemoryLedger::Lease> memory;
         if (retained_memory) {
             memory = retained_memory->try_acquire(
-                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
+                work_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
             if (!memory)
                 throw std::runtime_error("process retained-memory RPC admission saturated");
@@ -3510,7 +3499,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         std::optional<RetainedMemoryLedger::Lease> memory;
         if (retained_memory) {
             memory = retained_memory->try_acquire(
-                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
+                work_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
             if (!memory)
                 return false;
@@ -3747,20 +3736,7 @@ std::deque<RpcServer::RequestJob>& RpcServer::queue(RequestClass cls) {
 
 bool RpcServer::admit_locked(RequestJob job) {
     if (retained_memory_) {
-        const auto memory_class = [&] {
-            switch (job.frame.frame_type) {
-            case FrameType::control:
-                return MemoryClass::control;
-            case FrameType::foreground:
-            case FrameType::read_ahead:
-                return MemoryClass::viewer;
-            case FrameType::loader:
-                return MemoryClass::loader;
-            case FrameType::speculative:
-                return MemoryClass::speculative;
-            }
-            return MemoryClass::speculative;
-        }();
+        const auto memory_class = work_class(job.frame.frame_type);
         auto memory = retained_memory_->try_acquire(
             memory_class, MemoryOwner::rpc_frame,
             sizeof(RequestJob) +

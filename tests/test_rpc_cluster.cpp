@@ -387,7 +387,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_is_loader_activity_not_viewer_acti
     auto store = bench.store();
     const auto bytes = pattern(256 * 1024, 91);
     REQUIRE(store->put(bytes) == object_id(bytes));
-    CHECK(store->loader_idle_for() < 5s);
+    CHECK(store->idle_for(WorkClass::loader) < 5s);
     CHECK(store->take_loader_bytes() >= bytes.size());
     CHECK(store->take_foreground_bytes() == 0);
     CHECK(store->take_interactive_bytes() == 0);
@@ -589,7 +589,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_concurrent_readers_share_one_fetch_and
         auto reply = object_reply(bytes);
         reply.retained_memory = std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
         reply.retained_memory->push_back(*memory.try_acquire(
-            MemoryClass::viewer, MemoryOwner::rpc_frame, reply.payload.size()));
+            WorkClass::viewer, MemoryOwner::rpc_frame, reply.payload.size()));
         return reply;
     });
     const auto held = [&] {
@@ -1249,7 +1249,7 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
         REQUIRE(restored);
         CHECK(*s2.local_state().data().get(id) == bytes);
         CHECK(share_after > share_before);
-        CHECK((paced_by & DistributedStore::paced_by_peer_playback));
+        CHECK((paced_by & DistributedStore::paced_by_peer_viewer));
     }
 
     // This node's loader, active throughout.
@@ -1261,11 +1261,11 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
         }
     });
     REQUIRE(wait_until([&] {
-        return s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
+        return s2.resources().activity.idle_for(WorkClass::loader) < c2.maintenance.foreground_quiet;
     }, 5s));
     const auto [id, bytes] = lose_a_copy(2);
     const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
-    CHECK(s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
+    CHECK(s2.resources().activity.idle_for(WorkClass::loader) < c2.maintenance.foreground_quiet);
     CHECK((s2.repair_diagnostics().paced_by & DistributedStore::paced_by_loader));
     loading = false;
     loader.join();
