@@ -23,8 +23,9 @@ marks a viewer present; a work context carries its allowed waits apart
 from its class; API-started DATA work carries the request's class down.
 Six steps, one to two days; two questions for the operator at the end of
 the document. Step 1 (one `WorkClass`, read by the arbiter, the clocks and
-the pacing; three misclassified reads fixed) is 0.90.35. Next: step 2, the
-route table classes each HTTP request and marks the viewer present.
+the pacing; three misclassified reads fixed) is 0.90.35; step 2 (the route
+table classes each HTTP request; a served one marks its class present) is
+0.90.36. Next: step 3, allowed waits apart from class.
 
 ## 1. The catalogue plan: a materialised view of the local head
 
