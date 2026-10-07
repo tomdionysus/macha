@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "observation.hpp"
 #include "fuse/fuse_frontend.hpp"
 
 #include "codec.hpp"
@@ -1649,7 +1650,9 @@ struct FuseFrontend::State {
                 write_exact(journal_fd, frame);
             }
             if (sync) {
+                const auto sync_started = Clock::now();
                 fsync_fd(journal_fd, "cannot sync FUSE operation journal");
+                observations().record("fuse.journal_sync_us", elapsed_us(sync_started));
                 journal_durability_barriers.fetch_add(1, std::memory_order_relaxed);
             }
             journal_append_batches.fetch_add(1, std::memory_order_relaxed);

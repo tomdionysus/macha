@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <string>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -41,6 +42,7 @@ class DurabilityDomain {
     };
 
     uint64_t id_{};
+    std::string barrier_series_;
     std::vector<std::filesystem::path> representatives_;
     std::chrono::milliseconds batch_window_;
     mutable Mutex mutex_;
