@@ -92,7 +92,11 @@ preloaded or embedded.
 - **A viewer** is a person using the system right now: watching or listening
   (playback startup, reads, seeks and transport, read-ahead for what is
   playing) or using the API (browsing the catalogue, editing, managing
-  files). Every API route but the control routes is viewer work.
+  files). Every API route but the control routes is viewer work, and so is
+  everything the web serves, because it is viewed. That includes a response
+  body on its way out: the bytes are viewer work for as long as they flow,
+  so a viewer whose stream is still draining is a viewer present, whether or
+  not the server is reading anything for them at that moment.
 - **A loader** is durable work the user asked for - FUSE publication and
   mount reads, ingest, acquisition - which must finish but need not finish
   first.
