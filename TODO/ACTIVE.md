@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.39.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.41.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -29,7 +29,11 @@ table classes each HTTP request; a served one marks its class present) is
 request's class passed down its DATA work) and step 5 (the definition in
 the docs) are 0.90.38; step 6 measured on polling load (COMPLETED);
 continuous browsing not yet measured. The network reserve is 0.90.39 (BBR
-on every peer socket; section 4). Next: the disk reserve.
+on every peer socket; section 4). A response still draining is viewer work
+until its last byte leaves (0.90.40, 0.90.41; COMPLETED). Open: repair
+yields time, not rate, so it keeps about 3 Mbit/s of an uplink a viewer is
+using; a reserve sized by the operator would close it. Next: the five
+unreadable movies (section 2), then the disk reserve.
 
 ## 1. The catalogue plan: a materialised view of the local head
 
@@ -53,6 +57,14 @@ item in section 0, then stage 6.
 
 ## 2. Failing tests and defects
 
+- **Five movies unreadable on gbni-1** (2026-10-07): The Transformers: The
+  Movie, Once Were Warriors, Evil Dead II, 28 Days Later and the first half
+  of 12 Monkeys return EIO through the mount within 0.2 s; 5 of 25 sampled.
+  The survey counts 206,130 of 941,588 extents unavailable to gbni-1.
+  Not yet known whether fi-1 can read them.
+- **26 GB of abandoned write temp files** in gbni-1's `state/tmp` from 7 and
+  9 September: a write handle removes its temp file when it finishes, but
+  nothing sweeps those a crash leaves.
 - **gbni-1 killed by the kernel for memory during a large import** (2026-10-06
   21:16Z; 1.15 GB to 2.1 GB in a minute on a 4 GB node). Cause: each commit
   owed to the peer held two encoded snapshots and the decoded one until its
@@ -191,7 +203,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.39**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.41**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -201,7 +213,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.39` back to
+  in place before that version was installed (`pre-0.90.41` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild

@@ -2,6 +2,20 @@
 
 Last updated: 2026-10-07
 
+## 2026-10-07 -- 0.90.39 to 0.90.41
+
+- **A response still draining is viewer work** (0.90.40, 0.90.41). The
+  HTTP reactor notes a served request's class with every send, and each
+  socket holds at most one unsent chunk, so presence follows the client's
+  link. A direct-play movie from gbni-1 at fi-1's site, 16:08Z: both nodes
+  saw the viewer throughout (`viewer_idle` under 4 s at every window end),
+  repair dropped from about 50 MB/min to 8 to 25, Macha's unsent bytes
+  stayed at 230 to 327 KB; the operator: fast and trouble-free. Before, a
+  viewer was present for 2 s per chunk read and repair took the link back
+  in every pause.
+- **BBR on peer sockets** (0.90.39): control's round trip on gbni-1 from
+  295 to 451 ms to 85 to 122 ms under repair (floor 77 ms).
+
 ## 2026-10-06/07 -- 0.90.35 to 0.90.38
 
 - **One definition of work class** (0.90.35 to 0.90.38,
