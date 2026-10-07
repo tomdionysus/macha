@@ -2,8 +2,12 @@
 
 Last updated: 2026-10-07
 
-## 2026-10-07 -- 0.90.39 to 0.90.41
+## 2026-10-07 -- 0.90.39 to 0.90.42
 
+- **Abandoned write files cleared at startup** (0.90.42). gbni-1 removed
+  23 files left by the crashes of 7 and 9 September on its first start
+  (70.8 GB logical, sparse; the root filesystem went from 59 to 34 GB
+  used). fi-1 had none.
 - **A response still draining is viewer work** (0.90.40, 0.90.41). The
   HTTP reactor notes a served request's class with every send, and each
   socket holds at most one unsent chunk, so presence follows the client's
