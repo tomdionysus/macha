@@ -1656,9 +1656,10 @@ MACHA_FAST_TEST("storage_metadata", test_a_checkpoint_write_holds_no_reader_of_t
         CHECK(committed == mine.hash);
         CHECK(usable == std::vector<Hash256>{mine.hash});
     }
-    // The checkpoint written off the lock is the one a restart reads.
+    // The checkpoint written off the lock opens; a set-aside is this run's
+    // alone, so a restart holds both heads again.
     MetadataReplica reopened(path, keys.storage);
-    CHECK(reopened.committed().hash == mine.hash);
+    CHECK(hashes_of(reopened.accepted_heads()) == hashes_of({mine, theirs}));
 #endif
 }
 
