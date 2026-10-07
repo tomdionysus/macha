@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.34.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.35.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -22,7 +22,9 @@ three; every HTTP route but the four control routes is viewer-class and
 marks a viewer present; a work context carries its allowed waits apart
 from its class; API-started DATA work carries the request's class down.
 Six steps, one to two days; two questions for the operator at the end of
-the document. Next, before catalogue stage 6.
+the document. Step 1 (one `WorkClass`, read by the arbiter, the clocks and
+the pacing; three misclassified reads fixed) is 0.90.35. Next: step 2, the
+route table classes each HTTP request and marks the viewer present.
 
 ## 1. The catalogue plan: a materialised view of the local head
 
@@ -56,9 +58,6 @@ item in section 0, then stage 6.
   import had finished before the deploy). Also to do: memory per component
   in the observation windows, which hold only total RSS, so the next spike
   can be attributed from the record rather than from `/proc`.
-- **Shelved for the import fix:** work-class step 1 (`WorkClass` replacing
-  `MemoryClass` and the four frame-to-class mappings), in `git stash`
-  `stash@{0}`, partly written.
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
   `/root/claude-missing-extent-driver.py` are staged on fi-1, not run.
   *Carried.*
@@ -187,7 +186,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.34**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.35**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -197,7 +196,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.34` back to
+  in place before that version was installed (`pre-0.90.35` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
