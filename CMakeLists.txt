@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.90.42 LANGUAGES CXX)
+project(macha VERSION 0.90.43 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -290,6 +290,7 @@ set(MACHA_CORE_SOURCES
     src/ledger/predicate_query.cpp
     src/observation.cpp
     src/durable_file.cpp
+    src/write_behind.cpp
     src/json.cpp
     src/subsystem/subsystem.cpp
     src/subsystem/subsystem_registry.cpp

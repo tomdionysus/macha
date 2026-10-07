@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "storage/local_store.hpp"
+#include "write_behind.hpp"
 #include "codec.hpp"
 #include "log.hpp"
 #include "startup_progress.hpp"
@@ -285,6 +286,9 @@ void PosixLocalStoreFiles::install(const std::filesystem::path& path,
         if (fd < 0) throw std::runtime_error(strerror(errno));
         wa(fd, head);
         wa(fd, body);
+        // An ephemeral store (the cache) is never synced; nothing it writes
+        // should sit dirty behind a control commit.
+        start_writeback(fd);
         const int close_rc = ::close(fd);
         fd = -1;
         if (close_rc != 0) throw std::runtime_error(strerror(errno));
