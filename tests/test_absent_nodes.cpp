@@ -156,17 +156,19 @@ MACHA_FAST_TEST("absent_nodes", test_a_node_unheard_of_for_the_horizon_is_forgot
     const auto self = node_at(57401);
     auto peer = node_at(57402);
     {
-        // The horizon is never shorter than twice dead_after.
-        Membership membership(self, 40ms, roster, 0ms);
+        // The horizon is never shorter than twice dead_after: 200 ms here.
+        // Each check sits at least 70 ms from the edge it tests, so a loaded
+        // machine's late wakeup does not cross it.
+        Membership membership(self, 100ms, roster, 0ms);
         membership.observe(peer, true);
         CHECK(membership.directly_reachable(peer.id));
         CHECK(membership.directly_reachable(self.id));
         CHECK(membership.forget_unseen() == 0);
-        std::this_thread::sleep_for(60ms);
+        std::this_thread::sleep_for(130ms);
         CHECK(!membership.directly_reachable(peer.id));
         CHECK(membership.forget_unseen() == 0);
         REQUIRE(membership.all().size() == 2);
-        std::this_thread::sleep_for(60ms);
+        std::this_thread::sleep_for(140ms);
         CHECK(membership.forget_unseen() == 1);
         CHECK(membership.all().size() == 1);
         CHECK(membership.all_known_reachable());
@@ -175,11 +177,11 @@ MACHA_FAST_TEST("absent_nodes", test_a_node_unheard_of_for_the_horizon_is_forgot
         CHECK(membership.all().size() == 1);
         membership.observe(peer, true);
         CHECK(membership.all().size() == 2);
-        std::this_thread::sleep_for(120ms);
+        std::this_thread::sleep_for(280ms);
         CHECK(membership.forget_unseen() == 1);
     }
     // The roster on disk forgot it too.
-    Membership recovered(self, 40ms, roster, 0ms);
+    Membership recovered(self, 100ms, roster, 0ms);
     CHECK(recovered.all().size() == 1);
 }
 

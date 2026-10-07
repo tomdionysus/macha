@@ -431,14 +431,14 @@ InboundResolution NodeRuntime::inbound_resolution() const {
     return inbound_;
 }
 
-void NodeRuntime::persist_inbound_resolution_locked() const {
+void NodeRuntime::persist_inbound_resolution(const InboundResolution& resolution) const {
     const auto path = inbound_resolution_path(cfg_);
     std::filesystem::create_directories(path.parent_path());
     Writer writer;
     writer.fixed(inbound_resolution_magic);
-    writer.u8(inbound_.inbound_capable ? 1 : 0);
-    writer.u64(inbound_.decided_unix_ms);
-    writer.string(inbound_.source);
+    writer.u8(resolution.inbound_capable ? 1 : 0);
+    writer.u64(resolution.decided_unix_ms);
+    writer.string(resolution.source);
     const auto& bytes = writer.data();
     durable_replace_file(path, std::string_view(reinterpret_cast<const char*>(bytes.data()),
                                                 bytes.size()));
@@ -448,6 +448,8 @@ void NodeRuntime::apply_inbound_resolution(bool inbound_capable, std::string sou
     bool changed = false;
     bool hosts = false;
     InboundResolution before;
+    InboundResolution after;
+    Lock persisting(inbound_persist_mutex_);
     {
         Lock lock(inbound_mutex_);
         before = inbound_;
@@ -459,12 +461,14 @@ void NodeRuntime::apply_inbound_resolution(bool inbound_capable, std::string sou
         inbound_.source = std::move(source);
         if (changed)
             inbound_.decided_unix_ms = unix_ms();
-        try {
-            persist_inbound_resolution_locked();
-        } catch (const std::exception& error) {
-            Log::warn("inbound resolution not persisted: " + std::string(error.what()));
-        }
+        after = inbound_;
     }
+    try {
+        persist_inbound_resolution(after);
+    } catch (const std::exception& error) {
+        Log::warn("inbound resolution not persisted: " + std::string(error.what()));
+    }
+    persisting.unlock();
     if (!changed)
         return;
     // The flags travel with every handshake and members reply; placement

@@ -24,8 +24,14 @@ class Membership {
         uint64_t last_seen_unix_ms{};
         uint64_t persisted_seen_unix_ms{};
     };
-    // Held while the known peers are persisted.
-    mutable IoMutex m_;
+    // Never held across I/O: the roster is encoded under it and written
+    // after it is released.
+    mutable Mutex m_;
+    // Held to write an encoded roster; one older than the last written is
+    // skipped, so writes land in the order they were encoded.
+    mutable IoMutex persist_m_;
+    uint64_t roster_sequence_ MACHA_GUARDED_BY(m_){};
+    uint64_t written_sequence_ MACHA_GUARDED_BY(persist_m_){};
     NodeInfo self_ MACHA_GUARDED_BY(m_);
     const std::chrono::milliseconds dead_;
     // How long a node may go unheard of before it is forgotten.
@@ -35,7 +41,12 @@ class Membership {
     std::unordered_map<std::string, IdentityAssociationReset> identity_resets_ MACHA_GUARDED_BY(m_);
 
     void load_known() MACHA_REQUIRES(m_);
-    void persist_known_locked() MACHA_REQUIRES(m_);
+    struct EncodedRoster {
+        uint64_t sequence{};
+        std::string bytes;
+    };
+    EncodedRoster encode_known_locked() MACHA_REQUIRES(m_);
+    void write_known(const EncodedRoster&) MACHA_EXCLUDES(m_);
 
   public:
     Membership(NodeInfo, std::chrono::milliseconds dead_after,
