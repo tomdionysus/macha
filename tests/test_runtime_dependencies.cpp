@@ -421,7 +421,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "    token_file: " << (t.path() / "api.token").string() << "\n"
             << "    max_request_bytes: 2M\n"
             << "    workers: 7\n"
-            << "    control_workers: 3\n"
+            << "    control_workers: 4\n"
             << "    max_connections: 33\n"
             << "    max_queued_requests: 44\n"
             << "    staging_chunks: 3\n"
@@ -612,7 +612,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(*yc.catalogue.api.token_file == t.path() / "api.token");
     CHECK(yc.catalogue.api.max_request_bytes == 2ULL * 1024 * 1024);
     CHECK(yc.catalogue.api.workers == 7);
-    CHECK(yc.catalogue.api.control_workers == 3);
+    CHECK(yc.catalogue.api.control_workers == 4);
     CHECK(yc.catalogue.api.max_connections == 33);
     CHECK(yc.catalogue.api.max_queued_requests == 44);
     CHECK(yc.catalogue.api.staging_chunks == 3);
@@ -819,8 +819,10 @@ MACHA_FAST_TEST("runtime_dependencies", test_password_checks_may_never_fill_the_
         out << "state_path: " << (t.path() / "state").string() << "\n"
             << "key_file: " << keyfile.string() << "\n"
             << "storage:\n"
-            << "  - path: " << disk.string() << "\n"
-            << "    limit: 10G\n"
+            << "  data:\n"
+            << "    backends:\n"
+            << "      - path: " << disk.string() << "\n"
+            << "        limit: 10G\n"
             << "catalogue:\n"
             << "  api:\n"
             << "    control_workers: " << control_workers << "\n"
