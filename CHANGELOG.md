@@ -1,5 +1,17 @@
 # Current release
 
+## 0.90.44: control's commits are timed in the observation windows
+
+No API, wire, protocol or on-disk changes.
+
+Four new histograms in the observation windows, in microseconds:
+`metadata.journal_sync_us` and `metadata.history_sync_us` (the metadata
+store's fsyncs), `fuse.journal_sync_us` (the FUSE operation journal's), and
+`durability.barrier_us.<directory>`, one per filesystem a durability domain
+syncs, named after the directory it was made for: the control store's
+(`metadata-objects`) or a DATA backend's. Whether control waits on the disk
+is now read from the record rather than from a probe.
+
 ## 0.90.43: bulk writes keep no backlog for a control commit to wait on
 
 No API, wire, protocol or on-disk changes.

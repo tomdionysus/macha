@@ -3,6 +3,7 @@
 #include "codec.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
+#include "observation.hpp"
 #include "resident_bytes.hpp"
 #include "startup_progress.hpp"
 #include <algorithm>
@@ -2454,12 +2455,14 @@ void MetadataReplica::append_journal(uint8_t kind, const MetadataRecord& record,
         }
         offset += static_cast<size_t>(count);
     }
+    const auto sync_started = Clock::now();
     if (fsync(fd)) {
         auto error = errno;
         close(fd);
         throw std::runtime_error("cannot sync metadata journal " + journal_p_.string() + ": " +
                                  strerror(error));
     }
+    observations().record("metadata.journal_sync_us", elapsed_us(sync_started));
     if (close(fd) != 0)
         throw std::runtime_error("cannot close metadata journal " + journal_p_.string() + ": " +
                                  strerror(errno));
@@ -2733,12 +2736,14 @@ void MetadataReplica::write_history_frame(std::span<const uint8_t> bytes) const 
         }
         offset += static_cast<size_t>(count);
     }
+    const auto sync_started = Clock::now();
     if (fsync(fd) != 0) {
         const auto error = errno;
         close(fd);
         throw std::runtime_error("cannot sync metadata history " + history_p_.string() + ": " +
                                  strerror(error));
     }
+    observations().record("metadata.history_sync_us", elapsed_us(sync_started));
     if (close(fd) != 0)
         throw std::runtime_error("cannot close metadata history " + history_p_.string() + ": " +
                                  strerror(errno));

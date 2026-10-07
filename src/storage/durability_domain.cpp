@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "storage/durability_domain.hpp"
 #include "diagnostics.hpp"
+#include "observation.hpp"
 #include "supervised.hpp"
 
 #include <algorithm>
@@ -61,6 +62,9 @@ DurabilityDomain::DurabilityDomain(uint64_t id, std::filesystem::path representa
         throw std::runtime_error("durability domain id must be non-zero");
     if (batch_window_ < std::chrono::milliseconds::zero())
         throw std::runtime_error("durability batch window cannot be negative");
+    // Named after the directory it was made for: the control store's or a
+    // DATA backend's.
+    barrier_series_ = "durability.barrier_us." + representative.filename().string();
     add_representative(std::move(representative));
     worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("durability-domain", stop, [this, stop] { loop(stop); });
@@ -151,6 +155,7 @@ bool DurabilityDomain::failed() const {
 }
 
 void DurabilityDomain::perform_barrier(Generation cut, std::vector<PortableMutation> portable) {
+    const auto started = Clock::now();
 #if defined(__linux__)
     (void)cut;
     (void)portable;
@@ -200,6 +205,7 @@ void DurabilityDomain::perform_barrier(Generation cut, std::vector<PortableMutat
         sync_directory(directory);
 #endif
     physical_barriers_.fetch_add(1, std::memory_order_relaxed);
+    observations().record(barrier_series_, elapsed_us(started));
 }
 
 void DurabilityDomain::loop(std::stop_token stop) {
