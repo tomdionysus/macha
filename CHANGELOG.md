@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.37: what work may wait on is said apart from its class
+
+No API, wire, protocol or on-disk changes.
+
+A work context carries the waits it allows beside its class. By default a
+class allows what the laws let it wait on: control its own state device and
+locks, never the DATA device or the network; every other class anything.
+Work may allow itself less, never more. The wait guard checks an operation's
+declared waits against what the work allows.
+
+The catalogue and manage API reads that must answer from memory were
+spelled as control work to get that refusal. They are now what they are:
+viewer-class work allowing only waits on this node (`local_waits`). A cold
+catalogue is still refused to them rather than loaded on the request
+thread.
+
 ## 0.90.36: an API request is viewer work, and a viewer present
 
 No API, wire, protocol or on-disk changes.
