@@ -7,6 +7,12 @@
 #include "supervised.hpp"
 #include "coverage.hpp"
 #include "write_behind.hpp"
+#include <arpa/inet.h>
+#include <thread>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <future>
+#include "cluster/public_connectivity.hpp"
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -1886,6 +1892,103 @@ MACHA_FAST_TEST("foundations", test_write_behind_leaves_what_was_written_intact)
             CHECK(false);
             break;
         }
+}
+
+} // namespace
+
+namespace {
+
+MACHA_TEST("foundations", test_a_connectivity_probe_holds_no_reader_of_the_status) {
+#if defined(__linux__)
+    // A listener whose accept queue is full: Linux drops the SYN, so a connect
+    // to it waits out its timeout and the probe is slow for a known time.
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(::listen(listener, 0) == 0);
+    socklen_t size = sizeof(address);
+    REQUIRE(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+    const auto port = ntohs(address.sin_port);
+    std::vector<int> fillers;
+    for (int i = 0; i < 8; ++i) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        (void)::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+        fillers.push_back(fd);
+    }
+
+    Config config;
+    config.connectivity_check.enabled = true;
+    config.connectivity_check.timeout = 1500ms;
+    PublicConnectivity connectivity(config, random_node_id(), {"127.0.0.1", port});
+
+    const auto started = Clock::now();
+    auto probe = std::async(std::launch::async, [&] { return connectivity.refresh(true, true); });
+    std::this_thread::sleep_for(200ms);
+    const auto asked = Clock::now();
+    const auto status = connectivity.status();
+    const auto answered_in = Clock::now() - asked;
+    const auto result = probe.get();
+    const auto probe_took = Clock::now() - started;
+
+    // The probe was slow, and the status answered at once all the same.
+    CHECK(probe_took >= 1s);
+    CHECK(answered_in < scaled(200ms));
+    CHECK(status.configured.port == port);
+    CHECK(result.self_probe == "unreachable");
+    CHECK(connectivity.status().self_probe == "unreachable");
+    for (const int fd : fillers)
+        ::close(fd);
+    ::close(listener);
+#endif
+}
+
+MACHA_FAST_TEST("foundations", test_a_roster_being_written_holds_no_reader_of_membership) {
+#if defined(__linux__)
+    TempDir t;
+    const auto roster = t.path() / "membership" / "known-nodes.bin";
+    NodeInfo self;
+    self.id = random_node_id();
+    self.host = "127.0.0.1";
+    self.port = 57401;
+    NodeInfo peer;
+    peer.id = random_node_id();
+    peer.host = "127.0.0.2";
+    peer.port = 57402;
+    peer.seen_unix_ms = unix_ms();
+    Membership membership(self, 30s, roster);
+
+    auto& hold = test_support::fsync_hold;
+    {
+        std::lock_guard lock(hold.mutex);
+        hold.path = roster.string();
+        hold.armed = true;
+    }
+    // A new peer is written to the roster; the write is held at its fsync.
+    std::thread writer([&] { membership.observe(peer, true); });
+    bool held = false;
+    {
+        std::unique_lock lock(hold.mutex);
+        held = hold.changed.wait_for(lock, scaled(5s), [&] { return hold.holding; });
+    }
+    CHECK(held);
+    auto reader = std::async(std::launch::async, [&] { return membership.all().size(); });
+    const bool answered = reader.wait_for(scaled(2s)) == std::future_status::ready;
+    {
+        std::lock_guard lock(hold.mutex);
+        hold.armed = false;
+    }
+    hold.changed.notify_all();
+    writer.join();
+    CHECK(answered);
+    CHECK(reader.get() == 2);
+
+    Membership reloaded(self, 30s, roster);
+    CHECK(reloaded.all().size() == 2);
+#endif
 }
 
 } // namespace
