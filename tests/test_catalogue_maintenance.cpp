@@ -514,4 +514,29 @@ MACHA_TEST("catalogue_maintenance", test_data_is_released_only_when_nothing_refe
     CHECK(released(object_id(index)));
 }
 
+MACHA_TEST("catalogue_maintenance", test_artwork_is_staged_in_the_class_of_whoever_asked) {
+    Node fixture;
+    FakeMetadataView metadata;
+    metadata.view = empty_head(fixture.node->known_metadata_generation());
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
+    auto& data = fixture.node->resources.data;
+    (void)catalogue.upsert(movie("movie:one", "One"));
+
+    // A person in the editor: viewer admission.
+    auto before = data.stats();
+    (void)catalogue.put_artwork("movie:one", "poster", "image/jpeg",
+                                test_support::pattern(4096, 11), std::nullopt,
+                                FrameType::foreground);
+    auto after = data.stats();
+    CHECK(after.viewer_admissions > before.viewer_admissions);
+    CHECK(after.speculative_admissions == before.speculative_admissions);
+
+    // The scanner: speculative admission.
+    before = after;
+    (void)catalogue.stage_artwork("cover", "image/jpeg", test_support::pattern(4096, 12));
+    after = data.stats();
+    CHECK(after.speculative_admissions > before.speculative_admissions);
+    CHECK(after.viewer_admissions == before.viewer_admissions);
+}
+
 } // namespace
