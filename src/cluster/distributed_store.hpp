@@ -66,10 +66,9 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     enum class RepairGate : uint8_t { ran, share, quiescent, credit };
     // The higher classes whose activity holds repair to its share.
     enum RepairPacedBy : uint8_t {
-        paced_by_playback = 1,
-        paced_by_mounted_filesystem = 2,
-        paced_by_loader = 4,
-        paced_by_peer_playback = 8,
+        paced_by_viewer = 1,
+        paced_by_loader = 2,
+        paced_by_peer_viewer = 4,
     };
     struct RepairDiagnostics {
         uint64_t pull_unsourceable{};
@@ -451,14 +450,10 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     uint64_t take_loader_bytes() { return activity_.take_bytes(FrameType::loader); }
     // Advances when membership changes or a storage backend comes or goes.
     uint64_t reachability_epoch() const noexcept;
-    std::chrono::milliseconds foreground_idle_for() const;
-    std::chrono::milliseconds interactive_idle_for() const {
-        return activity_.idle_for(FrameType::read_ahead);
-    }
-    // Durable user-requested work (FUSE publication, ingest, acquisition);
-    // law 3 ranks it above background maintenance, which must see it.
-    std::chrono::milliseconds loader_idle_for() const {
-        return activity_.idle_for(FrameType::loader);
+    // Since work of `work_class` was last present on this node (24 h when
+    // never).
+    std::chrono::milliseconds idle_for(WorkClass work_class) const {
+        return activity_.idle_for(work_class);
     }
     double estimated_network_bps() const {
         return network_bps_.load();
