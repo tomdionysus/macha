@@ -493,7 +493,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             PageQuery page;
             if (auto bad = read_page_query(request, page)) return *bad;
             auto snapshot = catalogue_.snapshot_view(
-                WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/catalogue/items"));
+                WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/catalogue/items", local_waits));
             auto items = catalogue_.list(kind, parent);
             std::sort(items.begin(), items.end(),
                       [](const auto& a, const auto& b) { return a.id < b.id; });
@@ -540,7 +540,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 return true;
             };
             auto snapshot = catalogue_.snapshot_view(
-                WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/catalogue/search"));
+                WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/catalogue/search", local_waits));
             const auto found = catalogue_.search(q->second, offset + limit + 1, keep);
             const auto begin = std::min(offset, found.size());
             const auto end = std::min(begin + limit, found.size());
@@ -651,7 +651,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 auto item = catalogue_.get(id);
                 if (!item) return error(404, "not_found", "catalogue item not found");
                 auto snapshot = catalogue_.snapshot_view(
-                WorkContext(FrameType::control, {}, nullptr, "/api/v1/catalogue/items/{id}"));
+                WorkContext(FrameType::foreground, {}, nullptr, "/api/v1/catalogue/items/{id}", local_waits));
                 auto response = json(200, item_json(*item, *snapshot,
                                                     {catalogue_.cluster_keys(), artwork_capability_ttl_},
                                                     *item_availability(snapshot)));
@@ -679,7 +679,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 validate_parent(catalogue_, item);
                 auto saved = catalogue_.upsert(std::move(item), expected_revision(request));
                 auto snapshot = catalogue_.snapshot_view(
-                WorkContext(FrameType::control, {}, nullptr, "/api/v1/catalogue/items/{id}"));
+                WorkContext(FrameType::foreground, {}, nullptr, "/api/v1/catalogue/items/{id}", local_waits));
                 auto response = json(existing ? 200 : 201, item_json(saved, *snapshot,
                                                     {catalogue_.cluster_keys(), artwork_capability_ttl_},
                                                     *item_availability(snapshot)));
