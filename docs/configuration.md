@@ -693,7 +693,7 @@ catalogue:
     listen: 127.0.0.1
     port: 7438
     workers: 16
-    control_workers: 2
+    control_workers: 4
     max_connections: 1024
     max_queued_requests: 256
     client_io_timeout_ms: 30000
@@ -732,7 +732,7 @@ Validated ranges: `workers` 1..256, `control_workers` 1..64,
 `stream_chunk_bytes` `16K`..`4M`, `client_io_timeout_ms` 1000..300000,
 `max_request_bytes` at least `1K`.
 
-The server is one reactor thread that owns every socket, plus two pools of threads that only compute (see `docs/streaming.md`, "Public HTTP behaviour"). `workers` is the data lane: catalogue, playback, web assets, and every body read that can block on a disk or a replica. `control_workers` is the control lane: health, status, session and account routes, so they are answered while the data lane is saturated. `max_connections` bounds open connections; an idle kept-alive connection is a descriptor and a small struct, not a thread. `max_queued_requests` bounds how many requests may wait for a lane worker before the reactor answers `503 overloaded` with `Retry-After: 1`. `staging_chunks` is how many `stream_chunk_bytes` chunks a streaming response may hold ahead of a slow client, so streaming memory is at most connections × `staging_chunks` × `stream_chunk_bytes`. A handler slower than `slow_request_threshold_ms` is logged with its route; a reactor pass longer than `reactor_stall_threshold_ms` is counted in diagnostics as a stall, which should never happen.
+The server is one reactor thread that owns every socket, plus two pools of threads that only compute (see `docs/streaming.md`, "Public HTTP behaviour"). `workers` is the data lane: catalogue, playback, web assets, and every body read that can block on a disk or a replica. `control_workers` is the control lane: status, session and account routes, so they are answered while the data lane is saturated. `/api/v1/health` is answered by the reactor itself, never queued for a worker. Password checks run scrypt on the control lane, so `session.max_concurrent_password_checks` must be below `control_workers` (the node refuses to start otherwise): logins can never take the whole lane. `max_connections` bounds open connections; an idle kept-alive connection is a descriptor and a small struct, not a thread. `max_queued_requests` bounds how many requests may wait for a lane worker before the reactor answers `503 overloaded` with `Retry-After: 1`. `staging_chunks` is how many `stream_chunk_bytes` chunks a streaming response may hold ahead of a slow client, so streaming memory is at most connections × `staging_chunks` × `stream_chunk_bytes`. A handler slower than `slow_request_threshold_ms` is logged with its route; a reactor pass longer than `reactor_stall_threshold_ms` is counted in diagnostics as a stall, which should never happen.
 
 `compression` gzips text responses on the way out: JSON from the API, and the web client's HTML, CSS and JavaScript. It applies only to complete in-memory bodies above `compression_min_bytes` (at least 64), and only for a client whose `Accept-Encoding` asks for it. Media is never compressed - it is already compressed, it is streamed rather than buffered, and the reactor sends it from resident memory without a copy. Neither are images, fonts or wasm, for the same reason. `compression_level` is the zlib level, 1 to 9; 1 gives most of the ratio for a fraction of the CPU, which is what a Pi-class node wants. Every compressible response carries `Vary: Accept-Encoding` whether or not it was compressed, so a shared cache keys the two representations apart.
 

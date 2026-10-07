@@ -197,6 +197,10 @@ class HttpServer {
     // as it flows, so a body draining to a slow client keeps a viewer
     // present. Set before start().
     void set_activity(std::function<void(WorkClass, uint64_t bytes)> note);
+    // A GET or HEAD of exactly `path` is answered by the reactor itself, never
+    // queued for a worker, so nothing on either lane can delay it. Only for a
+    // handler that reads atomics and builds a small body. Set before start().
+    void set_inline_route(std::string path, std::function<HttpResponse()> handler);
     // Test-only: called once per reactor pass, inside the measured region.
     void set_reactor_pass_hook(std::function<void()> hook);
 

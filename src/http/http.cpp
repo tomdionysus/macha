@@ -8,6 +8,7 @@
 #include "observation.hpp"
 #include "supervised.hpp"
 
+#include <map>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -581,6 +582,7 @@ struct HttpServer::Impl {
     SessionAuthenticator authenticate;
     std::function<WorkClass(std::string_view)> classify;
     std::function<void(WorkClass, uint64_t)> note_activity;
+    std::map<std::string, std::function<HttpResponse()>, std::less<>> inline_routes;
     std::function<void()> pass_hook;
 
     std::shared_ptr<Inbox> inbox;
@@ -1146,7 +1148,34 @@ struct HttpServer::Impl {
             begin_response(connection, HttpResponse{204, "text/plain", {}, {}, {}}, {});
             return;
         }
+        if (request.method == "GET" || request.method == "HEAD") {
+            if (const auto found = inline_routes.find(request.path); found != inline_routes.end()) {
+                answer_inline(connection, request, found->second);
+                return;
+            }
+        }
         post_request(connection, std::move(request));
+    }
+
+    void answer_inline(Connection& connection, const HttpRequest& request,
+                       const std::function<HttpResponse()>& handler) {
+        const auto started = Clock::now();
+        const auto work = request_class(request.path);
+        if (note_activity)
+            note_activity(work, 0);
+        HttpResponse response;
+        try {
+            response = handler();
+        } catch (const std::exception& e) {
+            Log::debug("HTTP inline " + request.path + ": " + e.what());
+            response = http_error(500, "internal", "the request could not be completed");
+        }
+        http_stamp_status(response);
+        observations().record(observation_route_label(request.method, request.path),
+                              elapsed_us(started));
+        ++connection.generation;
+        connection.draining = work;
+        begin_response(connection, std::move(response), {});
     }
 
     void handle_event(Event& event) {
@@ -1433,6 +1462,10 @@ void HttpServer::set_work_class(std::function<WorkClass(std::string_view)> class
 
 void HttpServer::set_activity(std::function<void(WorkClass, uint64_t)> note) {
     impl_->note_activity = std::move(note);
+}
+
+void HttpServer::set_inline_route(std::string path, std::function<HttpResponse()> handler) {
+    impl_->inline_routes.insert_or_assign(std::move(path), std::move(handler));
 }
 
 void HttpServer::set_reactor_pass_hook(std::function<void()> hook) {
