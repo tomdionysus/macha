@@ -192,9 +192,11 @@ class HttpServer {
     // viewer-class. Set before start().
     void set_work_class(std::function<WorkClass(std::string_view path)> classify);
     // Called with a request's class as it is served (not when it is refused
-    // for want of a session), so work of that class is known present. Set
-    // before start().
-    void set_activity(std::function<void(WorkClass)> note);
+    // for want of a session), and again with the bytes of every send while
+    // its response drains: served traffic is work of that class for as long
+    // as it flows, so a body draining to a slow client keeps a viewer
+    // present. Set before start().
+    void set_activity(std::function<void(WorkClass, uint64_t bytes)> note);
     // Test-only: called once per reactor pass, inside the measured region.
     void set_reactor_pass_hook(std::function<void()> hook);
 

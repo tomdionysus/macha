@@ -176,6 +176,8 @@ struct Event {
     HttpResponse response;
     std::shared_ptr<BodyPump> pump;
     std::optional<HttpRequest> request; // carried back when the handler deferred
+    // The class the handler ran as; nothing when the request was refused.
+    std::optional<WorkClass> served;
     Bytes bytes;
     bool ok{};
 };
@@ -380,6 +382,8 @@ struct Connection {
     bool read_in_flight{};
     uint64_t read_offset{};
     bool want_write{};
+    // The served request's class while its response drains; a refusal has none.
+    std::optional<WorkClass> draining;
 };
 
 } // namespace
@@ -576,7 +580,7 @@ struct HttpServer::Impl {
     std::function<bool(const HttpRequest&)> bearer_exempt;
     SessionAuthenticator authenticate;
     std::function<WorkClass(std::string_view)> classify;
-    std::function<void(WorkClass)> note_activity;
+    std::function<void(WorkClass, uint64_t)> note_activity;
     std::function<void()> pass_hook;
 
     std::shared_ptr<Inbox> inbox;
@@ -633,7 +637,7 @@ struct HttpServer::Impl {
         return std::max<size_t>(1, config.staging_chunks);
     }
 
-    HttpResponse run_handler(HttpRequest& request) {
+    HttpResponse run_handler(HttpRequest& request, std::optional<WorkClass>& served) {
         const auto started = Clock::now();
         request.work = request_class(request.path);
         HttpResponse response;
@@ -653,13 +657,15 @@ struct HttpServer::Impl {
                         http_error(401, "unauthorized", "a valid session bearer token is required");
                 } else {
                     request.session = std::move(identity);
+                    served = request.work;
                     if (note_activity)
-                        note_activity(request.work);
+                        note_activity(request.work, 0);
                     response = handler(request);
                 }
             } else {
+                served = request.work;
                 if (note_activity)
-                    note_activity(request.work);
+                    note_activity(request.work, 0);
                 response = handler(request);
             }
         } catch (const std::exception& e) {
@@ -732,7 +738,7 @@ struct HttpServer::Impl {
                 event.kind = EventKind::response;
                 event.connection = id;
                 event.generation = generation;
-                event.response = run_handler(request);
+                event.response = run_handler(request, event.served);
                 if (!event.response.defer) {
                     http_stamp_status(event.response);
                     compress_response(request, event.response);
@@ -1151,6 +1157,7 @@ struct HttpServer::Impl {
                 park(connection, std::move(*event.response.defer), std::move(event.request));
                 return;
             }
+            connection.draining = event.served;
             begin_response(connection, std::move(event.response), std::move(event.pump));
             return;
         case EventKind::chunk:
@@ -1307,6 +1314,9 @@ struct HttpServer::Impl {
             }
             const auto sent = static_cast<size_t>(n);
             connection.deadline = Clock::now() + config.client_io_timeout;
+            // Bytes on the wire are the served request's work while they flow.
+            if (note_activity && connection.draining)
+                note_activity(*connection.draining, sent);
             switch (from) {
             case head:
                 connection.out_sent += sent;
@@ -1342,6 +1352,7 @@ struct HttpServer::Impl {
         connection.read_in_flight = false;
         connection.read_offset = 0;
         connection.request = HttpRequest{};
+        connection.draining.reset();
         connection.deferral.reset();
         if (!connection.keep_alive || connection.input_closed) {
             close_connection(connection.id);
@@ -1413,7 +1424,7 @@ void HttpServer::set_work_class(std::function<WorkClass(std::string_view)> class
     impl_->classify = std::move(classify);
 }
 
-void HttpServer::set_activity(std::function<void(WorkClass)> note) {
+void HttpServer::set_activity(std::function<void(WorkClass, uint64_t)> note) {
     impl_->note_activity = std::move(note);
 }
 
