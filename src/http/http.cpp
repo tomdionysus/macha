@@ -635,6 +635,7 @@ struct HttpServer::Impl {
 
     HttpResponse run_handler(HttpRequest& request) {
         const auto started = Clock::now();
+        request.work = request_class(request.path);
         HttpResponse response;
         try {
             const bool exempt = bearer_exempt && bearer_exempt(request);
@@ -653,12 +654,12 @@ struct HttpServer::Impl {
                 } else {
                     request.session = std::move(identity);
                     if (note_activity)
-                        note_activity(request_class(request.path));
+                        note_activity(request.work);
                     response = handler(request);
                 }
             } else {
                 if (note_activity)
-                    note_activity(request_class(request.path));
+                    note_activity(request.work);
                 response = handler(request);
             }
         } catch (const std::exception& e) {

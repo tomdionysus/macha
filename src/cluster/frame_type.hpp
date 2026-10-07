@@ -33,4 +33,16 @@ constexpr WorkClass work_class(FrameType frame_type) noexcept {
     return WorkClass::speculative;
 }
 
+// The frame a class's work travels on when it moves DATA: a viewer's is
+// foreground. Control has none to move (DATA admission refuses it).
+constexpr FrameType frame_for(WorkClass work) noexcept {
+    switch (work) {
+    case WorkClass::control: return FrameType::control;
+    case WorkClass::viewer: return FrameType::foreground;
+    case WorkClass::loader: return FrameType::loader;
+    case WorkClass::speculative: return FrameType::speculative;
+    }
+    return FrameType::speculative;
+}
+
 } // namespace macha

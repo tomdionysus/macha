@@ -515,10 +515,12 @@ class CatalogueScanner {
         MACHA_REQUIRES(config_mutex_);
     // Fetch and stage the provider artwork `match` names onto its items. An
     // item `locked` names keeps its artwork. False when `stop` interrupted it.
+    // The staging carries `frame`, the class of whoever asked.
     bool stage_remote_artwork(ProviderMatch& match,
                               const std::function<bool(std::string_view)>& locked,
                               std::stop_token stop, size_t max_artwork_bytes,
-                              DistributedStore::DurabilityBatch& artwork_batch);
+                              DistributedStore::DurabilityBatch& artwork_batch,
+                              FrameType frame);
     // The editor's metadata provider for a scan provider ("movies", "tv",
     // "music") and a metadata provider name.
     static MetadataProvider* editor_metadata(
@@ -555,9 +557,10 @@ class CatalogueScanner {
     // Match an unmatched file to a provider reference (`tmdb:movie:<id>`,
     // `tmdb:tv:<id>`, `musicbrainz:release:<mbid>`): fetch the record, build
     // the hierarchy, stage its artwork and bind the file, as a scan match
-    // would. Throws ProviderRequestError with the API's answer.
+    // would. Its DATA work carries `frame`, the asking request's class.
+    // Throws ProviderRequestError with the API's answer.
     ProviderRefMatch match_unmatched_ref(std::string_view hint_id, std::string_view ref,
-                                         const ProviderRefNumbers& numbers);
+                                         const ProviderRefNumbers& numbers, FrameType frame);
     // Search the provider for a kind (movie, show: TMDB; album: MusicBrainz).
     // A result's catalogue_id is kept only when the catalogue holds that item.
     // Throws ProviderRequestError with the API's answer.
@@ -575,10 +578,11 @@ class CatalogueScanner {
                                                      std::string_view release_id);
     // Fetch one listed option and make it the item's artwork for the role.
     // The reference is the item's own unless `ref` names one. Locks the item
-    // unless `lock` is false. Throws ProviderRequestError.
+    // unless `lock` is false. Its DATA work carries `frame`, the asking
+    // request's class. Throws ProviderRequestError.
     CatalogueItem choose_artwork(std::string_view item_id, std::string_view role,
                                  std::string_view option_id, std::optional<std::string> ref,
-                                 ProviderRefNumbers numbers, bool lock);
+                                 ProviderRefNumbers numbers, bool lock, FrameType frame);
     size_t scan_once();
 };
 

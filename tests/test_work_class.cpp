@@ -23,6 +23,13 @@ MACHA_FAST_TEST("work_class", test_every_frame_has_one_class) {
     CHECK(work_class(FrameType::speculative) == WorkClass::speculative);
 }
 
+MACHA_FAST_TEST("work_class", test_each_class_moves_data_on_its_own_frame) {
+    for (const auto work : {WorkClass::control, WorkClass::viewer, WorkClass::loader,
+                            WorkClass::speculative})
+        CHECK(work_class(frame_for(work)) == work);
+    CHECK(frame_for(WorkClass::viewer) == FrameType::foreground);
+}
+
 MACHA_FAST_TEST("work_class", test_presence_is_per_class_and_bytes_per_frame) {
     auto now = Clock::time_point{} + 1h;
     ActivityClocks clocks([&] { return now; });

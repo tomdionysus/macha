@@ -218,8 +218,11 @@ a viewer browsing (stage 3 numbers are the baseline).
 3. **Done, 0.90.37.** `WorkContext::allowed` (default from the class,
    narrowed never widened); `may_enter` is "declared within allowed"; the
    six API reads are viewer work allowing `local_waits`.
-4. The request's class passed down the match and artwork paths.
-5. `docs/principles-and-laws.md` gets the definition (class, what it is,
+4. **Done, 0.90.38.** The request's class passed down the match and
+   artwork paths: `HttpRequest::work` from the route table, `frame_for`
+   back to a frame; staging, the durability barrier, the commit's artwork
+   proof, `upsert` and `put_artwork` take it, defaulting to speculative.
+5. **Done, 0.90.38.** `docs/principles-and-laws.md` gets the definition (class, what it is,
    which frames carry it); `docs/configuration.md` where it names classes.
    No API or wire change, so nothing to announce.
 6. Measure repair pacing with a viewer browsing, against the stage 3

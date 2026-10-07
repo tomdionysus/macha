@@ -1,5 +1,18 @@
 # Current release
 
+## 0.90.38: a request's DATA work carries the request's class
+
+No API, wire, protocol or on-disk changes.
+
+An HTTP request carries its work class from the route table
+(`HttpRequest::work`), and what it sets going in the DATA store carries it
+down, as `frame_for(work)`. A person matching a file, choosing artwork,
+uploading artwork or saving an item in the editor is a viewer: the artwork
+staged and proven for them is admitted as viewer work, ahead of loaders and
+never refused for disk pressure. The scanner's own matching shares those
+paths and stays speculative. Control requests move no DATA: their frame is
+refused at DATA admission.
+
 ## 0.90.37: what work may wait on is said apart from its class
 
 No API, wire, protocol or on-disk changes.
