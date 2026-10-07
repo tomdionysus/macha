@@ -61,10 +61,10 @@ item in section 0, then stage 6.
   Movie, Once Were Warriors, Evil Dead II, 28 Days Later and the first half
   of 12 Monkeys return EIO through the mount within 0.2 s; 5 of 25 sampled.
   The survey counts 206,130 of 941,588 extents unavailable to node-c.
-  Not yet known whether node-f can read them.
+  node-f cannot read them either (EIO after 2 to 6 s, against 0.2 s on
+  node-c): held by no node online. Not established that node-e holds them.
 - **26 GB of abandoned write temp files** in node-c's `state/tmp` from 7 and
-  9 September: a write handle removes its temp file when it finishes, but
-  nothing sweeps those a crash leaves.
+  9 September: swept at startup from 0.90.42; to confirm on node-c's log.
 - **node-c killed by the kernel for memory during a large import** (2026-10-06
   21:16Z; 1.15 GB to 2.1 GB in a minute on a 4 GB node). Cause: each commit
   owed to the peer held two encoded snapshots and the decoded one until its

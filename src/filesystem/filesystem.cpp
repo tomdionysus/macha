@@ -1430,6 +1430,25 @@ void WriteHandle::cleanup() {
         std::filesystem::remove(temp_path_, e);
     }
 }
+std::pair<size_t, uint64_t>
+FileSystem::remove_abandoned_write_files(const std::filesystem::path& state_path,
+                                         const NodeId& node) {
+    const auto prefix = "write." + to_string(node) + ".";
+    size_t files = 0;
+    uint64_t bytes = 0;
+    std::error_code ec;
+    for (const auto& item : std::filesystem::directory_iterator(state_path / "tmp", ec)) {
+        if (!item.is_regular_file(ec) || !item.path().filename().string().starts_with(prefix))
+            continue;
+        const auto size = item.file_size(ec);
+        if (std::filesystem::remove(item.path(), ec)) {
+            ++files;
+            bytes += ec ? 0 : size;
+        }
+    }
+    return {files, bytes};
+}
+
 FileSystem::FileSystem(const Config& config, NodeId node_id, const Membership& membership,
                        LocalState& local, MetadataServer& metadata_server,
                        DistributedStore& s, MetadataView& m,
@@ -1437,6 +1456,10 @@ FileSystem::FileSystem(const Config& config, NodeId node_id, const Membership& m
     : config_(config), node_id_(node_id), membership_(membership), local_(local),
       metadata_server_(metadata_server), retained_memory_(retained_memory), s_(s), m_(m),
       playback_(playback) {
+    const auto [files, bytes] = remove_abandoned_write_files(config_.state_path, node_id_);
+    if (files)
+        Log::info("filesystem removed abandoned write files files=" + std::to_string(files) +
+                  " bytes=" + std::to_string(bytes));
     extent_worker_limit_ = std::max<size_t>(1, config_.fuse.commit_workers);
     extent_task_limit_ = extent_worker_limit_ * 2;
     extent_workers_.reserve(extent_worker_limit_);
