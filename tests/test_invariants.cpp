@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "observation.hpp"
 #include "json.hpp"
 #include "api/manage_api.hpp"
 #include "api/status_api.hpp"
@@ -2365,6 +2366,21 @@ MACHA_TEST("invariants", test_rpc_pre_auth_admission_is_bounded) {
 #else
     std::cout << "[ARCH-REGRESSION] pre-auth admission check requires /proc/self/task; skipped\n";
 #endif
+}
+
+MACHA_TEST("invariants", test_a_durability_barrier_is_timed_per_filesystem) {
+    // Each barrier's time is recorded under the directory its domain was made
+    // for, so control's commits and a DATA disk's are told apart.
+    TempDir t;
+    const auto root = t.path() / "barrier-timed-objects";
+    std::filesystem::create_directories(root);
+    auto& series = observations().histogram("durability.barrier_us.barrier-timed-objects");
+    const auto before = series.snapshot().count;
+    auto domain = std::make_shared<DurabilityDomain>(1, root, 1ms);
+    const auto file = root / "object";
+    std::ofstream(file) << "bytes";
+    domain->await_durable(domain->complete_mutation(file, root), DurabilityUrgency::immediate);
+    CHECK(series.snapshot().count > before);
 }
 
 MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_storage_barriers) {
