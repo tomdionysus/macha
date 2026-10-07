@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.42.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.43.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -32,8 +32,9 @@ continuous browsing not yet measured. The network reserve is 0.90.39 (BBR
 on every peer socket; section 4). A response still draining is viewer work
 until its last byte leaves (0.90.40, 0.90.41; COMPLETED). Open: repair
 yields time, not rate, so it keeps about 3 Mbit/s of an uplink a viewer is
-using; a reserve sized by the operator would close it. Next: the disk
-reserve.
+using; a reserve sized by the operator would close it. The disk reserve is 0.90.43 (bulk writers on the control filesystem
+keep their dirty data to a window; COMPLETED). Left of non-interference:
+CPU, locks and memory, each to audit against control's paths.
 
 ## 1. The catalogue plan: a materialised view of the local head
 
@@ -200,7 +201,7 @@ From the local-first work
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.42**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.43**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -210,7 +211,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.42` back to
+  in place before that version was installed (`pre-0.90.43` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - node-f's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
