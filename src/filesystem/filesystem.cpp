@@ -610,6 +610,11 @@ bool WriteHandle::range_changed(uint64_t begin, uint64_t end) const {
     return it != changed_ranges_.end() && it->begin < end;
 }
 
+void WriteHandle::stage_temp(std::span<const uint8_t> bytes, uint64_t offset) {
+    pwa(temp_, bytes, offset);
+    temp_write_behind_.wrote(temp_, bytes.size());
+}
+
 void WriteHandle::begin_sparse_overlay() {
     if (temp_ >= 0)
         return;
@@ -635,7 +640,7 @@ void WriteHandle::begin_sparse_overlay() {
     // Keep a partially staged sequential tail as overlay data; full extents in
     // extents_ stay reusable by id.
     if (!buffer_.empty()) {
-        pwa(temp_, buffer_, staged_);
+        stage_temp(buffer_, staged_);
         note_changed_range(staged_, staged_ + buffer_.size());
         buffer_.clear();
     }
@@ -702,7 +707,7 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
                 fail(EIO, "staged extent exceeds materialization quantum");
             if (extent.hole) {
                 Bytes zeros(static_cast<size_t>(extent.length), 0);
-                pwa(temp_, zeros, extent.offset);
+                stage_temp(zeros, extent.offset);
             } else {
                 auto bytes = fs_.store().get(extent.id, materialize_extent_index_,
                                              work_context_.frame_type(), {},
@@ -713,7 +718,7 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
                         fail(EINTR, "write cancelled");
                     fail(EIO, "cannot rematerialize staged extent");
                 }
-                pwa(temp_, *bytes, extent.offset);
+                stage_temp(*bytes, extent.offset);
             }
             materialize_offset_ += extent.length;
             processed += extent.length;
@@ -728,7 +733,7 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
             const auto n = static_cast<size_t>(std::min<uint64_t>(
                 {buffer_.size() - buffer_offset, source_size - materialize_offset_,
                  remaining_budget}));
-            pwa(temp_, {buffer_.data() + buffer_offset, n}, materialize_offset_);
+            stage_temp({buffer_.data() + buffer_offset, n}, materialize_offset_);
             materialize_offset_ += n;
             processed += n;
             continue;
@@ -744,7 +749,7 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
                 fail(EINTR, "write cancelled");
             fail(EIO, "short source read");
         }
-        pwa(temp_, bytes, materialize_offset_);
+        stage_temp(bytes, materialize_offset_);
         materialize_offset_ += n;
         processed += n;
     }
@@ -914,7 +919,7 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
 
         rebuild_prepared_ = false;
 
-        pwa(temp_, d, off);
+        stage_temp(d, off);
         if (sparse_overlay_)
             note_changed_range(off, off + d.size());
         logical_ = std::max<uint64_t>(logical_, off + d.size());

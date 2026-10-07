@@ -7,6 +7,7 @@
 #include "cluster/distributed_store.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/namespace_control_store.hpp"
+#include "write_behind.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -259,6 +260,9 @@ class PlaybackTracker;
     std::optional<ExtentRef> append_tail_ MACHA_GUARDED_BY(m_);
     int temp_ MACHA_GUARDED_BY(m_){-1};
     std::filesystem::path temp_path_ MACHA_GUARDED_BY(m_);
+    // The staging file shares the control filesystem: its dirty data is kept
+    // small (write_behind.hpp).
+    WriteBehind temp_write_behind_ MACHA_GUARDED_BY(m_);
     const uint64_t diagnostic_id_{};
     uint64_t diagnostic_write_sequence_ MACHA_GUARDED_BY(m_){};
     size_t diagnostic_completed_extents_ MACHA_GUARDED_BY(m_){};
@@ -304,6 +308,7 @@ class PlaybackTracker;
     std::chrono::milliseconds drain_staging_locked() MACHA_REQUIRES(m_);
     void prepare_append_tail() MACHA_REQUIRES(m_);
     bool canonical_base() const MACHA_REQUIRES(m_);
+    void stage_temp(std::span<const uint8_t>, uint64_t offset) MACHA_REQUIRES(m_);
     void begin_sparse_overlay() MACHA_REQUIRES(m_);
     void note_changed_range(uint64_t, uint64_t) MACHA_REQUIRES(m_);
     bool range_changed(uint64_t, uint64_t) const MACHA_REQUIRES(m_);

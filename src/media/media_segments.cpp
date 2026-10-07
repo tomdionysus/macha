@@ -2,18 +2,44 @@
 #include "media/media_engine.hpp"
 
 #include "contract/thread_safety.hpp"
+#include "write_behind.hpp"
 
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cerrno>
 #include <condition_variable>
+#include <fcntl.h>
 #include <fstream>
 #include <iomanip>
 #include <chrono>
 #include <optional>
 #include <sstream>
+#include <unistd.h>
 
 namespace macha {
+
+namespace {
+// A spilled fragment is on the control filesystem: its writeback starts at
+// once rather than leaving it dirty (write_behind.hpp).
+bool spill_file(const std::filesystem::path& path, const Bytes& bytes) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+        return false;
+    size_t done = 0;
+    while (done < bytes.size()) {
+        const auto n = ::write(fd, bytes.data() + done, bytes.size() - done);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        done += static_cast<size_t>(n);
+    }
+    if (done == bytes.size())
+        start_writeback(fd);
+    return ::close(fd) == 0 && done == bytes.size();
+}
+} // namespace
 
 struct MediaSegmentStore::Impl {
     struct Segment {
@@ -96,12 +122,7 @@ struct MediaSegmentStore::Impl {
                 n << std::setfill('0') << std::setw(6) << i;
                 return n.str();
             }() + ".m4s");
-            std::ofstream out(path, std::ios::binary | std::ios::trunc);
-            if (!out) continue;
-            out.write(reinterpret_cast<const char*>(segments[i].memory->data()),
-                      static_cast<std::streamsize>(segments[i].memory->size()));
-            out.close();
-            if (!out) {
+            if (!spill_file(path, *segments[i].memory)) {
                 std::filesystem::remove(path, ec);
                 continue;
             }
