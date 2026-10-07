@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <future>
+#include <thread>
 #include "api/session_api.hpp"
 #include "test_backend_support.hpp"
 #include "api/users_api.hpp"
@@ -300,6 +302,54 @@ MACHA_FAST_TEST("users", test_user_credentials) {
 
 // What reaches the disk and the wire: the sealed table, the user codec, and
 // a session payload that stays v1 until it carries a user.
+MACHA_FAST_TEST("users", test_a_change_being_written_holds_no_reader_of_the_accounts) {
+#if defined(__linux__)
+    // Every authenticated request reads the account table. A password change
+    // is hashed before any lock and written after the table is released, so a
+    // reader answers while the write is held at its fsync.
+    TempDir dir;
+    const auto path = dir.path() / "users" / "users.bin";
+    std::array<uint8_t, 32> key{};
+    key.fill(7);
+    UserStore store(16, path, key);
+    const auto carol = store.create("carol", "first-password", {std::string(role_manage_users)},
+                                    node_id(1));
+    REQUIRE(carol.has_value());
+
+    auto& hold = test_support::fsync_hold;
+    {
+        std::lock_guard lock(hold.mutex);
+        hold.path = path.string();
+        hold.armed = true;
+    }
+    std::thread writer([&] {
+        CHECK(store.update(carol->id, "second-password", std::nullopt, node_id(1)).has_value());
+    });
+    bool held = false;
+    {
+        std::unique_lock lock(hold.mutex);
+        held = hold.changed.wait_for(lock, scaled(5s), [&] { return hold.holding; });
+    }
+    CHECK(held);
+    auto reader = std::async(std::launch::async, [&] { return store.find(carol->id).has_value(); });
+    const bool answered = reader.wait_for(scaled(2s)) == std::future_status::ready;
+    {
+        std::lock_guard lock(hold.mutex);
+        hold.armed = false;
+    }
+    hold.changed.notify_all();
+    writer.join();
+    CHECK(answered);
+    CHECK(reader.get());
+    CHECK(store.verify("carol", "second-password").ok);
+    CHECK(!store.verify("carol", "first-password").ok);
+
+    // What was written off the lock is what a restart reads.
+    UserStore reloaded(16, path, key);
+    CHECK(reloaded.verify("carol", "second-password").ok);
+#endif
+}
+
 MACHA_FAST_TEST("users", test_user_and_session_encodings) {
     TempDir dir;
     const auto path = dir.path() / "users" / "users.bin";

@@ -186,10 +186,24 @@ class UserStore {
     // An empty password makes a kdf-0 record, which verify() refuses before the KDF.
     std::optional<UserRecord> insert(std::string_view username, std::string_view password,
                                      const std::vector<std::string>& roles, const NodeId& by);
-    void persist_locked() const MACHA_REQUIRES_SHARED(mutex_);
+    // A fresh salt and the password's hash, computed before any lock: the KDF
+    // is tens of milliseconds and every authenticated request reads the table.
+    struct Credential {
+        std::array<uint8_t, 16> salt{};
+        Hash256 hash{};
+    };
+    static Credential hash_password(std::string_view password);
+    bool apply_locked(UserRecord incoming) MACHA_REQUIRES(mutex_);
+    std::vector<UserRecord> records_locked() const MACHA_REQUIRES_SHARED(mutex_);
+    // Seals and writes `records` with no hold on the table; persist_mutex_
+    // keeps writes in the order the changes were made.
+    void write(const std::vector<UserRecord>& records) const MACHA_REQUIRES(persist_mutex_);
 
-    // Held shared while the table is persisted.
-    mutable IoSharedMutex mutex_;
+    // Taken before mutex_ by every change and held until it is on disk.
+    mutable IoMutex persist_mutex_ MACHA_ACQUIRED_BEFORE(mutex_);
+    // Held only to read or change the table in memory, never across I/O or
+    // the KDF.
+    mutable SharedMutex mutex_;
     std::map<std::string, UserRecord> by_id_ MACHA_GUARDED_BY(mutex_);
     const size_t max_users_;
     const std::filesystem::path persisted_path_;

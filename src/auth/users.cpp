@@ -402,6 +402,8 @@ std::optional<UserRecord> UserStore::insert(std::string_view username, std::stri
     user.version = 1;
     user.updated_by = by;
 
+    Lock persisting(persist_mutex_);
+    std::vector<UserRecord> records;
     {
         WriteLock lock(mutex_);
         for (const auto& [_, record] : by_id_)
@@ -410,27 +412,43 @@ std::optional<UserRecord> UserStore::insert(std::string_view username, std::stri
         if (by_id_.size() >= max_users_)
             return std::nullopt;
         by_id_[user.id] = user;
-        persist_locked();
+        records = records_locked();
     }
+    write(records);
     return user;
 }
 
 std::optional<UserRecord> UserStore::mutate(std::string_view user_id,
                                             const std::function<bool(UserRecord&)>& change,
                                             const NodeId& by) {
-    WriteLock lock(mutex_);
-    auto found = by_id_.find(std::string(user_id));
-    if (found == by_id_.end() || found->second.tombstone)
-        return std::nullopt;
-    UserRecord next = found->second;
-    if (!change(next))
-        return std::nullopt;
-    ++next.version;
-    next.updated_unix_ms = unix_ms();
-    next.updated_by = by;
-    found->second = next;
-    persist_locked();
+    Lock persisting(persist_mutex_);
+    UserRecord next;
+    std::vector<UserRecord> records;
+    {
+        WriteLock lock(mutex_);
+        auto found = by_id_.find(std::string(user_id));
+        if (found == by_id_.end() || found->second.tombstone)
+            return std::nullopt;
+        next = found->second;
+        if (!change(next))
+            return std::nullopt;
+        ++next.version;
+        next.updated_unix_ms = unix_ms();
+        next.updated_by = by;
+        found->second = next;
+        records = records_locked();
+    }
+    write(records);
     return next;
+}
+
+UserStore::Credential UserStore::hash_password(std::string_view password) {
+    Credential credential;
+    const auto salt = random_bytes(credential.salt.size());
+    std::copy(salt.begin(), salt.end(), credential.salt.begin());
+    credential.hash =
+        scrypt_hash(password, credential.salt, default_kdf_n, default_kdf_r, default_kdf_p);
+    return credential;
 }
 
 std::optional<UserRecord> UserStore::update(std::string_view user_id, std::string_view password,
@@ -440,22 +458,23 @@ std::optional<UserRecord> UserStore::update(std::string_view user_id, std::strin
     if (roles && std::find(roles->begin(), roles->end(), role_manage_users) == roles->end() &&
         sole_user_manager(user_id))
         return std::nullopt;
+    std::optional<Credential> credential;
+    if (!password.empty())
+        credential = hash_password(password);
     return mutate(
         user_id,
         [&](UserRecord& user) {
             // anonymous cannot be given a password; the whole update is
             // refused, not half applied.
-            if (!password.empty() && user.username == anonymous_username)
+            if (credential && user.username == anonymous_username)
                 return false;
-            if (!password.empty()) {
-                const auto salt = random_bytes(user.salt.size());
-                std::copy(salt.begin(), salt.end(), user.salt.begin());
+            if (credential) {
+                user.salt = credential->salt;
                 user.kdf = 1;
                 user.kdf_n = default_kdf_n;
                 user.kdf_r = default_kdf_r;
                 user.kdf_p = default_kdf_p;
-                user.password_hash =
-                    scrypt_hash(password, user.salt, user.kdf_n, user.kdf_r, user.kdf_p);
+                user.password_hash = credential->hash;
                 // Retires sessions minted against the old password.
                 ++user.credential_generation;
             }
@@ -516,17 +535,16 @@ std::optional<UserRecord> UserStore::reset_root_password(std::string_view new_pa
     auto root = find_by_username(root_username);
     if (!root)
         return std::nullopt;
+    const auto credential = hash_password(new_password);
     return mutate(
         root->id,
         [&](UserRecord& user) {
-            const auto salt = random_bytes(user.salt.size());
-            std::copy(salt.begin(), salt.end(), user.salt.begin());
+            user.salt = credential.salt;
             user.kdf = 1;
             user.kdf_n = default_kdf_n;
             user.kdf_r = default_kdf_r;
             user.kdf_p = default_kdf_p;
-            user.password_hash =
-                scrypt_hash(new_password, user.salt, user.kdf_n, user.kdf_r, user.kdf_p);
+            user.password_hash = credential.hash;
             // Retires every root session, including any held by an intruder.
             ++user.credential_generation;
             return true;
@@ -534,14 +552,12 @@ std::optional<UserRecord> UserStore::reset_root_password(std::string_view new_pa
         by);
 }
 
-bool UserStore::apply(UserRecord incoming) {
-    WriteLock lock(mutex_);
+bool UserStore::apply_locked(UserRecord incoming) {
     auto found = by_id_.find(incoming.id);
     if (found != by_id_.end()) {
         if (!incoming_wins(found->second, incoming))
             return false;
         found->second = std::move(incoming);
-        persist_locked();
         return true;
     }
     if (by_id_.size() >= max_users_) {
@@ -552,14 +568,27 @@ bool UserStore::apply(UserRecord incoming) {
     }
     auto id = incoming.id;
     by_id_.emplace(std::move(id), std::move(incoming));
-    persist_locked();
     return true;
 }
 
+bool UserStore::apply(UserRecord incoming) {
+    return apply_all({std::move(incoming)});
+}
+
 bool UserStore::apply_all(const std::vector<UserRecord>& values) {
+    Lock persisting(persist_mutex_);
     bool changed = false;
-    for (const auto& value : values)
-        changed = apply(value) || changed;
+    std::vector<UserRecord> records;
+    {
+        WriteLock lock(mutex_);
+        for (const auto& value : values)
+            changed = apply_locked(value) || changed;
+        if (changed)
+            records = records_locked();
+    }
+    // One write for the whole set, not one per record.
+    if (changed)
+        write(records);
     return changed;
 }
 
@@ -698,17 +727,26 @@ std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const C
 }
 
 void UserStore::persist() const {
-    ReadLock lock(mutex_);
-    persist_locked();
+    Lock persisting(persist_mutex_);
+    std::vector<UserRecord> records;
+    {
+        ReadLock lock(mutex_);
+        records = records_locked();
+    }
+    write(records);
 }
 
-void UserStore::persist_locked() const {
+std::vector<UserRecord> UserStore::records_locked() const {
+    std::vector<UserRecord> records;
+    records.reserve(by_id_.size());
+    for (const auto& [_, record] : by_id_)
+        records.push_back(record);
+    return records;
+}
+
+void UserStore::write(const std::vector<UserRecord>& values) const {
     if (persisted_path_.empty())
         return;
-    std::vector<UserRecord> values;
-    values.reserve(by_id_.size());
-    for (const auto& [_, record] : by_id_)
-        values.push_back(record);
     try {
         // Hashes replicate to every node, offsite ones included; sealing keeps
         // a stolen disk from being a credential dump (SECURITY.md).

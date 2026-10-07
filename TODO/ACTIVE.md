@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.44.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.45.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -39,14 +39,11 @@ in the observation windows from 0.90.44 (`metadata.*_sync_us`,
 
 Lock audit of control's paths (2026-10-07; the HTTP control routes and the
 metadata server's handlers, which T5's audit did not cover), ranked:
-1. `MetadataReplica::m_` held across a full checkpoint write: a peer's
-   commit reaches `import_history` -> `reset_checkpoint` under it
-   (metadata.cpp:3871-3880, :4267); every control-lane metadata read and
-   /status/diagnostics wait, and the two RPC control workers fill. Fix as
-   `accept_commit` does (:4088): write after releasing.
-2. `UserStore::mutex_` write lock held across scrypt and two fsyncs
-   (users.cpp:421-432, :722; `apply_all` one rewrite per record); every
-   authenticated request takes its read lock.
+1. Done, 0.90.45: the checkpoint is written after releasing
+   `MetadataReplica::m_` on every runtime path. (`compact_if_needed` still
+   writes under it; reached only from `compact()`.)
+2. Done, 0.90.46: the account table is released before the KDF and the
+   write.
 3. `PublicConnectivity::mutex_` held across UPnP, external-IP and
    self-probe (public_connectivity.cpp:298-302); /status waits.
 4. The HTTP control lane (2 workers) runs login scrypt and the
@@ -92,6 +89,14 @@ item in section 0, then stage 6.
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
   `/root/claude-missing-extent-driver.py` are staged on fi-1, not run.
   *Carried.*
+- **`rpc_cluster/test_two_node_mutual_bootstrap_metadata_write_floor`**
+  failed once in a full laptop run (2026-10-07) and once on 2026-10-05
+  (`build/suite-s1a.log`), both on `metadata replica set forming: waiting
+  for bootstrap checkpoint survey`; 24 of 24 under `--repeat` at 8 jobs.
+  The same refusal failed other cases under suite load from 2026-09-21. A
+  first write while the set forms is refused when a peer's survey answer
+  is late, and the test treats the refusal as fatal. P0: decide whether the
+  write should wait for the survey, or the test retry the refusal.
 - **Test failures**, each P0 when it recurs: *carried*
   `filesystem_fuse/test_fuse_recovery_thousand_operations_have_bounded_publications`
   (one segfault on fi-1, 2026-09-28),
@@ -222,7 +227,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.44**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.45**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -232,7 +237,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.44` back to
+  in place before that version was installed (`pre-0.90.45` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
