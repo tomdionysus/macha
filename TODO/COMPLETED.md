@@ -2,8 +2,17 @@
 
 Last updated: 2026-10-07
 
-## 2026-10-07 -- 0.90.39 to 0.90.42
+## 2026-10-07 -- 0.90.39 to 0.90.43
 
+- **Bulk writes keep no backlog for a control commit** (0.90.43). Write
+  staging starts writeback every 8 MB and waits for the previous window; a
+  cache object or spilled fragment starts its writeback once written.
+  Measured on fi-1's root filesystem, a small fsync every 0.25 s beside an
+  8 GB writer: plain, p50 4.5 ms, 7 over 50 ms, max 3.4 s, peak dirty
+  1,880 MB; with write-behind, max 53 ms, peak dirty 16 MB, the writer as
+  fast (20 s against 19). The median rose to 37 ms while the writer ran
+  flat out: each fsync waits for the window in flight. A smaller window
+  would lower it.
 - **Abandoned write files cleared at startup** (0.90.42). gbni-1 removed
   23 files left by the crashes of 7 and 9 September on its first start
   (70.8 GB logical, sparse; the root filesystem went from 59 to 34 GB
