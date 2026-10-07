@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.38.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.39.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -28,8 +28,8 @@ table classes each HTTP request; a served one marks its class present) is
 0.90.36; step 3 (allowed waits apart from class) is 0.90.37; step 4 (the
 request's class passed down its DATA work) and step 5 (the definition in
 the docs) are 0.90.38; step 6 measured on polling load (COMPLETED);
-continuous browsing not yet measured. Next: the non-interference reserves,
-network first, then disk.
+continuous browsing not yet measured. The network reserve is 0.90.39 (BBR
+on every peer socket; section 4). Next: the disk reserve.
 
 ## 1. The catalogue plan: a materialised view of the local head
 
@@ -121,14 +121,14 @@ item in section 0, then stage 6.
 ## 4. Replication and repair
 
 - **Control objects crossed a saturated WAN at 0.9 to 4.6 s each: a law 1
-  defect.** Under load (2026-10-06 20:38Z), fi-1 fetched gbni-1's new
-  catalogue shards, control objects on the control lane, at 0.9 to 4.6 s
-  while the link carried 20 torrents and repair. Two parts: the commit's
-  claims had not delivered the shards (claim scope stops at
-  `metadata_write_copies` holders), and control has no bandwidth reserve on
-  the link. The second is the work-class design's network item (section
-  0); the first, whether a commit's control objects go to every node
-  present with the head, goes with it.
+  defect.** The link half is 0.90.39: cubic on the DATA socket kept about
+  200 ms of queue at the bottleneck, which control waited in, and the idle
+  control socket restarted at a congestion window of ten. Every peer socket
+  now uses BBR: gbni-1's control round trip went from 295 to 451 ms to 85
+  to 122 ms (floor 77 ms), repair unchanged. Still open: whether a commit's
+  control objects should go to every node present with the head (the
+  claims stop at `metadata_write_copies` holders), and libtorrent's own
+  sockets, which use the system's cubic and can fill the same uplink.
 - Repair is bound by the WAN link: one step sends a batch of at most two
   extents and waits for it (about 4 MB in 5 s between fi-1 and gbni-1).
   Pipelining batches, or several steps per pass, would lift it further.
@@ -191,7 +191,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.38**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.39**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -201,7 +201,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.38` back to
+  in place before that version was installed (`pre-0.90.39` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild

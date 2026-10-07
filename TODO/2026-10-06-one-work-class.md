@@ -29,6 +29,11 @@ audit in step 1 covers each:
   bandwidth reserve the pacer keeps free (`repair_share` and the torrent
   rate know their own sending; the reserve is what they must not use), or
   priority on the socket, not just a lane.
+  **0.90.39:** measured, the wait was queueing, not bandwidth: cubic on the
+  DATA socket held about 200 ms of queue at the bottleneck and control's
+  idle socket restarted in slow start. BBR on every peer socket brought
+  gbni-1's control round trip from 295 to 451 ms to 85 to 122 ms against a
+  77 ms floor, with repair unchanged. No configured link rate needed.
 - **Disk**: known gap, recorded in memory as the I/O control-reserve gap
   (es-1, 2026-09-19: ingest starved health). Law 1 has no disk-I/O reserve;
   the pressure gate throttles loaders by measured service time, which is
