@@ -479,6 +479,13 @@ class FileSystem final : public PublicationTarget {
         const FilesystemNamespaceMutation&);
 
   public:
+    // Removes the write staging files `node` left in `state_path/tmp` when it
+    // stopped without finishing them. Only that node's own, and only before
+    // its filesystem exists, so no handle can hold one. Returns the files and
+    // bytes removed.
+    static std::pair<size_t, uint64_t> remove_abandoned_write_files(
+        const std::filesystem::path& state_path, const NodeId& node);
+    // Clears this node's abandoned write files first.
     FileSystem(const Config&, NodeId, const Membership&, LocalState&, MetadataServer&,
                DistributedStore&, MetadataView&, RetainedMemoryLedger&,
                PlaybackTracker* = nullptr);

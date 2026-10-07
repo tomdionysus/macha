@@ -1,5 +1,16 @@
 # Current release
 
+## 0.90.42: a node clears the write files it abandoned
+
+No API, wire, protocol or on-disk changes.
+
+A write handle removes its staging file in `<state_path>/tmp` when it
+finishes, but one open when the process stopped stayed for good: gbni-1
+held 23 of them, 26 GB, from crashes on 7 and 9 September. The filesystem
+now removes the node's own `write.<node id>.*` files when it is constructed,
+before any handle can hold one, and logs what it removed. Another node's
+files and anything in a subdirectory are left alone.
+
 ## 0.90.41: a response is sent at the pace of the client's link
 
 No API, wire, protocol or on-disk changes.

@@ -3,6 +3,7 @@
 #include "fuse/fuse_adapter.hpp"
 #include "test_backend_support.hpp"
 #include <cerrno>
+#include <fstream>
 #include <iostream>
 #include <csignal>
 #include <fcntl.h>
@@ -225,6 +226,35 @@ MACHA_TEST("filesystem_fuse", test_fuse_signal_exit_is_a_clean_service_shutdown)
     CHECK(!fuse_loop_result_is_error(SIGTERM));
     CHECK(!fuse_loop_result_is_error(SIGINT));
     CHECK(fuse_loop_result_is_error(-EIO));
+}
+
+MACHA_FAST_TEST("filesystem_fuse", test_a_node_clears_only_its_own_abandoned_write_files) {
+    TempDir dir;
+    const auto tmp = dir.path() / "tmp";
+    std::filesystem::create_directories(tmp / "playback");
+    const auto own = random_node_id();
+    const auto other = random_node_id();
+    const auto write_file = [](const std::filesystem::path& path, size_t size) {
+        std::ofstream(path, std::ios::binary) << std::string(size, 'x');
+    };
+    write_file(tmp / ("write." + to_string(own) + ".AbCdEf"), 1000);
+    write_file(tmp / ("write." + to_string(own) + ".GhIjKl"), 24);
+    write_file(tmp / ("write." + to_string(other) + ".MnOpQr"), 7);
+    write_file(tmp / "playback" / ("write." + to_string(own) + ".nested"), 5);
+    write_file(tmp / "unrelated", 3);
+
+    const auto [files, bytes] = FileSystem::remove_abandoned_write_files(dir.path(), own);
+    CHECK(files == 2);
+    CHECK(bytes == 1024);
+    CHECK(!std::filesystem::exists(tmp / ("write." + to_string(own) + ".AbCdEf")));
+    // Another node's, anything nested and anything else stay.
+    CHECK(std::filesystem::exists(tmp / ("write." + to_string(other) + ".MnOpQr")));
+    CHECK(std::filesystem::exists(tmp / "playback" / ("write." + to_string(own) + ".nested")));
+    CHECK(std::filesystem::exists(tmp / "unrelated"));
+
+    // Nothing left, or no directory at all: nothing removed, no error.
+    CHECK(FileSystem::remove_abandoned_write_files(dir.path(), own).first == 0);
+    CHECK(FileSystem::remove_abandoned_write_files(dir.path() / "absent", own).first == 0);
 }
 
 MACHA_FAST_TEST("filesystem_fuse", test_fuse_journal_frame_scanner_exhaustive_tail_model) {
