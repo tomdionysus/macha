@@ -7,6 +7,7 @@
 #include "supervised.hpp"
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -19,6 +20,44 @@
 #include <unistd.h>
 
 namespace macha {
+
+bool peer_socket_options(int fd) {
+    int yes = 1;
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    // The OS default first probe (two hours) outlives any NAT mapping, and a
+    // node that cannot be dialled can only redial from its own side. Probe at
+    // 60 s, every 15 s after, give up after four: a dead mapping is noticed
+    // within two minutes at no application cost.
+    int keep_idle = 60;
+    int keep_interval = 15;
+    int keep_count = 4;
+#ifdef TCP_KEEPIDLE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+#elif defined(TCP_KEEPALIVE)
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keep_idle, sizeof(keep_idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_interval, sizeof(keep_interval));
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_count, sizeof(keep_count));
+#endif
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+#ifdef TCP_CONGESTION
+    if (setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, peer_congestion_control,
+                   static_cast<socklen_t>(strlen(peer_congestion_control))) == 0)
+        return true;
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+        Log::warn(std::string("peer sockets keep the system congestion control: ") +
+                  peer_congestion_control + " unavailable (" + strerror(errno) + ")");
+#endif
+    return false;
+}
+
 namespace {
 // 22: the metadata snapshot carries torrent requests (SM15/SM16, DLT9),
 // which a protocol-21 node rejects, so the two cannot share a cluster.
@@ -67,33 +106,6 @@ bool reset_invalidates_node_reference(const std::map<std::string, IdentityAssoci
 void validate_frame_limit(size_t size) {
     if (size < protocol_min_frame_size || size > protocol_max_frame_size)
         throw std::runtime_error("max frame size must be 4K..4M");
-}
-
-void socket_options(int fd) {
-    int yes = 1;
-#ifdef SO_NOSIGPIPE
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
-#endif
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
-    // The OS default first probe (two hours) outlives any NAT mapping, and a
-    // node that cannot be dialled can only redial from its own side. Probe at
-    // 60 s, every 15 s after, give up after four: a dead mapping is noticed
-    // within two minutes at no application cost.
-    int keep_idle = 60;
-    int keep_interval = 15;
-    int keep_count = 4;
-#ifdef TCP_KEEPIDLE
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
-#elif defined(TCP_KEEPALIVE)
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keep_idle, sizeof(keep_idle));
-#endif
-#ifdef TCP_KEEPINTVL
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_interval, sizeof(keep_interval));
-#endif
-#ifdef TCP_KEEPCNT
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_count, sizeof(keep_count));
-#endif
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 }
 
 void socket_timeout(int fd, std::chrono::milliseconds timeout) {
@@ -244,7 +256,7 @@ int connect_socket(const Endpoint& endpoint, std::chrono::milliseconds timeout) 
 
         if (rc == 0) {
             fcntl(fd, F_SETFL, flags);
-            socket_options(fd);
+            peer_socket_options(fd);
             break;
         }
 
@@ -758,7 +770,7 @@ FrameType default_frame_type(MessageType type) noexcept {
 SecureChannel::SecureChannel(int fd, ClusterKeys keys, NodeInfo local, size_t max_frame_size)
     : fd_(fd), keys_(keys), local_(std::move(local)), configured_max_frame_size_(max_frame_size) {
     validate_frame_limit(configured_max_frame_size_);
-    socket_options(fd_);
+    peer_socket_options(fd_);
 }
 
 SecureChannel::~SecureChannel() {
@@ -4065,7 +4077,7 @@ void RpcServer::accept_loop(std::stop_token stop) {
         int client = accept(fd, reinterpret_cast<sockaddr*>(&address), &size);
         if (client < 0)
             continue;
-        socket_options(client);
+        peer_socket_options(client);
 
         size_t pre_auth = pre_auth_sessions_.load(std::memory_order_relaxed);
         while (pre_auth < max_pre_auth_sessions &&
