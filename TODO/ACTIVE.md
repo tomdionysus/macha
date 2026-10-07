@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.46.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.47.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -44,12 +44,11 @@ metadata server's handlers, which T5's audit did not cover), ranked:
    writes under it; reached only from `compact()`.)
 2. Done, 0.90.46: the account table is released before the KDF and the
    write.
-3. `PublicConnectivity::mutex_` held across UPnP, external-IP and
-   self-probe (public_connectivity.cpp:298-302); /status waits.
+3. Done, 0.90.47: the connectivity check works on a copy and publishes.
 4. The HTTP control lane (2 workers) runs login scrypt and the
    connectivity check; two logins queue /health and /status.
-5. `Membership::m_` and `inbound_mutex_` held across an fsync; both on
-   /status.
+5. Done, 0.90.47: the roster and the inbound resolution are written after
+   their locks are released.
 6. One 128 MiB outbound budget for the control session (net.cpp:89).
 Not fully traced: `RpcClient::mutex_` holders, `Membership::m_` bodies.
 
@@ -234,7 +233,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.46**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.47**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -244,7 +243,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.46` back to
+  in place before that version was installed (`pre-0.90.47` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild

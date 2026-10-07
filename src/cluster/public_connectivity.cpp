@@ -285,7 +285,7 @@ PublicConnectivity::PublicConnectivity(const Config& config, NodeId node_id, End
 }
 
 PublicConnectivity::~PublicConnectivity() {
-    Lock lock(mutex_);
+    Lock work(work_mutex_);
     remove_owned_mapping_locked();
 }
 
@@ -295,38 +295,44 @@ PublicConnectivityStatus PublicConnectivity::status() const {
 }
 
 PublicConnectivityStatus PublicConnectivity::refresh(bool should_probe, bool force_probe) {
-    Lock lock(mutex_);
-    refresh_locked();
+    Lock work(work_mutex_);
+    auto next = status();
+    refresh_locked(next);
     if (should_probe)
-        probe_locked(force_probe);
-    return status_;
+        probe_locked(next, force_probe);
+    Lock lock(mutex_);
+    status_ = next;
+    return next;
 }
 
 PublicConnectivityStatus PublicConnectivity::probe(bool force) {
+    Lock work(work_mutex_);
+    auto next = status();
+    probe_locked(next, force);
     Lock lock(mutex_);
-    probe_locked(force);
-    return status_;
+    status_ = next;
+    return next;
 }
 
-void PublicConnectivity::refresh_locked() {
-    status_.advertised = configured_;
-    status_.advertised_source = "configured";
-    status_.upnp.gateway_found = false;
-    status_.upnp.mapping_active = false;
-    status_.upnp.mapping_created = false;
-    status_.upnp.mapping_owned = false;
-    status_.upnp.private_wan = false;
-    status_.upnp.lan_address.clear();
-    status_.upnp.external_address.clear();
-    status_.upnp.igd_status = 0;
-    status_.upnp.error.clear();
-    status_.upnp.error_code.clear();
-    status_.external_ip.attempted = false;
-    status_.external_ip.address.clear();
-    status_.external_ip.error.clear();
-    status_.external_ip.error_code.clear();
-    status_.self_probe = "not_run";
-    status_.self_probe_error.clear();
+void PublicConnectivity::refresh_locked(PublicConnectivityStatus& status) {
+    status.advertised = configured_;
+    status.advertised_source = "configured";
+    status.upnp.gateway_found = false;
+    status.upnp.mapping_active = false;
+    status.upnp.mapping_created = false;
+    status.upnp.mapping_owned = false;
+    status.upnp.private_wan = false;
+    status.upnp.lan_address.clear();
+    status.upnp.external_address.clear();
+    status.upnp.igd_status = 0;
+    status.upnp.error.clear();
+    status.upnp.error_code.clear();
+    status.external_ip.attempted = false;
+    status.external_ip.address.clear();
+    status.external_ip.error.clear();
+    status.external_ip.error_code.clear();
+    status.self_probe = "not_run";
+    status.self_probe_error.clear();
 
     const uint16_t external_port =
         upnp_config_.external_port ? upnp_config_.external_port : configured_.port;
@@ -335,19 +341,19 @@ void PublicConnectivity::refresh_locked() {
 #ifdef MACHA_HAVE_MINIUPNPC
         std::string discovery_error;
         if (auto session = discover_upnp(upnp_config_.discovery_timeout, discovery_error)) {
-            status_.upnp.gateway_found = true;
-            status_.upnp.igd_status = session->igd_status;
-            status_.upnp.lan_address = session->lan.data();
-            status_.upnp.external_address = session->wan.data();
+            status.upnp.gateway_found = true;
+            status.upnp.igd_status = session->igd_status;
+            status.upnp.lan_address = session->lan.data();
+            status.upnp.external_address = session->wan.data();
             bool usable_igd = true;
 #if MINIUPNPC_API_VERSION >= 18
-            status_.upnp.private_wan =
+            status.upnp.private_wan =
                 miniupnpc_compat::private_wan(MINIUPNPC_API_VERSION, session->igd_status);
 #endif
             usable_igd = miniupnpc_compat::usable(MINIUPNPC_API_VERSION, session->igd_status);
             if (!usable_igd) {
-                status_.upnp.error_code = "igd_not_connected";
-                status_.upnp.error =
+                status.upnp.error_code = "igd_not_connected";
+                status.upnp.error =
                     "UPnP IGD is not connected status=" + std::to_string(session->igd_status);
             }
             if (usable_igd) {
@@ -358,10 +364,10 @@ void PublicConnectivity::refresh_locked() {
 
                 const auto existing = get_mapping(*session, external_port);
                 bool active = existing.exists && existing.internal_port == configured_.port &&
-                              existing.internal_client == status_.upnp.lan_address;
+                              existing.internal_client == status.upnp.lan_address;
                 if (existing.exists && !active) {
-                    status_.upnp.error_code = "port_mapped_elsewhere";
-                    status_.upnp.error = "UPnP external port " + ext + " is already mapped to " +
+                    status.upnp.error_code = "port_mapped_elsewhere";
+                    status.upnp.error = "UPnP external port " + ext + " is already mapped to " +
                                          existing.internal_client + ":" +
                                          std::to_string(existing.internal_port);
                 } else if (!active) {
@@ -372,105 +378,105 @@ void PublicConnectivity::refresh_locked() {
                     if (result == UPNPCOMMAND_SUCCESS) {
                         const auto created = get_mapping(*session, external_port);
                         active = created.exists && created.internal_port == configured_.port &&
-                                 created.internal_client == status_.upnp.lan_address;
+                                 created.internal_client == status.upnp.lan_address;
                         if (active) {
                             mapping_owned_ = true;
                             owned_external_port_ = external_port;
-                            status_.upnp.mapping_created = true;
-                            status_.upnp.mapping_owned = true;
+                            status.upnp.mapping_created = true;
+                            status.upnp.mapping_owned = true;
                         } else {
-                            status_.upnp.error_code = "mapping_verification_failed";
-                            status_.upnp.error =
+                            status.upnp.error_code = "mapping_verification_failed";
+                            status.upnp.error =
                                 "UPnP AddPortMapping succeeded but mapping verification failed";
                         }
                     } else {
-                        status_.upnp.error_code = "add_mapping_failed";
-                        status_.upnp.error =
+                        status.upnp.error_code = "add_mapping_failed";
+                        status.upnp.error =
                             "UPnP AddPortMapping failed code=" + std::to_string(result) + " (" +
                             strupnperror(result) + ")";
                     }
                 }
-                status_.upnp.mapping_active = active;
-                status_.upnp.mapping_owned = active && mapping_owned_;
-                if (active && ipv4_literal(status_.upnp.external_address)) {
-                    status_.advertised = {status_.upnp.external_address, external_port};
-                    status_.advertised_source = "upnp";
+                status.upnp.mapping_active = active;
+                status.upnp.mapping_owned = active && mapping_owned_;
+                if (active && ipv4_literal(status.upnp.external_address)) {
+                    status.advertised = {status.upnp.external_address, external_port};
+                    status.advertised_source = "upnp";
                 }
             }
         } else {
-            status_.upnp.error_code = "discovery_failed";
-            status_.upnp.error = std::move(discovery_error);
+            status.upnp.error_code = "discovery_failed";
+            status.upnp.error = std::move(discovery_error);
         }
 #else
-        status_.upnp.error_code = "support_not_built";
-        status_.upnp.error = "UPnP support was not built (miniupnpc not found)";
+        status.upnp.error_code = "support_not_built";
+        status.upnp.error = "UPnP support was not built (miniupnpc not found)";
 #endif
     }
 
     const bool needs_external_ip =
         external_ip_config_.enabled &&
-        (status_.advertised_source == "configured" || status_.upnp.private_wan ||
-         (status_.upnp.mapping_active && !ipv4_literal(status_.upnp.external_address)));
+        (status.advertised_source == "configured" || status.upnp.private_wan ||
+         (status.upnp.mapping_active && !ipv4_literal(status.upnp.external_address)));
     if (needs_external_ip) {
-        status_.external_ip.attempted = true;
+        status.external_ip.attempted = true;
         try {
-            status_.external_ip.address = aws_external_ip(external_ip_config_.timeout);
-            status_.advertised.host = status_.external_ip.address;
-            status_.advertised.port =
-                status_.upnp.mapping_active ? external_port : configured_.port;
-            status_.advertised_source =
-                status_.upnp.mapping_active ? "upnp+external_ip" : "external_ip";
+            status.external_ip.address = aws_external_ip(external_ip_config_.timeout);
+            status.advertised.host = status.external_ip.address;
+            status.advertised.port =
+                status.upnp.mapping_active ? external_port : configured_.port;
+            status.advertised_source =
+                status.upnp.mapping_active ? "upnp+external_ip" : "external_ip";
         } catch (const std::exception& error) {
-            status_.external_ip.error_code = "lookup_failed";
-            status_.external_ip.error = error.what();
+            status.external_ip.error_code = "lookup_failed";
+            status.external_ip.error = error.what();
         }
     }
 
-    status_.checked_unix_ms = unix_ms();
+    status.checked_unix_ms = unix_ms();
 
     if (upnp_config_.enabled) {
-        if (status_.upnp.mapping_active) {
-            Log::info("UPnP port mapping active gateway_external=" + status_.upnp.external_address +
-                      ":" + std::to_string(status_.upnp.external_port) + " internal=" +
-                      status_.upnp.lan_address + ":" + std::to_string(configured_.port) +
+        if (status.upnp.mapping_active) {
+            Log::info("UPnP port mapping active gateway_external=" + status.upnp.external_address +
+                      ":" + std::to_string(status.upnp.external_port) + " internal=" +
+                      status.upnp.lan_address + ":" + std::to_string(configured_.port) +
                       " lease_s=" + std::to_string(upnp_config_.lease_seconds));
-            if (status_.upnp.private_wan)
+            if (status.upnp.private_wan)
                 Log::warn("UPnP gateway WAN address is private address=" +
-                          status_.upnp.external_address + " probable_cgnat=true");
-        } else if (!status_.upnp.error.empty()) {
-            Log::warn(status_.upnp.error);
+                          status.upnp.external_address + " probable_cgnat=true");
+        } else if (!status.upnp.error.empty()) {
+            Log::warn(status.upnp.error);
         }
     }
-    if (status_.external_ip.attempted) {
-        if (!status_.external_ip.address.empty())
-            Log::info("external IP discovered source=aws address=" + status_.external_ip.address);
-        else if (!status_.external_ip.error.empty())
-            Log::warn(status_.external_ip.error);
+    if (status.external_ip.attempted) {
+        if (!status.external_ip.address.empty())
+            Log::info("external IP discovered source=aws address=" + status.external_ip.address);
+        else if (!status.external_ip.error.empty())
+            Log::warn(status.external_ip.error);
     }
 }
 
-void PublicConnectivity::probe_locked(bool force) {
-    status_.self_probe_error.clear();
+void PublicConnectivity::probe_locked(PublicConnectivityStatus& status, bool force) {
+    status.self_probe_error.clear();
     if (!check_config_.enabled && !force) {
-        status_.self_probe = "disabled";
-        status_.checked_unix_ms = unix_ms();
+        status.self_probe = "disabled";
+        status.checked_unix_ms = unix_ms();
         return;
     }
 
     std::string error;
-    if (tcp_probe(status_.advertised, check_config_.timeout, error)) {
-        status_.self_probe = "reachable";
-        Log::info("connectivity self probe reachable endpoint=" + status_.advertised.host + ":" +
-                  std::to_string(status_.advertised.port) + " external_verification=unknown");
+    if (tcp_probe(status.advertised, check_config_.timeout, error)) {
+        status.self_probe = "reachable";
+        Log::info("connectivity self probe reachable endpoint=" + status.advertised.host + ":" +
+                  std::to_string(status.advertised.port) + " external_verification=unknown");
     } else {
-        status_.self_probe = "unreachable";
-        status_.self_probe_error = std::move(error);
-        Log::warn("connectivity self probe failed endpoint=" + status_.advertised.host + ":" +
-                  std::to_string(status_.advertised.port) +
-                  " external_reachability=unknown reason=\"" + status_.self_probe_error +
+        status.self_probe = "unreachable";
+        status.self_probe_error = std::move(error);
+        Log::warn("connectivity self probe failed endpoint=" + status.advertised.host + ":" +
+                  std::to_string(status.advertised.port) +
+                  " external_reachability=unknown reason=\"" + status.self_probe_error +
                   "\" (NAT loopback may be unavailable)");
     }
-    status_.checked_unix_ms = unix_ms();
+    status.checked_unix_ms = unix_ms();
 }
 
 void PublicConnectivity::remove_owned_mapping_locked() noexcept {

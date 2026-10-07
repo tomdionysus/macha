@@ -108,9 +108,9 @@ void Membership::load_known() {
     reader.finish();
 }
 
-void Membership::persist_known_locked() {
+Membership::EncodedRoster Membership::encode_known_locked() {
     if (known_path_.empty())
-        return;
+        return {};
     if (nodes_.size() > max_known_nodes)
         throw std::runtime_error("too many known nodes");
     std::vector<const R*> ordered;
@@ -155,10 +155,19 @@ void Membership::persist_known_locked() {
     const auto& bytes = writer.data();
     if (bytes.size() > max_known_bytes)
         throw std::runtime_error("known-node roster is too large");
-    durable_replace_file(
-        known_path_, std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
     for (auto& [_, record] : nodes_)
         record.persisted_seen_unix_ms = record.last_seen_unix_ms;
+    return {++roster_sequence_, std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size())};
+}
+
+void Membership::write_known(const EncodedRoster& roster) {
+    if (known_path_.empty())
+        return;
+    Lock persisting(persist_m_);
+    if (roster.sequence <= written_sequence_)
+        return;
+    durable_replace_file(known_path_, roster.bytes);
+    written_sequence_ = roster.sequence;
 }
 
 NodeInfo Membership::self() const {
@@ -268,8 +277,11 @@ void Membership::observe(NodeInfo n, bool direct) {
                 wall - i->second.persisted_seen_unix_ms >= seen_persist_step_ms;
         }
     }
-    if (durable_roster_changed)
-        persist_known_locked();
+    if (!durable_roster_changed)
+        return;
+    const auto roster = encode_known_locked();
+    g.unlock();
+    write_known(roster);
 }
 
 bool Membership::apply_identity_reset(const IdentityAssociationReset& reset) {
@@ -288,7 +300,9 @@ bool Membership::apply_identity_reset(const IdentityAssociationReset& reset) {
     });
     // Persist the tombstone even when the member is absent from the roster, so
     // the reset survives a restart and works without cluster metadata.
-    persist_known_locked();
+    const auto roster = encode_known_locked();
+    g.unlock();
+    write_known(roster);
     return true;
 }
 
@@ -360,8 +374,11 @@ size_t Membership::forget_unseen() {
         return now - record.seen > dead_ && wall >= record.last_seen_unix_ms &&
                wall - record.last_seen_unix_ms >= static_cast<uint64_t>(horizon.count());
     });
-    if (forgotten)
-        persist_known_locked();
+    if (forgotten) {
+        const auto roster = encode_known_locked();
+        g.unlock();
+        write_known(roster);
+    }
     return forgotten;
 }
 

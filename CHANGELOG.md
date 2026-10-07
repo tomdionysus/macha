@@ -1,5 +1,23 @@
 # Current release
 
+## 0.90.47: /status waits on no probe and no roster write
+
+No API, wire, protocol or on-disk changes.
+
+Three locks that `/status` reads were held across slow work. The
+connectivity check held its status lock across UPnP discovery, the
+external-IP lookup and the TCP self-probe, seconds each; a check now works
+on a copy under its own lock and publishes the result. Membership held its
+lock across the known-node roster's fsync, on the gossip path; the roster is
+now encoded under the lock and written after it is released, in the order
+it was encoded. The inbound resolution held its lock across its file's
+fsync on every apply; it is now written from a copy after release. Tests
+hold the slow part and read the status meanwhile.
+
+A test of the absence horizon had 20 ms between its sleeps and the edges
+it checks, and crossed one under a loaded suite; each check is now 70 ms or
+more from its edge.
+
 ## 0.90.46: a change to an account holds no request that reads accounts
 
 No API, wire, protocol or on-disk changes.

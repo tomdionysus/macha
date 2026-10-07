@@ -94,8 +94,11 @@ class NodeRuntime : public ClusterNode {
     // watches; the node never calls a consumer.
     NodeEvents& events_;
     // Declared before members_ so the roster is built with the right flags.
-    // Held across the resolution file's durable replace and its failure log.
-    mutable IoMutex inbound_mutex_;
+    // Held by a resolution being applied until its file is written, so
+    // writes land in order.
+    mutable IoMutex inbound_persist_mutex_ MACHA_ACQUIRED_BEFORE(inbound_mutex_);
+    // Held only to read or change the resolution in memory.
+    mutable Mutex inbound_mutex_;
     InboundResolution inbound_ MACHA_GUARDED_BY(inbound_mutex_);
 
     // The control plane is constructed before storage and metadata, so the
@@ -161,7 +164,8 @@ class NodeRuntime : public ClusterNode {
     void connectivity_loop(std::stop_token);
     bool resolve_hosts_extents_for(bool inbound_capable) const;
     void apply_inbound_resolution(bool inbound_capable, std::string source);
-    void persist_inbound_resolution_locked() const MACHA_REQUIRES(inbound_mutex_);
+    void persist_inbound_resolution(const InboundResolution&) const
+        MACHA_REQUIRES(inbound_persist_mutex_);
     void refuse_impossible_cluster() const;
     void exchange(const Endpoint&);
     void exchange(const NodeInfo&);
