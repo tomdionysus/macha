@@ -32,8 +32,8 @@ continuous browsing not yet measured. The network reserve is 0.90.39 (BBR
 on every peer socket; section 4). A response still draining is viewer work
 until its last byte leaves (0.90.40, 0.90.41; COMPLETED). Open: repair
 yields time, not rate, so it keeps about 3 Mbit/s of an uplink a viewer is
-using; a reserve sized by the operator would close it. Next: the five
-unreadable movies (section 2), then the disk reserve.
+using; a reserve sized by the operator would close it. Next: the disk
+reserve.
 
 ## 1. The catalogue plan: a materialised view of the local head
 
@@ -57,12 +57,6 @@ item in section 0, then stage 6.
 
 ## 2. Failing tests and defects
 
-- **Five movies unreadable on gbni-1** (2026-10-07): The Transformers: The
-  Movie, Once Were Warriors, Evil Dead II, 28 Days Later and the first half
-  of 12 Monkeys return EIO through the mount within 0.2 s; 5 of 25 sampled.
-  The survey counts 206,130 of 941,588 extents unavailable to gbni-1.
-  fi-1 cannot read them either (EIO after 2 to 6 s, against 0.2 s on
-  gbni-1): held by no node online. Not established that es-1 holds them.
 - **gbni-1 killed by the kernel for memory during a large import** (2026-10-06
   21:16Z; 1.15 GB to 2.1 GB in a minute on a 4 GB node). Cause: each commit
   owed to the peer held two encoded snapshots and the decoded one until its
@@ -144,8 +138,13 @@ item in section 0, then stage 6.
   Pipelining batches, or several steps per pass, would lift it further.
 - Expose the counts holdings now give: extents this node lacks, extents each
   peer lacks, extents below their replication target.
-- **Unsourceable objects on fi-1**: extents no node can supply, probably lost
-  with es-1; the survey's `unavailable` count is the measure now. *Carried.*
+- **Extents held by no node online** (2026-10-07): five of 25 sampled
+  movies (The Transformers: The Movie, Once Were Warriors, Evil Dead II,
+  28 Days Later, most of 12 Monkeys) return EIO on both nodes, 0.2 s on
+  gbni-1 and 2 to 6 s on fi-1; the survey counts 206,130 of 941,588
+  extents unavailable. EIO is the correct answer. Whether es-1 holds them
+  is not known either way: es-1 is offline, and only its return settles it.
+  fi-1's slower refusal is worth a look (a viewer waits for the error).
 - Per-peer down state in the transport; `fsync` without a deadline.
 - Seven namespace conflicts standing from before 0.89.0.
 - Say why a node counts itself busy (the pacer's active classes in status).
