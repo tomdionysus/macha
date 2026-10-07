@@ -193,7 +193,9 @@ MACHA_TEST("http_server", test_a_blocking_body_read_on_one_connection_does_not_d
             return http_json(200, "{\"status\":\"ok\"}");
         return http_error(404, "not_found", "not found");
     });
-    server.set_control_prefixes({"/api/v1/health"});
+    server.set_work_class([](std::string_view path) {
+        return path == "/api/v1/health" ? WorkClass::control : WorkClass::viewer;
+    });
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
 
@@ -231,7 +233,9 @@ MACHA_TEST("http_server",
             return http_json(200, "{\"status\":\"ok\"}");
         return http_error(404, "not_found", "not found");
     });
-    server.set_control_prefixes({"/api/v1/health"});
+    server.set_work_class([](std::string_view path) {
+        return path == "/api/v1/health" ? WorkClass::control : WorkClass::viewer;
+    });
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
 
@@ -333,7 +337,9 @@ MACHA_TEST("http_server", test_hundreds_of_idle_keep_alive_connections_cost_noth
             return http_json(200, "{\"status\":\"ok\"}");
         return http_json(200, "{\"ok\":true}");
     });
-    server.set_control_prefixes({"/api/v1/health"});
+    server.set_work_class([](std::string_view path) {
+        return path == "/api/v1/health" ? WorkClass::control : WorkClass::viewer;
+    });
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
 

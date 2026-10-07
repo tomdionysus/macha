@@ -2977,7 +2977,7 @@ void add_artwork(CatalogueItem& item, CatalogueArtwork art) {
 bool CatalogueScanner::stage_remote_artwork(
     ProviderMatch& match, const std::function<bool(std::string_view)>& locked,
     std::stop_token stop, size_t max_artwork_bytes,
-    DistributedStore::DurabilityBatch& artwork_batch) {
+    DistributedStore::DurabilityBatch& artwork_batch, FrameType frame) {
     struct Fetch {
         const RemoteArtwork* art{};
         CatalogueItem* target{};
@@ -3042,7 +3042,7 @@ bool CatalogueScanner::stage_remote_artwork(
         if (!mime.starts_with("image/")) continue;
         try {
             auto staged = catalogue_.stage_artwork_deferred(
-                art.role, mime, response.body, artwork_batch);
+                art.role, mime, response.body, artwork_batch, frame);
             {
                 Lock lock(remote_artwork_mutex_);
                 if (remote_artwork_.size() >= remote_artwork_max)
@@ -3136,7 +3136,8 @@ std::vector<ProviderSearchResult> CatalogueScanner::search_providers(
 
 ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
                                                        std::string_view ref,
-                                                       const ProviderRefNumbers& numbers) {
+                                                       const ProviderRefNumbers& numbers,
+                                                       FrameType frame) {
     auto hint = hints_.get(hint_id);
     if (!hint || hint->media_id.empty())
         throw ProviderRequestError(404, "not_found", "unmatched file not found");
@@ -3226,12 +3227,12 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
         return lock != item->external_ids.end() && lock->second == "1";
     };
     const auto lookup_ms = stage_ms();
-    (void)stage_remote_artwork(*match, locked, {}, max_artwork_bytes, artwork_batch);
+    (void)stage_remote_artwork(*match, locked, {}, max_artwork_bytes, artwork_batch, frame);
     const auto artwork_ms = stage_ms();
-    if (!catalogue_.artwork_durability_barrier(artwork_batch))
+    if (!catalogue_.artwork_durability_barrier(artwork_batch, frame))
         throw CatalogueUnavailable("catalogue artwork durability floor unavailable");
     const auto barrier_ms = stage_ms();
-    catalogue_.reconcile_scanner(match->items, {probe.media_id}, false, {}, {});
+    catalogue_.reconcile_scanner(match->items, {probe.media_id}, false, {}, {}, {}, frame);
     if (Log::enabled(LogLevel::debug))
         Log::debug("catalogue match path=" + hint->path + " lookup_ms=" + lookup_ms +
                    " artwork_ms=" + artwork_ms + " images=" +
@@ -3347,7 +3348,8 @@ std::vector<ProviderReleaseTrack> CatalogueScanner::release_tracks(std::string_v
 CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::string_view role,
                                                std::string_view option_id,
                                                std::optional<std::string> ref,
-                                               ProviderRefNumbers numbers, bool lock) {
+                                               ProviderRefNumbers numbers, bool lock,
+                                               FrameType frame) {
     auto item = catalogue_.get(item_id);
     if (!item) throw ProviderRequestError(404, "not_found", "catalogue item not found");
 
@@ -3421,7 +3423,7 @@ CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::st
         throw provider_unavailable("artwork",
                                    "the image fetch answered HTTP " + std::to_string(response.status));
 
-    auto art = catalogue_.stage_artwork(std::string(role), mime, response.body);
+    auto art = catalogue_.stage_artwork(std::string(role), mime, response.body, frame);
     std::erase_if(item->artwork, [&](const CatalogueArtwork& existing) {
         return existing.role == art.role;
     });
@@ -3430,7 +3432,7 @@ CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::st
         item->external_ids["macha_metadata_locked"] = "1";
     else
         item->external_ids.erase("macha_metadata_locked");
-    return catalogue_.upsert(*item, item->revision);
+    return catalogue_.upsert(*item, item->revision, frame);
 }
 
 std::optional<CatalogueScanner::PreparedHintMatch>
@@ -3660,7 +3662,8 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         const auto lock = old->external_ids.find("macha_metadata_locked");
         return lock != old->external_ids.end() && lock->second == "1";
     };
-    if (!stage_remote_artwork(match, locked, stop, config.max_artwork_bytes, artwork_batch))
+    if (!stage_remote_artwork(match, locked, stop, config.max_artwork_bytes, artwork_batch,
+                              FrameType::speculative))
         return {};
 
     std::vector<std::string> item_ids;
