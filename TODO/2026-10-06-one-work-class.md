@@ -215,7 +215,9 @@ a viewer browsing (stage 3 numbers are the baseline).
 2. **Done, 0.90.36.** The route table classes requests; the server follows
    it and marks the clock. Behaviour change: API activity is a viewer
    present. A request refused for want of a session marks nothing.
-3. `WorkContext::allowed`; API reads become viewer-class, waits none.
+3. **Done, 0.90.37.** `WorkContext::allowed` (default from the class,
+   narrowed never widened); `may_enter` is "declared within allowed"; the
+   six API reads are viewer work allowing `local_waits`.
 4. The request's class passed down the match and artwork paths.
 5. `docs/principles-and-laws.md` gets the definition (class, what it is,
    which frames carry it); `docs/configuration.md` where it names classes.

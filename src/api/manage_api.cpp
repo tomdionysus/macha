@@ -933,7 +933,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             // of one season.
             std::map<std::string, std::vector<const CatalogueItem*>> bound;
             const auto snapshot = catalogue_.snapshot_view(
-                WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/unmatched"));
+                WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/manage/unmatched", local_waits));
             for (const auto& [_, item] : snapshot->items()) {
                 if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
                     item.kind != CatalogueKind::track)
@@ -1216,7 +1216,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             std::map<std::string, std::vector<std::string>, std::less<>> bindings;
             try {
                 (void)catalogue_.snapshot_view(
-                    WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/filesystem"));
+                    WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/manage/filesystem", local_waits));
                 bindings = catalogue_.indexes()->media_bindings;
             } catch (const std::exception& e) {
                 // MachaDFS browsing does not depend on the catalogue; binding annotations are
