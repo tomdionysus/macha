@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.45.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.46.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -52,6 +52,13 @@ metadata server's handlers, which T5's audit did not cover), ranked:
    /status.
 6. One 128 MiB outbound budget for the control session (net.cpp:89).
 Not fully traced: `RpcClient::mutex_` holders, `Membership::m_` bodies.
+
+Measured under 20+ torrents on both nodes (2026-10-07, 0.90.45): the
+control store's barrier is mean 0.6 ms, max 3.3 ms on node-c and mean
+1.5 ms, max 70 ms on node-f. node-c's DATA barrier (`diskB`) is mean 484 ms,
+max 5.1 s: syncfs flushes the whole disk, torrent staging and the FUSE
+spool included, and libtorrent's writes keep no write-behind. Viewer and
+loader DATA writes wait on it; not control.
 CPU and memory audits still to do.
 
 ## 1. The catalogue plan: a materialised view of the local head
@@ -227,7 +234,7 @@ From the local-first work
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.45**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.46**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -237,7 +244,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.45` back to
+  in place before that version was installed (`pre-0.90.46` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - node-f's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
