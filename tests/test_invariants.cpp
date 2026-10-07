@@ -3300,9 +3300,29 @@ MACHA_TEST("invariants", test_authenticated_receiver_enforces_transport_lane) {
 } // namespace
 
 #if defined(__linux__)
+namespace {
+void hold_named_fsync(int fd) {
+    auto& hold = macha::test_support::fsync_hold;
+    std::unique_lock lock(hold.mutex);
+    if (!hold.armed)
+        return;
+    std::array<char, 4096> target{};
+    const auto link = "/proc/self/fd/" + std::to_string(fd);
+    const auto n = ::readlink(link.c_str(), target.data(), target.size() - 1);
+    if (n <= 0 || std::string_view(target.data(), static_cast<size_t>(n)).find(hold.path) ==
+                      std::string_view::npos)
+        return;
+    hold.holding = true;
+    hold.changed.notify_all();
+    hold.changed.wait(lock, [&] { return !hold.armed; });
+    hold.holding = false;
+}
+} // namespace
+
 extern "C" int fsync(int fd) {
     if (track_fsync.load(std::memory_order_relaxed))
         fsync_calls.fetch_add(1, std::memory_order_relaxed);
+    hold_named_fsync(fd);
     return static_cast<int>(::syscall(SYS_fsync, fd));
 }
 

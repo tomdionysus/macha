@@ -37,6 +37,19 @@
 
 namespace macha::test_support {
 
+#if defined(__linux__)
+// The test binary's fsync (test_invariants.cpp) holds a call on a file whose
+// path contains `path` while armed, so a test can show who waits on a sync.
+struct FsyncHold {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::string path;
+    bool armed{};
+    bool holding{};
+};
+inline FsyncHold fsync_hold;
+#endif
+
 // The catalogue's half of a maintenance inventory: the head, then the read.
 // With no installer behind these fixtures, the view is brought to the head
 // first, as the installer would have.

@@ -3218,6 +3218,7 @@ void MetadataReplica::persist_set_aside_since_locked() {
 
 bool MetadataReplica::set_aside(const Hash256& hash, uint64_t now_unix_ms) {
     const HeadsRevisionBump heads_bump(heads_revision_);
+    Lock durable(durable_mutation_m_);
     Lock lock(m_);
     const auto found = accepted_heads_.find(hash);
     if (found == accepted_heads_.end() || set_aside_.size() + 1 >= accepted_heads_.size())
@@ -3226,7 +3227,10 @@ bool MetadataReplica::set_aside(const Hash256& hash, uint64_t now_unix_ms) {
     load_set_aside_since_locked();
     if (set_aside_since_.try_emplace(hash, now_unix_ms).second)
         persist_set_aside_since_locked();
-    refresh_materialized_head_locked();
+    const auto pending_checkpoint = refresh_materialized_head_deferred_locked();
+    lock.unlock();
+    if (pending_checkpoint)
+        persist(checkpoint_p_, *pending_checkpoint);
     return true;
 }
 
@@ -3258,20 +3262,28 @@ size_t MetadataReplica::expire_set_aside(uint64_t now_unix_ms, std::chrono::mill
     }
     if (changed)
         persist_set_aside_since_locked();
+    std::optional<MetadataRecord> pending_checkpoint;
     if (dropped) {
         persist_heads_locked();
-        refresh_materialized_head_locked();
+        pending_checkpoint = refresh_materialized_head_deferred_locked();
     }
+    lock.unlock();
+    if (pending_checkpoint)
+        persist(checkpoint_p_, *pending_checkpoint);
     return dropped;
 }
 
 void MetadataReplica::clear_set_aside() {
     const HeadsRevisionBump heads_bump(heads_revision_);
+    Lock durable(durable_mutation_m_);
     Lock lock(m_);
     if (set_aside_.empty())
         return;
     set_aside_.clear();
-    refresh_materialized_head_locked();
+    const auto pending_checkpoint = refresh_materialized_head_deferred_locked();
+    lock.unlock();
+    if (pending_checkpoint)
+        persist(checkpoint_p_, *pending_checkpoint);
 }
 
 std::vector<MetadataRecord> MetadataReplica::usable_heads() const {
@@ -3296,6 +3308,13 @@ std::vector<MetadataIdentity> MetadataReplica::usable_head_identities() const {
 void MetadataReplica::refresh_materialized_head_locked() {
     if (refresh_materialized_head_in_memory_locked())
         reset_checkpoint(committed_);
+}
+
+std::optional<MetadataRecord> MetadataReplica::refresh_materialized_head_deferred_locked() {
+    if (!refresh_materialized_head_in_memory_locked())
+        return std::nullopt;
+    reset_checkpoint_journal_locked();
+    return committed_;
 }
 
 void MetadataReplica::ensure_history_root(const MetadataRecord& record) {
@@ -3800,12 +3819,16 @@ bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) 
     if (prune_accepted_heads_locked())
         persist_heads_locked();
     // Another flagged head may make the refresh throw; this repair still succeeded.
+    std::optional<MetadataRecord> pending_checkpoint;
     try {
-        refresh_materialized_head_locked();
+        pending_checkpoint = refresh_materialized_head_deferred_locked();
     } catch (const std::exception& error) {
         Log::debug("metadata materialized head refresh deferred after re-anchor: " +
                    std::string(error.what()));
     }
+    lock.unlock();
+    if (pending_checkpoint)
+        persist(checkpoint_p_, *pending_checkpoint);
     return true;
 }
 
@@ -3875,10 +3898,14 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
     history_bytes_ += frame.size();
     cache_materialization_locked(candidate->record, candidate->snapshot,
                                  candidate->resident_bytes);
+    std::optional<MetadataRecord> pending_checkpoint;
     if (prune_accepted_heads_locked()) {
         persist_heads_locked();
-        refresh_materialized_head_locked();
+        pending_checkpoint = refresh_materialized_head_deferred_locked();
     }
+    lock.unlock();
+    if (pending_checkpoint)
+        persist(checkpoint_p_, *pending_checkpoint);
     return true;
 }
 

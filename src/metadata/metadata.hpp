@@ -603,6 +603,11 @@ class MetadataReplica {
     bool legacy_write_api_allowed_locked() const MACHA_REQUIRES(m_);
     void set_legacy_committed_head_locked(const MetadataRecord&) MACHA_REQUIRES(m_);
     void refresh_materialized_head_locked() MACHA_REQUIRES(m_);
+    // The head refreshed in memory; when the committed head moved, the journal
+    // is emptied and the record returned for the caller to write as the
+    // checkpoint after releasing `m_` (under `durable_mutation_m_`), so no
+    // reader waits on a checkpoint write.
+    std::optional<MetadataRecord> refresh_materialized_head_deferred_locked() MACHA_REQUIRES(m_);
     bool refresh_materialized_head_in_memory_locked() MACHA_REQUIRES(m_);
     MetadataHistoryEntry history_for_current(std::span<const uint8_t> delta = {})
         MACHA_REQUIRES(m_);
