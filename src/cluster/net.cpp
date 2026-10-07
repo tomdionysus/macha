@@ -7,7 +7,6 @@
 #include "supervised.hpp"
 
 #include <arpa/inet.h>
-#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -20,44 +19,6 @@
 #include <unistd.h>
 
 namespace macha {
-
-bool peer_socket_options(int fd) {
-    int yes = 1;
-#ifdef SO_NOSIGPIPE
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
-#endif
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
-    // The OS default first probe (two hours) outlives any NAT mapping, and a
-    // node that cannot be dialled can only redial from its own side. Probe at
-    // 60 s, every 15 s after, give up after four: a dead mapping is noticed
-    // within two minutes at no application cost.
-    int keep_idle = 60;
-    int keep_interval = 15;
-    int keep_count = 4;
-#ifdef TCP_KEEPIDLE
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
-#elif defined(TCP_KEEPALIVE)
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keep_idle, sizeof(keep_idle));
-#endif
-#ifdef TCP_KEEPINTVL
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_interval, sizeof(keep_interval));
-#endif
-#ifdef TCP_KEEPCNT
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_count, sizeof(keep_count));
-#endif
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-#ifdef TCP_CONGESTION
-    if (setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, peer_congestion_control,
-                   static_cast<socklen_t>(strlen(peer_congestion_control))) == 0)
-        return true;
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true))
-        Log::warn(std::string("peer sockets keep the system congestion control: ") +
-                  peer_congestion_control + " unavailable (" + strerror(errno) + ")");
-#endif
-    return false;
-}
-
 namespace {
 // 22: the metadata snapshot carries torrent requests (SM15/SM16, DLT9),
 // which a protocol-21 node rejects, so the two cannot share a cluster.
@@ -93,6 +54,17 @@ constexpr size_t frame_header_size = 28;
 constexpr uint8_t frame_first = 0x01;
 constexpr uint8_t frame_last = 0x02;
 
+MemoryClass retained_memory_class(FrameType frame_type) {
+    switch (frame_type) {
+    case FrameType::control: return MemoryClass::control;
+    case FrameType::foreground:
+    case FrameType::read_ahead: return MemoryClass::viewer;
+    case FrameType::loader: return MemoryClass::loader;
+    case FrameType::speculative: return MemoryClass::speculative;
+    }
+    return MemoryClass::speculative;
+}
+
 bool reset_invalidates_node_reference(const std::map<std::string, IdentityAssociationReset>& resets,
                                       const NodeInfo& node) {
     for (const auto& [_, reset] : resets) {
@@ -106,6 +78,33 @@ bool reset_invalidates_node_reference(const std::map<std::string, IdentityAssoci
 void validate_frame_limit(size_t size) {
     if (size < protocol_min_frame_size || size > protocol_max_frame_size)
         throw std::runtime_error("max frame size must be 4K..4M");
+}
+
+void socket_options(int fd) {
+    int yes = 1;
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    // The OS default first probe (two hours) outlives any NAT mapping, and a
+    // node that cannot be dialled can only redial from its own side. Probe at
+    // 60 s, every 15 s after, give up after four: a dead mapping is noticed
+    // within two minutes at no application cost.
+    int keep_idle = 60;
+    int keep_interval = 15;
+    int keep_count = 4;
+#ifdef TCP_KEEPIDLE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+#elif defined(TCP_KEEPALIVE)
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keep_idle, sizeof(keep_idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_interval, sizeof(keep_interval));
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_count, sizeof(keep_count));
+#endif
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 }
 
 void socket_timeout(int fd, std::chrono::milliseconds timeout) {
@@ -256,7 +255,7 @@ int connect_socket(const Endpoint& endpoint, std::chrono::milliseconds timeout) 
 
         if (rc == 0) {
             fcntl(fd, F_SETFL, flags);
-            peer_socket_options(fd);
+            socket_options(fd);
             break;
         }
 
@@ -497,7 +496,7 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
         std::shared_ptr<std::vector<RetainedMemoryLedger::Lease>> memory;
         if (retained_memory_) {
             auto lease = retained_memory_->try_acquire(
-                work_class(fragment.frame_type), MemoryOwner::rpc_frame,
+                retained_memory_class(fragment.frame_type), MemoryOwner::rpc_frame,
                 fragment.payload.size() + sizeof(RetainedMemoryLedger::Lease));
             if (!lease)
                 throw std::runtime_error("process retained-memory RPC reassembly saturated");
@@ -540,7 +539,7 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
         throw std::runtime_error("incomplete RPC reassembly budget exceeded");
     if (retained_memory_) {
         auto memory = retained_memory_->try_acquire(
-            work_class(found->second.frame_type), MemoryOwner::rpc_frame,
+            retained_memory_class(found->second.frame_type), MemoryOwner::rpc_frame,
             fragment.payload.size() + sizeof(RetainedMemoryLedger::Lease));
         if (!memory)
             throw std::runtime_error("process retained-memory RPC reassembly saturated");
@@ -770,7 +769,7 @@ FrameType default_frame_type(MessageType type) noexcept {
 SecureChannel::SecureChannel(int fd, ClusterKeys keys, NodeInfo local, size_t max_frame_size)
     : fd_(fd), keys_(keys), local_(std::move(local)), configured_max_frame_size_(max_frame_size) {
     validate_frame_limit(configured_max_frame_size_);
-    peer_socket_options(fd_);
+    socket_options(fd_);
 }
 
 SecureChannel::~SecureChannel() {
@@ -1271,7 +1270,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         std::optional<RetainedMemoryLedger::Lease> memory;
         if (retained_memory_) {
             memory = retained_memory_->try_acquire(
-                work_class(frame_type), MemoryOwner::rpc_frame,
+                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
             if (!memory)
                 throw std::runtime_error("process retained-memory RPC admission saturated");
@@ -1791,7 +1790,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         std::optional<RetainedMemoryLedger::Lease> memory;
         if (retained_memory_) {
             memory = retained_memory_->try_acquire(
-                work_class(frame_type), MemoryOwner::rpc_frame,
+                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
             if (!memory)
                 return false;
@@ -3231,7 +3230,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         std::optional<RetainedMemoryLedger::Lease> memory;
         if (retained_memory) {
             memory = retained_memory->try_acquire(
-                work_class(frame_type), MemoryOwner::rpc_frame,
+                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
             if (!memory)
                 throw std::runtime_error("process retained-memory RPC admission saturated");
@@ -3511,7 +3510,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         std::optional<RetainedMemoryLedger::Lease> memory;
         if (retained_memory) {
             memory = retained_memory->try_acquire(
-                work_class(frame_type), MemoryOwner::rpc_frame,
+                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
             if (!memory)
                 return false;
@@ -3748,7 +3747,20 @@ std::deque<RpcServer::RequestJob>& RpcServer::queue(RequestClass cls) {
 
 bool RpcServer::admit_locked(RequestJob job) {
     if (retained_memory_) {
-        const auto memory_class = work_class(job.frame.frame_type);
+        const auto memory_class = [&] {
+            switch (job.frame.frame_type) {
+            case FrameType::control:
+                return MemoryClass::control;
+            case FrameType::foreground:
+            case FrameType::read_ahead:
+                return MemoryClass::viewer;
+            case FrameType::loader:
+                return MemoryClass::loader;
+            case FrameType::speculative:
+                return MemoryClass::speculative;
+            }
+            return MemoryClass::speculative;
+        }();
         auto memory = retained_memory_->try_acquire(
             memory_class, MemoryOwner::rpc_frame,
             sizeof(RequestJob) +
@@ -4077,7 +4089,7 @@ void RpcServer::accept_loop(std::stop_token stop) {
         int client = accept(fd, reinterpret_cast<sockaddr*>(&address), &size);
         if (client < 0)
             continue;
-        peer_socket_options(client);
+        socket_options(client);
 
         size_t pre_auth = pre_auth_sessions_.load(std::memory_order_relaxed);
         while (pre_auth < max_pre_auth_sessions &&

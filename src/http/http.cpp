@@ -575,8 +575,7 @@ struct HttpServer::Impl {
     std::function<HttpResponse(const HttpRequest&)> handler;
     std::function<bool(const HttpRequest&)> bearer_exempt;
     SessionAuthenticator authenticate;
-    std::function<WorkClass(std::string_view)> classify;
-    std::function<void(WorkClass)> note_activity;
+    std::vector<std::string> control_prefixes;
     std::function<void()> pass_hook;
 
     std::shared_ptr<Inbox> inbox;
@@ -620,10 +619,16 @@ struct HttpServer::Impl {
         : config(std::move(c)), handler(std::move(h)), bearer_exempt(std::move(exempt)),
           authenticate(std::move(auth)) {}
 
-    WorkClass request_class(std::string_view path) const {
-        return classify ? classify(path) : WorkClass::viewer;
+    bool control_route(std::string_view path) const noexcept {
+        for (const auto& prefix : control_prefixes) {
+            if (path == prefix)
+                return true;
+            if (path.size() > prefix.size() && path.starts_with(prefix) &&
+                path[prefix.size()] == '/')
+                return true;
+        }
+        return false;
     }
-    bool control_route(std::string_view path) const { return request_class(path) == WorkClass::control; }
 
     size_t chunk_bytes() const noexcept {
         return std::max<size_t>(16 * 1024, config.stream_chunk_bytes);
@@ -635,7 +640,6 @@ struct HttpServer::Impl {
 
     HttpResponse run_handler(HttpRequest& request) {
         const auto started = Clock::now();
-        request.work = request_class(request.path);
         HttpResponse response;
         try {
             const bool exempt = bearer_exempt && bearer_exempt(request);
@@ -653,13 +657,9 @@ struct HttpServer::Impl {
                         http_error(401, "unauthorized", "a valid session bearer token is required");
                 } else {
                     request.session = std::move(identity);
-                    if (note_activity)
-                        note_activity(request.work);
                     response = handler(request);
                 }
             } else {
-                if (note_activity)
-                    note_activity(request.work);
                 response = handler(request);
             }
         } catch (const std::exception& e) {
@@ -1409,12 +1409,8 @@ HttpServer::~HttpServer() {
     stop();
 }
 
-void HttpServer::set_work_class(std::function<WorkClass(std::string_view)> classify) {
-    impl_->classify = std::move(classify);
-}
-
-void HttpServer::set_activity(std::function<void(WorkClass)> note) {
-    impl_->note_activity = std::move(note);
+void HttpServer::set_control_prefixes(std::vector<std::string> prefixes) {
+    impl_->control_prefixes = std::move(prefixes);
 }
 
 void HttpServer::set_reactor_pass_hook(std::function<void()> hook) {

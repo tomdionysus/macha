@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.39.
+Last updated: 2026-10-06, on `develop`. Both nodes run 0.90.40.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -11,25 +11,13 @@ Items marked *carried* come from
 `archive/2026-10-05-ACTIVE-before-rationalisation.md` and have not been
 re-checked since.
 
-## 0. One definition of work class; the API is viewer-class work
+## 0. One definition of work class: withdrawn
 
-Design: [`2026-10-06-one-work-class.md`](2026-10-06-one-work-class.md).
-DATA admission, the activity clocks and the HTTP server each class work by
-their own rule and disagree; an API request marks no activity, so a node
-with someone in the editor reads as idle. One `WorkClass` (control, viewer,
-loader, background) with one mapping from the wire frame, read by all
-three; every HTTP route but the four control routes is viewer-class and
-marks a viewer present; a work context carries its allowed waits apart
-from its class; API-started DATA work carries the request's class down.
-Six steps, one to two days; two questions for the operator at the end of
-the document. Step 1 (one `WorkClass`, read by the arbiter, the clocks and
-the pacing; three misclassified reads fixed) is 0.90.35; step 2 (the route
-table classes each HTTP request; a served one marks its class present) is
-0.90.36; step 3 (allowed waits apart from class) is 0.90.37; step 4 (the
-request's class passed down its DATA work) and step 5 (the definition in
-the docs) are 0.90.38; step 6 measured on polling load (COMPLETED);
-continuous browsing not yet measured. The network reserve is 0.90.39 (BBR
-on every peer socket; section 4). Next: the disk reserve.
+0.90.35 to 0.90.39 reverted at the operator's instruction (0.90.40 is
+0.90.34's code). The design stays in
+[`2026-10-06-one-work-class.md`](2026-10-06-one-work-class.md) as written,
+not active. BBR on peer sockets cost throughput on gbni-1's DATA socket (12
+to 15 Mbit/s against cubic's 19 to 20) and is withdrawn with it.
 
 ## 1. The catalogue plan: a materialised view of the local head
 
@@ -121,11 +109,11 @@ item in section 0, then stage 6.
 ## 4. Replication and repair
 
 - **Control objects crossed a saturated WAN at 0.9 to 4.6 s each: a law 1
-  defect.** The link half is 0.90.39: cubic on the DATA socket kept about
-  200 ms of queue at the bottleneck, which control waited in, and the idle
-  control socket restarted at a congestion window of ten. Every peer socket
-  now uses BBR: gbni-1's control round trip went from 295 to 451 ms to 85
-  to 122 ms (floor 77 ms), repair unchanged. Still open: whether a commit's
+  defect.** Measured: cubic on the DATA socket keeps about 200 ms of queue
+  at the bottleneck, which control waits in, and the idle control socket
+  restarts at a congestion window of ten. BBR (0.90.39) cut control's round
+  trip to 85 to 122 ms but slowed the DATA socket, and was withdrawn in
+  0.90.40. Also open: whether a commit's
   control objects should go to every node present with the head (the
   claims stop at `metadata_write_copies` holders), and libtorrent's own
   sockets, which use the system's cubic and can fill the same uplink.
@@ -191,7 +179,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.39**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.40**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -201,7 +189,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.39` back to
+  in place before that version was installed (`pre-0.90.40` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild

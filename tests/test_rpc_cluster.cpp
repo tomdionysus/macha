@@ -8,57 +8,11 @@
 #include "cluster/placement.hpp"
 #include "startup_progress.hpp"
 
-#include <cstring>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 using namespace macha;
 using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
-
-MACHA_FAST_TEST("rpc_cluster", test_peer_sockets_use_delay_based_congestion_control) {
-#ifdef TCP_CONGESTION
-    // Whether this process may choose it at all: a plain socket asks first.
-    const int probe = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(probe >= 0);
-    const bool offered =
-        setsockopt(probe, IPPROTO_TCP, TCP_CONGESTION, peer_congestion_control,
-                   static_cast<socklen_t>(strlen(peer_congestion_control))) == 0;
-    close(probe);
-
-    const int listener = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    CHECK(bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
-    CHECK(listen(listener, 1) == 0);
-    socklen_t size = sizeof(address);
-    CHECK(getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) == 0);
-    const int dialled = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(connect(dialled, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
-    const int accepted = accept(listener, nullptr, nullptr);
-    CHECK(accepted >= 0);
-
-    for (const int fd : {dialled, accepted}) {
-        CHECK(peer_socket_options(fd) == offered);
-        char chosen[16]{};
-        socklen_t length = sizeof(chosen);
-        CHECK(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, chosen, &length) == 0);
-        if (offered)
-            CHECK(std::string(chosen) == peer_congestion_control);
-    }
-    close(accepted);
-    close(dialled);
-    close(listener);
-#else
-    // No per-socket congestion control on this platform.
-    CHECK(!peer_socket_options(-1));
-#endif
-}
 
 MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_has_count_byte_and_message_bounds) {
     MessageAssembler assembler(2, 8, 16);
@@ -433,7 +387,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_is_loader_activity_not_viewer_acti
     auto store = bench.store();
     const auto bytes = pattern(256 * 1024, 91);
     REQUIRE(store->put(bytes) == object_id(bytes));
-    CHECK(store->idle_for(WorkClass::loader) < 5s);
+    CHECK(store->loader_idle_for() < 5s);
     CHECK(store->take_loader_bytes() >= bytes.size());
     CHECK(store->take_foreground_bytes() == 0);
     CHECK(store->take_interactive_bytes() == 0);
@@ -635,7 +589,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_concurrent_readers_share_one_fetch_and
         auto reply = object_reply(bytes);
         reply.retained_memory = std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
         reply.retained_memory->push_back(*memory.try_acquire(
-            WorkClass::viewer, MemoryOwner::rpc_frame, reply.payload.size()));
+            MemoryClass::viewer, MemoryOwner::rpc_frame, reply.payload.size()));
         return reply;
     });
     const auto held = [&] {
@@ -1295,7 +1249,7 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
         REQUIRE(restored);
         CHECK(*s2.local_state().data().get(id) == bytes);
         CHECK(share_after > share_before);
-        CHECK((paced_by & DistributedStore::paced_by_peer_viewer));
+        CHECK((paced_by & DistributedStore::paced_by_peer_playback));
     }
 
     // This node's loader, active throughout.
@@ -1307,11 +1261,11 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
         }
     });
     REQUIRE(wait_until([&] {
-        return s2.resources().activity.idle_for(WorkClass::loader) < c2.maintenance.foreground_quiet;
+        return s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
     }, 5s));
     const auto [id, bytes] = lose_a_copy(2);
     const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
-    CHECK(s2.resources().activity.idle_for(WorkClass::loader) < c2.maintenance.foreground_quiet);
+    CHECK(s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
     CHECK((s2.repair_diagnostics().paced_by & DistributedStore::paced_by_loader));
     loading = false;
     loader.join();

@@ -389,7 +389,7 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         // Viewer class, because it is bounded only by the non-control
         // capacity: a loader-class lease could not take the whole budget a
         // wedged publication pipeline fills.
-        auto hog = ledger.try_acquire(WorkClass::viewer, MemoryOwner::playback_segment,
+        auto hog = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment,
                                       ledger.stats().capacity_bytes -
                                           ledger.stats().control_reserve_bytes);
         REQUIRE(hog.has_value());
@@ -898,20 +898,22 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
         frontend->release(inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
 
-        // Publication replay must not mark its own chunks as viewer work, or
+        // Publication replay must not mark its own chunks as foreground, or
         // the quiet policy would throttle it by one quiet interval per chunk.
-        CHECK(fs.idle_for(WorkClass::viewer) >= 1h);
+        CHECK(fs.foreground_idle_for() >= 1h);
         CHECK(frontend->status().pending_data == 0);
         const auto entry = fs.getattr("/movie.bin");
         CHECK(entry.size == expected.size());
 
-        // A read-only FUSE handle is loader traffic too: the viewer clock
-        // does not move.
+        // A read-only FUSE handle is loader traffic too: neither viewer clock
+        // moves.
         auto fuse_reader = frontend->open("/movie.bin", true, false, false, false);
         Bytes fuse_probe(4096);
-        const auto viewer_before = fs.idle_for(WorkClass::viewer);
+        const auto foreground_before = fs.foreground_idle_for();
+        const auto interactive_before = fs.store().interactive_idle_for();
         REQUIRE(frontend->read(fuse_reader, 0, fuse_probe) == fuse_probe.size());
-        CHECK(fs.idle_for(WorkClass::viewer) >= viewer_before);
+        CHECK(fs.foreground_idle_for() >= foreground_before);
+        CHECK(fs.store().interactive_idle_for() >= interactive_before);
         frontend->release(fuse_reader.inode, false);
 
         CHECK(read_back(fs, "/movie.bin", expected.size()) == expected);
@@ -956,8 +958,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
         REQUIRE(hints.size() == 1);
         CHECK(hints.front().run_id == "fuse:" + std::to_string(handle.inode));
         CHECK(hints.front().priority == fuse.hydration_priority);
-        // Prefetch for mount reads has their class: loader.
-        CHECK(hints.front().frame_type == FrameType::loader);
+        CHECK(hints.front().frame_type == FrameType::read_ahead);
         REQUIRE(hints.front().objects.size() == 3);
         CHECK(hints.front().objects[0] == base_entry.extents[1].id);
         CHECK(hints.front().objects[1] == base_entry.extents[2].id);
@@ -1681,9 +1682,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         frontend->stop();
     }
 
-    // Production admission (law 2): viewer-class work makes a viewer active;
-    // loader work is then paced by its weighted share, never stopped. Loader
-    // and speculative work, the node's own included, do not count.
+    // Production admission (law 2): only the foreground clock, which HTTP
+    // playback alone advances, makes a viewer active; loader work is then
+    // paced by its weighted share, never stopped. The interactive clock,
+    // which the node's own object writes feed, does not count.
     {
         auto fuse = node.fuse("viewer-admission");
         fuse.publication_quiet = 1h;
@@ -1692,7 +1694,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         CHECK(admission.can_start(t0));
         CHECK(!admission.should_yield(t0));
         CHECK(admission.retry_after(t0) == std::optional<std::chrono::milliseconds>(0ms));
-        fs.store().loader_activity(1);
+        fs.note_interactive_activity(1);
         CHECK(admission.can_start(t0));
         CHECK(!admission.should_yield(t0));
 

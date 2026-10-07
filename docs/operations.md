@@ -204,7 +204,7 @@ under `diagnostics`:
 - `repair` reports objects repair could not source from any peer and local
   copies that could not be read, and how repair stood at the latest
   maintenance pass. `paced_by` lists the higher classes active then:
-  `viewer` (playback, the mount), `loader`, `peer_viewer` (a viewer on
+  `playback`, `mounted_filesystem`, `loader`, `peer_playback` (a viewer on
   another node, whose links repair shares). While any is, repair takes
   turns on its share and `pace` is `paced`. With none, `pace` is `running`,
   `settling` (the quiet period after such activity), `awaiting_credit` (its

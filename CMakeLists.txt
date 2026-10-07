@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.90.39 LANGUAGES CXX)
+project(macha VERSION 0.90.40 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -615,7 +615,6 @@ if(MACHA_BUILD_TESTS)
         tests/test_horizon_builder.cpp
         tests/test_availability.cpp
         tests/test_predicates.cpp
-        tests/test_work_class.cpp
         tests/test_catalogue_maintenance.cpp
         tests/test_namespace_entries.cpp
         tests/test_claim_walk.cpp

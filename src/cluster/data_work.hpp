@@ -39,7 +39,7 @@ class DataWorkContext : public WorkContext {
                              std::chrono::milliseconds no_progress_budget = {})
         : WorkContext(frame_type, deadline, cancelled), quantum_bytes_(quantum_bytes),
           progress_(progress), no_progress_budget_(no_progress_budget) {
-        if (work_class(frame_type) == WorkClass::control)
+        if (frame_type == FrameType::control)
             throw std::invalid_argument("control is not a DATA work class");
     }
 
@@ -171,10 +171,10 @@ class DataResourceArbiter {
     uint64_t cancelled_waits_ MACHA_GUARDED_BY(mutex_){};
 
     static bool viewer(FrameType frame_type) noexcept {
-        return work_class(frame_type) == WorkClass::viewer;
+        return frame_type == FrameType::foreground || frame_type == FrameType::read_ahead;
     }
     static bool loader(FrameType frame_type) noexcept {
-        return work_class(frame_type) == WorkClass::loader;
+        return frame_type == FrameType::loader;
     }
     uint64_t charge(uint64_t bytes) const noexcept { return std::max<uint64_t>(1, bytes); }
     // `refused_for_pressure` reports whether a false answer was the pressure
@@ -232,7 +232,7 @@ inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes,
         lower_active_ >= min_background_under_pressure_) {
         const bool viewer_present = waiting_viewers_ > 0 || used_bytes_ > lower_used_bytes_ ||
                                     (viewer_recently_active_ && viewer_recently_active_());
-        if (work_class(frame_type) == WorkClass::speculative || viewer_present) {
+        if (frame_type == FrameType::speculative || viewer_present) {
             if (refused_for_pressure)
                 *refused_for_pressure = true;
             return false;
@@ -245,7 +245,7 @@ inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes,
         return false;
     if (lower_used_bytes_ > lower_capacity - bytes)
         return false;
-    if (work_class(frame_type) == WorkClass::speculative && waiting_loaders_)
+    if (frame_type == FrameType::speculative && waiting_loaders_)
         return false;
     return true;
 }
@@ -253,7 +253,7 @@ inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes,
 inline std::optional<DataResourceArbiter::Lease>
 DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_bytes) {
     const auto frame_type = context.frame_type();
-    if (work_class(frame_type) == WorkClass::control)
+    if (frame_type == FrameType::control)
         throw std::invalid_argument("control cannot acquire DATA resource credit");
     const auto bytes = charge(requested_bytes);
     const auto class_capacity = viewer(frame_type)
@@ -341,7 +341,7 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
 inline std::optional<DataResourceArbiter::Lease>
 DataResourceArbiter::try_acquire(const DataWorkContext& context, uint64_t requested_bytes) {
     const auto frame_type = context.frame_type();
-    if (work_class(frame_type) == WorkClass::control)
+    if (frame_type == FrameType::control)
         throw std::invalid_argument("control cannot acquire DATA resource credit");
     const auto bytes = charge(requested_bytes);
     const auto class_capacity = viewer(frame_type)

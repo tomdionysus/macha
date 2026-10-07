@@ -2,7 +2,7 @@
 
 ## Membership
 
-Each node has a persistent random node ID, advertised endpoint, configured failure domain and DATA capacity. Bootstrap endpoints are discovery seeds, not masters. Once connected, peers exchange membership and maintain separate CONTROL and DATA transport lanes. Every peer socket asks the kernel for BBR congestion control: a loss-based sender keeps the bottleneck's buffer full, and control frames on their own lane would wait in that queue behind DATA; BBR sends at the measured bottleneck rate and keeps it near empty, and an idle control socket resumes at that rate rather than in slow start. Where the kernel does not offer BBR the node logs one warning and uses the system default.
+Each node has a persistent random node ID, advertised endpoint, configured failure domain and DATA capacity. Bootstrap endpoints are discovery seeds, not masters. Once connected, peers exchange membership and maintain separate CONTROL and DATA transport lanes.
 
 The cluster protocol version is 23. Mixed-version operation is rejected at the
 handshake rather than negotiated down, so every node in a cluster runs the same
