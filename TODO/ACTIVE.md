@@ -27,8 +27,9 @@ the pacing; three misclassified reads fixed) is 0.90.35; step 2 (the route
 table classes each HTTP request; a served one marks its class present) is
 0.90.36; step 3 (allowed waits apart from class) is 0.90.37; step 4 (the
 request's class passed down its DATA work) and step 5 (the definition in
-the docs) are 0.90.38. Next: step 6, measure repair pacing with a viewer
-browsing; then the non-interference reserves (network, disk).
+the docs) are 0.90.38; step 6 measured on polling load (COMPLETED);
+continuous browsing not yet measured. Next: the non-interference reserves,
+network first, then disk.
 
 ## 1. The catalogue plan: a materialised view of the local head
 

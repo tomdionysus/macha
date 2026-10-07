@@ -1,6 +1,19 @@
 # Completed and tested
 
-Last updated: 2026-10-06
+Last updated: 2026-10-07
+
+## 2026-10-06/07 -- 0.90.35 to 0.90.38
+
+- **One definition of work class** (0.90.35 to 0.90.38,
+  [design](2026-10-06-one-work-class.md)): one `WorkClass` and one mapping
+  from the frame, read by DATA admission, the activity clocks, the memory
+  ledger, the pacing and status; every API route but the four control
+  routes is viewer work and marks a viewer present; allowed waits are said
+  apart from class; a request's class is carried down its DATA work.
+  Measured on gbni-1 against a web client polling once a minute: repair
+  steps ending with a viewer present are cut short (2.4 s, 3.0 MB against
+  3.7 s, 4.6 MB), and repair holds 3.3 GB/h against the 1.8 to 3.2 GB/h
+  baseline. Continuous browsing is not yet measured.
 
 ## 2026-10-06 -- 0.90.26 to 0.90.29
 

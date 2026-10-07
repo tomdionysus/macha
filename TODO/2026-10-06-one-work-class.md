@@ -225,8 +225,11 @@ a viewer browsing (stage 3 numbers are the baseline).
 5. **Done, 0.90.38.** `docs/principles-and-laws.md` gets the definition (class, what it is,
    which frames carry it); `docs/configuration.md` where it names classes.
    No API or wire change, so nothing to announce.
-6. Measure repair pacing with a viewer browsing, against the stage 3
-   baseline; record in COMPLETED.
+6. **Measured, 0.90.38, on polling load only.** A web client polling
+   gbni-1's job lists once a minute is now a viewer present: repair steps
+   ending with one present are cut short (2.4 s, 3.0 MB against 3.7 s,
+   4.6 MB) and repair holds 3.3 GB/h, at or above the 1.8 to 3.2 GB/h
+   baseline. Not yet measured: continuous browsing holding repair down.
 
 One to two days. Steps 1 and 3 are mechanical; 2 and 4 are the ones with
 behaviour to watch.
