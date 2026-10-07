@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.47.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.48.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -45,8 +45,9 @@ metadata server's handlers, which T5's audit did not cover), ranked:
 2. Done, 0.90.46: the account table is released before the KDF and the
    write.
 3. Done, 0.90.47: the connectivity check works on a copy and publishes.
-4. The HTTP control lane (2 workers) runs login scrypt and the
-   connectivity check; two logins queue /health and /status.
+4. Done, 0.90.48: /health is answered by the reactor; four control
+   workers; password checks capped below them. The connectivity-check
+   POST still runs on the lane (operator-triggered, bounded by timeouts).
 5. Done, 0.90.47: the roster and the inbound resolution are written after
    their locks are released.
 6. One 128 MiB outbound budget for the control session (net.cpp:89).
@@ -233,7 +234,7 @@ From the local-first work
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.47**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.48**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -243,7 +244,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.47` back to
+  in place before that version was installed (`pre-0.90.48` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - node-f's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild

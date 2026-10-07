@@ -807,6 +807,43 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
 
 }
 
+MACHA_FAST_TEST("runtime_dependencies", test_password_checks_may_never_fill_the_control_lane) {
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto disk = t.path() / "disk";
+    std::filesystem::create_directories(disk);
+    const auto parse = [&](size_t control_workers, size_t password_checks) {
+        const auto yaml = t.path() / "lanes.yaml";
+        std::ofstream out(yaml);
+        out << "state_path: " << (t.path() / "state").string() << "\n"
+            << "key_file: " << keyfile.string() << "\n"
+            << "storage:\n"
+            << "  - path: " << disk.string() << "\n"
+            << "    limit: 10G\n"
+            << "catalogue:\n"
+            << "  api:\n"
+            << "    control_workers: " << control_workers << "\n"
+            << "session:\n"
+            << "  max_concurrent_password_checks: " << password_checks << "\n";
+        out.close();
+        std::vector<std::string> args{"macha", "--config", yaml.string()};
+        std::vector<char*> argv;
+        for (auto& arg : args)
+            argv.push_back(arg.data());
+        try {
+            (void)parse_config(static_cast<int>(argv.size()), argv.data());
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+    CHECK(parse(4, 2));
+    CHECK(parse(3, 2));
+    CHECK(!parse(2, 2));
+    CHECK(!parse(2, 3));
+}
+
 MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwork) {
     TempDir t;
     auto key = t.path() / "cluster.key";
