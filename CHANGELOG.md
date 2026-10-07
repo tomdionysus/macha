@@ -1,5 +1,19 @@
 # Current release
 
+## 0.90.46: a change to an account holds no request that reads accounts
+
+No API, wire, protocol or on-disk changes.
+
+Every authenticated request reads the account table under its lock. A
+password change, an account created, or an account replicated from a peer
+held that lock exclusively across scrypt (tens of milliseconds on a Pi) and
+two fsyncs, and a set of replicated accounts was written once per record.
+A password is now hashed before any lock; a change edits the table in
+memory and copies it, then seals and writes it after releasing the table,
+under a separate lock that keeps writes in order; a replicated set is
+merged and written once. A test holds the account file's fsync and reads
+the table meanwhile.
+
 ## 0.90.45: a checkpoint write holds no reader of the metadata replica
 
 No API, wire, protocol or on-disk changes.
