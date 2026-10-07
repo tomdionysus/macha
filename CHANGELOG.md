@@ -1,5 +1,23 @@
 # Current release
 
+## 0.90.36: an API request is viewer work, and a viewer present
+
+No API, wire, protocol or on-disk changes.
+
+**The service's route table gives each HTTP request its work class.** The
+health, status, session and account routes are control-class (law 1: a node
+saturated serving viewers still says what is wrong with it); every other
+route is viewer-class. The HTTP server runs control requests on its control
+pool and every other class on its data pool, as before, now from the class
+rather than its own list of path prefixes.
+
+**A served request marks its class present.** Someone browsing the
+catalogue, editing or managing files is a viewer present on that node:
+maintenance paces repair and other background work down while they are
+there, the DATA arbiter treats a viewer as present under disk pressure, and
+FUSE publication takes its share. A request refused for want of a session
+marks nothing.
+
 ## 0.90.35: one definition of work class
 
 API change in status diagnostics only: `repair.paced_by` lists `viewer`,

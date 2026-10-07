@@ -212,8 +212,9 @@ a viewer browsing (stage 3 numbers are the baseline).
    behind a running transfer. Candidate to check: the peer validity check
    (`have_valid_objects`, `storage_server.cpp`) admits with the request's
    frame, since validity means a decrypt.
-2. The route table classes requests; the server follows it and marks the
-   clock. Behaviour change: API activity is a viewer present.
+2. **Done, 0.90.36.** The route table classes requests; the server follows
+   it and marks the clock. Behaviour change: API activity is a viewer
+   present. A request refused for want of a session marks nothing.
 3. `WorkContext::allowed`; API reads become viewer-class, waits none.
 4. The request's class passed down the match and artwork paths.
 5. `docs/principles-and-laws.md` gets the definition (class, what it is,
