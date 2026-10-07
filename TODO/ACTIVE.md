@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.41.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.42.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -63,8 +63,6 @@ item in section 0, then stage 6.
   The survey counts 206,130 of 941,588 extents unavailable to node-c.
   node-f cannot read them either (EIO after 2 to 6 s, against 0.2 s on
   node-c): held by no node online. Not established that node-e holds them.
-- **26 GB of abandoned write temp files** in node-c's `state/tmp` from 7 and
-  9 September: swept at startup from 0.90.42; to confirm on node-c's log.
 - **node-c killed by the kernel for memory during a large import** (2026-10-06
   21:16Z; 1.15 GB to 2.1 GB in a minute on a 4 GB node). Cause: each commit
   owed to the peer held two encoded snapshots and the decoded one until its
@@ -203,7 +201,7 @@ From the local-first work
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.41**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.42**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -213,7 +211,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.41` back to
+  in place before that version was installed (`pre-0.90.42` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - node-f's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
