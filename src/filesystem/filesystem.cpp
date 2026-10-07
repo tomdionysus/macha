@@ -21,6 +21,17 @@ namespace macha {
 namespace {
 std::atomic_uint64_t next_write_handle_diagnostic_id{1};
 
+MemoryClass filesystem_memory_class(FrameType frame_type) {
+    switch (frame_type) {
+    case FrameType::control: return MemoryClass::control;
+    case FrameType::foreground:
+    case FrameType::read_ahead: return MemoryClass::viewer;
+    case FrameType::loader: return MemoryClass::loader;
+    case FrameType::speculative: return MemoryClass::speculative;
+    }
+    return MemoryClass::speculative;
+}
+
 [[noreturn]] void fail(int c, const std::string& s) {
     throw FsError(c, s);
 }
@@ -291,7 +302,7 @@ WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bo
 void WriteHandle::ensure_buffer_memory() {
     if (buffer_memory_)
         return;
-    const auto memory_class = work_class(work_context_.frame_type());
+    const auto memory_class = filesystem_memory_class(work_context_.frame_type());
     auto& ledger = fs_.retained_memory_;
 
     // Without a no-progress budget, wait on the caller's deadline alone.
@@ -2245,7 +2256,7 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {
     auto e = getattr(*resolved);
     if (e.type != EntryType::file)
         fail(EISDIR, "directory");
-    return open_read(e, *resolved, false, FrameType::speculative);
+    return open_read(e, *resolved, false, FrameType::read_ahead);
 }
 
 std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const std::string& logical_path,

@@ -501,7 +501,8 @@ void ClusterStatusService::persist_local_status() {
     // lock or enter publication CAS. The small durable write (with its fsync) is
     // deferred while viewer-critical work is active.
     constexpr auto idle_before_persist = std::chrono::seconds(30);
-    if (activity_.idle_for(WorkClass::viewer) < idle_before_persist)
+    if (activity_.idle_for(FrameType::foreground) < idle_before_persist ||
+        activity_.idle_for(FrameType::read_ahead) < idle_before_persist)
         return;
     node_.telemetry().persist();
     accounts_.sessions().persist();
@@ -1345,12 +1346,14 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             // the classes active at the latest pass do.
             Json::Array paced_by;
             if (values.last_gate) {
-                if (values.paced_by & DistributedStore::paced_by_viewer)
-                    paced_by.push_back("viewer");
+                if (values.paced_by & DistributedStore::paced_by_playback)
+                    paced_by.push_back("playback");
+                if (values.paced_by & DistributedStore::paced_by_mounted_filesystem)
+                    paced_by.push_back("mounted_filesystem");
                 if (values.paced_by & DistributedStore::paced_by_loader)
                     paced_by.push_back("loader");
-                if (values.paced_by & DistributedStore::paced_by_peer_viewer)
-                    paced_by.push_back("peer_viewer");
+                if (values.paced_by & DistributedStore::paced_by_peer_playback)
+                    paced_by.push_back("peer_playback");
             }
             const char* pace = "unknown";
             if (!paced_by.empty()) {

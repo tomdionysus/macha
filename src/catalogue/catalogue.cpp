@@ -1568,12 +1568,12 @@ CatalogueManager::PreparedCommit CatalogueManager::prepare(const std::optional<O
 }
 
 void CatalogueManager::commit(const std::optional<ObjectId>& expected_root, CatalogueDraft&& draft,
-                              std::optional<Hash256> expected_namespace, FrameType frame) {
+                              std::optional<Hash256> expected_namespace) {
     const auto started = Clock::now();
     auto prepared = prepare(std::move(draft));
     const auto prepare_ms = ms_since(started);
     const auto touched = std::count(prepared.touched.begin(), prepared.touched.end(), true);
-    publish(expected_root, std::move(prepared), expected_namespace, std::nullopt, frame);
+    publish(expected_root, std::move(prepared), expected_namespace, std::nullopt);
     Log::debug("catalogue commit touched=" + std::to_string(touched) +
                " prepare_ms=" + std::to_string(prepare_ms) +
                " publish_ms=" + std::to_string(ms_since(started) - prepare_ms));
@@ -1590,7 +1590,7 @@ void CatalogueManager::commit(
 void CatalogueManager::publish(
     const std::optional<ObjectId>& expected_root, PreparedCommit&& prepared,
     std::optional<Hash256> expected_namespace,
-    std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict, FrameType frame) {
+    std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict) {
     // This node's own head: a catalogue write asks no peer what the head is.
     std::optional<MetadataSnapshotView> head;
     try {
@@ -1611,7 +1611,7 @@ void CatalogueManager::publish(
         // Held here is enough; only one that is not is fetched to prove it
         // exists somewhere.
         if (local_.data().has(id)) continue;
-        if (!store_.get(id, 0, frame))
+        if (!store_.get(id, 0, FrameType::speculative))
             throw CatalogueUnavailable("referenced artwork object is unavailable: " + to_string(id));
     }
 
@@ -1734,8 +1734,7 @@ void CatalogueManager::publish(
 }
 
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,
-                                        std::optional<uint64_t> expected_revision,
-                                        FrameType frame) {
+                                        std::optional<uint64_t> expected_revision) {
     if (item.id.empty())
         throw std::runtime_error("catalogue item id is required");
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
@@ -1753,7 +1752,7 @@ CatalogueItem CatalogueManager::upsert(CatalogueItem item,
     }
     item.updated_ns = wall_time_ns();
     current.put(item);
-    commit(expected_root, std::move(current), std::nullopt, frame);
+    commit(expected_root, std::move(current));
     return item;
 }
 
@@ -1944,32 +1943,30 @@ size_t CatalogueManager::clear_metadata(std::string_view id,
 }
 
 CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string mime_type,
-                                                   std::span<const uint8_t> bytes,
-                                                   FrameType frame) {
+                                                   std::span<const uint8_t> bytes) {
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
-    if (!store_.put_here(art.id, bytes, frame))
+    if (!store_.put_here(art.id, bytes, FrameType::speculative))
         throw std::runtime_error("cannot store artwork in distributed DATA storage");
     return art;
 }
 
 CatalogueArtwork CatalogueManager::stage_artwork_deferred(
     std::string role, std::string mime_type, std::span<const uint8_t> bytes,
-    DistributedStore::DurabilityBatch& batch, FrameType frame) {
+    DistributedStore::DurabilityBatch& batch) {
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
     // Written on this node, durable at the batch's barrier; no peer is waited
     // for.
-    if (!store_.put_deferred_here(art.id, bytes, batch, frame))
+    if (!store_.put_deferred_here(art.id, bytes, batch, FrameType::speculative))
         throw std::runtime_error("cannot stage artwork in distributed DATA storage");
     return art;
 }
 
-bool CatalogueManager::artwork_durability_barrier(DistributedStore::DurabilityBatch& batch,
-                                                  FrameType frame) {
-    return store_.durability_barrier(batch, frame);
+bool CatalogueManager::artwork_durability_barrier(DistributedStore::DurabilityBatch& batch) {
+    return store_.durability_barrier(batch, FrameType::speculative);
 }
 
 void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& discovered,
@@ -1977,8 +1974,7 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                                          bool prune_missing,
                                          std::optional<Hash256> expected_namespace,
                                          const std::map<std::string, MediaProbeResult, std::less<>>& profiles,
-                                         const std::set<std::string>& vanished_media,
-                                         FrameType frame) {
+                                         const std::set<std::string>& vanished_media) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
     auto [expected_root, view] = installed();
@@ -2132,14 +2128,13 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
     }
 
     if (changed)
-        commit(expected_root, std::move(current), expected_namespace, frame);
+        commit(expected_root, std::move(current), expected_namespace);
 }
 
 CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::string role,
                                                 std::string mime_type,
                                                 std::span<const uint8_t> bytes,
-                                                std::optional<uint64_t> expected_revision,
-                                                FrameType frame) {
+                                                std::optional<uint64_t> expected_revision) {
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     auto item = get(item_id);
@@ -2148,14 +2143,14 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
     if (expected_revision && item->revision != *expected_revision)
         revision_changed(item->id, *expected_revision, item->revision);
 
-    CatalogueArtwork art = stage_artwork(std::move(role), std::move(mime_type), bytes, frame);
+    CatalogueArtwork art = stage_artwork(std::move(role), std::move(mime_type), bytes);
 
     std::erase_if(item->artwork, [&](const CatalogueArtwork& existing) {
         return existing.role == art.role;
     });
     item->artwork.push_back(art);
     try {
-        (void)upsert(*item, item->revision, frame);
+        (void)upsert(*item, item->revision);
     } catch (...) {
         // Content-addressed: a concurrent commit may make this hash live, so
         // failed staging is left as an orphan for reachability GC.
