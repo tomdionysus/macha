@@ -1,5 +1,16 @@
 # Current release
 
+## 0.90.41: a response is sent at the pace of the client's link
+
+No API, wire, protocol or on-disk changes.
+
+Every HTTP socket takes at most one chunk the wire has not yet sent
+(`TCP_NOTSENT_LOWAT`, the stream chunk size), so the reactor's sends, and
+the viewer presence each one notes since 0.90.40, follow the client's link
+instead of running a 4 MB send buffer ahead of it: at a viewer's 5 Mbit/s
+that buffer was six seconds of bytes, past the two-second quiet window
+after which maintenance counts the node idle.
+
 ## 0.90.40: a draining response keeps its viewer present
 
 No API, wire, protocol or on-disk changes.
