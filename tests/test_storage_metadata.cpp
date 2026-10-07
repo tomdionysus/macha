@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 
+#include <thread>
+#include <future>
 #include <optional>
 #include <string_view>
 
@@ -1599,6 +1601,65 @@ MACHA_FAST_TEST("storage_metadata",
         REQUIRE(replica.accept_commit(accepted_by_two(foreign)));
         CHECK(hashes_of(replica.accepted_heads()) == hashes_of({floor, foreign}));
     }
+}
+
+MACHA_FAST_TEST("storage_metadata", test_a_checkpoint_write_holds_no_reader_of_the_replica) {
+#if defined(__linux__)
+    // Setting a head aside moves the committed head and rewrites the
+    // checkpoint. The write is held at its fsync; a reader of the replica
+    // still answers, and the new head is in memory before the write lands.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "checkpoint-off-lock";
+    const auto genesis = genesis_metadata();
+    const auto mine =
+        record_with_clock(genesis.generation + 1, genesis.hash, {{author(1), 1}}, {"/mine"});
+    const auto theirs =
+        record_with_clock(genesis.generation + 3, genesis.hash, {{author(2), 1}}, {"/theirs"});
+    {
+        MetadataReplica replica(path, keys.storage);
+        REQUIRE(replica.store_commit(mine));
+        REQUIRE(replica.accept_commit(accepted_by_two(mine)));
+        REQUIRE(replica.import_history(rootless_entry(theirs)));
+        REQUIRE(replica.accept_commit(accepted_by_two(theirs)));
+        REQUIRE(replica.committed().hash != mine.hash);
+
+        auto& hold = test_support::fsync_hold;
+        {
+            std::lock_guard lock(hold.mutex);
+            hold.path = (path / "metadata" / "checkpoint.meta").string();
+            hold.armed = true;
+        }
+        std::thread writer([&] { CHECK(replica.set_aside(theirs.hash, 10'000)); });
+        bool held = false;
+        {
+            std::unique_lock lock(hold.mutex);
+            held = hold.changed.wait_for(lock, scaled(5s), [&] { return hold.holding; });
+        }
+        CHECK(held);
+
+        auto reader = std::async(std::launch::async, [&] {
+            return std::make_pair(replica.committed().hash,
+                                  hashes_of(replica.usable_heads()));
+        });
+        const bool answered = reader.wait_for(scaled(2s)) == std::future_status::ready;
+        {
+            std::lock_guard lock(hold.mutex);
+            hold.armed = false;
+        }
+        hold.changed.notify_all();
+        writer.join();
+        CHECK(answered);
+        const auto [committed, usable] = reader.get();
+        CHECK(committed == mine.hash);
+        CHECK(usable == std::vector<Hash256>{mine.hash});
+    }
+    // The checkpoint written off the lock is the one a restart reads.
+    MetadataReplica reopened(path, keys.storage);
+    CHECK(reopened.committed().hash == mine.hash);
+#endif
 }
 
 MACHA_FAST_TEST("storage_metadata", test_a_head_set_aside_for_the_horizon_is_dropped) {

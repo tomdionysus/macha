@@ -1,5 +1,20 @@
 # Current release
 
+## 0.90.45: a checkpoint write holds no reader of the metadata replica
+
+No API, wire, protocol or on-disk changes.
+
+When the committed head moves, the replica rewrites its checkpoint, which
+can be hundreds of MB. Five paths wrote it while holding the replica's lock:
+importing a peer's history (`import_history`), re-anchoring history, and
+setting a head aside, expiring set-aside heads or clearing them. Every
+control-lane metadata read and `/status/diagnostics` waited behind the write,
+and the two RPC control workers could fill. They now do what accepting a
+commit already did: refresh the head in memory and empty the journal under
+the lock, then write the checkpoint after releasing it, still under the
+replica's durable-mutation lock so checkpoint writes stay in order. A test
+holds the checkpoint's fsync and reads the replica meanwhile.
+
 ## 0.90.44: control's commits are timed in the observation windows
 
 No API, wire, protocol or on-disk changes.
