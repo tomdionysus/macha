@@ -150,6 +150,19 @@ const char* transport_lane_name(TransportLane) noexcept;
 // the writer drains it concurrently.
 inline constexpr size_t max_pending_rpc_requests = 512;
 inline constexpr size_t max_peer_outbound_messages = 256;
+// Queued payload bytes per connection; the writer may also hold one
+// dequeued message of at most this size.
+inline constexpr size_t max_peer_outbound_bytes = 128ULL * 1024 * 1024;
+// A message no larger than this (a ping, membership, account or session
+// sync) may use a reserve of the queue that larger messages cannot, so no
+// number of large replies crowds a small one out.
+inline constexpr size_t small_outbound_payload = 64 * 1024;
+inline constexpr size_t small_outbound_reserve_messages = 32;
+inline constexpr size_t small_outbound_reserve_bytes = 8ULL * 1024 * 1024;
+// Whether a message of `payload` bytes may join a session's outbound queue
+// holding `queued` messages of `queued_bytes`. Empty when it may; otherwise
+// why not.
+const char* outbound_refusal(size_t queued, size_t queued_bytes, size_t payload) noexcept;
 // Cluster bytes in and out by frame class since start, every sealed fragment
 // with header and AEAD overhead. One instance is shared by the node's client,
 // server and all their channels. Only Macha's own traffic.

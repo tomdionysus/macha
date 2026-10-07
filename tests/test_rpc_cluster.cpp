@@ -6107,3 +6107,33 @@ MACHA_TEST("rpc_cluster", test_inbound_auto_resolves_from_dial_back_and_survives
 }
 
 } // namespace
+
+namespace {
+
+MACHA_FAST_TEST("rpc_cluster", test_large_replies_never_crowd_out_a_small_message) {
+    const size_t large = small_outbound_payload + 1;
+    const size_t large_cap = max_peer_outbound_messages - small_outbound_reserve_messages;
+    const size_t large_bytes = max_peer_outbound_bytes - small_outbound_reserve_bytes;
+
+    // An empty queue takes either.
+    CHECK(outbound_refusal(0, 0, 1) == nullptr);
+    CHECK(outbound_refusal(0, 0, large) == nullptr);
+
+    // Large messages stop short of the reserve, by count and by bytes; small
+    // ones are still admitted there.
+    CHECK(outbound_refusal(large_cap - 1, 0, large) == nullptr);
+    CHECK(outbound_refusal(large_cap, 0, large) != nullptr);
+    CHECK(outbound_refusal(large_cap, 0, small_outbound_payload) == nullptr);
+    CHECK(outbound_refusal(0, large_bytes - large, large) == nullptr);
+    CHECK(outbound_refusal(0, large_bytes - large + 1, large) != nullptr);
+    CHECK(outbound_refusal(0, large_bytes, 100) == nullptr);
+
+    // The whole queue still bounds small messages.
+    CHECK(outbound_refusal(max_peer_outbound_messages - 1, 0, 100) == nullptr);
+    CHECK(outbound_refusal(max_peer_outbound_messages, 0, 100) != nullptr);
+    CHECK(outbound_refusal(0, max_peer_outbound_bytes - 100, 100) == nullptr);
+    CHECK(outbound_refusal(0, max_peer_outbound_bytes - 99, 100) != nullptr);
+    CHECK(outbound_refusal(0, 0, max_peer_outbound_bytes + 1) != nullptr);
+}
+
+} // namespace

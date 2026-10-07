@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.48.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.47.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -50,7 +50,8 @@ metadata server's handlers, which T5's audit did not cover), ranked:
    POST still runs on the lane (operator-triggered, bounded by timeouts).
 5. Done, 0.90.47: the roster and the inbound resolution are written after
    their locks are released.
-6. One 128 MiB outbound budget for the control session (net.cpp:89).
+6. Done, 0.90.49: messages of 64 KiB or less keep a reserve of the
+   session queue.
 Not fully traced: `RpcClient::mutex_` holders, `Membership::m_` bodies.
 
 Measured under 20+ torrents on both nodes (2026-10-07, 0.90.45): the
@@ -104,6 +105,14 @@ item in section 0, then stage 6.
   first write while the set forms is refused when a peer's survey answer
   is late, and the test treats the refusal as fatal. P0: decide whether the
   write should wait for the survey, or the test retry the refusal.
+- **`storage_v18/test_node_that_stops_hosting_drains_through_repair`**
+  fails on fi-1 about 1 run in 25: 5 of 120 on 0.90.46's code, 1 of 40 on
+  0.90.48 (2026-10-08), 0 of 80 on the laptop. Repair on the draining node
+  moves nothing for 20 s after its restart, and logs nothing: the first
+  step is to make repair say why a push did not happen.
+- **`availability/test_two_nodes_survey_what_neither_holds`** exceeds its
+  20 s wait under heavy load (laptop load 58 to 102, 2026-10-08; 3.4 s
+  alone); failed before in coverage runs.
 - **Test failures**, each P0 when it recurs: *carried*
   `filesystem_fuse/test_fuse_recovery_thousand_operations_have_bounded_publications`
   (one segfault on fi-1, 2026-09-28),
@@ -234,7 +243,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.48**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.47**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -244,7 +253,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.48` back to
+  in place before that version was installed (`pre-0.90.47` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild

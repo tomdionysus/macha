@@ -1,5 +1,20 @@
 # Current release
 
+## 0.90.49: no number of large replies crowds out a ping
+
+No API, wire, protocol or on-disk changes.
+
+A peer session's outbound queue (256 messages, 128 MiB) was shared by every
+message on it, and a large metadata reply is a control frame like a ping,
+so enough large replies could make a ping, a membership update or an
+account sync fail with "peer outbound queue full". A message of 64 KiB or
+less now keeps a reserve of 32 messages and 8 MiB that larger messages
+cannot use; one decision serves both ends of a session.
+
+`test_yaml_config` sets three password checks against four control
+workers, which the 0.90.48 rule requires; the new configuration test uses
+the current `storage.data.backends` form.
+
 ## 0.90.48: logins can never fill the control lane, and liveness never queues
 
 No API, wire, protocol or on-disk changes. One configuration rule.
