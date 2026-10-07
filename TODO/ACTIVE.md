@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.47.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.49.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -243,7 +243,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.47**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.49**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -253,7 +253,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.47` back to
+  in place before that version was installed (`pre-0.90.49` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
