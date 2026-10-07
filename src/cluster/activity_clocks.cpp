@@ -14,38 +14,44 @@ int64_t ActivityClocks::now_ms() const {
 }
 
 void ActivityClocks::note(FrameType type, uint64_t bytes) {
-    if (type == FrameType::foreground)
-        foreground_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    else if (type == FrameType::read_ahead)
-        read_ahead_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    else if (type == FrameType::loader)
+    const auto now = now_ms();
+    if (type == FrameType::foreground) {
+        playback_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        last_playback_ms_.store(now, std::memory_order_relaxed);
+    } else if (type == FrameType::read_ahead) {
+        interactive_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        last_interactive_ms_.store(now, std::memory_order_relaxed);
+    } else if (type == FrameType::loader) {
         loader_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    note(work_class(type));
-}
-
-void ActivityClocks::note(WorkClass work) {
-    last_ms_[static_cast<size_t>(work)].store(now_ms(), std::memory_order_relaxed);
+        last_loader_ms_.store(now, std::memory_order_relaxed);
+    }
 }
 
 uint64_t ActivityClocks::take_bytes(FrameType type) {
     if (type == FrameType::foreground)
-        return foreground_bytes_.exchange(0, std::memory_order_relaxed);
+        return playback_bytes_.exchange(0, std::memory_order_relaxed);
     if (type == FrameType::read_ahead)
-        return read_ahead_bytes_.exchange(0, std::memory_order_relaxed);
+        return interactive_bytes_.exchange(0, std::memory_order_relaxed);
     if (type == FrameType::loader)
         return loader_bytes_.exchange(0, std::memory_order_relaxed);
     return 0;
 }
 
-std::chrono::milliseconds ActivityClocks::idle_for(WorkClass work) const {
-    const auto last = last_ms_[static_cast<size_t>(work)].load(std::memory_order_relaxed);
+std::chrono::milliseconds ActivityClocks::idle_for(FrameType type) const {
+    int64_t last = 0;
+    if (type == FrameType::foreground)
+        last = last_playback_ms_.load(std::memory_order_relaxed);
+    else if (type == FrameType::read_ahead)
+        last = last_interactive_ms_.load(std::memory_order_relaxed);
+    else if (type == FrameType::loader)
+        last = last_loader_ms_.load(std::memory_order_relaxed);
     if (!last)
         return std::chrono::hours(24);
     return std::chrono::milliseconds(std::max<int64_t>(0, now_ms() - last));
 }
 
 bool ActivityClocks::viewer_recently_active(std::chrono::milliseconds window) const {
-    return idle_for(WorkClass::viewer) < window;
+    return idle_for(FrameType::foreground) < window || idle_for(FrameType::read_ahead) < window;
 }
 
 } // namespace macha

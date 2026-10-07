@@ -464,35 +464,6 @@ const Json* conflict_named(const Json& listing, const std::string& id) {
 // Standing metadata conflicts over HTTP: each is listed with both
 // alternatives and its common ancestor, and resolving one installs the side
 // chosen and leaves the others standing.
-// The route table's classes: liveness, status, session and account routes
-// are control-class work, every other route viewer-class. A served request
-// marks its class present; a refused one marks nothing.
-MACHA_TEST("service_root", test_an_api_request_is_viewer_work_and_a_viewer_present) {
-    TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("api-class");
-    const auto port = enable_api(config);
-    Service service(config, cluster.keys(), test_durability_window);
-    service.start();
-    REQUIRE(wait_metadata_writable(service));
-    auto& activity = service.resources().activity;
-    const auto viewer_idle = [&] { return activity.idle_for(WorkClass::viewer); };
-
-    // Refused for want of a session: nobody is present.
-    const auto before = viewer_idle();
-    CHECK(http_request(port, "GET", "/api/v1/catalogue/items").status == 401);
-    CHECK(viewer_idle() >= before);
-
-    // Control routes are control-class work.
-    CHECK(http_request(port, "GET", "/api/v1/health").status == 200);
-    CHECK(activity.idle_for(WorkClass::control) < 5s);
-    CHECK(viewer_idle() >= before);
-
-    // Any other route, served, is a viewer present.
-    const auto admin = bearer_header(service);
-    CHECK(http_request(port, "GET", "/api/v1/catalogue/items", admin).status == 200);
-    CHECK(viewer_idle() < 5s);
-}
-
 MACHA_TEST("service_root", test_standing_conflicts_are_listed_and_resolved_over_http) {
     TestCluster cluster(ConfigProfile::isolated);
     auto config = cluster.node_config("conflicts");

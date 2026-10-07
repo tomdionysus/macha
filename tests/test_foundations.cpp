@@ -1106,15 +1106,15 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
 
 MACHA_FAST_TEST("foundations", test_retained_memory_ledger_preserves_priority_headroom) {
     RetainedMemoryLedger ledger(100, 10, 30, 10);
-    auto speculative = ledger.try_acquire(WorkClass::speculative, MemoryOwner::cache, 50);
+    auto speculative = ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 50);
     REQUIRE(speculative.has_value());
-    CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::cache, 1).has_value());
+    CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 1).has_value());
 
     // Speculative use cannot consume the loader floor; viewer and control
     // reserves stay usable at full lower load.
-    auto loader = ledger.try_acquire(WorkClass::loader, MemoryOwner::publication, 10);
-    auto viewer = ledger.try_acquire(WorkClass::viewer, MemoryOwner::playback_segment, 30);
-    auto control = ledger.try_acquire(WorkClass::control, MemoryOwner::rpc_frame, 10);
+    auto loader = ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 10);
+    auto viewer = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 30);
+    auto control = ledger.try_acquire(MemoryClass::control, MemoryOwner::rpc_frame, 10);
     REQUIRE(loader.has_value());
     REQUIRE(viewer.has_value());
     REQUIRE(control.has_value());
@@ -1136,33 +1136,33 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_never_starves_rpc_rea
     // durable-lower budget must therefore never block reassembly.
     RetainedMemoryLedger ledger(100, 10, 30, 10);
 
-    auto publication = ledger.try_acquire(WorkClass::loader, MemoryOwner::publication, 60);
+    auto publication = ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 60);
     REQUIRE(publication.has_value());
 
     // The durable-lower budget is full: ordinary lower work is refused.
-    CHECK(!ledger.try_acquire(WorkClass::loader, MemoryOwner::publication, 1).has_value());
-    CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::cache, 1).has_value());
+    CHECK(!ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 1).has_value());
+    CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 1).has_value());
 
     // Reassembly is still admitted: it is what releases publication's bytes.
-    auto reassembly = ledger.try_acquire(WorkClass::loader, MemoryOwner::rpc_frame, 10);
+    auto reassembly = ledger.try_acquire(MemoryClass::loader, MemoryOwner::rpc_frame, 10);
     REQUIRE(reassembly.has_value());
 
     // The exemption covers the durable-lower budget only: 60 + 10 held of 90
     // non-control capacity, so 30 more is refused, as is exceeding the total.
-    CHECK(!ledger.try_acquire(WorkClass::loader, MemoryOwner::rpc_frame, 30).has_value());
-    CHECK(!ledger.try_acquire(WorkClass::control, MemoryOwner::rpc_frame, 40).has_value());
+    CHECK(!ledger.try_acquire(MemoryClass::loader, MemoryOwner::rpc_frame, 30).has_value());
+    CHECK(!ledger.try_acquire(MemoryClass::control, MemoryOwner::rpc_frame, 40).has_value());
 
     reassembly.reset();
     publication.reset();
     CHECK(ledger.stats().used_bytes == 0);
-    CHECK(ledger.try_acquire(WorkClass::loader, MemoryOwner::publication, 60).has_value());
+    CHECK(ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 60).has_value());
 }
 
 MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounded_not_absolute) {
     // A 5-byte reassembly reserve, so the bound is testable.
     RetainedMemoryLedger ledger(100, 10, 30, 10, 5);
 
-    auto publication = ledger.try_acquire(WorkClass::loader, MemoryOwner::publication, 60);
+    auto publication = ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 60);
     REQUIRE(publication.has_value());
 
     // A queued lower-class waiter must not shut reassembly out of the reserve.
@@ -1171,7 +1171,7 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
     std::jthread waiter([&] {
         started.store(true);
         std::atomic_bool cancel{false};
-        auto blocked = ledger.acquire(WorkClass::loader, MemoryOwner::publication, 40,
+        auto blocked = ledger.acquire(MemoryClass::loader, MemoryOwner::publication, 40,
                                       RetainedMemoryLedger::Clock::now() + 2s, &cancel);
         finished.store(true);
         CHECK(!blocked.has_value());
@@ -1187,13 +1187,13 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
     std::atomic_bool viewer_started{false};
     std::jthread viewer([&] {
         viewer_started.store(true);
-        (void)ledger.acquire(WorkClass::viewer, MemoryOwner::playback_segment, 40,
+        (void)ledger.acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 40,
                              RetainedMemoryLedger::Clock::now() + 1s, &viewer_cancel);
     });
     while (!viewer_started.load()) std::this_thread::yield();
     for (int i = 0; i < 200 && ledger.stats().waits[0] + ledger.stats().waits[3] == 0; ++i)
         std::this_thread::sleep_for(1ms);
-    CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::rpc_frame, 1).has_value());
+    CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::rpc_frame, 1).has_value());
     viewer_cancel.store(true);
     viewer.join();
 
@@ -1201,15 +1201,15 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
         // Inside the reserve, reassembly is admitted despite the lower waiter.
         // Scoped so the destructor releases the lease: an explicit reset()
         // here trips a GCC -Wmaybe-uninitialized false positive.
-        auto inside = ledger.try_acquire(WorkClass::speculative, MemoryOwner::rpc_frame, 4);
+        auto inside = ledger.try_acquire(MemoryClass::speculative, MemoryOwner::rpc_frame, 4);
         REQUIRE(inside.has_value());
 
         // Beyond the reserve it defers; unbounded priority would starve the
         // node's own publication.
-        CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::rpc_frame, 4)
+        CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::rpc_frame, 4)
                    .has_value());
         // The reserve is for reassembly only; other speculative work defers.
-        CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::cache, 1).has_value());
+        CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 1).has_value());
     }
     waiter.join();
     CHECK(finished.load());
@@ -1221,12 +1221,12 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
 MACHA_FAST_TEST("foundations", test_retained_memory_ledger_sheds_borrowed_cache_for_viewer) {
     RetainedMemoryLedger ledger(100, 10, 30, 10);
     std::optional<RetainedMemoryLedger::Lease> borrowed;
-    borrowed = ledger.try_acquire(WorkClass::loader, MemoryOwner::cache, 90, true,
+    borrowed = ledger.try_acquire(MemoryClass::loader, MemoryOwner::cache, 90, true,
                                   [&] { borrowed.reset(); });
     REQUIRE(borrowed.has_value());
     CHECK(ledger.stats().reclaimable_bytes == 90);
 
-    auto viewer = ledger.acquire(WorkClass::viewer, MemoryOwner::playback_segment, 30,
+    auto viewer = ledger.acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 30,
                                  RetainedMemoryLedger::Clock::now() + 1s);
     REQUIRE(viewer.has_value());
     CHECK(!borrowed.has_value());
@@ -1240,14 +1240,14 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_sheds_borrowed_cache_
 
 MACHA_FAST_TEST("foundations", test_retained_memory_ledger_restores_durable_overcommit) {
     RetainedMemoryLedger ledger(100, 10, 30, 10);
-    auto restored = ledger.restore(WorkClass::loader, MemoryOwner::fuse_operation, 120);
+    auto restored = ledger.restore(MemoryClass::loader, MemoryOwner::fuse_operation, 120);
     const auto overcommitted = ledger.stats();
     CHECK(overcommitted.used_bytes == 120);
     CHECK(overcommitted.restored_bytes == 120);
-    CHECK(!ledger.try_acquire(WorkClass::viewer, MemoryOwner::playback_segment, 1).has_value());
+    CHECK(!ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 1).has_value());
 
     restored.reset();
-    auto viewer = ledger.try_acquire(WorkClass::viewer, MemoryOwner::playback_segment, 30);
+    auto viewer = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 30);
     REQUIRE(viewer.has_value());
     CHECK(ledger.stats().used_bytes == 30);
 }

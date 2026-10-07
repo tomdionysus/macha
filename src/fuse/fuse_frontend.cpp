@@ -238,7 +238,7 @@ ViewerWeightedAdmission::ViewerWeightedAdmission(FileSystem& filesystem, const F
       share_(config.viewer_weight, config.loader_weight) {}
 
 bool ViewerWeightedAdmission::viewer_active() const {
-    return quiet_.count() > 0 && fs_.idle_for(WorkClass::viewer) < quiet_;
+    return quiet_.count() > 0 && fs_.foreground_idle_for() < quiet_;
 }
 
 bool ViewerWeightedAdmission::can_start(TimePoint now) {
@@ -263,7 +263,7 @@ void ViewerWeightedAdmission::finished(TimePoint now) {
 
 std::optional<std::chrono::milliseconds> ViewerWeightedAdmission::retry_after(TimePoint now) {
     // The earlier of the viewer window closing and the loader's cooldown.
-    const auto idle = fs_.idle_for(WorkClass::viewer);
+    const auto idle = fs_.foreground_idle_for();
     if (quiet_.count() <= 0 || idle >= quiet_)
         return std::chrono::milliseconds(0);
     auto retry = quiet_ - idle;
@@ -994,7 +994,7 @@ struct FuseFrontend::State {
     }
 
     std::shared_ptr<RetainedMemoryLedger::Lease> reserve_process_memory(
-        WorkClass memory_class, MemoryOwner owner, uint64_t bytes, Clock::time_point) {
+        MemoryClass memory_class, MemoryOwner owner, uint64_t bytes, Clock::time_point) {
         const auto since = Clock::now();
         for (;;) {
             auto lease = retained_memory.acquire(memory_class, owner, bytes,
@@ -4732,7 +4732,7 @@ struct FuseFrontend::State {
                         if (op.sequence > done) {
                             auto recovered_op = op;
                             auto memory = retained_memory.restore(
-                                WorkClass::loader, MemoryOwner::fuse_operation,
+                                MemoryClass::loader, MemoryOwner::fuse_operation,
                                 recovered_op.metadata_charge);
                             recovered_op.process_memory =
                                 std::make_shared<RetainedMemoryLedger::Lease>(std::move(memory));
@@ -5794,7 +5794,7 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
             state_->wait_for_inode_durability(inode, deadline, cancelled);
         auto process_memory = truncate_on_open
                                   ? state_->reserve_process_memory(
-                                        WorkClass::loader, MemoryOwner::fuse_operation,
+                                        MemoryClass::loader, MemoryOwner::fuse_operation,
                                         State::operation_metadata_charge(0), deadline)
                                   : nullptr;
         auto metadata_admission = truncate_on_open
@@ -6096,7 +6096,7 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
     auto write_admission =
         state_->reserve_write_request_bytes(static_cast<uint64_t>(data.size()), admission_deadline);
     auto process_write_admission = state_->reserve_process_memory(
-        WorkClass::loader, MemoryOwner::fuse_request, data.size(), admission_deadline);
+        MemoryClass::loader, MemoryOwner::fuse_request, data.size(), admission_deadline);
     Bytes owned(data.begin(), data.end());
     return dispatch(
         FuseOperationClass::write, [this, inode_id, offset, append,
@@ -6115,7 +6115,7 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                 State::spool_checksum_chunk_size;
             const auto metadata_charge = State::operation_metadata_charge(checksum_count);
             auto process_operation = state_->reserve_process_memory(
-                WorkClass::loader, MemoryOwner::fuse_operation, metadata_charge, deadline);
+                MemoryClass::loader, MemoryOwner::fuse_operation, metadata_charge, deadline);
             auto metadata_admission = state_->reserve_operation_metadata(
                 metadata_charge, deadline, [&] { state_->request_data_publication(inode); });
 
@@ -6243,7 +6243,7 @@ void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
                  auto inode = state_->resolve_inode(inode_id);
                  state_->wait_for_inode_durability(inode, deadline, cancelled);
                  auto process_memory = state_->reserve_process_memory(
-                     WorkClass::loader, MemoryOwner::fuse_operation,
+                     MemoryClass::loader, MemoryOwner::fuse_operation,
                      State::operation_metadata_charge(0), deadline);
                  auto metadata_admission = state_->reserve_operation_metadata(
                      State::operation_metadata_charge(0), deadline,
@@ -6745,8 +6745,7 @@ std::vector<HydrationHint> FuseFrontend::hints() {
         result.run_id = "fuse:" + std::to_string(it->first);
         result.priority = state_->config.hydration_priority;
         result.reason = "fuse-demand";
-        // Prefetch for mount reads, which are loader work.
-        result.frame_type = FrameType::loader;
+        result.frame_type = FrameType::read_ahead;
         const auto end =
             std::min(hint.entry.extents.size(), hint.last + 1 + state_->config.read_ahead_extents);
         std::set<ObjectId> seen;

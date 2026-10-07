@@ -31,6 +31,17 @@ bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled,
            (deadline != Clock::time_point{} && Clock::now() >= deadline);
 }
 
+MemoryClass object_memory_class(FrameType frame_type) {
+    switch (frame_type) {
+    case FrameType::control: return MemoryClass::control;
+    case FrameType::foreground:
+    case FrameType::read_ahead: return MemoryClass::viewer;
+    case FrameType::loader: return MemoryClass::loader;
+    case FrameType::speculative: return MemoryClass::speculative;
+    }
+    return MemoryClass::speculative;
+}
+
 DistributedStore::ObjectData take_object_reply_payload(RpcMessage message,
                                                        const ObjectId& expected) {
     if (message.type != MessageType::object_reply)
@@ -108,6 +119,10 @@ void DistributedStore::note_network(uint64_t bytes, Clock::duration duration) {
     double old = network_bps_.load(std::memory_order_relaxed);
     double next = old > 0.0 ? old * 0.80 + sample * 0.20 : sample;
     network_bps_.store(next, std::memory_order_relaxed);
+}
+
+std::chrono::milliseconds DistributedStore::foreground_idle_for() const {
+    return activity_.idle_for(FrameType::foreground);
 }
 
 std::vector<NodeInfo> DistributedStore::hosting_nodes() const {
@@ -1355,7 +1370,7 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
             if (!resource)
                 return {};
             auto memory = retained_memory_.acquire(
-                work_class(frame_type), MemoryOwner::object_payload,
+                object_memory_class(frame_type), MemoryOwner::object_payload,
                 n_.config().extent_size, deadline, cancelled);
             if (!memory)
                 return {};
@@ -1690,7 +1705,7 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
     if (!local_resource)
         return {};
     auto local_memory = retained_memory_.acquire(
-        work_class(frame_type), MemoryOwner::object_payload,
+        object_memory_class(frame_type), MemoryOwner::object_payload,
         n_.config().extent_size, deadline, cancelled);
     if (!local_memory)
         return {};
@@ -1719,7 +1734,7 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
     if (!cache_resource)
         return {};
     auto cache_memory = retained_memory_.acquire(
-        work_class(frame_type), MemoryOwner::object_payload,
+        object_memory_class(frame_type), MemoryOwner::object_payload,
         n_.config().extent_size, deadline, cancelled);
     if (!cache_memory)
         return {};
@@ -2876,7 +2891,7 @@ void DistributedStore::enqueue_local_copy(const ObjectId& id, std::span<const ui
     if (!cache && !promote)
         return;
 
-    auto memory = retained_memory_.try_acquire(WorkClass::speculative,
+    auto memory = retained_memory_.try_acquire(MemoryClass::speculative,
                                                MemoryOwner::object_payload, data.size());
     if (!memory) {
         // Log the drop, so an unfilled cache is distinguishable from a broken one.
