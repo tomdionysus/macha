@@ -1377,6 +1377,36 @@ MACHA_TEST("storage_v18", test_edge_node_never_owns_and_its_writes_land_on_owner
 
 // A node that stops hosting extents drains through ordinary repair: the
 // copies it holds are pushed to the owners and then removed locally.
+MACHA_TEST("storage_v18", test_repair_keeps_a_copy_it_has_nowhere_to_send) {
+    // A node that stops hosting while it knows no other host has nowhere to
+    // send its copies. Repair must keep them, not count zero owners as all
+    // its owners having them.
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    StorageClusterNode alone(storage_node_config(cluster, "alone", port, 64ULL * 1024 * 1024, 1, 1),
+                             keys);
+    alone.start();
+    std::vector<ObjectId> held;
+    for (uint8_t salt = 1; held.size() < 4 && salt < 250; ++salt) {
+        const auto id = alone.store().put(pattern(96 * 1024, salt), FrameType::loader);
+        REQUIRE(alone.node().local_store().has(id));
+        held.push_back(id);
+    }
+    alone.stop();
+    alone.config().hosts_extents = Tristate::no;
+    alone.start();
+    REQUIRE(!alone.node().hosts_extents());
+    // No node hosts: the object has no owner at all.
+    for (const auto& id : held)
+        REQUIRE(!alone.store().should_own(id));
+
+    for (int pass = 0; pass < 3; ++pass)
+        (void)alone.store().repair_once();
+    for (const auto& id : held)
+        CHECK(alone.node().local_store().has(id));
+}
+
 MACHA_TEST("storage_v18", test_node_that_stops_hosting_drains_through_repair) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto& keys = cluster.keys();

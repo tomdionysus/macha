@@ -105,11 +105,12 @@ item in section 0, then stage 6.
   first write while the set forms is refused when a peer's survey answer
   is late, and the test treats the refusal as fatal. P0: decide whether the
   write should wait for the survey, or the test retry the refusal.
-- **`storage_v18/test_node_that_stops_hosting_drains_through_repair`**
-  fails on fi-1 about 1 run in 25: 5 of 120 on 0.90.46's code, 1 of 40 on
-  0.90.48 (2026-10-08), 0 of 80 on the laptop. Repair on the draining node
-  moves nothing for 20 s after its restart, and logs nothing: the first
-  step is to make repair say why a push did not happen.
+- **Repair deleted a copy it had nowhere to send** (fixed 0.90.50): a node
+  hosting nothing and knowing no host had a target of zero owners, so
+  repair dropped its local copy. fi-1 did not host 2026-09-15 to 09-24 and
+  could have lost a copy it alone held at a restart in that window; nothing
+  recorded says whether it did. Any such loss is among the unavailable
+  extents and cannot be told from es-1's absence until es-1 returns.
 - **`availability/test_two_nodes_survey_what_neither_holds`** exceeds its
   20 s wait under heavy load (laptop load 58 to 102, 2026-10-08; 3.4 s
   alone); failed before in coverage runs.

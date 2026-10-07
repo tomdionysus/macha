@@ -1,5 +1,25 @@
 # Current release
 
+## 0.90.50: repair never deletes a copy it has nowhere to send
+
+No API, wire, protocol or on-disk changes.
+
+Repair drops a node's local copy of an object the node does not own once
+enough owners hold it: kept by at least `min(replication, owners)` nodes.
+A node that hosts no extents and knows no node that does (a draining node
+just after a restart, before its peers are seen) has no owners, so the
+target was zero, "enough owners hold it" was vacuously true, and repair
+deleted the copy, possibly the only one. The condition goes back to the
+first repair code. A copy is now dropped only when at least one owner is
+known to hold it. A test runs repair on a lone non-hosting node and checks
+nothing is removed; the drain test that failed on fi-1 about 1 run in 25
+was this.
+
+Exposure: gbni-1 has always hosted extents and fi-1 has since 0.55.1
+(2026-09-24); a hosting node is its own owner, so its target is never zero.
+fi-1 did not host from at least 2026-09-15 to 2026-09-24, when a restart
+could have dropped a copy it alone held; no record says whether it did.
+
 ## 0.90.49: no number of large replies crowds out a ping
 
 No API, wire, protocol or on-disk changes.

@@ -2735,7 +2735,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             for (const auto& plan : plans) {
                 if (failed.contains(plan.id))
                     continue; // retried from the same place next step
-                if (plan.live && plan.keepers.size() >= plan.target &&
+                // No owner known means nowhere it is kept, not every owner
+                // keeping it: the copy stays until a host is known.
+                if (plan.live && plan.target > 0 && plan.keepers.size() >= plan.target &&
                     !plan.keepers.contains(n_.node_id()) &&
                     !local_.retention().retained(RetentionClass::data, plan.id)) {
                     auto resource = data_resources_.acquire(
