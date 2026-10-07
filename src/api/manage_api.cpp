@@ -933,7 +933,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             // of one season.
             std::map<std::string, std::vector<const CatalogueItem*>> bound;
             const auto snapshot = catalogue_.snapshot_view(
-                WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/unmatched"));
+                WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/manage/unmatched", local_waits));
             for (const auto& [_, item] : snapshot->items()) {
                 if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
                     item.kind != CatalogueKind::track)
@@ -1067,7 +1067,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             auto item = scanner_.choose_artwork(required_string(body, "item_id"),
                                                 required_string(body, "role"),
                                                 required_string(body, "option_id"), std::move(ref),
-                                                numbers, lock);
+                                                numbers, lock, frame_for(request.work));
             Json::Object out;
             out["status"] = "chosen";
             out["item"] = catalogue_item_json(item);
@@ -1126,7 +1126,8 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                     numbers.episode = optional_i32(root, "episode_number");
                     numbers.disc = optional_i32(root, "disc_number");
                     numbers.track = optional_i32(root, "track_number");
-                    const auto matched = scanner_.match_unmatched_ref(id, ref, numbers);
+                    const auto matched =
+                        scanner_.match_unmatched_ref(id, ref, numbers, frame_for(request.work));
                     Json::Array items;
                     for (const auto& item_id : matched.item_ids)
                         if (auto item = catalogue_.get(item_id)) items.push_back(catalogue_item_json(*item));
@@ -1144,7 +1145,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                     return http_error(400, "not_playable_item", "files may be matched only to movies, episodes or tracks");
                 if (std::find(item->media_ids.begin(), item->media_ids.end(), current->second) == item->media_ids.end())
                     item->media_ids.push_back(current->second);
-                auto saved = catalogue_.upsert(*item, item->revision);
+                auto saved = catalogue_.upsert(*item, item->revision, frame_for(request.work));
                 hints_.mark_catalogued(hint->id, "manual", current->second, {saved.id},
                                        "manual_existing_item");
                 Json::Object out;
@@ -1216,7 +1217,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             std::map<std::string, std::vector<std::string>, std::less<>> bindings;
             try {
                 (void)catalogue_.snapshot_view(
-                    WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/filesystem"));
+                    WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/manage/filesystem", local_waits));
                 bindings = catalogue_.indexes()->media_bindings;
             } catch (const std::exception& e) {
                 // MachaDFS browsing does not depend on the catalogue; binding annotations are

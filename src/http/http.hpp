@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "cluster/frame_type.hpp"
 #include "config.hpp"
 #include "contract/thread_safety.hpp"
 #include "types.hpp"
@@ -33,6 +34,9 @@ struct HttpRequest {
     bool resumed{};
     std::shared_ptr<void> resumed_state{};
     Clock::time_point resume_deadline{};
+    // The request's work class, from the route table; the work it does
+    // carries it (frame_for(work) for its DATA work).
+    WorkClass work{WorkClass::viewer};
     // Every value of each repeatable query parameter, in order; `query` keeps
     // the last.
     std::map<std::string, std::vector<std::string>, std::less<>> query_all{};
@@ -182,9 +186,15 @@ class HttpServer {
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
-    // Control-lane routes: a path equal to a prefix or beginning with it plus
-    // '/'. Pure string matching, so the reactor decides it. Set before start().
-    void set_control_prefixes(std::vector<std::string> prefixes);
+    // Each request's work class, from the service's route table. Control
+    // requests run on the control pool, every other class on the data pool.
+    // Cheap and pure: the reactor calls it. Unset, every request is
+    // viewer-class. Set before start().
+    void set_work_class(std::function<WorkClass(std::string_view path)> classify);
+    // Called with a request's class as it is served (not when it is refused
+    // for want of a session), so work of that class is known present. Set
+    // before start().
+    void set_activity(std::function<void(WorkClass)> note);
     // Test-only: called once per reactor pass, inside the measured region.
     void set_reactor_pass_hook(std::function<void()> hook);
 

@@ -41,12 +41,34 @@ MACHA_FAST_TEST("contract", test_waits_compose_and_include_over_every_mask) {
 }
 
 MACHA_FAST_TEST("contract", test_only_control_is_refused_and_only_device_or_network_waits) {
+    // By default a class allows what the laws let it wait on.
     for (auto frame_type : frame_types)
         for (unsigned mask = 0; mask < 16; ++mask) {
             const bool data_or_network = (mask & (2U | 4U)) != 0;
             const bool expected = frame_type != FrameType::control || !data_or_network;
-            CHECK(may_enter(frame_type, static_cast<Waits>(mask)) == expected);
+            CHECK(may_enter(WorkContext(frame_type).allowed(), static_cast<Waits>(mask)) == expected);
         }
+}
+
+MACHA_FAST_TEST("contract", test_work_may_allow_itself_less_never_more) {
+    // A memory-only read: viewer work allowing no network wait.
+    const WorkContext read(FrameType::foreground, {}, nullptr, "read",
+                           Waits::state_device | Waits::locks);
+    CHECK(read.work() == WorkClass::viewer);
+    CHECK(may_enter(read.allowed(), Waits::state_device));
+    CHECK(!may_enter(read.allowed(), Waits::network));
+    CHECK(!may_enter(read.allowed(), Waits::data_device));
+    // Control cannot allow itself the network.
+    const WorkContext control(FrameType::control, {}, nullptr, "control",
+                              Waits::state_device | Waits::data_device | Waits::network |
+                                  Waits::locks);
+    CHECK(!may_enter(control.allowed(), Waits::network));
+    CHECK(!may_enter(control.allowed(), Waits::data_device));
+    // Every mask against every mask: allowed means a subset.
+    for (unsigned allowed = 0; allowed < 16; ++allowed)
+        for (unsigned declared = 0; declared < 16; ++declared)
+            CHECK(may_enter(static_cast<Waits>(allowed), static_cast<Waits>(declared)) ==
+                  ((declared & ~allowed) == 0));
 }
 
 MACHA_FAST_TEST("contract", test_wait_guard_records_or_throws) {

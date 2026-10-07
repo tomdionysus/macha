@@ -499,6 +499,7 @@ class FileSystem final : public PublicationTarget {
         std::span<const FilesystemNamespaceMutation>,
         std::optional<MetadataMutationIdentity> identity = {}, bool atomic = false);
     void truncate_file(const std::string&, uint64_t);
+    // A read nobody is viewing: speculative work.
     std::shared_ptr<ReadHandle> open_read(const std::string&);
     // Opens a resolved immutable entry, so a path replacement cannot change
     // the bytes under a playback session.
@@ -574,9 +575,7 @@ class FileSystem final : public PublicationTarget {
     }
     void note_interactive_activity(uint64_t bytes = 0) { s_.interactive_activity(bytes); }
     void note_foreground_activity(uint64_t bytes = 0) { s_.foreground_activity(bytes); }
-    std::chrono::milliseconds foreground_idle_for() const { return s_.foreground_idle_for(); }
-    std::chrono::milliseconds interactive_idle_for() const { return s_.interactive_idle_for(); }
-    std::chrono::milliseconds loader_idle_for() const { return s_.loader_idle_for(); }
+    std::chrono::milliseconds idle_for(WorkClass work_class) const { return s_.idle_for(work_class); }
     void reset_io_cancellation() { io_cancelled_.store(false, std::memory_order_relaxed); }
     void request_io_cancellation() {
         io_cancelled_.store(true, std::memory_order_relaxed);
