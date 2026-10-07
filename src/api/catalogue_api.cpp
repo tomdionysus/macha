@@ -637,7 +637,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 if (role == request.query.end() || role->second.empty() || mime == request.query.end() || mime->second.empty())
                     return error(400, "bad_artwork", "role and mime are required");
                 auto art = catalogue_.put_artwork(id, role->second, mime->second, request.body,
-                                                  expected_revision(request));
+                                                  expected_revision(request),
+                                                  frame_for(request.work));
                 auto updated = catalogue_.get(id);
                 auto response = json(201, "{\"role\":" + json_escape(art.role) +
                                              ",\"id\":" + json_escape(to_string(art.id)) +
@@ -677,7 +678,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 }
                 apply_item_fields(item, root, request.method == "PUT");
                 validate_parent(catalogue_, item);
-                auto saved = catalogue_.upsert(std::move(item), expected_revision(request));
+                auto saved = catalogue_.upsert(std::move(item), expected_revision(request),
+                                               frame_for(request.work));
                 auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::foreground, {}, nullptr, "/api/v1/catalogue/items/{id}", local_waits));
                 auto response = json(existing ? 200 : 201, item_json(saved, *snapshot,

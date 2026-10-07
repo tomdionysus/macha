@@ -89,12 +89,30 @@ preloaded or embedded.
   admit viewer operations. It must stay answerable whatever else is happening,
   because it is how the cluster, the client and the operator find out anything
   at all.
-- **A viewer** is someone watching or listening right now: playback startup,
-  reads, seeks and transport.
-- **A loader** is durable work the user asked for - FUSE publication, ingest,
-  acquisition - which must finish but need not finish first.
-- **Speculative** work is everything nobody is waiting for: read-ahead beyond
-  demand, maintenance, repair, diagnostics.
+- **A viewer** is a person using the system right now: watching or listening
+  (playback startup, reads, seeks and transport, read-ahead for what is
+  playing) or using the API (browsing the catalogue, editing, managing
+  files). Every API route but the control routes is viewer work.
+- **A loader** is durable work the user asked for - FUSE publication and
+  mount reads, ingest, acquisition - which must finish but need not finish
+  first.
+- **Speculative** work is everything nobody is waiting for: maintenance,
+  repair, the scanner, diagnostics.
+
+Work has exactly one class, and every part of the server that admits, paces,
+schedules or measures work reads that one class (`WorkClass`, from the frame
+the work travels on: `foreground` and `read_ahead` are viewer frames). None
+keeps its own notion of which work is which.
+
+A request's class is the class of answering it; the work it starts has its
+own. A torrent added from the API is answered as viewer work and downloaded
+as loader work; a rescan is requested as viewer work and run as speculative
+work. The DATA work a request does itself, such as artwork a person stages
+in the editor, carries the request's class.
+
+What work may wait on is said beside its class: by default control may wait
+on its own state device and locks, never the DATA device or the network, and
+every other class on anything; work may allow itself less, never more.
 
 ## Scheduling laws
 
