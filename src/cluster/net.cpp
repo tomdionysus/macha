@@ -21,6 +21,20 @@
 
 namespace macha {
 
+const char* outbound_refusal(size_t queued, size_t queued_bytes, size_t payload) noexcept {
+    const bool small = payload <= small_outbound_payload;
+    const size_t message_cap =
+        small ? max_peer_outbound_messages
+              : max_peer_outbound_messages - small_outbound_reserve_messages;
+    const size_t byte_cap =
+        small ? max_peer_outbound_bytes : max_peer_outbound_bytes - small_outbound_reserve_bytes;
+    if (queued >= message_cap)
+        return "peer outbound queue full";
+    if (payload > byte_cap || queued_bytes > byte_cap - payload)
+        return "peer outbound byte queue full";
+    return nullptr;
+}
+
 bool peer_socket_options(int fd) {
     int yes = 1;
 #ifdef SO_NOSIGPIPE
@@ -83,10 +97,6 @@ constexpr size_t data_worker_count = 8;
 constexpr size_t foreground_data_worker_reserve = 2;
 static_assert(foreground_data_worker_reserve < data_worker_count);
 constexpr size_t max_pending_requests = max_pending_rpc_requests;
-constexpr size_t max_peer_outbound = max_peer_outbound_messages;
-// Queued payload bytes per connection; the writer may also hold one
-// dequeued message of at most this size.
-constexpr size_t max_peer_outbound_bytes = 128ULL * 1024 * 1024;
 constexpr size_t max_pre_auth_sessions = 8;
 constexpr auto rpc_handshake_timeout = std::chrono::seconds(5);
 constexpr size_t frame_header_size = 28;
@@ -1288,11 +1298,9 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 if (auto found = inbound_classes_.find(request_id); found != inbound_classes_.end())
                     frame_type = more_urgent(found->second, frame_type);
             }
-            if (outbound_.size() >= max_peer_outbound)
-                throw std::runtime_error("peer outbound queue full");
-            if (message.payload.size() > max_peer_outbound_bytes ||
-                outbound_bytes_ > max_peer_outbound_bytes - message.payload.size())
-                throw std::runtime_error("peer outbound byte queue full");
+            if (const auto refused =
+                    outbound_refusal(outbound_.size(), outbound_bytes_, message.payload.size()))
+                throw std::runtime_error(refused);
             if (!reply && request_id)
                 outbound_classes_[request_id] = frame_type;
             const auto payload_bytes = message.payload.size();
@@ -3248,11 +3256,9 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 if (auto found = inbound_classes.find(request_id); found != inbound_classes.end())
                     frame_type = more_urgent(found->second, frame_type);
             }
-            if (outbound.size() >= max_peer_outbound)
-                throw std::runtime_error("peer outbound queue full");
-            if (message.payload.size() > max_peer_outbound_bytes ||
-                outbound_bytes > max_peer_outbound_bytes - message.payload.size())
-                throw std::runtime_error("peer outbound byte queue full");
+            if (const auto refused =
+                    outbound_refusal(outbound.size(), outbound_bytes, message.payload.size()))
+                throw std::runtime_error(refused);
             if (!reply && request_id)
                 outbound_classes[request_id] = frame_type;
             const auto payload_bytes = message.payload.size();
