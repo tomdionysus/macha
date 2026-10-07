@@ -10,6 +10,7 @@
 #include "startup_progress.hpp"
 #include "supervised.hpp"
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
@@ -65,11 +66,22 @@ Service::Service(Config config, ClusterKeys keys,
                 }
                 return std::optional(session_identity(*session));
             });
-        // The control lane: liveness, cluster status, session and account routes.
-        // Everything else is the data lane, so a node saturated serving fragments
-        // still says what is wrong with it.
-        catalogue_http_->set_control_prefixes(
-            {"/api/v1/health", "/api/v1/status", "/api/v1/session", "/api/v1/users"});
+        // The route table's classes: liveness, cluster status, session and
+        // account routes are control (law 1), so a node saturated serving
+        // viewers still says what is wrong with it; every other route is
+        // viewer-class work, and a request to one is a viewer present.
+        catalogue_http_->set_work_class([](std::string_view path) {
+            static constexpr std::array<std::string_view, 4> control{
+                "/api/v1/health", "/api/v1/status", "/api/v1/session", "/api/v1/users"};
+            for (const auto prefix : control)
+                if (path == prefix ||
+                    (path.size() > prefix.size() && path.starts_with(prefix) &&
+                     path[prefix.size()] == '/'))
+                    return WorkClass::control;
+            return WorkClass::viewer;
+        });
+        catalogue_http_->set_activity(
+            [this](WorkClass work) { resources_.activity.note(work); });
     }
 }
 

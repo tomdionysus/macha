@@ -1,18 +1,5 @@
 # Current release
 
-## 0.90.40: the work-class changes are withdrawn
-
-The code is 0.90.34's again: 0.90.35 to 0.90.39 are reverted at the
-operator's instruction. One API change: `diagnostics.repair.paced_by` in
-status diagnostics lists `playback`, `mounted_filesystem`, `loader` and
-`peer_playback` again, in place of `viewer`, `loader` and `peer_viewer`.
-
-Withdrawn with it: the one `WorkClass` mapping and the classes of FUSE
-prefetch, the scanner's tag reads and the default `open_read`; API requests
-marking a viewer present; allowed waits on a work context; the request's
-class passed down its DATA work; BBR on peer sockets, which moved gbni-1's
-DATA socket to fi-1 at 12 to 15 Mbit/s against cubic's 19 to 20.
-
 ## 0.90.39: control frames no longer wait behind a full link
 
 No API, wire, protocol or on-disk changes.

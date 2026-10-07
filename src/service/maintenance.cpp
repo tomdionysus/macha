@@ -354,19 +354,15 @@ void Maintenance::run(std::stop_token stop) {
         auto playback_bytes = store_.take_foreground_bytes();
         auto interactive_bytes = store_.take_interactive_bytes();
         auto loader_bytes = store_.take_loader_bytes();
-        const bool playback_busy =
-            playback_bytes > 0 || store_.foreground_idle_for() < policy.foreground_quiet;
-        const bool interactive_busy =
-            interactive_bytes > 0 || store_.interactive_idle_for() < policy.foreground_quiet;
+        const bool viewer_busy = playback_bytes > 0 || interactive_bytes > 0 ||
+                                 store_.idle_for(WorkClass::viewer) < policy.foreground_quiet;
         // Law 3: the loader outranks background work, so loader activity (an
         // ingest) counts as busy too.
         const bool loader_busy =
-            loader_bytes > 0 || store_.loader_idle_for() < policy.foreground_quiet;
-        // Priority law: playback/seek > mounted MachaDFS/useful prefetch >
-        // user-requested loader work > repair/rebalance/scrub. All three
-        // suppress background work, while the transport queues themselves keep
-        // playback above mount I/O.
-        bool busy = playback_busy || interactive_busy || loader_busy;
+            loader_bytes > 0 || store_.idle_for(WorkClass::loader) < policy.foreground_quiet;
+        // Viewer > loader > repair/rebalance/scrub. Both higher classes pace
+        // background work, while the transport queues order within them.
+        bool busy = viewer_busy || loader_busy;
         // A peer's viewers pace repair as this node's own do, since repair shares
         // their links: paced, never stopped, or a later viewer waits for the copy.
         const bool peer_viewers = node_.peer_viewers_active(
@@ -523,10 +519,9 @@ void Maintenance::run(std::stop_token stop) {
                                         : DistributedStore::RepairGate::quiescent,
                 network_credit,
                 static_cast<uint8_t>(
-                    (playback_busy ? DistributedStore::paced_by_playback : 0) |
-                    (interactive_busy ? DistributedStore::paced_by_mounted_filesystem : 0) |
+                    (viewer_busy ? DistributedStore::paced_by_viewer : 0) |
                     (loader_busy ? DistributedStore::paced_by_loader : 0) |
-                    (peer_viewers ? DistributedStore::paced_by_peer_playback : 0)));
+                    (peer_viewers ? DistributedStore::paced_by_peer_viewer : 0)));
             trace_gate("gate.repair", network_due,
                        flag("share", allow_network_repair) + " " +
                            flag("quiescent", now < network_quiescent_until));
@@ -644,9 +639,8 @@ void Maintenance::run(std::stop_token stop) {
                     } restorer{store_, network_credit, extent, trace_action};
                     const auto higher_class_active = [this, &policy, peer_viewers] {
                         const auto quiet = policy.foreground_quiet;
-                        return peer_viewers || store_.foreground_idle_for() < quiet ||
-                               store_.interactive_idle_for() < quiet ||
-                               store_.loader_idle_for() < quiet;
+                        return peer_viewers || store_.idle_for(WorkClass::viewer) < quiet ||
+                               store_.idle_for(WorkClass::loader) < quiet;
                     };
                     repair_share.started(clock_->now(), repair_busy);
                     // A throw from either repair stage must still close the
@@ -949,9 +943,8 @@ void Maintenance::run(std::stop_token stop) {
                         orphan_grace, 64,
                         [this] {
                             const auto quiet = node_.config().maintenance.foreground_quiet;
-                            return store_.foreground_idle_for() < quiet ||
-                                   store_.interactive_idle_for() < quiet ||
-                                   store_.loader_idle_for() < quiet;
+                            return store_.idle_for(WorkClass::viewer) < quiet ||
+                               store_.idle_for(WorkClass::loader) < quiet;
                         },
                         [this](const ObjectId& id) {
                             return ledger_.retained(RetentionClass::data, id);
@@ -1018,9 +1011,8 @@ void Maintenance::run(std::stop_token stop) {
                 auto rebalance = local_.data().rebalance_step(
                     static_cast<uint64_t>(local_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
-                        return store_.foreground_idle_for() < quiet ||
-                               store_.interactive_idle_for() < quiet ||
-                               store_.loader_idle_for() < quiet;
+                        return store_.idle_for(WorkClass::viewer) < quiet ||
+                               store_.idle_for(WorkClass::loader) < quiet;
                     });
                 log_slow_stage("local-rebalance", rebalance_stage,
                                "bytes=" + std::to_string(rebalance.bytes) +
@@ -1080,9 +1072,8 @@ void Maintenance::run(std::stop_token stop) {
                 auto scrub =
                     local_.data().scrub_step(static_cast<uint64_t>(scrub_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
-                        return store_.foreground_idle_for() < quiet ||
-                               store_.interactive_idle_for() < quiet ||
-                               store_.loader_idle_for() < quiet;
+                        return store_.idle_for(WorkClass::viewer) < quiet ||
+                               store_.idle_for(WorkClass::loader) < quiet;
                     });
                 log_slow_stage("scrub", scrub_stage,
                                "bytes=" + std::to_string(scrub.bytes) +
@@ -1205,8 +1196,8 @@ void Maintenance::run(std::stop_token stop) {
             // A busy pass suppressed GC, repair and rebalance; it re-evaluates as soon as
             // the foreground quiet period is met, or at once if it already has, rather
             // than sleeping until an unrelated event.
-            auto idle = std::min({store_.foreground_idle_for(), store_.interactive_idle_for(),
-                                  store_.loader_idle_for()});
+            auto idle = std::min(store_.idle_for(WorkClass::viewer),
+                                 store_.idle_for(WorkClass::loader));
             deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
                                                                 ? policy.foreground_quiet - idle
                                                                 : Clock::duration{}));

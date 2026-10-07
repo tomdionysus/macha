@@ -374,11 +374,15 @@ class CatalogueManager {
     static PreparedCommit prepare(CatalogueDraft&& draft);
     PreparedCommit prepare(const std::optional<ObjectId>& expected_root,
                            const CatalogueSnapshot& next, const std::set<ObjectId>& old_artwork);
+    // `frame`: the class of the work the commit is for, which its DATA reads
+    // (proving new artwork exists) carry.
     void publish(const std::optional<ObjectId>& expected_root, PreparedCommit&& prepared,
                  std::optional<Hash256> expected_namespace,
-                 std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict);
+                 std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict,
+                 FrameType frame = FrameType::speculative);
     void commit(const std::optional<ObjectId>& expected_root, CatalogueDraft&& draft,
-                std::optional<Hash256> expected_namespace = std::nullopt);
+                std::optional<Hash256> expected_namespace = std::nullopt,
+                FrameType frame = FrameType::speculative);
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
                 const std::set<ObjectId>& old_artwork,
                 std::optional<Hash256> expected_namespace = std::nullopt,
@@ -414,7 +418,8 @@ class CatalogueManager {
     std::shared_ptr<const CatalogueIndexes> indexes();
     std::shared_ptr<const CatalogueView> snapshot_view();
     // Warm, waits on nothing (cached snapshot); cold, loads from metadata and
-    // the control store, which the wait guard refuses to control work.
+    // the control store, which the wait guard refuses to work allowing only
+    // local waits.
     std::shared_ptr<const CatalogueView> snapshot_view(const WorkContext&);
     std::optional<CatalogueItem> get(std::string_view id);
     std::optional<MediaProbeResult> media_profile(std::string_view media_id);
@@ -432,7 +437,11 @@ class CatalogueManager {
     // `keep` filters before ranking, so `limit` counts only kept items.
     std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50,
                                       const std::function<bool(const CatalogueItem&)>& keep = {});
-    CatalogueItem upsert(CatalogueItem, std::optional<uint64_t> expected_revision = {});
+    // A write's DATA work (staging artwork, proving it exists) carries
+    // `frame`, the class of whoever asked: a person in the editor is a viewer,
+    // the scanner is speculative.
+    CatalogueItem upsert(CatalogueItem, std::optional<uint64_t> expected_revision = {},
+                         FrameType frame = FrameType::speculative);
     std::vector<CatalogueItem> upsert_many(std::vector<CatalogueItem>);
     bool erase(std::string_view id, std::optional<uint64_t> expected_revision = {});
     bool definitely_absent(std::string_view id) const;
@@ -448,13 +457,17 @@ class CatalogueManager {
                                        std::optional<uint64_t> expected_revision = {});
     CatalogueArtwork put_artwork(std::string_view item_id, std::string role,
                                  std::string mime_type, std::span<const uint8_t> bytes,
-                                 std::optional<uint64_t> expected_revision = {});
+                                 std::optional<uint64_t> expected_revision = {},
+                                 FrameType frame = FrameType::speculative);
     CatalogueArtwork stage_artwork(std::string role, std::string mime_type,
-                                   std::span<const uint8_t> bytes);
+                                   std::span<const uint8_t> bytes,
+                                   FrameType frame = FrameType::speculative);
     CatalogueArtwork stage_artwork_deferred(std::string role, std::string mime_type,
                                             std::span<const uint8_t> bytes,
-                                            DistributedStore::DurabilityBatch& batch);
-    bool artwork_durability_barrier(DistributedStore::DurabilityBatch& batch);
+                                            DistributedStore::DurabilityBatch& batch,
+                                            FrameType frame = FrameType::speculative);
+    bool artwork_durability_barrier(DistributedStore::DurabilityBatch& batch,
+                                    FrameType frame = FrameType::speculative);
     // Whether this node holds the artwork object itself.
     bool artwork_held_here(const ObjectId& id) const { return store_.held_here(id); }
     // `vanished_media`: media a complete scan found nowhere in the namespace.
@@ -465,7 +478,8 @@ class CatalogueManager {
                            bool prune_missing = true,
                            std::optional<Hash256> expected_namespace = std::nullopt,
                            const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {},
-                           const std::set<std::string>& vanished_media = {});
+                           const std::set<std::string>& vanished_media = {},
+                           FrameType frame = FrameType::speculative);
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     // The maintenance inventory's catalogue half, called in order (spec A4):
     // the head (may read the committed record when behind), then the read of

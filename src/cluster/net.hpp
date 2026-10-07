@@ -171,6 +171,14 @@ const char* message_type_name(MessageType) noexcept;
 unsigned frame_type_priority(FrameType) noexcept;
 FrameType default_frame_type(MessageType) noexcept;
 
+// Delay-based congestion control on every peer socket: a bulk transfer keeps
+// no standing queue at the bottleneck for control frames to wait behind, and
+// an idle control socket resumes at its measured rate, not slow start.
+inline constexpr const char* peer_congestion_control = "bbr";
+// Keepalive, no Nagle, and peer_congestion_control where the kernel offers
+// it; returns whether the socket got it.
+bool peer_socket_options(int fd);
+
 struct RpcMessage {
     MessageType type{MessageType::error};
     Bytes payload;

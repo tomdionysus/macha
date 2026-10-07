@@ -37,12 +37,12 @@ uint64_t WaitGuard::violations() noexcept {
 }
 
 bool WaitGuard::enter(const WorkContext& context, Waits declared, std::string_view operation) {
-    if (may_enter(context.frame_type(), declared))
+    if (may_enter(context.allowed(), declared))
         return true;
     guard_violations.fetch_add(1, std::memory_order_relaxed);
-    const std::string message = "control work (" + std::string(context.origin()) + ") entered " +
+    const std::string message = "work (" + std::string(context.origin()) + ") entered " +
                                 std::string(operation) +
-                                ", which waits on the DATA device or the network";
+                                ", which may wait on what the work does not allow";
     if (mode() == Mode::throw_on_violation)
         throw std::logic_error(message);
     bool first = false;

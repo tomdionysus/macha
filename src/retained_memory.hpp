@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "cluster/frame_type.hpp"
 #include "contract/thread_safety.hpp"
 
 #include <algorithm>
@@ -18,8 +19,6 @@
 #include <vector>
 
 namespace macha {
-
-enum class MemoryClass : uint8_t { control, viewer, loader, speculative };
 
 enum class MemoryOwner : uint8_t {
     fuse_request,
@@ -101,7 +100,7 @@ class RetainedMemoryLedger {
 
   private:
     struct Allocation {
-        MemoryClass memory_class{};
+        WorkClass memory_class{};
         MemoryOwner owner{};
         uint64_t bytes{};
         bool reclaimable{};
@@ -132,21 +131,21 @@ class RetainedMemoryLedger {
     uint64_t restored_bytes_ MACHA_GUARDED_BY(mutex_){};
     bool stopping_ MACHA_GUARDED_BY(mutex_){};
 
-    static constexpr size_t index(MemoryClass value) {
+    static constexpr size_t index(WorkClass value) {
         return static_cast<size_t>(value);
     }
     static constexpr size_t index(MemoryOwner value) {
         return static_cast<size_t>(value);
     }
-    static constexpr bool lower(MemoryClass value) {
-        return value == MemoryClass::loader || value == MemoryClass::speculative;
+    static constexpr bool lower(WorkClass value) {
+        return value == WorkClass::loader || value == WorkClass::speculative;
     }
-    static constexpr int priority(MemoryClass value) {
+    static constexpr int priority(WorkClass value) {
         return 3 - static_cast<int>(value);
     }
     uint64_t charge(uint64_t bytes) const noexcept { return std::max<uint64_t>(1, bytes); }
-    bool available_locked(MemoryClass, MemoryOwner, uint64_t, bool reclaimable) const MACHA_REQUIRES(mutex_);
-    std::vector<std::function<void()>> request_shedding_locked(MemoryClass) MACHA_REQUIRES(mutex_);
+    bool available_locked(WorkClass, MemoryOwner, uint64_t, bool reclaimable) const MACHA_REQUIRES(mutex_);
+    std::vector<std::function<void()>> request_shedding_locked(WorkClass) MACHA_REQUIRES(mutex_);
     void release(uint64_t id);
 
   public:
@@ -154,18 +153,18 @@ class RetainedMemoryLedger {
                          uint64_t viewer_reserve_bytes, uint64_t loader_reserve_bytes,
                          uint64_t reassembly_reserve_bytes = 32ULL * 1024 * 1024);
 
-    std::optional<Lease> acquire(MemoryClass, MemoryOwner, uint64_t bytes,
+    std::optional<Lease> acquire(WorkClass, MemoryOwner, uint64_t bytes,
                                  Clock::time_point deadline = {},
                                  std::atomic_bool* cancelled = nullptr,
                                  bool reclaimable = false,
                                  std::function<void()> shed = {});
-    std::optional<Lease> try_acquire(MemoryClass, MemoryOwner, uint64_t bytes,
+    std::optional<Lease> try_acquire(WorkClass, MemoryOwner, uint64_t bytes,
                                      bool reclaimable = false,
                                      std::function<void()> shed = {});
     // Reconstruct ownership for already-acknowledged durable work. Recovery is
     // never refused merely because an operator lowered the limit; the resulting
     // overcommit blocks new admissions until normal completion releases it.
-    Lease restore(MemoryClass, MemoryOwner, uint64_t bytes);
+    Lease restore(WorkClass, MemoryOwner, uint64_t bytes);
     void stop();
     RetainedMemoryStats stats() const;
 };
@@ -187,18 +186,18 @@ inline RetainedMemoryLedger::RetainedMemoryLedger(uint64_t capacity_bytes,
         throw std::invalid_argument("retained-memory reserves exceed capacity");
 }
 
-inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, MemoryOwner owner,
+inline bool RetainedMemoryLedger::available_locked(WorkClass memory_class, MemoryOwner owner,
                                                     uint64_t bytes, bool reclaimable) const {
     if (bytes > capacity_bytes_ || used_bytes_ > capacity_bytes_ - bytes)
         return false;
-    if (memory_class == MemoryClass::control)
+    if (memory_class == WorkClass::control)
         return true;
     const auto non_control_capacity = capacity_bytes_ - control_reserve_bytes_;
     if (bytes > non_control_capacity || used_bytes_ > non_control_capacity - bytes)
         return false;
-    if (memory_class == MemoryClass::viewer)
+    if (memory_class == WorkClass::viewer)
         return true;
-    if (waiters_[index(MemoryClass::control)] || waiters_[index(MemoryClass::viewer)])
+    if (waiters_[index(WorkClass::control)] || waiters_[index(WorkClass::viewer)])
         return false;
     // Inbound RPC reassembly gets a small dedicated reserve ahead of the gates
     // below: it releases what they protect, since publication holds its bytes until
@@ -210,7 +209,7 @@ inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, Mem
     if (owner == MemoryOwner::rpc_frame &&
         owner_bytes_[index(MemoryOwner::rpc_frame)] + bytes <= reassembly_reserve_bytes_)
         return true;
-    if (memory_class == MemoryClass::speculative && waiters_[index(MemoryClass::loader)])
+    if (memory_class == WorkClass::speculative && waiters_[index(WorkClass::loader)])
         return false;
     if (reclaimable)
         return true;
@@ -223,7 +222,7 @@ inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, Mem
     const auto durable_lower_capacity = non_control_capacity - viewer_reserve_bytes_;
     if (bytes > durable_lower_capacity || lower_durable_bytes_ > durable_lower_capacity - bytes)
         return false;
-    if (memory_class == MemoryClass::loader)
+    if (memory_class == WorkClass::loader)
         return true;
     const auto speculative_capacity = durable_lower_capacity - loader_reserve_bytes_;
     return bytes <= speculative_capacity &&
@@ -231,7 +230,7 @@ inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, Mem
 }
 
 inline std::vector<std::function<void()>>
-RetainedMemoryLedger::request_shedding_locked(MemoryClass incoming) {
+RetainedMemoryLedger::request_shedding_locked(WorkClass incoming) {
     std::vector<std::function<void()>> callbacks;
     for (auto& [_, allocation] : allocations_) {
         if (!allocation.reclaimable || allocation.shed_requested ||
@@ -245,7 +244,7 @@ RetainedMemoryLedger::request_shedding_locked(MemoryClass incoming) {
 }
 
 inline std::optional<RetainedMemoryLedger::Lease>
-RetainedMemoryLedger::acquire(MemoryClass memory_class, MemoryOwner owner,
+RetainedMemoryLedger::acquire(WorkClass memory_class, MemoryOwner owner,
                               uint64_t requested_bytes, Clock::time_point deadline,
                               std::atomic_bool* cancelled, bool reclaimable,
                               std::function<void()> shed) {
@@ -253,7 +252,7 @@ RetainedMemoryLedger::acquire(MemoryClass memory_class, MemoryOwner owner,
         throw std::invalid_argument("reclaimable retained memory requires a shed callback");
     const auto bytes = charge(requested_bytes);
     const auto absolute_class_capacity =
-        memory_class == MemoryClass::control
+        memory_class == WorkClass::control
             ? capacity_bytes_
             : capacity_bytes_ - control_reserve_bytes_;
     if (bytes > absolute_class_capacity)
@@ -306,7 +305,7 @@ RetainedMemoryLedger::acquire(MemoryClass memory_class, MemoryOwner owner,
         reclaimable_bytes_ += bytes;
     else if (lower(memory_class)) {
         lower_durable_bytes_ += bytes;
-        if (memory_class == MemoryClass::speculative)
+        if (memory_class == WorkClass::speculative)
             speculative_durable_bytes_ += bytes;
     }
     peak_used_bytes_ = std::max(peak_used_bytes_, used_bytes_);
@@ -315,7 +314,7 @@ RetainedMemoryLedger::acquire(MemoryClass memory_class, MemoryOwner owner,
 }
 
 inline RetainedMemoryLedger::Lease RetainedMemoryLedger::restore(
-    MemoryClass memory_class, MemoryOwner owner, uint64_t bytes) {
+    WorkClass memory_class, MemoryOwner owner, uint64_t bytes) {
     bytes = charge(bytes);
     Lock lock(mutex_);
     const auto id = next_id_++;
@@ -324,7 +323,7 @@ inline RetainedMemoryLedger::Lease RetainedMemoryLedger::restore(
     owner_bytes_[index(owner)] += bytes;
     if (lower(memory_class)) {
         lower_durable_bytes_ += bytes;
-        if (memory_class == MemoryClass::speculative)
+        if (memory_class == WorkClass::speculative)
             speculative_durable_bytes_ += bytes;
     }
     restored_bytes_ += bytes;
@@ -333,7 +332,7 @@ inline RetainedMemoryLedger::Lease RetainedMemoryLedger::restore(
 }
 
 inline std::optional<RetainedMemoryLedger::Lease>
-RetainedMemoryLedger::try_acquire(MemoryClass memory_class, MemoryOwner owner, uint64_t bytes,
+RetainedMemoryLedger::try_acquire(WorkClass memory_class, MemoryOwner owner, uint64_t bytes,
                                   bool reclaimable, std::function<void()> shed) {
     if (reclaimable && !shed)
         throw std::invalid_argument("reclaimable retained memory requires a shed callback");
@@ -350,7 +349,7 @@ RetainedMemoryLedger::try_acquire(MemoryClass memory_class, MemoryOwner owner, u
         reclaimable_bytes_ += bytes;
     else if (lower(memory_class)) {
         lower_durable_bytes_ += bytes;
-        if (memory_class == MemoryClass::speculative)
+        if (memory_class == WorkClass::speculative)
             speculative_durable_bytes_ += bytes;
     }
     peak_used_bytes_ = std::max(peak_used_bytes_, used_bytes_);
@@ -371,7 +370,7 @@ inline void RetainedMemoryLedger::release(uint64_t id) {
         reclaimable_bytes_ -= allocation.bytes;
     else if (lower(allocation.memory_class)) {
         lower_durable_bytes_ -= allocation.bytes;
-        if (allocation.memory_class == MemoryClass::speculative)
+        if (allocation.memory_class == WorkClass::speculative)
             speculative_durable_bytes_ -= allocation.bytes;
     }
     cv_.notify_all();

@@ -1,6 +1,6 @@
 # One definition of work class
 
-Status: withdrawn 2026-10-07; 0.90.35 to 0.90.39 reverted in 0.90.40. Operator's instruction: "the
+Status: agreed design, 2026-10-06. Not started. Operator's instruction: "the
 API is viewer class work", and one definition of a class, used by every
 subsystem, is a principle of the project.
 
