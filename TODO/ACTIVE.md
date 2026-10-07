@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.43.
+Last updated: 2026-10-07, on `develop`. Both nodes run 0.90.44.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -33,8 +33,29 @@ on every peer socket; section 4). A response still draining is viewer work
 until its last byte leaves (0.90.40, 0.90.41; COMPLETED). Open: repair
 yields time, not rate, so it keeps about 3 Mbit/s of an uplink a viewer is
 using; a reserve sized by the operator would close it. The disk reserve is 0.90.43 (bulk writers on the control filesystem
-keep their dirty data to a window; COMPLETED). Left of non-interference:
-CPU, locks and memory, each to audit against control's paths.
+keep their dirty data to a window; COMPLETED). Control's commit times are
+in the observation windows from 0.90.44 (`metadata.*_sync_us`,
+`fuse.journal_sync_us`, `durability.barrier_us.<dir>`).
+
+Lock audit of control's paths (2026-10-07; the HTTP control routes and the
+metadata server's handlers, which T5's audit did not cover), ranked:
+1. `MetadataReplica::m_` held across a full checkpoint write: a peer's
+   commit reaches `import_history` -> `reset_checkpoint` under it
+   (metadata.cpp:3871-3880, :4267); every control-lane metadata read and
+   /status/diagnostics wait, and the two RPC control workers fill. Fix as
+   `accept_commit` does (:4088): write after releasing.
+2. `UserStore::mutex_` write lock held across scrypt and two fsyncs
+   (users.cpp:421-432, :722; `apply_all` one rewrite per record); every
+   authenticated request takes its read lock.
+3. `PublicConnectivity::mutex_` held across UPnP, external-IP and
+   self-probe (public_connectivity.cpp:298-302); /status waits.
+4. The HTTP control lane (2 workers) runs login scrypt and the
+   connectivity check; two logins queue /health and /status.
+5. `Membership::m_` and `inbound_mutex_` held across an fsync; both on
+   /status.
+6. One 128 MiB outbound budget for the control session (net.cpp:89).
+Not fully traced: `RpcClient::mutex_` holders, `Membership::m_` bodies.
+CPU and memory audits still to do.
 
 ## 1. The catalogue plan: a materialised view of the local head
 
@@ -201,7 +222,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.43**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.44**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -211,7 +232,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.43` back to
+  in place before that version was installed (`pre-0.90.44` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild
