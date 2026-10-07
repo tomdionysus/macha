@@ -6,6 +6,9 @@
 #include "retained_memory.hpp"
 #include "supervised.hpp"
 #include "coverage.hpp"
+#include "write_behind.hpp"
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
@@ -1846,3 +1849,43 @@ MACHA_FAST_TEST("foundations", test_node_events_count_each_kind) {
     CHECK(events.count(NodeEvent::topology) == 0);
     CHECK(events.total() == 3);
 }
+
+namespace {
+
+MACHA_FAST_TEST("foundations", test_write_behind_acts_once_per_window) {
+    WriteBehind behind(8);
+    CHECK(!behind.window_filled(3));
+    CHECK(!behind.window_filled(4));
+    CHECK(behind.window_filled(1));  // 8: a window, which starts again
+    CHECK(!behind.window_filled(7));
+    CHECK(behind.window_filled(20)); // one large write fills one window
+    CHECK(!behind.window_filled(0));
+}
+
+MACHA_FAST_TEST("foundations", test_write_behind_leaves_what_was_written_intact) {
+    TempDir dir;
+    const auto path = dir.path() / "staged";
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    REQUIRE(fd >= 0);
+    WriteBehind behind(64 * 1024);
+    Bytes chunk(10000);
+    uint64_t written = 0;
+    for (int round = 0; round < 40; ++round) {
+        std::fill(chunk.begin(), chunk.end(), static_cast<uint8_t>(round));
+        REQUIRE(::pwrite(fd, chunk.data(), chunk.size(), static_cast<off_t>(written)) ==
+                static_cast<ssize_t>(chunk.size()));
+        written += chunk.size();
+        behind.wrote(fd, chunk.size());
+    }
+    start_writeback(fd);
+    Bytes back(written);
+    REQUIRE(::pread(fd, back.data(), back.size(), 0) == static_cast<ssize_t>(back.size()));
+    ::close(fd);
+    for (uint64_t i = 0; i < written; ++i)
+        if (back[i] != static_cast<uint8_t>(i / chunk.size())) {
+            CHECK(false);
+            break;
+        }
+}
+
+} // namespace

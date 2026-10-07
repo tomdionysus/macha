@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.43: bulk writes keep no backlog for a control commit to wait on
+
+No API, wire, protocol or on-disk changes.
+
+Control's state (the metadata replica, `state/`, the FUSE operation journal)
+shares each node's root filesystem with three bulk writers that left their
+data dirty: write staging in `state/tmp`, the cache's object files and
+playback's spilled fragments. On ext4 a small fsync commits the journal,
+which can wait for every other file's dirty data; on fi-1, an 8 GB buffered
+write beside it made 9 of 80 small fsyncs take 122 ms to 3.3 s against
+4 ms. Write staging now starts writeback every 8 MB and waits for the last
+window before starting the next, so it holds at most about two windows
+unwritten; a cache object or a spilled fragment starts its writeback as
+soon as it is written. Nothing here is a durability change: no fsync is
+added. Linux only.
+
 ## 0.90.42: a node clears the write files it abandoned
 
 No API, wire, protocol or on-disk changes.
