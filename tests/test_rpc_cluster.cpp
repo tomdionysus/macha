@@ -8,11 +8,57 @@
 #include "cluster/placement.hpp"
 #include "startup_progress.hpp"
 
+#include <cstring>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 using namespace macha;
 using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
+
+MACHA_FAST_TEST("rpc_cluster", test_peer_sockets_use_delay_based_congestion_control) {
+#ifdef TCP_CONGESTION
+    // Whether this process may choose it at all: a plain socket asks first.
+    const int probe = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(probe >= 0);
+    const bool offered =
+        setsockopt(probe, IPPROTO_TCP, TCP_CONGESTION, peer_congestion_control,
+                   static_cast<socklen_t>(strlen(peer_congestion_control))) == 0;
+    close(probe);
+
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    CHECK(listen(listener, 1) == 0);
+    socklen_t size = sizeof(address);
+    CHECK(getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+    const int dialled = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(connect(dialled, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    const int accepted = accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+
+    for (const int fd : {dialled, accepted}) {
+        CHECK(peer_socket_options(fd) == offered);
+        char chosen[16]{};
+        socklen_t length = sizeof(chosen);
+        CHECK(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, chosen, &length) == 0);
+        if (offered)
+            CHECK(std::string(chosen) == peer_congestion_control);
+    }
+    close(accepted);
+    close(dialled);
+    close(listener);
+#else
+    // No per-socket congestion control on this platform.
+    CHECK(!peer_socket_options(-1));
+#endif
+}
 
 MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_has_count_byte_and_message_bounds) {
     MessageAssembler assembler(2, 8, 16);

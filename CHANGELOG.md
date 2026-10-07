@@ -1,5 +1,18 @@
 # Current release
 
+## 0.90.39: control frames no longer wait behind a full link
+
+No API, wire, protocol or on-disk changes.
+
+Every peer socket, on both lanes and both ends, asks for BBR congestion
+control. Measured on gbni-1 under repair: the DATA socket to fi-1 held its
+20 Mbit/s uplink with cubic, and the bottleneck's queue raised both lanes'
+round trip from 77 ms to 250 to 320 ms; the idle control socket restarted at
+a congestion window of ten, so a catalogue shard crossed in several of those
+round trips (0.9 to 4.6 s). BBR keeps the queue near empty and is exempt
+from the slow-start restart. Where the kernel does not offer it, the node
+warns once and keeps the system default.
+
 ## 0.90.38: a request's DATA work carries the request's class
 
 No API, wire, protocol or on-disk changes.
