@@ -1000,6 +1000,13 @@ struct HttpServer::Impl {
             }
             int yes = 1;
             (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+#ifdef TCP_NOTSENT_LOWAT
+            // The socket takes at most one chunk the wire has not sent, so the
+            // reactor's sends, and the presence they note, track the client's
+            // link rather than running a send buffer (4 MB) ahead of it.
+            int unsent = static_cast<int>(chunk_bytes());
+            (void)setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &unsent, sizeof(unsent));
+#endif
 #ifdef SO_NOSIGPIPE
             (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
