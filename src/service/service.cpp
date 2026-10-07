@@ -82,6 +82,9 @@ Service::Service(Config config, ClusterKeys keys,
         });
         catalogue_http_->set_activity(
             [this](WorkClass work, uint64_t) { resources_.activity.note(work); });
+        // Liveness reads two atomics: answered by the reactor, so no worker,
+        // on either lane, can delay it.
+        catalogue_http_->set_inline_route("/api/v1/health", [this] { return health_response(); });
     }
 }
 

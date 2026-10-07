@@ -232,6 +232,10 @@ void validate(Config& config) {
         throw std::runtime_error("catalogue.api.workers must be 1..256");
     if (!config.catalogue.api.control_workers || config.catalogue.api.control_workers > 64)
         throw std::runtime_error("catalogue.api.control_workers must be 1..64");
+    // Password checks run scrypt on the control lane; they may never fill it.
+    if (config.session.max_concurrent_password_checks >= config.catalogue.api.control_workers)
+        throw std::runtime_error(
+            "session.max_concurrent_password_checks must be below catalogue.api.control_workers");
     if (!config.catalogue.api.max_connections || config.catalogue.api.max_connections > 65536)
         throw std::runtime_error("catalogue.api.max_connections must be 1..65536");
     if (!config.catalogue.api.max_queued_requests || config.catalogue.api.max_queued_requests > 65536)

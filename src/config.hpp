@@ -233,7 +233,7 @@ struct CatalogueApiConfig {
     // `control_workers` the control lane (health, status, session, users), so
     // control never queues behind playback (law 1).
     size_t workers{16};
-    size_t control_workers{2};
+    size_t control_workers{4};
     // Open connections; this bounds memory.
     size_t max_connections{1024};
     // Requests waiting for a lane worker before the reactor answers 503.

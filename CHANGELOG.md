@@ -1,5 +1,18 @@
 # Current release
 
+## 0.90.48: logins can never fill the control lane, and liveness never queues
+
+No API, wire, protocol or on-disk changes. One configuration rule.
+
+The HTTP control lane had two workers, and up to two password checks
+(scrypt, tens of milliseconds each on a Pi, including the dummy check for
+an unknown user) could run on it at once, so two logins held `/health` and
+`/status` behind them. `/api/v1/health` is now answered by the reactor
+itself from two atomics, never queued for a worker; the control lane
+defaults to four workers; and `session.max_concurrent_password_checks` must
+be below `catalogue.api.control_workers`, or the node refuses to start.
+Neither node sets either key.
+
 ## 0.90.47: /status waits on no probe and no roster write
 
 No API, wire, protocol or on-disk changes.

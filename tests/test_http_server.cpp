@@ -278,6 +278,51 @@ MACHA_TEST("http_server",
     server.stop();
 }
 
+MACHA_TEST("http_server", test_an_inline_route_answers_with_every_worker_busy) {
+    // Both lanes' only workers are held; liveness is answered by the reactor.
+    auto config = loopback_config();
+    config.workers = 1;
+    config.control_workers = 1;
+    TestGate gate;
+    HttpServer server(config, [&](const HttpRequest& request) {
+        if (request.path == "/block-control" || request.path == "/block-data") {
+            gate.enter_and_wait();
+            return http_json(200, "{}");
+        }
+        return http_error(404, "not_found", "not found");
+    });
+    server.set_work_class([](std::string_view path) {
+        return path == "/block-control" ? WorkClass::control : WorkClass::viewer;
+    });
+    std::atomic<int> inline_calls{0};
+    server.set_inline_route("/api/v1/health", [&] {
+        inline_calls.fetch_add(1);
+        return http_json(200, "{\"service\":\"macha\"}");
+    });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
+
+    std::jthread control([&] { (void)raw_http_get(server.bound_port(), "/block-control"); });
+    std::jthread data([&] { (void)raw_http_get(server.bound_port(), "/block-data"); });
+    REQUIRE(gate.wait_for_entries(2, 2s));
+
+    const auto asked = Clock::now();
+    const auto health = raw_http_get(server.bound_port(), "/api/v1/health");
+    CHECK(Clock::now() - asked < 500ms);
+    CHECK(health.find("HTTP/1.1 200") != std::string::npos);
+    CHECK(health.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(inline_calls.load() == 1);
+
+    gate.open();
+    control.join();
+    data.join();
+    // Only that exact path is inline; anything else goes to a lane.
+    CHECK(raw_http_get(server.bound_port(), "/api/v1/health/x").find("HTTP/1.1 404") !=
+          std::string::npos);
+    CHECK(inline_calls.load() == 1);
+    server.stop();
+}
+
 MACHA_TEST("http_server", test_a_client_that_stops_reading_does_not_delay_another_clients_body) {
     auto config = loopback_config();
     config.workers = 1; // so the stalled body cannot be on another worker
