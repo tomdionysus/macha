@@ -309,8 +309,7 @@ MACHA_TEST("node_services", test_observation_gauges_follow_activity_repair_and_t
     constexpr uint64_t never = 24ULL * 60 * 60 * 1000;
 
     const auto idle = services.observation_gauges();
-    CHECK(idle.at("foreground_idle_ms") == never);
-    CHECK(idle.at("interactive_idle_ms") == never);
+    CHECK(idle.at("viewer_idle_ms") == never);
     CHECK(idle.at("loader_idle_ms") == never);
     CHECK(!has_fuse_gauges(idle));
 
@@ -318,7 +317,7 @@ MACHA_TEST("node_services", test_observation_gauges_follow_activity_repair_and_t
     write_file(services.filesystem(), "/written.bin", pattern(64 * 1024, 51));
     const auto written = services.observation_gauges();
     CHECK(written.at("loader_idle_ms") < never);
-    CHECK(written.at("foreground_idle_ms") == never);
+    CHECK(written.at("viewer_idle_ms") == never);
 
     // Repair's figures are the store's own.
     const auto repair = services.store().repair_diagnostics();

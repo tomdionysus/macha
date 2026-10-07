@@ -1,5 +1,33 @@
 # Current release
 
+## 0.90.35: one definition of work class
+
+API change in status diagnostics only: `repair.paced_by` lists `viewer`,
+`loader` and `peer_viewer` (was `playback`, `mounted_filesystem`, `loader`,
+`peer_playback`). No wire, protocol or on-disk changes.
+
+**Work has one class, read everywhere.** `WorkClass` (control, viewer,
+loader, speculative) and `work_class(FrameType)` are the only place a frame
+becomes a class. The retained-memory ledger's `MemoryClass` and four copies
+of the same mapping are gone; DATA admission, the activity clocks, FUSE's
+publication pacing, maintenance's pacing and status all read the one class.
+Presence is per class: a viewer is present when viewer-class work was,
+whichever viewer frame carried it.
+
+**Three reads were in the wrong class**, found by the audit:
+- FUSE prefetch for mount reads ran as viewer work (`read_ahead`) while the
+  mount reads it serves are loader work; it is now loader work.
+- The scanner's reading of embedded music tags and artwork ran as viewer
+  work; it is now speculative.
+- `FileSystem::open_read(path)`, a read nobody is viewing, defaulted to
+  viewer work; it is now speculative.
+Each was admitted ahead of loaders, never refused for disk pressure, and
+counted as a viewer present.
+
+FUSE publication now yields to any viewer-class work, not only playback;
+with the reclassification above, the node's own reading no longer counts.
+Control cannot form DATA work (unchanged; now stated through the class).
+
 ## 0.90.34: commits owed to the peers cost their claims, not their snapshots
 
 No API, wire, protocol or on-disk changes.

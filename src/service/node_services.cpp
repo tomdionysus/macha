@@ -143,9 +143,8 @@ std::map<std::string, uint64_t> NodeServices::observation_gauges() {
     const auto idle_ms = [](std::chrono::milliseconds idle) {
         return static_cast<uint64_t>(std::max<int64_t>(0, idle.count()));
     };
-    gauges["foreground_idle_ms"] = idle_ms(store_.foreground_idle_for());
-    gauges["interactive_idle_ms"] = idle_ms(store_.interactive_idle_for());
-    gauges["loader_idle_ms"] = idle_ms(store_.loader_idle_for());
+    gauges["viewer_idle_ms"] = idle_ms(store_.idle_for(WorkClass::viewer));
+    gauges["loader_idle_ms"] = idle_ms(store_.idle_for(WorkClass::loader));
     const auto repair = store_.repair_diagnostics();
     gauges["repair_push_examined"] = repair.push_examined;
     gauges["repair_pull_examined"] = repair.pull_examined;

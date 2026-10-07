@@ -195,8 +195,16 @@ a viewer browsing (stage 3 numbers are the baseline).
 
 ## Order of work
 
-1. `WorkClass` and `work_class`; arbiter and clocks on it; status callers
-   updated. No behaviour change. With it, an audit: every DATA admission
+1. **Done, 0.90.35.** `WorkClass` and `work_class`; arbiter and clocks on
+   it; status callers updated. Found: the retained-memory ledger already had
+   the class (`MemoryClass`, with `speculative` as the fourth name, which the
+   code and docs use, so it is kept rather than `background`) and four
+   identical copies of the mapping; all now one. The audit found three reads
+   in the wrong class (FUSE prefetch, the scanner's embedded-tag reads, the
+   default `open_read`), all viewer work that was not; reclassified. Control
+   was already refused at DATA admission and at forming a DATA context.
+   `paced_by` values changed in status diagnostics (announced).
+   Originally: No behaviour change. With it, an audit: every DATA admission
    (`DataResourceArbiter::acquire` and `try_acquire`) listed with the frame
    it is given, confirming no control frame reaches one. Control's guarantee
    is separation from DATA work, not priority within it (law 1, "a floor,
