@@ -1,5 +1,17 @@
 # Current release
 
+## 0.90.40: a draining response keeps its viewer present
+
+No API, wire, protocol or on-disk changes.
+
+The HTTP reactor notes a request's work class with every send, not only
+when its handler runs. A direct-play range or a web asset draining to a
+client over a slow link is viewer work for as long as it flows, so
+maintenance's pacing sees the viewer until the last byte leaves. Before,
+presence lasted two seconds past the handler: a 60 s download from the
+viewer's site ran through 41.9 MB of unpaced repair on the same uplink,
+and a direct-play movie waited behind it.
+
 ## 0.90.39: control frames no longer wait behind a full link
 
 No API, wire, protocol or on-disk changes.

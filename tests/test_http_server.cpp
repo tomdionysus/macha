@@ -5,7 +5,11 @@
 // runtime.
 #include "test_backend_support.hpp"
 
+#include <array>
+#include <atomic>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <thread>
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -313,6 +317,67 @@ MACHA_TEST("http_server", test_a_client_that_stops_reading_does_not_delay_anothe
 
     ::close(stalled_pool);
     ::close(stalled_resident);
+    server.stop();
+}
+
+MACHA_TEST("http_server", test_a_body_draining_to_a_slow_client_keeps_its_class_present) {
+    // Served traffic is work of its class for as long as it flows: the
+    // reactor notes the request's class with every send, so a viewer whose
+    // body is still draining is a viewer present, not a request served once.
+    auto config = loopback_config();
+    constexpr uint64_t body_size = 32 * 1024 * 1024;
+    HttpServer server(config, [&](const HttpRequest&) {
+        HttpResponse response;
+        response.content_type = "application/octet-stream";
+        response.stream = std::make_shared<PoolBody>(body_size);
+        return response;
+    });
+    std::atomic<uint64_t> notes{0}, wire_bytes{0}, other_class{0};
+    server.set_activity([&](WorkClass work, uint64_t bytes) {
+        notes.fetch_add(1, std::memory_order_relaxed);
+        wire_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (work != WorkClass::viewer)
+            other_class.fetch_add(1, std::memory_order_relaxed);
+    });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
+
+    const int fd = connect_idle(server.bound_port());
+    raw_http_send(fd, "GET /pool HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+
+    // A client that takes the body a little at a time. The socket buffers
+    // absorb a few MB up front; the rest is sent only as this loop reads.
+    std::string head;
+    uint64_t received = 0, header_bytes = 0, notes_early = 0;
+    std::array<char, 64 * 1024> buffer{};
+    while (true) {
+        const auto n = ::recv(fd, buffer.data(), buffer.size(), 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        received += static_cast<uint64_t>(n);
+        if (header_bytes == 0) {
+            head.append(buffer.data(), static_cast<size_t>(n));
+            const auto end = head.find("\r\n\r\n");
+            if (end != std::string::npos)
+                header_bytes = end + 4;
+        }
+        if (notes_early == 0 && received >= 8 * 1024 * 1024)
+            notes_early = notes.load();
+        std::this_thread::sleep_for(1ms);
+    }
+    ::close(fd);
+    REQUIRE(header_bytes > 0);
+    CHECK(head.find("HTTP/1.1 200") != std::string::npos);
+    CHECK(received - header_bytes == body_size);
+
+    // Every byte sent was noted under the request's class, and the notes
+    // kept coming while the client was still reading.
+    CHECK(wire_bytes.load() == received);
+    CHECK(notes_early > 1);
+    CHECK(notes.load() > notes_early);
+    CHECK(other_class.load() == 0);
     server.stop();
 }
 

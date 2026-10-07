@@ -81,7 +81,7 @@ Service::Service(Config config, ClusterKeys keys,
             return WorkClass::viewer;
         });
         catalogue_http_->set_activity(
-            [this](WorkClass work) { resources_.activity.note(work); });
+            [this](WorkClass work, uint64_t) { resources_.activity.note(work); });
     }
 }
 
