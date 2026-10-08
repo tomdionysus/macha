@@ -3,6 +3,7 @@
 // retention store, and the per-class trie.
 #include "codec.hpp"
 #include "crypto.hpp"
+#include "ledger/held_ledger.hpp"
 #include "ledger/object_trie.hpp"
 #include "storage/local_store.hpp"
 #include "storage/sealed_journal.hpp"
@@ -10,6 +11,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <map>
 #include <random>
 #include <string>
@@ -750,6 +752,45 @@ MACHA_FAST_TEST("object_ledger", test_verification_corrects_the_ledger_from_the_
     CHECK(again.complete);
     CHECK(again.recorded == 0);
     CHECK(again.lost == 0);
+}
+
+// A write's flush does not wait for a seed being built, and what it queued
+// after the snapshot is applied over the seed.
+MACHA_FAST_TEST("object_ledger", test_a_flush_does_not_wait_for_the_seed) {
+    TempDir dir;
+    HeldLedger ledger(dir.path(), key_of(16), small_options());
+    std::mt19937_64 random(21);
+    const auto seeded_id = id_of(random);
+    const auto later_id = id_of(random);
+    std::promise<void> in_snapshot;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    auto seeding = std::async(std::launch::async, [&] {
+        ledger.seed([&] {
+            ledger.drop_queued();
+            in_snapshot.set_value();
+            // The slow part of a seed, held open.
+            released.wait();
+            return std::vector<ObjectId>{seeded_id};
+        });
+    });
+    in_snapshot.get_future().wait();
+    // While the seed is held open: a write records and flushes, and returns.
+    auto writing = std::async(std::launch::async, [&] {
+        ledger.record(later_id, true);
+        ledger.flush();
+    });
+    const bool flushed = writing.wait_for(5s) == std::future_status::ready;
+    CHECK(flushed);
+    CHECK(!ledger.seeded());
+    release.set_value();
+    seeding.get();
+    if (!flushed)
+        writing.get();
+    // Queued after the snapshot: applied over the seed by the seed itself.
+    CHECK(ledger.held(seeded_id) == std::optional<bool>(true));
+    CHECK(ledger.held(later_id) == std::optional<bool>(true));
+    CHECK(ledger.size() == 2);
 }
 
 } // namespace
