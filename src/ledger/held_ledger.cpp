@@ -25,6 +25,33 @@ std::optional<bool> HeldLedger::held(const ObjectId& id) const {
     return trie_->get(id).has_value();
 }
 
+std::vector<ObjectId> HeldLedger::held_with_prefix(uint16_t prefix) const {
+    const auto first = static_cast<uint8_t>(prefix >> 8);
+    const auto second = static_cast<uint8_t>(prefix & 0xff);
+    // Start after the last id of the prefix before.
+    std::optional<ObjectId> after;
+    if (prefix) {
+        ObjectId before;
+        before.bytes.fill(0xff);
+        before.bytes[0] = static_cast<uint8_t>((prefix - 1) >> 8);
+        before.bytes[1] = static_cast<uint8_t>((prefix - 1) & 0xff);
+        after = before;
+    }
+    std::vector<ObjectId> out;
+    Lock lock(trie_mutex_);
+    while (true) {
+        const auto page = trie_->next(after, 256);
+        for (const auto& [id, value] : page) {
+            if (id.bytes[0] != first || id.bytes[1] != second)
+                return out;
+            out.push_back(id);
+        }
+        if (page.size() < 256)
+            return out;
+        after = page.back().first;
+    }
+}
+
 void HeldLedger::record(const ObjectId& id, bool held) {
     Lock lock(queue_mutex_);
     queued_.push_back({id, held ? std::optional<Bytes>(held_value) : std::nullopt});

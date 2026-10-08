@@ -1061,6 +1061,27 @@ uint64_t StoragePool::rebalance_once(uint64_t budget_bytes) {
     }
 }
 
+LocalStore::VerifyResult StoragePool::verify_step(size_t directories) {
+    LocalStore::VerifyResult total;
+    total.complete = true;
+    for (const auto& backend : snapshot()) {
+        std::shared_ptr<LocalStore> store;
+        {
+            Lock lock(backend->mutex);
+            if (backend->online)
+                store = backend->store;
+        }
+        if (!store)
+            continue;
+        const auto step = store->verify_step(directories);
+        total.directories += step.directories;
+        total.recorded += step.recorded;
+        total.lost += step.lost;
+        total.complete = total.complete && step.complete;
+    }
+    return total;
+}
+
 size_t StoragePool::compact_packs(std::stop_token stop) {
     size_t visited = 0;
     for (const auto& backend : snapshot()) {

@@ -247,6 +247,7 @@ void Maintenance::run(std::stop_token stop) {
     uint64_t observed_event = absorbed_total_;
     auto network_quiescent_until = Clock::time_point{};
     auto local_quiescent_until = Clock::time_point{};
+    auto ledger_verify_due = Clock::time_point{};
     auto gc_quiescent_until = Clock::time_point{};
     auto scrub_due_unix_ms = initialise_scrub_due(node_.config().state_path, policy.scrub_interval);
     double network_credit = 0.0;
@@ -1101,6 +1102,19 @@ void Maintenance::run(std::stop_token stop) {
                     }
                     Log::trace("maintenance: scrub pass complete; next campaign scheduled");
                 }
+            }
+
+            // The held ledgers checked against the disk, a directory or a few
+            // a pass (paced, never waiting for viewers to stop), a pass a day.
+            if (now >= ledger_verify_due) {
+                enter_stage("ledger-verify");
+                const size_t directories = busy ? 1 : 16;
+                const auto data = local_.data().verify_step(directories);
+                const auto control = local_.control().verify_step(directories);
+                observations().add("ledger.verify.recorded", data.recorded + control.recorded);
+                observations().add("ledger.verify.lost", data.lost + control.lost);
+                if (data.complete && control.complete)
+                    ledger_verify_due = now + std::chrono::hours(24);
             }
 
         } catch (const MetadataNotReady&) {

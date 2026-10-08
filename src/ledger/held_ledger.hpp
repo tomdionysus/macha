@@ -32,6 +32,9 @@ class HeldLedger {
     }
     // From the record once seeded; nothing before.
     std::optional<bool> held(const ObjectId&) const;
+    // The recorded ids whose first two bytes are `prefix` (big-endian), in
+    // order.
+    std::vector<ObjectId> held_with_prefix(uint16_t prefix) const;
     // Queues a change. The caller holds the lock that orders its changes.
     void record(const ObjectId&, bool held);
     // Journals and installs every queued change, in order.
