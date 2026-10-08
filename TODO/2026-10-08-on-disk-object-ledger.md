@@ -188,6 +188,52 @@ Each ships alone, with the suite green on the laptop and fi-1.
    the fallback for a peer without it. `lost` reported.
 6. **Retire** the fallbacks and the replaced files once every node runs 5.
 
+## Stage 4 proposal (2026-10-09)
+
+**What exists** (survey, 0.90.61). The referenced set is held five times,
+each about 32 B an id: the census (`FileSystem::NamespaceCensus`, extents
+once per reference, sorted vectors), `MaintenanceObjects` (a deduplicated
+copy), `NamespaceReferences` (another, per release build),
+`InventoryHorizon` and `ReleaseHorizon` (`ReferencedSets`, sorted vectors,
+copied again with the catalogue's sets). Consumers read them as
+`binary_search` over spans: repair (`repair_step`), DATA GC (`gc_step`),
+claim release (`release_unreferenced`), control GC (`control_gc_step`),
+`query_referenced`. The census is walked whole at every start, then followed
+by tree diff. `UnreferencedSince` is two in-memory maps loaded and saved
+whole. Cost on gbni-1 (0.90.58 to 0.90.60): an inventory build takes 0.7 to
+1.7 s and runs one to four times a minute, a release build about 0.45 s one
+to five times a minute: 4 to 5 s of a Pi core every minute copying sets.
+
+**Proposal.**
+1. One `referenced` trie a class under `state/ledger/referenced-{data,control}`:
+   the record is the number of references from the followed head (extent
+   references counted, so a shared extent leaves only when its last
+   reference goes). The census follow writes count deltas from the tree
+   diff it already computes, journaled, with the root it reflects kept
+   beside the trie: a restart resumes from that root by diff, not a walk.
+   The census, `MaintenanceObjects.live/namespace_nodes` and
+   `NamespaceReferences` go.
+2. Horizons become pinned snapshots of those tries: the trie is
+   copy-on-write, so a snapshot is a root plus the node-file generation it
+   reads; a rewrite waits while an older generation is pinned. A horizon
+   keeps today's meaning exactly (immutable, of one head), built in O(1)
+   instead of copied. Consumers take a `referenced(id)` lookup and an
+   ordered `next()` instead of a span.
+3. `unreferenced_since` becomes one trie a class (value: first sighting in
+   ms), replacing the two maps and their whole-file saves.
+4. The catalogue's own sets (`live`, `control_live`, outside-namespace) stay
+   in memory: they grow with catalogue items (7,477), not extents, and are
+   unioned in by the snapshot's lookup.
+
+**Decisions needed.**
+- Pinned snapshots (exact current semantics, more mechanism) or consumers
+  reading the newest followed head (simpler; each consumer's safety under a
+  head newer than its horizon must then be argued, and release with several
+  accepted heads is the hard case). Recommended: pinned snapshots.
+- Whether a release horizon and the inventory may be snapshots at different
+  heads of one followed chain (today they are built from different heads:
+  `release_head()` and the inventory's generation).
+
 ## Open questions
 
 - **Whether `held` records the backend.** A pool with several backends
