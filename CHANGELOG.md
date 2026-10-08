@@ -1,5 +1,20 @@
 # Current release
 
+## 0.90.56: a start replays little of the claims journal
+
+No API, wire, protocol or on-disk changes.
+
+On 0.90.55, gbni-1's restart spent 7 s from the cache scan to metadata ready,
+against 2 s on 0.90.54: it replayed the 8.8 MB `claims.log` 0.90.54 left,
+through the trie, and kept doing so on every start until maintenance next
+compacted, which a log of re-claims that change nothing can put off to 64
+MiB. A checkpoint now saves only changed nodes, so it is cheap: one is taken
+once the log reaches 4 MiB, on the write path, and at the end of a start's
+replay, so a start replays at most about 4 MiB once. The control trie's
+share of the claims cache goes from an eighth to a quarter (gbni-1's control
+claims are 46 MB of nodes against 60 MB for DATA). Test: a start that replays
+a long journal checkpoints it (shown to fail without the checkpoint).
+
 ## 0.90.55: retention claims in the ledger (object ledger stage 3)
 
 No API, wire or protocol changes. On disk: the claims move from

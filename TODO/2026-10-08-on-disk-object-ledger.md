@@ -1,6 +1,6 @@
 # The on-disk object ledger
 
-Status: design, 2026-10-08. Not started. Stages 2 and 3 of the object ledger
+Status: stages 1 to 3 shipped (0.90.53 to 0.90.55), 2026-10-08. Stages 2 and 3 of the object ledger
 spec ([archive/2026-09-29-object-ledger-spec.md](archive/2026-09-29-object-ledger-spec.md)),
 refreshed against the code at 0.90.52 and the operator's answers to its open
 questions. Stage 0 (the `ObjectLedger` interface) was built in the object
@@ -170,9 +170,15 @@ Each ships alone, with the suite green on the laptop and fi-1.
    answers `held` as it does today, and nothing waits on it. Exit: a
    restart of gbni-1 is ready within the 30 s bound with `held_indexed`
    true at once; verification finds nothing to correct.
-3. **Claims in the ledger.** The retention store's maps and checkpoints
-   migrate into the `claimed` column; `prune_unclaimed` is journaled. The
-   old files are kept until the first ledger checkpoint (downgrade safe).
+3. **Claims in the ledger.** Done in 0.90.55: one trie a class under
+   `retention/ledger-{data,control}`, the record an object's observed-remove
+   state, `claims.log` the journal; prunes journaled; checkpoint at the old
+   thresholds or 8,192 changed objects; the shard files migrate at the first
+   start and are removed at the first checkpoint. Separate tries from
+   `held`, not a column of one record: the two are written by different
+   owners under different locks, and merging them waits on stage 5's need
+   for one diffable record. Exit to confirm on the cluster: the migration
+   counts match, the restart is inside the bound, resident memory drops.
 4. **`referenced` and `unreferenced_since`** as columns, fed by the census's
    tree diff; horizons read the ledger instead of copying vectors.
 5. **The diff** (spec stage 3): one RPC pair, subtree-hash descent between
