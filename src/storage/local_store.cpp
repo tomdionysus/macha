@@ -1893,10 +1893,11 @@ LocalStore::VerifyResult LocalStore::verify_step(size_t directories) {
         return result;
     }
     std::vector<ObjectId> missing;
+    uint32_t next = ledger_->verify_next();
     while (result.directories < directories && !result.complete) {
-        const auto prefix = static_cast<uint16_t>(verify_prefix_);
-        verify_prefix_ = (verify_prefix_ + 1) & 0xffff;
-        result.complete = verify_prefix_ == 0;
+        const auto prefix = static_cast<uint16_t>(next);
+        next = (next + 1) & 0xffff;
+        result.complete = next == 0;
         ++result.directories;
         ObjectId sample;
         sample.bytes[0] = static_cast<uint8_t>(prefix >> 8);
@@ -1950,6 +1951,7 @@ LocalStore::VerifyResult LocalStore::verify_step(size_t directories) {
         }
     }
     flush_ledger();
+    ledger_->set_verify_next(static_cast<uint16_t>(next));
     if (result.recorded || result.lost)
         Log::warn("storage held ledger corrected path=" + root_.string() +
                   " recorded=" + std::to_string(result.recorded) +

@@ -4,6 +4,8 @@
 #include "durable_file.hpp"
 
 #include <algorithm>
+#include <fstream>
+#include <string>
 
 namespace macha {
 
@@ -16,6 +18,18 @@ HeldLedger::HeldLedger(std::filesystem::path dir, std::array<uint8_t, 32> key,
                        ObjectTrie::Options options)
     : dir_(std::move(dir)), trie_(std::make_unique<ObjectTrie>(dir_, key, options)) {
     seeded_.store(std::filesystem::exists(dir_ / "seeded"), std::memory_order_release);
+    if (std::ifstream in(dir_ / "verify-next"); in) {
+        unsigned next = 0;
+        if (in >> next && next <= 0xffff)
+            verify_next_ = static_cast<uint16_t>(next);
+    }
+}
+
+void HeldLedger::set_verify_next(uint16_t next) {
+    if (next == verify_next_)
+        return;
+    durable_replace_file(dir_ / "verify-next", std::to_string(next) + "\n");
+    verify_next_ = next;
 }
 
 std::optional<bool> HeldLedger::held(const ObjectId& id) const {
