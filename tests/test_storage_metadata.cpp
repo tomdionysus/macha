@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "codec.hpp"
+#include "crypto.hpp"
+#include "storage/sealed_journal.hpp"
 
+#include <cstdio>
+#include <fstream>
 #include <thread>
 #include <future>
 #include <optional>
@@ -197,7 +202,7 @@ MACHA_FAST_TEST("storage_metadata", test_retention_prune_keeps_a_row_claimed_whi
     CHECK(retention.retained(RetentionClass::data, objects[1]));
 }
 
-MACHA_FAST_TEST("storage_metadata", test_retention_checkpoint_is_hash_sharded_and_restartable) {
+MACHA_FAST_TEST("storage_metadata", test_retention_claims_checkpoint_into_the_ledger_and_restart) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -205,7 +210,6 @@ MACHA_FAST_TEST("storage_metadata", test_retention_checkpoint_is_hash_sharded_an
     const auto state = t.path() / "state";
     const auto origin = random_node_id();
     std::vector<ObjectId> objects;
-    objects.reserve(512);
     for (uint16_t shard = 0; shard < 256; ++shard) {
         for (uint16_t suffix = 0; suffix < 2; ++suffix) {
             ObjectId id{};
@@ -215,32 +219,185 @@ MACHA_FAST_TEST("storage_metadata", test_retention_checkpoint_is_hash_sharded_an
             objects.push_back(id);
         }
     }
-
+    ObjectId later{};
+    later.bytes[5] = 9;
     {
         RetentionStore retention(state, keys.storage);
         retention.retain_batch(RetentionClass::data, objects, {origin, 7});
         REQUIRE(retention.compact_if_needed(1));
+        CHECK(std::filesystem::file_size(state / "retention" / "claims.log") == 0);
+        // After the checkpoint: in the journal only.
+        retention.retain(RetentionClass::control, later, {origin, 8});
     }
-
-    const auto manifest = state / "retention" / "claims.current";
-    REQUIRE(std::filesystem::exists(manifest));
-    CHECK(!std::filesystem::exists(state / "retention" / "claims.meta"));
-    CHECK(std::filesystem::file_size(state / "retention" / "claims.log") == 0);
-
-    std::ifstream in(manifest);
-    std::string generation;
-    std::getline(in, generation);
-    REQUIRE(!generation.empty());
-    const auto generation_path = state / "retention" / "checkpoints" / generation;
-    size_t shards = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(generation_path))
-        if (entry.is_regular_file())
-            ++shards;
-    CHECK(shards == 256);
-
+    CHECK(std::filesystem::exists(state / "retention" / "ledger-data" / "root"));
+    CHECK(std::filesystem::file_size(state / "retention" / "claims.log") > 0);
     RetentionStore reopened(state, keys.storage);
     for (const auto& id : objects)
         CHECK(reopened.retained(RetentionClass::data, id));
+    CHECK(reopened.retained(RetentionClass::control, later));
+    CHECK(!reopened.retained(RetentionClass::data, later));
+    CHECK(reopened.claim_objects(RetentionClass::data) == objects.size());
+    CHECK(reopened.claim_objects(RetentionClass::control) == 1);
+}
+
+// Enough changed objects checkpoint the tries on their own: what the tries
+// hold unsaved stays bounded whatever the batch.
+MACHA_FAST_TEST("storage_metadata", test_retention_checkpoints_after_enough_changes) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto state = t.path() / "state";
+    const auto origin = random_node_id();
+    std::vector<ObjectId> objects(10000);
+    for (size_t i = 0; i < objects.size(); ++i) {
+        objects[i].bytes[0] = static_cast<uint8_t>(i);
+        objects[i].bytes[1] = static_cast<uint8_t>(i >> 8);
+    }
+    RetentionStore retention(state, keys.storage);
+    retention.retain_batch(RetentionClass::data, objects, {origin, 1});
+    CHECK(std::filesystem::file_size(state / "retention" / "claims.log") == 0);
+    CHECK(retention.claim_objects(RetentionClass::data) == objects.size());
+}
+
+// A prune is journaled: the erased row stays erased across a restart with no
+// checkpoint between, so an old dot is no longer suppressed.
+MACHA_FAST_TEST("storage_metadata", test_retention_prune_survives_a_restart) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto state = t.path() / "state";
+    const auto origin = random_node_id();
+    ObjectId pruned{};
+    pruned.bytes[0] = 1;
+    ObjectId kept{};
+    kept.bytes[0] = 2;
+    {
+        RetentionStore retention(state, keys.storage);
+        retention.retain(RetentionClass::data, pruned, {origin, 1});
+        retention.retain(RetentionClass::data, kept, {origin, 1});
+        CHECK(retention.release_unreferenced(RetentionClass::data, {},
+                                             RetentionClock{{origin, 1}}, 8) == 2);
+        CHECK(retention.prune_unclaimed(
+                  RetentionClass::data, [&](const ObjectId& id) { return id == kept; }, 8) == 1);
+    }
+    RetentionStore reopened(state, keys.storage);
+    CHECK(reopened.claims(RetentionClass::data, pruned).removed.empty());
+    CHECK(reopened.claims(RetentionClass::data, kept).removed.size() == 1);
+    reopened.retain(RetentionClass::data, pruned, {origin, 1});
+    CHECK(reopened.retained(RetentionClass::data, pruned));
+    reopened.retain(RetentionClass::data, kept, {origin, 1});
+    CHECK(!reopened.retained(RetentionClass::data, kept));
+}
+
+// A node's sharded checkpoint and the journal after it move into the ledger at
+// the first start, claims and tombstones alike; the first checkpoint removes
+// the shard files.
+MACHA_FAST_TEST("storage_metadata", test_retention_shard_checkpoint_moves_into_the_ledger) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto state = t.path() / "state";
+    const auto root = state / "retention";
+    const auto a = random_node_id();
+    const auto b = random_node_id();
+    std::vector<ObjectId> data_ids;
+    for (int i = 0; i < 600; ++i) {
+        ObjectId id{};
+        id.bytes[0] = static_cast<uint8_t>(i * 7);
+        id.bytes[1] = static_cast<uint8_t>(i);
+        id.bytes[2] = static_cast<uint8_t>(i >> 8);
+        data_ids.push_back(id);
+    }
+    std::sort(data_ids.begin(), data_ids.end());
+    // data_ids[0] carries a tombstone from b only; the rest a claim from a.
+    ObjectId control_id{};
+    control_id.bytes[0] = 200;
+    control_id.bytes[9] = 1;
+    {
+        const auto generation = root / "checkpoints" / "gen-1-1-1";
+        std::filesystem::create_directories(generation);
+        constexpr std::array<uint8_t, 8> aad{'M', 'A', 'C', 'H', 'R', 'T', 'S', '1'};
+        for (int shard = 0; shard < 256; ++shard) {
+            Writer plain;
+            plain.u8(2);
+            plain.u8(static_cast<uint8_t>(shard));
+            std::vector<ObjectId> in_shard;
+            for (const auto& id : data_ids)
+                if (id.bytes[0] == shard)
+                    in_shard.push_back(id);
+            plain.u32(static_cast<uint32_t>(in_shard.size()));
+            for (const auto& id : in_shard) {
+                plain.fixed(id.bytes);
+                if (id == data_ids[0]) {
+                    plain.u32(0);
+                    plain.u32(1);
+                    plain.fixed(b.bytes);
+                    plain.u64(5);
+                } else {
+                    plain.u32(1);
+                    plain.fixed(a.bytes);
+                    plain.u64(3);
+                    plain.u32(0);
+                }
+            }
+            const bool control_here = shard == control_id.bytes[0];
+            plain.u32(control_here ? 1 : 0);
+            if (control_here) {
+                plain.fixed(control_id.bytes);
+                plain.u32(1);
+                plain.fixed(a.bytes);
+                plain.u64(4);
+                plain.u32(0);
+            }
+            const auto sealed = aes_gcm_seal(keys.storage, plain.data(), aad);
+            Writer outer;
+            outer.fixed(std::array<uint8_t, 8>{'M', 'R', 'T', 'S', '0', '0', '0', '2'});
+            outer.fixed(sealed.nonce);
+            outer.fixed(sealed.tag);
+            outer.bytes(sealed.ciphertext);
+            char name[8];
+            std::snprintf(name, sizeof(name), "%02x.meta", shard);
+            std::ofstream(generation / name, std::ios::binary)
+                .write(reinterpret_cast<const char*>(outer.data().data()),
+                       static_cast<std::streamsize>(outer.data().size()));
+        }
+        std::ofstream(root / "claims.current") << "gen-1-1-1\n";
+        // The journal after the checkpoint: b claims data_ids[1].
+        constexpr std::array<uint8_t, 8> journal_aad{'M', 'A', 'C', 'H', 'R', 'T', 'J', '1'};
+        SealedJournal journal(root / "claims.log", keys.storage, journal_aad, 4U << 20);
+        Writer frame;
+        frame.u8(1);
+        frame.u8(static_cast<uint8_t>(RetentionClass::data));
+        frame.fixed(b.bytes);
+        frame.u64(6);
+        frame.u32(1);
+        frame.fixed(data_ids[1].bytes);
+        journal.append(frame.data());
+    }
+    {
+        RetentionStore retention(state, keys.storage);
+        CHECK(!retention.retained(RetentionClass::data, data_ids[0]));
+        CHECK(retention.claims(RetentionClass::data, data_ids[0]).removed.at(b) == 5);
+        CHECK(retention.claims(RetentionClass::data, data_ids[1]).adds.size() == 2);
+        for (size_t i = 1; i < data_ids.size(); ++i)
+            CHECK(retention.retained(RetentionClass::data, data_ids[i]));
+        CHECK(retention.retained(RetentionClass::control, control_id));
+        CHECK(retention.claim_objects(RetentionClass::data) == data_ids.size() - 1);
+        // The tombstone still suppresses b's older dot.
+        retention.retain(RetentionClass::data, data_ids[0], {b, 5});
+        CHECK(!retention.retained(RetentionClass::data, data_ids[0]));
+        CHECK(std::filesystem::exists(root / "claims.current"));
+        REQUIRE(retention.compact_if_needed(1));
+    }
+    CHECK(!std::filesystem::exists(root / "claims.current"));
+    CHECK(!std::filesystem::exists(root / "checkpoints"));
+    RetentionStore reopened(state, keys.storage);
+    CHECK(reopened.claims(RetentionClass::data, data_ids[1]).adds.size() == 2);
+    CHECK(reopened.retained(RetentionClass::control, control_id));
+    CHECK(reopened.claim_objects(RetentionClass::data) == data_ids.size() - 1);
 }
 
 MACHA_FAST_TEST("storage_metadata", test_retention_claim_is_physical_gc_barrier) {

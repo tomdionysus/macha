@@ -25,6 +25,25 @@ void stage(const LocalState::StageHook& hook, std::string_view name, std::stop_t
         throw RecoveryCancelled();
 }
 
+// storage.ledger_cache, divided among the ledgers: half to the claims (both
+// classes), a sixteenth to the control store's held ledger, the rest to the
+// data backends'.
+enum class LedgerShare { data_held, control_held, claims };
+
+uint64_t ledger_cache_share(const Config& cfg, LedgerShare share) {
+    const auto claims = cfg.ledger_cache / 2;
+    const auto control_held = cfg.ledger_cache / 16;
+    switch (share) {
+    case LedgerShare::claims:
+        return claims;
+    case LedgerShare::control_held:
+        return control_held;
+    case LedgerShare::data_held:
+        break;
+    }
+    return cfg.ledger_cache - claims - control_held;
+}
+
 } // namespace
 
 LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, ClusterNode& node,
@@ -65,7 +84,7 @@ void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
         auto pool = std::make_unique<StoragePool>(cfg.state_path, identity.id, cfg.storage_backends,
                                                   identity.keys.storage, durability_batch_window,
                                                   cfg.storage_packing,
-                                                  cfg.ledger_cache - cfg.ledger_cache / 8);
+                                                  ledger_cache_share(cfg, LedgerShare::data_held));
         if (stop.stop_requested())
             throw RecoveryCancelled();
         // Device-pressure admission; a zero target disables it.
@@ -111,7 +130,7 @@ void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
                                           cfg.metadata_store.packing.threshold,
                                           cfg.metadata_store.packing.target_size};
         control_options.ledger_dir = cfg.state_path / "ledger" / "control";
-        control_options.ledger_cache_bytes = cfg.ledger_cache / 8;
+        control_options.ledger_cache_bytes = ledger_cache_share(cfg, LedgerShare::control_held);
         control_ = std::make_unique<LocalStore>(
             cfg.metadata_store.path, control_options,
             identity.keys.storage, LocalStoreMode::authoritative, nullptr,
@@ -126,7 +145,8 @@ void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
         progress.mark(RecoveryProgress::cache);
 
         stage(hook, "retention", stop);
-        retention_ = std::make_unique<RetentionStore>(cfg.state_path, identity.keys.storage);
+        retention_ = std::make_unique<RetentionStore>(cfg.state_path, identity.keys.storage,
+                                                      ledger_cache_share(cfg, LedgerShare::claims));
         note_startup_progress();
         progress.mark(RecoveryProgress::retention);
 

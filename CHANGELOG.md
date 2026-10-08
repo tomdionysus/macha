@@ -1,5 +1,38 @@
 # Current release
 
+## 0.90.55: retention claims in the ledger (object ledger stage 3)
+
+No API, wire or protocol changes. On disk: the claims move from
+`<state_path>/retention/checkpoints/` and `claims.current` into one
+`ObjectTrie` a class, `retention/ledger-data` and `ledger-control`;
+`claims.log` stays, as their journal.
+
+The retention store kept every claim in two in-memory maps that grew with the
+library, and a checkpoint rewrote all 256 shards of them. Each object's
+observed-remove state is now a record in its class's trie: an add, release
+or prune is journaled in `claims.log` and fsynced, then applied to the trie,
+and a checkpoint saves only the changed nodes and empties the log; replaying
+the log over a checkpoint is idempotent. A checkpoint runs at the old
+thresholds and also once 8,192 objects have changed, which bounds what the
+tries hold unsaved. Memory is the tries' cache: half of `storage.ledger_cache`,
+mostly to the DATA class; the control store's held ledger now takes a
+sixteenth of it and the DATA backends' the rest. `prune_unclaimed` is now
+journaled, so a pruned row stays pruned across a crash.
+
+The trie's values are byte strings of up to 16 KiB (they were a u64), and
+its root is format 2. A format-1 trie (0.90.54's held ledgers) is read once
+at open and rewritten, each value its eight big-endian bytes; held ledgers
+are not reseeded. The first start on 0.90.55 moves the shard checkpoint and
+the log after it into the tries; the first checkpoint after that removes
+the shard files. A node cannot go back to 0.90.54 after that first start:
+the log holds prune frames it does not read.
+
+Tests: claims checkpoint into the ledger and survive a restart, with later
+claims from the log alone; a large batch checkpoints on its own; a prune
+survives a restart; hand-built shard files and log move into the ledger,
+claims and tombstones alike, and are removed at the first checkpoint; a
+hand-built format-1 trie opens with every record and is rewritten.
+
 ## 0.90.54: a restarted store knows what it holds (object ledger stage 2)
 
 No API, wire or protocol changes. New on disk: `<state_path>/ledger/`. New
