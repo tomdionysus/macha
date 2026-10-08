@@ -4,6 +4,14 @@ Contracts settled with the client sessions (from 2026-09-13), kept here
 because they were agreed across sessions and exist nowhere else in this
 repository. A server change that breaks one breaks four clients at once.
 
+**0.90.35 (announced 2026-10-06 to Core and every client; Core's type
+restored to it in `b4a549f` on 2026-10-08).** `diagnostics.repair.paced_by`
+in `GET /api/v1/status/diagnostics` lists `viewer`, `loader` and
+`peer_viewer` (in place of `playback`, `mounted_filesystem`, `loader`,
+`peer_playback`); Core's type names those three and stays open for codes it
+does not name. The web client labels them in `repairPaceText`. A 0.90.40
+that would have reverted the names never shipped.
+
 **0.63.0 (announced 2026-09-27 to Core, web, Android TV and mobile, before
 deploy).** `POST /api/v1/torrents/jobs` can answer `409
 torrent_already_added` with the holding job's `id` and `node_id` at top level
