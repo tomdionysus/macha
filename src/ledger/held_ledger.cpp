@@ -64,6 +64,9 @@ void HeldLedger::drop_queued() {
 
 void HeldLedger::flush() {
     Lock flushing(flush_mutex_);
+    // Unseeded, nothing reads the record: changes stay queued for the seed.
+    if (!seeded())
+        return;
     std::vector<ObjectTrie::Change> changes;
     {
         Lock lock(queue_mutex_);
@@ -95,7 +98,8 @@ void HeldLedger::write_journal(std::span<const ObjectTrie::Change> changes) {
 }
 
 void HeldLedger::seed(const std::function<std::vector<ObjectId>()>& snapshot) {
-    Lock flushing(flush_mutex_);
+    // Flushes leave the trie alone until seeded_ is set, so the build runs
+    // without the flush lock and a write never waits for it.
     const auto present = snapshot();
     std::vector<ObjectTrie::Record> records;
     records.reserve(present.size());
@@ -106,7 +110,13 @@ void HeldLedger::seed(const std::function<std::vector<ObjectId>()>& snapshot) {
         trie_->replace_all(std::move(records));
     }
     durable_replace_file(dir_ / "seeded", "1\n");
-    seeded_.store(true, std::memory_order_release);
+    {
+        // Under the flush lock, so a flush either left everything queued or
+        // applies it over the seed.
+        Lock flushing(flush_mutex_);
+        seeded_.store(true, std::memory_order_release);
+    }
+    flush();
 }
 
 ObjectTrie::Stats HeldLedger::stats() const {

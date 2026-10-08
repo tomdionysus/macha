@@ -1,5 +1,19 @@
 # Current release
 
+## 0.90.59: a first-start seed holds no write up
+
+No API, wire, protocol or on-disk changes.
+
+A store's first start on a held ledger seeds it from the walk. The seed held
+the ledger's flush lock while it built the trie and wrote it (2.8 s on
+gbni-1), so every put and removal in that time waited in its flush. Until the
+seed completes nothing reads the ledger, so a flush now leaves its changes
+queued; the seed builds without the lock, marks itself seeded under it, and
+applies what was queued after its snapshot. Only a node seeding for the
+first time (a new or returning one) is affected. Test: a flush during a seed
+held open returns at once, and what it queued is applied over the seed
+(shown to fail with the old locking).
+
 ## 0.90.58: the ledger check paced by time
 
 No API, wire, protocol or on-disk changes.

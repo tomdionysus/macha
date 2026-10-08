@@ -20,7 +20,8 @@ namespace macha {
 // The store queues each change under its own index lock, so they are queued
 // in the order they happened, and flushes outside that lock: a flush journals
 // the queue (an fsync) without holding the lookup lock, then installs it, so
-// a lookup never waits on another write's sync. Thread safe.
+// a lookup never waits on another write's sync. Until seeded a flush leaves
+// the queue alone, so the seed's build never holds a write up. Thread safe.
 class HeldLedger {
   public:
     HeldLedger(std::filesystem::path dir, std::array<uint8_t, 32> key,
@@ -39,11 +40,11 @@ class HeldLedger {
     void record(const ObjectId&, bool held);
     // Journals and installs every queued change, in order.
     void flush();
-    // Replaces the record with what `snapshot` returns (sorted, unique) and
-    // marks it seeded. `snapshot` runs with flushes held off and must drop
-    // the queued changes the snapshot already includes (drop_queued() under
-    // the same lock it records under); changes queued after it are applied
-    // over the seed by the next flush.
+    // Replaces the record with what `snapshot` returns (sorted, unique),
+    // marks it seeded and applies what was queued after the snapshot.
+    // `snapshot` must drop the queued changes the snapshot already includes
+    // (drop_queued() under the same lock it records under). Writes go on
+    // meanwhile: their flushes leave the queue for the seed.
     void seed(const std::function<std::vector<ObjectId>()>& snapshot);
     // Drops every queued change. Called from within seed's snapshot.
     void drop_queued();
@@ -53,8 +54,8 @@ class HeldLedger {
   private:
     const std::filesystem::path dir_;
     std::atomic_bool seeded_{};
-    // Held across a flush or a seed, so their journal writes and installs
-    // keep the order the changes were queued in.
+    // Held across a flush, so journal writes and installs keep the order the
+    // changes were queued in.
     IoMutex flush_mutex_ MACHA_ACQUIRED_BEFORE(trie_mutex_);
     // Held to read or install; a lookup may read a node from disk.
     mutable IoMutex trie_mutex_;
