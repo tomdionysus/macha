@@ -1,5 +1,29 @@
 # Current release
 
+## 0.90.53: the object ledger's trie and its journal (stage 1)
+
+No API, wire, protocol or on-disk changes for a running node: the trie is
+built and tested, not yet used.
+
+The retention store's journal (sealed frames, fsynced per append, replay
+stopping and truncating at the first torn frame) is now `SealedJournal`, the
+one crash-safe journal the store and the object ledger share; the retention
+store runs on it unchanged, with the same files and format. It also appends
+unsynced frames, syncs them together and reads one back by offset, which is
+how the ledger keeps its nodes.
+
+`ObjectTrie` is one class's ledger on disk: a radix-256 trie of object ids
+and 64-bit values whose shape and hash depend only on its records, changes
+journaled before they apply, copy-on-write checkpoints that publish a new
+root, a page cache of bounded size, and a node file rewritten once it holds
+more superseded nodes than live ones. Tests: every operation against a
+model, the hash independent of write order (including subtrees that grow
+and collapse), reopening, a crash at each step of a checkpoint, a torn
+journal, the rewrite, and a trie larger than its cache. Measured on the
+laptop with 224,000 records and a near-full journal left behind: open in
+437 ms, a cold lookup 10 us, the cache within its bound.
+Design: `TODO/2026-10-08-on-disk-object-ledger.md`.
+
 ## 0.90.52: a restarted node answers its peers at once
 
 No API or wire changes. One new file: `<state_path>/availability/holdings.bin`.
