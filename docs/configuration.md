@@ -133,7 +133,11 @@ holds, journaled before they change and checkpointed into a trie on disk, so
 a restart knows what it holds without walking its disk (`data-<disk token>`
 per DATA backend, named by the disk's own identity, and `control`). The
 first start on a version that keeps one walks the store once to seed it, in
-the background; every later start reads it. The retention claims are kept
+the background; every later start reads it. Maintenance checks each held
+ledger against its disk once a day, one `objects/xx/yy` directory at a time
+(one a pass while viewers or loaders are active, sixteen otherwise): a file
+the ledger does not list is recorded held, and a listed object whose file is
+gone is recorded lost, so repair puts it back. The retention claims are kept
 the same way, one trie a class under `<state_path>/retention/ledger-data`
 and `ledger-control`, with `claims.log` as their journal. `ledger_cache`
 (default `64M`) is the page cache the ledgers share: half to the claims, a
