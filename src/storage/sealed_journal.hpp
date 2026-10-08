@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <span>
 #include <string>
 
@@ -45,6 +46,28 @@ class SealedJournal {
     // The plaintext of the frame at `offset`, as an append returned it.
     // Throws if it is not a whole frame that opens.
     Bytes read_at(uint64_t offset) const;
+
+    // A read-only handle on the frames appended so far, with its own
+    // descriptor: it stays readable after the file is replaced or removed.
+    // Thread safe.
+    class FrameReader {
+      public:
+        ~FrameReader();
+        FrameReader(const FrameReader&) = delete;
+        FrameReader& operator=(const FrameReader&) = delete;
+        Bytes read_at(uint64_t offset) const;
+
+      private:
+        friend class SealedJournal;
+        FrameReader(int fd, std::array<uint8_t, 32> key, std::array<uint8_t, 8> aad,
+                    uint32_t max_frame, uint64_t limit);
+        int fd_;
+        std::array<uint8_t, 32> key_;
+        std::array<uint8_t, 8> aad_;
+        uint32_t max_frame_;
+        uint64_t limit_;
+    };
+    std::shared_ptr<const FrameReader> reader() const;
     // Empties the journal durably, once what it held is checkpointed.
     void reset();
 
