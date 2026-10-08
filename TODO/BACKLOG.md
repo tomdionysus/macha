@@ -48,9 +48,9 @@ gone from here, and the old file with its full reasoning is
 - **The block cache cannot be judged from status**: counters exist
   (`status_api.cpp:302`) but a sustained zero-hit, high-eviction cache is not a
   condition. Then revisit fi-1 read latency and whether hydration runs.
-- **An unclean exit leaks staging files**: no startup sweep of
-  `streaming.temp_path` or of `state/tmp/write.<node-id>.*`
-  (`filesystem.cpp:632`); decide how orphaned bytes become visible.
+- **An unclean exit leaks playback temp files**: no startup sweep of
+  `streaming.temp_path`. (A node's own `state/tmp/write.<node-id>.*` files
+  are swept at start since 0.90.42.)
 - **Zero storage reported healthy**: `data_storage` is ready whether or not a
   backend is online (`local_state.cpp:85`); `storage_backends_online` feeds no
   condition (`status_api.cpp:309`).

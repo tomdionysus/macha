@@ -1,6 +1,46 @@
 # Completed and tested
 
-Last updated: 2026-10-07
+Last updated: 2026-10-08
+
+## 2026-10-07/08 -- 0.90.44 to 0.90.52
+
+- **Control's commits timed in the observation windows** (0.90.44):
+  `metadata.*_sync_us`, `fuse.journal_sync_us`,
+  `durability.barrier_us.<dir>`. Under 20+ torrents the control store's
+  barrier was mean 0.6 ms (max 3.3 ms) on gbni-1 and 1.5 ms (max 70 ms) on
+  fi-1.
+- **The lock audit of control's paths, six hazards fixed** (0.90.45 to
+  0.90.49), each with a test that holds the slow part (an fsync held by the
+  test binary's interposer, or a probe against a full accept queue) and
+  reads meanwhile; the checkpoint test was shown to fail with the old
+  locking. The metadata checkpoint is written after the replica's lock is
+  released on every runtime path; account changes hash and write off the
+  table lock and a replicated set is written once; the connectivity probe,
+  the roster and the inbound resolution are written off the locks `/status`
+  reads; `/api/v1/health` is answered by the HTTP reactor itself, the
+  control lane has four workers and password checks are capped below them;
+  messages of 64 KiB or less keep a reserve of a peer session's queue.
+- **Repair never deletes a copy it has nowhere to send** (0.90.50, data
+  loss). A node hosting no extents and knowing no host had zero owners for
+  an object, so "enough owners hold it" held vacuously and repair deleted
+  its copy. The condition was as old as repair. The drain test that failed
+  on fi-1 about 1 run in 25 was this: 5 of 120 on 0.90.46's code, 120 of
+  120 passing after. Exposure: fi-1 did not host from 2026-09-15 to 09-24;
+  since then a hosting node is its own owner and the target is never zero.
+- **A survey that could ask no host calls nothing unavailable** (0.90.51).
+  At 20:55Z on 2026-10-07 fi-1 published 686,296 unavailable extents
+  against about 204,000 true, from a survey that asked no peer while gbni-1
+  dropped out of its active set; a node that knows other hosts but can
+  reach none now keeps its last survey and retries. The test fails without
+  the fix.
+- **A restarted node answers its peers at once** (0.90.52). Peers were
+  refused ("holdings are not rolled up yet") for 17 to 20 minutes after
+  each gbni-1 restart, while its presence index warmed (1,180 s, 807,076
+  objects), and fi-1's reads of extents no node holds waited 6 to 16 s for
+  their refusal. The roll-up of a stored tree is kept at
+  `availability/holdings.bin` and answered from until the node rolls up
+  again; dropped on any loss. Confirmation across a gbni-1 restart is ACTIVE
+  section 0. A survey's failed peer is logged with the peer's reason.
 
 ## 2026-10-07 -- 0.90.39 to 0.90.43
 
@@ -32,7 +72,7 @@ Last updated: 2026-10-07
 ## 2026-10-06/07 -- 0.90.35 to 0.90.38
 
 - **One definition of work class** (0.90.35 to 0.90.38,
-  [design](2026-10-06-one-work-class.md)): one `WorkClass` and one mapping
+  [design](archive/2026-10-06-one-work-class.md)): one `WorkClass` and one mapping
   from the frame, read by DATA admission, the activity clocks, the memory
   ledger, the pacing and status; every API route but the four control
   routes is viewer work and marks a viewer present; allowed waits are said
