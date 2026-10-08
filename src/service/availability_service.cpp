@@ -66,8 +66,17 @@ class RemotePeer final : public PeerHoldings {
             const auto payload = encode_tree_holdings_request(part);
             const auto reply =
                 node_.call(peer_, MessageType::tree_holdings, payload, FrameType::speculative);
-            if (reply.message.type != MessageType::tree_holdings_reply)
-                throw std::runtime_error("peer refused tree_holdings");
+            if (reply.message.type != MessageType::tree_holdings_reply) {
+                std::string reason = "no reason given";
+                if (reply.message.type == MessageType::error) {
+                    try {
+                        Reader why(reply.message.payload);
+                        reason = why.string();
+                    } catch (const std::exception&) {
+                    }
+                }
+                throw std::runtime_error("peer refused tree_holdings: " + reason);
+            }
             auto decoded = decode_tree_holdings_reply(reply.message.payload);
             if (decoded.size() != part.size())
                 throw std::runtime_error("peer answered a different number of tree nodes");
@@ -280,7 +289,21 @@ AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
                                          const NodeEvents& events, MessageRoutes& routes,
                                          std::filesystem::path persisted)
     : node_(node), local_(local), store_(store), ledger_(ledger), events_(events),
-      routes_(routes), persisted_(std::move(persisted)) {
+      routes_(routes), persisted_(std::move(persisted)),
+      kept_path_(persisted_.empty() ? std::filesystem::path{}
+                                    : persisted_.parent_path() / "holdings.bin") {
+    if (!kept_path_.empty()) {
+        std::ifstream in(kept_path_, std::ios::binary);
+        if (in) {
+            const Bytes bytes{std::istreambuf_iterator<char>(in), {}};
+            try {
+                kept_.publish(Kept{HoldingsRollup::decode(bytes),
+                                   ledger_.held_losses(RetentionClass::data)});
+            } catch (const DecodeError& error) {
+                Log::warn("availability: ignoring " + kept_path_.string() + ": " + error.what());
+            }
+        }
+    }
     if (!persisted_.empty()) {
         std::ifstream in(persisted_, std::ios::binary);
         if (in) {
@@ -304,24 +327,30 @@ AvailabilityService::~AvailabilityService() {
 
 RpcMessage AvailabilityService::answer(const RpcMessage& request) const {
     const auto holdings = holdings_.handle();
-    if (!holdings)
-        return error_reply("holdings are not rolled up yet");
+    const auto kept = kept_.handle();
+    const auto losses = ledger_.held_losses(RetentionClass::data);
+    const HoldingsRollup* kept_rollup = kept && kept->rollup ? &*kept->rollup : nullptr;
+    const auto* rollup =
+        answering_rollup(holdings ? &holdings->rollup : nullptr, holdings ? holdings->losses : 0,
+                         kept_rollup, kept ? kept->losses : 0, losses);
     // A loss since the roll-up: what it calls whole may not be. The pass
     // rolls up again; until then this node cannot answer.
-    if (ledger_.held_losses(RetentionClass::data) != holdings->losses)
-        return error_reply("holdings changed since they were rolled up");
+    if (!rollup)
+        return error_reply(holdings ? "holdings changed since they were rolled up"
+                                    : "holdings are not rolled up yet");
     const auto nodes = decode_tree_holdings_request(request.payload);
     // This node's own copy of each tree node: answering never asks a peer.
     const LocalNamespaceNodeStore stored(local_.control());
     const NamespaceNodeStore& local_nodes =
-        holdings->built ? static_cast<const NamespaceNodeStore&>(*holdings->built) : stored;
+        holdings && holdings->built ? static_cast<const NamespaceNodeStore&>(*holdings->built)
+                                    : stored;
     const HeldFn held = [this](const ObjectId& id) {
         return ledger_.held(RetentionClass::data, id);
     };
     std::vector<NodeHoldings> answers;
     answers.reserve(nodes.size());
     for (const auto& node : nodes)
-        answers.push_back(describe_holdings(holdings->rollup, local_nodes, held, node));
+        answers.push_back(describe_holdings(*rollup, local_nodes, held, node));
     return {MessageType::tree_holdings_reply, encode_tree_holdings_reply(answers)};
 }
 
@@ -343,6 +372,13 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     bool rolled = false;
     const auto losses = ledger_.held_losses(RetentionClass::data);
     const bool lost = holdings && losses != holdings->losses;
+    // A loss makes the kept roll-up claim what this node may not hold.
+    if (const auto kept = kept_.handle();
+        kept && kept->rollup && losses != kept->losses && !kept_path_.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(kept_path_, ec);
+        kept_.publish(Kept{});
+    }
     const bool head_changed = rolled_head_ != head_key;
     const bool changed = head_changed || storage_events != rolled_storage_events_ || lost;
     const auto rollup_due = rolled_at_ + rolled_cost_ * share;
@@ -384,6 +420,19 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         next.snapshot = head.snapshot;
         holdings_.publish(std::move(next));
         holdings = holdings_.handle();
+        // Kept for the next start: a stored tree's roll-up only, since an
+        // inline namespace's tree is rebuilt from the snapshot.
+        if (!kept_path_.empty() && tree_backed) {
+            try {
+                const auto bytes = holdings->rollup.encode();
+                durable_replace_file(kept_path_,
+                                     std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                                                      bytes.size()));
+            } catch (const std::exception& error) {
+                Log::warn(std::string("availability: cannot keep the holdings: ") +
+                          error.what());
+            }
+        }
         rolled_head_ = head_key;
         rolled_storage_events_ = storage_events;
         rolled_at_ = now;

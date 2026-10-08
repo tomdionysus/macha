@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-08, on `develop`. Both nodes run 0.90.50.
+Last updated: 2026-10-08, on `develop`. Both nodes run 0.90.51.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -127,14 +127,13 @@ item in section 0, then stage 6.
   first write while the set forms is refused when a peer's survey answer
   is late, and the test treats the refusal as fatal. P0: decide whether the
   write should wait for the survey, or the test retry the refusal.
-- **A peer's restart blinds the availability survey for about 15 minutes**
-  (fi-1, 2026-10-07/08): the peer refuses holdings questions until its DATA
-  presence index warms, 17 to 19 minutes on gbni-1's hard disk for 740,000
-  objects; meanwhile a read no node can serve waits 6 to 16 s for its
-  refusal. The false answer at 20:55:09Z (686,296 unavailable) was a survey
-  that asked no peer at all; fixed in 0.90.51. Still open: the warm-up
-  time itself, and whether the peer could answer from its persisted
-  holdings while it warms.
+- **A peer's restart blinded the availability survey for 17 to 20 minutes**
+  (2026-10-07/08): the peer refused holdings questions ("holdings are not
+  rolled up yet") until its DATA presence index warmed, 1,180 s for 807,076
+  objects on gbni-1. 0.90.52 keeps the roll-up and answers from it; to
+  confirm on the deploy that restarts gbni-1. Separately open: why warming
+  takes 20 minutes. The false answer at 20:55:09Z was a survey that asked
+  no peer, fixed in 0.90.51.
 - **Repair deleted a copy it had nowhere to send** (fixed 0.90.50): a node
   hosting nothing and knowing no host had a target of zero owners, so
   repair dropped its local copy. fi-1 did not host 2026-09-15 to 09-24 and
@@ -274,7 +273,7 @@ From the local-first work
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.50**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.51**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -284,7 +283,7 @@ From the local-first work
   before 0.90.17 removed three keys, `macha.yaml.before-dead-keys`. Both set
   `catalogue.api.max_connections: 128`.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.50` back to
+  in place before that version was installed (`pre-0.90.51` back to
   `pre-0.89.0`, which also has the roster and sequence counter).
 - fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
   objects; their linked binaries are intact, the trees need a clean rebuild

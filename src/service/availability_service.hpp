@@ -164,6 +164,16 @@ class AvailabilityService {
     const NodeEvents& events_;
     MessageRoutes& routes_;
     const std::filesystem::path persisted_;
+    // The last roll-up, kept beside the survey: after a restart, peers are
+    // answered from it until the store's presence index has filled and a
+    // roll-up is made again. Dropped once this node loses anything.
+    const std::filesystem::path kept_path_;
+    struct Kept {
+        std::optional<HoldingsRollup> rollup;
+        // The DATA store's losses() when it was read back.
+        uint64_t losses{};
+    };
+    Published<Kept> kept_;
 
     // This node's holdings, and for a namespace kept inline in its snapshot
     // the tree built from it: every node derives the same tree from the same

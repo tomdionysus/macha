@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.52: a restarted node answers its peers at once
+
+No API or wire changes. One new file: `<state_path>/availability/holdings.bin`.
+
+A node answers peers' questions about what it holds from its holdings
+roll-up, and does not build one while its store's presence index fills:
+17 to 20 minutes after a restart on gbni-1's hard disk, 807,076 objects.
+Until then it refused every question ("holdings are not rolled up yet"), so
+fi-1's survey failed after each of gbni-1's restarts, and a read no node can
+serve took 6 to 16 s to be refused instead of 0.2 s. Each roll-up of a
+stored namespace tree is now kept on disk, about 50 bytes per tree node, and
+a restarted node answers from it until it rolls up again. It is dropped as
+soon as the node loses anything, the condition under which a roll-up in
+memory already stopped answering. A survey's failed peer is now logged with
+the peer's own reason.
+
 ## 0.90.51: a survey that could ask no host calls nothing unavailable
 
 No API, wire, protocol or on-disk changes.
