@@ -200,8 +200,6 @@ class LocalStore final : public ObjectStore {
     // Journals and installs what the ledger has queued; a failure is the
     // caller's write failing.
     void flush_ledger() const;
-    // The next objects/xx/yy directory verify_step() compares. Single owner.
-    uint32_t verify_prefix_{};
     void seed_ledger();
     std::atomic_uint64_t presence_index_entries_{};
     std::atomic_uint64_t pack_recovery_truncated_tails_{};
@@ -336,7 +334,8 @@ class LocalStore final : public ObjectStore {
     // ledger's ids under that prefix. A file the ledger does not list is
     // recorded held; a listed id with no file is recorded gone (a loss,
     // unless it is packed). Complete once a pass over all 65,536 has
-    // wrapped. A no-op until the ledger is seeded. Single owner.
+    // wrapped; a restart resumes where it stopped. A no-op until the ledger
+    // is seeded. Single owner.
     struct VerifyResult {
         size_t directories{};
         uint64_t recorded{};

@@ -793,4 +793,21 @@ MACHA_FAST_TEST("object_ledger", test_a_flush_does_not_wait_for_the_seed) {
     CHECK(ledger.size() == 2);
 }
 
+// A restarted store resumes its check where it stopped.
+MACHA_FAST_TEST("object_ledger", test_verification_resumes_after_a_restart) {
+    TempDir dir;
+    const auto root = dir.path() / "store";
+    const auto ledger = dir.path() / "ledger";
+    const auto key = key_of(17);
+    {
+        LocalStore store(root, ledgered(ledger), key);
+        REQUIRE(wait_until([&] { return std::filesystem::exists(ledger / "seeded"); }, 10s));
+        CHECK(store.verify_step(100).directories == 100);
+    }
+    LocalStore store(root, ledgered(ledger), key);
+    const auto rest = store.verify_step(65536);
+    CHECK(rest.complete);
+    CHECK(rest.directories == 65536 - 100);
+}
+
 } // namespace

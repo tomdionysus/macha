@@ -50,10 +50,15 @@ class HeldLedger {
     void drop_queued();
     ObjectTrie::Stats stats() const;
     uint64_t size() const;
+    // The objects/xx/yy directory the store's check against its disk
+    // resumes at, kept across restarts. Single owner (that check).
+    uint16_t verify_next() const noexcept { return verify_next_; }
+    void set_verify_next(uint16_t);
 
   private:
     const std::filesystem::path dir_;
     std::atomic_bool seeded_{};
+    uint16_t verify_next_{};
     // Held across a flush, so journal writes and installs keep the order the
     // changes were queued in.
     IoMutex flush_mutex_ MACHA_ACQUIRED_BEFORE(trie_mutex_);

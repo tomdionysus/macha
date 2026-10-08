@@ -1,5 +1,18 @@
 # Current release
 
+## 0.90.60: the ledger check resumes after a restart
+
+No API, wire or protocol changes. New on disk: `verify-next` in each held
+ledger's directory.
+
+The check of each held ledger against its disk kept its place in memory, so
+every restart began it again at the first directory; with deploys every hour
+or two, a pass of 4.5 hours or more never finished (gbni-1 had reached
+33,196 of 65,536 directories, fi-1 10,513, both with nothing to correct when
+0.90.59 restarted them). The next directory is now kept in the ledger's
+directory and a restart resumes there. Test: a store that checked 100
+directories and restarted finishes its pass in the other 65,436.
+
 ## 0.90.59: a first-start seed holds no write up
 
 No API, wire, protocol or on-disk changes.
