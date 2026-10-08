@@ -1886,6 +1886,77 @@ std::optional<ObjectId> object_id_from_file_name(std::string_view name) {
 }
 } // namespace
 
+LocalStore::VerifyResult LocalStore::verify_step(size_t directories) {
+    VerifyResult result;
+    if (!ledger_ || !ledger_->seeded()) {
+        result.complete = true;
+        return result;
+    }
+    std::vector<ObjectId> missing;
+    while (result.directories < directories && !result.complete) {
+        const auto prefix = static_cast<uint16_t>(verify_prefix_);
+        verify_prefix_ = (verify_prefix_ + 1) & 0xffff;
+        result.complete = verify_prefix_ == 0;
+        ++result.directories;
+        ObjectId sample;
+        sample.bytes[0] = static_cast<uint8_t>(prefix >> 8);
+        sample.bytes[1] = static_cast<uint8_t>(prefix & 0xff);
+        const auto directory = path(sample).parent_path();
+        std::vector<ObjectId> files;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end;
+             it.increment(error))
+            if (auto id = object_id_from_file_name(it->path().filename().string()))
+                files.push_back(*id);
+        // A listing that failed part way proves nothing; an absent
+        // directory holds nothing.
+        if (error && error != std::errc::no_such_file_or_directory)
+            continue;
+        std::sort(files.begin(), files.end());
+        const auto listed = ledger_->held_with_prefix(prefix);
+        std::vector<ObjectId> unlisted;
+        std::set_difference(files.begin(), files.end(), listed.begin(), listed.end(),
+                            std::back_inserter(unlisted));
+        std::set_difference(listed.begin(), listed.end(), files.begin(), files.end(),
+                            std::back_inserter(missing));
+        for (const auto& id : unlisted) {
+            // As the scan does: under the object's lock, and only if the
+            // file is still there and not empty.
+            ObjectLock object_guard(object_mutex(id));
+            std::error_code size_error;
+            const auto size = std::filesystem::file_size(path(id), size_error);
+            if (size_error || size == 0)
+                continue;
+            Lock lock(m_);
+            ledger_->record(id, true);
+            ++result.recorded;
+        }
+    }
+    // Every change already made is installed, so a removal that raced the
+    // listing reads as not held below.
+    flush_ledger();
+    for (const auto& id : missing) {
+        ObjectLock object_guard(object_mutex(id));
+        if (!ledger_->held(id).value_or(false))
+            continue;
+        std::error_code exists_error;
+        if (std::filesystem::exists(path(id), exists_error) || exists_error)
+            continue;
+        Lock lock(m_);
+        ledger_->record(id, false);
+        if (!packed_.contains(id)) {
+            ++result.lost;
+            losses_.fetch_add(1, std::memory_order_release);
+        }
+    }
+    flush_ledger();
+    if (result.recorded || result.lost)
+        Log::warn("storage held ledger corrected path=" + root_.string() +
+                  " recorded=" + std::to_string(result.recorded) +
+                  " lost=" + std::to_string(result.lost));
+    return result;
+}
+
 void LocalStore::warm_presence_index(std::stop_token stop) {
     // Until a walk completes, has() asks the device on a miss; a failed walk
     // is retried, backing off to five minutes, so that stays temporary.

@@ -1,5 +1,23 @@
 # Current release
 
+## 0.90.57: the held ledger checked against the disk
+
+No API, wire, protocol or on-disk changes.
+
+Once seeded, a store's held ledger is its whole answer to "do I hold this",
+and repair trusts that answer. Until now nothing noticed a file that went
+missing behind the store's back (a disk fault, a repaired filesystem): the
+ledger kept saying held, so repair never put it back. Maintenance now checks
+every store's ledger against its disk, one `objects/xx/yy` directory at a
+time, compared both ways with the ledger's ids under that prefix: a file the
+ledger does not list is recorded held, and a listed object with no file is
+recorded gone and counted a loss (a packed one is just recorded). It paces:
+one directory a pass while viewers or loaders are active, sixteen otherwise,
+and a pass a day. Corrections are logged as `storage held ledger corrected`
+and counted as `ledger.verify.recorded` and `ledger.verify.lost`. Test: a
+seeded store with one file deleted and one written behind its back is
+corrected in one pass, and a second pass finds nothing.
+
 ## 0.90.56: a start replays little of the claims journal
 
 No API, wire, protocol or on-disk changes.

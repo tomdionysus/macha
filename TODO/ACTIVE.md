@@ -14,26 +14,18 @@ since.
 
 ## 1. The on-disk object ledger
 
-Design: [`2026-10-08-on-disk-object-ledger.md`](2026-10-08-on-disk-object-ledger.md).
-`held` lives in a per-class, disk-resident radix-256 trie with a journal
-and copy-on-write checkpoints on the state SSD and a configurable page
-cache (64 MiB default), so a restarted node knows what it holds in seconds
-instead of walking its DATA disk for 20 minutes; then claims, `referenced`
-and `unreferenced_since` move in; then the diff RPC drives repair. Built
-in-tree, generalised from the retention store's journal and checkpoint (one
-mechanism, not two). The operator answered the spec's five questions on
-2026-10-08; they are in the design. Stage 1 is 0.90.53: the shared
-`SealedJournal` (the retention store moved onto it unchanged) and
-`ObjectTrie`, tested and measured (laptop, 224,000 records: open with a
-near-full journal 437 ms, cold lookup 10 us); fi-1's figure at a few million
-records is still to take. Stage 2 is 0.90.54, confirmed on the cluster (COMPLETED): each store's
-ledger seeded on the first start (gbni-1 840,507 objects in 2.8 s), and a
-gbni-1 restart walked nothing; fi-1's surveys failed once while gbni-1's
-service started and were whole from a minute after. Then stage 3, claims
-in the ledger. Still to do
-in stage 2: the slow background verification pass, and a bulk seed that
-does not hold flushes off while it builds (today a put waits for the seed
-on the first start).
+Design and stage status: [`2026-10-08-on-disk-object-ledger.md`](2026-10-08-on-disk-object-ledger.md).
+Shipped and confirmed on the cluster (COMPLETED): stage 1 (the trie and
+`SealedJournal`, 0.90.53), stage 2 (`held`, 0.90.54), stage 3 (claims in
+per-class tries, 0.90.55 and 0.90.56). 0.90.57 adds stage 2's verification
+pass (maintenance checks each held ledger against its disk, a pass a day).
+Still to do:
+- Stage 2: a first-start seed that does not hold flushes off while it builds
+  (a put waits for the seed; only a new or returning node seeds).
+- Stage 3: resident memory against 0.90.54, which was not measured like for
+  like.
+- Stage 4: `referenced` and `unreferenced_since` as columns.
+- Stages 5 and 6: the diff RPC, then retiring the fallbacks.
 
 ## 2. Control must never wait: what is left
 

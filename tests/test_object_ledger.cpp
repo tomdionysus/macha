@@ -697,4 +697,59 @@ MACHA_FAST_TEST("object_ledger", test_a_store_with_its_ledger_starts_knowing_wha
         CHECK(again.has(id));
 }
 
+// The verification pass corrects the ledger both ways: a file it does not list
+// is recorded held, and a listed object whose file is gone is recorded lost.
+MACHA_FAST_TEST("object_ledger", test_verification_corrects_the_ledger_from_the_disk) {
+    TempDir dir;
+    const auto root = dir.path() / "store";
+    const auto ledger = dir.path() / "ledger";
+    const auto key = key_of(15);
+    std::vector<ObjectId> held;
+    {
+        LocalStore store(root, ledgered(ledger), key);
+        REQUIRE(wait_until([&] { return std::filesystem::exists(ledger / "seeded"); }, 10s));
+        for (int i = 0; i < 30; ++i) {
+            const auto data = pattern(4096 + i, static_cast<uint8_t>(i));
+            held.push_back(object_id(data));
+            REQUIRE(store.put(held.back(), data));
+        }
+    }
+    const auto unlisted_data = pattern(5555, 77);
+    const auto unlisted = object_id(unlisted_data);
+    {
+        LocalStore bare(root, 64ULL * 1024 * 1024, key);
+        REQUIRE(bare.put(unlisted, unlisted_data));
+    }
+    LocalStore store(root, ledgered(ledger), key);
+    const auto gone = held.front();
+    REQUIRE(std::filesystem::remove(store.object_path(gone)));
+    CHECK(store.has(gone));
+    CHECK(!store.has(unlisted));
+    const auto losses = store.losses();
+
+    // Slice by slice until a pass completes.
+    LocalStore::VerifyResult total;
+    size_t steps = 0;
+    while (!total.complete) {
+        const auto step = store.verify_step(4096);
+        total.recorded += step.recorded;
+        total.lost += step.lost;
+        total.complete = step.complete;
+        REQUIRE(++steps <= 16);
+    }
+    CHECK(steps == 16);
+    CHECK(total.recorded == 1);
+    CHECK(total.lost == 1);
+    CHECK(store.has(unlisted));
+    CHECK(!store.has(gone));
+    CHECK(store.losses() == losses + 1);
+    for (size_t i = 1; i < held.size(); ++i)
+        CHECK(store.has(held[i]));
+    // Nothing left to correct.
+    const auto again = store.verify_step(65536);
+    CHECK(again.complete);
+    CHECK(again.recorded == 0);
+    CHECK(again.lost == 0);
+}
+
 } // namespace

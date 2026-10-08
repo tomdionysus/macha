@@ -170,6 +170,10 @@ class StoragePool final : public ObjectStore {
     // LocalStore per call, bounding temporary disk use.
     size_t compact_packs(std::stop_token = {});
 
+    // LocalStore::verify_step() on every online backend, summed; complete
+    // once every backend's pass is.
+    LocalStore::VerifyResult verify_step(size_t directories);
+
     uint64_t used() const;
     uint64_t limit() const;
     size_t online_backends() const;
