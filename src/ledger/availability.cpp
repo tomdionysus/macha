@@ -62,6 +62,57 @@ HoldingsRollup HoldingsRollup::build(const ObjectId& root, const NamespaceNodeSt
     return rollup;
 }
 
+namespace {
+constexpr uint32_t rollup_schema = 1;
+} // namespace
+
+const HoldingsRollup* answering_rollup(const HoldingsRollup* current, uint64_t current_losses,
+                                       const HoldingsRollup* kept, uint64_t kept_losses,
+                                       uint64_t losses) noexcept {
+    if (current)
+        return losses == current_losses ? current : nullptr;
+    if (kept && losses == kept_losses)
+        return kept;
+    return nullptr;
+}
+
+Bytes HoldingsRollup::encode() const {
+    Writer out;
+    out.u32(rollup_schema);
+    out.fixed(root_.bytes);
+    out.u64(nodes_.size());
+    for (const auto& [id, holding] : nodes_) {
+        out.fixed(id.bytes);
+        out.u64(holding.extents);
+        out.u64(holding.held);
+    }
+    return out.take();
+}
+
+HoldingsRollup HoldingsRollup::decode(std::span<const uint8_t> bytes) {
+    Reader in(bytes);
+    if (in.u32() != rollup_schema)
+        throw DecodeError("unknown holdings schema");
+    HoldingsRollup rollup;
+    rollup.root_.bytes = in.fixed<32>();
+    const auto count = in.u64();
+    for (uint64_t i = 0; i < count; ++i) {
+        ObjectId id;
+        id.bytes = in.fixed<32>();
+        Holding holding;
+        holding.extents = in.u64();
+        holding.held = in.u64();
+        if (holding.held > holding.extents)
+            throw DecodeError("holdings exceed the extents");
+        if (!rollup.nodes_.emplace(id, holding).second)
+            throw DecodeError("holdings node repeated");
+    }
+    in.finish();
+    if (!rollup.nodes_.contains(rollup.root_))
+        throw DecodeError("holdings lack their root");
+    return rollup;
+}
+
 std::optional<Holding> HoldingsRollup::find(const ObjectId& node) const {
     const auto found = nodes_.find(node);
     if (found == nodes_.end())

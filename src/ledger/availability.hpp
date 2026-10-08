@@ -56,11 +56,25 @@ class HoldingsRollup {
     std::optional<Holding> find(const ObjectId& node) const;
     size_t nodes() const noexcept { return nodes_.size(); }
 
+    // The roll-up as bytes, kept so a restarted node can answer from it
+    // while its store's presence index fills; decode refuses anything it
+    // cannot read whole.
+    Bytes encode() const;
+    static HoldingsRollup decode(std::span<const uint8_t>);
+
   private:
     ObjectId root_{};
     std::map<ObjectId, Holding> nodes_;
     size_t carries_{};
 };
+
+// The roll-up a node answers peers from: the current one, while nothing has
+// been lost since it was made; else, before any since a restart, the one
+// kept from before it, while nothing has been lost since it was read back.
+// None: the node cannot answer yet.
+const HoldingsRollup* answering_rollup(const HoldingsRollup* current, uint64_t current_losses,
+                                       const HoldingsRollup* kept, uint64_t kept_losses,
+                                       uint64_t losses) noexcept;
 
 // A node's answer about one tree node. `known`: the node is in its tree, and
 // `holding` is its count. `children`, when not empty, has one flag per direct
