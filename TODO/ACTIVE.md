@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-08, on `develop`. Both nodes run 0.90.52.
+Last updated: 2026-10-08, on `develop`. Both nodes run 0.90.53.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -228,7 +228,7 @@ batched profile publication; holdings for catalogue DATA; measure again.
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.52**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.53**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -239,7 +239,7 @@ batched profile publication; holdings for catalogue DATA; measure again.
   sets `hosts_extents: true` and `inbound_capable: false`; gbni-1 resolves
   both automatically (true).
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.52` back to
+  in place before that version was installed (`pre-0.90.53` back to
   `pre-0.89.0`).
 - gbni-1's DATA presence index takes about 20 minutes to warm after a
   restart (1,180 s, 807,076 objects).
