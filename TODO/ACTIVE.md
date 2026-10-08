@@ -17,7 +17,7 @@ since.
 Design and stage status: [`2026-10-08-on-disk-object-ledger.md`](2026-10-08-on-disk-object-ledger.md).
 Shipped and confirmed on the cluster (COMPLETED): stage 1 (the trie and
 `SealedJournal`, 0.90.53), stage 2 (`held`, 0.90.54), stage 3 (claims in
-per-class tries, 0.90.55 and 0.90.56). 0.90.57 adds stage 2's verification
+per-class tries, 0.90.55 and 0.90.56). 0.90.57 and 0.90.58 add stage 2's verification
 pass (maintenance checks each held ledger against its disk, a pass a day).
 Still to do:
 - Stage 2: a first-start seed that does not hold flushes off while it builds
