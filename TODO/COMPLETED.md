@@ -2,6 +2,20 @@
 
 Last updated: 2026-10-08
 
+## 2026-10-08 -- 0.90.55 and 0.90.56: the object ledger, stage 3
+
+- **Retention claims in the ledger** (0.90.55): one `ObjectTrie` a class
+  under `retention/ledger-{data,control}`, `claims.log` their journal,
+  prunes journaled, trie values byte strings (format-1 held ledgers
+  rewritten at open, not reseeded). Migrated at the first start: gbni-1
+  651,024 DATA and 159,897 control records, fi-1 42,441 and 96,048.
+- **A start replays little of the log** (0.90.56): checkpoint at 4 MiB of
+  log and after a start's replay. 0.90.55 had replayed gbni-1's 8.8 MB log
+  on every start (7 s from cache scan to metadata ready, against 2 s on
+  0.90.54); on 0.90.56 the first start replayed it once and removed the
+  shard files, and the next start took under 1 s for that span.
+  Not measured: resident memory against 0.90.54.
+
 ## 2026-10-08 -- 0.90.53 and 0.90.54: the object ledger, stages 1 and 2
 
 - **The trie and its journal** (0.90.53): `SealedJournal`, the one
