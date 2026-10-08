@@ -1025,6 +1025,84 @@ MACHA_FAST_TEST("availability", test_a_file_the_survey_cannot_decide_takes_its_l
 
 // Two real nodes: the pass rolls up and surveys, a peer answers over RPC, and
 // the path table says what a reader would be told.
+MACHA_TEST("availability", test_a_survey_that_could_ask_no_host_calls_nothing_unavailable) {
+    // The second node alone holds a file. With the second out of reach, the
+    // first knows it exists but can ask it nothing: what the first lacks is
+    // not thereby held by nobody.
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto first_port = free_port();
+    const auto second_port = free_port();
+    auto first_config =
+        cluster.node_config("blind-first", first_port, {{"127.0.0.1", second_port}});
+    auto second_config =
+        cluster.node_config("blind-second", second_port, {{"127.0.0.1", first_port}});
+    for (auto* config : {&first_config, &second_config}) {
+        config->replication = 2;
+        config->write_copies = 2;
+        config->catalogue.scanner.enabled = false;
+        config->ingest.enabled = false;
+        config->torrent.enabled = false;
+    }
+    Service first(first_config, cluster.keys(), test_durability_window);
+    Service second(second_config, cluster.keys(), test_durability_window);
+    first.start();
+    second.start();
+    (void)first.filesystem();
+    (void)second.filesystem();
+    REQUIRE(wait_until(
+        [&] {
+            return first.node().membership().active().size() == 2 &&
+                   second.node().membership().active().size() == 2;
+        },
+        10s));
+
+    const auto extent = first_config.extent_size;
+    REQUIRE(retry_while_not_ready(
+        [&] { write_file(first.filesystem(), "/kept.bin", pattern(extent * 2, 1)); }));
+    const auto ids = [&] {
+        std::vector<ObjectId> out;
+        for (const auto& item : first.filesystem().getattr("/kept.bin").extents)
+            out.push_back(item.id);
+        return out;
+    }();
+    REQUIRE(wait_until(
+        [&] {
+            return std::all_of(ids.begin(), ids.end(), [&](const ObjectId& id) {
+                return second.local_state().data().has(id);
+            });
+        },
+        20s));
+    // Both surveyed the file whole; then the second goes out of reach, and
+    // only afterwards does the first lose its own copy, so it cannot fetch it
+    // back: only the absent second holds it.
+    REQUIRE(wait_until(
+        [&] {
+            const auto snapshot = first.availability().snapshot();
+            return snapshot && snapshot->paths.contains("/kept.bin") &&
+                   snapshot->survey.peers_asked == 1 && snapshot->survey.unavailable.empty();
+        },
+        20s));
+    second.stop();
+    REQUIRE(wait_until([&] { return first.node().membership().active().size() == 1; }, 20s));
+    for (const auto& id : ids)
+        REQUIRE(first.local_state().data().remove(id));
+    REQUIRE(retry_while_not_ready(
+        [&] { write_file(first.filesystem(), "/after.bin", pattern(extent, 3)); }));
+    // However long the first keeps trying, the second's file is never called
+    // held by no node.
+    const auto deadline = Clock::now() + 15s;
+    bool called_unavailable = false;
+    while (Clock::now() < deadline && !called_unavailable) {
+        const auto snapshot = first.availability().snapshot();
+        for (const auto& id : ids)
+            called_unavailable =
+                called_unavailable || (snapshot && snapshot->survey.is_unavailable(id));
+        std::this_thread::sleep_for(100ms);
+    }
+    CHECK(!called_unavailable);
+    first.stop();
+}
+
 MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto first_port = free_port();
