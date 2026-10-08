@@ -69,16 +69,30 @@ persistent, exact and fast from the first second, for every consumer.
   `held`), availability (`held`, `held_losses`, `held_indexed`), catalogue
   control GC (`retained`), `predicate_query` (tests only).
 
-## Requirement: a restart is milliseconds
+## Requirements: a restart in seconds, memory bounded by the cache
 
-The ledger is a persisted database. A 20-minute start (gbni-1 today) is
-unacceptable, and so is any start whose cost grows with the library. A
-restart opens the last checkpoint's root page and replays the journal
-written since it, and is then ready: target under 100 ms on a Pi, measured
-in stage 1 as an exit criterion. The journal is checkpointed often enough
-to hold that bound (a few MB of journal, not the retention store's 64 MiB).
-No start ever walks the DATA disk. Pages come from the state SSD into the
-cache as lookups touch them; a cold lookup is one or two SSD page reads.
+**Restart.** The ledger is a persisted database. A 20-minute start (gbni-1
+today) is unacceptable, and so is any start whose cost grows with the
+library. A restart opens the last checkpoint's root page and replays the
+journal written since it, and is then ready. The bound is 30 s on a Pi
+(operator, 2026-10-08); the expectation is far under it (milliseconds to
+open, the replay set by how much journal a checkpoint allows), measured in
+stage 1 as an exit criterion. No start ever walks the DATA disk. Pages
+come from the state SSD into the cache as lookups touch them; a cold lookup
+is one or two SSD page reads.
+
+**Memory.** The ledger's resident memory is its page cache
+(`storage.ledger_cache`, 64 MiB default) and fixed buffers, whatever the
+number of extents. It removes, stage by stage, the structures that grow with
+the library today: the presence index (about 40 B a loose object) and the
+pack index (stage 2), the retention store's claim maps (stage 3), the
+census's extent vectors and the unreferenced-since map (stage 4). Bounded
+by this work, not by the ledger: the availability survey's unavailable and
+unknown lists grow with what is missing; the holdings roll-up grows with
+tree nodes (about 8,000), not extents; the metadata snapshot cache has its
+own 128 MB budget; the catalogue grows with items (about 15 MB). Each
+stage's exit includes resident memory measured against a synthetic library
+ten times today's.
 
 ## The design
 
@@ -154,8 +168,8 @@ Each ships alone, with the suite green on the laptop and fi-1.
    background verification. Migration: first start under it runs the walk
    once to seed, in the background: until the seed completes the node
    answers `held` as it does today, and nothing waits on it. Exit: a
-   restart of gbni-1 is ready in milliseconds with `held_indexed` true at
-   once; verification finds nothing to correct.
+   restart of gbni-1 is ready within the 30 s bound with `held_indexed`
+   true at once; verification finds nothing to correct.
 3. **Claims in the ledger.** The retention store's maps and checkpoints
    migrate into the `claimed` column; `prune_unclaimed` is journaled. The
    old files are kept until the first ledger checkpoint (downgrade safe).
