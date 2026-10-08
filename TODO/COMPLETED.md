@@ -2,6 +2,21 @@
 
 Last updated: 2026-10-08
 
+## 2026-10-08 -- 0.90.53 and 0.90.54: the object ledger, stages 1 and 2
+
+- **The trie and its journal** (0.90.53): `SealedJournal`, the one
+  crash-safe journal the retention store (moved onto it unchanged; both
+  nodes' real journals replayed cleanly) and the ledger share, and
+  `ObjectTrie`. Measured on fi-1 with 2,024,000 records: open with a
+  near-full journal 262 ms, cold lookup 7 us, cache 33 MB, 86 MB on disk.
+- **A restarted store knows what it holds** (0.90.54): each store's held
+  ledger, seeded from the first start's walk (gbni-1 840,507 objects in
+  2.8 s, fi-1 235,400 in 0.4 s), then read at every start. A gbni-1
+  restart at 14:08:07Z walked nothing; fi-1's survey failed once while
+  gbni-1's service started (14:08:11) and was whole from 14:09:15. Before:
+  17 to 20 minutes of failed surveys after each restart (0.90.51), nine of
+  partial answers with the kept roll-up (0.90.52).
+
 ## 2026-10-07/08 -- 0.90.44 to 0.90.52
 
 - **Control's commits timed in the observation windows** (0.90.44):

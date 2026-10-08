@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-08, on `develop`. Both nodes run 0.90.53.
+Last updated: 2026-10-08, on `develop`. Both nodes run 0.90.54.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -11,17 +11,6 @@ handovers; a record, not requirements). This file was rationalised on
 `archive/2026-10-08-ACTIVE-before-rationalisation.md`. Items marked
 *carried* come from earlier rationalisations and have not been re-checked
 since.
-
-## 0. 0.90.52 across a gbni-1 restart: better, not whole
-
-Restarted gbni-1 at 12:41:18Z on 2026-10-08 with `holdings.bin` kept. fi-1's
-surveys: refused for about 30 s while gbni-1 started ("tree_holdings is not
-available on this node"); then answered from the kept roll-up, but each
-question about a subtree gbni-1 does not hold whole asks `held()` per extent,
-a hard-disk lookup while the presence index warms, so questions hit the 30 s
-RPC limit until 12:50 (unknown 781,051, then 518,508, 243,655, 158,551); whole
-from 12:51 once the index warmed (525 s). Twenty blind minutes became nine
-partial ones. The rest is `held()` from the ledger (section 1, stage 2).
 
 ## 1. The on-disk object ledger
 
@@ -37,12 +26,11 @@ mechanism, not two). The operator answered the spec's five questions on
 `SealedJournal` (the retention store moved onto it unchanged) and
 `ObjectTrie`, tested and measured (laptop, 224,000 records: open with a
 near-full journal 437 ms, cold lookup 10 us); fi-1's figure at a few million
-records is still to take. Stage 2 is 0.90.54: every store keeps a held ledger under
-`<state_path>/ledger/`, seeded once from the first start's walk, then read at
-every start (indexed at once, no walk) and answering `has()`. To confirm on
-the cluster: the seed on the first 0.90.54 start (a log line "storage held
-ledger seeded"), then a gbni-1 restart that is indexed at once and whose
-peers' surveys never fail. Then stage 3, claims in the ledger. Still to do
+records is still to take. Stage 2 is 0.90.54, confirmed on the cluster (COMPLETED): each store's
+ledger seeded on the first start (gbni-1 840,507 objects in 2.8 s), and a
+gbni-1 restart walked nothing; fi-1's surveys failed once while gbni-1's
+service started and were whole from a minute after. Then stage 3, claims
+in the ledger. Still to do
 in stage 2: the slow background verification pass, and a bulk seed that
 does not hold flushes off while it builds (today a put waits for the seed
 on the first start).
@@ -233,7 +221,7 @@ batched profile publication; holdings for catalogue DATA; measure again.
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.53**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.54**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
@@ -244,10 +232,11 @@ batched profile publication; holdings for catalogue DATA; measure again.
   sets `hosts_extents: true` and `inbound_capable: false`; gbni-1 resolves
   both automatically (true).
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.53` back to
+  in place before that version was installed (`pre-0.90.54` back to
   `pre-0.89.0`).
-- gbni-1's DATA presence index takes about 20 minutes to warm after a
-  restart (1,180 s, 807,076 objects).
+- Each store keeps its held ledger under `/etc/macha/state/ledger/` (since
+  0.90.54); a restart reads it and walks nothing. Before, gbni-1's walk took
+  up to 20 minutes.
 - gbni-1 also runs Plex Media Server, which reads `/mnt/diskA` (the exFAT
   ingest source, bound at `/media/Movies` and `/media/TV`); Macha never
   touches that disk except to ingest from it.
