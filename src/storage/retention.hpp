@@ -56,6 +56,7 @@ class RetentionStore final : public ClaimStore {
         MACHA_REQUIRES(mutex_);
     size_t apply_prune_locked(RetentionClass, std::vector<ObjectId>) MACHA_REQUIRES(mutex_);
     void checkpoint_locked() MACHA_REQUIRES(mutex_);
+    void checkpoint_if_due_locked() MACHA_REQUIRES(mutex_);
     // Visits records from after `cursor`, wrapping to the first once, until
     // `visit` returns false, `limit` are visited or it is back where it began.
     void scan_locked(const ClassLedger&, std::optional<ObjectId>& cursor, size_t limit,
@@ -66,7 +67,7 @@ class RetentionStore final : public ClaimStore {
     void load(size_t cache_bytes);
 
   public:
-    // `cache_bytes` is shared by the two tries, mostly to the data one.
+    // `cache_bytes` is shared by the two tries, three quarters to the data one.
     RetentionStore(std::filesystem::path state_path, std::array<uint8_t, 32> key,
                    size_t cache_bytes = 8ULL * 1024 * 1024);
 

@@ -28,8 +28,10 @@ constexpr uint64_t journal_compact_bytes = 64ULL * 1024ULL * 1024ULL;
 constexpr size_t retain_ids_per_frame = 65536;
 constexpr uint64_t max_checkpoint_shard_bytes = 64ULL * 1024ULL * 1024ULL;
 constexpr size_t checkpoint_shards = 256;
-// The tries hold this many changed objects unsaved before a checkpoint.
+// A checkpoint is due once the tries hold this many changed objects unsaved,
+// or the journal this many bytes: what a start replays stays small.
 constexpr uint64_t checkpoint_changed = 8192;
+constexpr uint64_t checkpoint_journal_bytes = 4ULL * 1024 * 1024;
 constexpr size_t scan_page = 256;
 
 bool valid_class(uint8_t value) {
@@ -343,6 +345,11 @@ void RetentionStore::checkpoint_locked() {
     remove_checkpoint_files(root_);
 }
 
+void RetentionStore::checkpoint_if_due_locked() {
+    if (changed_ >= checkpoint_changed || journal_.bytes() >= checkpoint_journal_bytes)
+        checkpoint_locked();
+}
+
 void RetentionStore::scan_locked(
     const ClassLedger& ledger, std::optional<ObjectId>& cursor, size_t limit,
     const std::function<bool(const ObjectId&, std::span<const uint8_t>)>& visit) const {
@@ -442,14 +449,15 @@ void RetentionStore::load_journal_locked() {
 void RetentionStore::load(size_t cache_bytes) {
     Lock lock(mutex_);
     ObjectTrie::Options data_options;
-    data_options.cache_bytes = cache_bytes - cache_bytes / 8;
+    data_options.cache_bytes = cache_bytes - cache_bytes / 4;
     ObjectTrie::Options control_options;
-    control_options.cache_bytes = cache_bytes / 8;
+    control_options.cache_bytes = cache_bytes / 4;
     data_.trie = std::make_unique<ObjectTrie>(root_ / "ledger-data", key_, data_options);
     control_.trie = std::make_unique<ObjectTrie>(root_ / "ledger-control", key_, control_options);
     if (!std::filesystem::exists(root_ / "ledger"))
         migrate_locked();
     load_journal_locked();
+    checkpoint_if_due_locked();
 }
 
 void RetentionStore::retain(RetentionClass type, const ObjectId& id, const RetentionDot& dot) {
@@ -479,8 +487,7 @@ void RetentionStore::retain_batch(RetentionClass type, const std::vector<ObjectI
         apply_add_locked(type, dot,
                          std::vector<ObjectId>(ids.begin() + static_cast<std::ptrdiff_t>(begin),
                                                ids.begin() + static_cast<std::ptrdiff_t>(end)));
-        if (changed_ >= checkpoint_changed)
-            checkpoint_locked();
+        checkpoint_if_due_locked();
     }
 }
 
@@ -580,8 +587,7 @@ size_t RetentionStore::release_unreferenced(RetentionClass type,
         writer.fixed(id.bytes);
     journal_.append(writer.data());
     const auto released = apply_release_locked(type, encoded_clock, std::move(candidates));
-    if (changed_ >= checkpoint_changed)
-        checkpoint_locked();
+    checkpoint_if_due_locked();
     return released;
 }
 
@@ -636,8 +642,7 @@ size_t RetentionStore::prune_unclaimed(
     const auto removed = apply_prune_locked(type, std::move(unclaimed));
     if (class_for(type).trie->size() == 0)
         class_for(type).prune_after.reset();
-    if (changed_ >= checkpoint_changed)
-        checkpoint_locked();
+    checkpoint_if_due_locked();
     return removed;
 }
 

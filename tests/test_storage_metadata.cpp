@@ -260,6 +260,50 @@ MACHA_FAST_TEST("storage_metadata", test_retention_checkpoints_after_enough_chan
     CHECK(retention.claim_objects(RetentionClass::data) == objects.size());
 }
 
+// A start that replays a long journal checkpoints it, so the next start does
+// not replay it again.
+MACHA_FAST_TEST("storage_metadata", test_retention_start_checkpoints_a_long_journal) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto state = t.path() / "state";
+    const auto root = state / "retention";
+    const auto origin = random_node_id();
+    std::vector<ObjectId> objects(60000);
+    for (size_t i = 0; i < objects.size(); ++i) {
+        objects[i].bytes[0] = static_cast<uint8_t>(i);
+        objects[i].bytes[1] = static_cast<uint8_t>(i >> 8);
+        objects[i].bytes[2] = static_cast<uint8_t>(i >> 16);
+    }
+    std::sort(objects.begin(), objects.end());
+    { RetentionStore created(state, keys.storage); }
+    {
+        // As a crash leaves it: frames journaled, no checkpoint.
+        constexpr std::array<uint8_t, 8> journal_aad{'M', 'A', 'C', 'H', 'R', 'T', 'J', '1'};
+        SealedJournal journal(root / "claims.log", keys.storage, journal_aad, 4U << 20);
+        for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+            Writer frame;
+            frame.u8(1);
+            frame.u8(static_cast<uint8_t>(RetentionClass::data));
+            frame.fixed(origin.bytes);
+            frame.u64(sequence);
+            frame.u32(static_cast<uint32_t>(objects.size()));
+            for (const auto& id : objects)
+                frame.fixed(id.bytes);
+            journal.append(frame.data());
+        }
+    }
+    REQUIRE(std::filesystem::file_size(root / "claims.log") > 4ULL * 1024 * 1024);
+    {
+        RetentionStore reopened(state, keys.storage);
+        CHECK(std::filesystem::file_size(root / "claims.log") == 0);
+        CHECK(reopened.claims(RetentionClass::data, objects[7]).adds.at(origin) == 3);
+    }
+    RetentionStore again(state, keys.storage);
+    CHECK(again.claim_objects(RetentionClass::data) == objects.size());
+}
+
 // A prune is journaled: the erased row stays erased across a restart with no
 // checkpoint between, so an old dot is no longer suppressed.
 MACHA_FAST_TEST("storage_metadata", test_retention_prune_survives_a_restart) {
