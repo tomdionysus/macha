@@ -33,33 +33,6 @@ constexpr size_t retain_ids_per_frame = 65536;
 constexpr uint64_t max_checkpoint_shard_bytes = 64ULL * 1024ULL * 1024ULL;
 constexpr size_t checkpoint_shards = 256;
 
-void write_all(int fd, std::span<const uint8_t> bytes) {
-    size_t done = 0;
-    while (done < bytes.size()) {
-        const auto n = ::write(fd, bytes.data() + done, bytes.size() - done);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            throw std::runtime_error(std::string("retention journal write failed: ") +
-                                     std::strerror(errno));
-        done += static_cast<size_t>(n);
-    }
-}
-
-bool pread_all(int fd, std::span<uint8_t> bytes, uint64_t offset) {
-    size_t done = 0;
-    while (done < bytes.size()) {
-        const auto n = ::pread(fd, bytes.data() + done, bytes.size() - done,
-                               static_cast<off_t>(offset + done));
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            return false;
-        done += static_cast<size_t>(n);
-    }
-    return true;
-}
-
 void fsync_checked(int fd) {
     int rc;
     do { rc = ::fsync(fd); } while (rc != 0 && errno == EINTR);
@@ -81,18 +54,6 @@ void sync_directory(const std::filesystem::path& path) {
         ::close(fd);
         throw;
     }
-}
-
-uint32_t read_be32(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24U) |
-           (static_cast<uint32_t>(p[1]) << 16U) |
-           (static_cast<uint32_t>(p[2]) << 8U) |
-           static_cast<uint32_t>(p[3]);
-}
-
-std::array<uint8_t, 4> be32(uint32_t value) {
-    return {static_cast<uint8_t>(value >> 24U), static_cast<uint8_t>(value >> 16U),
-            static_cast<uint8_t>(value >> 8U), static_cast<uint8_t>(value)};
 }
 
 bool valid_class(uint8_t value) {
@@ -132,9 +93,9 @@ std::string read_small_text(const std::filesystem::path& path, size_t limit) {
 RetentionStore::RetentionStore(std::filesystem::path state_path, std::array<uint8_t, 32> key)
     : legacy_checkpoint_path_(state_path / "retention" / "claims.meta"),
       checkpoint_root_(state_path / "retention" / "checkpoints"),
-      checkpoint_manifest_path_(state_path / "retention" / "claims.current"),
-      journal_path_(std::move(state_path) / "retention" / "claims.log"), key_(key) {
-    std::filesystem::create_directories(journal_path_.parent_path());
+      checkpoint_manifest_path_(state_path / "retention" / "claims.current"), key_(key),
+      journal_(state_path / "retention" / "claims.log", key, journal_aad, max_journal_frame) {
+    std::filesystem::create_directories(state_path / "retention");
     std::filesystem::create_directories(checkpoint_root_);
     load();
 }
@@ -200,33 +161,7 @@ size_t RetentionStore::apply_release_locked(RetentionClass type, const Retention
 }
 
 void RetentionStore::append_frame_locked(std::span<const uint8_t> plaintext) {
-    const auto sealed = aes_gcm_seal(key_, plaintext, journal_aad);
-    if (sealed.ciphertext.size() > max_journal_frame)
-        throw std::runtime_error("retention journal frame too large");
-    const auto length = be32(static_cast<uint32_t>(sealed.ciphertext.size()));
-    std::vector<uint8_t> frame;
-    frame.reserve(4 + sealed.nonce.size() + sealed.tag.size() + sealed.ciphertext.size());
-    frame.insert(frame.end(), length.begin(), length.end());
-    frame.insert(frame.end(), sealed.nonce.begin(), sealed.nonce.end());
-    frame.insert(frame.end(), sealed.tag.begin(), sealed.tag.end());
-    frame.insert(frame.end(), sealed.ciphertext.begin(), sealed.ciphertext.end());
-
-    const int fd = ::open(journal_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
-    if (fd < 0)
-        throw std::runtime_error("cannot open retention journal " + journal_path_.string() +
-                                 ": " + std::strerror(errno));
-    try {
-        write_all(fd, frame);
-        fsync_checked(fd);
-        if (::close(fd) != 0)
-            throw std::runtime_error("cannot close retention journal: " +
-                                     std::string(std::strerror(errno)));
-    } catch (...) {
-        ::close(fd);
-        throw;
-    }
-    ++journal_records_;
-    journal_bytes_ += frame.size();
+    journal_.append(plaintext);
 }
 
 Bytes RetentionStore::encode_checkpoint_shard_locked(uint8_t shard) const {
@@ -463,40 +398,8 @@ void RetentionStore::load_checkpoint_generation_locked() {
 }
 
 void RetentionStore::load_journal_locked() {
-    if (!std::filesystem::exists(journal_path_))
-        return;
-    const int fd = ::open(journal_path_.c_str(), O_RDWR);
-    if (fd < 0)
-        throw std::runtime_error("cannot read retention journal " + journal_path_.string());
-    struct stat st {};
-    if (::fstat(fd, &st) != 0) {
-        const auto saved = errno;
-        ::close(fd);
-        throw std::runtime_error("cannot stat retention journal: " +
-                                 std::string(std::strerror(saved)));
-    }
-    const uint64_t file_size = static_cast<uint64_t>(st.st_size);
-    uint64_t offset = 0;
-    uint64_t durable = 0;
-    while (offset + 4 <= file_size) {
-        std::array<uint8_t, 4> length_bytes{};
-        if (!pread_all(fd, length_bytes, offset))
-            break;
-        const uint32_t length = read_be32(length_bytes.data());
-        if (length > max_legacy_frame)
-            break;
-        const uint64_t frame_size = 4 + 12 + 16 + static_cast<uint64_t>(length);
-        if (offset > std::numeric_limits<uint64_t>::max() - frame_size ||
-            offset + frame_size > file_size)
-            break;
-        std::array<uint8_t, 12> nonce{};
-        std::array<uint8_t, 16> tag{};
-        Bytes ciphertext(length);
-        if (!pread_all(fd, nonce, offset + 4) || !pread_all(fd, tag, offset + 16) ||
-            !pread_all(fd, ciphertext, offset + 32))
-            break;
-        try {
-            const auto plaintext = aes_gcm_open(key_, nonce, tag, ciphertext, journal_aad);
+    (void)journal_.replay(
+        [&](std::span<const uint8_t> plaintext) MACHA_REQUIRES(mutex_) {
             Reader reader(plaintext);
             const auto op = reader.u8();
             const auto raw_class = reader.u8();
@@ -540,28 +443,8 @@ void RetentionStore::load_journal_locked() {
             } else {
                 throw DecodeError("unknown retention journal operation");
             }
-        } catch (const std::exception& error) {
-            Log::warn("retention journal recovered path=" + journal_path_.string() +
-                      " offset=" + std::to_string(offset) + " reason=" + error.what());
-            break;
-        }
-        offset += frame_size;
-        durable = offset;
-        ++journal_records_;
-    }
-
-    if (durable != file_size) {
-        if (::ftruncate(fd, static_cast<off_t>(durable)) != 0) {
-            const auto error = errno;
-            ::close(fd);
-            throw std::runtime_error("cannot truncate retention journal: " +
-                                     std::string(std::strerror(error)));
-        }
-        fsync_checked(fd);
-    }
-    if (::close(fd) != 0)
-        throw std::runtime_error("cannot close retention journal");
-    journal_bytes_ = durable;
+        },
+        max_legacy_frame, "retention journal");
 }
 
 void RetentionStore::load() {
@@ -721,12 +604,12 @@ size_t RetentionStore::claim_objects(RetentionClass type) const {
 
 bool RetentionStore::compact_if_needed(size_t record_threshold) {
     Lock lock(mutex_);
-    if (journal_records_ < record_threshold && journal_bytes_ < journal_compact_bytes)
+    if (journal_.frames() < record_threshold && journal_.bytes() < journal_compact_bytes)
         return false;
 
     const auto generation = "gen-" + std::to_string(unix_ms()) + "-" +
                             std::to_string(getpid()) + "-" +
-                            std::to_string(journal_records_);
+                            std::to_string(journal_.frames());
     const auto generation_path = checkpoint_root_ / generation;
     std::filesystem::create_directories(generation_path);
     for (size_t i = 0; i < checkpoint_shards; ++i) {
@@ -743,9 +626,7 @@ bool RetentionStore::compact_if_needed(size_t record_threshold) {
 
     // The checkpoint is already durable. If this replacement fails or the
     // process dies before it, replaying the old journal is idempotent.
-    durable_replace_file(journal_path_, {});
-    journal_records_ = 0;
-    journal_bytes_ = 0;
+    journal_.reset();
 
     std::error_code remove_error;
     std::filesystem::remove(legacy_checkpoint_path_, remove_error);

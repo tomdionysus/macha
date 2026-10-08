@@ -4,6 +4,7 @@
 #include "contract/claim_store.hpp"
 #include "contract/thread_safety.hpp"
 #include "crypto.hpp"
+#include "storage/sealed_journal.hpp"
 
 #include <filesystem>
 #include <span>
@@ -36,7 +37,6 @@ class RetentionStore final : public ClaimStore {
     std::filesystem::path legacy_checkpoint_path_;
     std::filesystem::path checkpoint_root_;
     std::filesystem::path checkpoint_manifest_path_;
-    std::filesystem::path journal_path_;
     std::array<uint8_t, 32> key_{};
     // Held across the journal's fsync and compaction's shard writes.
     mutable IoMutex mutex_;
@@ -46,8 +46,8 @@ class RetentionStore final : public ClaimStore {
     std::optional<ObjectId> control_release_after_ MACHA_GUARDED_BY(mutex_);
     std::optional<ObjectId> data_prune_after_ MACHA_GUARDED_BY(mutex_);
     std::optional<ObjectId> control_prune_after_ MACHA_GUARDED_BY(mutex_);
-    size_t journal_records_ MACHA_GUARDED_BY(mutex_){};
-    uint64_t journal_bytes_ MACHA_GUARDED_BY(mutex_){};
+    // claims.log: the add and release frames since the last checkpoint.
+    SealedJournal journal_ MACHA_GUARDED_BY(mutex_);
 
     StateMap& state_for(RetentionClass) MACHA_REQUIRES(mutex_);
     const StateMap& state_for(RetentionClass) const MACHA_REQUIRES(mutex_);
