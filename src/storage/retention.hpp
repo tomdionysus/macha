@@ -4,15 +4,14 @@
 #include "contract/claim_store.hpp"
 #include "contract/thread_safety.hpp"
 #include "crypto.hpp"
+#include "ledger/object_trie.hpp"
 #include "storage/sealed_journal.hpp"
 
 #include <filesystem>
 #include <span>
 #include <functional>
-#include <map>
-#include <mutex>
+#include <memory>
 #include <optional>
-#include <set>
 #include <vector>
 
 namespace macha {
@@ -23,53 +22,53 @@ namespace macha {
 // the highest undominated add sequence and the highest remove context observed.
 // A removal can therefore erase only claims causally visible to the metadata
 // mutation that produced it; a concurrent branch re-affirmation survives.
+//
+// Each class's claims live in an on-disk object trie (ledger-data and
+// ledger-control under state/retention), one record an object, so memory is
+// the tries' caches whatever the number of claims. claims.log is the write-ahead
+// log: every add, release and prune is journaled and fsynced, then applied to
+// the trie in memory; a checkpoint saves both tries and empties the log.
+// Replaying the log over a checkpoint is idempotent.
 class RetentionStore final : public ClaimStore {
-    struct ObjectState {
-        std::map<NodeId, uint64_t> adds;
-        std::map<NodeId, uint64_t> removed;
+    struct ClassLedger {
+        std::unique_ptr<ObjectTrie> trie;
+        std::optional<ObjectId> release_after;
+        std::optional<ObjectId> prune_after;
     };
 
-    using StateMap = std::map<ObjectId, ObjectState>;
-
-    // claims.meta is the protocol-20 monolithic checkpoint, read if present.
-    // Checkpoints are generation directories selected by claims.current and
-    // sharded by the first SHA-256 byte, so no buffer is O(retained objects).
-    std::filesystem::path legacy_checkpoint_path_;
-    std::filesystem::path checkpoint_root_;
-    std::filesystem::path checkpoint_manifest_path_;
+    std::filesystem::path root_;
     std::array<uint8_t, 32> key_{};
-    // Held across the journal's fsync and compaction's shard writes.
+    // Held across the journal's fsync, a lookup's node read and a
+    // checkpoint's writes.
     mutable IoMutex mutex_;
-    StateMap data_ MACHA_GUARDED_BY(mutex_);
-    StateMap control_ MACHA_GUARDED_BY(mutex_);
-    std::optional<ObjectId> data_release_after_ MACHA_GUARDED_BY(mutex_);
-    std::optional<ObjectId> control_release_after_ MACHA_GUARDED_BY(mutex_);
-    std::optional<ObjectId> data_prune_after_ MACHA_GUARDED_BY(mutex_);
-    std::optional<ObjectId> control_prune_after_ MACHA_GUARDED_BY(mutex_);
-    // claims.log: the add and release frames since the last checkpoint.
+    ClassLedger data_ MACHA_GUARDED_BY(mutex_);
+    ClassLedger control_ MACHA_GUARDED_BY(mutex_);
+    // Objects changed since the last checkpoint: what the tries hold unsaved.
+    uint64_t changed_ MACHA_GUARDED_BY(mutex_){};
+    // claims.log: the add, release and prune frames since the last checkpoint.
     SealedJournal journal_ MACHA_GUARDED_BY(mutex_);
 
-    StateMap& state_for(RetentionClass) MACHA_REQUIRES(mutex_);
-    const StateMap& state_for(RetentionClass) const MACHA_REQUIRES(mutex_);
-    std::optional<ObjectId>& cursor_for(RetentionClass) MACHA_REQUIRES(mutex_);
-    std::optional<ObjectId>& prune_cursor_for(RetentionClass) MACHA_REQUIRES(mutex_);
-    void apply_add_locked(RetentionClass, const RetentionDot&, const std::vector<ObjectId>&)
+    ClassLedger& class_for(RetentionClass) MACHA_REQUIRES(mutex_);
+    const ClassLedger& class_for(RetentionClass) const MACHA_REQUIRES(mutex_);
+    void apply_add_locked(RetentionClass, const RetentionDot&, std::vector<ObjectId>)
         MACHA_REQUIRES(mutex_);
-    size_t apply_release_locked(RetentionClass, const RetentionClock&,
-                                const std::vector<ObjectId>&) MACHA_REQUIRES(mutex_);
-    void append_frame_locked(std::span<const uint8_t>) MACHA_REQUIRES(mutex_);
-    Bytes encode_checkpoint_shard_locked(uint8_t shard) const MACHA_REQUIRES(mutex_);
-    void decode_checkpoint_shard_locked(uint8_t shard, std::span<const uint8_t>)
+    size_t apply_release_locked(RetentionClass, const RetentionClock&, std::vector<ObjectId>)
         MACHA_REQUIRES(mutex_);
-    void decode_legacy_checkpoint_locked(std::span<const uint8_t>) MACHA_REQUIRES(mutex_);
-    void load_checkpoint_generation_locked() MACHA_REQUIRES(mutex_);
+    size_t apply_prune_locked(RetentionClass, std::vector<ObjectId>) MACHA_REQUIRES(mutex_);
+    void checkpoint_locked() MACHA_REQUIRES(mutex_);
+    // Visits records from after `cursor`, wrapping to the first once, until
+    // `visit` returns false, `limit` are visited or it is back where it began.
+    void scan_locked(const ClassLedger&, std::optional<ObjectId>& cursor, size_t limit,
+                     const std::function<bool(const ObjectId&, std::span<const uint8_t>)>& visit)
+        const MACHA_REQUIRES(mutex_);
+    void migrate_locked() MACHA_REQUIRES(mutex_);
     void load_journal_locked() MACHA_REQUIRES(mutex_);
-    void cleanup_checkpoint_generations_locked(std::string_view keep) const
-        MACHA_REQUIRES(mutex_);
-    void load();
+    void load(size_t cache_bytes);
 
   public:
-    RetentionStore(std::filesystem::path state_path, std::array<uint8_t, 32> key);
+    // `cache_bytes` is shared by the two tries, mostly to the data one.
+    RetentionStore(std::filesystem::path state_path, std::array<uint8_t, 32> key,
+                   size_t cache_bytes = 8ULL * 1024 * 1024);
 
     void retain(RetentionClass, const ObjectId&, const RetentionDot&) override;
     void retain_batch(RetentionClass, const std::vector<ObjectId>&, const RetentionDot&) override;
@@ -88,14 +87,14 @@ class RetentionStore final : public ClaimStore {
 
     size_t claim_objects(RetentionClass) const override;
 
-    // Compact the append journal into an atomically-selected generation of 256
-    // bounded encrypted shards. The journal is also compacted on a byte ceiling,
-    // not only by record count, so recovery never has to absorb an unbounded WAL.
+    // Checkpoints the tries and empties the journal once it holds
+    // `record_threshold` frames or its byte ceiling, so recovery never
+    // replays an unbounded log.
     bool compact_if_needed(size_t record_threshold = 4096) override;
 
     // Forget causality tombstones only when no claim remains and the physical
-    // object is absent. Traversal is cursor-based so a small operation budget
-    // cannot starve entries later in the ordered map indefinitely.
+    // object is absent. Journaled. Traversal is cursor-based so a small
+    // operation budget cannot starve later records indefinitely.
     size_t prune_unclaimed(RetentionClass, const std::function<bool(const ObjectId&)>& exists,
                            size_t operation_budget) override;
 };

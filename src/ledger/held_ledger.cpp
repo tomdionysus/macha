@@ -8,7 +8,8 @@
 namespace macha {
 
 namespace {
-constexpr uint64_t held_value = 1;
+// One, as eight big-endian bytes.
+const Bytes held_value{0, 0, 0, 0, 0, 0, 0, 1};
 } // namespace
 
 HeldLedger::HeldLedger(std::filesystem::path dir, std::array<uint8_t, 32> key,
@@ -26,7 +27,7 @@ std::optional<bool> HeldLedger::held(const ObjectId& id) const {
 
 void HeldLedger::record(const ObjectId& id, bool held) {
     Lock lock(queue_mutex_);
-    queued_.push_back({id, held ? std::optional<uint64_t>(held_value) : std::nullopt});
+    queued_.push_back({id, held ? std::optional<Bytes>(held_value) : std::nullopt});
 }
 
 void HeldLedger::drop_queued() {

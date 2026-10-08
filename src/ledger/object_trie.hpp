@@ -18,7 +18,8 @@
 namespace macha {
 
 // One class's object ledger on disk: every object id this node records, each
-// with a 64-bit value, in a radix-256 trie keyed by the id's bytes.
+// with a value of up to `value_max` bytes, in a radix-256 trie keyed by the
+// id's bytes.
 //
 // Its shape depends only on the ids: a node holding more than `leaf_max`
 // records below it is interior, with one child per next byte; otherwise it
@@ -47,13 +48,14 @@ class ObjectTrie {
         uint64_t rewrite_floor_bytes = 16ULL * 1024 * 1024;
     };
     static constexpr size_t leaf_max = 128;
+    static constexpr size_t value_max = 16 * 1024;
 
     // A record set to `value`, or erased when it has none.
     struct Change {
         ObjectId id;
-        std::optional<uint64_t> value;
+        std::optional<Bytes> value;
     };
-    using Record = std::pair<ObjectId, uint64_t>;
+    using Record = std::pair<ObjectId, Bytes>;
 
     // Opens the trie in `dir`, creating it if empty. Throws if its published
     // root cannot be read.
@@ -62,7 +64,7 @@ class ObjectTrie {
     ObjectTrie(const ObjectTrie&) = delete;
     ObjectTrie& operator=(const ObjectTrie&) = delete;
 
-    std::optional<uint64_t> get(const ObjectId&) const;
+    std::optional<Bytes> get(const ObjectId&) const;
     // Journals the changes as one frame, then applies them in order (a later
     // change to the same id wins).
     void apply(std::span<const Change>);
@@ -132,6 +134,9 @@ class ObjectTrie {
     std::unique_ptr<SealedJournal> journal_;
     std::unique_ptr<SealedJournal> nodes_;
     uint64_t generation_{};
+    // Opened in format 1; rewritten in the current format before the
+    // constructor returns.
+    bool format1_{};
     Child root_;
     uint64_t live_bytes_{};
     uint64_t superseded_bytes_{};

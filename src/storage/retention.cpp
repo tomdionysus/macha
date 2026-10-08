@@ -7,16 +7,11 @@
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
-#include <cstring>
-#include <fcntl.h>
 #include <fstream>
 #include <iomanip>
-#include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace macha {
 namespace {
@@ -26,35 +21,16 @@ constexpr std::array<uint8_t, 8> legacy_checkpoint_magic{'M', 'R', 'T', 'S', '0'
 constexpr std::array<uint8_t, 8> shard_checkpoint_magic{'M', 'R', 'T', 'S', '0', '0', '0', '2'};
 constexpr uint8_t op_add = 1;
 constexpr uint8_t op_release = 2;
+constexpr uint8_t op_prune = 3;
 constexpr uint32_t max_legacy_frame = 64U * 1024U * 1024U;
 constexpr uint32_t max_journal_frame = 4U * 1024U * 1024U;
 constexpr uint64_t journal_compact_bytes = 64ULL * 1024ULL * 1024ULL;
 constexpr size_t retain_ids_per_frame = 65536;
 constexpr uint64_t max_checkpoint_shard_bytes = 64ULL * 1024ULL * 1024ULL;
 constexpr size_t checkpoint_shards = 256;
-
-void fsync_checked(int fd) {
-    int rc;
-    do { rc = ::fsync(fd); } while (rc != 0 && errno == EINTR);
-    if (rc != 0)
-        throw std::runtime_error(std::string("retention journal sync failed: ") +
-                                 std::strerror(errno));
-}
-
-void sync_directory(const std::filesystem::path& path) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd < 0)
-        throw std::runtime_error("cannot open retention directory for sync: " + path.string());
-    try {
-        fsync_checked(fd);
-        if (::close(fd) != 0)
-            throw std::runtime_error("cannot close retention directory: " +
-                                     std::string(std::strerror(errno)));
-    } catch (...) {
-        ::close(fd);
-        throw;
-    }
-}
+// The tries hold this many changed objects unsaved before a checkpoint.
+constexpr uint64_t checkpoint_changed = 8192;
+constexpr size_t scan_page = 256;
 
 bool valid_class(uint8_t value) {
     return value == static_cast<uint8_t>(RetentionClass::data) ||
@@ -88,137 +64,84 @@ std::string read_small_text(const std::filesystem::path& path, size_t limit) {
         text.pop_back();
     return text;
 }
-} // namespace
 
-RetentionStore::RetentionStore(std::filesystem::path state_path, std::array<uint8_t, 32> key)
-    : legacy_checkpoint_path_(state_path / "retention" / "claims.meta"),
-      checkpoint_root_(state_path / "retention" / "checkpoints"),
-      checkpoint_manifest_path_(state_path / "retention" / "claims.current"), key_(key),
-      journal_(state_path / "retention" / "claims.log", key, journal_aad, max_journal_frame) {
-    std::filesystem::create_directories(state_path / "retention");
-    std::filesystem::create_directories(checkpoint_root_);
-    load();
-}
+// One object's observed-remove state, as its trie record holds it.
+struct ObjectState {
+    std::map<NodeId, uint64_t> adds;
+    std::map<NodeId, uint64_t> removed;
+    bool empty() const noexcept { return adds.empty() && removed.empty(); }
+};
+using StateMap = std::map<ObjectId, ObjectState>;
 
-RetentionStore::StateMap& RetentionStore::state_for(RetentionClass type) {
-    return type == RetentionClass::data ? data_ : control_;
-}
-
-const RetentionStore::StateMap& RetentionStore::state_for(RetentionClass type) const {
-    return type == RetentionClass::data ? data_ : control_;
-}
-
-std::optional<ObjectId>& RetentionStore::cursor_for(RetentionClass type) {
-    return type == RetentionClass::data ? data_release_after_ : control_release_after_;
-}
-
-std::optional<ObjectId>& RetentionStore::prune_cursor_for(RetentionClass type) {
-    return type == RetentionClass::data ? data_prune_after_ : control_prune_after_;
-}
-
-void RetentionStore::apply_add_locked(RetentionClass type, const RetentionDot& dot,
-                                      const std::vector<ObjectId>& ids) {
-    if (dot.origin == NodeId{} || !dot.sequence)
-        throw std::runtime_error("invalid retention mutation dot");
-    auto& state = state_for(type);
-    for (const auto& id : ids) {
-        auto& object = state[id];
-        const auto removed = object.removed.find(dot.origin);
-        if (removed != object.removed.end() && removed->second >= dot.sequence)
-            continue;
-        auto& current = object.adds[dot.origin];
-        current = std::max(current, dot.sequence);
-    }
-}
-
-size_t RetentionStore::apply_release_locked(RetentionClass type, const RetentionClock& observed,
-                                            const std::vector<ObjectId>& ids) {
-    auto& state = state_for(type);
-    size_t changed = 0;
-    for (const auto& id : ids) {
-        auto found = state.find(id);
-        if (found == state.end())
-            continue;
-        bool object_changed = false;
-        for (const auto& [origin, sequence] : observed) {
-            if (!sequence)
-                continue;
-            auto& removed = found->second.removed[origin];
-            if (removed < sequence) {
-                removed = sequence;
-                object_changed = true;
-            }
-            auto add = found->second.adds.find(origin);
-            if (add != found->second.adds.end() && add->second <= sequence) {
-                found->second.adds.erase(add);
-                object_changed = true;
-            }
+// u16 n | (origin, u64 sequence) x n, for the adds and then the removes.
+Bytes encode_state(const ObjectState& state) {
+    Writer writer;
+    for (const auto* side : {&state.adds, &state.removed}) {
+        if (side->size() > UINT16_MAX)
+            throw std::runtime_error("too many retention clocks for one object");
+        writer.u16(static_cast<uint16_t>(side->size()));
+        for (const auto& [origin, sequence] : *side) {
+            writer.fixed(origin.bytes);
+            writer.u64(sequence);
         }
-        if (object_changed)
-            ++changed;
     }
-    return changed;
+    return writer.take();
 }
 
-void RetentionStore::append_frame_locked(std::span<const uint8_t> plaintext) {
-    journal_.append(plaintext);
-}
-
-Bytes RetentionStore::encode_checkpoint_shard_locked(uint8_t shard) const {
-    Writer plain;
-    plain.u8(2);
-    plain.u8(shard);
-
-    auto range_for = [&](const StateMap& state) {
-        ObjectId low{};
-        low.bytes[0] = shard;
-        auto begin = state.lower_bound(low);
-        if (shard == 255)
-            return std::pair{begin, state.end()};
-        ObjectId high{};
-        high.bytes[0] = static_cast<uint8_t>(shard + 1);
-        return std::pair{begin, state.lower_bound(high)};
-    };
-
-    auto encode_state = [&](const StateMap& state) {
-        const auto [begin, end] = range_for(state);
-        const auto count = static_cast<uint64_t>(std::distance(begin, end));
-        if (count > UINT32_MAX)
-            throw std::runtime_error("too many retention objects in checkpoint shard");
-        plain.u32(static_cast<uint32_t>(count));
-        for (auto it = begin; it != end; ++it) {
-            const auto& [id, object] = *it;
-            plain.fixed(id.bytes);
-            if (object.adds.size() > UINT32_MAX || object.removed.size() > UINT32_MAX)
-                throw std::runtime_error("too many retention clocks for one object");
-            plain.u32(static_cast<uint32_t>(object.adds.size()));
-            for (const auto& [origin, sequence] : object.adds) {
-                plain.fixed(origin.bytes);
-                plain.u64(sequence);
-            }
-            plain.u32(static_cast<uint32_t>(object.removed.size()));
-            for (const auto& [origin, sequence] : object.removed) {
-                plain.fixed(origin.bytes);
-                plain.u64(sequence);
-            }
+ObjectState decode_state(std::span<const uint8_t> bytes) {
+    ObjectState state;
+    Reader reader(bytes);
+    for (auto* side : {&state.adds, &state.removed}) {
+        const auto count = reader.u16();
+        for (uint16_t i = 0; i < count; ++i) {
+            NodeId origin{reader.fixed<16>()};
+            const auto sequence = reader.u64();
+            if (origin == NodeId{} || !sequence || !side->emplace(origin, sequence).second)
+                throw DecodeError("bad retention record clock");
         }
-    };
-    encode_state(data_);
-    encode_state(control_);
-
-    const auto sealed = aes_gcm_seal(key_, plain.data(), checkpoint_aad);
-    if (sealed.ciphertext.size() > max_checkpoint_shard_bytes)
-        throw std::runtime_error("retention checkpoint shard too large");
-    Writer outer;
-    outer.fixed(shard_checkpoint_magic);
-    outer.fixed(sealed.nonce);
-    outer.fixed(sealed.tag);
-    outer.bytes(sealed.ciphertext);
-    return outer.take();
+    }
+    reader.finish();
+    return state;
 }
 
-void RetentionStore::decode_checkpoint_shard_locked(uint8_t shard,
-                                                     std::span<const uint8_t> encoded) {
+bool claimed(std::span<const uint8_t> record) {
+    // The adds' count leads the record.
+    return record.size() >= 2 && (record[0] != 0 || record[1] != 0);
+}
+
+ObjectState read_clocks(Reader& reader, uint32_t limit) {
+    ObjectState object;
+    const auto adds = reader.u32();
+    if (adds > limit)
+        throw DecodeError("too many retention checkpoint adds");
+    for (uint32_t j = 0; j < adds; ++j) {
+        NodeId origin{reader.fixed<16>()};
+        const auto sequence = reader.u64();
+        if (origin == NodeId{} || !sequence || !object.adds.emplace(origin, sequence).second)
+            throw DecodeError("bad retention checkpoint add");
+    }
+    const auto removed = reader.u32();
+    if (removed > limit)
+        throw DecodeError("too many retention checkpoint removes");
+    for (uint32_t j = 0; j < removed; ++j) {
+        NodeId origin{reader.fixed<16>()};
+        const auto sequence = reader.u64();
+        if (origin == NodeId{} || !sequence || !object.removed.emplace(origin, sequence).second)
+            throw DecodeError("bad retention checkpoint remove");
+    }
+    for (auto it = object.adds.begin(); it != object.adds.end();) {
+        const auto rm = object.removed.find(it->first);
+        if (rm != object.removed.end() && rm->second >= it->second)
+            it = object.adds.erase(it);
+        else
+            ++it;
+    }
+    return object;
+}
+
+void decode_checkpoint_shard(const std::array<uint8_t, 32>& key, uint8_t shard,
+                             std::span<const uint8_t> encoded, StateMap& data,
+                             StateMap& control) {
     Reader outer(encoded);
     if (outer.fixed<8>() != shard_checkpoint_magic)
         throw DecodeError("bad retention checkpoint shard magic");
@@ -226,59 +149,28 @@ void RetentionStore::decode_checkpoint_shard_locked(uint8_t shard,
     const auto tag = outer.fixed<16>();
     const auto ciphertext = outer.bytes(max_checkpoint_shard_bytes);
     outer.finish();
-    const auto plain = aes_gcm_open(key_, nonce, tag, ciphertext, checkpoint_aad);
+    const auto plain = aes_gcm_open(key, nonce, tag, ciphertext, checkpoint_aad);
     Reader reader(plain);
     if (reader.u8() != 2 || reader.u8() != shard)
         throw DecodeError("bad retention checkpoint shard identity");
-
-    auto decode_state = [&](StateMap& state) {
+    for (auto* state : {&data, &control}) {
         const auto count = reader.u32();
-        // A 64 MiB shard cannot contain anywhere near UINT32_MAX valid records,
-        // but keep an explicit structural bound before any map growth.
         if (count > 1'500'000)
             throw DecodeError("too many retention checkpoint shard objects");
         for (uint32_t i = 0; i < count; ++i) {
             ObjectId id{reader.fixed<32>()};
             if (id.bytes[0] != shard)
                 throw DecodeError("retention object stored in wrong checkpoint shard");
-            ObjectState object;
-            const auto adds = reader.u32();
-            if (adds > 65536)
-                throw DecodeError("too many retention checkpoint adds");
-            for (uint32_t j = 0; j < adds; ++j) {
-                NodeId origin{reader.fixed<16>()};
-                const auto sequence = reader.u64();
-                if (origin == NodeId{} || !sequence ||
-                    !object.adds.emplace(origin, sequence).second)
-                    throw DecodeError("bad retention checkpoint add");
-            }
-            const auto removed = reader.u32();
-            if (removed > 65536)
-                throw DecodeError("too many retention checkpoint removes");
-            for (uint32_t j = 0; j < removed; ++j) {
-                NodeId origin{reader.fixed<16>()};
-                const auto sequence = reader.u64();
-                if (origin == NodeId{} || !sequence ||
-                    !object.removed.emplace(origin, sequence).second)
-                    throw DecodeError("bad retention checkpoint remove");
-            }
-            for (auto it = object.adds.begin(); it != object.adds.end();) {
-                const auto rm = object.removed.find(it->first);
-                if (rm != object.removed.end() && rm->second >= it->second)
-                    it = object.adds.erase(it);
-                else
-                    ++it;
-            }
-            if (!state.emplace(id, std::move(object)).second)
+            if (!state->emplace(id, read_clocks(reader, 65536)).second)
                 throw DecodeError("duplicate retention checkpoint object");
         }
-    };
-    decode_state(data_);
-    decode_state(control_);
+    }
     reader.finish();
 }
 
-void RetentionStore::decode_legacy_checkpoint_locked(std::span<const uint8_t> encoded) {
+void decode_monolithic_checkpoint(const std::array<uint8_t, 32>& key,
+                                  std::span<const uint8_t> encoded, StateMap& data,
+                                  StateMap& control) {
     Reader outer(encoded);
     if (outer.fixed<8>() != legacy_checkpoint_magic)
         throw DecodeError("bad retention checkpoint magic");
@@ -286,115 +178,218 @@ void RetentionStore::decode_legacy_checkpoint_locked(std::span<const uint8_t> en
     const auto tag = outer.fixed<16>();
     const auto ciphertext = outer.bytes(max_legacy_frame);
     outer.finish();
-    const auto plain = aes_gcm_open(key_, nonce, tag, ciphertext, checkpoint_aad);
+    const auto plain = aes_gcm_open(key, nonce, tag, ciphertext, checkpoint_aad);
     Reader reader(plain);
     if (reader.u8() != 1)
         throw DecodeError("unsupported retention checkpoint version");
-
-    auto decode_state = [&](StateMap& state) {
+    for (auto* state : {&data, &control}) {
         const auto count = reader.u32();
         if (count > 4'000'000)
             throw DecodeError("too many retention checkpoint objects");
         for (uint32_t i = 0; i < count; ++i) {
             ObjectId id{reader.fixed<32>()};
-            ObjectState object;
-            const auto adds = reader.u32();
-            if (adds > 1'000'000)
-                throw DecodeError("too many retention checkpoint adds");
-            for (uint32_t j = 0; j < adds; ++j) {
-                NodeId origin{reader.fixed<16>()};
-                const auto sequence = reader.u64();
-                if (origin == NodeId{} || !sequence ||
-                    !object.adds.emplace(origin, sequence).second)
-                    throw DecodeError("bad retention checkpoint add");
-            }
-            const auto removed = reader.u32();
-            if (removed > 1'000'000)
-                throw DecodeError("too many retention checkpoint removes");
-            for (uint32_t j = 0; j < removed; ++j) {
-                NodeId origin{reader.fixed<16>()};
-                const auto sequence = reader.u64();
-                if (origin == NodeId{} || !sequence ||
-                    !object.removed.emplace(origin, sequence).second)
-                    throw DecodeError("bad retention checkpoint remove");
-            }
-            for (auto it = object.adds.begin(); it != object.adds.end();) {
-                const auto rm = object.removed.find(it->first);
-                if (rm != object.removed.end() && rm->second >= it->second)
-                    it = object.adds.erase(it);
-                else
-                    ++it;
-            }
-            if (!state.emplace(id, std::move(object)).second)
+            if (!state->emplace(id, read_clocks(reader, 1'000'000)).second)
                 throw DecodeError("duplicate retention checkpoint object");
         }
-    };
-    decode_state(data_);
-    decode_state(control_);
+    }
     reader.finish();
 }
 
-void RetentionStore::cleanup_checkpoint_generations_locked(std::string_view keep) const {
-    std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(checkpoint_root_, error)) {
-        if (error)
-            break;
-        if (!entry.is_directory())
-            continue;
-        const auto name = entry.path().filename().string();
-        if (name == keep)
-            continue;
-        std::error_code remove_error;
-        std::filesystem::remove_all(entry.path(), remove_error);
-        if (remove_error)
-            Log::debug("cannot remove obsolete retention checkpoint generation " +
-                       entry.path().string() + ": " + remove_error.message());
+Bytes read_file(const std::filesystem::path& path, uint64_t limit) {
+    const auto size = std::filesystem::file_size(path);
+    if (size > limit)
+        throw std::runtime_error("retention checkpoint is too large: " + path.string());
+    std::ifstream input(path, std::ios::binary);
+    Bytes bytes(static_cast<size_t>(size));
+    if (!input || (size && !input.read(reinterpret_cast<char*>(bytes.data()),
+                                       static_cast<std::streamsize>(size))))
+        throw std::runtime_error("cannot read retention checkpoint " + path.string());
+    return bytes;
+}
+
+// The claims the checkpoint files before the tries hold: the sharded
+// generation claims.current names, or the monolithic claims.meta.
+void load_checkpoint_files(const std::filesystem::path& root, const std::array<uint8_t, 32>& key,
+                           StateMap& data, StateMap& control) {
+    const auto manifest = root / "claims.current";
+    if (!std::filesystem::exists(manifest)) {
+        const auto monolithic = root / "claims.meta";
+        if (std::filesystem::exists(monolithic))
+            decode_monolithic_checkpoint(key, read_file(monolithic, max_legacy_frame + 64ULL),
+                                         data, control);
+        return;
+    }
+    const auto generation = read_small_text(manifest, 256);
+    if (!valid_generation_name(generation))
+        throw std::runtime_error("invalid retention checkpoint generation");
+    const auto generation_path = root / "checkpoints" / generation;
+    for (size_t i = 0; i < checkpoint_shards; ++i) {
+        const auto shard = static_cast<uint8_t>(i);
+        decode_checkpoint_shard(
+            key, shard,
+            read_file(generation_path / shard_name(shard), max_checkpoint_shard_bytes + 64ULL),
+            data, control);
     }
 }
 
-void RetentionStore::load_checkpoint_generation_locked() {
-    if (!std::filesystem::exists(checkpoint_manifest_path_)) {
-        if (!std::filesystem::exists(legacy_checkpoint_path_)) {
-            cleanup_checkpoint_generations_locked({});
-            return;
-        }
-        const auto size = std::filesystem::file_size(legacy_checkpoint_path_);
-        if (size > max_legacy_frame + 64ULL)
-            throw std::runtime_error("legacy retention checkpoint is too large");
-        std::ifstream checkpoint(legacy_checkpoint_path_, std::ios::binary);
-        if (!checkpoint)
-            throw std::runtime_error("cannot read retention checkpoint " +
-                                     legacy_checkpoint_path_.string());
-        Bytes encoded(static_cast<size_t>(size));
-        if (size && !checkpoint.read(reinterpret_cast<char*>(encoded.data()),
-                                     static_cast<std::streamsize>(size)))
-            throw std::runtime_error("cannot read retention checkpoint " +
-                                     legacy_checkpoint_path_.string());
-        decode_legacy_checkpoint_locked(encoded);
-        cleanup_checkpoint_generations_locked({});
-        return;
-    }
+void remove_checkpoint_files(const std::filesystem::path& root) {
+    std::error_code error;
+    std::filesystem::remove(root / "claims.current", error);
+    std::filesystem::remove(root / "claims.meta", error);
+    std::filesystem::remove_all(root / "checkpoints", error);
+    if (error)
+        Log::debug("cannot remove retention checkpoint files: " + error.message());
+}
 
-    const auto generation = read_small_text(checkpoint_manifest_path_, 256);
-    if (!valid_generation_name(generation))
-        throw std::runtime_error("invalid retention checkpoint generation");
-    const auto generation_path = checkpoint_root_ / generation;
-    for (size_t i = 0; i < checkpoint_shards; ++i) {
-        const auto shard = static_cast<uint8_t>(i);
-        const auto path = generation_path / shard_name(shard);
-        const auto size = std::filesystem::file_size(path);
-        if (size > max_checkpoint_shard_bytes + 64ULL)
-            throw std::runtime_error("retention checkpoint shard is too large: " + path.string());
-        std::ifstream checkpoint(path, std::ios::binary);
-        if (!checkpoint)
-            throw std::runtime_error("cannot read retention checkpoint shard " + path.string());
-        Bytes encoded(static_cast<size_t>(size));
-        if (size && !checkpoint.read(reinterpret_cast<char*>(encoded.data()),
-                                     static_cast<std::streamsize>(size)))
-            throw std::runtime_error("cannot read retention checkpoint shard " + path.string());
-        decode_checkpoint_shard_locked(shard, encoded);
+std::vector<ObjectId> sorted_unique(std::vector<ObjectId> ids) {
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+} // namespace
+
+RetentionStore::RetentionStore(std::filesystem::path state_path, std::array<uint8_t, 32> key,
+                               size_t cache_bytes)
+    : root_(state_path / "retention"), key_(key),
+      journal_(state_path / "retention" / "claims.log", key, journal_aad, max_journal_frame) {
+    std::filesystem::create_directories(root_);
+    load(cache_bytes);
+}
+
+RetentionStore::ClassLedger& RetentionStore::class_for(RetentionClass type) {
+    return type == RetentionClass::data ? data_ : control_;
+}
+
+const RetentionStore::ClassLedger& RetentionStore::class_for(RetentionClass type) const {
+    return type == RetentionClass::data ? data_ : control_;
+}
+
+void RetentionStore::apply_add_locked(RetentionClass type, const RetentionDot& dot,
+                                      std::vector<ObjectId> ids) {
+    if (dot.origin == NodeId{} || !dot.sequence)
+        throw std::runtime_error("invalid retention mutation dot");
+    auto& trie = *class_for(type).trie;
+    std::vector<ObjectTrie::Change> changes;
+    for (const auto& id : sorted_unique(std::move(ids))) {
+        const auto record = trie.get(id);
+        auto object = record ? decode_state(*record) : ObjectState{};
+        const auto removed = object.removed.find(dot.origin);
+        if (removed != object.removed.end() && removed->second >= dot.sequence)
+            continue;
+        auto& current = object.adds[dot.origin];
+        if (current >= dot.sequence)
+            continue;
+        current = dot.sequence;
+        changes.push_back({id, encode_state(object)});
     }
-    cleanup_checkpoint_generations_locked(generation);
+    changed_ += changes.size();
+    trie.install(changes);
+}
+
+size_t RetentionStore::apply_release_locked(RetentionClass type, const RetentionClock& observed,
+                                            std::vector<ObjectId> ids) {
+    auto& trie = *class_for(type).trie;
+    std::vector<ObjectTrie::Change> changes;
+    for (const auto& id : sorted_unique(std::move(ids))) {
+        const auto record = trie.get(id);
+        if (!record)
+            continue;
+        auto object = decode_state(*record);
+        bool object_changed = false;
+        for (const auto& [origin, sequence] : observed) {
+            if (!sequence)
+                continue;
+            auto& removed = object.removed[origin];
+            if (removed < sequence) {
+                removed = sequence;
+                object_changed = true;
+            }
+            auto add = object.adds.find(origin);
+            if (add != object.adds.end() && add->second <= sequence) {
+                object.adds.erase(add);
+                object_changed = true;
+            }
+        }
+        if (object_changed)
+            changes.push_back({id, encode_state(object)});
+    }
+    changed_ += changes.size();
+    trie.install(changes);
+    return changes.size();
+}
+
+size_t RetentionStore::apply_prune_locked(RetentionClass type, std::vector<ObjectId> ids) {
+    auto& trie = *class_for(type).trie;
+    std::vector<ObjectTrie::Change> changes;
+    for (const auto& id : sorted_unique(std::move(ids))) {
+        const auto record = trie.get(id);
+        if (record && !claimed(*record))
+            changes.push_back({id, std::nullopt});
+    }
+    changed_ += changes.size();
+    trie.install(changes);
+    return changes.size();
+}
+
+void RetentionStore::checkpoint_locked() {
+    data_.trie->checkpoint();
+    control_.trie->checkpoint();
+    // The tries are durable; replaying the old journal over them would be
+    // idempotent had this not happened.
+    journal_.reset();
+    changed_ = 0;
+    // The first checkpoint supersedes the files the tries were migrated from.
+    remove_checkpoint_files(root_);
+}
+
+void RetentionStore::scan_locked(
+    const ClassLedger& ledger, std::optional<ObjectId>& cursor, size_t limit,
+    const std::function<bool(const ObjectId&, std::span<const uint8_t>)>& visit) const {
+    std::optional<ObjectId> start;
+    std::optional<ObjectId> after = cursor;
+    bool wrapped = false;
+    size_t visited = 0;
+    while (visited < limit) {
+        const auto page = ledger.trie->next(after, std::min(scan_page, limit - visited));
+        if (page.empty()) {
+            if (wrapped || !after)
+                return;
+            wrapped = true;
+            after.reset();
+            continue;
+        }
+        for (const auto& [id, record] : page) {
+            if (wrapped && start && !(id < *start))
+                return;
+            if (!start)
+                start = id;
+            ++visited;
+            cursor = id;
+            after = id;
+            if (!visit(id, record))
+                return;
+        }
+    }
+}
+
+void RetentionStore::migrate_locked() {
+    // The claims the files before the tries held, and the journal written
+    // since them, which the normal replay then applies over the tries.
+    StateMap data;
+    StateMap control;
+    load_checkpoint_files(root_, key_, data, control);
+    for (auto [state, ledger] : {std::pair{&data, &data_}, std::pair{&control, &control_}}) {
+        std::vector<ObjectTrie::Record> records;
+        records.reserve(state->size());
+        for (const auto& [id, object] : *state)
+            if (!object.empty())
+                records.emplace_back(id, encode_state(object));
+        ledger->trie->replace_all(std::move(records));
+    }
+    durable_replace_file(root_ / "ledger", "1\n");
+    Log::info("retention claims moved into the ledger data=" + std::to_string(data.size()) +
+              " control=" + std::to_string(control.size()));
 }
 
 void RetentionStore::load_journal_locked() {
@@ -406,19 +401,22 @@ void RetentionStore::load_journal_locked() {
             if (!valid_class(raw_class))
                 throw DecodeError("bad retention object class");
             const auto type = static_cast<RetentionClass>(raw_class);
-            if (op == op_add) {
-                RetentionDot dot;
-                dot.origin.bytes = reader.fixed<16>();
-                dot.sequence = reader.u64();
+            const auto read_ids = [&](const char* what) {
                 const auto count = reader.u32();
                 if (count > 1'000'000)
-                    throw DecodeError("too many retention add objects");
+                    throw DecodeError(std::string("too many retention ") + what + " objects");
                 std::vector<ObjectId> ids;
                 ids.reserve(count);
                 for (uint32_t i = 0; i < count; ++i)
                     ids.push_back(ObjectId{reader.fixed<32>()});
                 reader.finish();
-                apply_add_locked(type, dot, ids);
+                return ids;
+            };
+            if (op == op_add) {
+                RetentionDot dot;
+                dot.origin.bytes = reader.fixed<16>();
+                dot.sequence = reader.u64();
+                apply_add_locked(type, dot, read_ids("add"));
             } else if (op == op_release) {
                 const auto clocks = reader.u32();
                 if (clocks > 1'000'000)
@@ -431,15 +429,9 @@ void RetentionStore::load_journal_locked() {
                         !observed.emplace(node, sequence).second)
                         throw DecodeError("bad retention release clock");
                 }
-                const auto count = reader.u32();
-                if (count > 1'000'000)
-                    throw DecodeError("too many retention release objects");
-                std::vector<ObjectId> ids;
-                ids.reserve(count);
-                for (uint32_t i = 0; i < count; ++i)
-                    ids.push_back(ObjectId{reader.fixed<32>()});
-                reader.finish();
-                (void)apply_release_locked(type, observed, ids);
+                (void)apply_release_locked(type, observed, read_ids("release"));
+            } else if (op == op_prune) {
+                (void)apply_prune_locked(type, read_ids("prune"));
             } else {
                 throw DecodeError("unknown retention journal operation");
             }
@@ -447,9 +439,16 @@ void RetentionStore::load_journal_locked() {
         max_legacy_frame, "retention journal");
 }
 
-void RetentionStore::load() {
+void RetentionStore::load(size_t cache_bytes) {
     Lock lock(mutex_);
-    load_checkpoint_generation_locked();
+    ObjectTrie::Options data_options;
+    data_options.cache_bytes = cache_bytes - cache_bytes / 8;
+    ObjectTrie::Options control_options;
+    control_options.cache_bytes = cache_bytes / 8;
+    data_.trie = std::make_unique<ObjectTrie>(root_ / "ledger-data", key_, data_options);
+    control_.trie = std::make_unique<ObjectTrie>(root_ / "ledger-control", key_, control_options);
+    if (!std::filesystem::exists(root_ / "ledger"))
+        migrate_locked();
     load_journal_locked();
 }
 
@@ -463,9 +462,7 @@ void RetentionStore::retain_batch(RetentionClass type, const std::vector<ObjectI
         return;
     if (dot.origin == NodeId{} || !dot.sequence)
         throw std::runtime_error("invalid retention mutation dot");
-    auto ids = input;
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    const auto ids = sorted_unique(input);
 
     Lock lock(mutex_);
     for (size_t begin = 0; begin < ids.size(); begin += retain_ids_per_frame) {
@@ -478,53 +475,63 @@ void RetentionStore::retain_batch(RetentionClass type, const std::vector<ObjectI
         writer.u32(static_cast<uint32_t>(end - begin));
         for (size_t i = begin; i < end; ++i)
             writer.fixed(ids[i].bytes);
-        append_frame_locked(writer.data());
-        std::vector<ObjectId> slice(ids.begin() + static_cast<std::ptrdiff_t>(begin),
-                                    ids.begin() + static_cast<std::ptrdiff_t>(end));
-        apply_add_locked(type, dot, slice);
+        journal_.append(writer.data());
+        apply_add_locked(type, dot,
+                         std::vector<ObjectId>(ids.begin() + static_cast<std::ptrdiff_t>(begin),
+                                               ids.begin() + static_cast<std::ptrdiff_t>(end)));
+        if (changed_ >= checkpoint_changed)
+            checkpoint_locked();
     }
 }
 
 bool RetentionStore::retained(RetentionClass type, const ObjectId& id) const {
     Lock lock(mutex_);
-    const auto& state = state_for(type);
-    const auto found = state.find(id);
-    return found != state.end() && !found->second.adds.empty();
+    const auto record = class_for(type).trie->get(id);
+    return record && claimed(*record);
 }
 
 RetentionStore::Claims RetentionStore::claims(RetentionClass type, const ObjectId& id) const {
     Lock lock(mutex_);
-    const auto& state = state_for(type);
-    const auto found = state.find(id);
-    if (found == state.end())
+    const auto record = class_for(type).trie->get(id);
+    if (!record)
         return {};
-    return {found->second.adds, found->second.removed};
+    auto object = decode_state(*record);
+    return {std::move(object.adds), std::move(object.removed)};
 }
 
 std::vector<ObjectId> RetentionStore::retained_ids(RetentionClass type) const {
     Lock lock(mutex_);
     std::vector<ObjectId> ids;
-    for (const auto& [id, state] : state_for(type))
-        if (!state.adds.empty())
-            ids.push_back(id);
-    return ids;
+    std::optional<ObjectId> after;
+    while (true) {
+        const auto page = class_for(type).trie->next(after, scan_page);
+        for (const auto& [id, record] : page)
+            if (claimed(record))
+                ids.push_back(id);
+        if (page.size() < scan_page)
+            return ids;
+        after = page.back().first;
+    }
 }
 
 std::optional<ObjectId> RetentionStore::next_retained(
     RetentionClass type, std::optional<ObjectId>& cursor, bool& complete) const {
     Lock lock(mutex_);
-    const auto& state = state_for(type);
-    auto it = cursor ? state.upper_bound(*cursor) : state.begin();
-    while (it != state.end() && it->second.adds.empty())
-        ++it;
-    if (it == state.end()) {
-        complete = true;
-        cursor.reset();
-        return {};
+    while (true) {
+        const auto page = class_for(type).trie->next(cursor, scan_page);
+        for (const auto& [id, record] : page) {
+            cursor = id;
+            if (claimed(record)) {
+                complete = false;
+                return id;
+            }
+        }
+        if (page.size() < scan_page) {
+            complete = true;
+            cursor.reset();
+            return {};
+        }
     }
-    cursor = it->first;
-    complete = false;
-    return it->first;
 }
 
 size_t RetentionStore::release_unreferenced(RetentionClass type,
@@ -533,49 +540,31 @@ size_t RetentionStore::release_unreferenced(RetentionClass type,
                                             size_t operation_budget) {
     if (!operation_budget || observed.empty())
         return 0;
-
-    Lock lock(mutex_);
-    auto& state = state_for(type);
-    auto& cursor = cursor_for(type);
-    if (state.empty()) {
-        cursor.reset();
-        return 0;
-    }
-
-    auto it = cursor ? state.upper_bound(*cursor) : state.begin();
-    if (it == state.end())
-        it = state.begin();
-    const auto start = it;
-    bool wrapped = false;
-    std::vector<ObjectId> candidates;
-    candidates.reserve(operation_budget);
-
-    // A bounded stretch of claims from where the last call stopped: commits
-    // take this lock for their own claims, and nearly every claim is live,
-    // so a call that looked at them all would hold it for the whole store.
-    const size_t examine_max = std::max<size_t>(operation_budget * 128, 8192);
-    size_t examined = 0;
-    while (it != state.end() && candidates.size() < operation_budget &&
-           examined++ < examine_max) {
-        if (!std::binary_search(live.begin(), live.end(), it->first) && !it->second.adds.empty())
-            candidates.push_back(it->first);
-        cursor = it->first;
-        ++it;
-        if (it == state.end() && !wrapped) {
-            it = state.begin();
-            wrapped = true;
-        }
-        if (wrapped && it == start)
-            break;
-    }
-    if (candidates.empty())
-        return 0;
-
     RetentionClock encoded_clock;
     for (const auto& [node, sequence] : observed)
         if (node != NodeId{} && sequence)
             encoded_clock[node] = sequence;
     if (encoded_clock.empty())
+        return 0;
+
+    Lock lock(mutex_);
+    auto& ledger = class_for(type);
+    if (ledger.trie->size() == 0) {
+        ledger.release_after.reset();
+        return 0;
+    }
+    // A bounded stretch of claims from where the last call stopped: commits
+    // take this lock for their own claims, and nearly every claim is live,
+    // so a call that looked at them all would hold it for the whole store.
+    std::vector<ObjectId> candidates;
+    candidates.reserve(operation_budget);
+    scan_locked(ledger, ledger.release_after, std::max<size_t>(operation_budget * 128, 8192),
+                [&](const ObjectId& id, std::span<const uint8_t> record) {
+                    if (claimed(record) && !std::binary_search(live.begin(), live.end(), id))
+                        candidates.push_back(id);
+                    return candidates.size() < operation_budget;
+                });
+    if (candidates.empty())
         return 0;
 
     Writer writer;
@@ -589,48 +578,22 @@ size_t RetentionStore::release_unreferenced(RetentionClass type,
     writer.u32(static_cast<uint32_t>(candidates.size()));
     for (const auto& id : candidates)
         writer.fixed(id.bytes);
-    append_frame_locked(writer.data());
-    return apply_release_locked(type, encoded_clock, candidates);
+    journal_.append(writer.data());
+    const auto released = apply_release_locked(type, encoded_clock, std::move(candidates));
+    if (changed_ >= checkpoint_changed)
+        checkpoint_locked();
+    return released;
 }
 
 size_t RetentionStore::claim_objects(RetentionClass type) const {
-    Lock lock(mutex_);
-    size_t count = 0;
-    for (const auto& [_, state] : state_for(type))
-        if (!state.adds.empty())
-            ++count;
-    return count;
+    return retained_ids(type).size();
 }
 
 bool RetentionStore::compact_if_needed(size_t record_threshold) {
     Lock lock(mutex_);
     if (journal_.frames() < record_threshold && journal_.bytes() < journal_compact_bytes)
         return false;
-
-    const auto generation = "gen-" + std::to_string(unix_ms()) + "-" +
-                            std::to_string(getpid()) + "-" +
-                            std::to_string(journal_.frames());
-    const auto generation_path = checkpoint_root_ / generation;
-    std::filesystem::create_directories(generation_path);
-    for (size_t i = 0; i < checkpoint_shards; ++i) {
-        const auto shard = static_cast<uint8_t>(i);
-        const auto encoded = encode_checkpoint_shard_locked(shard);
-        durable_replace_file(
-            generation_path / shard_name(shard),
-            std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
-    }
-    // Persist the generation directory entry before publishing the tiny manifest
-    // which makes the complete set authoritative.
-    sync_directory(checkpoint_root_);
-    durable_replace_file(checkpoint_manifest_path_, generation + "\n");
-
-    // The checkpoint is already durable. If this replacement fails or the
-    // process dies before it, replaying the old journal is idempotent.
-    journal_.reset();
-
-    std::error_code remove_error;
-    std::filesystem::remove(legacy_checkpoint_path_, remove_error);
-    cleanup_checkpoint_generations_locked(generation);
+    checkpoint_locked();
     return true;
 }
 
@@ -640,39 +603,22 @@ size_t RetentionStore::prune_unclaimed(
     if (!operation_budget || !exists)
         return 0;
     // Three steps, so `exists` (which may read a device) runs without mutex_:
-    // pick the unclaimed rows under the lock, ask the store without it, then
-    // erase under the lock only what is still unclaimed.
+    // pick the unclaimed records under the lock, ask the store without it,
+    // then journal and erase under the lock only what is still unclaimed.
     std::vector<ObjectId> unclaimed;
     {
         Lock lock(mutex_);
-        auto& state = state_for(type);
-        auto& cursor = prune_cursor_for(type);
-        if (state.empty()) {
-            cursor.reset();
+        auto& ledger = class_for(type);
+        if (ledger.trie->size() == 0) {
+            ledger.prune_after.reset();
             return 0;
         }
-
-        auto it = cursor ? state.upper_bound(*cursor) : state.begin();
-        if (it == state.end())
-            it = state.begin();
-        const auto start_id = it->first;
-        bool wrapped = false;
-        size_t examined = 0;
-        while (examined < operation_budget) {
-            if (it == state.end()) {
-                if (wrapped)
-                    break;
-                it = state.begin();
-                wrapped = true;
-            }
-            if (wrapped && it->first == start_id)
-                break;
-            ++examined;
-            if (it->second.adds.empty())
-                unclaimed.push_back(it->first);
-            cursor = it->first;
-            ++it;
-        }
+        scan_locked(ledger, ledger.prune_after, operation_budget,
+                    [&](const ObjectId& id, std::span<const uint8_t> record) {
+                        if (!claimed(record))
+                            unclaimed.push_back(id);
+                        return true;
+                    });
     }
 
     std::erase_if(unclaimed, [&](const ObjectId& id) { return exists(id); });
@@ -680,17 +626,18 @@ size_t RetentionStore::prune_unclaimed(
         return 0;
 
     Lock lock(mutex_);
-    auto& state = state_for(type);
-    size_t removed = 0;
-    for (const auto& id : unclaimed) {
-        auto it = state.find(id);
-        if (it != state.end() && it->second.adds.empty()) {
-            state.erase(it);
-            ++removed;
-        }
-    }
-    if (state.empty())
-        prune_cursor_for(type).reset();
+    Writer writer;
+    writer.u8(op_prune);
+    writer.u8(static_cast<uint8_t>(type));
+    writer.u32(static_cast<uint32_t>(unclaimed.size()));
+    for (const auto& id : unclaimed)
+        writer.fixed(id.bytes);
+    journal_.append(writer.data());
+    const auto removed = apply_prune_locked(type, std::move(unclaimed));
+    if (class_for(type).trie->size() == 0)
+        class_for(type).prune_after.reset();
+    if (changed_ >= checkpoint_changed)
+        checkpoint_locked();
     return removed;
 }
 

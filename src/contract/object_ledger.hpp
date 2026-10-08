@@ -69,7 +69,7 @@ class ObjectLedger {
     static constexpr Waits prune_waits = held_waits | ClaimStore::prune_waits;
     static constexpr ThreadSafety prune_safety = ClaimStore::prune_safety;
     virtual size_t prune_unclaimed(RetentionClass, size_t operation_budget) = 0;
-    // Compacts the claims' journal past a threshold.
+    // Checkpoints the claims and empties their journal past a threshold.
     static constexpr Waits compact_waits = ClaimStore::compact_waits;
     static constexpr ThreadSafety compact_safety = ClaimStore::compact_safety;
     virtual bool compact_if_needed(size_t record_threshold) = 0;
