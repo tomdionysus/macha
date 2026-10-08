@@ -170,8 +170,8 @@ Each ships alone, with the suite green on the laptop and fi-1.
    answers `held` as it does today, and nothing waits on it. Exit: a
    restart of gbni-1 is ready within the 30 s bound with `held_indexed`
    true at once; verification finds nothing to correct. Shipped 0.90.54;
-   the verification pass is 0.90.57 (a maintenance step, a directory at a
-   time, a pass a day). Open: a seed that does not hold flushes off.
+   the verification pass is 0.90.57/58 (a maintenance step paced by time, a
+   directory at a time, a pass a day). Open: a seed that does not hold flushes off.
 3. **Claims in the ledger.** Done in 0.90.55: one trie a class under
    `retention/ledger-{data,control}`, the record an object's observed-remove
    state, `claims.log` the journal; prunes journaled; checkpoint at the old

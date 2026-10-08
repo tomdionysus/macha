@@ -1,5 +1,18 @@
 # Current release
 
+## 0.90.58: the ledger check paced by time
+
+No API, wire, protocol or on-disk changes.
+
+0.90.57 checked one or sixteen directories each time maintenance woke, but a
+quiet node wakes about once a minute (`maintenance_wakeups` 1 a window on
+gbni-1), so a pass would have taken days. The check now paces by time: four
+directories a second, one every four seconds while viewers or loaders are
+active, at most 256 a wake; a pass of 65,536 takes about 4.5 hours idle, and
+the next starts a day after. Progress is counted as
+`ledger.verify.directories`, and a finished pass is logged as `storage held
+ledgers verified against the disk`.
+
 ## 0.90.57: the held ledger checked against the disk
 
 No API, wire, protocol or on-disk changes.

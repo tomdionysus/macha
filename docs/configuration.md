@@ -134,8 +134,8 @@ a restart knows what it holds without walking its disk (`data-<disk token>`
 per DATA backend, named by the disk's own identity, and `control`). The
 first start on a version that keeps one walks the store once to seed it, in
 the background; every later start reads it. Maintenance checks each held
-ledger against its disk once a day, one `objects/xx/yy` directory at a time
-(one a pass while viewers or loaders are active, sixteen otherwise): a file
+ledger against its disk a pass a day, `objects/xx/yy` directories at four a
+second (one every four seconds while viewers or loaders are active): a file
 the ledger does not list is recorded held, and a listed object whose file is
 gone is recorded lost, so repair puts it back. The retention claims are kept
 the same way, one trie a class under `<state_path>/retention/ledger-data`

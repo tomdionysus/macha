@@ -248,6 +248,8 @@ void Maintenance::run(std::stop_token stop) {
     auto network_quiescent_until = Clock::time_point{};
     auto local_quiescent_until = Clock::time_point{};
     auto ledger_verify_due = Clock::time_point{};
+    auto ledger_verify_at = Clock::time_point{};
+    double ledger_verify_credit = 0.0;
     auto gc_quiescent_until = Clock::time_point{};
     auto scrub_due_unix_ms = initialise_scrub_due(node_.config().state_path, policy.scrub_interval);
     double network_credit = 0.0;
@@ -1104,17 +1106,34 @@ void Maintenance::run(std::stop_token stop) {
                 }
             }
 
-            // The held ledgers checked against the disk, a directory or a few
-            // a pass (paced, never waiting for viewers to stop), a pass a day.
+            // The held ledgers checked against the disk at a rate, whatever
+            // the wake cadence: four directories a second, one every four
+            // while viewers or loaders are active (paced, never waiting for
+            // them to stop); a pass of 65,536, then a day's rest.
             if (now >= ledger_verify_due) {
-                enter_stage("ledger-verify");
-                const size_t directories = busy ? 1 : 16;
-                const auto data = local_.data().verify_step(directories);
-                const auto control = local_.control().verify_step(directories);
-                observations().add("ledger.verify.recorded", data.recorded + control.recorded);
-                observations().add("ledger.verify.lost", data.lost + control.lost);
-                if (data.complete && control.complete)
-                    ledger_verify_due = now + std::chrono::hours(24);
+                const double seconds =
+                    ledger_verify_at == Clock::time_point{}
+                        ? 1.0
+                        : std::chrono::duration<double>(now - ledger_verify_at).count();
+                ledger_verify_at = now;
+                ledger_verify_credit =
+                    std::min(256.0, ledger_verify_credit + seconds * (busy ? 0.25 : 4.0));
+                const auto directories = static_cast<size_t>(ledger_verify_credit);
+                if (directories) {
+                    ledger_verify_credit -= static_cast<double>(directories);
+                    enter_stage("ledger-verify");
+                    const auto data = local_.data().verify_step(directories);
+                    const auto control = local_.control().verify_step(directories);
+                    observations().add("ledger.verify.directories", directories);
+                    observations().add("ledger.verify.recorded",
+                                       data.recorded + control.recorded);
+                    observations().add("ledger.verify.lost", data.lost + control.lost);
+                    if (data.complete && control.complete) {
+                        ledger_verify_due = now + std::chrono::hours(24);
+                        ledger_verify_at = {};
+                        Log::info("storage held ledgers verified against the disk");
+                    }
+                }
             }
 
         } catch (const MetadataNotReady&) {
