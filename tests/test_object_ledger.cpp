@@ -9,12 +9,14 @@
 #include "storage/sealed_journal.hpp"
 #include "test_support.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <fstream>
 #include <future>
 #include <map>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace macha;
@@ -575,6 +577,76 @@ MACHA_FAST_TEST("object_ledger", test_a_format_1_trie_opens_and_is_rewritten) {
     CHECK(std::string(magic.data(), 8) == "MLTR0002");
     ObjectTrie reopened(dir.path(), key, small_options());
     check_matches(reopened, model, random);
+}
+
+// A snapshot keeps the records it was taken with, read from several threads,
+// while the trie changes, checkpoints and rewrites its node file under it.
+MACHA_FAST_TEST("object_ledger", test_a_snapshot_is_frozen_through_writes_and_rewrites) {
+    TempDir dir;
+    std::mt19937_64 random(22);
+    ObjectTrie trie(dir.path(), key_of(18), small_options());
+    std::map<ObjectId, Bytes> model;
+    std::vector<ObjectId> ids;
+    std::vector<ObjectTrie::Change> first;
+    for (int i = 0; i < 3000; ++i) {
+        ids.push_back(id_of(random));
+        first.push_back({ids.back(), value_of(random)});
+        model[ids.back()] = *first.back().value;
+    }
+    trie.apply(first);
+    trie.checkpoint();
+    // Some unsaved changes too, held in memory by the snapshot.
+    std::vector<ObjectTrie::Change> unsaved;
+    for (int i = 0; i < 50; ++i) {
+        unsaved.push_back({ids[static_cast<size_t>(i)], std::nullopt});
+        model.erase(ids[static_cast<size_t>(i)]);
+    }
+    trie.apply(unsaved);
+    const auto frozen = trie.snapshot();
+    const auto hash = trie.root_hash();
+
+    const auto read_all = [&](const ObjectTrie::Snapshot& snapshot) {
+        std::map<ObjectId, Bytes> out;
+        std::optional<ObjectId> after;
+        while (true) {
+            const auto page = snapshot.next(after, 101);
+            for (const auto& [id, value] : page)
+                out.emplace(id, value);
+            if (page.size() < 101)
+                return out;
+            after = page.back().first;
+        }
+    };
+    std::atomic_bool done{false};
+    std::atomic_int mismatches{0};
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 4; ++r)
+        readers.emplace_back([&, r] {
+            std::mt19937_64 pick(static_cast<uint64_t>(100 + r));
+            while (!done.load()) {
+                const auto& id = ids[pick() % ids.size()];
+                const auto found = model.find(id);
+                const auto got = frozen.get(id);
+                if (found == model.end() ? got.has_value() : got != found->second)
+                    ++mismatches;
+            }
+        });
+    // Rewrite the same ids many times: checkpoints and node-file rewrites.
+    for (int round = 0; round < 30; ++round) {
+        std::vector<ObjectTrie::Change> batch;
+        for (const auto& id : ids)
+            batch.push_back({id, value_of(random)});
+        trie.apply(batch);
+    }
+    done = true;
+    for (auto& reader : readers)
+        reader.join();
+    CHECK(mismatches.load() == 0);
+    CHECK(trie.stats().rewrites > 0);
+    CHECK(frozen.size() == model.size());
+    CHECK(frozen.root_hash() == hash);
+    CHECK(read_all(frozen) == model);
+    CHECK(trie.root_hash() != hash);
 }
 
 // Stage 1's measurement: a synthetic class of MACHA_LEDGER_MEASURE_RECORDS

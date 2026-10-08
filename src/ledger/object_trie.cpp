@@ -5,11 +5,13 @@
 #include "crypto.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
+#include "contract/thread_safety.hpp"
 
 #include <algorithm>
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -62,6 +64,80 @@ Hash256 format1_leaf_hash(Reader& reader, uint32_t count, std::vector<ObjectTrie
 }
 
 } // namespace
+
+class ObjectTrie::NodeCache {
+  public:
+    explicit NodeCache(size_t bound) : bound_(bound) {}
+
+    NodePtr find(uint64_t generation, uint64_t offset) {
+        Lock lock(mutex_);
+        const auto found = entries_.find({generation, offset});
+        if (found == entries_.end())
+            return {};
+        recent_.splice(recent_.begin(), recent_, found->second.recent);
+        return found->second.node;
+    }
+
+    void insert(uint64_t generation, uint64_t offset, NodePtr node, size_t bytes) {
+        Lock lock(mutex_);
+        ++loads_;
+        const Key key{generation, offset};
+        if (entries_.contains(key))
+            return;
+        recent_.push_front(key);
+        entries_.emplace(key, Cached{std::move(node), bytes, recent_.begin()});
+        used_ += bytes;
+        while (used_ > bound_ && recent_.size() > 1) {
+            const auto victim = entries_.find(recent_.back());
+            recent_.pop_back();
+            used_ -= victim->second.bytes;
+            entries_.erase(victim);
+        }
+    }
+
+    void drop_generation(uint64_t generation) {
+        Lock lock(mutex_);
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->first.first != generation) {
+                ++it;
+                continue;
+            }
+            used_ -= it->second.bytes;
+            recent_.erase(it->second.recent);
+            it = entries_.erase(it);
+        }
+    }
+
+    struct Usage {
+        size_t bytes{};
+        size_t nodes{};
+        uint64_t loads{};
+    };
+    Usage usage() const {
+        Lock lock(mutex_);
+        return {used_, entries_.size(), loads_};
+    }
+
+  private:
+    using Key = std::pair<uint64_t, uint64_t>;
+    struct Cached {
+        NodePtr node;
+        size_t bytes{};
+        std::list<Key>::iterator recent;
+    };
+    mutable Mutex mutex_;
+    std::map<Key, Cached> entries_ MACHA_GUARDED_BY(mutex_);
+    std::list<Key> recent_ MACHA_GUARDED_BY(mutex_);
+    size_t used_ MACHA_GUARDED_BY(mutex_){};
+    const size_t bound_;
+    uint64_t loads_ MACHA_GUARDED_BY(mutex_){};
+};
+
+struct ObjectTrie::Snapshot::Source {
+    uint64_t generation{};
+    std::shared_ptr<const SealedJournal::FrameReader> file;
+    std::shared_ptr<NodeCache> cache;
+};
 
 std::filesystem::path ObjectTrie::nodes_path(uint64_t generation) const {
     return dir_ / ("nodes-" + std::to_string(generation) + ".bin");
@@ -144,7 +220,7 @@ Bytes ObjectTrie::encode(const Node& node) const {
     return writer.take();
 }
 
-ObjectTrie::NodePtr ObjectTrie::decode(std::span<const uint8_t> bytes) const {
+ObjectTrie::NodePtr ObjectTrie::decode(std::span<const uint8_t> bytes, bool format1) {
     Reader reader(bytes);
     const auto kind = reader.u8();
     const auto depth = reader.u8();
@@ -156,7 +232,7 @@ ObjectTrie::NodePtr ObjectTrie::decode(std::span<const uint8_t> bytes) const {
             throw DecodeError("object trie leaf of the wrong size");
         std::vector<Record> records;
         records.reserve(count);
-        if (format1_) {
+        if (format1) {
             const auto hash = format1_leaf_hash(reader, count, records);
             reader.finish();
             for (size_t i = 1; i < records.size(); ++i)
@@ -202,32 +278,26 @@ ObjectTrie::NodePtr ObjectTrie::decode(std::span<const uint8_t> bytes) const {
     return node;
 }
 
-ObjectTrie::NodePtr ObjectTrie::load(const Child& child) const {
+ObjectTrie::NodePtr ObjectTrie::load_from(const Child& child, uint64_t generation,
+                                          const Read& read, NodeCache& cache, bool format1) {
     if (child.node)
         return child.node;
     if (child.empty() || child.offset == unsaved)
         throw std::logic_error("object trie: loading an empty child");
-    if (const auto found = cache_.find(child.offset); found != cache_.end()) {
-        recent_.splice(recent_.begin(), recent_, found->second.recent);
-        return found->second.node;
-    }
-    auto node = decode(nodes_->read_at(child.offset));
+    if (auto cached = cache.find(generation, child.offset))
+        return cached;
+    auto node = decode(read(child.offset), format1);
     if (node->hash != child.hash || node->count != child.count)
         throw std::runtime_error("object trie node at " + std::to_string(child.offset) +
                                  " does not match its parent");
-    ++loads_;
-    recent_.push_front(child.offset);
-    const auto bytes = footprint(*node);
-    cache_.emplace(child.offset, Cached{node, bytes, recent_.begin()});
-    cache_used_ += bytes;
-    while (cache_used_ > options_.cache_bytes && recent_.size() > 1) {
-        const auto victim = recent_.back();
-        recent_.pop_back();
-        const auto found = cache_.find(victim);
-        cache_used_ -= found->second.bytes;
-        cache_.erase(found);
-    }
+    cache.insert(generation, child.offset, node, footprint(*node));
     return node;
+}
+
+ObjectTrie::NodePtr ObjectTrie::load(const Child& child) const {
+    return load_from(
+        child, generation_, [this](uint64_t offset) { return nodes_->read_at(offset); }, *cache_,
+        format1_);
 }
 
 ObjectTrie::Child ObjectTrie::build(uint8_t depth, std::vector<Record> records) const {
@@ -358,7 +428,8 @@ void ObjectTrie::publish_root() const {
 }
 
 ObjectTrie::ObjectTrie(std::filesystem::path dir, std::array<uint8_t, 32> key, Options options)
-    : dir_(std::move(dir)), key_(key), options_(options) {
+    : dir_(std::move(dir)), key_(key), options_(options),
+      cache_(std::make_shared<NodeCache>(options.cache_bytes)) {
     std::filesystem::create_directories(dir_);
     if (std::ifstream in(dir_ / "root", std::ios::binary); in) {
         const Bytes bytes{std::istreambuf_iterator<char>(in), {}};
@@ -531,9 +602,7 @@ void ObjectTrie::checkpoint() {
         root_ = rewritten;
         live_bytes_ = fresh->bytes();
         nodes_ = std::move(fresh);
-        cache_.clear();
-        recent_.clear();
-        cache_used_ = 0;
+        cache_->drop_generation(generation_ - 1);
         publish_root();
         std::filesystem::remove(old, ec);
         ++rewrites_;
@@ -542,10 +611,11 @@ void ObjectTrie::checkpoint() {
     }
 }
 
-std::optional<Bytes> ObjectTrie::get(const ObjectId& id) const {
-    if (root_.empty())
+std::optional<Bytes> ObjectTrie::find(const Child& root, const ObjectId& id,
+                                      const std::function<NodePtr(const Child&)>& load) {
+    if (root.empty())
         return std::nullopt;
-    auto node = load(root_);
+    auto node = load(root);
     while (!node->leaf) {
         const auto& child = node->children[id.bytes[node->depth]];
         if (child.empty())
@@ -561,7 +631,8 @@ std::optional<Bytes> ObjectTrie::get(const ObjectId& id) const {
 }
 
 void ObjectTrie::collect(const Child& child, const std::optional<ObjectId>& after, bool bounded,
-                         size_t limit, std::vector<Record>& out) const {
+                         size_t limit, std::vector<Record>& out,
+                         const std::function<NodePtr(const Child&)>& load) {
     if (child.empty() || out.size() >= limit)
         return;
     const auto node = load(child);
@@ -577,13 +648,51 @@ void ObjectTrie::collect(const Child& child, const std::optional<ObjectId>& afte
     }
     const size_t start = bounded ? after->bytes[node->depth] : 0;
     for (size_t i = start; i < 256 && out.size() < limit; ++i)
-        collect(node->children[i], after, bounded && i == start, limit, out);
+        collect(node->children[i], after, bounded && i == start, limit, out, load);
+}
+
+std::optional<Bytes> ObjectTrie::get(const ObjectId& id) const {
+    return find(root_, id, [this](const Child& child) { return load(child); });
 }
 
 std::vector<ObjectTrie::Record> ObjectTrie::next(const std::optional<ObjectId>& after,
                                                  size_t limit) const {
     std::vector<Record> out;
-    collect(root_, after, after.has_value(), limit, out);
+    collect(root_, after, after.has_value(), limit, out,
+            [this](const Child& child) { return load(child); });
+    return out;
+}
+
+ObjectTrie::Snapshot ObjectTrie::snapshot() const {
+    Snapshot out;
+    out.root_ = root_;
+    out.source_ = std::make_shared<const Snapshot::Source>(
+        Snapshot::Source{generation_, nodes_->reader(), cache_});
+    return out;
+}
+
+std::optional<Bytes> ObjectTrie::Snapshot::get(const ObjectId& id) const {
+    if (root_.empty())
+        return std::nullopt;
+    const auto& source = *source_;
+    return find(root_, id, [&](const Child& child) {
+        return load_from(
+            child, source.generation,
+            [&](uint64_t offset) { return source.file->read_at(offset); }, *source.cache, false);
+    });
+}
+
+std::vector<ObjectTrie::Record> ObjectTrie::Snapshot::next(const std::optional<ObjectId>& after,
+                                                           size_t limit) const {
+    std::vector<Record> out;
+    if (root_.empty())
+        return out;
+    const auto& source = *source_;
+    collect(root_, after, after.has_value(), limit, out, [&](const Child& child) {
+        return load_from(
+            child, source.generation,
+            [&](uint64_t offset) { return source.file->read_at(offset); }, *source.cache, false);
+    });
     return out;
 }
 
@@ -596,8 +705,9 @@ Hash256 ObjectTrie::root_hash() const noexcept {
 }
 
 ObjectTrie::Stats ObjectTrie::stats() const noexcept {
-    return {journal_->bytes(), nodes_->bytes(), live_bytes_, cache_used_,
-            cache_.size(),     loads_,          checkpoints_, rewrites_};
+    const auto usage = cache_->usage();
+    return {journal_->bytes(), nodes_->bytes(), live_bytes_,  usage.bytes,
+            usage.nodes,       usage.loads,     checkpoints_, rewrites_};
 }
 
 } // namespace macha
