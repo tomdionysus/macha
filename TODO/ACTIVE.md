@@ -60,7 +60,29 @@ control store's barrier is mean 0.6 ms, max 3.3 ms on gbni-1 and mean
 max 5.1 s: syncfs flushes the whole disk, torrent staging and the FUSE
 spool included, and libtorrent's writes keep no write-behind. Viewer and
 loader DATA writes wait on it; not control.
-CPU and memory audits still to do.
+CPU and memory audit (2026-10-08), ranked:
+1. One metadata-mutation worker (`metadata_workers` 1) serves every class
+   first come: a control accept waits behind history imports and
+   checkpoint rewrites (net.cpp:3727-3736, :4437); its queue limits are
+   shared.
+2. Background work travels as control: maintenance's head repair
+   (maintenance.cpp:1045, full history record on the peer) and cluster
+   job polling and torrent actions (cluster_jobs.cpp, torrent_coordinator)
+   run on the 2-worker RPC control lane; `class_allowed` forces it
+   (net.cpp:438-445).
+3. Whole-record copies inline on control threads (get_metadata,
+   get_committed_metadata, accept_commit decode).
+4. No CPU priority anywhere: no nice, SCHED or cgroup weight; an x264
+   transcode uses every core (media_engine.cpp:777).
+5. The ledger counts few large structures (metadata, catalogue, cache
+   owners declared, never charged); the 64 MB control reserve protects
+   counted bytes only.
+6. Control-class background work (2.) can take the control reserve;
+   `restore()` overcommits without the reserve.
+7. Account create, update and root reset run scrypt outside the password
+   check limit.
+Protected: separate HTTP and RPC control pools, ping and members on their
+own workers, non-waiting ledger admission, DATA arbiter refuses control.
 
 ## 1. The catalogue plan: a materialised view of the local head
 
@@ -105,6 +127,17 @@ item in section 0, then stage 6.
   first write while the set forms is refused when a peer's survey answer
   is late, and the test treats the refusal as fatal. P0: decide whether the
   write should wait for the survey, or the test retry the refusal.
+- **A peer's restart blinds the availability survey for about 15 minutes,
+  and once returned a false answer** (fi-1, 2026-10-07/08). After every
+  gbni-1 restart (19:02, 19:25, 20:38, 21:38, 06:07Z) fi-1's survey counts
+  the peer failed (`unknown` about 690,000) for about 15 minutes, so a read
+  no node can serve waits 6 to 16 s for its refusal instead of 0.2 s. At
+  20:55:09Z a survey that succeeded reported 686,296 unavailable against
+  about 204,000 true: the peer answered from a partial view. Reads refuse
+  at once and repair's pull skips what the survey calls unavailable, so for
+  that minute files held on gbni-1 could be refused on fi-1. The survey
+  swallows the peer's error (availability.cpp:301); a peer must not answer
+  before its holdings are complete, and the error must be said.
 - **Repair deleted a copy it had nowhere to send** (fixed 0.90.50): a node
   hosting nothing and knowing no host had a target of zero owners, so
   repair dropped its local copy. fi-1 did not host 2026-09-15 to 09-24 and
