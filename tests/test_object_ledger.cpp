@@ -2,6 +2,7 @@
 // The object ledger's primitives: the sealed journal it shares with the
 // retention store, and the per-class trie.
 #include "ledger/object_trie.hpp"
+#include "storage/local_store.hpp"
 #include "storage/sealed_journal.hpp"
 #include "test_support.hpp"
 
@@ -14,6 +15,7 @@
 
 using namespace macha;
 using namespace macha::test_support;
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -496,6 +498,66 @@ MACHA_HEAVY_TEST("object_ledger", test_a_large_trie_opens_within_the_bound) {
               " loads=" + std::to_string(stats.loads));
     CHECK(open_ms < 30000);
     CHECK(stats.cache_bytes <= options.cache_bytes + 64 * 1024);
+}
+
+// --- Stage 2: a store's held ledger --------------------------------------------
+
+LocalStoreOptions ledgered(const std::filesystem::path& ledger) {
+    LocalStoreOptions options;
+    options.limit = 64ULL * 1024 * 1024;
+    options.ledger_dir = ledger;
+    options.ledger_cache_bytes = 1024 * 1024;
+    return options;
+}
+
+MACHA_FAST_TEST("object_ledger", test_a_store_with_its_ledger_starts_knowing_what_it_holds) {
+    TempDir dir;
+    const auto root = dir.path() / "store";
+    const auto ledger = dir.path() / "ledger";
+    const auto key = key_of(14);
+    std::vector<ObjectId> kept;
+    std::vector<ObjectId> removed;
+    {
+        LocalStore store(root, ledgered(ledger), key);
+        // The first start walks its objects once and seeds the ledger.
+        REQUIRE(wait_until([&] { return std::filesystem::exists(ledger / "seeded"); }, 10s));
+        for (int i = 0; i < 40; ++i) {
+            const auto data = pattern(4096 + i, static_cast<uint8_t>(i));
+            const auto id = object_id(data);
+            REQUIRE(store.put(id, data));
+            (i % 4 == 0 ? removed : kept).push_back(id);
+        }
+        for (const auto& id : removed)
+            REQUIRE(store.remove(id));
+    }
+    // A file the ledger never heard of, as a crash between a file and its
+    // record would leave: written by a store keeping no ledger.
+    const auto unlisted_data = pattern(7777, 99);
+    const auto unlisted = object_id(unlisted_data);
+    {
+        LocalStore bare(root, 64ULL * 1024 * 1024, key);
+        REQUIRE(bare.put(unlisted, unlisted_data));
+    }
+    {
+        LocalStore store(root, ledgered(ledger), key);
+        // Known at once: no walk.
+        CHECK(store.indexed());
+        for (const auto& id : kept)
+            CHECK(store.has(id));
+        for (const auto& id : removed)
+            CHECK(!store.has(id));
+        // The ledger is the answer, so the unlisted file is not seen, which
+        // is also how this test knows nothing walked the store...
+        CHECK(!store.has(unlisted));
+        // ...until a read finds it, which records it.
+        CHECK(store.get(unlisted) == std::optional<Bytes>(unlisted_data));
+        CHECK(store.has(unlisted));
+    }
+    LocalStore again(root, ledgered(ledger), key);
+    CHECK(again.indexed());
+    CHECK(again.has(unlisted));
+    for (const auto& id : kept)
+        CHECK(again.has(id));
 }
 
 } // namespace

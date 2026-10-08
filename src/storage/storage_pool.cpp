@@ -73,9 +73,10 @@ StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
                          std::vector<StorageBackendConfig> configs,
                          std::array<uint8_t, 32> key,
                          std::chrono::milliseconds durability_batch_window,
-                         StoragePackingConfig packing)
+                         StoragePackingConfig packing, uint64_t ledger_cache)
     : state_path_(std::move(state_path)), node_id_(node_id), key_(key),
-      durability_batch_window_(durability_batch_window), packing_(packing) {
+      durability_batch_window_(durability_batch_window), packing_(packing),
+      ledger_cache_(ledger_cache) {
     reconfigure(configs);
     refresh();
 }
@@ -238,6 +239,13 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
             options.reserve_free = cfg.reserve_free;
             options.pack_threshold = packing_.threshold;
             options.pack_target_size = packing_.target_size;
+            if (ledger_cache_) {
+                // Named by the disk's own identity token: another disk in the
+                // same place starts its own ledger.
+                options.ledger_dir = state_path_ / "ledger" / ("data-" + to_string(token));
+                options.ledger_cache_bytes =
+                    static_cast<size_t>(ledger_cache_ / std::max<size_t>(1, ledger_shares_.load()));
+            }
             store = std::make_shared<LocalStore>(cfg.path, options, key_,
                                                  LocalStoreMode::authoritative,
                                                  durability_domain,
@@ -285,6 +293,7 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
 }
 
 void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) {
+    ledger_shares_.store(std::max<size_t>(1, configs.size()));
     std::vector<std::shared_ptr<LocalStore>> retired;
     {
         TimedLock lock(mutex_, "storage.pool");
