@@ -37,10 +37,15 @@ mechanism, not two). The operator answered the spec's five questions on
 `SealedJournal` (the retention store moved onto it unchanged) and
 `ObjectTrie`, tested and measured (laptop, 224,000 records: open with a
 near-full journal 437 ms, cold lookup 10 us); fi-1's figure at a few million
-records is still to take. Next, stage 2: `held` in the ledger, with a bulk
-build from sorted records for the seed (inserting record by record costs
-about 46 us a record with random ids, which a seed of 800,000 should not
-pay).
+records is still to take. Stage 2 is 0.90.54: every store keeps a held ledger under
+`<state_path>/ledger/`, seeded once from the first start's walk, then read at
+every start (indexed at once, no walk) and answering `has()`. To confirm on
+the cluster: the seed on the first 0.90.54 start (a log line "storage held
+ledger seeded"), then a gbni-1 restart that is indexed at once and whose
+peers' surveys never fail. Then stage 3, claims in the ledger. Still to do
+in stage 2: the slow background verification pass, and a bulk seed that
+does not hold flushes off while it builds (today a put waits for the seed
+on the first start).
 
 ## 2. Control must never wait: what is left
 

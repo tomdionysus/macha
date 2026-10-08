@@ -542,6 +542,9 @@ struct Config {
     // without data backends or inbound connectivity, `yes` otherwise.
     Tristate hosts_extents{Tristate::automatic};
     StoragePackingConfig storage_packing;
+    // The held ledgers' page cache: shared by the DATA backends, the control
+    // store keeping an eighth of it.
+    uint64_t ledger_cache{64ULL * 1024 * 1024};
     MetadataObjectStoreConfig metadata_store;
     CacheConfig cache;
     MaintenanceConfig maintenance;

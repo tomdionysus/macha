@@ -858,6 +858,8 @@ Config load_yaml_config(const std::filesystem::path& path) {
                 c.storage_packing.target_size = static_cast<size_t>(yaml_size(packing["target_size"]));
         }
     }
+    if (storage["ledger_cache"])
+        c.ledger_cache = yaml_size(storage["ledger_cache"]);
     if (auto metadata = storage["metadata"]) {
         if (!metadata.IsMap())
             throw std::runtime_error("storage.metadata must be a mapping");

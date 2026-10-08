@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "ledger/held_ledger.hpp"
 #include "crypto.hpp"
 #include "storage/durability_domain.hpp"
 #include <atomic>
@@ -45,6 +46,10 @@ struct LocalStoreOptions {
     uint64_t reserve_free{};
     size_t pack_threshold{};
     size_t pack_target_size{};
+    // Where this store keeps its held ledger, on the state device; none
+    // keeps none, and the store walks its objects at every start.
+    std::filesystem::path ledger_dir{};
+    size_t ledger_cache_bytes{8ULL * 1024 * 1024};
 };
 
 // The device work behind LocalStore's object reads, object writes and pack
@@ -189,6 +194,13 @@ class LocalStore final : public ObjectStore {
     // Fills presence_ from object directory names at start (readdir only, no
     // stat). Started by the constructor, joined by the destructor.
     std::jthread presence_thread_;
+    // Which loose objects this store holds, kept across restarts: once
+    // seeded, the answer to has() and the reason a start walks nothing.
+    std::unique_ptr<HeldLedger> ledger_;
+    // Journals and installs what the ledger has queued; a failure is the
+    // caller's write failing.
+    void flush_ledger() const;
+    void seed_ledger();
     std::atomic_uint64_t presence_index_entries_{};
     std::atomic_uint64_t pack_recovery_truncated_tails_{};
     std::atomic_uint64_t pack_recovery_skipped_regions_{};

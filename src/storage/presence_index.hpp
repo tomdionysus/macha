@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <set>
 #include <span>
+#include <vector>
 
 namespace macha {
 
@@ -54,6 +55,10 @@ class PresenceIndex {
     }
     size_t size() const noexcept {
         return present_.size();
+    }
+    // Every id known present, in order: what seeds the store's ledger.
+    std::vector<ObjectId> present() const {
+        return {present_.begin(), present_.end()};
     }
 };
 

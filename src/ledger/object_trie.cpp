@@ -384,6 +384,31 @@ void ObjectTrie::apply_unjournaled(std::span<const Change> changes) {
     root_ = mutate(root_, 0, changes);
 }
 
+void ObjectTrie::write(std::span<const Change> sorted_unique) {
+    for (size_t from = 0; from < sorted_unique.size(); from += changes_per_frame) {
+        const auto part = sorted_unique.subspan(
+            from, std::min(changes_per_frame, sorted_unique.size() - from));
+        Writer writer;
+        writer.u8(journal_version);
+        writer.u32(static_cast<uint32_t>(part.size()));
+        for (const auto& change : part) {
+            writer.fixed(change.id.bytes);
+            writer.u8(change.value ? 1 : 0);
+            if (change.value)
+                writer.u64(*change.value);
+        }
+        journal_->append(writer.data());
+    }
+}
+
+void ObjectTrie::install(std::span<const Change> sorted_unique) {
+    if (sorted_unique.empty())
+        return;
+    apply_unjournaled(sorted_unique);
+    if (journal_->bytes() >= options_.checkpoint_bytes)
+        checkpoint();
+}
+
 void ObjectTrie::apply(std::span<const Change> input) {
     if (input.empty())
         return;
@@ -399,23 +424,15 @@ void ObjectTrie::apply(std::span<const Change> input) {
         else
             unique.push_back(change);
     }
-    for (size_t from = 0; from < unique.size(); from += changes_per_frame) {
-        const auto part = std::span<const Change>(unique).subspan(
-            from, std::min(changes_per_frame, unique.size() - from));
-        Writer writer;
-        writer.u8(journal_version);
-        writer.u32(static_cast<uint32_t>(part.size()));
-        for (const auto& change : part) {
-            writer.fixed(change.id.bytes);
-            writer.u8(change.value ? 1 : 0);
-            if (change.value)
-                writer.u64(*change.value);
-        }
-        journal_->append(writer.data());
-        apply_unjournaled(part);
-    }
-    if (journal_->bytes() >= options_.checkpoint_bytes)
-        checkpoint();
+    write(unique);
+    install(unique);
+}
+
+void ObjectTrie::replace_all(std::vector<Record> records) {
+    // Everything saved is superseded; the rewrite reclaims it.
+    superseded_bytes_ = live_bytes_;
+    root_ = build(0, std::move(records));
+    checkpoint();
 }
 
 void ObjectTrie::checkpoint() {

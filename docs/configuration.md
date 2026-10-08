@@ -84,6 +84,7 @@ value rather than claiming to apply a limit after worker arenas already exist.
 ```yaml
 storage:
   hosts_extents: auto    # true | false | auto
+  ledger_cache: 64M
   data:
     backends:
       - path: /mnt/media-a/macha-data
@@ -126,6 +127,16 @@ node.
 Packing may be disabled by setting both `threshold` and `target_size` to zero. Otherwise `target_size` must be at least `threshold`.
 
 The metadata store has an independent limit and never consumes DATA quota.
+
+Each store keeps a held ledger under `<state_path>/ledger/`: which objects it
+holds, journaled before they change and checkpointed into a trie on disk, so
+a restart knows what it holds without walking its disk (`data-<disk token>`
+per DATA backend, named by the disk's own identity, and `control`). The
+first start on a version that keeps one walks the store once to seed it, in
+the background; every later start reads it. `ledger_cache` is the page cache
+the ledgers share, the control store keeping an eighth of it (default
+`64M`); a ledger's memory is its share of this, whatever the number of
+objects. Keep `state_path` on the fastest device, never on a DATA disk.
 
 ## DHT policy
 

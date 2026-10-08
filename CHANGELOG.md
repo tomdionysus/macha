@@ -1,5 +1,27 @@
 # Current release
 
+## 0.90.54: a restarted store knows what it holds (object ledger stage 2)
+
+No API, wire or protocol changes. New on disk: `<state_path>/ledger/`. New
+setting: `storage.ledger_cache` (default `64M`).
+
+Each store (every DATA backend and the control store) keeps a held ledger:
+which loose objects it holds, in an `ObjectTrie` on the state device, each
+change journaled before it applies. The first start on 0.90.54 walks the
+store once, as every start did before, and seeds the ledger from the walk in
+the background; from then on a start reads the ledger and is indexed at
+once: no walk. gbni-1's walk took 525 to 1,180 s for 807,000 to 840,000
+objects. Once seeded the ledger is `has()`'s answer, packs aside, and the
+walked index is dropped, so presence costs the ledger's cache, not memory per
+object. A put, a removal and a pruned empty file are recorded and flushed
+before the call returns; the journal's sync happens without the lookup lock,
+so a lookup never waits on another write's sync. A loose file the ledger
+does not list (a crash between the file and its record) is recorded by the
+read that finds it. Tests: a restarted store is indexed at once and answers
+for what was written and removed, without a walk (shown to fail with the
+ledger's answer switched off), and a read records an unlisted file across a
+restart.
+
 ## 0.90.53: the object ledger's trie and its journal (stage 1)
 
 No API, wire, protocol or on-disk changes for a running node: the trie is
