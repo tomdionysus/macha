@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The object ledger's primitives: the sealed journal it shares with the
 // retention store, and the per-class trie.
+#include "codec.hpp"
+#include "crypto.hpp"
 #include "ledger/object_trie.hpp"
 #include "storage/local_store.hpp"
 #include "storage/sealed_journal.hpp"
@@ -164,6 +166,14 @@ ObjectId id_of(std::mt19937_64& random) {
     return id;
 }
 
+// Of varying length, empty included.
+Bytes value_of(std::mt19937_64& random) {
+    Bytes value(random() % 24);
+    for (auto& byte : value)
+        byte = static_cast<uint8_t>(random());
+    return value;
+}
+
 ObjectTrie::Options small_options() {
     ObjectTrie::Options options;
     options.cache_bytes = 64 * 1024;
@@ -173,8 +183,8 @@ ObjectTrie::Options small_options() {
 }
 
 // Everything the trie holds, read back in order through next().
-std::map<ObjectId, uint64_t> contents(const ObjectTrie& trie) {
-    std::map<ObjectId, uint64_t> out;
+std::map<ObjectId, Bytes> contents(const ObjectTrie& trie) {
+    std::map<ObjectId, Bytes> out;
     std::optional<ObjectId> after;
     while (true) {
         const auto page = trie.next(after, 97);
@@ -187,12 +197,12 @@ std::map<ObjectId, uint64_t> contents(const ObjectTrie& trie) {
     return out;
 }
 
-void check_matches(const ObjectTrie& trie, const std::map<ObjectId, uint64_t>& model,
+void check_matches(const ObjectTrie& trie, const std::map<ObjectId, Bytes>& model,
                    std::mt19937_64& random) {
     CHECK(trie.size() == model.size());
     CHECK(contents(trie) == model);
     for (const auto& [id, value] : model)
-        CHECK(trie.get(id) == std::optional<uint64_t>(value));
+        CHECK(trie.get(id) == std::optional<Bytes>(value));
     for (int i = 0; i < 50; ++i)
         CHECK(!trie.get(id_of(random)).has_value());
 }
@@ -200,7 +210,7 @@ void check_matches(const ObjectTrie& trie, const std::map<ObjectId, uint64_t>& m
 MACHA_FAST_TEST("object_ledger", test_the_trie_holds_exactly_what_was_written) {
     TempDir dir;
     std::mt19937_64 random(11);
-    std::map<ObjectId, uint64_t> model;
+    std::map<ObjectId, Bytes> model;
     std::vector<ObjectId> known;
     ObjectTrie trie(dir.path(), key_of(6), small_options());
     CHECK(trie.size() == 0);
@@ -213,9 +223,9 @@ MACHA_FAST_TEST("object_ledger", test_the_trie_holds_exactly_what_was_written) {
             if (roll < 6 || known.empty()) {
                 const auto id = id_of(random);
                 known.push_back(id);
-                batch.push_back({id, random()});
+                batch.push_back({id, value_of(random)});
             } else if (roll < 8) {
-                batch.push_back({known[random() % known.size()], random()});
+                batch.push_back({known[random() % known.size()], value_of(random)});
             } else {
                 batch.push_back({known[random() % known.size()], std::nullopt});
             }
@@ -237,7 +247,7 @@ MACHA_FAST_TEST("object_ledger", test_the_trie_hash_depends_only_on_its_records)
     std::mt19937_64 random(12);
     std::vector<ObjectTrie::Change> records;
     for (int i = 0; i < 3000; ++i)
-        records.push_back({id_of(random), random()});
+        records.push_back({id_of(random), value_of(random)});
     TempDir one_dir;
     TempDir two_dir;
     ObjectTrie one(one_dir.path(), key_of(7), small_options());
@@ -254,7 +264,7 @@ MACHA_FAST_TEST("object_ledger", test_the_trie_hash_depends_only_on_its_records)
         auto id = id_of(random);
         id.bytes[0] = 7;
         id.bytes[1] = static_cast<uint8_t>(i % 3);
-        extra.push_back({id, random()});
+        extra.push_back({id, value_of(random)});
     }
     two.apply(extra);
     for (size_t from = 0; from < shuffled.size(); from += 37)
@@ -267,14 +277,14 @@ MACHA_FAST_TEST("object_ledger", test_the_trie_hash_depends_only_on_its_records)
     CHECK(one.root_hash() == two.root_hash());
     CHECK(contents(one) == contents(two));
     // One value different: the hashes differ.
-    two.apply(std::vector<ObjectTrie::Change>{{records[0].id, *records[0].value + 1}});
+    two.apply(std::vector<ObjectTrie::Change>{{records[0].id, Bytes{9, 9, 9}}});
     CHECK(one.root_hash() != two.root_hash());
 }
 
 MACHA_FAST_TEST("object_ledger", test_a_reopened_trie_is_the_one_that_was_closed) {
     TempDir dir;
     std::mt19937_64 random(13);
-    std::map<ObjectId, uint64_t> model;
+    std::map<ObjectId, Bytes> model;
     Hash256 hash{};
     {
         ObjectTrie trie(dir.path(), key_of(8), small_options());
@@ -282,12 +292,15 @@ MACHA_FAST_TEST("object_ledger", test_a_reopened_trie_is_the_one_that_was_closed
             std::vector<ObjectTrie::Change> batch;
             for (int i = 0; i < 300; ++i) {
                 const auto id = id_of(random);
-                const auto value = random();
+                const auto value = value_of(random);
                 batch.push_back({id, value});
                 model[id] = value;
             }
             trie.apply(batch);
         }
+        const auto last = id_of(random);
+        model[last] = Bytes{1};
+        trie.apply(std::vector<ObjectTrie::Change>{{last, Bytes{1}}});
         hash = trie.root_hash();
         // Some changes since the last checkpoint stay only in the journal.
         CHECK(trie.stats().journal_bytes > 0);
@@ -303,7 +316,7 @@ MACHA_FAST_TEST("object_ledger", test_a_crash_at_any_step_of_a_checkpoint_loses_
     std::mt19937_64 random(14);
     for (int step = 0; step < 3; ++step) {
         TempDir dir;
-        std::map<ObjectId, uint64_t> model;
+        std::map<ObjectId, Bytes> model;
         ObjectTrie::Options options = small_options();
         options.checkpoint_bytes = 1ULL << 40; // only when asked
         const auto snapshot = [&](const std::string& name) {
@@ -325,14 +338,14 @@ MACHA_FAST_TEST("object_ledger", test_a_crash_at_any_step_of_a_checkpoint_loses_
             ObjectTrie trie(dir.path(), key_of(9), options);
             std::vector<ObjectTrie::Change> first;
             for (int i = 0; i < 400; ++i) {
-                first.push_back({id_of(random), random()});
+                first.push_back({id_of(random), value_of(random)});
                 model[first.back().id] = *first.back().value;
             }
             trie.apply(first);
             trie.checkpoint();
             std::vector<ObjectTrie::Change> second;
             for (int i = 0; i < 400; ++i) {
-                second.push_back({id_of(random), random()});
+                second.push_back({id_of(random), value_of(random)});
                 model[second.back().id] = *second.back().value;
             }
             trie.apply(second);
@@ -358,7 +371,7 @@ MACHA_FAST_TEST("object_ledger", test_a_crash_at_any_step_of_a_checkpoint_loses_
 MACHA_FAST_TEST("object_ledger", test_a_trie_rewrites_its_node_file_and_stays_bounded) {
     TempDir dir;
     std::mt19937_64 random(15);
-    std::map<ObjectId, uint64_t> model;
+    std::map<ObjectId, Bytes> model;
     std::vector<ObjectId> ids;
     for (int i = 0; i < 2000; ++i)
         ids.push_back(id_of(random));
@@ -368,7 +381,7 @@ MACHA_FAST_TEST("object_ledger", test_a_trie_rewrites_its_node_file_and_stays_bo
     for (int round = 0; round < 40; ++round) {
         std::vector<ObjectTrie::Change> batch;
         for (const auto& id : ids) {
-            const auto value = random();
+            const auto value = value_of(random);
             batch.push_back({id, value});
             model[id] = value;
         }
@@ -391,14 +404,14 @@ MACHA_FAST_TEST("object_ledger", test_a_trie_rewrites_its_node_file_and_stays_bo
 MACHA_FAST_TEST("object_ledger", test_a_trie_larger_than_its_cache_reads_what_it_needs) {
     TempDir dir;
     std::mt19937_64 random(16);
-    std::map<ObjectId, uint64_t> model;
+    std::map<ObjectId, Bytes> model;
     ObjectTrie::Options options = small_options();
     options.cache_bytes = 16 * 1024;
     {
         ObjectTrie trie(dir.path(), key_of(11), options);
         std::vector<ObjectTrie::Change> batch;
         for (int i = 0; i < 20000; ++i) {
-            batch.push_back({id_of(random), random()});
+            batch.push_back({id_of(random), value_of(random)});
             model[batch.back().id] = *batch.back().value;
         }
         trie.apply(batch);
@@ -415,20 +428,20 @@ MACHA_FAST_TEST("object_ledger", test_a_trie_larger_than_its_cache_reads_what_it
 MACHA_FAST_TEST("object_ledger", test_a_trie_with_a_torn_journal_keeps_what_was_whole) {
     TempDir dir;
     std::mt19937_64 random(17);
-    std::map<ObjectId, uint64_t> whole;
+    std::map<ObjectId, Bytes> whole;
     ObjectTrie::Options options = small_options();
     options.checkpoint_bytes = 1ULL << 40;
     {
         ObjectTrie trie(dir.path(), key_of(12), options);
         std::vector<ObjectTrie::Change> first;
         for (int i = 0; i < 200; ++i) {
-            first.push_back({id_of(random), random()});
+            first.push_back({id_of(random), value_of(random)});
             whole[first.back().id] = *first.back().value;
         }
         trie.apply(first);
         std::vector<ObjectTrie::Change> second;
         for (int i = 0; i < 200; ++i)
-            second.push_back({id_of(random), random()});
+            second.push_back({id_of(random), value_of(random)});
         trie.apply(second);
     }
     // The second batch's frame is cut short: only the first survives.
@@ -436,6 +449,130 @@ MACHA_FAST_TEST("object_ledger", test_a_trie_with_a_torn_journal_keeps_what_was_
     std::filesystem::resize_file(journal, std::filesystem::file_size(journal) - 3);
     ObjectTrie reopened(dir.path(), key_of(12), options);
     check_matches(reopened, whole, random);
+}
+
+// A trie written in format 1 (a u64 value a record) opens with every record,
+// each value its eight big-endian bytes, and is rewritten in the current one.
+MACHA_FAST_TEST("object_ledger", test_a_format_1_trie_opens_and_is_rewritten) {
+    TempDir dir;
+    std::mt19937_64 random(19);
+    const auto key = key_of(20);
+    const auto be64 = [](uint64_t value) {
+        Writer writer;
+        writer.u64(value);
+        return writer.take();
+    };
+    std::map<ObjectId, uint64_t> saved;
+    for (int i = 0; i < 600; ++i)
+        saved[id_of(random)] = random();
+    {
+        // Format 1's node file: a leaf per first byte, then the interior root.
+        constexpr std::array<uint8_t, 8> nodes_aad{'M', 'A', 'C', 'H', 'L', 'N', '0', '1'};
+        SealedJournal nodes(dir.path() / "nodes-0.bin", key, nodes_aad, 4U << 20);
+        struct Slot {
+            uint64_t offset{};
+            uint32_t size{};
+            uint64_t count{};
+            Hash256 hash{};
+        };
+        std::map<uint8_t, Slot> slots;
+        auto at = saved.begin();
+        while (at != saved.end()) {
+            const auto byte = at->first.bytes[0];
+            Writer leaf;
+            Writer hashed;
+            hashed.u8('L');
+            std::vector<std::pair<ObjectId, uint64_t>> records;
+            for (; at != saved.end() && at->first.bytes[0] == byte; ++at)
+                records.emplace_back(at->first, at->second);
+            REQUIRE(records.size() <= ObjectTrie::leaf_max);
+            leaf.u8(1);
+            leaf.u8(1);
+            leaf.u32(static_cast<uint32_t>(records.size()));
+            for (const auto& [id, value] : records) {
+                leaf.fixed(id.bytes);
+                leaf.u64(value);
+                hashed.fixed(id.bytes);
+                hashed.u64(value);
+            }
+            const auto before = nodes.bytes();
+            const auto offset = nodes.append_unsynced(leaf.data());
+            slots[byte] = {offset, static_cast<uint32_t>(nodes.bytes() - before), records.size(),
+                           sha256(hashed.data())};
+        }
+        Writer interior;
+        Writer hashed;
+        hashed.u8('I');
+        interior.u8(2);
+        interior.u8(0);
+        std::array<uint8_t, 32> present{};
+        for (const auto& [byte, slot] : slots)
+            present[byte / 8] |= static_cast<uint8_t>(1U << (byte % 8));
+        interior.fixed(present);
+        for (const auto& [byte, slot] : slots) {
+            interior.u64(slot.offset);
+            interior.u32(slot.size);
+            interior.u64(slot.count);
+            interior.fixed(slot.hash.bytes);
+            hashed.u8(byte);
+            hashed.fixed(slot.hash.bytes);
+            hashed.u64(slot.count);
+        }
+        const auto before = nodes.bytes();
+        const auto offset = nodes.append_unsynced(interior.data());
+        const auto size = static_cast<uint32_t>(nodes.bytes() - before);
+        nodes.sync();
+
+        Writer root;
+        root.fixed(std::array<uint8_t, 8>{'M', 'L', 'T', 'R', '0', '0', '0', '1'});
+        root.u64(0);
+        root.u64(offset);
+        root.u32(size);
+        root.u64(saved.size());
+        root.fixed(sha256(hashed.data()).bytes);
+        root.u64(nodes.bytes());
+        const auto check = sha256(root.data());
+        root.fixed(check.bytes);
+        std::ofstream(dir.path() / "root", std::ios::binary)
+            .write(reinterpret_cast<const char*>(root.data().data()),
+                   static_cast<std::streamsize>(root.data().size()));
+
+        // Format 1's journal: one record changed, one erased, one added.
+        auto changed = saved.begin();
+        auto erased = std::next(changed);
+        const auto added = id_of(random);
+        std::map<ObjectId, std::optional<uint64_t>> frame{
+            {changed->first, 77}, {erased->first, std::nullopt}, {added, 88}};
+        changed->second = 77;
+        saved.erase(erased);
+        saved[added] = 88;
+        constexpr std::array<uint8_t, 8> journal_aad{'M', 'A', 'C', 'H', 'L', 'J', '0', '1'};
+        SealedJournal journal(dir.path() / "journal.log", key, journal_aad, 4U << 20);
+        Writer writer;
+        writer.u8(1);
+        writer.u32(static_cast<uint32_t>(frame.size()));
+        for (const auto& [id, value] : frame) {
+            writer.fixed(id.bytes);
+            writer.u8(value ? 1 : 0);
+            if (value)
+                writer.u64(*value);
+        }
+        journal.append(writer.data());
+    }
+    std::map<ObjectId, Bytes> model;
+    for (const auto& [id, value] : saved)
+        model[id] = be64(value);
+    {
+        ObjectTrie trie(dir.path(), key, small_options());
+        check_matches(trie, model, random);
+        CHECK(trie.stats().journal_bytes == 0);
+    }
+    std::ifstream root(dir.path() / "root", std::ios::binary);
+    std::array<char, 8> magic{};
+    root.read(magic.data(), 8);
+    CHECK(std::string(magic.data(), 8) == "MLTR0002");
+    ObjectTrie reopened(dir.path(), key, small_options());
+    check_matches(reopened, model, random);
 }
 
 // Stage 1's measurement: a synthetic class of MACHA_LEDGER_MEASURE_RECORDS
@@ -455,7 +592,7 @@ MACHA_HEAVY_TEST("object_ledger", test_a_large_trie_opens_within_the_bound) {
         std::vector<ObjectTrie::Change> batch;
         batch.reserve(10000);
         for (uint64_t i = 0; i < records; ++i) {
-            batch.push_back({id_of(random), i});
+            batch.push_back({id_of(random), Bytes(8, static_cast<uint8_t>(i))});
             if (sample.size() < 2000 && i % 97 == 0)
                 sample.push_back(batch.back().id);
             if (batch.size() == 10000) {
@@ -468,8 +605,8 @@ MACHA_HEAVY_TEST("object_ledger", test_a_large_trie_opens_within_the_bound) {
         // Leave a journal behind, as a crash would, just under the size at
         // which it would be checkpointed: the most an open replays.
         std::vector<ObjectTrie::Change> tail;
-        for (int i = 0; i < 24000; ++i)
-            tail.push_back({id_of(random), 1});
+        for (int i = 0; i < 22000; ++i)
+            tail.push_back({id_of(random), Bytes(8, 1)});
         trie.apply(tail);
         REQUIRE(trie.stats().journal_bytes > 900 * 1024);
     }

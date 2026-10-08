@@ -38,9 +38,9 @@ class ClaimStore {
   public:
     virtual ~ClaimStore() = default;
 
-    // Every operation takes the store's lock, which writes and compaction
-    // hold across their state-device I/O and nothing holds across DATA or
-    // network I/O.
+    // Every operation takes the store's lock, which writes, lookups (a
+    // ledger node read) and compaction hold across their state-device I/O
+    // and nothing holds across DATA or network I/O.
 
     // Claim writes: one durable journal frame per 65,536 ids.
     static constexpr Waits write_waits = Waits::state_device | Waits::locks;
@@ -49,9 +49,9 @@ class ClaimStore {
     virtual void retain_batch(RetentionClass, const std::vector<ObjectId>&,
                               const RetentionDot&) = 0;
 
-    // Claim reads, from the in-memory map; `retained_ids` and
+    // Claim reads, from the class's ledger; `retained_ids` and
     // `claim_objects` are linear in the class's claims.
-    static constexpr Waits read_waits = Waits::locks;
+    static constexpr Waits read_waits = Waits::state_device | Waits::locks;
     static constexpr ThreadSafety read_safety = ThreadSafety::thread_safe;
     virtual bool retained(RetentionClass, const ObjectId&) const = 0;
     virtual std::optional<ObjectId> next_retained(RetentionClass, std::optional<ObjectId>& cursor,
@@ -76,15 +76,15 @@ class ClaimStore {
                                         const RetentionClock& observed,
                                         size_t operation_budget) = 0;
     // Forget causality tombstones once no claim remains and the object is
-    // absent. Bounded; journals nothing. `exists` is called without the lock,
-    // so this also waits on whatever `exists` waits on. Single owner (the
-    // maintenance pass): the store keeps the walk's position.
-    static constexpr Waits prune_waits = Waits::locks;
+    // absent. Bounded; one journal frame. `exists` is called without the
+    // lock, so this also waits on whatever `exists` waits on. Single owner
+    // (the maintenance pass): the store keeps the walk's position.
+    static constexpr Waits prune_waits = Waits::state_device | Waits::locks;
     static constexpr ThreadSafety prune_safety = ThreadSafety::single_owner;
     virtual size_t prune_unclaimed(RetentionClass,
                                    const std::function<bool(const ObjectId&)>& exists,
                                    size_t operation_budget) = 0;
-    // Compact the journal into checkpoint shards past a threshold.
+    // Checkpoint the ledger and empty the journal past a threshold.
     static constexpr Waits compact_waits = Waits::state_device | Waits::locks;
     static constexpr ThreadSafety compact_safety = ThreadSafety::thread_safe;
     virtual bool compact_if_needed(size_t record_threshold = 4096) = 0;

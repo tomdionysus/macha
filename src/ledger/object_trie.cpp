@@ -18,12 +18,15 @@ namespace {
 
 constexpr std::array<uint8_t, 8> journal_aad{'M', 'A', 'C', 'H', 'L', 'J', '0', '1'};
 constexpr std::array<uint8_t, 8> nodes_aad{'M', 'A', 'C', 'H', 'L', 'N', '0', '1'};
-constexpr std::array<uint8_t, 8> root_magic{'M', 'L', 'T', 'R', '0', '0', '0', '1'};
+constexpr std::array<uint8_t, 8> root_magic{'M', 'L', 'T', 'R', '0', '0', '0', '2'};
+// Format 1 held a u64 value a record; it is read once and rewritten.
+constexpr std::array<uint8_t, 8> format1_root_magic{'M', 'L', 'T', 'R', '0', '0', '0', '1'};
 constexpr uint32_t max_frame = 4U * 1024U * 1024U;
 constexpr size_t changes_per_frame = 65536;
 constexpr uint8_t kind_leaf = 1;
 constexpr uint8_t kind_interior = 2;
-constexpr uint8_t journal_version = 1;
+constexpr uint8_t journal_version = 2;
+constexpr uint8_t format1_journal_version = 1;
 
 Hash256 leaf_hash(const std::vector<ObjectTrie::Record>& records) {
     if (records.empty())
@@ -32,7 +35,28 @@ Hash256 leaf_hash(const std::vector<ObjectTrie::Record>& records) {
     writer.u8('L');
     for (const auto& [id, value] : records) {
         writer.fixed(id.bytes);
+        writer.bytes(value);
+    }
+    return sha256(writer.data());
+}
+
+Bytes format1_value(uint64_t value) {
+    Writer writer;
+    writer.u64(value);
+    return writer.take();
+}
+
+Hash256 format1_leaf_hash(Reader& reader, uint32_t count, std::vector<ObjectTrie::Record>& out) {
+    Writer writer;
+    writer.u8('L');
+    for (uint32_t i = 0; i < count; ++i) {
+        ObjectTrie::Record record;
+        record.first.bytes = reader.fixed<32>();
+        const auto value = reader.u64();
+        record.second = format1_value(value);
+        writer.fixed(record.first.bytes);
         writer.u64(value);
+        out.push_back(std::move(record));
     }
     return sha256(writer.data());
 }
@@ -44,7 +68,10 @@ std::filesystem::path ObjectTrie::nodes_path(uint64_t generation) const {
 }
 
 size_t ObjectTrie::footprint(const Node& node) noexcept {
-    return sizeof(Node) + node.records.capacity() * sizeof(Record) +
+    size_t values = 0;
+    for (const auto& record : node.records)
+        values += record.second.capacity();
+    return sizeof(Node) + node.records.capacity() * sizeof(Record) + values +
            node.children.capacity() * sizeof(Child);
 }
 
@@ -93,7 +120,7 @@ Bytes ObjectTrie::encode(const Node& node) const {
         writer.u32(static_cast<uint32_t>(node.records.size()));
         for (const auto& [id, value] : node.records) {
             writer.fixed(id.bytes);
-            writer.u64(value);
+            writer.bytes(value);
         }
         return writer.take();
     }
@@ -129,10 +156,23 @@ ObjectTrie::NodePtr ObjectTrie::decode(std::span<const uint8_t> bytes) const {
             throw DecodeError("object trie leaf of the wrong size");
         std::vector<Record> records;
         records.reserve(count);
+        if (format1_) {
+            const auto hash = format1_leaf_hash(reader, count, records);
+            reader.finish();
+            for (size_t i = 1; i < records.size(); ++i)
+                if (!(records[i - 1].first < records[i].first))
+                    throw DecodeError("object trie leaf out of order");
+            auto node = std::make_shared<Node>();
+            node->depth = depth;
+            node->count = records.size();
+            node->hash = hash;
+            node->records = std::move(records);
+            return node;
+        }
         for (uint32_t i = 0; i < count; ++i) {
             Record record;
             record.first.bytes = reader.fixed<32>();
-            record.second = reader.u64();
+            record.second = reader.bytes(value_max);
             if (!records.empty() && !(records.back().first < record.first))
                 throw DecodeError("object trie leaf out of order");
             records.push_back(record);
@@ -323,7 +363,9 @@ ObjectTrie::ObjectTrie(std::filesystem::path dir, std::array<uint8_t, 32> key, O
     if (std::ifstream in(dir_ / "root", std::ios::binary); in) {
         const Bytes bytes{std::istreambuf_iterator<char>(in), {}};
         Reader reader(bytes);
-        if (reader.fixed<8>() != root_magic)
+        const auto magic = reader.fixed<8>();
+        format1_ = magic == format1_root_magic;
+        if (magic != root_magic && !format1_)
             throw DecodeError("object trie root of another format");
         generation_ = reader.u64();
         root_.offset = reader.u64();
@@ -354,7 +396,9 @@ ObjectTrie::ObjectTrie(std::filesystem::path dir, std::array<uint8_t, 32> key, O
     journal_->replay(
         [&](std::span<const uint8_t> plain) {
             Reader reader(plain);
-            if (reader.u8() != journal_version)
+            const auto version = reader.u8();
+            const bool u64_values = version == format1_journal_version;
+            if (version != journal_version && !u64_values)
                 throw DecodeError("object trie journal of another version");
             const auto count = reader.u32();
             if (count > changes_per_frame)
@@ -365,7 +409,8 @@ ObjectTrie::ObjectTrie(std::filesystem::path dir, std::array<uint8_t, 32> key, O
                 Change change;
                 change.id.bytes = reader.fixed<32>();
                 if (reader.u8())
-                    change.value = reader.u64();
+                    change.value = u64_values ? format1_value(reader.u64())
+                                              : reader.bytes(value_max);
                 if (!changes.empty() && !(changes.back().id < change.id))
                     throw DecodeError("object trie journal frame out of order");
                 changes.push_back(change);
@@ -374,6 +419,13 @@ ObjectTrie::ObjectTrie(std::filesystem::path dir, std::array<uint8_t, 32> key, O
             apply_unjournaled(changes);
         },
         max_frame, "object trie journal");
+    if (format1_) {
+        // Each value becomes its eight big-endian bytes, in the current format.
+        auto records = next(std::nullopt, root_.count);
+        format1_ = false;
+        replace_all(std::move(records));
+        return;
+    }
     if (journal_->bytes() >= options_.checkpoint_bytes)
         checkpoint();
 }
@@ -385,6 +437,9 @@ void ObjectTrie::apply_unjournaled(std::span<const Change> changes) {
 }
 
 void ObjectTrie::write(std::span<const Change> sorted_unique) {
+    for (const auto& change : sorted_unique)
+        if (change.value && change.value->size() > value_max)
+            throw std::invalid_argument("object trie value too large");
     for (size_t from = 0; from < sorted_unique.size(); from += changes_per_frame) {
         const auto part = sorted_unique.subspan(
             from, std::min(changes_per_frame, sorted_unique.size() - from));
@@ -395,7 +450,7 @@ void ObjectTrie::write(std::span<const Change> sorted_unique) {
             writer.fixed(change.id.bytes);
             writer.u8(change.value ? 1 : 0);
             if (change.value)
-                writer.u64(*change.value);
+                writer.bytes(*change.value);
         }
         journal_->append(writer.data());
     }
@@ -487,7 +542,7 @@ void ObjectTrie::checkpoint() {
     }
 }
 
-std::optional<uint64_t> ObjectTrie::get(const ObjectId& id) const {
+std::optional<Bytes> ObjectTrie::get(const ObjectId& id) const {
     if (root_.empty())
         return std::nullopt;
     auto node = load(root_);

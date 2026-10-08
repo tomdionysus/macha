@@ -133,9 +133,12 @@ holds, journaled before they change and checkpointed into a trie on disk, so
 a restart knows what it holds without walking its disk (`data-<disk token>`
 per DATA backend, named by the disk's own identity, and `control`). The
 first start on a version that keeps one walks the store once to seed it, in
-the background; every later start reads it. `ledger_cache` is the page cache
-the ledgers share, the control store keeping an eighth of it (default
-`64M`); a ledger's memory is its share of this, whatever the number of
+the background; every later start reads it. The retention claims are kept
+the same way, one trie a class under `<state_path>/retention/ledger-data`
+and `ledger-control`, with `claims.log` as their journal. `ledger_cache`
+(default `64M`) is the page cache the ledgers share: half to the claims, a
+sixteenth to the control store's held ledger, the rest to the DATA
+backends'. A ledger's memory is its share of this, whatever the number of
 objects. Keep `state_path` on the fastest device, never on a DATA disk.
 
 ## DHT policy
