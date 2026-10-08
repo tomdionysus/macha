@@ -1,5 +1,20 @@
 # Current release
 
+## 0.90.62: frozen views of a ledger trie (object ledger stage 4, step 1)
+
+No API, wire, protocol or on-disk changes.
+
+`ObjectTrie::snapshot()` returns a frozen view of every record, readable
+from any thread while the trie goes on changing: later writes, checkpoints
+and node-file rewrites leave it as it was. A view holds the root it was
+taken with and its own descriptor on that root's node file, so a rewrite
+that replaces the file cannot pull it away (the old file's space returns
+when the last view of it goes). The node cache is now shared by the trie and
+its views, thread safe, and keyed by node-file generation and offset. Stage
+4 builds the horizons on these views (operator, 2026-10-09: frozen views,
+not the newest head). Test: a view read by four threads while its trie is
+rewritten thirty times keeps exactly its records and hash.
+
 ## 0.90.61: metadata journal compaction holds no reader
 
 No API, wire, protocol or on-disk changes.

@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
@@ -36,9 +37,36 @@ namespace macha {
 // unsaved nodes stay in memory. When the node file holds more superseded
 // nodes than live ones it is rewritten.
 //
-// Not thread-safe: its owner serialises every call, const ones included (a
-// lookup fills the cache).
+// Not thread-safe: its owner serialises every call, const ones included.
+// Snapshots are read from any thread, alongside the owner.
 class ObjectTrie {
+    struct Node;
+    using NodePtr = std::shared_ptr<const Node>;
+    static constexpr uint64_t unsaved = ~0ULL;
+    // A slot in an interior node, or the root: where the subtree is saved,
+    // what it holds, and the subtree itself while it is unsaved.
+    struct Child {
+        uint64_t offset{unsaved};
+        uint32_t size{};
+        uint64_t count{};
+        Hash256 hash{};
+        NodePtr node;
+        bool empty() const noexcept { return count == 0; }
+    };
+
+  public:
+    using Record = std::pair<ObjectId, Bytes>;
+
+  private:
+    struct Node {
+        uint8_t depth{};
+        bool leaf{true};
+        std::vector<Record> records;
+        std::vector<Child> children; // 256 for an interior node
+        uint64_t count{};
+        Hash256 hash{};
+    };
+
   public:
     struct Options {
         size_t cache_bytes = 64ULL * 1024 * 1024;
@@ -55,7 +83,28 @@ class ObjectTrie {
         ObjectId id;
         std::optional<Bytes> value;
     };
-    using Record = std::pair<ObjectId, Bytes>;
+
+    // Saved nodes read from disk, shared by the trie and its snapshots,
+    // least recently used out first. Thread safe.
+    class NodeCache;
+
+    // Every record as they were when it was taken: later changes,
+    // checkpoints and rewrites leave it as it is (it reads its node file
+    // generation through its own handle). Thread safe; cheap to copy.
+    class Snapshot {
+      public:
+        Snapshot() = default;
+        std::optional<Bytes> get(const ObjectId&) const;
+        std::vector<Record> next(const std::optional<ObjectId>& after, size_t limit) const;
+        uint64_t size() const noexcept { return root_.count; }
+        Hash256 root_hash() const noexcept { return root_.hash; }
+
+      private:
+        friend class ObjectTrie;
+        struct Source;
+        std::shared_ptr<const Source> source_;
+        Child root_;
+    };
 
     // Opens the trie in `dir`, creating it if empty. Throws if its published
     // root cannot be read.
@@ -85,6 +134,7 @@ class ObjectTrie {
     uint64_t size() const noexcept;
     // Of every record; zero for none.
     Hash256 root_hash() const noexcept;
+    Snapshot snapshot() const;
 
     struct Stats {
         uint64_t journal_bytes{};
@@ -101,32 +151,8 @@ class ObjectTrie {
     Stats stats() const noexcept;
 
   private:
-    struct Node;
-    using NodePtr = std::shared_ptr<const Node>;
-    static constexpr uint64_t unsaved = ~0ULL;
-    // A slot in an interior node, or the root: where the subtree is saved,
-    // what it holds, and the subtree itself while it is unsaved.
-    struct Child {
-        uint64_t offset{unsaved};
-        uint32_t size{};
-        uint64_t count{};
-        Hash256 hash{};
-        NodePtr node;
-        bool empty() const noexcept { return count == 0; }
-    };
-    struct Node {
-        uint8_t depth{};
-        bool leaf{true};
-        std::vector<Record> records;
-        std::vector<Child> children; // 256 for an interior node
-        uint64_t count{};
-        Hash256 hash{};
-    };
-    struct Cached {
-        NodePtr node;
-        size_t bytes{};
-        std::list<uint64_t>::iterator recent;
-    };
+    // Reads a saved node's bytes.
+    using Read = std::function<Bytes(uint64_t offset)>;
 
     std::filesystem::path dir_;
     std::array<uint8_t, 32> key_;
@@ -140,16 +166,15 @@ class ObjectTrie {
     Child root_;
     uint64_t live_bytes_{};
     uint64_t superseded_bytes_{};
-    mutable std::unordered_map<uint64_t, Cached> cache_;
-    mutable std::list<uint64_t> recent_;
-    mutable size_t cache_used_{};
-    mutable uint64_t loads_{};
+    std::shared_ptr<NodeCache> cache_;
     uint64_t checkpoints_{};
     uint64_t rewrites_{};
 
     std::filesystem::path nodes_path(uint64_t generation) const;
     void publish_root() const;
     NodePtr load(const Child&) const;
+    static NodePtr load_from(const Child&, uint64_t generation, const Read&, NodeCache&,
+                             bool format1);
     static NodePtr make_leaf(uint8_t depth, std::vector<Record> records);
     static NodePtr make_interior(uint8_t depth, std::vector<Child> children);
     static Child child_of(NodePtr node);
@@ -158,10 +183,13 @@ class ObjectTrie {
     Child mutate(const Child&, uint8_t depth, std::span<const Change>);
     Child save(const Child&, SealedJournal& into);
     void apply_unjournaled(std::span<const Change>);
-    void collect(const Child&, const std::optional<ObjectId>& after, bool bounded, size_t limit,
-                 std::vector<Record>& out) const;
+    static std::optional<Bytes> find(const Child& root, const ObjectId&,
+                                     const std::function<NodePtr(const Child&)>& load);
+    static void collect(const Child&, const std::optional<ObjectId>& after, bool bounded,
+                        size_t limit, std::vector<Record>& out,
+                        const std::function<NodePtr(const Child&)>& load);
     Bytes encode(const Node&) const;
-    NodePtr decode(std::span<const uint8_t>) const;
+    static NodePtr decode(std::span<const uint8_t>, bool format1);
     static size_t footprint(const Node&) noexcept;
 };
 

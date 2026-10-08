@@ -194,21 +194,50 @@ void SealedJournal::sync() {
         fsync_checked(fd_);
 }
 
-Bytes SealedJournal::read_at(uint64_t offset) const {
+namespace {
+Bytes read_frame(int fd, const std::array<uint8_t, 32>& key, const std::array<uint8_t, 8>& aad,
+                 uint32_t max_frame, uint64_t limit, uint64_t offset) {
     std::array<uint8_t, 4> length_bytes{};
-    if (offset + frame_header > bytes_ || !pread_all(fd(), length_bytes, offset))
+    if (offset + frame_header > limit || !pread_all(fd, length_bytes, offset))
         throw std::runtime_error("no journal frame at offset " + std::to_string(offset));
     const uint32_t length = read_be32(length_bytes.data());
-    if (length > max_frame_ || offset + frame_header + length > bytes_)
+    if (length > max_frame || offset + frame_header + length > limit)
         throw std::runtime_error("journal frame at offset " + std::to_string(offset) +
                                  " runs past the end");
     std::array<uint8_t, 12> nonce{};
     std::array<uint8_t, 16> tag{};
     Bytes ciphertext(length);
-    if (!pread_all(fd(), nonce, offset + 4) || !pread_all(fd(), tag, offset + 16) ||
-        !pread_all(fd(), ciphertext, offset + 32))
+    if (!pread_all(fd, nonce, offset + 4) || !pread_all(fd, tag, offset + 16) ||
+        !pread_all(fd, ciphertext, offset + 32))
         throw std::runtime_error("short journal frame at offset " + std::to_string(offset));
-    return aes_gcm_open(key_, nonce, tag, ciphertext, aad_);
+    return aes_gcm_open(key, nonce, tag, ciphertext, aad);
+}
+} // namespace
+
+Bytes SealedJournal::read_at(uint64_t offset) const {
+    return read_frame(fd(), key_, aad_, max_frame_, bytes_, offset);
+}
+
+SealedJournal::FrameReader::FrameReader(int fd, std::array<uint8_t, 32> key,
+                                        std::array<uint8_t, 8> aad, uint32_t max_frame,
+                                        uint64_t limit)
+    : fd_(fd), key_(key), aad_(aad), max_frame_(max_frame), limit_(limit) {}
+
+SealedJournal::FrameReader::~FrameReader() {
+    ::close(fd_);
+}
+
+Bytes SealedJournal::FrameReader::read_at(uint64_t offset) const {
+    return read_frame(fd_, key_, aad_, max_frame_, limit_, offset);
+}
+
+std::shared_ptr<const SealedJournal::FrameReader> SealedJournal::reader() const {
+    const int copy = ::fcntl(fd(), F_DUPFD_CLOEXEC, 0);
+    if (copy < 0)
+        throw std::runtime_error("cannot duplicate journal " + path_.string() + ": " +
+                                 std::strerror(errno));
+    return std::shared_ptr<const FrameReader>(
+        new FrameReader(copy, key_, aad_, max_frame_, bytes_));
 }
 
 void SealedJournal::reset() {
