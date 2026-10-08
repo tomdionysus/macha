@@ -1,8 +1,7 @@
 # One definition of work class
 
-Status: agreed design, 2026-10-06. Not started. Operator's instruction: "the
-API is viewer class work", and one definition of a class, used by every
-subsystem, is a principle of the project.
+Status: done, 0.90.35 to 0.90.38 (2026-10-06/07); step 6 measured on polling
+load only. Kept as the record of the design; COMPLETED has the outcome.
 
 ## The rule
 
