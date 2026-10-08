@@ -4296,18 +4296,35 @@ void MetadataReplica::reset_checkpoint(const MetadataRecord& record) {
     reset_checkpoint_journal_locked();
 }
 
-void MetadataReplica::compact_if_needed() {
+void MetadataReplica::compact() {
     constexpr size_t record_threshold = 128;
     constexpr uint64_t byte_threshold = 8ULL * 1024 * 1024;
-    if (cur_.generation != committed_.generation || cur_.hash != committed_.hash)
-        return;
-    if (journal_records_ < record_threshold && journal_bytes_ < byte_threshold)
-        return;
-    const auto records = journal_records_;
-    const auto bytes = journal_bytes_;
-    const auto generation = committed_.generation;
-    const auto snapshot_bytes = committed_.payload.size();
-    reset_checkpoint(committed_);
+    // Every journal append holds durable_mutation_m_, so with it held the
+    // journal and the committed head stay as read here while the files are
+    // written without m_: no reader waits on the checkpoint's sync.
+    Lock durable(durable_mutation_m_);
+    MetadataRecord checkpoint;
+    size_t records = 0;
+    uint64_t bytes = 0;
+    {
+        Lock lock(m_);
+        if (cur_.generation != committed_.generation || cur_.hash != committed_.hash)
+            return;
+        if (journal_records_ < record_threshold && journal_bytes_ < byte_threshold)
+            return;
+        checkpoint = committed_;
+        records = journal_records_;
+        bytes = journal_bytes_;
+    }
+    persist(checkpoint_p_, checkpoint);
+    writefile(journal_p_, {});
+    {
+        Lock lock(m_);
+        journal_records_ = 0;
+        journal_bytes_ = 0;
+    }
+    const auto generation = checkpoint.generation;
+    const auto snapshot_bytes = checkpoint.payload.size();
     Log::debug("metadata journal compacted generation=" + std::to_string(generation) +
                " records=" + std::to_string(records) + " journal_bytes=" + std::to_string(bytes) +
                " snapshot_bytes=" + std::to_string(snapshot_bytes));
@@ -4670,12 +4687,6 @@ bool MetadataReplica::remember_current_committed(uint64_t generation, const Hash
     pending_recovered_ = false;
     set_legacy_committed_head_locked(committed_);
     return true;
-}
-
-void MetadataReplica::compact() {
-    Lock durable(durable_mutation_m_);
-    Lock lock(m_);
-    compact_if_needed();
 }
 
 bool MetadataReplica::compact_history_if_safe(size_t record_threshold, uint64_t byte_threshold) {

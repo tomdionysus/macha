@@ -1,5 +1,19 @@
 # Current release
 
+## 0.90.61: metadata journal compaction holds no reader
+
+No API, wire, protocol or on-disk changes.
+
+`MetadataReplica::compact()` wrote the checkpoint and emptied the journal
+holding the replica's lock, so every reader of the replica (a control
+`get_metadata`, a commit's accept) waited on the checkpoint's fsync.
+Compaction now reads the committed head under the lock and writes both files
+after releasing it, holding only the durable-mutation lock: every journal
+append takes that lock, so the journal cannot grow while it is replaced. The
+order stays checkpoint first, then the emptied journal. Test (Linux): a
+compaction held at its checkpoint fsync leaves a reader answering, and the
+compacted replica reopens at its head.
+
 ## 0.90.60: the ledger check resumes after a restart
 
 No API, wire or protocol changes. New on disk: `verify-next` in each held
