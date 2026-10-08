@@ -66,6 +66,15 @@ class ObjectTrie {
     // Journals the changes as one frame, then applies them in order (a later
     // change to the same id wins).
     void apply(std::span<const Change>);
+    // apply() in two steps, for an owner that keeps lookups going while the
+    // journal syncs: write() journals changes already sorted by id and
+    // unique; install() applies them (and checkpoints when the journal is
+    // due). The owner serialises writes and installs, in the same order.
+    void write(std::span<const Change> sorted_unique);
+    void install(std::span<const Change> sorted_unique);
+    // Replaces every record with `records` (sorted by id, unique) and
+    // checkpoints at once: what was there before is superseded.
+    void replace_all(std::vector<Record> records);
     // Folds the journal into the node file now.
     void checkpoint();
     // Records after `after` (from the first when none), in id order, at most

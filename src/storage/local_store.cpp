@@ -518,9 +518,51 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
             });
         });
     }
+    if (!options.ledger_dir.empty() && mode_ == LocalStoreMode::authoritative) {
+        ObjectTrie::Options ledger_options;
+        ledger_options.cache_bytes = options.ledger_cache_bytes;
+        ledger_ = std::make_unique<HeldLedger>(options.ledger_dir, key_, ledger_options);
+    }
+    if (ledger_ && ledger_->seeded()) {
+        // The ledger knows what is held: nothing to walk.
+        {
+            Lock lock(m_);
+            presence_.warmed();
+        }
+        presence_warm_.store(true, std::memory_order_release);
+        presence_index_entries_.store(ledger_->size(), std::memory_order_relaxed);
+        return;
+    }
     presence_thread_ = std::jthread([this](std::stop_token stop) {
         run_supervised_once("local-store-presence", [this, stop] { warm_presence_index(stop); });
     });
+}
+
+void LocalStore::flush_ledger() const {
+    if (ledger_)
+        ledger_->flush();
+}
+
+void LocalStore::seed_ledger() {
+    const auto started = Clock::now();
+    ledger_->seed([this] {
+        Lock lock(m_);
+        auto present = presence_.present();
+        // Every change queued so far is in the snapshot.
+        ledger_->drop_queued();
+        return present;
+    });
+    {
+        // The ledger answers from now on; the walked index is not kept.
+        Lock lock(m_);
+        presence_ = PresenceIndex{};
+        presence_.warmed();
+    }
+    Log::info("storage held ledger seeded path=" + root_.string() +
+              " objects=" + std::to_string(ledger_->size()) + " elapsed_ms=" +
+              std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 Clock::now() - started)
+                                 .count()));
 }
 
 LocalStore::LocalStore(std::filesystem::path root, uint64_t limit,
@@ -729,8 +771,11 @@ bool LocalStore::prune_empty_loose(const ObjectId& id, const std::filesystem::pa
         Lock lock(m_);
         verified_loose_.erase(id);
         presence_.pruned(id);
+        if (ledger_)
+            ledger_->record(id, false);
     }
     losses_.fetch_add(1, std::memory_order_release);
+    flush_ledger();
     Log::warn("storage pruned an empty object file id=" + to_string(id) + " path=" + p.string());
     return true;
 }
@@ -1041,6 +1086,8 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
         used_.fetch_add(need, std::memory_order_relaxed);
         remember_verified_loose_locked(id, *installed_stamp);
         presence_.installed(id);
+        if (ledger_)
+            ledger_->record(id, true);
         generation = 0;
         if (!ephemeral && durability_domain_) {
             generation = durability_domain_->complete_mutation(p, p.parent_path());
@@ -1270,6 +1317,14 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
     if (stamp) {
         lock.lock();
         remember_verified_loose_locked(id, *stamp);
+        // A file the ledger does not list (a crash between the file and its
+        // record) is recorded by the read that finds it.
+        const bool unlisted = ledger_ && ledger_->seeded() && !ledger_->held(id).value_or(true);
+        if (unlisted)
+            ledger_->record(id, true);
+        lock.unlock();
+        if (unlisted)
+            flush_ledger();
     }
     return plain;
 }
@@ -1286,6 +1341,15 @@ std::optional<bool> LocalStore::presence_from_index(const ObjectId& id) const {
 
 bool LocalStore::has(const ObjectId& id) const noexcept {
     try {
+        // Once the ledger is seeded it is the answer, packs aside.
+        if (ledger_ && ledger_->seeded()) {
+            {
+                Lock lock(m_);
+                if (packed_.contains(id))
+                    return true;
+            }
+            return ledger_->held(id).value_or(false);
+        }
         // After warm-up the index is the answer. A put publishes presence
         // only once its file is installed, so a put in progress reads as
         // absent, never as half-written; nothing else writes objects.
@@ -1307,6 +1371,8 @@ bool LocalStore::has(const ObjectId& id) const noexcept {
         if (present) {
             Lock lock(m_);
             presence_.observed(id);
+            if (ledger_)
+                ledger_->record(id, true);
         }
         return present;
     } catch (...) {
@@ -1355,6 +1421,8 @@ bool LocalStore::remove_locked(const ObjectId& id, Lock& lock) {
             generation = durability_domain_->complete_mutation({}, p.parent_path());
     }
     if (error || !removed) return false;
+    if (ledger_)
+        ledger_->record(id, false);
     losses_.fetch_add(1, std::memory_order_release);
     const auto before = used_.fetch_sub(size, std::memory_order_relaxed);
     if (size > before) {
@@ -1369,13 +1437,17 @@ bool LocalStore::remove_locked(const ObjectId& id, Lock& lock) {
 }
 
 bool LocalStore::put(const ObjectId& id, std::span<const uint8_t> data) {
-    return put_impl(id, data, StoreWriteDurability::immediate, nullptr);
+    const auto stored = put_impl(id, data, StoreWriteDurability::immediate, nullptr);
+    flush_ledger();
+    return stored;
 }
 
 std::optional<uint64_t> LocalStore::put_deferred(const ObjectId& id,
                                                  std::span<const uint8_t> data) {
     uint64_t generation = 0;
-    if (!put_impl(id, data, StoreWriteDurability::deferred, &generation)) return {};
+    const auto stored = put_impl(id, data, StoreWriteDurability::deferred, &generation);
+    flush_ledger();
+    if (!stored) return {};
     return generation;
 }
 
@@ -1404,29 +1476,38 @@ uint64_t LocalStore::durability_domain_id() const noexcept {
 }
 
 bool LocalStore::remove(const ObjectId& id) {
-    ObjectLock object_guard(object_mutex(id));
-    Lock lock(m_);
-    wait_for_accounting(lock);
-    return remove_locked(id, lock);
+    bool removed = false;
+    {
+        ObjectLock object_guard(object_mutex(id));
+        Lock lock(m_);
+        wait_for_accounting(lock);
+        removed = remove_locked(id, lock);
+    }
+    flush_ledger();
+    return removed;
 }
 
 bool LocalStore::remove_if_older_than(const ObjectId& id, std::chrono::milliseconds age) {
-    ObjectLock object_guard(object_mutex(id));
-    Lock lock(m_);
-    wait_for_accounting(lock);
-    if (auto found = packed_.find(id); found != packed_.end()) {
-        const auto now = unix_ms();
-        if (now < found->second.touched_unix_ms ||
-            now - found->second.touched_unix_ms < static_cast<uint64_t>(age.count()))
-            return false;
+    const bool removed = [&] {
+        ObjectLock object_guard(object_mutex(id));
+        Lock lock(m_);
+        wait_for_accounting(lock);
+        if (auto found = packed_.find(id); found != packed_.end()) {
+            const auto now = unix_ms();
+            if (now < found->second.touched_unix_ms ||
+                now - found->second.touched_unix_ms < static_cast<uint64_t>(age.count()))
+                return false;
+            return remove_locked(id, lock);
+        }
+        lock.unlock();
+        std::error_code error;
+        const auto modified = std::filesystem::last_write_time(path(id), error);
+        if (error || std::filesystem::file_time_type::clock::now() - modified < age) return false;
+        lock.lock();
         return remove_locked(id, lock);
-    }
-    lock.unlock();
-    std::error_code error;
-    const auto modified = std::filesystem::last_write_time(path(id), error);
-    if (error || std::filesystem::file_time_type::clock::now() - modified < age) return false;
-    lock.lock();
-    return remove_locked(id, lock);
+    }();
+    flush_ledger();
+    return removed;
 }
 
 std::vector<ObjectId> LocalStore::list() const {
@@ -1846,6 +1927,8 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
             Log::debug("storage presence index warmed path=" + root_.string() +
                        " objects=" + std::to_string(entries) +
                        " elapsed_ms=" + std::to_string(elapsed_ms));
+            if (ledger_)
+                seed_ledger();
             return;
         }
         Log::warn("storage presence index walk failed path=" + root_.string() +
@@ -1892,6 +1975,8 @@ void LocalStore::scan(std::stop_token stop) {
                         if (std::filesystem::exists(it->path(), exists_error)) {
                             Lock lock(m_);
                             presence_.observed(*id);
+                            if (ledger_)
+                                ledger_->record(*id, true);
                         }
                     }
                 }
@@ -1962,6 +2047,7 @@ void LocalStore::scan(std::stop_token stop) {
     }
     scan_complete_.store(true, std::memory_order_release);
     accounting_cv_.notify_all();
+    flush_ledger();
     Log::debug("storage accounting scan complete path=" + root_.string() +
                " used=" + std::to_string(total));
 }

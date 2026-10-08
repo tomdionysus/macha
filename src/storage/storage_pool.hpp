@@ -63,6 +63,9 @@ class StoragePool final : public ObjectStore {
     const std::array<uint8_t, 32> key_{};
     const std::chrono::milliseconds durability_batch_window_{500};
     const StoragePackingConfig packing_{};
+    const uint64_t ledger_cache_{};
+    // How many backends share the ledger cache: the configured count.
+    std::atomic<size_t> ledger_shares_{1};
     mutable Mutex mutex_;
     std::vector<std::shared_ptr<Backend>> backends_ MACHA_GUARDED_BY(mutex_);
     mutable Mutex domain_mutex_;
@@ -96,10 +99,13 @@ class StoragePool final : public ObjectStore {
     std::shared_ptr<DurabilityDomain> domain_for(const std::filesystem::path&);
 
   public:
+    // `ledger_cache`: each backend keeps a held ledger under
+    // <state_path>/ledger/, sharing this much page cache; zero keeps none.
     StoragePool(std::filesystem::path state_path, NodeId, std::vector<StorageBackendConfig>,
                 std::array<uint8_t, 32> key,
                 std::chrono::milliseconds durability_batch_window = std::chrono::milliseconds(500),
-                StoragePackingConfig packing = StoragePackingConfig{0, 0});
+                StoragePackingConfig packing = StoragePackingConfig{0, 0},
+                uint64_t ledger_cache = 0);
     void reconfigure(const std::vector<StorageBackendConfig>&);
     void refresh();
 
