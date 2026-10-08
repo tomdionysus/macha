@@ -69,6 +69,17 @@ persistent, exact and fast from the first second, for every consumer.
   `held`), availability (`held`, `held_losses`, `held_indexed`), catalogue
   control GC (`retained`), `predicate_query` (tests only).
 
+## Requirement: a restart is milliseconds
+
+The ledger is a persisted database. A 20-minute start (gbni-1 today) is
+unacceptable, and so is any start whose cost grows with the library. A
+restart opens the last checkpoint's root page and replays the journal
+written since it, and is then ready: target under 100 ms on a Pi, measured
+in stage 1 as an exit criterion. The journal is checkpointed often enough
+to hold that bound (a few MB of journal, not the retention store's 64 MiB).
+No start ever walks the DATA disk. Pages come from the state SSD into the
+cache as lookups touch them; a cold lookup is one or two SSD page reads.
+
 ## The design
 
 **One mechanism, generalised from the retention store.** The ledger is the
@@ -141,8 +152,10 @@ Each ships alone, with the suite green on the laptop and fi-1.
 2. **`held` in the ledger.** The store records puts and removals through
    the ledger; `has()` answers from it; the warm-up walk becomes the
    background verification. Migration: first start under it runs the walk
-   once to seed. Exit: a restart of gbni-1 answers `held` in seconds;
-   `held_indexed` is true at once; verification finds nothing to correct.
+   once to seed, in the background: until the seed completes the node
+   answers `held` as it does today, and nothing waits on it. Exit: a
+   restart of gbni-1 is ready in milliseconds with `held_indexed` true at
+   once; verification finds nothing to correct.
 3. **Claims in the ledger.** The retention store's maps and checkpoints
    migrate into the `claimed` column; `prune_unclaimed` is journaled. The
    old files are kept until the first ledger checkpoint (downgrade safe).
