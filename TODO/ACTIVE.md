@@ -46,9 +46,7 @@ of 2026-10-08, ranked:
 5. The memory ledger counts few large structures (metadata, catalogue and
    cache owners declared, never charged), so the control reserve protects
    counted bytes only; `restore()` overcommits without the reserve.
-6. `MetadataReplica::compact_if_needed` still writes the checkpoint under
-   `m_` (reached only from `compact()`).
-7. Not fully traced in the lock audit: `RpcClient::mutex_` holders and
+6. Not fully traced in the lock audit: `RpcClient::mutex_` holders and
    `Membership::m_` bodies.
 
 Waiting on the operator (section 9): CPU priority for background threads

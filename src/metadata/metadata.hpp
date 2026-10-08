@@ -621,7 +621,6 @@ class MetadataReplica {
     bool history_is_ancestor_locked(const Hash256&, const Hash256&) const MACHA_REQUIRES(m_);
     std::optional<Hash256> history_common_ancestor_locked(const Hash256&, const Hash256&) const
         MACHA_REQUIRES(m_);
-    void compact_if_needed() MACHA_REQUIRES(m_);
     void reset_checkpoint(const MetadataRecord&) MACHA_REQUIRES(m_);
     void reset_checkpoint_journal_locked() MACHA_REQUIRES(m_);
     void recover_from_seed(const MetadataRecord&, const std::string&) MACHA_REQUIRES(m_);

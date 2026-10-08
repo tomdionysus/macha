@@ -1864,6 +1864,62 @@ MACHA_FAST_TEST("storage_metadata", test_a_checkpoint_write_holds_no_reader_of_t
 #endif
 }
 
+MACHA_FAST_TEST("storage_metadata", test_a_journal_compaction_holds_no_reader_of_the_replica) {
+#if defined(__linux__)
+    // Compaction writes the checkpoint and empties the journal; the write
+    // is held at its fsync and a reader of the replica still answers.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "compaction-off-lock";
+    {
+        MetadataReplica replica(path, keys.storage);
+        for (size_t i = 0; i < 65; ++i) {
+            auto base = replica.current();
+            auto before = decode_snapshot(base.payload);
+            auto after = before;
+            after.entries["/"].mtime_ns = static_cast<int64_t>(i + 1);
+            auto d = metadata_delta(before, after);
+            REQUIRE(d.has_value());
+            MetadataRecord proposal;
+            REQUIRE(replica.cas_delta(base.generation, base.hash, encode_metadata_delta(*d),
+                                      &proposal));
+            REQUIRE(replica.remember_current_committed(proposal.generation, proposal.hash));
+        }
+        const auto head = replica.committed().hash;
+
+        auto& hold = test_support::fsync_hold;
+        {
+            std::lock_guard lock(hold.mutex);
+            hold.path = (path / "metadata" / "checkpoint.meta").string();
+            hold.armed = true;
+        }
+        std::thread compactor([&] { replica.compact(); });
+        bool held = false;
+        {
+            std::unique_lock lock(hold.mutex);
+            held = hold.changed.wait_for(lock, scaled(5s), [&] { return hold.holding; });
+        }
+        CHECK(held);
+        auto reader = std::async(std::launch::async, [&] { return replica.committed().hash; });
+        const bool answered = reader.wait_for(scaled(2s)) == std::future_status::ready;
+        {
+            std::lock_guard lock(hold.mutex);
+            hold.armed = false;
+        }
+        hold.changed.notify_all();
+        compactor.join();
+        CHECK(answered);
+        CHECK(reader.get() == head);
+    }
+    CHECK(std::filesystem::file_size(path / "metadata" / "journal.log") < 4096);
+    MetadataReplica reopened(path, keys.storage);
+    CHECK(reopened.current().generation == 66);
+    CHECK(reopened.current().hash == reopened.committed().hash);
+#endif
+}
+
 MACHA_FAST_TEST("storage_metadata", test_a_head_set_aside_for_the_horizon_is_dropped) {
     TempDir t;
     auto keyfile = t.path() / "key";
