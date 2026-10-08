@@ -12,17 +12,16 @@ handovers; a record, not requirements). This file was rationalised on
 *carried* come from earlier rationalisations and have not been re-checked
 since.
 
-## 0. Now: confirm 0.90.52 across a node-c restart
+## 0. 0.90.52 across a node-c restart: better, not whole
 
-0.90.52 keeps the holdings roll-up at `availability/holdings.bin` so a
-restarted node answers peers at once. Its own deploy restarted node-c at
-07:45Z on 2026-10-08 without the file (0.90.51 did not write it), so that
-restart was blind as before. The file appears after node-c's first roll-up,
-once its presence index warms (about 20 minutes, so from about 08:06Z).
-Then: restart node-c alone (node-f stays up), and read node-f's surveys through
-node-c's warm-up: every one should have `peers_failed=0`, and a refused read
-on node-f should take about 0.2 s, not 6 to 16 s. The failed-peer log line now
-carries the peer's reason. Operator agreed to the restart (2026-10-08).
+Restarted node-c at 12:41:18Z on 2026-10-08 with `holdings.bin` kept. node-f's
+surveys: refused for about 30 s while node-c started ("tree_holdings is not
+available on this node"); then answered from the kept roll-up, but each
+question about a subtree node-c does not hold whole asks `held()` per extent,
+a hard-disk lookup while the presence index warms, so questions hit the 30 s
+RPC limit until 12:50 (unknown 781,051, then 518,508, 243,655, 158,551); whole
+from 12:51 once the index warmed (525 s). Twenty blind minutes became nine
+partial ones. The rest is `held()` from the ledger (section 1, stage 2).
 
 ## 1. The on-disk object ledger
 
@@ -34,8 +33,14 @@ instead of walking its DATA disk for 20 minutes; then claims, `referenced`
 and `unreferenced_since` move in; then the diff RPC drives repair. Built
 in-tree, generalised from the retention store's journal and checkpoint (one
 mechanism, not two). The operator answered the spec's five questions on
-2026-10-08; they are in the design. Six stages; stage 1 (the trie and
-journal as a tested primitive, measured on node-f) first.
+2026-10-08; they are in the design. Stage 1 is 0.90.53: the shared
+`SealedJournal` (the retention store moved onto it unchanged) and
+`ObjectTrie`, tested and measured (laptop, 224,000 records: open with a
+near-full journal 437 ms, cold lookup 10 us); node-f's figure at a few million
+records is still to take. Next, stage 2: `held` in the ledger, with a bulk
+build from sorted records for the seed (inserting record by record costs
+about 46 us a record with random ids, which a seed of 800,000 should not
+pay).
 
 ## 2. Control must never wait: what is left
 
