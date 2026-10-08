@@ -446,6 +446,24 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         return false;
     }
 
+    // Asking nobody proves nothing. With every other host this node knows of
+    // out of reach, a survey would call all it lacks unavailable; it waits
+    // for one to come back and keeps the last answer. A node that knows no
+    // other host surveys alone.
+    if (hosts.empty()) {
+        const auto known = node_.membership().all();
+        const bool others = std::any_of(known.begin(), known.end(), [&](const NodeInfo& peer) {
+            return peer.id != node_.node_id() && node_hosts_extents(peer);
+        });
+        if (others) {
+            retry_backoff_ =
+                std::clamp<Clock::duration>(retry_backoff_ * 2, retry_floor, retry_ceiling);
+            retry_at_ = now + retry_backoff_;
+            due_ = due_ ? std::min(*due_, *retry_at_) : *retry_at_;
+            return false;
+        }
+    }
+
     const auto telemetry = node_.telemetry().all();
     std::vector<RemotePeer> remotes;
     remotes.reserve(hosts.size());

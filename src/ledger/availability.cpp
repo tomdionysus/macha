@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ledger/availability.hpp"
+#include "log.hpp"
 
 #include "codec.hpp"
 #include "crypto.hpp"
@@ -298,8 +299,10 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
                     throw std::runtime_error("peer answered a different number of tree nodes");
                 answers.push_back(std::move(answer));
                 ++peer;
-            } catch (const std::exception&) {
+            } catch (const std::exception& error) {
                 ++survey.peers_failed;
+                Log::debug(std::string("availability survey: a peer could not answer: ") +
+                           error.what());
                 peer = asking.erase(peer);
             }
         }

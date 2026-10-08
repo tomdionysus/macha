@@ -127,17 +127,14 @@ item in section 0, then stage 6.
   first write while the set forms is refused when a peer's survey answer
   is late, and the test treats the refusal as fatal. P0: decide whether the
   write should wait for the survey, or the test retry the refusal.
-- **A peer's restart blinds the availability survey for about 15 minutes,
-  and once returned a false answer** (fi-1, 2026-10-07/08). After every
-  gbni-1 restart (19:02, 19:25, 20:38, 21:38, 06:07Z) fi-1's survey counts
-  the peer failed (`unknown` about 690,000) for about 15 minutes, so a read
-  no node can serve waits 6 to 16 s for its refusal instead of 0.2 s. At
-  20:55:09Z a survey that succeeded reported 686,296 unavailable against
-  about 204,000 true: the peer answered from a partial view. Reads refuse
-  at once and repair's pull skips what the survey calls unavailable, so for
-  that minute files held on gbni-1 could be refused on fi-1. The survey
-  swallows the peer's error (availability.cpp:301); a peer must not answer
-  before its holdings are complete, and the error must be said.
+- **A peer's restart blinds the availability survey for about 15 minutes**
+  (fi-1, 2026-10-07/08): the peer refuses holdings questions until its DATA
+  presence index warms, 17 to 19 minutes on gbni-1's hard disk for 740,000
+  objects; meanwhile a read no node can serve waits 6 to 16 s for its
+  refusal. The false answer at 20:55:09Z (686,296 unavailable) was a survey
+  that asked no peer at all; fixed in 0.90.51. Still open: the warm-up
+  time itself, and whether the peer could answer from its persisted
+  holdings while it warms.
 - **Repair deleted a copy it had nowhere to send** (fixed 0.90.50): a node
   hosting nothing and knowing no host had a target of zero owners, so
   repair dropped its local copy. fi-1 did not host 2026-09-15 to 09-24 and

@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.51: a survey that could ask no host calls nothing unavailable
+
+No API, wire, protocol or on-disk changes.
+
+The availability survey asks the hosting peers it can reach which extents
+they hold; what none holds is unavailable, and reads refuse it at once and
+repair's pull passes it by. With no hosting peer reachable (a session flap,
+or a peer restarting), the survey asked nobody, so "every peer described
+it" was vacuously true and everything this node lacks was called
+unavailable: fi-1 published 686,296 unavailable extents against about
+204,000 at 20:55Z on 2026-10-07, when gbni-1 dropped out of its active set
+for a moment. A node that can reach no host while it knows other hosts
+exist now keeps its last survey and asks again with backoff; a node that
+knows no other host surveys alone as before. A peer that cannot answer is
+now logged with its reason.
+
 ## 0.90.50: repair never deletes a copy it has nowhere to send
 
 No API, wire, protocol or on-disk changes.
