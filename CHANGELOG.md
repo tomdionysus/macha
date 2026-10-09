@@ -1,5 +1,22 @@
 # Current release
 
+## 0.90.70: the memory limit shrinks, never refuses
+
+No API, wire, protocol or on-disk changes. `runtime.memory_bytes` changes
+meaning.
+
+`runtime.memory_bytes` is the node's memory limit, 0 (the default) none
+(operator, 2026-10-09). It caps the parts configured in bytes: the metadata
+materialisation cache, the ledger caches and the in-flight budget
+(`retained_memory_bytes`, which may be set beside it). When they total more,
+the node starts anyway: each part shrinks by the same fraction, the
+in-flight reserves with their budget, and a `MEMORY OVER LIMIT` WARN names
+every part's configured and shrunk size. 0.90.69's version refused to start
+and derived the in-flight budget from the limit; neither remains. New gauge
+`memory_limit_bytes`. Test: parts that fit are unchanged; parts at twice the
+limit are each halved, the reserves too; no limit, and a limit beside an
+explicit in-flight budget, both start.
+
 ## 0.90.69: one memory budget, every part reported
 
 No API, wire, protocol or on-disk changes. New setting: `runtime.memory_bytes`.

@@ -49,21 +49,22 @@ routes, ranks or authenticates on the name.
 ```yaml
 runtime:
   glibc_arena_max: 4
-  # memory_bytes: 1344M   # the node's one memory budget; see below
+  memory_bytes: 0        # the node's memory limit; 0 is none
   retained_memory_bytes: 768M
   control_memory_reserve_bytes: 64M
   viewer_memory_reserve_bytes: 192M
   loader_memory_reserve_bytes: 64M
 ```
 
-`memory_bytes`, when set, is the node's one memory budget: the metadata
-materialisation cache (`dht.metadata_materialization_cache_bytes`) and the
-ledger caches (`storage.ledger_cache`) are carved out of it, and the rest is
-the in-flight admission budget below, which is then derived and must not be
-set as well. A budget that cannot hold both caches and the in-flight
-reserves is refused at start, naming each part. Unset, the in-flight budget
-is `retained_memory_bytes` and the caches sit beside it. Either way the
-observation log reports each part once a minute: `memory_budget_bytes`,
+`memory_bytes` is the node's memory limit; 0 (the default) is none. It caps
+the parts that are configured in bytes: the metadata materialisation cache
+(`dht.metadata_materialization_cache_bytes`), the ledger caches
+(`storage.ledger_cache`) and the in-flight admission budget
+(`retained_memory_bytes`, below). When they total more than the limit, the
+node still starts: each shrinks by the same fraction, the in-flight reserves
+with their budget, and a `MEMORY OVER LIMIT` WARN names every part's
+configured and shrunk size. The observation log reports each part once a
+minute: `memory_limit_bytes`, `memory_budget_bytes` (the parts' total),
 `memory_in_flight_capacity_bytes` and `memory_in_flight_bytes`,
 `memory_metadata_cache_bytes`, `memory_ledger_caches_bytes`,
 `memory_catalogue_bytes`, beside `rss_bytes`.

@@ -506,14 +506,13 @@ struct WebConfig {
 struct RuntimeConfig {
     // Caps glibc arenas so short-lived codec threads cannot ratchet retained memory.
     size_t glibc_arena_max{4};
-    // The node's memory budget, when set: the metadata materialisation cache
-    // and the ledger caches are carved out of it, and the rest is
-    // `retained_memory_bytes` (which is then derived, not set).
+    // The node's memory limit; 0 is none. When the metadata materialisation
+    // cache, the ledger caches and `retained_memory_bytes` total more, each
+    // shrinks by the same fraction, with a WARN.
     uint64_t memory_bytes{};
     // Heap retained across asynchronous subsystem boundaries. Reserves are
     // priority headroom inside this total, not extra capacity.
     uint64_t retained_memory_bytes{768ULL * 1024 * 1024};
-    bool retained_memory_bytes_set{};
     uint64_t control_memory_reserve_bytes{64ULL * 1024 * 1024};
     uint64_t viewer_memory_reserve_bytes{192ULL * 1024 * 1024};
     uint64_t loader_memory_reserve_bytes{64ULL * 1024 * 1024};
