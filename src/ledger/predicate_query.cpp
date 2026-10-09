@@ -26,12 +26,16 @@ Page<ObjectId, ObjectId> query_referenced(Predicate predicate, const ObjectLedge
         page.next = {};
         return page;
     }
-    const auto ids = inventory->referenced_ids(RetentionClass::data);
-    auto it = from.after ? std::upper_bound(ids.begin(), ids.end(), *from.after) : ids.begin();
+    std::vector<ObjectId> ids;
+    auto it = ids.end();
     for (;; ++it) {
         if (const auto stop = budget.must_stop()) {
             page.stopped = *stop;
             return page;
+        }
+        if (it == ids.end()) {
+            ids = inventory->next(RetentionClass::data, page.next.after, 256);
+            it = ids.begin();
         }
         if (it == ids.end()) {
             page.next = {};

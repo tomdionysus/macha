@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "contract/id_lookup.hpp"
 #include "contract/object_store.hpp"
 #include "storage/io_pressure.hpp"
 #include "storage/local_store.hpp"
@@ -153,7 +154,7 @@ class StoragePool final : public ObjectStore {
     // orphan_grace, so uncommitted puts cannot race metadata commit, and,
     // given `sightings`, only once this node has seen it unreferenced and
     // unclaimed for `unreferenced_grace`.
-    MaintenanceResult gc_step(std::span<const ObjectId> live,
+    MaintenanceResult gc_step(const IdLookup& live,
                               const std::vector<ObjectId>& protected_ids,
                               std::chrono::milliseconds orphan_grace,
                               size_t operation_budget,

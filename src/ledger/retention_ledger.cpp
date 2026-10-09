@@ -37,7 +37,7 @@ void RetentionLedger::publish(InventoryHandle inventory) { inventory_.publish(st
 
 size_t RetentionLedger::release_unreferenced(RetentionClass type, const ReleaseHorizon& release,
                                              size_t operation_budget) {
-    return claims_.release_unreferenced(type, release.referenced_ids(type), release.clock(),
+    return claims_.release_unreferenced(type, release.lookup(type), release.clock(),
                                         operation_budget);
 }
 

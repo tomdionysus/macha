@@ -492,7 +492,7 @@ class CatalogueManager {
                                                  const std::optional<ObjectId>& new_root);
     // Given `sightings`, an object goes only once this node has seen it
     // unreferenced and unclaimed for `grace`.
-    size_t control_gc_step(std::span<const ObjectId> live,
+    size_t control_gc_step(const IdLookup& live,
                            std::chrono::milliseconds grace, size_t operation_budget = 32,
                            UnreferencedSince* sightings = nullptr, uint64_t now_unix_ms = 0);
 };

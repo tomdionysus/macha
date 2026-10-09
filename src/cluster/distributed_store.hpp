@@ -2,6 +2,7 @@
 #pragma once
 #include "cluster/cluster.hpp"
 #include "cluster/control_objects.hpp"
+#include "contract/id_lookup.hpp"
 #include "contract/predicates.hpp"
 #include "contract/thread_safety.hpp"
 #include "cluster/data_work.hpp"
@@ -435,7 +436,7 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     uint64_t repair_once(uint64_t byte_budget = 0,
                          std::optional<std::span<const ObjectId>> live = std::nullopt);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
-                             std::optional<std::span<const ObjectId>> live = std::nullopt,
+                             std::optional<IdLookup> live = std::nullopt,
                              const std::function<bool()>& should_yield = {},
                              uint64_t live_generation = 0,
                              const std::function<bool(const ObjectId&)>& unavailable = {},

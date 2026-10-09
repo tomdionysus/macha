@@ -98,6 +98,8 @@ class ObjectTrie {
         std::vector<Record> next(const std::optional<ObjectId>& after, size_t limit) const;
         uint64_t size() const noexcept { return root_.count; }
         Hash256 root_hash() const noexcept { return root_.hash; }
+        // Every id, in order: linear, for tests and small sets.
+        std::vector<ObjectId> ids() const;
 
       private:
         friend class ObjectTrie;

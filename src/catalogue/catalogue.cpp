@@ -2371,7 +2371,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     return out;
 }
 
-size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
+size_t CatalogueManager::control_gc_step(const IdLookup& live,
                                          std::chrono::milliseconds grace,
                                          size_t operation_budget,
                                          UnreferencedSince* sightings, uint64_t now_unix_ms) {
@@ -2400,7 +2400,7 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
         auto id = local_.control().next_object(control_gc_cursor_, exhausted);
         if (!id) continue;
 
-        if (std::binary_search(live.begin(), live.end(), *id)) {
+        if (live.contains(*id)) {
             if (sightings)
                 sightings->forget(*id);
             Lock lock(mutex_);

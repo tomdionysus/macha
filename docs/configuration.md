@@ -140,10 +140,17 @@ the ledger does not list is recorded held, and a listed object whose file is
 gone is recorded lost, so repair puts it back. The retention claims are kept
 the same way, one trie a class under `<state_path>/retention/ledger-data`
 and `ledger-control`, with `claims.log` as their journal. `ledger_cache`
-(default `64M`) is the page cache the ledgers share: half to the claims, a
-sixteenth to the control store's held ledger, the rest to the DATA
-backends'. A ledger's memory is its share of this, whatever the number of
-objects. Keep `state_path` on the fastest device, never on a DATA disk.
+(default `64M`) is the page cache the ledgers share: three eighths to the
+claims, a quarter to the namespace's reference counts, a sixteenth to the
+control store's held ledger, the rest to the DATA backends'. A ledger's
+memory is its share of this, whatever the number of objects.
+
+What the namespace refers to (its DATA extents, counted per reference, and
+its tree's own nodes) is kept the same way under
+`<state_path>/ledger/referenced`, at the namespace root it was last brought
+to. Each maintenance horizon is a frozen view of those counts, not a copy,
+and a start carries on from the saved root by tree diff instead of walking
+the namespace. Keep `state_path` on the fastest device, never on a DATA disk.
 
 ## DHT policy
 

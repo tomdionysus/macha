@@ -6,6 +6,7 @@
 #include "cluster/membership.hpp"
 #include "cluster/distributed_store.hpp"
 #include "metadata/metadata_manager.hpp"
+#include "ledger/object_trie.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "write_behind.hpp"
 #include <atomic>
@@ -36,21 +37,28 @@ class FsError : public std::runtime_error {
 class FileSystem;
 class PlaybackTracker;
 
-// What a tree-backed namespace refers to: the DATA extents its entries name
-// and the tree's own nodes, each sorted and distinct.
+// What a namespace tree refers to, frozen at one root: its DATA extents and
+// the tree's own nodes (control objects). A record's value is its count.
 struct NamespaceReferences {
+    ObjectTrie::Snapshot extents;
+    ObjectTrie::Snapshot nodes;
+};
+
+// The same, listed: each sorted and distinct.
+struct NamespaceListing {
     std::vector<ObjectId> extents;
     std::vector<ObjectId> nodes;
 };
 
 struct MaintenanceObjects {
-    // Sorted, unique vectors: far smaller than a tree node per extent at
-    // millions of objects.
-    std::vector<ObjectId> live;
+    // What the namespace refers to at `metadata_generation`: its DATA
+    // extents and the tree's own nodes (empty for an inline namespace).
+    ObjectTrie::Snapshot referenced_extents;
+    ObjectTrie::Snapshot referenced_nodes;
+    // The extents of unresolved conflict alternatives, sorted and distinct:
+    // live until resolved.
+    std::vector<ObjectId> conflict_live;
     std::vector<GarbageRef> garbage;
-    // The namespace tree's own nodes, control objects; empty for an inline
-    // namespace.
-    std::vector<ObjectId> namespace_nodes;
     uint64_t metadata_generation{};
     RetentionClock observed_mutations;
     size_t entries{};
@@ -441,27 +449,17 @@ class FileSystem final : public PublicationTarget {
     // The tree the index was built from, when the namespace is a tree.
     std::optional<ObjectId> media_index_root_ MACHA_GUARDED_BY(media_index_mutex_);
     void refresh_media_index(const MetadataSnapshotView&) MACHA_REQUIRES(media_index_mutex_);
-    // What the namespace refers to, one item per reference and in order, at
-    // the tree it was last counted at. Guarded by maintenance_build_mutex_.
-    struct NamespaceCensus {
-        std::optional<ObjectId> root;
-        // DATA extents the entries name; one that two files share is here twice.
-        std::vector<ObjectId> extents;
-        // The tree's own nodes: branches and leaves once, extent spine nodes
-        // once for each entry that holds them.
-        std::vector<ObjectId> nodes;
-        size_t entries{};
-        size_t extent_count{};
-    };
-    // Held across a census: a namespace walk the first time, the tree diff
-    // after.
+    // Held across a census: the reference counts (LocalState's) brought to a
+    // namespace's tree, by a walk of the whole namespace the first time and
+    // by tree diff after, across restarts.
     IoMutex maintenance_build_mutex_;
-    NamespaceCensus maintenance_census_ MACHA_GUARDED_BY(maintenance_build_mutex_);
-    void census_walk(const MetadataSnapshot&, NamespaceCensus&);
-    // False when the census cannot be brought to `root` from where it stands.
-    bool census_follow(const ObjectId& root, NamespaceCensus&);
-    MaintenanceObjects maintenance_objects_from(const MetadataSnapshotView&,
-                                                const NamespaceCensus&);
+    // Brings the counts to `snapshot`'s namespace.
+    void census_count(const MetadataSnapshot&) MACHA_REQUIRES(maintenance_build_mutex_);
+    void census_walk(const MetadataSnapshot&) MACHA_REQUIRES(maintenance_build_mutex_);
+    // False when the counts cannot be brought to `root` from where they stand.
+    bool census_follow(const ObjectId& root) MACHA_REQUIRES(maintenance_build_mutex_);
+    MaintenanceObjects maintenance_objects_from(const MetadataSnapshotView&)
+        MACHA_REQUIRES(maintenance_build_mutex_);
     Mutex maintenance_index_mutex_;
     uint64_t maintenance_index_generation_ MACHA_GUARDED_BY(maintenance_index_mutex_){};
     std::shared_ptr<const MaintenanceObjects> maintenance_index_
@@ -565,16 +563,16 @@ class FileSystem final : public PublicationTarget {
         return local_.replica().committed_generation();
     }
     uint64_t known_metadata_generation() const noexcept { return metadata_server_.known_generation(); }
-    std::vector<ObjectId> live_objects();
     // Hashes namespace/content identity, excluding catalogue metadata, so the
     // catalogue scanner's own commits cannot trigger a rescan loop.
     Hash256 namespace_signature(uint64_t* metadata_generation = nullptr);
     std::optional<Hash256> available_namespace_signature(
         uint64_t* metadata_generation = nullptr) const;
     std::shared_ptr<const MaintenanceObjects> maintenance_objects_cached();
-    // The same, from a walk of the whole namespace.
-    MaintenanceObjects maintenance_objects();
-    // What the namespace of `snapshot` refers to, from the census brought to
+    // What the converged namespace refers to, from a walk of all of it and
+    // apart from the counts: the reference for checking them.
+    NamespaceListing walk_namespace_references();
+    // What the namespace of `snapshot` refers to, from the counts brought to
     // its tree. None for a namespace that is not a tree.
     std::optional<NamespaceReferences> namespace_references(const MetadataSnapshot& snapshot);
     DistributedStore& store() {
