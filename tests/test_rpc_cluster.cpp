@@ -2346,6 +2346,52 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_orders_each_peer_and_parall
     server.stop();
 }
 
+// A caller that finds another caller's dial in flight waits no longer than a
+// dial of its own may take: a peer that accepts and never answers holds the
+// first caller in its handshake, not the second.
+MACHA_TEST("rpc_cluster", test_rpc_a_dial_in_flight_is_waited_for_no_longer_than_a_dial) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listener >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const int on = 1;
+    ::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(::listen(listener, 8) == 0); // accepted by the kernel, never answered
+
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    NetworkLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+    auto first = std::async(std::launch::async, [&] {
+        try {
+            (void)client.call(endpoint, MessageType::ping, {}, 10s);
+        } catch (const std::exception&) {
+        }
+    });
+    std::this_thread::sleep_for(200ms);
+    const auto started = std::chrono::steady_clock::now();
+    bool failed = false;
+    try {
+        (void)client.call(endpoint, MessageType::ping, {}, 10s);
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    const auto waited = std::chrono::steady_clock::now() - started;
+    CHECK(failed);
+    CHECK(waited < scaled(2s));
+    first.get();
+    client.stop();
+    ::close(listener);
+}
+
 // Torrent and ingest job traffic is not control: a job view's poll travels as
 // loader work and a user's action as viewer work, and both are served.
 MACHA_TEST("rpc_cluster", test_rpc_job_traffic_travels_as_its_own_class) {
