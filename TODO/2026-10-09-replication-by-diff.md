@@ -1,60 +1,242 @@
-# Replication by diff: what the ledger makes possible next
+# Replication by diff
 
-Status: direction, 2026-10-09. A written proposal (with a survey of the
-code it replaces) comes before any code, as the ledger's stage 4 had. This
-is the ledger design's stage 5 and 6
+Status: proposal, 2026-10-09. Supersedes the direction note of the same
+day. This is the ledger design's stages 5 and 6
 ([archive/2026-10-08-on-disk-object-ledger.md](archive/2026-10-08-on-disk-object-ledger.md)),
 re-scoped: since that design was written, enough of the node's state became
-canonical on-disk tries that one mechanism can replace several.
+canonical on-disk tries that one mechanism can replace several. Nothing
+here is built; each stage ships alone, the suite green on the laptop and
+fi-1, deployed to both nodes before the next.
 
-## What exists now (0.90.53 to 0.90.70)
+## The rule this proposal rests on
 
-Every node keeps, on the state device, in `ObjectTrie`s whose shape and hash
-depend only on their records:
+**A node's holdings have one identity, and it is the only signal that they
+changed.** Every node keeps, per DATA backend, a `held` trie whose root
+hash depends only on the ids it records (0.90.54). A put, a remove, a loss,
+a scrub correction, a backend coming online or going away: each changes a
+root hash or the set of roots. Nothing else can change what a node holds.
+So anything that memoises over holdings keys on that identity and on
+nothing else, and anything that compares two nodes' holdings compares those
+tries. Today's code instead watches proxies for "my holdings changed" (the
+namespace head, the `NodeEvent::storage` count, `losses()`, `indexed()`),
+and every list of proxies is incomplete: a backend coming online is missed
+now, and the next missed proxy is a matter of time. The rule removes the
+class of defect rather than the instance.
 
-- **held**: per store, which objects it holds (0.90.54), checked against the
-  disk daily (0.90.57 to 0.90.60);
-- **claimed**: per class, each object's observed-remove claim state (0.90.55);
-- **referenced**: per class, how many times the followed namespace head
-  refers to each object, at a saved root (0.90.63);
-- frozen views of any of them, readable from any thread (0.90.62);
-- tombstones as immutable batches named by the head (0.90.67).
+## What exists now (survey, 2026-10-09)
 
-Two nodes holding the same records have tries with the same root hash, and
-any subtree can be compared by its hash.
+Canonical tries on the state device, each an `ObjectTrie` (radix-256 over
+the 32-byte id, leaves of at most 128 records, copy-on-write pages, a
+journal, a root hash that depends only on the records):
 
-## What one diff could replace
+- **held**, one per DATA backend under `ledger/data-<token>` (0.90.54),
+  seeded from a walk on a disk's first start under the ledger and kept by
+  every put and remove since, checked against the disk a directory at a time
+  (0.90.57 to 0.90.60). `HeldLedger` wraps it; `LocalStore::has()` answers
+  from it once seeded.
+- **claimed**, one per class under `retention/ledger-{data,control}`
+  (0.90.55): each object's observed-remove state.
+- **referenced** (`ReferenceCounts`, 0.90.63): the extents and tree nodes
+  the followed namespace head refers to, a count per object, at a saved
+  root; moved root to root by the census's tree diff.
+- Frozen `Snapshot`s of any trie, readable from any thread (0.90.62).
+- Tombstones as immutable batches named by the head (0.90.67).
 
-A request pair, "here is my subtree hash at this prefix; send what differs",
-descending only where hashes differ, between two nodes' tries. Driven by it:
+What the diff replaces, with its size:
 
-- **The availability survey and its holdings roll-up** (`AvailabilityService`,
-  `availability/holdings.bin`, the `tree_holdings` messages, `missing_here`,
-  `peer_lacks`): what a peer holds that this node lacks, and the reverse, is
-  the diff of two `held` tries against `referenced`. The survey's memo, its
-  per-peer vectors and its kept roll-up (0.90.52's stopgap) go.
-- **Repair's walks** (push and pull cursors over the live set, presence
-  probes): repair works the diff's output instead of probing object by
-  object, so it can be pipelined (today one step sends at most two extents
-  and waits; about 4 MB in 5 s over the WAN).
-- **Catalogue DATA** (the catalogue plan's stage 10): if the catalogue's
-  objects are a source of the `referenced` counts beside the namespace, they
-  are covered by the same diff and repair, and **lost artwork is repaired**
-  (60 of 296 posters were held by no online node on 2026-09-27; nothing
-  re-fetches them).
-- **The counts operators asked for** ("extents this node lacks, each peer
-  lacks, below their replication target") fall out of the diff.
-- `lost` reported per object: held by nobody reachable.
+| Piece | Where | Lines | What it does today |
+|---|---|---|---|
+| Availability survey | `service/availability_service.{hpp,cpp}` | 879 | Rolls this node's holdings up the namespace tree (a `has()` per extent), asks peers `tree_holdings` about subtrees, memoises the answers, publishes `missing_here`, `peer_lacks`, `unavailable`; keeps `availability/holdings.bin` so a restart can answer peers before its presence index fills |
+| Holdings roll-up, survey, memo | `ledger/availability.{hpp,cpp}` | 588 | `HoldingsRollup`, `missing_extents`, `extents_peer_lacks`, `survey_availability`, `SurveyMemo`, the `tree_holdings` wire format |
+| Repair push and pull | `cluster/distributed_store.cpp` (`repair_step` and its cursors) | about 600 of 2976 | Walks the live set with two cursors, probes peers with `have_object(s)`, `have_valid_objects`, `have_control_objects`, sends at most two extents a step and waits |
+| Claim walk | `service/claim_walk.{hpp,cpp}` | 96 | Walks `claimed` for claims this node does not hold; stays (it is already a trie walk, no peer involved) |
+| `indexed()` / `held_indexed()` | `storage_pool.cpp:698`, `retention_ledger.hpp:31` | | Gates the roll-up while a presence index fills; one caller; wrong when no backend is open |
+| `outside_namespace` | `contract/horizon.hpp` | | The inventory's flat list of catalogue DATA (artwork, media indexes) that repair covers apart from the namespace and `known_present` does not trust |
 
-## Questions the proposal must answer
+Measured shape on the cluster: about 940,000 referenced extents, of which
+about 203,000 are held by neither online node; 60 of 296 posters held by no
+online node (2026-09-27); repair over the WAN moves about 4 MB in 5 s
+because one step sends two extents and waits for each.
 
-- Which trie pairs are diffed (held against held, per class; referenced
-  against referenced to confirm two nodes follow the same head), and how a
-  node with several DATA backends presents one `held` view.
-- Whether `held` records the backend (the old open question; proposed yes,
-  so a read is one lookup).
-- Pacing: the diff is speculative work, paced, never gating (laws 1 to 3).
-- The fallback for a peer without the diff, and when it is retired (stage 6).
-- The catalogue's objects as a `referenced` source: what changes in the
-  catalogue's own retention and in both horizons.
-- Absent nodes never block: a diff with a missing peer simply is not run.
+## The design
+
+### Identity
+
+`HeldLedger` exposes its trie's root hash. `LocalStore::held_root()` is
+that hash once the ledger is seeded and nothing before. `StoragePool`
+exposes:
+
+```
+struct HeldIdentity {
+    Hash256 hash;    // over (token, root) of every online, seeded backend, by token
+    bool complete;   // no online backend is still seeding
+};
+HeldIdentity held_identity() const noexcept;
+```
+
+An absent, closed or unseeded backend contributes nothing to the hash: it is
+not there, and absent things do not block. `complete` is false only while
+an online backend's first-start seed is running, which is the one state in
+which this node cannot say what it holds. With no backend online the node
+holds nothing and knows it: `complete` is true and the hash is of nothing.
+The read is one atomic per backend; no lock on a store, no device.
+
+`ObjectLedger` carries `held_identity()` in place of `held_indexed()` and
+`held_losses()`; `indexed()` leaves `ObjectStore`.
+
+### The held view
+
+Whatever reads this node's holdings for a roll-up or a diff reads frozen
+snapshots of the `held` tries taken together with the identity, not
+`has()`: no index lock, no device read, and the view is exactly the
+identity's, so a memo built from it is stale precisely when the identity
+differs. `StoragePool::held_view()` returns the identity and one snapshot
+per contributing backend.
+
+### The diff
+
+One RPC pair on the speculative frame:
+
+```
+trie_diff        { trie, token, prefix, depth, hash, want_records }
+trie_diff_reply  { per child slot whose hash differs from the asker's: slot, count, hash
+                   | for a leaf: its records }
+```
+
+`trie` names which trie (`held`, `claimed` per class, `referenced`
+extents); `token` the backend for `held`. The asker sends the 256 child
+hashes of its node at `prefix` in one message and gets back the slots that
+differ, so one round resolves one interior node; a request may carry several
+prefixes (as `tree_holdings` carries several tree nodes), so one round
+resolves a batch of differing subtrees. Descent stops where hashes agree.
+Two nodes at steady state differ only where placement means them to, so
+the common case is a root comparison and a handful of rounds; the worst
+case (disjoint tries) is bounded by the leaf count, about 7,400 per 940,000
+ids, batched.
+
+`ObjectTrie::Snapshot` grows `children(prefix)` (the 256 `(count, hash)`
+slots of the interior node at a prefix) and `records(prefix)` (a leaf's
+records). Both read saved nodes through the node cache; neither touches a
+DATA device (law 2).
+
+**Which pairs are diffed.** `held` against `held`, per peer backend
+against each local backend: the symmetric difference of ids, independent
+of the namespace. The asker then applies `referenced` locally. `referenced`
+is not diffed against `held` (their records differ in value, so their
+hashes never agree); "what this node lacks" is a merge join of the local
+`referenced` and `held` snapshots in id order, about 7,400 sequential leaf
+reads a side, paced, repeated only when either identity changes.
+`referenced` against a peer's `referenced` is a root comparison that says
+whether the two follow the same head; it is informational, since held
+against held needs no shared head.
+
+**Several backends.** A node's held view is its set of online, seeded
+backend tries, each named by its disk's token, and the diff runs per pair.
+This keeps each trie the record of one disk, verified against that disk,
+with no migration; the ledger design's open question "does `held` record
+the backend" is answered by the trie's name rather than a column. The
+rounds multiply by the backend count, which is one on both nodes today.
+If a node ever runs many backends the pool can maintain a union trie; not
+now.
+
+**What falls out.** For each peer that answered: what it holds that this
+node lacks (the pull list, placement-ordered), what this node holds that it
+lacks (the push list, filtered by `should_own`), and per object `lost`:
+referenced, held here by nothing, and held by no peer that answered. A peer
+that did not answer makes its share unknown, as `unknown` is today; nothing
+is concluded about it.
+
+### Repair on the diff
+
+`repair_step` takes the pull and push lists from the diff instead of
+walking the live set. No `have_object` probe is sent: presence is known
+exactly, so `known_present` becomes a lookup. Transfer is pipelined: a
+window of in-flight gets and puts bounded by the network credit in bytes,
+rather than two extents then a wait. Yielding stays at operation boundaries
+on the repair share, paced, never stopped.
+
+### Catalogue DATA
+
+The catalogue's DATA (artwork, media indexes) becomes a second source of
+`referenced` counts beside the namespace, fed from the catalogue head's
+shards by the same change mechanism the census uses. Then the merge join
+and the diff cover it: `outside_namespace` goes, lost artwork is in the
+pull list when a peer holds it and reported `lost` when none does, and the
+API's 1 to 2 s remote probe for a missing poster is answered from the
+survey. Re-fetching artwork that is lost everywhere is the catalogue's
+business, driven by `lost`; not this proposal. The catalogue plan's stage
+10 is this stage.
+
+### Laws and standing rules
+
+- Law 1: the identity is an atomic read; the trie journals are unchanged;
+  no commit path waits on a diff.
+- Law 2: diffs and merge joins read the state device through the node
+  cache; nothing here reads a DATA device. They run on the speculative
+  frame and the repair share, paced by viewer and loader activity, never
+  gating them (pace, never gate).
+- Absent nodes never block: a peer that does not answer is not in the
+  diff; `lost` is relative to who answered; a node's own identity needs no
+  peer. es-1 returning changes nothing until it is seeded, then its
+  identity appears and the diff runs.
+- Local always fast: a put or remove journals as today; the identity
+  moves as a side effect.
+- Codes are primary; no custom headers; the wire format is the trie's own
+  `(count, hash)` slots.
+
+## Stages
+
+0. **The holdings identity.** `HeldLedger::root_hash()`,
+   `LocalStore::held_root()`, `StoragePool::held_identity()` and
+   `held_view()`; `ObjectLedger::held_identity()`. The survey keys its
+   roll-up and its kept copy on `(head key, identity)` and nothing else:
+   `rolled_storage_events_`, `Holdings::losses`, `Kept::losses`,
+   `answering_rollup`'s loss arithmetic, `cold_since_`, `cold_retry`,
+   `cold_patience` and the `indexed()` branch go; the roll-up's `HeldFn`
+   reads the held view, not `has()`. While `complete` is false the node
+   makes no roll-up and answers `tree_holdings` "cannot say". `indexed()`
+   and `held_indexed()` are deleted with their last caller. `losses()` stays
+   where the store and scrub use it. Tests: the identity changes on put,
+   remove, loss, seed, online and offline and on nothing else; a roll-up
+   taken with the disk closed is replaced when the disk opens, with no head
+   change; a seeding node answers "cannot say". This closes ACTIVE 1's
+   `StoragePool::indexed()` item.
+1. **The trie's diff surface.** `Snapshot::children(prefix)` and
+   `records(prefix)`, tested exhaustively: canonical regardless of insert
+   order, every depth, a leaf at the root, an empty trie, after a
+   checkpoint and a rewrite. A local `diff(a, b)` over two snapshots as the
+   reference the RPC must match. The merge join `missing(referenced, held)`
+   with a pause between leaves.
+2. **`trie_diff` over the wire**, gated like `tree_holdings` on the first
+   release whose transport accepts it; a peer that refuses it is surveyed
+   the old way. The survey publishes `missing_here`, `peer_lacks` and
+   `unavailable` from the diff when every extent-hosting peer answers it,
+   and from the roll-up otherwise. Two-node tests: identical holdings cost
+   one round; one lost copy is found in two; a peer that refuses falls
+   back; a peer that fails mid-descent leaves its share unknown.
+3. **Repair on the diff.** The pull and push lists come from the survey;
+   no presence probe when the lists are from a diff; the pipelined window.
+   Measured on the cluster: bytes per second over the WAN against today's
+   4 MB in 5 s; probes per step, which should read zero. The walks stay
+   for a peer surveyed the old way.
+4. **Catalogue DATA as a `referenced` source**, with the catalogue plan's
+   stage 10 note folded in here; `outside_namespace` goes.
+5. **Retire** once every node runs stage 3: `tree_holdings` and its
+   formats, `HoldingsRollup`, `missing_extents`, `extents_peer_lacks`,
+   `survey_availability`, `SurveyMemo`, `PeerHoldings`,
+   `availability/holdings.bin`, the repair cursors and the `have_*` probes
+   in repair, and `ledger/availability.{hpp,cpp}` with them.
+
+Stage 0 is small and stands on its own; it is the structural answer to the
+`indexed()` defect and the primitive every later stage builds on.
+
+## Open questions
+
+- Whether `claimed` is diffed at all. The claim walk restores a claimed
+  object this node lacks by asking peers; a `claimed` diff would tell it
+  which peer to ask. Decide after stage 3 from the walk's probe counts.
+- The pipelined window's bound: bytes of credit, as proposed, or also a
+  count, so a WAN of small extents cannot hold a thousand puts in flight.
+- Whether the API should expose the counts (lacking here, lacking per
+  peer, below target, lost) as resources now that they are cheap; they
+  were asked for.

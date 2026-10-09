@@ -8,7 +8,9 @@ by area), `COMPLETED.md` (finished work), `CLIENT-CONTRACTS.md` (what the
 client sessions depend on) and `archive/` (past plans, evidence and
 handovers; a record, not requirements). Rationalised on 2026-10-09 after
 the object ledger, tombstone batches and the memory limit changed the plan;
-the version before is `archive/2026-10-09-ACTIVE-before-rationalisation.md`.
+the version before is `archive/2026-10-09-ACTIVE-before-rationalisation.md`. Section 2 was
+re-cut the same day around the replication-by-diff proposal: the items it
+closes sit under the stage that closes them.
 Items marked *carried* come from earlier rationalisations and have not been
 re-checked since.
 
@@ -24,10 +26,7 @@ A failing test is P0: reproduce it before deciding whose it is.
   (section 8).
 - **`availability/test_two_nodes_survey_what_neither_holds`** exceeds its
   20 s wait under heavy laptop load (3.4 s alone). The survey it tests is
-  to be replaced (section 2); fix only if it fails on fi-1.
-- **`StoragePool::indexed()`** skips a backend whose store is not open: the
-  "no vacuous truths" shape (zero open backends reads as every backend
-  indexed). Check and fix.
+  retired at section 2's stage 5; fix only if it fails on fi-1.
 - **gbni-1's memory through a multi-file import** on 0.90.34's bounded owed
   queue: now measurable by part (the `memory_*` gauges, 0.90.69).
 - **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
@@ -70,29 +69,52 @@ A failing test is P0: reproduce it before deciding whose it is.
 
 ## 2. Replication by diff (the next large piece)
 
-Direction: [`2026-10-09-replication-by-diff.md`](2026-10-09-replication-by-diff.md).
-The ledger's stages 1 to 4 (0.90.53 to 0.90.63) made `held`, `claimed` and
-`referenced` canonical on-disk tries on every node, so one subtree-hash diff
-between two nodes can replace the availability survey and its holdings
-roll-up, repair's walks and probes, and the catalogue plan's stage 10
-(catalogue DATA), and repair lost artwork. **Write the proposal first**,
-with a survey of what it replaces; then build it in stages, the walks kept
-as the fallback until every node runs it.
+Proposal: [`2026-10-09-replication-by-diff.md`](2026-10-09-replication-by-diff.md),
+written 2026-10-09 with the survey of what it replaces; **awaiting the
+operator's review** (section 8). Its rule: a node's holdings have one
+identity, the `held` tries' root hashes, and it is the only signal that
+they changed; nothing keys a holdings memo on proxies. One subtree-hash
+diff between two nodes' `held` tries, joined locally with `referenced`,
+replaces the availability survey and its roll-up, repair's walks and
+probes, and the inventory's `outside_namespace`. Each stage ships alone;
+the walks stay as the fallback until every node runs stage 3.
 
-What it absorbs from the old list (do not do separately):
-- **Extents held by no node online**: five of 25 sampled movies return EIO
-  on both nodes; the survey counts about 203,000 of 940,000 extents
-  unavailable. EIO is correct. Whether es-1 holds them is not known either
-  way; fi-1 may also have dropped a copy it alone held between 2026-09-15
-  and 09-24 (the repair defect fixed in 0.90.50). The diff reports `lost`
-  per object.
-- **Artwork held by no online node** (60 of 296 posters, 2026-09-27), never
-  re-fetched; a missing poster costs a 1 to 2 s remote probe each time it is
-  shown.
-- Repair bound by the WAN (one step sends at most two extents and waits).
-- Expose the counts holdings give (lacking here, lacking per peer, below
-  target).
-- The survey's memo applies only while no peer's holdings grow.
+0. **The holdings identity.** `StoragePool::held_identity()` and
+   `held_view()`; the survey keyed on (head, identity) only; `indexed()`,
+   `held_indexed()`, the loss counts in the roll-up and the cold wait
+   deleted. Closes: `StoragePool::indexed()` reads true with no backend
+   open, and a backend coming online never re-rolls the survey (found
+   2026-10-09; peers then push extents this node already holds).
+1. **The trie's diff surface**: `Snapshot::children(prefix)`,
+   `records(prefix)`, a local reference diff, the `referenced`/`held` merge
+   join. Exhaustive primitive tests.
+2. **`trie_diff` over the wire**, the survey publishing from it when every
+   peer answers. Closes: **extents held by no node online** (about 203,000
+   of 940,000; five of 25 sampled movies EIO on both nodes, which is
+   correct; whether es-1 holds them, or fi-1 dropped a sole copy between
+   2026-09-15 and 09-24, is not known) as `lost` per object; the survey's
+   memo going stale when a peer's holdings grow; **per-file readability**'s
+   answer (held by nobody reachable; the operator still chooses where it is
+   exposed, section 7).
+3. **Repair on the diff**: no presence probes, a pipelined window. Closes:
+   repair bound by the WAN (one step sends two extents and waits; about
+   4 MB in 5 s); logging the resumed push position (the cursors go).
+4. **Catalogue DATA as a `referenced` source** (the catalogue plan's stage
+   10). Closes: **artwork held by no online node** (60 of 296 posters,
+   2026-09-27) found and pulled, or reported `lost`; the 1 to 2 s remote
+   probe per missing poster; `GET catalogue/status` asking the store for
+   every artwork (`catalogue.cpp:896`, from the backlog). Catalogue
+   mutations already compute released DATA per touched shard (0.90.33);
+   whether stage 4 needs the plan's per-family shards (section 4) is for
+   its design.
+5. **Retire** `tree_holdings`, the roll-up, survey and memo,
+   `availability/holdings.bin`, the repair cursors and repair's `have_*`
+   probes, once every node runs stage 3.
+
+The proposal's open questions (for the review): whether `claimed` is diffed
+(decide from the claim walk's probe counts after stage 3); a count bound on
+the pipelined window beside bytes; whether the counts (lacking here, per
+peer, below target, lost) become API resources now that they are cheap.
 
 Still separate, in this area:
 - **Bringing es-1 back** (operator's question, 2026-10-07): install the
@@ -101,13 +123,13 @@ Still separate, in this area:
   removed in 0.90.17); back up its state directory first; files deleted
   elsewhere since 2026-09-24 may reappear from it (0.89.0). Its first start
   on the current release seeds its held ledger, migrates its claims and
-  counts its namespace. A rehearsal on a test cluster from 0.57.0 is
-  offered, not done.
+  counts its namespace; under the proposal it joins the diff once seeded,
+  and answers "cannot say" until then. A rehearsal on a test cluster from
+  0.57.0 is offered, not done.
 - A torrent can land on a node away from where it is watched.
 - Per-peer down state in the transport; `fsync` without a deadline.
 - Seven namespace conflicts standing from before 0.89.0.
-- Say why a node counts itself busy (the pacer's active classes in status);
-  log the resumed push position at INFO.
+- Say why a node counts itself busy (the pacer's active classes in status).
 
 ## 3. Memory
 
@@ -135,7 +157,8 @@ Stages 1 to 5 are done (0.90.27 to 0.90.33). Next: stage 6, the conflict
 merge per shard; then derived indexes for list, search and the descendant
 scan; the manifest change (per-family shards, growable count); batched
 profile publication; measure again. Stage 10 (holdings for catalogue DATA)
-moved to section 2. Its residency (about 16 MiB) is now a gauge.
+is section 2's stage 4; if that needs per-family shards, stage 8 comes
+first. Its residency (about 16 MiB) is now a gauge.
 
 ## 5. Matching
 
@@ -175,8 +198,8 @@ on control threads no longer grow with deletes. Left:
   from, served at `/api/v1/openapi.json`. Agreed, unstarted.
 - **Core's request**: `providers/artwork` taking `item_id`.
 - **Per-file readability**: designed; the operator chooses where it goes.
-  Two of its three uses are wire changes; section 2's diff would give it
-  its answer (held by nobody reachable).
+  Two of its three uses are wire changes; its answer (held by nobody
+  reachable) comes from section 2's stage 2, so it follows that.
 - **A media-type context on torrent add** (operator, 2026-09-25).
 - **People on catalogue items**: approved, with a backfill.
 - **Placement API asks**: the target `node_id` and a viewer-facing detail on
@@ -190,8 +213,11 @@ on control threads no longer grow with deletes. Left:
 
 ## 8. Waiting on the operator
 
-- The bootstrap test (section 1): the first write waits for the survey, or
-  the test retries the refusal.
+- **Review the replication-by-diff proposal** (section 2) and its three
+  open questions; stage 0 starts on approval.
+- The bootstrap test (section 1): the first write waits for the bootstrap
+  checkpoint survey (not the availability survey), or the test retries the
+  refusal.
 - The memory limit to set on each node (section 3).
 - CPU priority for background work: `nice` or `SCHED_IDLE` for repair,
   scrub, transcode and libtorrent threads, a cap on encoder threads, or a
