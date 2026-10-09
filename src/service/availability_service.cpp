@@ -289,30 +289,11 @@ AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
                                          const NodeEvents& events, MessageRoutes& routes,
                                          std::filesystem::path persisted)
     : node_(node), local_(local), store_(store), ledger_(ledger), events_(events),
-      routes_(routes), persisted_(std::move(persisted)),
-      kept_path_(persisted_.empty() ? std::filesystem::path{}
-                                    : persisted_.parent_path() / "holdings.bin") {
-    if (!kept_path_.empty()) {
-        std::ifstream in(kept_path_, std::ios::binary);
-        if (in) {
-            const Bytes bytes{std::istreambuf_iterator<char>(in), {}};
-            // Trusted only for the holdings it was of.
-            Hash256 of;
-            auto view = ledger_.held_view(RetentionClass::data);
-            if (bytes.size() >= of.bytes.size()) {
-                std::copy_n(bytes.begin(), of.bytes.size(), of.bytes.begin());
-                if (view.identity.complete && view.identity.hash == of) {
-                    try {
-                        kept_.publish(Kept{HoldingsRollup::decode(std::span(bytes).subspan(
-                                               of.bytes.size())),
-                                           view.identity, std::move(view.held)});
-                    } catch (const DecodeError& error) {
-                        Log::warn("availability: ignoring " + kept_path_.string() + ": " +
-                                  error.what());
-                    }
-                }
-            }
-        }
+      routes_(routes), persisted_(std::move(persisted)) {
+    // No roll-up is kept across a restart: one an earlier release left goes.
+    if (!persisted_.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(persisted_.parent_path() / "holdings.bin", ec);
     }
     if (!persisted_.empty()) {
         std::ifstream in(persisted_, std::ios::binary);
@@ -337,17 +318,14 @@ AvailabilityService::~AvailabilityService() {
 
 RpcMessage AvailabilityService::answer(const RpcMessage& request) const {
     const auto holdings = holdings_.handle();
-    const auto kept = kept_.handle();
-    const auto removals = ledger_.held_view(RetentionClass::data).identity.removals;
-    const HoldingsRollup* kept_rollup = kept && kept->rollup ? &*kept->rollup : nullptr;
-    const auto* rollup = answering_rollup(
-        holdings ? &holdings->rollup : nullptr, holdings ? holdings->identity.removals : 0,
-        kept_rollup, kept ? kept->identity.removals : 0, removals);
+    if (!holdings)
+        return error_reply("holdings are not rolled up yet");
     // Something stopped being held since the roll-up: what it calls whole may
     // not be. The pass rolls up again; until then this node cannot answer.
-    if (!rollup)
-        return error_reply(holdings ? "holdings changed since they were rolled up"
-                                    : "holdings are not rolled up yet");
+    if (ledger_.held_view(RetentionClass::data).identity.removals !=
+        holdings->identity.removals)
+        return error_reply("holdings changed since they were rolled up");
+    const auto* rollup = &holdings->rollup;
     const auto nodes = decode_tree_holdings_request(request.payload);
     // This node's own copy of each tree node: answering never asks a peer.
     const LocalNamespaceNodeStore stored(local_.control());
@@ -355,7 +333,7 @@ RpcMessage AvailabilityService::answer(const RpcMessage& request) const {
         holdings && holdings->built ? static_cast<const NamespaceNodeStore&>(*holdings->built)
                                     : stored;
     // The view the roll-up was made from, so the two agree.
-    const HeldFn& held = rollup == kept_rollup ? kept->held : holdings->held;
+    const HeldFn& held = holdings->held;
     std::vector<NodeHoldings> answers;
     answers.reserve(nodes.size());
     for (const auto& node : nodes)
@@ -378,13 +356,6 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     auto view = ledger_.held_view(RetentionClass::data);
     // Something held at the roll-up may no longer be.
     const bool lost = holdings && view.identity.removals != holdings->identity.removals;
-    if (const auto kept = kept_.handle();
-        kept && kept->rollup && view.identity.removals != kept->identity.removals &&
-        !kept_path_.empty()) {
-        std::error_code ec;
-        std::filesystem::remove(kept_path_, ec);
-        kept_.publish(Kept{});
-    }
     const bool head_changed = rolled_head_ != head_key;
     const bool holdings_changed = holdings && view.identity.hash != holdings->identity.hash;
     const bool changed = head_changed || holdings_changed || lost;
@@ -421,23 +392,6 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         next.snapshot = head.snapshot;
         holdings_.publish(std::move(next));
         holdings = holdings_.handle();
-        // Kept for the next start with the holdings it is of: a stored tree's
-        // roll-up only, since an inline namespace's tree is rebuilt from the
-        // snapshot.
-        if (!kept_path_.empty() && tree_backed) {
-            try {
-                Bytes bytes(holdings->identity.hash.bytes.begin(),
-                            holdings->identity.hash.bytes.end());
-                const auto rollup = holdings->rollup.encode();
-                bytes.insert(bytes.end(), rollup.begin(), rollup.end());
-                durable_replace_file(kept_path_,
-                                     std::string_view(reinterpret_cast<const char*>(bytes.data()),
-                                                      bytes.size()));
-            } catch (const std::exception& error) {
-                Log::warn(std::string("availability: cannot keep the holdings: ") +
-                          error.what());
-            }
-        }
         rolled_head_ = head_key;
         rolled_at_ = now;
         rolled = true;
