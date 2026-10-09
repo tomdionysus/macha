@@ -3766,11 +3766,19 @@ bool RpcServer::admit_locked(RequestJob job) {
         job.memory = std::move(*memory);
     }
     if (metadata_mutation_request(job.frame)) {
+        // A quarter of the queue is kept for control: background history
+        // imports cannot fill it and have a commit's accept refused.
+        const bool control = request_class(job.frame.frame_type) == RequestClass::control;
+        const auto job_limit = control ? execution_limits_.metadata_pending_jobs
+                                       : execution_limits_.metadata_pending_jobs -
+                                             execution_limits_.metadata_pending_jobs / 4;
+        const auto byte_limit = control ? execution_limits_.metadata_pending_bytes
+                                        : execution_limits_.metadata_pending_bytes -
+                                              execution_limits_.metadata_pending_bytes / 4;
         const auto bytes = job.frame.message.payload.size();
         const bool bytes_fit =
-            bytes <= execution_limits_.metadata_pending_bytes &&
-            metadata_request_bytes_ <= execution_limits_.metadata_pending_bytes - bytes;
-        if (metadata_requests_.size() >= execution_limits_.metadata_pending_jobs || !bytes_fit) {
+            bytes <= byte_limit && metadata_request_bytes_ <= byte_limit - bytes;
+        if (metadata_requests_.size() >= job_limit || !bytes_fit) {
             rejected_metadata_requests_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -4451,11 +4459,23 @@ void RpcServer::metadata_worker_loop(std::stop_token stop) {
             });
             if (stop.stop_requested() && metadata_requests_.empty())
                 return;
+            // The oldest control mutation first (a commit's prepare and
+            // accept), then the oldest of the rest: a commit never waits
+            // behind background history imports. Each flow awaits its own
+            // replies, so no dependency is reordered.
+            const auto eligible = [&](const RequestJob& candidate) MACHA_REQUIRES(request_mutex_) {
+                return !metadata_active_peers_.contains(candidate.peer.id);
+            };
             auto ready =
                 std::find_if(metadata_requests_.begin(), metadata_requests_.end(),
                              [&](const RequestJob& candidate) MACHA_REQUIRES(request_mutex_) {
-                                 return !metadata_active_peers_.contains(candidate.peer.id);
+                                 return eligible(candidate) &&
+                                        request_class(candidate.frame.frame_type) ==
+                                            RequestClass::control;
                              });
+            if (ready == metadata_requests_.end())
+                ready = std::find_if(metadata_requests_.begin(), metadata_requests_.end(),
+                                     eligible);
             if (ready == metadata_requests_.end())
                 continue;
             job = std::move(*ready);

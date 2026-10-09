@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.65: a commit's metadata mutations go before background imports
+
+No API, wire, protocol or on-disk changes.
+
+Every metadata mutation a peer sends (a history entry, a commit's prepare,
+its accept) went through one worker, first come, with one queue limit. A
+commit's accept could wait behind a peer's background history imports and
+checkpoint rewrites, and those imports could fill the queue and have the
+accept refused. The worker now takes the oldest control-class mutation
+first, then the oldest of the rest; within a class the order is unchanged,
+and each sending flow awaits its own replies, so no dependency is reordered.
+Background mutations are admitted only to three quarters of the queue's jobs
+and bytes, so a quarter is always left for control. Test: with a background
+import running and three more queued, a fourth is refused, a commit's accept
+is still admitted, and it runs before the queued imports.
+
 ## 0.90.64: one limit for every password hash
 
 API change: `POST /api/v1/users`, and `PATCH /api/v1/users/{id}` or
