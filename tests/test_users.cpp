@@ -453,7 +453,8 @@ MACHA_FAST_TEST("users", test_initial_accounts) {
     UserStore store(16, state / "users" / "users.bin", {});
     SessionConfig session;
     session.allow_anonymous = true;
-    PasswordCredentialValidator validator(store, session);
+    PasswordWork work(2);
+    PasswordCredentialValidator validator(store, session, work);
     CHECK(validator.validate(Json(Json::Object{})).outcome == CredentialOutcome::disabled);
 
     auto genesis = create_initial_accounts(store, keys, state, node_id(1));
@@ -522,8 +523,9 @@ MACHA_FAST_TEST("users", test_password_validator_outcomes) {
     open.allow_anonymous = true;
     auto closed = open;
     closed.allow_anonymous = false;
-    PasswordCredentialValidator validator(store, open);
-    PasswordCredentialValidator strict(store, closed);
+    PasswordWork work(2);
+    PasswordCredentialValidator validator(store, open, work);
+    PasswordCredentialValidator strict(store, closed, work);
 
     auto anonymous = store.create_without_password(
         anonymous_username, {std::string(role_media_viewer)}, node_id(1));
@@ -567,7 +569,7 @@ MACHA_FAST_TEST("users", test_password_validator_outcomes) {
     auto limited_config = open;
     limited_config.failed_login_attempts = 2;
     limited_config.failed_login_lockout = 200ms;
-    PasswordCredentialValidator limited(store, limited_config);
+    PasswordCredentialValidator limited(store, limited_config, work);
     REQUIRE(store.create("erin", "right", {std::string(role_media_viewer)}, node_id(1))
                 .has_value());
     CHECK(limited.validate(credentials("erin", "wrong")).outcome == CredentialOutcome::rejected);
@@ -606,6 +608,46 @@ MACHA_FAST_TEST("users", test_password_login_mints_a_bound_session) {
         CHECK(rejected.status == 401);
         CHECK(json_body(rejected).find("invalid_credentials") != std::string::npos);
     }
+}
+
+// Password hashing shares one limit: with every slot held, a sign-in and a
+// new account are both refused with try_later at once, never queued on a
+// control worker; changing only roles needs no slot.
+MACHA_FAST_TEST("users", test_password_work_is_one_limit_for_sign_in_and_account_changes) {
+    TestCluster cluster;
+    BareNode node(cluster.node_config("n1"), cluster.keys());
+    TempDir dir;
+    auto genesis =
+        create_initial_accounts(node.users(), cluster.keys(), dir.path(), node.node_id());
+    REQUIRE(genesis.has_value());
+    REQUIRE(node.users()
+                .create("gail", "long-enough-pw", {std::string(role_media_viewer)}, node.node_id())
+                .has_value());
+    SessionApi sessions(node, node.accounts());
+    UsersApi users(node, node.accounts());
+    std::vector<PasswordWork::Slot> held;
+    while (auto slot = node.accounts().password_work().try_acquire())
+        held.push_back(std::move(*slot));
+    CHECK(held.size() == node.config().session.max_concurrent_password_checks);
+
+    const auto signed_in = sessions.handle(login_request("gail", "long-enough-pw"));
+    CHECK(signed_in.status == 429);
+    CHECK(json_body(signed_in).find("try_later") != std::string::npos);
+    const auto created = users.handle(users_request(
+        "POST", "/api/v1/users", admin_identity(),
+        R"({"username":"hank","password":"long-enough-pw","roles":["media_viewer"]})"));
+    CHECK(created.status == 429);
+    CHECK(json_body(created).find("try_later") != std::string::npos);
+    CHECK(!node.users().find_by_username("hank"));
+    const auto gail = node.users().find_by_username("gail");
+    REQUIRE(gail.has_value());
+    const auto roles_only = users.handle(users_request("PATCH", "/api/v1/users/" + gail->id,
+                                                       admin_identity(),
+                                                       R"({"roles":["manager"]})"));
+    CHECK(roles_only.status == 200);
+
+    held.clear();
+    CHECK(sessions.handle(login_request("gail", "long-enough-pw")).status == 201);
 }
 
 // The users API: admin-only, hashes never readable, policy refusals with

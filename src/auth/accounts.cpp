@@ -33,6 +33,7 @@ Accounts::Accounts(const Config& cfg, const NodeIdentity& identity, NodeRuntime&
              hkdf_sha256(identity.keys.master, {},
                          std::span<const uint8_t>(
                              reinterpret_cast<const uint8_t*>("macha/users/v1"), 14))),
+      password_work_(cfg.session.max_concurrent_password_checks),
       gossip_ttl_(std::max(cfg.dead_after * 2, std::chrono::milliseconds(60000))) {
     bind_routes();
 }

@@ -3,6 +3,7 @@
 
 #include <atomic>
 
+#include "auth/password_work.hpp"
 #include "auth/session.hpp"
 #include "auth/users.hpp"
 #include "cluster/message_routes.hpp"
@@ -45,6 +46,7 @@ class Accounts {
     const UserStore& users() const noexcept { return users_; }
     SessionManager& sessions() noexcept { return sessions_; }
     const SessionManager& sessions() const noexcept { return sessions_; }
+    PasswordWork& password_work() noexcept { return password_work_; }
 
     bool apply_session(const AuthSession&);
     // Applies locally, then notifies peers without waiting on them. A peer
@@ -70,6 +72,7 @@ class Accounts {
     MessageRoutes& routes_;
     SessionManager sessions_;
     UserStore users_;
+    PasswordWork password_work_;
     std::chrono::milliseconds gossip_ttl_;
     // What the last gossip broadcast said, and which peers have been told it.
     // A set of ids rather than a count, so membership churn does not
