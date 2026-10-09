@@ -4651,6 +4651,116 @@ MACHA_FAST_TEST("storage_metadata", test_torrent_requests_join_without_conflicts
     CHECK(merge_torrent_requests({}, {{second.id, second}}, {{first.id, first}}) == both);
 }
 
+// A tree-backed head names tombstone batches (SM19, only while it names one)
+// and DLT11 names and drops them; a delta's successor re-encodes to the same
+// bytes, a merge is the union, and a head's tombstones are read from its
+// batches, the latest retirement per object.
+MACHA_FAST_TEST("storage_metadata", test_tombstone_batches_ride_the_head_and_its_deltas) {
+    const auto magic = [](const Bytes& bytes) { return std::string(bytes.begin(), bytes.begin() + 8); };
+    MetadataSnapshot base = decode_snapshot(genesis_metadata().payload);
+    base.metadata_write_replicas_required = 1;
+    base.entries.clear();
+    base.namespace_root = object_id(pattern(64));
+    CHECK(magic(encode_snapshot_v14(base)) == "DHTMETB4");
+
+    std::map<ObjectId, Bytes> objects;
+    const auto batch_of = [&](int64_t retired, std::vector<ObjectId> ids) {
+        std::sort(ids.begin(), ids.end());
+        const auto bytes = encode_tombstone_batch(retired, ids);
+        const auto id = object_id(bytes);
+        objects[id] = bytes;
+        return TombstoneBatch{id, retired, static_cast<uint32_t>(ids.size())};
+    };
+    const auto a = object_id(pattern(10, 1)), b = object_id(pattern(10, 2)),
+               c = object_id(pattern(10, 3));
+    const auto first = batch_of(100, {a, b});
+    const auto second = batch_of(200, {b, c});
+
+    auto with = base;
+    with.tombstone_batches = {first, second};
+    std::sort(with.tombstone_batches.begin(), with.tombstone_batches.end(),
+              [](const TombstoneBatch& x, const TombstoneBatch& y) { return x.id < y.id; });
+    const auto with_bytes = encode_snapshot_v14(with);
+    CHECK(magic(with_bytes) == "DHTMETB9");
+    CHECK(decode_snapshot(with_bytes).tombstone_batches == with.tombstone_batches);
+    CHECK(encode_snapshot_v14(decode_snapshot(with_bytes)) == with_bytes);
+    // The legacy clock still rides SM19.
+    auto clocked = with;
+    clocked.legacy_clock = std::map<NodeId, uint64_t>{{random_node_id(), 3}};
+    CHECK(decode_snapshot(encode_snapshot_v14(clocked)).legacy_clock == clocked.legacy_clock);
+
+    const NamespaceDeltaApplier same_tree = [](const ObjectId& root, const MetadataDelta&) {
+        return root;
+    };
+    const auto added = metadata_delta(base, with);
+    REQUIRE(added.has_value());
+    const auto added_bytes = encode_metadata_delta(*added);
+    CHECK(magic(added_bytes) == "DHTMDLTB");
+    CHECK(encode_snapshot_v14(apply_metadata_delta(base, decode_metadata_delta(added_bytes),
+                                                   same_tree)) == with_bytes);
+    auto dropped = with;
+    std::erase(dropped.tombstone_batches, first);
+    const auto drop = metadata_delta(with, dropped);
+    REQUIRE(drop.has_value());
+    CHECK(drop->drop_tombstone_batches == std::vector<ObjectId>{first.id});
+    CHECK(encode_snapshot_v14(apply_metadata_delta(
+              with, decode_metadata_delta(encode_metadata_delta(*drop)), same_tree)) ==
+          encode_snapshot_v14(dropped));
+
+    // A merge (over materialised namespaces) is the union of both heads'
+    // batches.
+    auto left = base;
+    left.namespace_root.reset();
+    left.tombstone_batches = {first};
+    auto right = left;
+    right.tombstone_batches = {second};
+    Hash256 left_head{}, right_head{};
+    left_head.bytes[0] = 1;
+    right_head.bytes[0] = 2;
+    CHECK(merge_metadata_heads(left, right, left_head, right_head).snapshot.tombstone_batches ==
+          with.tombstone_batches);
+
+    // Tombstones: the latest retirement per object; an unreadable batch is
+    // counted and left out.
+    size_t unreadable = 0;
+    const auto read = [&](const ObjectId& id) -> std::optional<Bytes> {
+        const auto found = objects.find(id);
+        return found == objects.end() ? std::nullopt : std::optional(found->second);
+    };
+    const auto all = tombstones_of(with, read, &unreadable);
+    CHECK(unreadable == 0);
+    REQUIRE(all.size() == 3);
+    for (const auto& tombstone : all)
+        CHECK(tombstone.retired_at_ns == (tombstone.id == a ? 100 : 200));
+    CHECK(tombstone_count(with) == 4);
+    objects.erase(second.id);
+    unreadable = 0;
+    CHECK(tombstones_of(with, read, &unreadable).size() == 2);
+    CHECK(unreadable == 1);
+
+    // An inline namespace cannot carry batches; a tree-backed mutation's
+    // retirements wait for the commit.
+    const auto throws = [](const auto& call) {
+        try {
+            call();
+        } catch (const std::exception&) {
+            return true;
+        }
+        return false;
+    };
+    auto inline_head = decode_snapshot(genesis_metadata().payload);
+    inline_head.tombstone_batches = {first};
+    CHECK(throws([&] { (void)encode_snapshot(inline_head); }));
+    MetadataDelta delta;
+    auto tree_head = base;
+    retire_objects(tree_head, delta, {a, b});
+    retire_objects(tree_head, delta, {c});
+    CHECK(tree_head.garbage.empty());
+    REQUIRE(delta.pending_tombstones.size() == 1);
+    CHECK(delta.pending_tombstones.front().ids.size() == 3);
+    CHECK(throws([&] { (void)encode_metadata_delta(delta); }));
+}
+
 MACHA_FAST_TEST("storage_metadata", test_torrent_requests_ride_the_snapshot_and_its_deltas) {
     // SM15 (inline namespace), SM16 (tree-backed) and DLT9 carry the
     // collection; a cluster with none keeps its exact encodings.

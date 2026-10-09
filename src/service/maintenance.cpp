@@ -209,6 +209,59 @@ void Maintenance::maintain_garbage_metadata(const std::vector<GarbageRef>& erase
     });
 }
 
+void Maintenance::maintain_tombstone_batches(const InventoryHorizon& inventory) {
+    const auto grace_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(node_.config().maintenance.garbage_grace)
+            .count();
+    const auto now_ns = clock_->wall_ns();
+    std::set<ObjectId> matured;
+    for (const auto& batch : inventory.tombstone_batches())
+        if (batch.retired_at_ns > 0 && now_ns >= batch.retired_at_ns &&
+            now_ns - batch.retired_at_ns >= grace_ns)
+            matured.insert(batch.id);
+    const auto view = metadata_.converged();
+    const bool inline_tombstones =
+        view.snapshot->namespace_root && !view.snapshot->garbage.empty();
+    if (matured.empty() && !inline_tombstones)
+        return;
+    constexpr int64_t hour_ns = 3600LL * 1000 * 1000 * 1000;
+    metadata_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+        // A batch is immutable, so dropping it by id cannot drop a later
+        // retirement of the same objects: that is another batch.
+        std::erase_if(snapshot.tombstone_batches, [&](const TombstoneBatch& batch) {
+            const bool drop = matured.contains(batch.id);
+            if (drop)
+                delta.drop_tombstone_batches.push_back(batch.id);
+            return drop;
+        });
+        if (!snapshot.namespace_root || snapshot.garbage.empty())
+            return;
+        // Inline tombstones into batches, an hour of retirements to a batch at
+        // the hour's latest: a collection waits at most an hour more. One
+        // never stamped is stamped now, a full grace from here.
+        const auto now = clock_->wall_ns();
+        std::map<int64_t, MetadataDelta::PendingTombstones> hours;
+        for (const auto& garbage : snapshot.garbage) {
+            const auto at = garbage.retired_at_ns > 0 ? garbage.retired_at_ns : now;
+            auto& hour = hours[at / hour_ns];
+            hour.at_commit = false;
+            hour.retired_at_ns = std::max(hour.retired_at_ns, at);
+            hour.ids.push_back(garbage.id);
+            delta.erase_garbage.push_back(garbage.id);
+        }
+        snapshot.garbage.clear();
+        std::sort(delta.erase_garbage.begin(), delta.erase_garbage.end());
+        delta.erase_garbage.erase(
+            std::unique(delta.erase_garbage.begin(), delta.erase_garbage.end()),
+            delta.erase_garbage.end());
+        for (auto& [_, hour] : hours)
+            delta.pending_tombstones.push_back(std::move(hour));
+        Log::info("metadata tombstones moved into batches tombstones=" +
+                  std::to_string(delta.erase_garbage.size()) +
+                  " batches=" + std::to_string(hours.size()));
+    });
+}
+
 double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds,
                             double wall_seconds, double cpu_target) {
     if (wall_seconds <= 0.0)
@@ -821,6 +874,8 @@ void Maintenance::run(std::stop_token stop) {
                                                        ids(legacy) + "]");
                         maintain_garbage_metadata(erase, legacy);
                     }
+                    if (inventory)
+                        maintain_tombstone_batches(*inventory);
                 }
 
                 // The control live set (catalogue objects and namespace tree nodes)
