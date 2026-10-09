@@ -4,6 +4,14 @@ Contracts settled with the client sessions (from 2026-09-13), kept here
 because they were agreed across sessions and exist nowhere else in this
 repository. A server change that breaks one breaks four clients at once.
 
+**0.90.64 (2026-10-09; NOT YET ANNOUNCED: no Core or client session was
+running; announce at the next one).** `POST /api/v1/users`, and `PATCH
+/api/v1/users/{id}` or `/api/v1/users/me` when the body sets a password, can
+answer `429 try_later` with `Retry-After: 1` when every password slot on the
+node is in use, exactly as `POST /api/v1/session` already does. A client
+retries after a second; nothing was changed. A roles-only `PATCH` never gets
+it.
+
 **0.90.35 (announced 2026-10-06 to Core and every client; Core's type
 restored to it in `b4a549f` on 2026-10-08).** `diagnostics.repair.paced_by`
 in `GET /api/v1/status/diagnostics` lists `viewer`, `loader` and
