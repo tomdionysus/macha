@@ -203,8 +203,10 @@ cross-session and will not be in the next session's context.
   DTS/TrueHD investigation in September was the same mistake at larger scale.
   The node is in the URL; there is no excuse for losing it.
 - **Prefer complete files when an item has several** (operator, 2026-10-09;
-  sent to Core that day). Consider media with `availability: available` from
-  `GET /api/v1/playback/media` first; fall back to `partial` or `unknown` only
-  when no complete file exists; treat `unavailable` as unplayable. Ranking among
-  the complete ones stays the client's. Found when Father Ted S02E01 was played
+  Core did it in 0a76fb7, `playableFirst`, used by every client). Consider
+  media with `availability: complete` from `GET /api/v1/playback/media` first;
+  fall back to `partial` or `unknown` only when no complete file exists; treat
+  `unavailable` as unplayable. Ranking among the complete ones stays the
+  client's. The node never chooses a file: session create requires `media_id`
+  and refuses `item_id`. Found when Father Ted S02E01 was played
   from a 720p copy held by no online node while a complete 1080p copy existed.
