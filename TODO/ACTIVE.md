@@ -30,7 +30,13 @@ From the lock audit (done, 0.90.45 to 0.90.49) and the CPU and memory audit
 of 2026-10-08, ranked:
 
 1. Whole-record copies inline on control threads (`get_metadata`,
-   `get_committed_metadata`, `accept_commit`'s decode).
+   `get_committed_metadata`, `accept_commit`'s decode). Measured 2026-10-09
+   on gbni-1: the head record is 2.67 MB, nearly all of it 46,092 tombstones
+   (deleted extents held for the 30-day grace); the namespace itself is in
+   the tree (9,819 entries, 1,071,309 extent references). So the copies grow
+   with recent deletes. **Operator question**: move tombstones out of the
+   head record (into the control tree, or the ledger like the reference
+   counts), so a record is a few KB; or only stop copying it.
 2. The memory ledger counts few large structures (metadata, catalogue and
    cache owners declared, never charged), so the control reserve protects
    counted bytes only; `restore()` overcommits without the reserve.
