@@ -47,24 +47,18 @@ Json session_json(const AuthSession& session, const UserStore& users,
 } // namespace
 
 PasswordCredentialValidator::PasswordCredentialValidator(const UserStore& users,
-                                                         SessionConfig config)
-    : users_(users), config_(std::move(config)) {}
+                                                         SessionConfig config,
+                                                         PasswordWork& password_work)
+    : users_(users), config_(std::move(config)), password_work_(password_work) {}
 
-bool PasswordCredentialValidator::begin_check(const std::string& username) const {
+bool PasswordCredentialValidator::locked_out(const std::string& username) const {
     Lock lock(mutex_);
-    if (auto found = failures_.find(username);
-        found != failures_.end() && Clock::now() < found->second.until)
-        return false;
-    if (in_flight_ >= config_.max_concurrent_password_checks)
-        return false;
-    ++in_flight_;
-    return true;
+    const auto found = failures_.find(username);
+    return found != failures_.end() && Clock::now() < found->second.until;
 }
 
 void PasswordCredentialValidator::end_check(const std::string& username, bool success) const {
     Lock lock(mutex_);
-    if (in_flight_)
-        --in_flight_;
     if (success) {
         failures_.erase(username);
         return;
@@ -102,7 +96,10 @@ CredentialResult PasswordCredentialValidator::validate(const Json& credentials) 
         return {CredentialOutcome::unsupported, {}};
 
     const auto name = normalize_username(username->asString());
-    if (!begin_check(name))
+    if (locked_out(name))
+        return {CredentialOutcome::rate_limited, {}};
+    const auto slot = password_work_.try_acquire();
+    if (!slot)
         return {CredentialOutcome::rate_limited, {}};
     auto check = users_.verify(name, password->asString());
     end_check(name, check.ok);
@@ -117,7 +114,8 @@ SessionApi::SessionApi(NodeRuntime& node, Accounts& accounts,
     : sessions_(accounts.sessions()), accounts_(accounts),
       validator_(validator ? std::move(validator)
                            : std::make_unique<PasswordCredentialValidator>(
-                                 accounts.users(), node.config().session)) {}
+                                 accounts.users(), node.config().session,
+                                 accounts.password_work())) {}
 
 bool SessionApi::capability_request(const HttpRequest& request) {
     return request.method == "POST" && request.path == "/api/v1/session";

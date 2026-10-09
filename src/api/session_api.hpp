@@ -49,22 +49,21 @@ class CredentialValidator {
 class PasswordCredentialValidator final : public CredentialValidator {
     const UserStore& users_;
     SessionConfig config_;
-
     // Local brakes on an unauthenticated endpoint running an expensive KDF. They
     // protect this node's CPU and are deliberately not cluster state.
+    PasswordWork& password_work_;
     mutable Mutex mutex_;
-    mutable size_t in_flight_ MACHA_GUARDED_BY(mutex_){};
     struct Failures {
         size_t count{};
         Clock::time_point until{};
     };
     mutable std::map<std::string, Failures, std::less<>> failures_;
 
-    bool begin_check(const std::string& username) const;
+    bool locked_out(const std::string& username) const;
     void end_check(const std::string& username, bool success) const;
 
   public:
-    PasswordCredentialValidator(const UserStore&, SessionConfig);
+    PasswordCredentialValidator(const UserStore&, SessionConfig, PasswordWork&);
     CredentialResult validate(const Json& credentials) const override;
 };
 
