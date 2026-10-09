@@ -108,7 +108,7 @@ void ClusterJobView::poll(const NodeInfo& info) {
     fresh.host = info.host;
     bool reached = false;
     try {
-        auto reply = node_.call(info, MessageType::get_torrent_jobs, {}, FrameType::control);
+        auto reply = node_.call(info, MessageType::get_torrent_jobs, {}, FrameType::loader);
         reached = true;
         if (reply.message.type == MessageType::torrent_jobs_reply) {
             auto parsed = parse_payload(reply);
@@ -133,7 +133,7 @@ void ClusterJobView::poll(const NodeInfo& info) {
         Log::debug("cluster job view: torrent query to " + info.host + ": " + error.what());
     }
     try {
-        auto reply = node_.call(info, MessageType::get_ingest_jobs, {}, FrameType::control);
+        auto reply = node_.call(info, MessageType::get_ingest_jobs, {}, FrameType::loader);
         reached = true;
         if (reply.message.type == MessageType::ingest_jobs_reply) {
             auto parsed = parse_payload(reply);
@@ -227,8 +227,9 @@ TorrentActionResult ClusterJobView::torrent_action(std::string_view id, std::str
     request["job_id"] = std::string(id);
     request["action"] = std::string(action);
     try {
+        // Called by the torrent coordinator's retries: loader work.
         auto reply = node_.call(*peer, MessageType::torrent_job_action, json_bytes(Json(std::move(request))),
-                                FrameType::control);
+                                FrameType::loader);
         if (reply.message.type != MessageType::torrent_job_action_reply) {
             result.unreachable = true;
             return result;
@@ -342,8 +343,9 @@ IngestActionResult ClusterJobView::ingest_action(std::string_view id, std::strin
     request["job_id"] = std::string(id);
     request["action"] = std::string(action);
     try {
+        // A user's action through the API: viewer work.
         auto reply = node_.call(*peer, MessageType::ingest_job_action, json_bytes(Json(std::move(request))),
-                                FrameType::control);
+                                FrameType::foreground);
         if (reply.message.type != MessageType::ingest_job_action_reply) {
             result.unreachable = true;
             return result;

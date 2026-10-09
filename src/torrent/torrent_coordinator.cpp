@@ -529,7 +529,7 @@ TorrentCoordinator::Outcome TorrentCoordinator::write_desired(const TorrentReque
         try {
             const auto text = Json(intent_request(r.id, desired, now)).dump();
             auto reply = node_.call(*owner, MessageType::torrent_intent, Bytes(text.begin(), text.end()),
-                                    FrameType::control);
+                                    FrameType::loader);
             if (reply.message.type != MessageType::torrent_intent_reply) throw std::runtime_error("refused");
             const std::string body(reply.message.payload.begin(), reply.message.payload.end());
             auto parsed = Json::parse(body);
@@ -805,7 +805,7 @@ TorrentCoordinator::resolve_remote(std::string_view uri, bool search_result, std
         try {
             const auto text = Json(std::move(request)).dump();
             auto reply = node_.call(*peer, MessageType::torrent_job_action, Bytes(text.begin(), text.end()),
-                                    FrameType::control);
+                                    FrameType::loader);
             if (reply.message.type != MessageType::torrent_job_action_reply) continue;
             const std::string body(reply.message.payload.begin(), reply.message.payload.end());
             auto parsed = Json::parse(body);
