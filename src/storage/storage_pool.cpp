@@ -990,7 +990,7 @@ StoragePool::scrub_step(uint64_t budget_bytes, size_t operation_budget,
 }
 
 StoragePool::MaintenanceResult
-StoragePool::gc_step(std::span<const ObjectId> live,
+StoragePool::gc_step(const IdLookup& live,
                      const std::vector<ObjectId>& protected_ids,
                      std::chrono::milliseconds orphan_grace, size_t operation_budget,
                      const std::function<bool()>& should_yield,
@@ -1013,7 +1013,7 @@ StoragePool::gc_step(std::span<const ObjectId> live,
         }
         ++result.objects;
         const auto& id = item->id;
-        if (std::binary_search(live.begin(), live.end(), id) ||
+        if (live.contains(id) ||
             std::binary_search(protected_ids.begin(), protected_ids.end(), id) ||
             (is_retained && is_retained(id))) {
             if (sightings)

@@ -25,6 +25,7 @@ class MetadataReplica;
 class ClusterNode;
 class PersistentBlockCache;
 class RetentionStore;
+class ReferenceCounts;
 class StoragePool;
 
 // How far this node's local state has recovered: plane by plane, the first
@@ -118,6 +119,7 @@ class LocalState {
     ControlObjectFetch& control_fetch() noexcept { return *control_fetch_; }
     PersistentBlockCache& cache() noexcept { return *cache_; }
     RetentionStore& retention() noexcept { return *retention_; }
+    ReferenceCounts& references() noexcept { return *references_; }
     MetadataReplica& replica() noexcept { return *replica_; }
 
     // Applies a live reload's storage backends and cache settings.
@@ -135,6 +137,7 @@ class LocalState {
     std::unique_ptr<ControlObjectFetch> control_fetch_;
     std::unique_ptr<PersistentBlockCache> cache_;
     std::unique_ptr<RetentionStore> retention_;
+    std::unique_ptr<ReferenceCounts> references_;
     std::unique_ptr<MetadataReplica> replica_;
 };
 

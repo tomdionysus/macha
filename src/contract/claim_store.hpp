@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/id_lookup.hpp"
 #include "contract/work.hpp"
 #include "types.hpp"
 
@@ -72,7 +73,7 @@ class ClaimStore {
     // the walk's position.
     static constexpr Waits release_waits = write_waits;
     static constexpr ThreadSafety release_safety = ThreadSafety::single_owner;
-    virtual size_t release_unreferenced(RetentionClass, std::span<const ObjectId> live,
+    virtual size_t release_unreferenced(RetentionClass, const IdLookup& live,
                                         const RetentionClock& observed,
                                         size_t operation_budget) = 0;
     // Forget causality tombstones once no claim remains and the object is

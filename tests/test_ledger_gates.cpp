@@ -32,9 +32,9 @@ std::vector<ObjectId> ids_of(std::span<const ObjectId> span) { return {span.begi
 
 MACHA_FAST_TEST("ledger", test_referenced_sets_are_sorted_unique_and_per_class) {
     const ReferencedSets sets({id(3), id(1), id(3), id(2)}, {id(9), id(9), id(5)});
-    CHECK((ids_of(sets.referenced_ids(RetentionClass::data)) ==
+    CHECK((ids_of(sets.all(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(2), id(3)}));
-    CHECK((ids_of(sets.referenced_ids(RetentionClass::control)) ==
+    CHECK((ids_of(sets.all(RetentionClass::control)) ==
            std::vector<ObjectId>{id(5), id(9)}));
     CHECK(sets.size(RetentionClass::data) == 3);
     CHECK(sets.size(RetentionClass::control) == 2);
@@ -44,7 +44,7 @@ MACHA_FAST_TEST("ledger", test_referenced_sets_are_sorted_unique_and_per_class) 
     }
     const ReferencedSets empty({}, {});
     CHECK(empty.size(RetentionClass::data) == 0);
-    CHECK(empty.referenced_ids(RetentionClass::control).empty());
+    CHECK(empty.all(RetentionClass::control).empty());
     CHECK(!empty.referenced(RetentionClass::data, id(0)));
 }
 
@@ -74,7 +74,7 @@ MACHA_FAST_TEST("ledger", test_release_horizon_carries_its_head_and_clock) {
     const ReleaseHorizon release(head, {{node, 12}}, {id(2), id(1)}, {id(3)});
     CHECK(release.head() == head);
     CHECK(release.clock().at(node) == 12);
-    CHECK((ids_of(release.referenced_ids(RetentionClass::data)) ==
+    CHECK((ids_of(release.all(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(2)}));
     CHECK(release.referenced(RetentionClass::control, id(3)));
 }

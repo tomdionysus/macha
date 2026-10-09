@@ -2271,7 +2271,8 @@ uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
 
 uint64_t DistributedStore::repair_once(uint64_t byte_budget,
                                       std::optional<std::span<const ObjectId>> live) {
-    return repair_step(byte_budget ? byte_budget : std::numeric_limits<uint64_t>::max(), 0, live)
+    return repair_step(byte_budget ? byte_budget : std::numeric_limits<uint64_t>::max(), 0,
+                       live ? std::optional<IdLookup>(*live) : std::nullopt)
         .bytes_transferred;
 }
 
@@ -2356,7 +2357,7 @@ DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const
 
 DistributedStore::RepairResult
 DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
-                              std::optional<std::span<const ObjectId>> live,
+                              std::optional<IdLookup> live,
                               const std::function<bool()>& should_yield,
                               uint64_t live_generation,
                               const std::function<bool(const ObjectId&)>& unavailable,
@@ -2371,7 +2372,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     // Cursor-based: never materialises the store's object list or copies the
     // live set per slice, which would make idle repair O(store).
     const std::optional<const ObjectId*> live_identity =
-        live ? std::optional<const ObjectId*>(live->data()) : std::nullopt;
+        live ? std::optional<const ObjectId*>(live->sorted().data()) : std::nullopt;
     const bool generation_changed =
         live_generation ? repair_live_generation_ != live_generation
                         : repair_live_identity_ != live_identity;
@@ -2389,7 +2390,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         repair_pass_spans_change_ = true;
     repair_live_identity_ = live_identity;
     repair_live_generation_ = live_generation;
-    const auto pull_list = pull ? pull : live;
+    const auto pull_list =
+        pull ? pull
+             : (live && !live->sorted().empty() ? std::optional(live->sorted()) : std::nullopt);
     // A new list of what to pull may name objects behind the cursor.
     const std::optional<const ObjectId*> pull_identity =
         pull_list ? std::optional<const ObjectId*>(pull_list->data()) : std::nullopt;
@@ -2466,7 +2469,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         // node among them, needs nothing: it settles without a probe and
         // without spending the scan budget.
         const auto settled_by_holdings = [&](const ObjectId& id) {
-            if (!known_present || (live && !std::binary_search(live->begin(), live->end(), id)))
+            if (!known_present || (live && !live->contains(id)))
                 return false;
             const auto nodes = ranked(id);
             const size_t target = std::min(n_.config().replication, nodes.size());
@@ -2520,7 +2523,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         for (const auto& id : repair_push_window_) {
             if (repair_push_probed_.contains(id))
                 continue;
-            if (live && !std::binary_search(live->begin(), live->end(), id))
+            if (live && !live->contains(id))
                 continue;
             for (const auto& peer : ranked(id)) {
                 if (peer.id == n_.node_id() || !has_room(peer))
@@ -2602,7 +2605,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 Plan plan;
                 plan.id = id;
                 // The physical cursor also sees non-live objects; GC handles them.
-                if (live && !std::binary_search(live->begin(), live->end(), id)) {
+                if (live && !live->contains(id)) {
                     plan.live = false;
                     plans.push_back(std::move(plan));
                     continue;
