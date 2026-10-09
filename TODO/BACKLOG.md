@@ -1,6 +1,8 @@
 # Backlog
 
-Verified against the code at 0.90.24 on 2026-10-06: what is still to do from
+Last touched 2026-10-09 (items moot after the object ledger, tombstone
+batches and the memory limit removed or moved to ACTIVE). Verified against
+the code at 0.90.24 on 2026-10-06: what is still to do from
 the sections written 2026-09-05..22. Each section of the old file was checked
 against the code, the CHANGELOG and COMPLETED; what was done or superseded is
 gone from here, and the old file with its full reasoning is
@@ -35,16 +37,13 @@ gone from here, and the old file with its full reasoning is
 
 ## Storage, caches and memory
 
-- **A cache must never be smaller than its own working set.**
-  `metadata_materialization_cache_bytes` is a fixed 128M, checked only for
-  range (`src/config_base.cpp:126`). Report the condition, warn or refuse when
-  a limit is below its unit size, derive bounds instead of fixing them, audit
-  the other declared bounds, and count pinned entries honestly. Fold in:
-  catch-up logs no progress and ignores a stop token, and `startup.phase`
-  reads `ready` whatever the lag (`status_api.cpp:818`).
+- **A cache's floor** moved to ACTIVE section 3 (the memory limit can now
+  shrink caches). Still here: catch-up logs no progress and ignores a stop
+  token, and `startup.phase` reads `ready` whatever the lag
+  (`status_api.cpp:818`).
 - **The namespace tree's Stage D**: `file_media_id` is derived on every call
-  (`filesystem.hpp:607`), not persisted; loaded tree nodes are not accounted
-  on the `RetainedMemoryLedger`.
+  (`filesystem.hpp:607`), not persisted; the namespace tree node cache is not
+  in the `memory_*` gauges (add it only if RSS grows unexplained).
 - **The block cache cannot be judged from status**: counters exist
   (`status_api.cpp:302`) but a sustained zero-hit, high-eviction cache is not a
   condition. Then revisit fi-1 read latency and whether hydration runs.
@@ -61,9 +60,9 @@ gone from here, and the old file with its full reasoning is
 
 ## Catalogue
 
-- **The catalogue's cost and residency**: the whole of it is ACTIVE
-  section 0's [plan](2026-10-06-catalogue-materialised-view.md), including
-  holdings for catalogue DATA. Nothing of it remains here.
+- **The catalogue's cost and residency**: ACTIVE section 4's
+  [plan](2026-10-06-catalogue-materialised-view.md); holdings for catalogue
+  DATA moved to ACTIVE section 2 (replication by diff).
 - **`GET catalogue/status` walks all artwork** and asks the store for each
   (`catalogue.cpp:896`).
 - **Clear Metadata is synchronous.** (Its descendant scan goes with the
@@ -79,8 +78,7 @@ gone from here, and the old file with its full reasoning is
 - **`durability_poisoned` is never cleared** (`fuse_frontend.cpp:2416`).
 - **Unlink does not short-circuit a pending publication**: data is abandoned
   only after a publication fails with ENOENT (`fuse_frontend.cpp:4055`).
-- Unclear, to check: a job shown `queued` while importing; whether retention
-  growth is still quadratic now that claims replaced the retention journal.
+- Unclear, to check: a job shown `queued` while importing.
 
 ## Cluster and operations
 

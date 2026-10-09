@@ -351,7 +351,7 @@ and collapse), reopening, a crash at each step of a checkpoint, a torn
 journal, the rewrite, and a trie larger than its cache. Measured on the
 laptop with 224,000 records and a near-full journal left behind: open in
 437 ms, a cold lookup 10 us, the cache within its bound.
-Design: `TODO/2026-10-08-on-disk-object-ledger.md`.
+Design: `TODO/archive/2026-10-08-on-disk-object-ledger.md`.
 
 ## 0.90.52: a restarted node answers its peers at once
 
