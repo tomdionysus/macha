@@ -545,10 +545,11 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
 
 HeldView LocalStore::held_view() const {
     if (!ledger_ || !ledger_->seeded())
-        return {{{}, held_removals(), false}, [](const ObjectId&) { return false; }};
+        return {{{}, held_removals(), false}, [](const ObjectId&) { return false; }, {}};
     auto view = ledger_->view();
     HeldView out;
     out.identity = {view.records.root_hash(), view.removals, true};
+    out.tries = {view.records};
     out.held = [records = std::move(view.records)](const ObjectId& id) {
         return records.get(id).has_value();
     };

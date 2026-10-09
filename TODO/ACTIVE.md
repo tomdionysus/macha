@@ -70,8 +70,7 @@ A failing test is P0: reproduce it before deciding whose it is.
 ## 2. Replication by diff (the next large piece)
 
 Proposal: [`2026-10-09-replication-by-diff.md`](2026-10-09-replication-by-diff.md),
-written 2026-10-09 with the survey of what it replaces; **awaiting the
-operator's review** (section 8). Its rule: a node's holdings have one
+written and approved 2026-10-09. Its rule: a node's holdings have one
 identity, the `held` tries' root hashes, and it is the only signal that
 they changed; nothing keys a holdings memo on proxies. One subtree-hash
 diff between two nodes' `held` tries, joined locally with `referenced`,
@@ -79,25 +78,25 @@ replaces the availability survey and its roll-up, repair's walks and
 probes, and the inventory's `outside_namespace`. Each stage ships alone;
 the walks stay as the fallback until every node runs stage 3.
 
-0. **The holdings identity: built, 0.90.71 (96769e7), laptop tests green;
-   not yet pushed, through fi-1's suites or deployed.** `held_view()` on
-   every store; the survey keyed on (head, identity) only; `indexed()`,
-   `held_indexed()`, the loss counts and the cold wait deleted. Closed
-   `StoragePool::indexed()` and the missing re-roll when a disk comes back.
-   Found on the way: packed objects were never in the held ledger; they are
-   now, and each node's first start on 0.90.71 lists its packed objects
-   (one ledger lookup per packed object; watch gbni-1's start time).
-1. **The trie's diff surface**: `Snapshot::children(prefix)`,
-   `records(prefix)`, a local reference diff, the `referenced`/`held` merge
-   join. Exhaustive primitive tests.
-2. **`trie_diff` over the wire**, the survey publishing from it when every
-   peer answers. Closes: **extents held by no node online** (about 203,000
-   of 940,000; five of 25 sampled movies EIO on both nodes, which is
-   correct; whether es-1 holds them, or fi-1 dropped a sole copy between
-   2026-09-15 and 09-24, is not known) as `lost` per object; the survey's
-   memo going stale when a peer's holdings grow; **per-file readability**'s
-   answer (held by nobody reachable; the operator still chooses where it is
-   exposed, section 7).
+0. **The holdings identity: built, 0.90.71.** `held_view()` on every
+   store; the survey keyed on (head, identity) only; `indexed()`,
+   `held_indexed()`, the loss counts, the cold wait and the kept roll-up
+   deleted. Closed `StoragePool::indexed()` and the missing re-roll when a
+   disk comes back. Found on the way: packed objects were never in the held
+   ledger; they are now, and each node's first start lists its packed
+   objects (watch gbni-1's start time).
+1. **The trie's diff surface: built, 0.90.72.**
+2. **`trie_diff` over the wire: built, 0.90.72.** The survey diffs held
+   tries when every peer runs 0.90.72 with one DATA disk; else the tree.
+   Closes, once deployed and read on the cluster: **extents held by no node
+   online** (about 203,000 of 940,000; five of 25 sampled movies EIO on
+   both nodes, which is correct) as `unavailable`; the memo going stale
+   when a peer's holdings grow (the diff has no memo); **per-file
+   readability**'s answer. Read after deploy: `method=diff` in the survey
+   debug line, its rounds, and `availability.survey_us` against before.
+   **0.90.71 and 0.90.72 are committed but not deployed**: the deploy
+   script was refused by the auto-mode classifier; fi-1's suites passed
+   for 0.90.71 on a clean build.
 3. **Repair on the diff**: no presence probes, a pipelined window. Closes:
    repair bound by the WAN (one step sends two extents and waits; about
    4 MB in 5 s); logging the resumed push position (the cursors go).
@@ -215,8 +214,9 @@ on control threads no longer grow with deletes. Left:
 
 ## 8. Waiting on the operator
 
-- **Review the replication-by-diff proposal** (section 2) and its three
-  open questions; stage 0 starts on approval.
+- **Allow the deploy** of 0.90.71/0.90.72 (section 2), refused by the
+  auto-mode classifier on 2026-10-09; and the proposal's three open
+  questions.
 - The bootstrap test (section 1): the first write waits for the bootstrap
   checkpoint survey (not the availability survey), or the test retries the
   refusal.

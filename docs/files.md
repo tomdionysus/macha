@@ -113,6 +113,16 @@ its id, and only partial subtrees are descended. The cost follows what
 differs between the nodes, not the size of the library, and no extent id is
 sent.
 
+When every peer can answer it (0.90.72 and later, one DATA disk each side),
+a node instead compares its held ledger with each peer's directly: the two
+tries are descended together from the root, a level a round, only where
+their subtree hashes differ, all from one snapshot of the peer's ledger.
+What a peer holds that this node lacks is available; what this node lacks
+and no peer holds is unavailable; what this node holds and a peer lacks,
+among what the namespace and catalogue refer to, is what repair sends it.
+Any peer that cannot answer puts the whole survey back on the tree
+questions above.
+
 The survey runs in the maintenance pass, as background work. A node's
 holdings are read from its held ledgers (see
 [Configuration](configuration.md)) as one frozen view with an identity, a

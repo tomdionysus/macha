@@ -717,13 +717,19 @@ HeldView StoragePool::held_view() const {
     }
     identity.hash = hasher.finish();
     std::vector<std::function<bool(const ObjectId&)>> held;
+    std::vector<ObjectTrie::Snapshot> tries;
     held.reserve(parts.size());
-    for (auto& part : parts)
+    for (auto& part : parts) {
         held.push_back(std::move(part.view.held));
-    return {identity, [held = std::move(held)](const ObjectId& id) {
+        for (auto& trie : part.view.tries)
+            tries.push_back(std::move(trie));
+    }
+    return {identity,
+            [held = std::move(held)](const ObjectId& id) {
                 return std::any_of(held.begin(), held.end(),
                                    [&](const auto& one) { return one(id); });
-            }};
+            },
+            std::move(tries)};
 }
 
 bool StoragePool::remove(const ObjectId& id) {

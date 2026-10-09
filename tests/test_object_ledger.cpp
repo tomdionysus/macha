@@ -5,6 +5,7 @@
 #include "crypto.hpp"
 #include "ledger/held_ledger.hpp"
 #include "ledger/object_trie.hpp"
+#include "ledger/trie_diff.hpp"
 #include "ledger/reference_counts.hpp"
 #include "storage/local_store.hpp"
 #include "storage/sealed_journal.hpp"
@@ -284,6 +285,254 @@ MACHA_FAST_TEST("object_ledger", test_the_trie_hash_depends_only_on_its_records)
     // One value different: the hashes differ.
     two.apply(std::vector<ObjectTrie::Change>{{records[0].id, Bytes{9, 9, 9}}});
     CHECK(one.root_hash() != two.root_hash());
+}
+
+// --- The trie's diff surface ------------------------------------------------
+
+// Ids that share leading bytes, so subtrees run several levels deep.
+ObjectId clustered_id(std::mt19937_64& random) {
+    auto id = id_of(random);
+    id.bytes[0] = static_cast<uint8_t>(random() % 4);
+    id.bytes[1] = static_cast<uint8_t>(random() % 3);
+    if (random() % 2)
+        id.bytes[2] = 9;
+    return id;
+}
+
+std::unique_ptr<ObjectTrie> trie_of(const std::filesystem::path& dir,
+                                    const std::map<ObjectId, Bytes>& records,
+                                    std::mt19937_64& random) {
+    // Unsaved until the caller checkpoints: in-memory nodes and saved ones
+    // are both read by the tests that need each.
+    auto options = small_options();
+    options.checkpoint_bytes = 64ULL * 1024 * 1024;
+    auto trie = std::make_unique<ObjectTrie>(dir, key_of(8), options);
+    std::vector<ObjectTrie::Change> changes;
+    for (const auto& [id, value] : records)
+        changes.push_back({id, value});
+    std::shuffle(changes.begin(), changes.end(), random);
+    for (size_t from = 0; from < changes.size(); from += 997)
+        trie->apply(std::span<const ObjectTrie::Change>(changes).subspan(
+            from, std::min<size_t>(997, changes.size() - from)));
+    return trie;
+}
+
+ObjectTrie::Prefix prefix_of(const ObjectId& id, uint8_t length) {
+    ObjectTrie::Prefix prefix;
+    std::copy_n(id.bytes.begin(), length, prefix.bytes.begin());
+    prefix.length = length;
+    return prefix;
+}
+
+std::map<ObjectId, Bytes> below(const std::map<ObjectId, Bytes>& records,
+                                const ObjectTrie::Prefix& prefix) {
+    std::map<ObjectId, Bytes> out;
+    for (const auto& [id, value] : records)
+        if (prefix.covers(id))
+            out.emplace(id, value);
+    return out;
+}
+
+// What is below a prefix reads the same from every trie holding the same
+// records below it: one holding only those, one holding thousands more
+// (where the prefix sits deeper in interior nodes or inside a larger leaf),
+// and the same trie after a checkpoint and a reopen, read from disk.
+MACHA_FAST_TEST("object_ledger", test_a_subtree_reads_the_same_in_every_trie_holding_it) {
+    std::mt19937_64 random(21);
+    std::map<ObjectId, Bytes> records;
+    while (records.size() < 3000)
+        records.emplace(clustered_id(random), value_of(random));
+    TempDir whole_dir;
+    auto whole = trie_of(whole_dir.path(), records, random);
+    std::vector<ObjectTrie::Prefix> prefixes{ObjectTrie::Prefix{}};
+    for (uint8_t length = 1; length <= 4; ++length)
+        for (int i = 0; i < 3; ++i) {
+            auto at = records.begin();
+            std::advance(at, static_cast<long>(random() % records.size()));
+            prefixes.push_back(prefix_of(at->first, length));
+        }
+    prefixes.push_back(prefix_of(id_of(random), 2)); // nothing below it
+    const auto expected_children = whole->snapshot().children(prefixes);
+    const auto expected_records = whole->snapshot().records(prefixes);
+    whole->checkpoint();
+    whole.reset();
+    ObjectTrie reopened(whole_dir.path(), key_of(8), small_options());
+    CHECK(reopened.snapshot().children(prefixes) == expected_children);
+    CHECK(reopened.snapshot().records(prefixes) == expected_records);
+
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+        const auto& prefix = prefixes[i];
+        const auto mine = below(records, prefix);
+        CHECK(expected_records[i] ==
+              std::vector<ObjectTrie::Record>(mine.begin(), mine.end()));
+        uint64_t counted = 0;
+        for (const auto& summary : expected_children[i])
+            counted += summary.count;
+        CHECK(counted == mine.size());
+        // Alone, and among others that are not below it.
+        auto crowded = mine;
+        // (Everything is below the empty prefix.)
+        while (prefix.length && crowded.size() < mine.size() + 600) {
+            const auto id = clustered_id(random);
+            if (!prefix.covers(id))
+                crowded.emplace(id, value_of(random));
+        }
+        const std::map<ObjectId, Bytes>* const sets[] = {&mine, &crowded};
+        for (const auto* set : sets) {
+            TempDir dir;
+            const auto other = trie_of(dir.path(), *set, random);
+            const auto snapshot = other->snapshot();
+            CHECK(snapshot.children(std::span(&prefix, 1)).front() == expected_children[i]);
+            CHECK(snapshot.records(std::span(&prefix, 1)).front() == expected_records[i]);
+        }
+    }
+}
+
+std::vector<TrieDifference> diff_of(ObjectTrie& left, ObjectTrie& right, TrieDiffCost* cost = nullptr) {
+    SnapshotSource a(left.snapshot());
+    SnapshotSource b(right.snapshot());
+    std::vector<TrieDifference> out;
+    const auto spent = diff_tries(a, b, [&](const TrieDifference& d) { out.push_back(d); });
+    if (cost)
+        *cost = spent;
+    std::sort(out.begin(), out.end(),
+              [](const TrieDifference& x, const TrieDifference& y) { return x.id < y.id; });
+    return out;
+}
+
+std::vector<TrieDifference> model_diff(const std::map<ObjectId, Bytes>& left,
+                                       const std::map<ObjectId, Bytes>& right) {
+    std::map<ObjectId, TrieDifference> out;
+    for (const auto& [id, value] : left)
+        out[id] = {id, value, std::nullopt};
+    for (const auto& [id, value] : right) {
+        auto& entry = out[id];
+        entry.id = id;
+        entry.right = value;
+        if (entry.left == entry.right)
+            out.erase(id);
+    }
+    std::vector<TrieDifference> flat;
+    for (auto& [id, d] : out)
+        flat.push_back(d);
+    return flat;
+}
+
+// The diff reports exactly what differs, both ways round, over pairs of
+// every size around a leaf: empty, a few, one either side of a leaf's limit,
+// thousands, one side crowded below a prefix the other barely holds.
+MACHA_FAST_TEST("object_ledger", test_a_diff_finds_exactly_what_differs) {
+    std::mt19937_64 random(22);
+    const size_t sizes[] = {0, 1, 40, ObjectTrie::leaf_max, ObjectTrie::leaf_max + 1, 700, 2500};
+    for (const auto base_size : sizes)
+        for (int variant = 0; variant < 4; ++variant) {
+            std::map<ObjectId, Bytes> base;
+            while (base.size() < base_size)
+                base.emplace(clustered_id(random), value_of(random));
+            auto left = base;
+            auto right = base;
+            for (auto* side : {&left, &right}) {
+                const auto changes = variant == 0 ? 0 : random() % (variant * 40 + 1);
+                for (size_t i = 0; i < changes; ++i) {
+                    const auto roll = random() % 3;
+                    if (roll == 0 || side->empty()) {
+                        side->emplace(clustered_id(random), value_of(random));
+                    } else {
+                        auto at = side->begin();
+                        std::advance(at, static_cast<long>(random() % side->size()));
+                        if (roll == 1)
+                            side->erase(at);
+                        else
+                            at->second = value_of(random);
+                    }
+                }
+            }
+            if (variant == 3) {
+                // One side holds hundreds below a prefix the other holds a few of.
+                for (int i = 0; i < 400; ++i) {
+                    auto id = id_of(random);
+                    id.bytes[0] = 200;
+                    id.bytes[1] = static_cast<uint8_t>(i % 2);
+                    left.emplace(id, value_of(random));
+                }
+            }
+            TempDir one;
+            TempDir two;
+            auto l = trie_of(one.path(), left, random);
+            auto r = trie_of(two.path(), right, random);
+            const auto expected = model_diff(left, right);
+            CHECK(diff_of(*l, *r) == expected);
+            auto swapped = expected;
+            for (auto& d : swapped)
+                std::swap(d.left, d.right);
+            CHECK(diff_of(*r, *l) == swapped);
+        }
+}
+
+// The cost follows the difference: equal tries cost nothing, and one record
+// changed among thousands is found in a round per level, reading a leaf a
+// side.
+MACHA_FAST_TEST("object_ledger", test_a_diff_costs_what_differs_not_the_size) {
+    std::mt19937_64 random(23);
+    std::map<ObjectId, Bytes> records;
+    while (records.size() < 20000)
+        records.emplace(id_of(random), value_of(random));
+    TempDir one;
+    TempDir two;
+    auto left = trie_of(one.path(), records, random);
+    auto right = trie_of(two.path(), records, random);
+    TrieDiffCost cost;
+    CHECK(diff_of(*left, *right, &cost).empty());
+    CHECK(cost.rounds == 0);
+
+    const auto changed = std::next(records.begin(), 777)->first;
+    right->apply(std::vector<ObjectTrie::Change>{{changed, Bytes{1, 2, 3}}});
+    const auto found = diff_of(*left, *right, &cost);
+    REQUIRE(found.size() == 1);
+    CHECK(found.front().id == changed);
+    // 20,000 random ids: interior at the root and one level down.
+    CHECK(cost.rounds <= 3);
+    CHECK(cost.prefixes <= 3);
+    CHECK(cost.records <= 2 * ObjectTrie::leaf_max);
+}
+
+// What a wanted trie holds that no held trie does, in order, for any number
+// of held tries, none included.
+MACHA_FAST_TEST("object_ledger", test_records_not_held_are_what_no_held_trie_holds) {
+    std::mt19937_64 random(24);
+    for (const size_t wanted_size : {size_t{0}, size_t{5}, size_t{3000}})
+        for (const size_t held_count : {size_t{0}, size_t{1}, size_t{3}}) {
+            std::map<ObjectId, Bytes> wanted;
+            while (wanted.size() < wanted_size)
+                wanted.emplace(clustered_id(random), value_of(random));
+            std::vector<std::map<ObjectId, Bytes>> held(held_count);
+            for (auto& set : held) {
+                for (const auto& [id, value] : wanted)
+                    if (random() % 3 == 0)
+                        set.emplace(id, Bytes{1});
+                for (int i = 0; i < 500; ++i)
+                    set.emplace(clustered_id(random), Bytes{1});
+            }
+            std::vector<ObjectTrie::Record> expected;
+            for (const auto& record : wanted)
+                if (std::none_of(held.begin(), held.end(),
+                                 [&](const auto& set) { return set.contains(record.first); }))
+                    expected.push_back(record);
+
+            TempDir wanted_dir;
+            auto wanted_trie = trie_of(wanted_dir.path(), wanted, random);
+            std::vector<TempDir> dirs(held_count);
+            std::vector<std::unique_ptr<ObjectTrie>> tries;
+            std::vector<ObjectTrie::Snapshot> snapshots;
+            for (size_t i = 0; i < held_count; ++i) {
+                tries.push_back(trie_of(dirs[i].path(), held[i], random));
+                snapshots.push_back(tries.back()->snapshot());
+            }
+            std::vector<ObjectTrie::Record> found;
+            records_not_held(wanted_trie->snapshot(), snapshots,
+                             [&](const ObjectTrie::Record& record) { found.push_back(record); });
+            CHECK(found == expected);
+        }
 }
 
 MACHA_FAST_TEST("object_ledger", test_a_reopened_trie_is_the_one_that_was_closed) {

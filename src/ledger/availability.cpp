@@ -6,6 +6,7 @@
 #include "crypto.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 
@@ -359,6 +360,38 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
     // Holding is by id: one reference every peer answered for decides the
     // extent, whatever another reference could not.
     std::erase_if(survey.unknown, [&](const ObjectId& id) { return survey.is_unavailable(id); });
+    return survey;
+}
+
+AvailabilitySurvey survey_by_diff(const ObjectTrie::Snapshot& mine,
+                                  const std::vector<ObjectId>& missing_here,
+                                  const IdLookup& referenced, std::span<TrieSource* const> peers,
+                                  std::vector<std::vector<ObjectId>>& lacks,
+                                  const std::function<void()>& pause) {
+    AvailabilitySurvey survey;
+    std::vector<ObjectId> held_elsewhere;
+    lacks.assign(peers.size(), {});
+    for (size_t i = 0; i < peers.size(); ++i) {
+        SnapshotSource here(mine);
+        const auto cost = diff_tries(
+            here, *peers[i],
+            [&](const TrieDifference& difference) {
+                if (difference.left && !difference.right) {
+                    if (referenced.contains(difference.id))
+                        lacks[i].push_back(difference.id);
+                } else if (!difference.left && difference.right) {
+                    held_elsewhere.push_back(difference.id);
+                }
+            },
+            pause);
+        survey.rounds += cost.rounds;
+        survey.nodes_asked += cost.prefixes;
+        ++survey.peers_asked;
+        std::sort(lacks[i].begin(), lacks[i].end());
+    }
+    sort_unique(held_elsewhere);
+    std::set_difference(missing_here.begin(), missing_here.end(), held_elsewhere.begin(),
+                        held_elsewhere.end(), std::back_inserter(survey.unavailable));
     return survey;
 }
 

@@ -26,6 +26,8 @@ namespace {
 
 // The first release whose transport accepts tree_holdings.
 constexpr std::tuple<unsigned, unsigned, unsigned> first_version{0, 82, 0};
+// The first release that answers trie_diff.
+constexpr std::tuple<unsigned, unsigned, unsigned> first_trie_version{0, 90, 72};
 
 // "0.82.1+abc" as (0, 82, 1); none if it is not three numbers.
 std::optional<std::tuple<unsigned, unsigned, unsigned>> parse_version(std::string_view text) {
@@ -89,6 +91,71 @@ class RemotePeer final : public PeerHoldings {
     NodeRuntime& node_;
     NodeInfo peer_;
     bool supported_;
+};
+
+// A peer's held trie asked over RPC, every round of a diff from the snapshot
+// its root question pinned.
+class RemoteTrie final : public TrieSource {
+  public:
+    RemoteTrie(NodeRuntime& node, NodeInfo peer) : node_(node), peer_(std::move(peer)) {}
+
+    ObjectTrie::Summary root() override {
+        const auto summary = decode_trie_root(ask(question(TrieQuestionKind::root, {})));
+        at_ = summary.hash;
+        return summary;
+    }
+    std::vector<ObjectTrie::Children> children(std::span<const ObjectTrie::Prefix> p) override {
+        std::vector<ObjectTrie::Children> out;
+        for (size_t from = 0; from < p.size(); from += trie_question_max) {
+            const auto part = p.subspan(from, std::min(trie_question_max, p.size() - from));
+            auto answers = decode_trie_children(ask(question(TrieQuestionKind::children, part)));
+            if (answers.size() != part.size())
+                throw std::runtime_error("peer answered a different number of prefixes");
+            std::move(answers.begin(), answers.end(), std::back_inserter(out));
+        }
+        return out;
+    }
+    std::vector<std::vector<ObjectTrie::Record>>
+    records(std::span<const ObjectTrie::Prefix> p) override {
+        std::vector<std::vector<ObjectTrie::Record>> out;
+        for (size_t from = 0; from < p.size(); from += trie_question_max) {
+            const auto part = p.subspan(from, std::min(trie_question_max, p.size() - from));
+            auto answers = decode_trie_records(ask(question(TrieQuestionKind::records, part)));
+            if (answers.size() != part.size())
+                throw std::runtime_error("peer answered a different number of prefixes");
+            std::move(answers.begin(), answers.end(), std::back_inserter(out));
+        }
+        return out;
+    }
+
+  private:
+    TrieQuestion question(TrieQuestionKind kind, std::span<const ObjectTrie::Prefix> p) const {
+        TrieQuestion out;
+        out.kind = kind;
+        out.at = at_;
+        out.prefixes.assign(p.begin(), p.end());
+        return out;
+    }
+    Bytes ask(const TrieQuestion& question) {
+        const auto reply = node_.call(peer_, MessageType::trie_diff,
+                                      encode_trie_question(question), FrameType::speculative);
+        if (reply.message.type != MessageType::trie_diff_reply) {
+            std::string reason = "no reason given";
+            if (reply.message.type == MessageType::error) {
+                try {
+                    Reader why(reply.message.payload);
+                    reason = why.string();
+                } catch (const std::exception&) {
+                }
+            }
+            throw std::runtime_error("peer refused trie_diff: " + reason);
+        }
+        return reply.message.payload;
+    }
+
+    NodeRuntime& node_;
+    NodeInfo peer_;
+    Hash256 at_{};
 };
 
 // "/a/b/c" -> "/a/b"; "/a" -> "/"; "/" has no parent.
@@ -310,10 +377,63 @@ AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return answer(request);
                  });
+    routes_.bind(MessageType::trie_diff,
+                 [this](const NodeInfo&, FrameType, const RpcMessage& request) {
+                     return answer_trie(request);
+                 });
 }
 
 AvailabilityService::~AvailabilityService() {
+    routes_.unbind(MessageType::trie_diff);
     routes_.unbind(MessageType::tree_holdings);
+}
+
+RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
+    const auto question = decode_trie_question(request.payload);
+    const auto now = Clock::now();
+    if (question.kind == TrieQuestionKind::root) {
+        auto view = ledger_.held_view(RetentionClass::data);
+        if (!view.identity.complete)
+            return error_reply("holdings_seeding");
+        if (view.tries.size() != 1)
+            return error_reply("several_held_tries");
+        auto& trie = view.tries.front();
+        const ObjectTrie::Summary summary{trie.size(), trie.root_hash()};
+        Lock lock(pinned_mutex_);
+        std::erase_if(pinned_, [&](const Pinned& pinned) {
+            return pinned.hash == summary.hash || now - pinned.pinned > pinned_for;
+        });
+        if (pinned_.size() >= pinned_max)
+            pinned_.erase(pinned_.begin());
+        pinned_.push_back({summary.hash, std::move(trie), now});
+        return {MessageType::trie_diff_reply, encode_trie_root(summary)};
+    }
+    std::optional<ObjectTrie::Snapshot> trie;
+    {
+        Lock lock(pinned_mutex_);
+        std::erase_if(pinned_,
+                      [&](const Pinned& pinned) { return now - pinned.pinned > pinned_for; });
+        for (const auto& pinned : pinned_)
+            if (pinned.hash == question.at)
+                trie = pinned.trie;
+    }
+    if (!trie)
+        return error_reply("snapshot_gone");
+    if (question.kind == TrieQuestionKind::children)
+        return {MessageType::trie_diff_reply,
+                encode_trie_children(trie->children(question.prefixes))};
+    // Records only where a diff reads them: below a leaf's worth.
+    for (const auto& prefix : question.prefixes) {
+        if (prefix.length >= 32)
+            continue;
+        uint64_t below = 0;
+        const auto children = trie->children(std::span(&prefix, 1));
+        for (const auto& slot : children.front())
+            below += slot.count;
+        if (below > ObjectTrie::leaf_max)
+            return error_reply("prefix_too_large");
+    }
+    return {MessageType::trie_diff_reply, encode_trie_records(trie->records(question.prefixes))};
 }
 
 RpcMessage AvailabilityService::answer(const RpcMessage& request) const {
@@ -372,6 +492,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         Holdings next;
         next.identity = view.identity;
         next.held = view.held;
+        next.tries = view.tries;
         if (tree_backed) {
             // With the same holdings as the last roll-up, only the tree has
             // moved: what the two trees share keeps its count.
@@ -475,11 +596,14 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     const auto telemetry = node_.telemetry().all();
     std::vector<RemotePeer> remotes;
     remotes.reserve(hosts.size());
+    // Every peer answers a trie diff and this node has one held trie.
+    bool diffable = holdings->tries.size() == 1;
     for (const auto& peer : hosts) {
         const auto seen = std::find_if(telemetry.begin(), telemetry.end(),
                                        [&](const auto& item) { return item.node_id == peer.id; });
         const auto version = seen == telemetry.end() ? std::nullopt : parse_version(seen->version);
         remotes.emplace_back(node_, peer, version && *version >= first_version);
+        diffable = diffable && version && *version >= first_trie_version;
     }
     std::vector<PeerHoldings*> asking;
     for (auto& remote : remotes)
@@ -514,22 +638,62 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     // held and this node has lost nothing.
     const bool remembered = ask && memo_ && surveyed_ && !lost && same_peers && !shrank &&
                             !(grew && missing) && topology_events == surveyed_topology_events_;
+    const char* method = "none";
     if (ask) {
-        SurveyMemo made;
-        next.survey = survey_availability(*rollup, nodes, held, asking,
-                                          remembered ? &*memo_ : nullptr, &made);
-        if (next.survey.peers_failed)
-            memo_.reset();
-        else
-            memo_ = std::move(made);
-        // What each peer lacks of what this node holds, from the peer's own
-        // account of its holdings.
+        // Each peer's held trie against this node's, when every peer can be
+        // asked so; otherwise each peer is asked about the namespace tree.
         PeerLacks lacks;
-        lacks.generation = holdings->generation;
-        for (size_t i = 0; i < remotes.size(); ++i)
-            if (auto found = extents_peer_lacks(*rollup, nodes, held, remotes[i]))
-                lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
-                                                     std::move(*found)));
+        std::optional<AvailabilitySurvey> diffed;
+        const auto inventory = ledger_.inventory();
+        if (!diffable)
+            method = holdings->tries.size() == 1 ? "tree:peer_version" : "tree:held_tries";
+        else if (!inventory)
+            method = "tree:no_inventory";
+        if (diffable && inventory && holdings->missing) {
+            std::vector<RemoteTrie> tries;
+            tries.reserve(hosts.size());
+            std::vector<TrieSource*> sources;
+            for (const auto& host : hosts)
+                sources.push_back(&tries.emplace_back(node_, host));
+            std::vector<std::vector<ObjectId>> found;
+            try {
+                diffed = survey_by_diff(holdings->tries.front(), *holdings->missing,
+                                        inventory->lookup(RetentionClass::data), sources, found,
+                                        pause);
+                lacks.generation = inventory->generation();
+                for (size_t i = 0; i < hosts.size(); ++i)
+                    lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
+                                                         std::move(found[i])));
+            } catch (const std::exception& error) {
+                diffed.reset();
+                lacks = {};
+                method = "tree:diff_failed";
+                Log::debug(std::string("availability: a trie diff failed, asking about the tree: ") +
+                           error.what());
+            }
+        }
+        if (diffed) {
+            next.survey = std::move(*diffed);
+            memo_.reset();
+            method = "diff";
+        } else {
+            if (std::string_view(method) == "none")
+                method = "tree";
+            SurveyMemo made;
+            next.survey = survey_availability(*rollup, nodes, held, asking,
+                                              remembered ? &*memo_ : nullptr, &made);
+            if (next.survey.peers_failed)
+                memo_.reset();
+            else
+                memo_ = std::move(made);
+            // What each peer lacks of what this node holds, from the peer's
+            // own account of its holdings.
+            lacks.generation = holdings->generation;
+            for (size_t i = 0; i < remotes.size(); ++i)
+                if (auto found = extents_peer_lacks(*rollup, nodes, held, remotes[i]))
+                    lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
+                                                         std::move(*found)));
+        }
         peer_lacks_.publish(std::move(lacks));
         surveyed_at_ = now;
     } else {
@@ -576,7 +740,8 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                " peers_failed=" + std::to_string(next.survey.peers_failed) +
                " rounds=" + std::to_string(next.survey.rounds) +
                " tree_nodes_asked=" + std::to_string(next.survey.nodes_asked) +
-               " remembered=" + (remembered ? "1" : "0") + " table=" + table);
+               " remembered=" + (remembered ? "1" : "0") + " table=" + table +
+               " method=" + method);
     if (table_changed && !persisted_.empty()) {
         try {
             const auto bytes = encode_availability_paths(next);

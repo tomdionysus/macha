@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/id_lookup.hpp"
+#include "ledger/trie_diff.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "types.hpp"
 
@@ -154,5 +156,17 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
                                        std::span<PeerHoldings* const> peers,
                                        const SurveyMemo* known = nullptr,
                                        SurveyMemo* made = nullptr);
+
+// The survey from trie diffs: this node's held trie against each peer's.
+// `missing_here` (sorted) is what the namespace refers to that this node
+// lacks; what any peer holds of it is available, the rest unavailable. Each
+// peer's lacks are what this node holds and the peer does not, within
+// `referenced`, sorted, one list per peer in order. Every peer must answer:
+// a peer that fails throws, and the caller surveys the old way.
+AvailabilitySurvey survey_by_diff(const ObjectTrie::Snapshot& mine,
+                                  const std::vector<ObjectId>& missing_here,
+                                  const IdLookup& referenced, std::span<TrieSource* const> peers,
+                                  std::vector<std::vector<ObjectId>>& lacks,
+                                  const std::function<void()>& pause = {});
 
 } // namespace macha

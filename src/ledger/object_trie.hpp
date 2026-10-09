@@ -84,6 +84,33 @@ class ObjectTrie {
         std::optional<Bytes> value;
     };
 
+    // The first `length` bytes of an id: where a subtree sits.
+    struct Prefix {
+        std::array<uint8_t, 32> bytes{};
+        uint8_t length{};
+        bool operator==(const Prefix&) const = default;
+        // This prefix and one more byte.
+        Prefix child(uint8_t byte) const noexcept {
+            Prefix out = *this;
+            out.bytes[length] = byte;
+            ++out.length;
+            return out;
+        }
+        bool covers(const ObjectId& id) const noexcept {
+            return std::equal(bytes.begin(), bytes.begin() + length, id.bytes.begin());
+        }
+    };
+    // What a subtree holds: its record count and hash. The same in every trie
+    // holding the same records under the same prefix, whatever else each
+    // holds, since the shape below a prefix depends only on the ids below it.
+    // All zero for none.
+    struct Summary {
+        uint64_t count{};
+        Hash256 hash{};
+        bool operator==(const Summary&) const = default;
+    };
+    using Children = std::array<Summary, 256>;
+
     // Saved nodes read from disk, shared by the trie and its snapshots,
     // least recently used out first. Thread safe.
     class NodeCache;
@@ -100,6 +127,11 @@ class ObjectTrie {
         Hash256 root_hash() const noexcept { return root_.hash; }
         // Every id, in order: linear, for tests and small sets.
         std::vector<ObjectId> ids() const;
+        // For each prefix (shorter than an id), the 256 subtrees one byte
+        // below it. Reads the nodes on the way down and no others.
+        std::vector<Children> children(std::span<const Prefix>) const;
+        // For each prefix, every record below it, in id order.
+        std::vector<std::vector<Record>> records(std::span<const Prefix>) const;
 
       private:
         friend class ObjectTrie;
@@ -192,6 +224,10 @@ class ObjectTrie {
                         const std::function<NodePtr(const Child&)>& load);
     Bytes encode(const Node&) const;
     static NodePtr decode(std::span<const uint8_t>, bool format1);
+    // The node covering `prefix`: an interior node at its depth, or the leaf
+    // holding everything below it. Null when nothing is below it.
+    static NodePtr descend(const Child& root, const Prefix&,
+                           const std::function<NodePtr(const Child&)>& load);
     static size_t footprint(const Node&) noexcept;
 };
 
