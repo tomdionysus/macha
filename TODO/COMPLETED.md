@@ -2,6 +2,15 @@
 
 Last updated: 2026-10-08
 
+## 2026-10-09 -- 0.90.68 and 0.90.69: lock audit finished, one memory budget
+
+- **A dial in flight is waited for no longer than a dial** (0.90.68), the
+  lock audit's last two holders traced.
+- **One memory budget, every part reported** (0.90.69). First readings a
+  few minutes after start: node-f RSS 517 MiB, node-c 471 MiB; in flight 0 to
+  8 MiB of 768; metadata cache 0 of 512 (empty after a start); ledger
+  caches 64 (their share); catalogue 16.
+
 ## 2026-10-09 -- 0.90.67: tombstones out of the head record
 
 - **Tombstone batches** (0.90.67): node-f's maintenance moved the 46,092
