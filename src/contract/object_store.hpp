@@ -2,6 +2,7 @@
 #pragma once
 
 #include "contract/work.hpp"
+#include "ledger/object_trie.hpp"
 #include "types.hpp"
 
 #include <functional>
@@ -31,6 +32,8 @@ struct HeldIdentity {
 struct HeldView {
     HeldIdentity identity;
     std::function<bool(const ObjectId&)> held;
+    // The held tries the view reads, one per disk, by disk token.
+    std::vector<ObjectTrie::Snapshot> tries;
 };
 
 class ObjectStore {

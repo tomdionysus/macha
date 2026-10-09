@@ -1,6 +1,6 @@
 # Replication by diff
 
-Status: proposal, 2026-10-09; stage 0 built in 0.90.71. Supersedes the direction note of the same
+Status: proposal, 2026-10-09; stage 0 built in 0.90.71, stages 1 and 2 in 0.90.72. Supersedes the direction note of the same
 day. This is the ledger design's stages 5 and 6
 ([archive/2026-10-08-on-disk-object-ledger.md](archive/2026-10-08-on-disk-object-ledger.md)),
 re-scoped: since that design was written, enough of the node's state became
@@ -189,13 +189,36 @@ business, driven by `lost`; not this proposal. The catalogue plan's stage
    is made and peers are answered from the last one (an under-claim), not
    refused. Packed objects are in the held ledger. Closed ACTIVE 1's
    `StoragePool::indexed()` item.
-1. **The trie's diff surface.** `Snapshot::children(prefix)` and
-   `records(prefix)`, tested exhaustively: canonical regardless of insert
-   order, every depth, a leaf at the root, an empty trie, after a
-   checkpoint and a rewrite. A local `diff(a, b)` over two snapshots as the
-   reference the RPC must match. The merge join `missing(referenced, held)`
-   with a pause between leaves.
-2. **`trie_diff` over the wire**, gated like `tree_holdings` on the first
+1. **The trie's diff surface. Built (0.90.72).** `ObjectTrie::Prefix`,
+   `Summary`; `Snapshot::children(prefixes)` and `records(prefixes)`,
+   batched, canonical inside a leaf (a subtree of at most `leaf_max`
+   records is a leaf, so its summary is computed from the records). The
+   diff (`ledger/trie_diff`) runs over a `TrieSource` with those two
+   batched calls, a level a round, so stage 2's peer is a second source;
+   `records_not_held(wanted, held...)` is the merge join. Tests: a subtree
+   reads the same alone, crowded and from disk; the diff matches a model
+   both ways round across sizes around a leaf; one change among 20,000
+   costs two rounds and two leaves; the join matches a model for none to
+   three held tries.
+2. **`trie_diff` over the wire. Built (0.90.72).** Decided while building stage 1:
+   - *One snapshot per diff.* A diff spans several rounds; a peer must
+     answer them all from one snapshot or a write between rounds makes the
+     diff miss or invent differences. The `root` question registers the
+     peer's current held snapshot under its root hash; `children` and
+     `records` name that hash. The peer keeps its last few (count and age
+     bounded) and answers `snapshot_gone` for an older one, and the asker
+     starts again.
+   - *One trie a side.* A diff of one trie against one is exact; a union
+     of several has no canonical summaries. With one DATA backend on each
+     side (every node today) the diff is direct; a peer with several, or
+     facing an asker with several, is surveyed the old way.
+   - *All or nothing.* The survey publishes from diffs only when every
+     extent-hosting peer answered and the inventory's `referenced` view is
+     of the head; otherwise from the roll-up. From diffs: `missing_here` is
+     the merge join of `referenced` against this node's held trie; a
+     peer's lacks are (held here, not there) within `referenced`;
+     `unavailable` is `missing_here` less what any peer holds.
+   Then: `trie_diff` is gated like `tree_holdings` on the first
    release whose transport accepts it; a peer that refuses it is surveyed
    the old way. The survey publishes `missing_here`, `peer_lacks` and
    `unavailable` from the diff when every extent-hosting peer answers it,

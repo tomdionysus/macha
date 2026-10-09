@@ -6,6 +6,7 @@
 #include "contract/metadata_view.hpp"
 #include "contract/object_ledger.hpp"
 #include "contract/published.hpp"
+#include "contract/thread_safety.hpp"
 #include "contract/work.hpp"
 #include "ledger/availability.hpp"
 #include "types.hpp"
@@ -156,6 +157,7 @@ class AvailabilityService {
 
   private:
     RpcMessage answer(const RpcMessage& request) const;
+    RpcMessage answer_trie(const RpcMessage& request) const;
 
     NodeRuntime& node_;
     LocalState& local_;
@@ -175,6 +177,7 @@ class AvailabilityService {
         // the view's, a subtree this roll-up calls whole may not be.
         HeldIdentity identity;
         HeldFn held;
+        std::vector<ObjectTrie::Snapshot> tries;
         // The head it was rolled up at; the survey and the path table read
         // the same one.
         uint64_t generation{};
@@ -184,6 +187,18 @@ class AvailabilityService {
     };
     // What peers are answered from; replaced whole by each roll-up.
     Published<Holdings> holdings_;
+
+    // The held tries pinned for peers' diffs, by root hash, newest last: a
+    // diff's every round reads the snapshot its root question pinned.
+    struct Pinned {
+        Hash256 hash;
+        ObjectTrie::Snapshot trie;
+        Clock::time_point pinned;
+    };
+    static constexpr size_t pinned_max = 4;
+    static constexpr std::chrono::minutes pinned_for{2};
+    mutable Mutex pinned_mutex_;
+    mutable std::vector<Pinned> pinned_ MACHA_GUARDED_BY(pinned_mutex_);
     Published<AvailabilitySnapshot> snapshot_;
     Published<PeerLacks> peer_lacks_;
 

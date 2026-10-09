@@ -1,5 +1,37 @@
 # Current release
 
+## 0.90.72: the survey compares held ledgers
+
+No API or on-disk changes. Wire: new cluster message `trie_diff` (49) and
+reply (125), sent only to peers at 0.90.72 or later.
+
+Replication by diff, stages 1 and 2
+([proposal](TODO/2026-10-09-replication-by-diff.md)). The trie gains a diff
+surface: `ObjectTrie::Prefix` and `Summary`, and a snapshot answers, for a
+batch of prefixes, the count and hash of each of the 256 subtrees one byte
+below (computed from the records inside a leaf, which is what any trie
+holding them would build) and the records below. `diff_tries` descends two
+tries a level a round where their summaries differ and reads records once
+both sides hold no more than a leaf below a prefix; `records_not_held` is a
+merge join of one trie against others. Over the wire, a peer's `root`
+answer pins its held snapshot under its hash (the last four, for two
+minutes) so every round of one diff reads the same snapshot, or the peer
+answers `snapshot_gone`; records are refused below a prefix holding more
+than a leaf (`prefix_too_large`). The availability survey diffs this
+node's held trie against each peer's when every extent-hosting peer runs
+0.90.72 and each side has one DATA disk: `unavailable` is what this node
+lacks less what any peer holds, and each peer's lacks are what this node
+holds and the peer does not, within the inventory's referenced set (stamped
+with the inventory's generation, which repair already checks). Otherwise,
+or if any peer fails mid-diff, the survey asks about the namespace tree as
+before. The debug survey line names the method (`diff`, `tree:<why>`,
+`none`). Tests: a subtree reads the same alone, crowded and from disk; the
+diff matches a model both ways round across sizes around a leaf; one change
+among 20,000 costs two rounds and two leaves; the merge join matches a
+model; the survey from diffs matches a model and a failing peer fails it;
+the wire forms round-trip and refuse malformed input; two nodes survey by
+diff once each knows the other's version.
+
 ## 0.90.71: a node's holdings have one identity
 
 No API, wire or protocol changes. On disk: the held ledgers list packed
