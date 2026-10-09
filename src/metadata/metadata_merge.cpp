@@ -8,6 +8,7 @@
 #include "codec.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 
@@ -316,6 +317,13 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
     out.garbage.reserve(garbage.size());
     for (const auto& [_, value] : garbage)
         out.garbage.push_back(value);
+    // Union the tombstone batches: each is immutable and content-addressed,
+    // so one named by both heads is the same batch.
+    out.tombstone_batches.clear();
+    std::set_union(left.tombstone_batches.begin(), left.tombstone_batches.end(),
+                   right.tombstone_batches.begin(), right.tombstone_batches.end(),
+                   std::back_inserter(out.tombstone_batches),
+                   [](const TombstoneBatch& a, const TombstoneBatch& b) { return a.id < b.id; });
 
     // Node status and identity resets are monotonic with deterministic joins.
     for (const auto* source : {&left.node_status, &right.node_status}) {

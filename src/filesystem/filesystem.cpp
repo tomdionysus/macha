@@ -78,51 +78,6 @@ uint64_t fd_size(int fd) {
     return static_cast<uint64_t>(st.st_size);
 }
 
-void record_garbage_upsert(MetadataDelta& delta, const GarbageRef& garbage) {
-    auto existing = std::find_if(delta.upsert_garbage.begin(), delta.upsert_garbage.end(),
-                                 [&](const GarbageRef& value) { return value.id == garbage.id; });
-    if (existing == delta.upsert_garbage.end())
-        delta.upsert_garbage.push_back(garbage);
-    else
-        *existing = garbage;
-}
-
-void queue_garbage_batch(MetadataSnapshot& snapshot, std::vector<ObjectId> ids,
-                         MetadataDelta& delta) {
-    if (ids.empty())
-        return;
-
-    // One pass over the (possibly huge) garbage set, not one per extent; the
-    // transient index is bounded by this file's extent count.
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-    std::vector<bool> found(ids.size(), false);
-
-    for (auto& garbage : snapshot.garbage) {
-        auto target = std::lower_bound(ids.begin(), ids.end(), garbage.id);
-        if (target == ids.end() || *target != garbage.id)
-            continue;
-        const auto index = static_cast<size_t>(target - ids.begin());
-        if (found[index])
-            continue;
-
-        auto retired = wall_time_ns();
-        if (retired <= garbage.retired_at_ns &&
-            garbage.retired_at_ns < std::numeric_limits<int64_t>::max())
-            retired = garbage.retired_at_ns + 1;
-        garbage.retired_at_ns = retired;
-        garbage.retirement_id = random_node_id();
-        record_garbage_upsert(delta, garbage);
-        found[index] = true;
-    }
-
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (found[i])
-            continue;
-        snapshot.garbage.push_back({ids[i], wall_time_ns(), random_node_id()});
-        record_garbage_upsert(delta, snapshot.garbage.back());
-    }
-}
 
 } // namespace
 ReadHandle::ReadHandle(DistributedStore& s, FsEntry e, PlaybackTracker* playback,
@@ -1746,7 +1701,7 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
         for (const auto& extent : entry->extents)
             if (!extent.hole)
                 retiring.push_back(extent.id);
-        queue_garbage_batch(s, std::move(retiring), delta);
+        retire_objects(s, delta, std::move(retiring));
         working.erase(q);
         return {};
     }
@@ -1780,7 +1735,7 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
                 for (const auto& extent : dst->extents)
                     if (!extent.hole)
                         retiring.push_back(extent.id);
-                queue_garbage_batch(s, std::move(retiring), delta);
+                retire_objects(s, delta, std::move(retiring));
             }
             working.erase(y);
         }
@@ -2441,7 +2396,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
             if (!extent.hole && !retained.contains(extent.id))
                 retiring.push_back(extent.id);
         }
-        queue_garbage_batch(s, std::move(retiring), delta);
+        retire_objects(s, delta, std::move(retiring));
 
         const FsEntry previous = current;
         current.size = z;
@@ -2640,18 +2595,15 @@ MaintenanceObjects FileSystem::maintenance_objects_from(const MetadataSnapshotVi
 
     // Tombstones keep retired_at_ns: maintenance combines filesystem and
     // catalogue liveness before collecting, and it makes pruning ABA-safe.
-    built.garbage = snapshot.garbage;
-    std::sort(built.garbage.begin(), built.garbage.end(),
-              [](const GarbageRef& a, const GarbageRef& b) {
-                  if (a.id != b.id)
-                      return a.id < b.id;
-                  return a.retired_at_ns > b.retired_at_ns;
-              });
-    built.garbage.erase(std::unique(built.garbage.begin(), built.garbage.end(),
-                                    [](const GarbageRef& a, const GarbageRef& b) {
-                                        return a.id == b.id;
-                                    }),
-                        built.garbage.end());
+    // A batch that cannot be read leaves its objects to the sighting grace.
+    auto batches = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    size_t unreadable = 0;
+    built.garbage = tombstones_of(
+        snapshot, [&](const ObjectId& id) { return batches.get(id); }, &unreadable);
+    if (unreadable)
+        Log::warn("maintenance cannot read tombstone batches count=" +
+                  std::to_string(unreadable));
+    built.tombstone_batches = snapshot.tombstone_batches;
     built.metadata_generation = view.generation;
     built.observed_mutations = snapshot.mutation_sequences;
     return built;

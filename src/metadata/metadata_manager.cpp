@@ -1859,7 +1859,31 @@ MetadataRecord MetadataManager::mutate_impl(
                 ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_);
             snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root,
                                                                     nodes, supplied_delta);
+            // The mutation's tombstones, each group one batch object written
+            // here beside the tree's nodes and named by the head.
+            for (auto& pending : supplied_delta.pending_tombstones) {
+                auto ids = std::move(pending.ids);
+                std::sort(ids.begin(), ids.end());
+                ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                if (ids.empty())
+                    continue;
+                const auto retired = pending.at_commit ? wall_time_ns() : pending.retired_at_ns;
+                const TombstoneBatch batch{nodes.put(encode_tombstone_batch(retired, ids)),
+                                           retired, static_cast<uint32_t>(ids.size())};
+                const auto by_id = [](const TombstoneBatch& held, const ObjectId& id) {
+                    return held.id < id;
+                };
+                for (auto* batches :
+                     {&snapshot.tombstone_batches, &supplied_delta.add_tombstone_batches}) {
+                    auto at = std::lower_bound(batches->begin(), batches->end(), batch.id, by_id);
+                    if (at == batches->end() || at->id != batch.id)
+                        batches->insert(at, batch);
+                }
+            }
+            supplied_delta.pending_tombstones.clear();
         }
+        if (!supplied_delta.pending_tombstones.empty())
+            throw std::logic_error("tombstone batches need a tree-backed namespace");
 
         const auto tree_ms = stage_ms();
         // Drop the conflicts this mutation decided by rewriting their subject,
