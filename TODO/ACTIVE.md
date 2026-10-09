@@ -79,12 +79,14 @@ replaces the availability survey and its roll-up, repair's walks and
 probes, and the inventory's `outside_namespace`. Each stage ships alone;
 the walks stay as the fallback until every node runs stage 3.
 
-0. **The holdings identity.** `StoragePool::held_identity()` and
-   `held_view()`; the survey keyed on (head, identity) only; `indexed()`,
-   `held_indexed()`, the loss counts in the roll-up and the cold wait
-   deleted. Closes: `StoragePool::indexed()` reads true with no backend
-   open, and a backend coming online never re-rolls the survey (found
-   2026-10-09; peers then push extents this node already holds).
+0. **The holdings identity: built, 0.90.71 (96769e7), laptop tests green;
+   not yet pushed, through fi-1's suites or deployed.** `held_view()` on
+   every store; the survey keyed on (head, identity) only; `indexed()`,
+   `held_indexed()`, the loss counts and the cold wait deleted. Closed
+   `StoragePool::indexed()` and the missing re-roll when a disk comes back.
+   Found on the way: packed objects were never in the held ledger; they are
+   now, and each node's first start on 0.90.71 lists its packed objects
+   (one ledger lookup per packed object; watch gbni-1's start time).
 1. **The trie's diff surface**: `Snapshot::children(prefix)`,
    `records(prefix)`, a local reference diff, the `referenced`/`held` merge
    join. Exhaustive primitive tests.
