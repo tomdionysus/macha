@@ -1,5 +1,19 @@
 # Current release
 
+## 0.90.68: a dial in flight is waited for no longer than a dial
+
+No API, wire, protocol or on-disk changes.
+
+When a caller (a control RPC, the health thread) found another caller
+already dialling the same peer, it waited, with no deadline, for that dial
+to finish: its connect, its handshake (5 s per I/O), and the peer observer's
+roster write. It now waits at most `connect_timeout`, as long as a dial of
+its own may take, and fails as a refused dial does. From the lock audit's
+last two holders (`RpcClient::mutex_`, `Membership::m_`): neither is held
+across a socket call, file write or fsync. Test: a peer that accepts and
+never answers holds the first caller in its handshake; the second is
+refused within the bound.
+
 ## 0.90.67: tombstones out of the head record, in batches
 
 No API changes. On disk and on the wire: SM19 (a tree-backed head that names

@@ -2219,9 +2219,12 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
         if (connection_dials_.insert(flight_key).second)
             break;
 
-        connection_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(mutex_) {
-            return !connection_dials_.contains(flight_key);
-        });
+        // Another caller is dialling: wait as long as a dial of our own would
+        // have been allowed, not for its whole handshake and roster write.
+        if (!connection_cv_.wait_for(lock.native(), connect_timeout_, [&]() MACHA_REQUIRES(mutex_) {
+                return !connection_dials_.contains(flight_key);
+            }))
+            throw std::runtime_error("peer dial in progress");
         // The leader may have installed an outbound route, accepted an inbound
         // one, or failed into backoff: re-evaluate rather than redial.
         known.reset();

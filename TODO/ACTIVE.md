@@ -41,9 +41,21 @@ of 2026-10-08, ranked:
    record that no longer grows with deletes.
 2. The memory ledger counts few large structures (metadata, catalogue and
    cache owners declared, never charged), so the control reserve protects
-   counted bytes only; `restore()` overcommits without the reserve.
-3. Not fully traced in the lock audit: `RpcClient::mutex_` holders and
-   `Membership::m_` bodies.
+   counted bytes only; `restore()` overcommits without the reserve. On
+   gbni-1 (2026-10-09): ledger 768 MiB (control 64, viewer 192, loader 64);
+   apart from it the metadata materialisation cache (512 MiB in its config),
+   segment memory 64 MiB, ledger caches 64 MiB, catalogue about 16 MiB: over
+   1.4 GiB of caps on a 4 GiB Pi, never checked together. **Operator
+   question**: charge the reconstructible caches (the metadata cache first)
+   into the ledger as sheddable leases, making it the one memory budget.
+3. Lock audit, the last two holders traced 2026-10-09 (`RpcClient::mutex_`,
+   `Membership::m_`): neither held across socket, file or fsync I/O. Fixed in
+   0.90.68: a waiter on another caller's dial now waits at most
+   `connect_timeout`. Left, small: DNS (`getaddrinfo`, net.cpp) has no
+   timeout of its own; two `Log::debug` calls under `mutex_` in
+   `await_reverse_dial`; the `mutex_` then `m_` order is unannotated; a
+   dial's peer observer can wait on another thread's roster fsync
+   (`persist_m_`).
 
 Waiting on the operator (section 9): CPU priority for background threads
 (audit item: no nice, SCHED or cgroup weight anywhere; an x264 transcode
