@@ -202,3 +202,9 @@ cross-session and will not be in the next session's context.
   client reports today were gbni-2 attributed to gbni-1, and the retracted
   DTS/TrueHD investigation in September was the same mistake at larger scale.
   The node is in the URL; there is no excuse for losing it.
+- **Prefer complete files when an item has several** (operator, 2026-10-09;
+  sent to Core that day). Consider media with `availability: available` from
+  `GET /api/v1/playback/media` first; fall back to `partial` or `unknown` only
+  when no complete file exists; treat `unavailable` as unplayable. Ranking among
+  the complete ones stays the client's. Found when Father Ted S02E01 was played
+  from a 720p copy held by no online node while a complete 1080p copy existed.
