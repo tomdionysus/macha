@@ -86,6 +86,11 @@ enum class MessageType : uint16_t {
     // carries it, so it is sent only to peers that advertise a version with
     // it.
     tree_holdings = 48,
+    // A question to the peer's held trie (ledger/trie_diff): its root,
+    // pinning that snapshot, or the subtrees or records below prefixes of a
+    // pinned snapshot. Reply: trie_diff_reply. Sent only to peers that
+    // advertise a version with it.
+    trie_diff = 49,
     // A history hash's record as a self-contained full-body entry,
     // materialised by the server (get_metadata_history_entry returns the
     // stored frame, possibly a delta the caller cannot replay).
@@ -124,7 +129,8 @@ enum class MessageType : uint16_t {
     have_control_objects_reply = 121,
     torrent_intent_reply = 122,
     have_valid_objects_reply = 123,
-    tree_holdings_reply = 124
+    tree_holdings_reply = 124,
+    trie_diff_reply = 125
 };
 
 // Each id in a have_valid_objects request is a full read on the peer, so a

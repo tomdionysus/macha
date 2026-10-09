@@ -804,6 +804,164 @@ MACHA_FAST_TEST("availability", test_questions_and_answers_survive_the_wire) {
     CHECK(too_many);
 }
 
+// --- The survey by trie diff -------------------------------------------------
+
+std::unique_ptr<ObjectTrie> held_trie(const std::filesystem::path& dir,
+                                      const std::set<ObjectId>& ids) {
+    auto trie = std::make_unique<ObjectTrie>(dir, std::array<uint8_t, 32>{}, ObjectTrie::Options{});
+    std::vector<ObjectTrie::Change> changes;
+    for (const auto& id : ids)
+        changes.push_back({id, Bytes{0, 0, 0, 0, 0, 0, 0, 1}});
+    trie->apply(changes);
+    return trie;
+}
+
+ObjectId numbered_id(uint32_t n) {
+    ObjectId id;
+    for (size_t i = 0; i < 4; ++i)
+        id.bytes[i] = static_cast<uint8_t>(n >> (8 * (3 - i)));
+    id.bytes[31] = 1;
+    return id;
+}
+
+// A question and every kind of answer survive the wire, and a malformed one
+// is refused.
+MACHA_FAST_TEST("availability", test_trie_questions_and_answers_survive_the_wire) {
+    TrieQuestion question;
+    question.kind = TrieQuestionKind::children;
+    question.at.bytes.fill(7);
+    for (uint8_t length = 0; length < 5; ++length) {
+        ObjectTrie::Prefix prefix;
+        prefix.length = length;
+        for (uint8_t i = 0; i < length; ++i)
+            prefix.bytes[i] = static_cast<uint8_t>(i * 31 + 1);
+        question.prefixes.push_back(prefix);
+    }
+    CHECK(decode_trie_question(encode_trie_question(question)) == question);
+
+    const ObjectTrie::Summary root{12345, question.at};
+    CHECK(decode_trie_root(encode_trie_root(root)) == root);
+
+    std::vector<ObjectTrie::Children> children(3);
+    children[1][0] = {5, question.at};
+    children[1][255] = {9, Hash256{}};
+    children[2][17] = {1, question.at};
+    CHECK(decode_trie_children(encode_trie_children(children)) == children);
+
+    std::vector<std::vector<ObjectTrie::Record>> records(2);
+    records[1] = {{numbered_id(1), Bytes{1}}, {numbered_id(2), Bytes{}}};
+    CHECK(decode_trie_records(encode_trie_records(records)) == records);
+
+    const auto refused = [](auto decode, Bytes bytes) {
+        try {
+            (void)decode(bytes);
+        } catch (const DecodeError&) {
+            return true;
+        }
+        return false;
+    };
+    auto too_long = encode_trie_question(question);
+    too_long[2 + 32 + 4] = 33; // the first prefix's length
+    CHECK(refused(decode_trie_question, too_long));
+    std::reverse(records[1].begin(), records[1].end());
+    CHECK(refused(decode_trie_records, encode_trie_records(records)));
+    auto whole = question;
+    whole.prefixes = {ObjectTrie::Prefix{{}, 32}};
+    CHECK(refused(decode_trie_question, encode_trie_question(whole)));
+}
+
+// One peer's trie as a source that fails after a few questions.
+class FailingSource final : public TrieSource {
+  public:
+    explicit FailingSource(ObjectTrie::Snapshot trie) : inner_(std::move(trie)) {}
+    ObjectTrie::Summary root() override { return inner_.root(); }
+    std::vector<ObjectTrie::Children> children(std::span<const ObjectTrie::Prefix> p) override {
+        throw std::runtime_error("peer went away");
+        return inner_.children(p);
+    }
+    std::vector<std::vector<ObjectTrie::Record>>
+    records(std::span<const ObjectTrie::Prefix> p) override {
+        throw std::runtime_error("peer went away");
+        return inner_.records(p);
+    }
+
+  private:
+    SnapshotSource inner_;
+};
+
+// From diffs: what no peer holds of what this node lacks is unavailable, and
+// each peer lacks what this node holds and it does not, within what is
+// referenced. A peer that fails mid-diff fails the whole survey.
+MACHA_FAST_TEST("availability", test_the_survey_by_diff_finds_what_no_node_holds) {
+    std::set<ObjectId> referenced;
+    for (uint32_t i = 0; i < 3000; ++i)
+        referenced.insert(numbered_id(i * 7919));
+    const auto pick = [&](auto keep) {
+        std::set<ObjectId> out;
+        size_t i = 0;
+        for (const auto& id : referenced)
+            if (keep(i++))
+                out.insert(id);
+        return out;
+    };
+    auto mine = pick([](size_t i) { return i % 3 != 0; });
+    auto first = pick([](size_t i) { return i % 5 != 0; });
+    auto second = pick([](size_t i) { return i % 2 == 0; });
+    // Garbage this node holds that nothing refers to.
+    const auto garbage = numbered_id(0xfffffff0);
+    mine.insert(garbage);
+
+    std::vector<ObjectId> missing_here;
+    for (const auto& id : referenced)
+        if (!mine.contains(id))
+            missing_here.push_back(id);
+    std::vector<ObjectId> unavailable;
+    for (const auto& id : missing_here)
+        if (!first.contains(id) && !second.contains(id))
+            unavailable.push_back(id);
+    const auto lacking = [&](const std::set<ObjectId>& peer) {
+        std::vector<ObjectId> out;
+        for (const auto& id : mine)
+            if (referenced.contains(id) && !peer.contains(id))
+                out.push_back(id);
+        return out;
+    };
+
+    TempDir dir;
+    auto here = held_trie(dir.path() / "here", mine);
+    auto one = held_trie(dir.path() / "one", first);
+    auto two = held_trie(dir.path() / "two", second);
+    SnapshotSource one_source(one->snapshot());
+    SnapshotSource two_source(two->snapshot());
+    std::vector<TrieSource*> peers{&one_source, &two_source};
+    const std::vector<ObjectId> referenced_list(referenced.begin(), referenced.end());
+    std::vector<std::vector<ObjectId>> lacks;
+    const auto survey = survey_by_diff(here->snapshot(), missing_here, IdLookup(referenced_list),
+                                       peers, lacks);
+    CHECK(survey.unavailable == unavailable);
+    CHECK(survey.unknown.empty());
+    CHECK(survey.peers_asked == 2);
+    REQUIRE(lacks.size() == 2);
+    CHECK(lacks[0] == lacking(first));
+    CHECK(lacks[1] == lacking(second));
+
+    // Alone, nothing anyone else holds: everything missing is unavailable.
+    std::vector<TrieSource*> none;
+    CHECK(survey_by_diff(here->snapshot(), missing_here, IdLookup(referenced_list), none, lacks)
+              .unavailable == missing_here);
+
+    FailingSource failing(two->snapshot());
+    std::vector<TrieSource*> broken{&one_source, &failing};
+    bool threw = false;
+    try {
+        (void)survey_by_diff(here->snapshot(), missing_here, IdLookup(referenced_list), broken,
+                             lacks);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 MACHA_FAST_TEST("availability", test_a_files_code_follows_its_extent_counts) {
     CHECK(availability_of(nullptr) == Availability::unknown);
     PathAvailability facts;

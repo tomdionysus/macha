@@ -710,6 +710,93 @@ std::vector<ObjectTrie::Record> ObjectTrie::Snapshot::next(const std::optional<O
     return out;
 }
 
+ObjectTrie::NodePtr ObjectTrie::descend(const Child& root, const Prefix& prefix,
+                                        const std::function<NodePtr(const Child&)>& load) {
+    if (root.empty())
+        return {};
+    auto node = load(root);
+    while (!node->leaf && node->depth < prefix.length) {
+        const auto& child = node->children[prefix.bytes[node->depth]];
+        if (child.empty())
+            return {};
+        node = load(child);
+    }
+    return node;
+}
+
+std::vector<ObjectTrie::Children>
+ObjectTrie::Snapshot::children(std::span<const Prefix> prefixes) const {
+    std::vector<Children> out(prefixes.size());
+    if (root_.empty())
+        return out;
+    const auto& source = *source_;
+    const auto load = [&](const Child& child) {
+        return load_from(
+            child, source.generation,
+            [&](uint64_t offset) { return source.file->read_at(offset); }, *source.cache, false);
+    };
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+        const auto& prefix = prefixes[i];
+        if (prefix.length >= 32)
+            throw std::logic_error("object trie: a whole id has no children");
+        const auto node = descend(root_, prefix, load);
+        if (!node)
+            continue;
+        if (!node->leaf) {
+            for (size_t slot = 0; slot < 256; ++slot)
+                out[i][slot] = {node->children[slot].count, node->children[slot].hash};
+            continue;
+        }
+        // Below a leaf every subtree is a leaf of its own records.
+        auto at = node->records.begin();
+        while (at != node->records.end()) {
+            if (!prefix.covers(at->first)) {
+                ++at;
+                continue;
+            }
+            const auto byte = at->first.bytes[prefix.length];
+            auto end = at;
+            while (end != node->records.end() && prefix.covers(end->first) &&
+                   end->first.bytes[prefix.length] == byte)
+                ++end;
+            const std::vector<Record> group(at, end);
+            out[i][byte] = {group.size(), leaf_hash(group)};
+            at = end;
+        }
+    }
+    return out;
+}
+
+std::vector<std::vector<ObjectTrie::Record>>
+ObjectTrie::Snapshot::records(std::span<const Prefix> prefixes) const {
+    std::vector<std::vector<Record>> out(prefixes.size());
+    if (root_.empty())
+        return out;
+    const auto& source = *source_;
+    const std::function<NodePtr(const Child&)> load = [&](const Child& child) {
+        return load_from(
+            child, source.generation,
+            [&](uint64_t offset) { return source.file->read_at(offset); }, *source.cache, false);
+    };
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+        const auto node = descend(root_, prefixes[i], load);
+        if (!node)
+            continue;
+        if (node->leaf) {
+            for (const auto& record : node->records)
+                if (prefixes[i].covers(record.first))
+                    out[i].push_back(record);
+            continue;
+        }
+        Child whole;
+        whole.count = node->count;
+        whole.hash = node->hash;
+        whole.node = node;
+        collect(whole, std::nullopt, false, node->count, out[i], load);
+    }
+    return out;
+}
+
 uint64_t ObjectTrie::size() const noexcept {
     return root_.count;
 }
