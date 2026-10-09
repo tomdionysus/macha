@@ -127,9 +127,8 @@ a peer's storage grows while something is unavailable. Requests read the
 last result and never wait for a survey.
 
 Each node keeps its last survey on disk and answers from it after a restart
-until its first new survey. It keeps its last roll-up too, with the identity
-it was of, and answers peers from it after a restart only if its holdings
-are still exactly those. A survey that cannot ask a peer leaves a file's
+until its first new survey. Peers are answered once it has rolled its
+holdings up again, on its first maintenance pass. A survey that cannot ask a peer leaves a file's
 counts to its last decided survey, matched by content identity: the answer
 is the best this node knows, and `surveyed_unix_ms` says when the survey
 ran.

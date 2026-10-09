@@ -184,8 +184,8 @@ business, driven by `lost`; not this proposal. The catalogue plan's stage
    roll-up on `(head key, identity hash)` and its answers on `removals`;
    storage events, the loss count and the 30-minute cold wait are gone;
    the roll-up, the survey and the answers read the roll-up's own view. The
-   kept roll-up is persisted with its identity and trusted after a restart
-   only if the node's identity is the same. While a disk seeds, no roll-up
+   kept roll-up (`availability/holdings.bin`, 0.90.52's stopgap for the
+   warm-up) is deleted. While a disk seeds, no roll-up
    is made and peers are answered from the last one (an under-claim), not
    refused. Packed objects are in the held ledger. Closed ACTIVE 1's
    `StoragePool::indexed()` item.
@@ -212,7 +212,7 @@ business, driven by `lost`; not this proposal. The catalogue plan's stage
 5. **Retire** once every node runs stage 3: `tree_holdings` and its
    formats, `HoldingsRollup`, `missing_extents`, `extents_peer_lacks`,
    `survey_availability`, `SurveyMemo`, `PeerHoldings`,
-   `availability/holdings.bin`, the repair cursors and the `have_*` probes
+   the repair cursors and the `have_*` probes
    in repair, and `ledger/availability.{hpp,cpp}` with them.
 
 Stage 0 is small and stands on its own; it is the structural answer to the
