@@ -39,11 +39,11 @@ of 2026-10-08, ranked:
    record is now 87,546 bytes (64 batches are 2.8 KB of it; the rest is the
    72 torrent requests, conflicts and node state). The copies stay, but of a
    record that no longer grows with deletes.
-2. Memory: one budget (`runtime.memory_bytes`) and every part in the
-   observation log, 0.90.69 (operator, 2026-10-09: account for all memory,
-   proportionately). To decide from the gauges: the budget to set on each
-   node (gbni-1 and fi-1 today: 768M in flight, 512M metadata cache, 64M
-   ledger caches).
+2. Memory: every part in the observation log (0.90.69) and
+   `runtime.memory_bytes` a limit that shrinks the parts pro rata with a WARN,
+   0 none (0.90.70; operator, 2026-10-09). To decide from the gauges: the
+   limit to set on each node (both today: 768M in flight, 512M metadata
+   cache, 64M ledger caches).
 3. Lock audit, the last two holders traced 2026-10-09 (`RpcClient::mutex_`,
    `Membership::m_`): neither held across socket, file or fsync I/O. Fixed in
    0.90.68: a waiter on another caller's dial now waits at most

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "config.hpp"
+#include "log.hpp"
 #include "macha_version.hpp"
 
 #include <algorithm>
@@ -23,23 +24,36 @@ void validate(Config& config) {
     if (!config.runtime.glibc_arena_max || config.runtime.glibc_arena_max > 64)
         throw std::runtime_error("runtime.glibc_arena_max must be 1..64");
     if (config.runtime.memory_bytes) {
-        // One budget: the fixed caches inside it, in-flight work the rest.
-        if (config.runtime.retained_memory_bytes_set)
-            throw std::runtime_error(
-                "set runtime.memory_bytes or runtime.retained_memory_bytes, not both");
-        const auto mib = [](uint64_t bytes) { return std::to_string(bytes >> 20) + "M"; };
-        const auto fixed = config.metadata_materialization_cache_bytes + config.ledger_cache;
-        const auto reserves = config.runtime.control_memory_reserve_bytes +
-                              config.runtime.viewer_memory_reserve_bytes +
-                              config.runtime.loader_memory_reserve_bytes +
-                              config.runtime.reassembly_memory_reserve_bytes;
-        if (config.runtime.memory_bytes < fixed + reserves)
-            throw std::runtime_error(
-                "runtime.memory_bytes " + mib(config.runtime.memory_bytes) +
-                " cannot hold the metadata cache (" +
-                mib(config.metadata_materialization_cache_bytes) + "), the ledger caches (" +
-                mib(config.ledger_cache) + ") and the in-flight reserves (" + mib(reserves) + ")");
-        config.runtime.retained_memory_bytes = config.runtime.memory_bytes - fixed;
+        // A ceiling on the parts: over it, each shrinks by the same fraction
+        // (the in-flight reserves with their capacity) and the node starts.
+        const uint64_t limit = config.runtime.memory_bytes;
+        const uint64_t total = config.metadata_materialization_cache_bytes + config.ledger_cache +
+                               config.runtime.retained_memory_bytes;
+        if (total > limit) {
+            const auto mib = [](uint64_t bytes) { return std::to_string(bytes >> 20) + "M"; };
+            const auto shrink = [&](uint64_t& part, const char* name, std::string& said) {
+                const auto was = part;
+                part = std::max<uint64_t>(
+                    1ULL << 20,
+                    static_cast<uint64_t>(static_cast<__uint128_t>(part) * limit / total));
+                said += std::string(said.empty() ? "" : ", ") + name + " " + mib(was) + " to " +
+                        mib(part);
+            };
+            std::string said;
+            shrink(config.metadata_materialization_cache_bytes,
+                   "dht.metadata_materialization_cache_bytes", said);
+            shrink(config.ledger_cache, "storage.ledger_cache", said);
+            shrink(config.runtime.retained_memory_bytes, "runtime.retained_memory_bytes", said);
+            std::string reserves;
+            shrink(config.runtime.control_memory_reserve_bytes, "control", reserves);
+            shrink(config.runtime.viewer_memory_reserve_bytes, "viewer", reserves);
+            shrink(config.runtime.loader_memory_reserve_bytes, "loader", reserves);
+            shrink(config.runtime.reassembly_memory_reserve_bytes, "reassembly", reserves);
+            Log::warn("MEMORY OVER LIMIT: the configured parts total " + mib(total) +
+                      ", over runtime.memory_bytes " + mib(limit) +
+                      "; each shrinks by the same fraction: " + said +
+                      " (in-flight reserves " + reserves + ")");
+        }
     }
     if (!config.runtime.retained_memory_bytes ||
         !config.runtime.control_memory_reserve_bytes ||

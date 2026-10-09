@@ -150,6 +150,7 @@ std::map<std::string, uint64_t> NodeServices::observation_gauges() {
         const auto& config = node_.config();
         const auto memory = resources_.memory.stats();
         const auto metadata = local_.replica().diagnostics();
+        gauges["memory_limit_bytes"] = config.runtime.memory_bytes;
         gauges["memory_budget_bytes"] = memory.capacity_bytes +
                                         metadata.materialization_cache_limit_bytes +
                                         config.ledger_cache;
