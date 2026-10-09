@@ -189,11 +189,12 @@ class AvailabilityService {
     Published<Holdings> holdings_;
 
     // The held tries pinned for peers' diffs, by root hash, newest last: a
-    // diff's every round reads the snapshot its root question pinned.
+    // diff's every round reads the snapshot its root question pinned. One is
+    // dropped once no question has used it for pinned_for.
     struct Pinned {
         Hash256 hash;
         ObjectTrie::Snapshot trie;
-        Clock::time_point pinned;
+        Clock::time_point used;
     };
     static constexpr size_t pinned_max = 4;
     static constexpr std::chrono::minutes pinned_for{2};

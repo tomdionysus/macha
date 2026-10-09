@@ -1,5 +1,18 @@
 # Current release
 
+## 0.90.73: a pinned trie lives while it is used
+
+No API, wire or on-disk changes.
+
+On the cluster, gbni-1's first trie diff against fi-1 ran for about an
+hour and then failed with `snapshot_gone`: fi-1 dropped the pinned snapshot
+two minutes after the diff's root question, however recently the diff had
+used it. A pin now expires two minutes after its last question. Each diff
+now logs, per peer, the questions sent, the reply bytes, the time spent
+waiting on the peer and the elapsed time, done or failed, and
+`availability.diff_us` records its duration: the hour is to be explained by
+measurement before the diff's batching changes.
+
 ## 0.90.72: the survey compares held ledgers
 
 No API or on-disk changes. Wire: new cluster message `trie_diff` (49) and

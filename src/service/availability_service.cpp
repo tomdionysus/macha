@@ -128,7 +128,6 @@ class RemoteTrie final : public TrieSource {
         return out;
     }
 
-  private:
     TrieQuestion question(TrieQuestionKind kind, std::span<const ObjectTrie::Prefix> p) const {
         TrieQuestion out;
         out.kind = kind;
@@ -136,9 +135,23 @@ class RemoteTrie final : public TrieSource {
         out.prefixes.assign(p.begin(), p.end());
         return out;
     }
+    // What asking cost: questions sent, reply bytes, and time waiting for
+    // the peer's answers.
+    struct Spent {
+        uint64_t questions{};
+        uint64_t bytes{};
+        Clock::duration waited{};
+    };
+    const Spent& spent() const noexcept { return spent_; }
+
+  private:
     Bytes ask(const TrieQuestion& question) {
+        const auto started = Clock::now();
         const auto reply = node_.call(peer_, MessageType::trie_diff,
                                       encode_trie_question(question), FrameType::speculative);
+        ++spent_.questions;
+        spent_.bytes += reply.message.payload.size();
+        spent_.waited += Clock::now() - started;
         if (reply.message.type != MessageType::trie_diff_reply) {
             std::string reason = "no reason given";
             if (reply.message.type == MessageType::error) {
@@ -156,6 +169,7 @@ class RemoteTrie final : public TrieSource {
     NodeRuntime& node_;
     NodeInfo peer_;
     Hash256 at_{};
+    Spent spent_;
 };
 
 // "/a/b/c" -> "/a/b"; "/a" -> "/"; "/" has no parent.
@@ -401,7 +415,7 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
         const ObjectTrie::Summary summary{trie.size(), trie.root_hash()};
         Lock lock(pinned_mutex_);
         std::erase_if(pinned_, [&](const Pinned& pinned) {
-            return pinned.hash == summary.hash || now - pinned.pinned > pinned_for;
+            return pinned.hash == summary.hash || now - pinned.used > pinned_for;
         });
         if (pinned_.size() >= pinned_max)
             pinned_.erase(pinned_.begin());
@@ -412,10 +426,12 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
     {
         Lock lock(pinned_mutex_);
         std::erase_if(pinned_,
-                      [&](const Pinned& pinned) { return now - pinned.pinned > pinned_for; });
-        for (const auto& pinned : pinned_)
-            if (pinned.hash == question.at)
+                      [&](const Pinned& pinned) { return now - pinned.used > pinned_for; });
+        for (auto& pinned : pinned_)
+            if (pinned.hash == question.at) {
+                pinned.used = now;
                 trie = pinned.trie;
+            }
     }
     if (!trie)
         return error_reply("snapshot_gone");
@@ -656,6 +672,24 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
             for (const auto& host : hosts)
                 sources.push_back(&tries.emplace_back(node_, host));
             std::vector<std::vector<ObjectId>> found;
+            const auto diff_started = Clock::now();
+            const auto report = [&](const char* outcome) {
+                const auto elapsed = Clock::now() - diff_started;
+                observations().record("availability.diff_us",
+                                      static_cast<uint64_t>(std::chrono::duration_cast<
+                                          std::chrono::microseconds>(elapsed).count()));
+                for (size_t i = 0; i < tries.size(); ++i) {
+                    const auto& spent = tries[i].spent();
+                    Log::debug("availability diff " + std::string(outcome) +
+                               " peer=" + to_string(hosts[i].id).substr(0, 12) +
+                               " questions=" + std::to_string(spent.questions) +
+                               " reply_bytes=" + std::to_string(spent.bytes) +
+                               " waited_ms=" + std::to_string(std::chrono::duration_cast<
+                                   std::chrono::milliseconds>(spent.waited).count()) +
+                               " elapsed_ms=" + std::to_string(std::chrono::duration_cast<
+                                   std::chrono::milliseconds>(elapsed).count()));
+                }
+            };
             try {
                 diffed = survey_by_diff(holdings->tries.front(), *holdings->missing,
                                         inventory->lookup(RetentionClass::data), sources, found,
@@ -664,7 +698,9 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                 for (size_t i = 0; i < hosts.size(); ++i)
                     lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
                                                          std::move(found[i])));
+                report("done");
             } catch (const std::exception& error) {
+                report("failed");
                 diffed.reset();
                 lacks = {};
                 method = "tree:diff_failed";
