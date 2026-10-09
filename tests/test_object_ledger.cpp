@@ -753,7 +753,7 @@ MACHA_FAST_TEST("object_ledger", test_a_store_with_its_ledger_starts_knowing_wha
     {
         LocalStore store(root, ledgered(ledger), key);
         // Known at once: no walk.
-        CHECK(store.indexed());
+        CHECK(store.held_view().identity.complete);
         for (const auto& id : kept)
             CHECK(store.has(id));
         for (const auto& id : removed)
@@ -766,7 +766,7 @@ MACHA_FAST_TEST("object_ledger", test_a_store_with_its_ledger_starts_knowing_wha
         CHECK(store.has(unlisted));
     }
     LocalStore again(root, ledgered(ledger), key);
-    CHECK(again.indexed());
+    CHECK(again.held_view().identity.complete);
     CHECK(again.has(unlisted));
     for (const auto& id : kept)
         CHECK(again.has(id));
@@ -825,6 +825,56 @@ MACHA_FAST_TEST("object_ledger", test_verification_corrects_the_ledger_from_the_
     CHECK(again.complete);
     CHECK(again.recorded == 0);
     CHECK(again.lost == 0);
+}
+
+// Packed objects are held like any other: listed by every put and removal,
+// by the next open when a store keeping no ledger packed them, and never
+// recorded lost by verification for having no file of their own.
+MACHA_FAST_TEST("object_ledger", test_the_ledger_lists_what_the_packs_hold) {
+    TempDir dir;
+    const auto root = dir.path() / "store";
+    const auto ledger = dir.path() / "ledger";
+    const auto key = key_of(16);
+    auto packing = ledgered(ledger);
+    packing.pack_threshold = 64 * 1024;
+    packing.pack_target_size = 1024 * 1024;
+    const auto small = [](int i) { return pattern(1000 + i, static_cast<uint8_t>(i)); };
+    const auto kept = object_id(small(1));
+    const auto dropped = object_id(small(2));
+    {
+        LocalStore store(root, packing, key);
+        REQUIRE(wait_until([&] { return store.held_view().identity.complete; }, 10s));
+        REQUIRE(store.put(kept, small(1)));
+        REQUIRE(store.put(dropped, small(2)));
+        REQUIRE(store.object_path(kept).parent_path() == root / "packs");
+        const auto view = store.held_view();
+        CHECK(view.held(kept));
+        CHECK(view.held(dropped));
+        REQUIRE(store.remove(dropped));
+        CHECK(!store.held_view().held(dropped));
+    }
+    const auto unlisted = object_id(small(3));
+    {
+        auto bare = packing;
+        bare.ledger_dir.clear();
+        LocalStore store(root, bare, key);
+        REQUIRE(store.put(unlisted, small(3)));
+    }
+    LocalStore store(root, packing, key);
+    const auto view = store.held_view();
+    CHECK(view.identity.complete);
+    CHECK(view.held(kept));
+    CHECK(view.held(unlisted));
+    CHECK(!view.held(dropped));
+
+    LocalStore::VerifyResult total;
+    while (!total.complete) {
+        const auto step = store.verify_step(65536);
+        total.lost += step.lost;
+        total.complete = step.complete;
+    }
+    CHECK(total.lost == 0);
+    CHECK(store.held_view().identity == view.identity);
 }
 
 // A write's flush does not wait for a seed being built, and what it queued

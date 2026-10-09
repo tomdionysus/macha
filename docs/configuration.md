@@ -143,11 +143,12 @@ Packing may be disabled by setting both `threshold` and `target_size` to zero. O
 The metadata store has an independent limit and never consumes DATA quota.
 
 Each store keeps a held ledger under `<state_path>/ledger/`: which objects it
-holds, journaled before they change and checkpointed into a trie on disk, so
-a restart knows what it holds without walking its disk (`data-<disk token>`
+holds, loose or packed, journaled before they change and checkpointed into a
+trie on disk, so a restart knows what it holds without walking its disk (`data-<disk token>`
 per DATA backend, named by the disk's own identity, and `control`). The
 first start on a version that keeps one walks the store once to seed it, in
-the background; every later start reads it. Maintenance checks each held
+the background; every later start reads it, and lists any packed object it
+does not yet (packs are replayed at every start). Maintenance checks each held
 ledger against its disk a pass a day, `objects/xx/yy` directories at four a
 second (one every four seconds while viewers or loaders are active): a file
 the ledger does not list is recorded held, and a listed object whose file is

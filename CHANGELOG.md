@@ -1,5 +1,37 @@
 # Current release
 
+## 0.90.71: a node's holdings have one identity
+
+No API, wire or protocol changes. On disk: the held ledgers list packed
+objects; `availability/holdings.bin` carries the identity it was of (an
+older file is not trusted and is replaced at the first roll-up).
+
+Replication by diff, stage 0 ([proposal](TODO/2026-10-09-replication-by-diff.md)).
+What a store holds is now read as a frozen view of its held ledgers with an
+identity: per disk the ledger trie's root hash, for the pool a hash over
+(disk token, root) of every online seeded disk, and a count of ids that
+stopped being held since start that never returns to an earlier value. The
+availability survey keys its roll-up on the namespace and that identity and
+nothing else, rolls up from the view, and answers peers from the view its
+roll-up was made from. It no longer watches storage events, the store's
+loss count or `indexed()` (removed, with the 30-minute wait for a presence
+index to fill: a seeded ledger needs none, and while a disk is seeded no
+roll-up is made). Fixed: a roll-up taken while a disk was absent stood until
+the namespace next changed after the disk came back (a backend coming online
+raised no storage event and changed no loss count), so peers pushed this
+node extents it held. Fixed: packed objects were never in the held ledger
+(`has()` answered them from the pack index), so the ledger was not the
+record of what a disk holds; a pack put and removal now record, a seed
+includes the packs, every open lists packed objects the ledger lacks (which
+migrates the nodes' ledgers on their first start), and verification no
+longer counts a packed object lost for having no file. Every pool backend
+keeps a held ledger whatever `storage.ledger_cache` is. The kept roll-up is
+trusted after a restart only if the node's identity is the one it was of.
+Tests: the identity moves with every put, removal and disk, returns to the
+same value for the same holdings, and its removals never go back; a disk
+coming back is surveyed with no namespace change; the ledger lists what the
+packs hold, through a store keeping no ledger, a reopen and verification.
+
 ## 0.90.70: the memory limit shrinks, never refuses
 
 No API, wire, protocol or on-disk changes. `runtime.memory_bytes` changes
