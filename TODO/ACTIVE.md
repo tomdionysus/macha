@@ -15,16 +15,14 @@ since.
 ## 1. The on-disk object ledger
 
 Design and stage status: [`2026-10-08-on-disk-object-ledger.md`](2026-10-08-on-disk-object-ledger.md).
-Shipped and confirmed on the cluster (COMPLETED): stage 1 (the trie and
-`SealedJournal`, 0.90.53), stage 2 (`held`, 0.90.54), stage 3 (claims in
-per-class tries, 0.90.55 and 0.90.56). 0.90.57 and 0.90.58 add stage 2's verification
-pass (maintenance checks each held ledger against its disk, a pass a day);
-0.90.59 lets writes go on while a first start seeds.
-Still to do:
-- Stage 3: resident memory against 0.90.54, which was not measured like for
-  like.
-- Stage 4: `referenced` and `unreferenced_since` as columns.
-- Stages 5 and 6: the diff RPC, then retiring the fallbacks.
+Shipped and confirmed on the cluster (COMPLETED): stages 1 to 4 (0.90.53 to
+0.90.63): the trie and `SealedJournal`; `held` with its daily check against
+the disk; claims in per-class tries; the namespace's reference counts with
+both horizons as frozen views of them. Still to do:
+- Resident memory on gbni-1 against 0.90.54 and 0.90.62, read after a few
+  hours of 0.90.63 (stage 3's and stage 4's exits).
+- Stages 5 and 6: the diff RPC driving repair, then retiring the fallbacks.
+- Deferred by measurement: `unreferenced_since` on disk (a few MB at most).
 
 ## 2. Control must never wait: what is left
 

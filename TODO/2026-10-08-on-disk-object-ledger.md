@@ -1,6 +1,6 @@
 # The on-disk object ledger
 
-Status: stages 1 to 3 shipped (0.90.53 to 0.90.55), 2026-10-08. Stages 2 and 3 of the object ledger
+Status: stages 1 to 4 shipped (0.90.53 to 0.90.63), 2026-10-09. Stages 2 and 3 of the object ledger
 spec ([archive/2026-09-29-object-ledger-spec.md](archive/2026-09-29-object-ledger-spec.md)),
 refreshed against the code at 0.90.52 and the operator's answers to its open
 questions. Stage 0 (the `ObjectLedger` interface) was built in the object
@@ -188,7 +188,24 @@ Each ships alone, with the suite green on the laptop and fi-1.
    the fallback for a peer without it. `lost` reported.
 6. **Retire** the fallbacks and the replaced files once every node runs 5.
 
-## Stage 4 proposal (2026-10-09)
+## Stage 4 (2026-10-09)
+
+Shipped: 0.90.62 (frozen trie views) and 0.90.63 (reference counts, horizons
+as views). Confirmed on the cluster 2026-10-09: the first start counted the
+namespace once (gbni-1: a 4.2 s first inventory, 48 MB of extent counts,
+468 KB of node counts); a restart used the saved root and wrote nothing to
+the counts (no walk), its first inventory 1.36 s. Resident memory against
+0.90.62 still to read after a few hours (0.90.62 grew to about 990 MB in
+its first half hour on gbni-1).
+
+**Deferred, by measurement:** `unreferenced_since` on disk. The sighting
+files hold only objects waiting out their grace: gbni-1 about 1,600 DATA
+and 10,800 control (63 KB and 433 KB), fi-1 about 2,400 and 51,500 (95 KB,
+2.1 MB); a few MB in memory at most, growing with garbage, not the library.
+On disk it would turn the per-pass sweep into a scan for no measurable gain.
+Revisit if a node's sightings reach hundreds of thousands.
+
+The proposal as agreed:
 
 **What exists** (survey, 0.90.61). The referenced set is held five times,
 each about 32 B an id: the census (`FileSystem::NamespaceCensus`, extents

@@ -2,6 +2,18 @@
 
 Last updated: 2026-10-08
 
+## 2026-10-08/09 -- 0.90.57 to 0.90.63: ledger stage 2 follow-ups, a control fix, stage 4
+
+- **The held ledger checked against the disk** (0.90.57, paced by time in
+  0.90.58, resuming after a restart in 0.90.60): a directory at a time, a
+  pass a day; no corrections in the partial passes so far.
+- **A first-start seed holds no write up** (0.90.59).
+- **Metadata journal compaction holds no reader** (0.90.61, ACTIVE 2 item 6).
+- **Frozen trie views** (0.90.62) and **horizons as views of on-disk
+  reference counts** (0.90.63): the five in-memory copies of the referenced
+  set are gone; a restart of gbni-1 used the saved counts and walked
+  nothing.
+
 ## 2026-10-08 -- 0.90.55 and 0.90.56: the object ledger, stage 3
 
 - **Retention claims in the ledger** (0.90.55): one `ObjectTrie` a class
