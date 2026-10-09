@@ -2,6 +2,19 @@
 
 Last updated: 2026-10-08
 
+## 2026-10-09 -- 0.90.64 to 0.90.66: control must never wait
+
+- **One limit for every password hash** (0.90.64): sign-ins and
+  password-setting account changes share `PasswordWork`; `429 try_later`
+  on the account routes (recorded in CLIENT-CONTRACTS, to announce).
+- **A commit's metadata mutations go first** (0.90.65): control-class
+  mutations ahead of background history imports; a quarter of the queue
+  kept for control.
+- **Job traffic and head repair are not control** (0.90.66): job polling
+  and the torrent coordinator as loader work, a user's ingest action as
+  viewer work, head repair as speculative. Only the deploy's transition
+  window refused the new classes (10:35:26 to 10:35:31Z), none after.
+
 ## 2026-10-08/09 -- 0.90.57 to 0.90.63: ledger stage 2 follow-ups, a control fix, stage 4
 
 - **The held ledger checked against the disk** (0.90.57, paced by time in
