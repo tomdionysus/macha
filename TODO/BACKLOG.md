@@ -62,9 +62,8 @@ gone from here, and the old file with its full reasoning is
 
 - **The catalogue's cost and residency**: ACTIVE section 4's
   [plan](2026-10-06-catalogue-materialised-view.md); holdings for catalogue
-  DATA moved to ACTIVE section 2 (replication by diff).
-- **`GET catalogue/status` walks all artwork** and asks the store for each
-  (`catalogue.cpp:896`).
+  DATA, and `catalogue/status` asking the store for every artwork, are
+  ACTIVE section 2's stage 4 (replication by diff).
 - **Clear Metadata is synchronous.** (Its descendant scan goes with the
   plan's derived parent index.)
 - **Opaque work ids**: items are still `tmdb:movie:`/`tmdb:tv:`.
