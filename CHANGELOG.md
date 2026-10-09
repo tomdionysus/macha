@@ -3,8 +3,7 @@
 ## 0.90.71: a node's holdings have one identity
 
 No API, wire or protocol changes. On disk: the held ledgers list packed
-objects; `availability/holdings.bin` carries the identity it was of (an
-older file is not trusted and is replaced at the first roll-up).
+objects; `availability/holdings.bin` is no longer kept (removed at start).
 
 Replication by diff, stage 0 ([proposal](TODO/2026-10-09-replication-by-diff.md)).
 What a store holds is now read as a frozen view of its held ledgers with an
@@ -25,8 +24,10 @@ record of what a disk holds; a pack put and removal now record, a seed
 includes the packs, every open lists packed objects the ledger lacks (which
 migrates the nodes' ledgers on their first start), and verification no
 longer counts a packed object lost for having no file. Every pool backend
-keeps a held ledger whatever `storage.ledger_cache` is. The kept roll-up is
-trusted after a restart only if the node's identity is the one it was of.
+keeps a held ledger whatever `storage.ledger_cache` is. The roll-up is no
+longer kept across a restart: it covered the presence index's warm-up, which
+a seeded ledger does not have, so a restarted node answers peers from its
+first pass's roll-up.
 Tests: the identity moves with every put, removal and disk, returns to the
 same value for the same holdings, and its removals never go back; a disk
 coming back is surveyed with no namespace change; the ledger lists what the
