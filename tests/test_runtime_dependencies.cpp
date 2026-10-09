@@ -846,6 +846,54 @@ MACHA_FAST_TEST("runtime_dependencies", test_password_checks_may_never_fill_the_
     CHECK(!parse(2, 3));
 }
 
+// runtime.memory_bytes is the node's one budget: the metadata cache and the
+// ledger caches come out of it, in-flight work gets the rest; a budget that
+// cannot hold them all, or set beside retained_memory_bytes, is refused.
+MACHA_FAST_TEST("runtime_dependencies", test_memory_bytes_is_one_budget) {
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto disk = t.path() / "disk";
+    std::filesystem::create_directories(disk);
+    const auto parse = [&](const std::string& runtime) -> std::optional<Config> {
+        const auto yaml = t.path() / "memory.yaml";
+        std::ofstream out(yaml);
+        out << "state_path: " << (t.path() / "state").string() << "\n"
+            << "key_file: " << keyfile.string() << "\n"
+            << "dht:\n"
+            << "  metadata_materialization_cache_bytes: 256M\n"
+            << "storage:\n"
+            << "  ledger_cache: 64M\n"
+            << "  data:\n"
+            << "    backends:\n"
+            << "      - path: " << disk.string() << "\n"
+            << "        limit: 10G\n"
+            << "runtime:\n"
+            << runtime;
+        out.close();
+        std::vector<std::string> args{"macha", "--config", yaml.string()};
+        std::vector<char*> argv;
+        for (auto& arg : args)
+            argv.push_back(arg.data());
+        try {
+            return parse_config(static_cast<int>(argv.size()), argv.data());
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    };
+    const auto budget = parse("  memory_bytes: 1G\n");
+    REQUIRE(budget.has_value());
+    CHECK(budget->runtime.retained_memory_bytes == (1024ULL - 256 - 64) * 1024 * 1024);
+    // Without a budget, the in-flight capacity is as set.
+    const auto unset = parse("  retained_memory_bytes: 700M\n");
+    REQUIRE(unset.has_value());
+    CHECK(unset->runtime.retained_memory_bytes == 700ULL * 1024 * 1024);
+    CHECK(!parse("  memory_bytes: 1G\n  retained_memory_bytes: 700M\n"));
+    // 256M + 64M of caches and 352M of in-flight reserves need 672M.
+    CHECK(!parse("  memory_bytes: 600M\n"));
+    CHECK(parse("  memory_bytes: 672M\n").has_value());
+}
+
 MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwork) {
     TempDir t;
     auto key = t.path() / "cluster.key";

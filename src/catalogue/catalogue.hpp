@@ -417,6 +417,9 @@ class CatalogueManager {
     // catalogue changes.
     std::shared_ptr<const CatalogueIndexes> indexes();
     std::shared_ptr<const CatalogueView> snapshot_view();
+    // The installed view's resident size; zero before one is installed.
+    // Memory only: never loads.
+    uint64_t resident_bytes();
     // Warm, waits on nothing (cached snapshot); cold, loads from metadata and
     // the control store, which the wait guard refuses to work allowing only
     // local waits.

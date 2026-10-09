@@ -143,6 +143,22 @@ std::map<std::string, uint64_t> NodeServices::observation_gauges() {
     const auto idle_ms = [](std::chrono::milliseconds idle) {
         return static_cast<uint64_t>(std::max<int64_t>(0, idle.count()));
     };
+    // Memory by part: the budget, the in-flight ledger's capacity and use, and
+    // the caches outside the ledger (their actual size, or the ledger caches'
+    // fixed share).
+    {
+        const auto& config = node_.config();
+        const auto memory = resources_.memory.stats();
+        const auto metadata = local_.replica().diagnostics();
+        gauges["memory_budget_bytes"] = memory.capacity_bytes +
+                                        metadata.materialization_cache_limit_bytes +
+                                        config.ledger_cache;
+        gauges["memory_in_flight_capacity_bytes"] = memory.capacity_bytes;
+        gauges["memory_in_flight_bytes"] = memory.used_bytes;
+        gauges["memory_metadata_cache_bytes"] = metadata.materialization_cache_bytes;
+        gauges["memory_ledger_caches_bytes"] = config.ledger_cache;
+        gauges["memory_catalogue_bytes"] = catalogue_.resident_bytes();
+    }
     gauges["viewer_idle_ms"] = idle_ms(store_.idle_for(WorkClass::viewer));
     gauges["loader_idle_ms"] = idle_ms(store_.idle_for(WorkClass::loader));
     const auto repair = store_.repair_diagnostics();
