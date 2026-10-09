@@ -1217,6 +1217,16 @@ std::shared_ptr<const CatalogueView> CatalogueManager::snapshot_view() {
     return current_snapshot();
 }
 
+uint64_t CatalogueManager::resident_bytes() {
+    std::shared_ptr<const CatalogueView> view;
+    {
+        Lock lock(mutex_);
+        if (ready_)
+            view = cached_;
+    }
+    return view ? catalogue_resident_bytes(*view) : 0;
+}
+
 std::shared_ptr<const CatalogueView>
 CatalogueManager::snapshot_view(const WorkContext& context) {
     bool warm = false;

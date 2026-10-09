@@ -1,5 +1,26 @@
 # Current release
 
+## 0.90.69: one memory budget, every part reported
+
+No API, wire, protocol or on-disk changes. New setting: `runtime.memory_bytes`.
+
+The retained-memory ledger admits heap held across asynchronous boundaries
+(RPC frames, FUSE operations, publications, payloads, playback segments);
+the large long-lived caches beside it each had their own cap, never counted
+with it: on gbni-1 the ledger's 768 MiB, the metadata materialisation cache's
+512 MiB and the ledger caches' 64 MiB, over 1.3 GiB of caps on a 4 GiB Pi
+that nothing checked together. `runtime.memory_bytes`, when set, is the one
+budget: the metadata cache and the ledger caches come out of it, the
+in-flight ledger gets the rest, and a budget that cannot hold all of them
+and the in-flight reserves is refused at start with each part named. Unset,
+nothing changes. Every part is now in the observation log once a minute:
+`memory_budget_bytes`, `memory_in_flight_capacity_bytes`,
+`memory_in_flight_bytes`, `memory_metadata_cache_bytes` (actual),
+`memory_ledger_caches_bytes`, `memory_catalogue_bytes` (actual, read without
+loading), beside `rss_bytes`. Test: a 1G budget leaves 704M in flight after
+256M and 64M of caches; setting both knobs, or a budget below the parts, is
+refused.
+
 ## 0.90.68: a dial in flight is waited for no longer than a dial
 
 No API, wire, protocol or on-disk changes.

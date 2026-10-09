@@ -49,11 +49,24 @@ routes, ranks or authenticates on the name.
 ```yaml
 runtime:
   glibc_arena_max: 4
+  # memory_bytes: 1344M   # the node's one memory budget; see below
   retained_memory_bytes: 768M
   control_memory_reserve_bytes: 64M
   viewer_memory_reserve_bytes: 192M
   loader_memory_reserve_bytes: 64M
 ```
+
+`memory_bytes`, when set, is the node's one memory budget: the metadata
+materialisation cache (`dht.metadata_materialization_cache_bytes`) and the
+ledger caches (`storage.ledger_cache`) are carved out of it, and the rest is
+the in-flight admission budget below, which is then derived and must not be
+set as well. A budget that cannot hold both caches and the in-flight
+reserves is refused at start, naming each part. Unset, the in-flight budget
+is `retained_memory_bytes` and the caches sit beside it. Either way the
+observation log reports each part once a minute: `memory_budget_bytes`,
+`memory_in_flight_capacity_bytes` and `memory_in_flight_bytes`,
+`memory_metadata_cache_bytes`, `memory_ledger_caches_bytes`,
+`memory_catalogue_bytes`, beside `rss_bytes`.
 
 `retained_memory_bytes` is the process-wide admission budget for heap objects
 which survive an asynchronous boundary, including FUSE write/operation state,
