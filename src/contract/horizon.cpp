@@ -105,10 +105,12 @@ InventoryHorizon::InventoryHorizon(uint64_t generation, bool catalogue_complete,
 InventoryHorizon::InventoryHorizon(uint64_t generation, bool catalogue_complete,
                                    ReferencedSets sets,
                                    const std::vector<GarbageRef>& garbage,
-                                   std::vector<ObjectId> outside_namespace)
+                                   std::vector<ObjectId> outside_namespace,
+                                   std::vector<TombstoneBatch> tombstone_batches)
     : ReferencedSets(std::move(sets)), generation_(generation),
       catalogue_complete_(catalogue_complete),
-      outside_namespace_(sorted_unique(std::move(outside_namespace))) {
+      outside_namespace_(sorted_unique(std::move(outside_namespace))),
+      tombstone_batches_(std::move(tombstone_batches)) {
     garbage_.reserve(garbage.size());
     stale_garbage_.reserve(garbage.size());
     for (const auto& candidate : garbage) {

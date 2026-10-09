@@ -463,6 +463,94 @@ MACHA_TEST("namespace_migration", test_the_inventory_and_the_media_index_follow_
     service.stop();
 }
 
+// Tombstones live in batches in a tree-backed head: maintenance moves a
+// migrated head's inline tombstones into batches, a delete writes its
+// extents' batch (a control object), maintenance reads every tombstone from
+// the batches, and drops each batch once its grace has run.
+MACHA_TEST("namespace_migration", test_tombstones_live_in_batches_in_a_tree_backed_head) {
+    TestCluster cluster;
+    auto config = cluster.node_config("tombstone-batches");
+    make_solo(config);
+    const auto extent = config.extent_size;
+    const auto write = [&](FileSystem& fs, const std::string& path, const Bytes& bytes) {
+        fs.create_file(path, 0644, getuid(), getgid());
+        auto writer = fs.open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+    };
+    NodeId node_id{};
+    std::vector<ObjectId> map_extents;
+    {
+        Service service(config, cluster.keys(), test_durability_window);
+        service.start();
+        node_id = service.node().node_id();
+        REQUIRE(wait_metadata_writable(service));
+        auto& fs = service.filesystem();
+        write(fs, "/before.bin", pattern(extent * 3, 21));
+        for (const auto& x : fs.getattr("/before.bin").extents)
+            map_extents.push_back(x.id);
+        fs.unlink("/before.bin");
+        REQUIRE(!service.metadata_manager().snapshot().garbage.empty());
+        service.stop();
+    }
+    (void)migrate_state(config, cluster.keys(), {node_id});
+    config.maintenance.garbage_grace = 4s;
+    Service service(config, cluster.keys(), test_durability_window);
+    service.start();
+    REQUIRE(wait_metadata_writable(service));
+    auto& fs = service.filesystem();
+    auto& metadata = service.metadata_manager();
+    REQUIRE(metadata.snapshot().namespace_root.has_value());
+
+    // The migrated head's inline tombstones move into batches.
+    REQUIRE(wait_until([&] {
+        const auto head = metadata.snapshot();
+        return head.garbage.empty() && !head.tombstone_batches.empty();
+    }, 30s));
+
+    // A delete in the tree writes one batch naming its extents.
+    write(fs, "/after.bin", pattern(extent * 4, 22));
+    std::vector<ObjectId> tree_extents;
+    for (const auto& x : fs.getattr("/after.bin").extents)
+        tree_extents.push_back(x.id);
+    std::sort(tree_extents.begin(), tree_extents.end());
+    tree_extents.erase(std::unique(tree_extents.begin(), tree_extents.end()), tree_extents.end());
+    const auto batches_before = metadata.snapshot().tombstone_batches;
+    fs.unlink("/after.bin");
+    const auto head = metadata.snapshot();
+    CHECK(head.garbage.empty());
+    std::vector<TombstoneBatch> added;
+    std::set_difference(head.tombstone_batches.begin(), head.tombstone_batches.end(),
+                        batches_before.begin(), batches_before.end(), std::back_inserter(added));
+    REQUIRE(added.size() == 1);
+    CHECK(added.front().count == tree_extents.size());
+    const auto object = service.local_state().control().get(added.front().id);
+    REQUIRE(object.has_value());
+    CHECK(decode_tombstone_batch(*object).ids == tree_extents);
+    // The head stays small: batches, not tombstones.
+    CHECK(encode_snapshot_v14(head).size() < 4096);
+    CHECK(decode_snapshot(encode_snapshot_v14(head)).tombstone_batches == head.tombstone_batches);
+
+    // Maintenance sees every tombstone, from the batches.
+    REQUIRE(wait_until([&] {
+        const auto objects = fs.maintenance_objects_cached();
+        const auto has = [&](const ObjectId& id) {
+            return std::binary_search(objects->garbage.begin(), objects->garbage.end(),
+                                      GarbageRef{id, 0, {}},
+                                      [](const GarbageRef& a, const GarbageRef& b) {
+                                          return a.id < b.id;
+                                      });
+        };
+        return std::all_of(tree_extents.begin(), tree_extents.end(), has) &&
+               std::all_of(map_extents.begin(), map_extents.end(), has);
+    }, 20s));
+
+    // Past their grace, maintenance drops the batches whole.
+    REQUIRE(wait_until([&] { return metadata.snapshot().tombstone_batches.empty(); }, 60s));
+    CHECK(metadata.snapshot().garbage.empty());
+    service.stop();
+}
+
 // Namespace operations that arrive while a commit is in flight are committed
 // together by the next one, on a map-held and on a tree-held namespace. One
 // that cannot apply fails alone and leaves the rest of its commit intact.

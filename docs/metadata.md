@@ -116,10 +116,19 @@ The overwhelming majority of a snapshot is the namespace entries themselves,
 and most of that is their extent tables; everything else is meant to be a
 rounding error. Three rules keep it that way:
 
-- **Tombstones** (`garbage`) are consumed by the maintenance sweep after
-  `maintenance.garbage_grace_ms` and then erased from metadata; the vector is
-  kept in canonical ObjectId order (DLT7) so a reconciliation's union is an
-  ordinary delta rather than a full snapshot frame.
+- **Tombstones** are held outside a tree-backed head: each mutation that
+  retires objects writes one tombstone batch, an immutable control object
+  holding every object it retired (sorted) at one retirement time, and the
+  head names its batches (SM19: id, retirement time and count, 44 bytes a
+  batch; DLT11 names and drops them). A batch is claimed, replicated and kept
+  alive like the tree's nodes. Maintenance reads every tombstone from the
+  batches (the latest retirement per object wins), and drops a batch whole
+  once `maintenance.garbage_grace_ms` has passed since its retirement, as its
+  tombstones retire together. An inline namespace keeps its tombstones in
+  the snapshot (`garbage`, in canonical ObjectId order, DLT7), erased after
+  the same grace; a tree-backed head migrated from one has its inline
+  tombstones moved into batches by maintenance, an hour of retirements to a
+  batch at the hour's latest.
 - **Conflicts** leave the snapshot when decided: a later write to (or
   removal of) the conflicted path, or a later catalogue root, supersedes the
   record at the next commit and at every merge; an operator can also resolve

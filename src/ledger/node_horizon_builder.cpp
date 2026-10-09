@@ -17,12 +17,16 @@ std::shared_ptr<const InventoryHorizon> build_inventory(const MaintenanceObjects
     std::vector<ObjectId> data = namespace_objects.conflict_live;
     data.insert(data.end(), catalogue.live.begin(), catalogue.live.end());
     std::vector<ObjectId> control(catalogue.control_live.begin(), catalogue.control_live.end());
+    // The head's tombstone batches are control objects it names.
+    for (const auto& batch : namespace_objects.tombstone_batches)
+        control.push_back(batch.id);
     return std::make_shared<const InventoryHorizon>(
         namespace_objects.metadata_generation, catalogue.complete,
         ReferencedSets({namespace_objects.referenced_extents, namespace_objects.referenced_nodes},
                        std::move(data), std::move(control)),
         namespace_objects.garbage,
-        std::vector<ObjectId>(catalogue.live.begin(), catalogue.live.end()));
+        std::vector<ObjectId>(catalogue.live.begin(), catalogue.live.end()),
+        namespace_objects.tombstone_batches);
 }
 
 ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNodeStore& nodes,
@@ -70,6 +74,8 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
                       to_string(*head.snapshot->namespace_root) + " error=" + error.what());
         }
     }
+    for (const auto& batch : head.snapshot->tombstone_batches)
+        control.push_back(batch.id);
     ReferencedSets::Views views;
     if (counted)
         views = {counted->extents, counted->nodes};

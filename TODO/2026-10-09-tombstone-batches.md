@@ -1,6 +1,6 @@
 # Tombstones out of the head record: batches
 
-Status: agreed with the operator 2026-10-09; in progress.
+Status: shipped in 0.90.67 (2026-10-09), all three slices together.
 
 ## Why
 
@@ -31,14 +31,16 @@ by id would scatter one delete across most of its leaves.
 2. **The head lists batches**: hash, count, `retired_at` per batch (48 B), so
    a few hundred deletes are 10 to 20 KB, not MB.
 3. **Collection drops whole batches**: a batch's tombstones mature together,
-   so maintenance removes its entry from the list. Erasing part of a batch
-   (rare: an extent that came back) writes a new batch without those ids.
+   so maintenance removes its entry from the list. A batch is never
+   rewritten: a tombstone whose object came back is harmless (the sweep still
+   needs reachability, no claim and the sighting grace), and a later delete
+   writes a later batch.
 4. **A re-retired extent** goes in the new batch; the latest retirement wins,
    as now.
 5. **Merge** is the union of the two batch lists.
-6. **Lookups by id** (GC, delete, stale-garbage detection) use a local index
-   on each node, an `ObjectTrie` built from the batches it reads, like the
-   reference counts; its memory is its cache share.
+6. **No lookups by id were left**: a delete no longer searches the
+   tombstones (it writes a batch), so no per-node index was needed;
+   maintenance reads the batches, a few hundred small objects.
 7. **Migration**: the first start on the new format turns the existing
    tombstones into batches grouped by `retired_at`. A new head record format:
    both nodes upgrade in one deploy.

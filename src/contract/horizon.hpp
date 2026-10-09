@@ -71,7 +71,8 @@ class InventoryHorizon : public ReferencedSets {
                      std::vector<ObjectId> outside_namespace = {});
     InventoryHorizon(uint64_t generation, bool catalogue_complete, ReferencedSets sets,
                      const std::vector<GarbageRef>& garbage,
-                     std::vector<ObjectId> outside_namespace);
+                     std::vector<ObjectId> outside_namespace,
+                     std::vector<TombstoneBatch> tombstone_batches = {});
 
     // The stamp: the generation the inventory was built at.
     uint64_t generation() const noexcept { return generation_; }
@@ -80,6 +81,10 @@ class InventoryHorizon : public ReferencedSets {
     const std::vector<GarbageRef>& stale_garbage() const noexcept { return stale_garbage_; }
     // Sorted and unique.
     const std::vector<ObjectId>& outside_namespace() const noexcept { return outside_namespace_; }
+    // The head's tombstone batches, sorted by id: dropped whole once matured.
+    const std::vector<TombstoneBatch>& tombstone_batches() const noexcept {
+        return tombstone_batches_;
+    }
 
   private:
     uint64_t generation_;
@@ -87,6 +92,7 @@ class InventoryHorizon : public ReferencedSets {
     std::vector<GarbageRef> garbage_;
     std::vector<GarbageRef> stale_garbage_;
     std::vector<ObjectId> outside_namespace_;
+    std::vector<TombstoneBatch> tombstone_batches_;
 };
 
 // The retention release horizon at the sole accepted head: what claims are

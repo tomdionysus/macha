@@ -1,5 +1,38 @@
 # Current release
 
+## 0.90.67: tombstones out of the head record, in batches
+
+No API changes. On disk and on the wire: SM19 (a tree-backed head that names
+tombstone batches) and DLT11 (a delta that names or drops one). A node before
+0.90.67 cannot read either, so during a rolling deploy the older node refuses
+the newer one's heads until it is upgraded too.
+
+gbni-1's head record was 2.67 MB, nearly all of it 46,092 tombstones held for
+the 30-day grace, so every control `get_metadata` copied it and every
+commit's accept decoded it, and both grew with recent deletes. Now each
+mutation that retires objects in a tree-backed namespace writes one
+tombstone batch: an immutable control object holding every object it
+retired, sorted, at one retirement time, written with the tree's nodes,
+claimed and replicated like them, and kept alive by both horizons. The head
+names its batches (44 bytes each). Maintenance reads every tombstone from
+the batches (the latest retirement per object wins; a batch it cannot read
+is logged, its objects left to the sighting grace) and drops a batch whole
+once its grace has run, as its tombstones retire together. A batch is never
+rewritten: a tombstone whose object is referenced again is harmless (the
+sweep still needs reachability, no claim and this node's own sighting
+grace), and a later delete writes a later batch. The filesystem's and the
+catalogue's retirement were two copies of one rule; both now call
+`retire_objects()`. A tree-backed head that still holds inline tombstones
+has them moved into batches by maintenance, an hour of retirements to a
+batch at the hour's latest (at most an hour's more wait on a 30-day grace).
+An inline namespace keeps its tombstones inline, as before.
+
+Tests: SM19 and DLT11 round trip and re-encode to the same bytes, a merge
+unions batches, tombstones are read latest-wins with an unreadable batch
+counted; on a node migrated from a map to a tree, maintenance moves the
+inline tombstones into batches, a delete writes one batch naming its
+extents, maintenance reads both, and drops every batch after the grace.
+
 ## 0.90.66: job traffic and head repair are not control
 
 No API or on-disk changes. Wire: torrent and ingest job messages

@@ -30,6 +30,11 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM15{'D', 'H', 'T', 'M', 'E', 'T', 'B', '5'}, SM16{'D', 'H', 'T', 'M', 'E', 'T', 'B', '6'},
     // SM17 is SM16 and SM18 is SM15, each followed by the legacy clock.
     SM17{'D', 'H', 'T', 'M', 'E', 'T', 'B', '7'}, SM18{'D', 'H', 'T', 'M', 'E', 'T', 'B', '8'},
+    // SM19 is SM14 with the torrent requests, a legacy clock flag and the
+    // clock when set, then the tombstone batches. Written only while the
+    // head names a batch.
+    SM19{'D', 'H', 'T', 'M', 'E', 'T', 'B', '9'},
+    TOMBSTONE_BATCH{'M', 'T', 'O', 'M', 'B', '0', '0', '1'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
     MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'},
@@ -159,6 +164,7 @@ uint64_t snapshot_resident_bytes(const MetadataSnapshot& snapshot) {
         account_entry_allocations(total, entry);
     }
     resident::add(total, snapshot.garbage.capacity() * sizeof(GarbageRef));
+    resident::add(total, snapshot.tombstone_batches.capacity() * sizeof(TombstoneBatch));
     resident::map_nodes(total, snapshot.node_status);
     for (const auto& [_, status] : snapshot.node_status) {
         resident::string(total, status.version);
@@ -468,9 +474,11 @@ int metadata_delta_version(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 7> prefix{'D', 'H', 'T', 'M', 'D', 'L', 'T'};
     if (data.size() < 8 || !std::equal(prefix.begin(), prefix.end(), data.begin()))
         return 0;
-    // DLT10 is written 'A'.
+    // DLT10 and DLT11 are written 'A' and 'B'.
     if (data[7] == 'A')
         return 10;
+    if (data[7] == 'B')
+        return 11;
     if (data[7] < '1' || data[7] > '9')
         return 0;
     return static_cast<int>(data[7] - '0');
@@ -495,6 +503,7 @@ Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSn
     case 8:
     case 9:
     case 10:
+    case 11:
         // A tree-backed successor is SM14; encode_snapshot refuses a namespace
         // root, which would force every commit to a full record.
         return snapshot.namespace_root ? encode_snapshot_v14(snapshot)
@@ -640,6 +649,139 @@ void record_entry_change(MetadataDelta& delta, const std::string& path, const Fs
     delta.upsert_entries[path] = after;
 }
 
+Bytes encode_tombstone_batch(int64_t retired_at_ns, const std::vector<ObjectId>& ids) {
+    if (ids.empty() || retired_at_ns < 0)
+        throw std::invalid_argument("empty or unretired tombstone batch");
+    for (size_t i = 1; i < ids.size(); ++i)
+        if (!(ids[i - 1] < ids[i]))
+            throw std::invalid_argument("tombstone batch ids not sorted and unique");
+    Writer w;
+    w.raw(TOMBSTONE_BATCH);
+    w.i64(retired_at_ns);
+    w.u32(static_cast<uint32_t>(ids.size()));
+    for (const auto& id : ids)
+        w.fixed(id.bytes);
+    return w.take();
+}
+
+TombstoneBatchContent decode_tombstone_batch(std::span<const uint8_t> bytes) {
+    Reader r(bytes);
+    const auto magic = r.raw(8);
+    if (!std::equal(magic.begin(), magic.end(), TOMBSTONE_BATCH.begin()))
+        throw DecodeError("not a tombstone batch");
+    TombstoneBatchContent batch;
+    batch.retired_at_ns = r.i64();
+    const auto count = r.u32();
+    if (batch.retired_at_ns < 0 || count == 0 || count > r.remaining() / 32)
+        throw DecodeError("bad tombstone batch");
+    batch.ids.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        ObjectId id{r.fixed<32>()};
+        if (!batch.ids.empty() && !(batch.ids.back() < id))
+            throw DecodeError("tombstone batch ids out of order");
+        batch.ids.push_back(id);
+    }
+    r.finish();
+    return batch;
+}
+
+namespace {
+void record_garbage_upsert(MetadataDelta& delta, const GarbageRef& garbage) {
+    auto existing = std::find_if(delta.upsert_garbage.begin(), delta.upsert_garbage.end(),
+                                 [&](const GarbageRef& value) { return value.id == garbage.id; });
+    if (existing == delta.upsert_garbage.end())
+        delta.upsert_garbage.push_back(garbage);
+    else
+        *existing = garbage;
+}
+} // namespace
+
+void retire_objects(MetadataSnapshot& snapshot, MetadataDelta& delta, std::vector<ObjectId> ids) {
+    if (ids.empty())
+        return;
+    if (snapshot.namespace_root) {
+        auto group = std::find_if(delta.pending_tombstones.begin(), delta.pending_tombstones.end(),
+                                  [](const auto& pending) { return pending.at_commit; });
+        if (group == delta.pending_tombstones.end()) {
+            delta.pending_tombstones.push_back({});
+            group = std::prev(delta.pending_tombstones.end());
+        }
+        group->ids.insert(group->ids.end(), ids.begin(), ids.end());
+        return;
+    }
+    // One pass over the (possibly huge) inline set, not one per object.
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    std::vector<bool> found(ids.size(), false);
+    for (auto& garbage : snapshot.garbage) {
+        auto target = std::lower_bound(ids.begin(), ids.end(), garbage.id);
+        if (target == ids.end() || *target != garbage.id)
+            continue;
+        const auto index = static_cast<size_t>(target - ids.begin());
+        if (found[index])
+            continue;
+        auto retired = wall_time_ns();
+        if (retired <= garbage.retired_at_ns &&
+            garbage.retired_at_ns < std::numeric_limits<int64_t>::max())
+            retired = garbage.retired_at_ns + 1;
+        garbage.retired_at_ns = retired;
+        garbage.retirement_id = random_node_id();
+        record_garbage_upsert(delta, garbage);
+        found[index] = true;
+    }
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (found[i])
+            continue;
+        snapshot.garbage.push_back({ids[i], wall_time_ns(), random_node_id()});
+        record_garbage_upsert(delta, snapshot.garbage.back());
+    }
+}
+
+std::vector<GarbageRef>
+tombstones_of(const MetadataSnapshot& snapshot,
+              const std::function<std::optional<Bytes>(const ObjectId&)>& read_batch,
+              size_t* unreadable) {
+    std::vector<GarbageRef> all = snapshot.garbage;
+    for (const auto& batch : snapshot.tombstone_batches) {
+        std::optional<TombstoneBatchContent> content;
+        try {
+            if (const auto bytes = read_batch(batch.id))
+                content = decode_tombstone_batch(*bytes);
+        } catch (const std::exception&) {
+        }
+        if (!content || content->ids.size() != batch.count ||
+            content->retired_at_ns != batch.retired_at_ns) {
+            if (unreadable)
+                ++*unreadable;
+            continue;
+        }
+        // The batch's own retirement: its id, so an equal one is never
+        // mistaken for another.
+        NodeId retirement;
+        std::copy_n(batch.id.bytes.begin(), retirement.bytes.size(), retirement.bytes.begin());
+        for (const auto& id : content->ids)
+            all.push_back({id, batch.retired_at_ns, retirement});
+    }
+    // The latest retirement per object.
+    std::sort(all.begin(), all.end(), [](const GarbageRef& a, const GarbageRef& b) {
+        if (a.id != b.id)
+            return a.id < b.id;
+        return std::tie(a.retired_at_ns, a.retirement_id) >
+               std::tie(b.retired_at_ns, b.retirement_id);
+    });
+    all.erase(std::unique(all.begin(), all.end(),
+                          [](const GarbageRef& a, const GarbageRef& b) { return a.id == b.id; }),
+              all.end());
+    return all;
+}
+
+uint64_t tombstone_count(const MetadataSnapshot& snapshot) noexcept {
+    uint64_t count = snapshot.garbage.size();
+    for (const auto& batch : snapshot.tombstone_batches)
+        count += batch.count;
+    return count;
+}
+
 bool garbage_is_canonical(const std::vector<GarbageRef>& garbage) {
     for (size_t i = 1; i < garbage.size(); ++i)
         if (!(garbage[i - 1].id < garbage[i].id))
@@ -738,6 +880,8 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     // entries live in the tree, so encoding it would publish an empty namespace.
     if (s.namespace_root)
         throw std::runtime_error("namespace root cannot be encoded before SM14");
+    if (!s.tombstone_batches.empty())
+        throw std::runtime_error("tombstone batches need a tree-backed snapshot (SM19)");
     Writer w;
     // The smallest format that holds the state: SM11 adds branch topology and
     // conflicts, SM12 the metadata write floor, SM13 the participant roster
@@ -857,8 +1001,9 @@ Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
     if (s.metadata_participants.size() > 65536)
         throw std::runtime_error("too many metadata participants");
 
+    const bool batches = !s.tombstone_batches.empty();
     Writer w;
-    w.raw(s.legacy_clock ? SM17 : s.torrent_requests.empty() ? SM14 : SM16);
+    w.raw(batches ? SM19 : s.legacy_clock ? SM17 : s.torrent_requests.empty() ? SM14 : SM16);
     w.u32(s.metadata_voters.size());
     for (const auto& v : s.metadata_voters)
         w.fixed(v.bytes);
@@ -903,12 +1048,24 @@ Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
         w.fixed(participant.bytes);
     w.fixed(s.metadata_branch_floor.bytes);
     w.u8(s.retention_baseline_complete ? 1 : 0);
-    if (s.legacy_clock || !s.torrent_requests.empty())
+    if (batches || s.legacy_clock || !s.torrent_requests.empty())
         encode_torrent_requests(w, s);
+    if (batches)
+        w.u8(s.legacy_clock ? 1 : 0);
     if (s.legacy_clock) {
         encode_clock(w, *s.legacy_clock);
         w.fixed(s.catalogue_dot.author.bytes);
         w.u64(s.catalogue_dot.sequence);
+    }
+    if (batches) {
+        if (s.tombstone_batches.size() > 10'000'000)
+            throw std::runtime_error("too many tombstone batches");
+        w.u32(static_cast<uint32_t>(s.tombstone_batches.size()));
+        for (const auto& batch : s.tombstone_batches) {
+            w.fixed(batch.id.bytes);
+            w.i64(batch.retired_at_ns);
+            w.u32(batch.count);
+        }
     }
     return w.take();
 }
@@ -916,7 +1073,10 @@ Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
 namespace {
 // Leaves `entries` empty: decoding has no node store. Callers needing the map
 // use `attach_namespace`; others read paths via `namespace_tree_lookup`.
-MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests, bool legacy_clock) {
+// SM19 (`batches`) carries the torrent requests, a legacy clock flag, and the
+// tombstone batches after the clock.
+MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests, bool legacy_clock,
+                                     bool batches = false) {
     MetadataSnapshot s;
     const auto voters = r.u32();
     if (voters > 1024)
@@ -1011,12 +1171,34 @@ MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests, bool lega
     if (baseline > 1)
         throw DecodeError("bad retention baseline state");
     s.retention_baseline_complete = baseline != 0;
-    if (torrent_requests)
+    if (torrent_requests || batches)
         decode_torrent_requests(r, s);
+    if (batches) {
+        const auto flag = r.u8();
+        if (flag > 1)
+            throw DecodeError("bad metadata legacy clock flag");
+        legacy_clock = flag != 0;
+    }
     if (legacy_clock) {
         s.legacy_clock = decode_clock(r);
         s.catalogue_dot.author.bytes = r.fixed<16>();
         s.catalogue_dot.sequence = r.u64();
+    }
+    if (batches) {
+        const auto count = r.u32();
+        if (count == 0 || count > r.remaining() / 44)
+            throw DecodeError("bad tombstone batch count");
+        s.tombstone_batches.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            TombstoneBatch batch;
+            batch.id.bytes = r.fixed<32>();
+            batch.retired_at_ns = r.i64();
+            batch.count = r.u32();
+            if (batch.count == 0 || batch.retired_at_ns < 0 ||
+                (!s.tombstone_batches.empty() && !(s.tombstone_batches.back().id < batch.id)))
+                throw DecodeError("bad tombstone batch");
+            s.tombstone_batches.push_back(batch);
+        }
     }
     r.finish();
     // No "/" check here: that needs a tree read, which belongs to the store's owner.
@@ -1034,6 +1216,8 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
         return decode_snapshot_v14(r, true, false);
     if (std::equal(m.begin(), m.end(), SM17.begin()))
         return decode_snapshot_v14(r, true, true);
+    if (std::equal(m.begin(), m.end(), SM19.begin()))
+        return decode_snapshot_v14(r, true, false, true);
     // SM15 is SM13 with every section present, then the torrent requests;
     // SM18 is SM15 and then the legacy clock.
     const bool v18 = std::equal(m.begin(), m.end(), SM18.begin());
@@ -1186,9 +1370,16 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
     static constexpr std::array<uint8_t, 8> magic_v8{'D', 'H', 'T', 'M', 'D', 'L', 'T', '8'};
     static constexpr std::array<uint8_t, 8> magic_v9{'D', 'H', 'T', 'M', 'D', 'L', 'T', '9'};
     static constexpr std::array<uint8_t, 8> magic_v10{'D', 'H', 'T', 'M', 'D', 'L', 'T', 'A'};
+    static constexpr std::array<uint8_t, 8> magic_v11{'D', 'H', 'T', 'M', 'D', 'L', 'T', 'B'};
+    if (!delta.pending_tombstones.empty())
+        throw std::logic_error("metadata delta still holds pending tombstones");
+    // DLT11 is DLT10 then the tombstone batches named and dropped, written
+    // when a mutation names or drops one.
+    const bool v11 =
+        !delta.add_tombstone_batches.empty() || !delta.drop_tombstone_batches.empty();
     // DLT10 is DLT9 with a content dot on every append and a trailing legacy
     // clock, written when a mutation carries either.
-    const bool v10 = delta.set_legacy_clock.has_value() || delta.set_catalogue_dot.has_value() ||
+    const bool v10 = v11 || delta.set_legacy_clock.has_value() || delta.set_catalogue_dot.has_value() ||
                      std::any_of(delta.append_entries.begin(), delta.append_entries.end(),
                                  [](const auto& item) { return bool(item.second.content); });
     const bool topology =
@@ -1205,8 +1396,13 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
                     (delta.replace_merge_parents.has_value() != delta.replace_conflicts.has_value());
     const bool v6 = !v7 && topology;
     Writer w;
-    w.raw(v10 ? magic_v10 : v9 ? magic_v9 : v8 ? magic_v8 : v7 ? magic_v7 : v6 ? magic_v6
-                                                                                 : magic_v5);
+    w.raw(v11   ? magic_v11
+          : v10 ? magic_v10
+          : v9  ? magic_v9
+          : v8  ? magic_v8
+          : v7  ? magic_v7
+          : v6  ? magic_v6
+                : magic_v5);
     w.u32(delta.mutation_sequences.size());
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         w.fixed(node.bytes);
@@ -1319,6 +1515,17 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
             w.u64(delta.set_catalogue_dot->sequence);
         }
     }
+    if (v11) {
+        w.u32(static_cast<uint32_t>(delta.add_tombstone_batches.size()));
+        for (const auto& batch : delta.add_tombstone_batches) {
+            w.fixed(batch.id.bytes);
+            w.i64(batch.retired_at_ns);
+            w.u32(batch.count);
+        }
+        w.u32(static_cast<uint32_t>(delta.drop_tombstone_batches.size()));
+        for (const auto& id : delta.drop_tombstone_batches)
+            w.fixed(id.bytes);
+    }
     return w.take();
 }
 
@@ -1333,6 +1540,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 8> magic_v8{'D', 'H', 'T', 'M', 'D', 'L', 'T', '8'};
     static constexpr std::array<uint8_t, 8> magic_v9{'D', 'H', 'T', 'M', 'D', 'L', 'T', '9'};
     static constexpr std::array<uint8_t, 8> magic_v10{'D', 'H', 'T', 'M', 'D', 'L', 'T', 'A'};
+    static constexpr std::array<uint8_t, 8> magic_v11{'D', 'H', 'T', 'M', 'D', 'L', 'T', 'B'};
     Reader r(data);
     auto got = r.raw(magic_v1.size());
     const bool v1 = std::equal(got.begin(), got.end(), magic_v1.begin());
@@ -1342,7 +1550,9 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     const bool v5 = std::equal(got.begin(), got.end(), magic_v5.begin());
     // DLT10 is DLT9 with a content dot on every append and a trailing legacy
     // clock.
-    const bool v10 = std::equal(got.begin(), got.end(), magic_v10.begin());
+    // DLT11 is DLT10 then the tombstone batches.
+    const bool v11 = std::equal(got.begin(), got.end(), magic_v11.begin());
+    const bool v10 = v11 || std::equal(got.begin(), got.end(), magic_v10.begin());
     // DLT9 is DLT8 plus a trailing torrent-requests section.
     const bool v9 = v10 || std::equal(got.begin(), got.end(), magic_v9.begin());
     const bool v8 = v9 || std::equal(got.begin(), got.end(), magic_v8.begin());
@@ -1554,6 +1764,32 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
             delta.set_catalogue_dot = value;
         }
     }
+    if (v11) {
+        const auto adds = r.u32();
+        if (adds > r.remaining() / 44)
+            throw DecodeError("too many tombstone batches in delta");
+        for (uint32_t i = 0; i < adds; ++i) {
+            TombstoneBatch batch;
+            batch.id.bytes = r.fixed<32>();
+            batch.retired_at_ns = r.i64();
+            batch.count = r.u32();
+            if (batch.count == 0 || batch.retired_at_ns < 0 ||
+                (!delta.add_tombstone_batches.empty() &&
+                 !(delta.add_tombstone_batches.back().id < batch.id)))
+                throw DecodeError("bad tombstone batch in delta");
+            delta.add_tombstone_batches.push_back(batch);
+        }
+        const auto drops = r.u32();
+        if (drops > r.remaining() / 32)
+            throw DecodeError("too many dropped tombstone batches in delta");
+        for (uint32_t i = 0; i < drops; ++i) {
+            ObjectId id{r.fixed<32>()};
+            if (!delta.drop_tombstone_batches.empty() &&
+                !(delta.drop_tombstone_batches.back() < id))
+                throw DecodeError("dropped tombstone batches out of order");
+            delta.drop_tombstone_batches.push_back(id);
+        }
+    }
     r.finish();
     return delta;
 }
@@ -1617,6 +1853,22 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         } else {
             delta.catalogue = CatalogueDelta::clear;
         }
+    }
+
+    // Tombstone batches are sorted by id and immutable: named or dropped.
+    {
+        const auto by_id = [](const TombstoneBatch& a, const TombstoneBatch& b) {
+            return a.id < b.id;
+        };
+        std::set_difference(after.tombstone_batches.begin(), after.tombstone_batches.end(),
+                            before.tombstone_batches.begin(), before.tombstone_batches.end(),
+                            std::back_inserter(delta.add_tombstone_batches), by_id);
+        std::vector<TombstoneBatch> dropped;
+        std::set_difference(before.tombstone_batches.begin(), before.tombstone_batches.end(),
+                            after.tombstone_batches.begin(), after.tombstone_batches.end(),
+                            std::back_inserter(dropped), by_id);
+        for (const auto& batch : dropped)
+            delta.drop_tombstone_batches.push_back(batch.id);
     }
 
     // Garbage can hold millions of tombstones: diff sorted pointer indexes
@@ -1812,6 +2064,23 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
     }
     if (delta.canonical_garbage)
         canonicalise_garbage(out.garbage);
+    if (!delta.drop_tombstone_batches.empty()) {
+        const std::set<ObjectId> dropped(delta.drop_tombstone_batches.begin(),
+                                         delta.drop_tombstone_batches.end());
+        std::erase_if(out.tombstone_batches,
+                      [&](const TombstoneBatch& batch) { return dropped.contains(batch.id); });
+    }
+    for (const auto& batch : delta.add_tombstone_batches) {
+        auto at = std::lower_bound(
+            out.tombstone_batches.begin(), out.tombstone_batches.end(), batch.id,
+            [](const TombstoneBatch& held, const ObjectId& id) { return held.id < id; });
+        if (at != out.tombstone_batches.end() && at->id == batch.id) {
+            if (*at != batch)
+                throw DecodeError("tombstone batch named twice with different contents");
+            continue;
+        }
+        out.tombstone_batches.insert(at, batch);
+    }
     for (const auto& [node, status] : delta.upsert_node_status)
         out.node_status[node] = status;
     for (const auto& [key, reset] : delta.upsert_identity_resets) {

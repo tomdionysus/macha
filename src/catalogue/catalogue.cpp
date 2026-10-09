@@ -109,33 +109,6 @@ uint64_t ms_since(Clock::time_point started) {
                             std::to_string(expected) + ", now " + std::to_string(found));
 }
 
-GarbageRef append_garbage(MetadataSnapshot& snapshot, const ObjectId& id) {
-    auto existing = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
-                                 [&](const GarbageRef& candidate) { return candidate.id == id; });
-    auto retired = wall_time_ns();
-    if (existing != snapshot.garbage.end()) {
-        if (retired <= existing->retired_at_ns &&
-            existing->retired_at_ns < std::numeric_limits<int64_t>::max())
-            retired = existing->retired_at_ns + 1;
-        existing->retired_at_ns = retired;
-        existing->retirement_id = random_node_id();
-    } else {
-        snapshot.garbage.push_back({id, retired, random_node_id()});
-        existing = std::prev(snapshot.garbage.end());
-    }
-    return *existing;
-}
-
-void record_garbage_upsert(MetadataDelta& delta, const GarbageRef& garbage) {
-    auto existing = std::find_if(delta.upsert_garbage.begin(), delta.upsert_garbage.end(),
-                                 [&](const GarbageRef& value) { return value.id == garbage.id; });
-    if (existing == delta.upsert_garbage.end())
-        delta.upsert_garbage.push_back(garbage);
-    else
-        *existing = garbage;
-}
-
-
 struct CatalogueManifest {
     std::array<std::optional<ObjectId>, catalogue_shard_count> shards;
 };
@@ -1700,8 +1673,7 @@ void CatalogueManager::publish(
                 delta.catalogue_root = root;
                 // The delta carries the conflict set; a replay infers nothing.
                 delta.replace_conflicts = metadata.conflicts;
-                for (const auto& id : released)
-                    record_garbage_upsert(delta, append_garbage(metadata, id));
+                retire_objects(metadata, delta, {released.begin(), released.end()});
             });
         } else {
             metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
@@ -1713,8 +1685,7 @@ void CatalogueManager::publish(
                 metadata.catalogue_root = root;
                 delta.catalogue = CatalogueDelta::set;
                 delta.catalogue_root = root;
-                for (const auto& id : released)
-                    record_garbage_upsert(delta, append_garbage(metadata, id));
+                retire_objects(metadata, delta, {released.begin(), released.end()});
             });
         }
     } catch (const CatalogueConflict&) {

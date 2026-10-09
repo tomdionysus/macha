@@ -388,6 +388,17 @@ NodeServices::retain_metadata_publication(const MetadataPublicationContext& cont
             collect_namespace_tree_changes(before.namespace_root, *context.proposed.namespace_root,
                                            namespace_nodes, control);
 
+        // Tombstone batches this commit names, likewise.
+        {
+            const auto& held = before.tombstone_batches;
+            for (const auto& batch : context.proposed.tombstone_batches)
+                if (!std::binary_search(held.begin(), held.end(), batch,
+                                        [](const TombstoneBatch& a, const TombstoneBatch& b) {
+                                            return a.id < b.id;
+                                        }))
+                    control.push_back(batch.id);
+        }
+
         const bool catalogue_changed =
             context.delta ? context.delta->catalogue != CatalogueDelta::unchanged
                           : before.catalogue_root != context.proposed.catalogue_root;

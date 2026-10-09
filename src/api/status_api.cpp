@@ -947,7 +947,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
         metadata_diagnostics["conflicts"] = static_cast<uint64_t>(metadata->conflicts.size());
         metadata_diagnostics["namespace_conflicts"] = namespace_conflicts;
         metadata_diagnostics["catalogue_conflicts"] = catalogue_conflicts;
-        metadata_diagnostics["tombstones"] = static_cast<uint64_t>(metadata->garbage.size());
+        metadata_diagnostics["tombstones"] = tombstone_count(*metadata);
     }
     if (metadata_manager) {
         metadata_diagnostics["conflicts_superseded"] = metadata_manager->conflicts_superseded();

@@ -82,6 +82,25 @@ struct GarbageRef {
     auto operator<=>(const GarbageRef&) const = default;
 };
 
+// One mutation's tombstones, kept as an immutable control object: `id` is the
+// content address of its encoding (encode_tombstone_batch), which holds every
+// object it retired, sorted, at `retired_at_ns`. A head names its batches;
+// the tombstones are read from the objects.
+struct TombstoneBatch {
+    ObjectId id{};
+    int64_t retired_at_ns{};
+    uint32_t count{};
+    auto operator<=>(const TombstoneBatch&) const = default;
+};
+
+// A batch's encoding: `ids` sorted and unique. Throws on a malformed batch.
+Bytes encode_tombstone_batch(int64_t retired_at_ns, const std::vector<ObjectId>& ids);
+struct TombstoneBatchContent {
+    int64_t retired_at_ns{};
+    std::vector<ObjectId> ids;
+};
+TombstoneBatchContent decode_tombstone_batch(std::span<const uint8_t>);
+
 struct MetadataConflict {
     MetadataConflictKind kind{MetadataConflictKind::namespace_entry};
     // Which value the merge left in place. Set by a merge of two heads: the
@@ -154,7 +173,11 @@ struct MetadataSnapshot {
     // alongside; both encoders refuse the mix. See namespace_tree.hpp.
     std::optional<ObjectId> namespace_root;
     std::map<std::string, FsEntry> entries;
+    // Tombstones held inline: an inline namespace's, and a tree-backed head's
+    // from before batches (moved into batches by maintenance).
     std::vector<GarbageRef> garbage;
+    // SM19: a tree-backed head's tombstones, by batch, sorted by id.
+    std::vector<TombstoneBatch> tombstone_batches;
     // One coalesced last-known record per node; not a metrics history.
     std::map<NodeId, PersistedNodeStatus> node_status;
     // Endpoint->NodeId tombstones: suppress a stale association; the endpoint
@@ -318,6 +341,19 @@ struct MetadataDelta {
     std::optional<std::map<NodeId, uint64_t>> set_legacy_clock;
     // DLT10: the catalogue root's dot, when the mutation moves it.
     std::optional<MetadataDot> set_catalogue_dot;
+    // DLT11: tombstone batches named and dropped, sorted by id.
+    std::vector<TombstoneBatch> add_tombstone_batches;
+    std::vector<ObjectId> drop_tombstone_batches;
+    // Never encoded: the tombstones a mutation makes in a tree-backed head,
+    // each group one batch at its time. The commit writes each batch object
+    // and names it (add_tombstone_batches). See retire_objects().
+    struct PendingTombstones {
+        // Retired when the commit writes the batch, or at `retired_at_ns`.
+        bool at_commit{true};
+        int64_t retired_at_ns{};
+        std::vector<ObjectId> ids;
+    };
+    std::vector<PendingTombstones> pending_tombstones;
 };
 // Applies one append to the entry at `path`, as both namespace forms do.
 // Throws DecodeError when the entry is not the file the append was made for.
@@ -336,6 +372,20 @@ void record_entry_change(MetadataDelta& delta, const std::string& path, const Fs
                          const FsEntry& after);
 
 // Strictly ordered by ObjectId, no duplicates.
+// Retires `ids` in the mutation `snapshot` and `delta` describe. In a
+// tree-backed head they join the mutation's one pending batch (the commit
+// writes it and names it); in an inline namespace each gets an inline
+// tombstone, a held one re-stamped later than it was.
+void retire_objects(MetadataSnapshot&, MetadataDelta&, std::vector<ObjectId> ids);
+// Every tombstone `snapshot` holds, inline and in its batches (each read by
+// `read_batch`), the latest retirement per object, sorted by id. A batch that
+// cannot be read is left out and counted in `unreadable`.
+std::vector<GarbageRef>
+tombstones_of(const MetadataSnapshot&,
+              const std::function<std::optional<Bytes>(const ObjectId&)>& read_batch,
+              size_t* unreadable = nullptr);
+// How many tombstones `snapshot` names, inline and in batches.
+uint64_t tombstone_count(const MetadataSnapshot&) noexcept;
 bool garbage_is_canonical(const std::vector<GarbageRef>&);
 // Stable sort into canonical order.
 void canonicalise_garbage(std::vector<GarbageRef>&);

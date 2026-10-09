@@ -58,7 +58,10 @@ struct MaintenanceObjects {
     // The extents of unresolved conflict alternatives, sorted and distinct:
     // live until resolved.
     std::vector<ObjectId> conflict_live;
+    // Every tombstone, inline and in batches, the latest per object, sorted.
     std::vector<GarbageRef> garbage;
+    // The head's tombstone batches: control objects, collected whole.
+    std::vector<TombstoneBatch> tombstone_batches;
     uint64_t metadata_generation{};
     RetentionClock observed_mutations;
     size_t entries{};
