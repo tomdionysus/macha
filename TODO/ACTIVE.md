@@ -35,8 +35,10 @@ of 2026-10-08, ranked:
    (deleted extents held for the 30-day grace); the namespace itself is in
    the tree (9,819 entries, 1,071,309 extent references). So the copies grow
    with recent deletes. Operator, 2026-10-09: move them out. Done in 0.90.67
-   (tombstone batches, [design](2026-10-09-tombstone-batches.md)); to
-   confirm on gbni-1: the head record's size after the migration.
+   (tombstone batches, [design](2026-10-09-tombstone-batches.md)): the head
+   record is now 87,546 bytes (64 batches are 2.8 KB of it; the rest is the
+   72 torrent requests, conflicts and node state). The copies stay, but of a
+   record that no longer grows with deletes.
 2. The memory ledger counts few large structures (metadata, catalogue and
    cache owners declared, never charged), so the control reserve protects
    counted bytes only; `restore()` overcommits without the reserve.

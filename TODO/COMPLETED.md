@@ -2,6 +2,12 @@
 
 Last updated: 2026-10-08
 
+## 2026-10-09 -- 0.90.67: tombstones out of the head record
+
+- **Tombstone batches** (0.90.67): fi-1's maintenance moved the 46,092
+  inline tombstones into 64 batches at 14:09:07Z; gbni-1's head record went
+  from 2,665,933 to 87,546 bytes; both nodes on head 76537, no errors.
+
 ## 2026-10-09 -- 0.90.64 to 0.90.66: control must never wait
 
 - **One limit for every password hash** (0.90.64): sign-ins and
