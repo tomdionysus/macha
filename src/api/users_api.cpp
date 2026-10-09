@@ -104,6 +104,15 @@ UserMutability UsersApi::mutability(const UserRecord& user) const {
     return out;
 }
 
+namespace {
+// What a sign-in answers when every password slot is in use.
+HttpResponse password_work_busy() {
+    auto response = http_error(429, "try_later", "too many password checks; retry shortly");
+    response.headers["Retry-After"] = "1";
+    return response;
+}
+} // namespace
+
 bool UsersApi::routes(std::string_view path) {
     return path == users_root || path.starts_with(users_prefix);
 }
@@ -126,6 +135,9 @@ HttpResponse UsersApi::create(const HttpRequest& request) {
     auto roles =
         read_roles(body).value_or(std::vector<std::string>{std::string(role_media_viewer)});
 
+    const auto slot = accounts_.password_work().try_acquire();
+    if (!slot)
+        return password_work_busy();
     auto created = accounts_.users().create(username->asString(), password, roles, node_.node_id());
     if (!created) {
         if (accounts_.users().find_by_username(username->asString()))
@@ -176,6 +188,11 @@ HttpResponse UsersApi::update(const HttpRequest& request, const std::string& use
         }
     }
 
+    // Hashing a new password takes a slot; changing only roles does not.
+    const auto slot = password.empty() ? std::optional<PasswordWork::Slot>{}
+                                       : accounts_.password_work().try_acquire();
+    if (!password.empty() && !slot)
+        return password_work_busy();
     auto updated = accounts_.users().update(user_id, password, roles, node_.node_id());
     if (!updated)
         return http_error(404, "not_found", "no such user");

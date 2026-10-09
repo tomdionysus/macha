@@ -1,5 +1,23 @@
 # Current release
 
+## 0.90.64: one limit for every password hash
+
+API change: `POST /api/v1/users`, and `PATCH /api/v1/users/{id}` or
+`/api/v1/users/me` when they set a password, can answer `429 try_later` with
+`Retry-After: 1`, as `POST /api/v1/session` already did. No wire, protocol
+or on-disk changes.
+
+Sign-ins counted their scrypt checks against
+`session.max_concurrent_password_checks`, kept below the control workers so
+logins could never fill the control lane; creating an account and setting a
+password ran the same scrypt outside that limit, so four at once filled all
+four control workers. `PasswordWork` (one per node, in `Accounts`) is now
+the one limit: a sign-in and a password-setting account change each take a
+slot or are refused at once, never queued. Changing only roles hashes
+nothing and takes no slot. Test: with every slot held, a sign-in and an
+account creation both answer `try_later`, a roles-only change goes through,
+and a sign-in succeeds once the slots are free.
+
 ## 0.90.63: horizons are frozen views of on-disk reference counts (object ledger stage 4, step 2)
 
 No API, wire or protocol changes. New on disk: `<state_path>/ledger/referenced`
