@@ -113,16 +113,23 @@ its id, and only partial subtrees are descended. The cost follows what
 differs between the nodes, not the size of the library, and no extent id is
 sent.
 
-The survey runs in the maintenance pass, as background work. It is repeated
-when something could change its answer: the namespace, this node losing
-something, the membership, or a peer's storage shrinking; and, at no more
-than a twentieth of the pass's time, when a peer's storage grows while
-something is unavailable. After a restart the first survey waits for the
-store's presence index to fill. Requests read the last result and never
-wait for a survey.
+The survey runs in the maintenance pass, as background work. A node's
+holdings are read from its held ledgers (see
+[Configuration](configuration.md)) as one frozen view with an identity, a
+hash over every online disk's ledger root that changes when and only when
+what the node holds changes: a write, a removal, a disk going or coming
+back. The node rolls its holdings up the tree again when the namespace or
+that identity changes, and makes none while a disk is still being seeded.
+The survey is repeated when something could change its answer: the
+namespace, this node ceasing to hold something, the membership, or a peer's
+storage shrinking; and, at no more than a twentieth of the pass's time, when
+a peer's storage grows while something is unavailable. Requests read the
+last result and never wait for a survey.
 
 Each node keeps its last survey on disk and answers from it after a restart
-until its first new survey. A survey that cannot ask a peer leaves a file's
+until its first new survey. It keeps its last roll-up too, with the identity
+it was of, and answers peers from it after a restart only if its holdings
+are still exactly those. A survey that cannot ask a peer leaves a file's
 counts to its last decided survey, matched by content identity: the answer
 is the best this node knows, and `surveyed_unix_ms` says when the survey
 ran.

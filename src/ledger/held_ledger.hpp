@@ -48,6 +48,15 @@ class HeldLedger {
     void seed(const std::function<std::vector<ObjectId>()>& snapshot);
     // Drops every queued change. Called from within seed's snapshot.
     void drop_queued();
+    // The record as installed now, and how many ids installs have marked not
+    // held since open (a seed counts one, as it may drop any), read together.
+    struct View {
+        ObjectTrie::Snapshot records;
+        uint64_t removals{};
+    };
+    View view() const;
+    // The removals alone, without the lookup lock.
+    uint64_t removals() const noexcept { return removals_.load(std::memory_order_acquire); }
     ObjectTrie::Stats stats() const;
     uint64_t size() const;
     // The objects/xx/yy directory the store's check against its disk
@@ -65,6 +74,8 @@ class HeldLedger {
     // Held to read or install; a lookup may read a node from disk.
     mutable IoMutex trie_mutex_;
     std::unique_ptr<ObjectTrie> trie_ MACHA_PT_GUARDED_BY(trie_mutex_);
+    // Advanced under trie_mutex_ with the install it counts.
+    std::atomic<uint64_t> removals_{};
     // Journals without the lookup lock: it touches only the trie's journal,
     // never the nodes or cache a lookup reads, and every journal write and
     // install happens under flush_mutex_, in order.

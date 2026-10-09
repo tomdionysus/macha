@@ -1,6 +1,6 @@
 # Replication by diff
 
-Status: proposal, 2026-10-09. Supersedes the direction note of the same
+Status: proposal, 2026-10-09; stage 0 built in 0.90.71. Supersedes the direction note of the same
 day. This is the ledger design's stages 5 and 6
 ([archive/2026-10-08-on-disk-object-ledger.md](archive/2026-10-08-on-disk-object-ledger.md)),
 re-scoped: since that design was written, enough of the node's state became
@@ -60,38 +60,30 @@ because one step sends two extents and waits for each.
 
 ## The design
 
-### Identity
+### Identity and the held view (built, 0.90.71)
 
-`HeldLedger` exposes its trie's root hash. `LocalStore::held_root()` is
-that hash once the ledger is seeded and nothing before. `StoragePool`
-exposes:
+Every `ObjectStore` answers `held_view()`: a frozen view of what it holds,
+read from its held ledgers (never `has()`, never a DATA device), and the
+identity that names it:
 
 ```
 struct HeldIdentity {
-    Hash256 hash;    // over (token, root) of every online, seeded backend, by token
-    bool complete;   // no online backend is still seeding
+    Hash256 hash;       // a disk: its held trie's root; the pool: over (token, root) by token
+    uint64_t removals;  // ids that stopped being held since start; never returns to an earlier value
+    bool complete;      // false while an online disk is still being seeded
 };
-HeldIdentity held_identity() const noexcept;
+struct HeldView { HeldIdentity identity; std::function<bool(const ObjectId&)> held; };
 ```
 
-An absent, closed or unseeded backend contributes nothing to the hash: it is
-not there, and absent things do not block. `complete` is false only while
-an online backend's first-start seed is running, which is the one state in
-which this node cannot say what it holds. With no backend online the node
-holds nothing and knows it: `complete` is true and the hash is of nothing.
-The read is one atomic per backend; no lock on a store, no device.
-
-`ObjectLedger` carries `held_identity()` in place of `held_indexed()` and
-`held_losses()`; `indexed()` leaves `ObjectStore`.
-
-### The held view
-
-Whatever reads this node's holdings for a roll-up or a diff reads frozen
-snapshots of the `held` tries taken together with the identity, not
-`has()`: no index lock, no device read, and the view is exactly the
-identity's, so a memo built from it is stale precisely when the identity
-differs. `StoragePool::held_view()` returns the identity and one snapshot
-per contributing backend.
+A ledger hands out its snapshot and its removal count under one lock, so a
+view and its identity never disagree. An absent or closed disk contributes
+nothing; with no disk online the node holds nothing and knows it
+(`complete`, the hash of nothing). `removals` is what lets a roll-up keep
+answering peers after gains (it under-claims, which is safe) and stop after
+any removal (it would over-claim). Every pool backend keeps a held ledger,
+whatever the cache. Building it found that **packed objects were never in
+the held ledger** (`has()` answered them from the pack index); they are
+now, with every open listing packed objects the ledger lacks.
 
 ### The diff
 
@@ -186,20 +178,16 @@ business, driven by `lost`; not this proposal. The catalogue plan's stage
 
 ## Stages
 
-0. **The holdings identity.** `HeldLedger::root_hash()`,
-   `LocalStore::held_root()`, `StoragePool::held_identity()` and
-   `held_view()`; `ObjectLedger::held_identity()`. The survey keys its
-   roll-up and its kept copy on `(head key, identity)` and nothing else:
-   `rolled_storage_events_`, `Holdings::losses`, `Kept::losses`,
-   `answering_rollup`'s loss arithmetic, `cold_since_`, `cold_retry`,
-   `cold_patience` and the `indexed()` branch go; the roll-up's `HeldFn`
-   reads the held view, not `has()`. While `complete` is false the node
-   makes no roll-up and answers `tree_holdings` "cannot say". `indexed()`
-   and `held_indexed()` are deleted with their last caller. `losses()` stays
-   where the store and scrub use it. Tests: the identity changes on put,
-   remove, loss, seed, online and offline and on nothing else; a roll-up
-   taken with the disk closed is replaced when the disk opens, with no head
-   change; a seeding node answers "cannot say". This closes ACTIVE 1's
+0. **The holdings identity. Built in 0.90.71.** `held_view()` on every
+   store and on `ObjectLedger`, replacing `indexed()`, `losses()` in the
+   contract, `held_indexed()` and `held_losses()`. The survey keys its
+   roll-up on `(head key, identity hash)` and its answers on `removals`;
+   storage events, the loss count and the 30-minute cold wait are gone;
+   the roll-up, the survey and the answers read the roll-up's own view. The
+   kept roll-up is persisted with its identity and trusted after a restart
+   only if the node's identity is the same. While a disk seeds, no roll-up
+   is made and peers are answered from the last one (an under-claim), not
+   refused. Packed objects are in the held ledger. Closed ACTIVE 1's
    `StoragePool::indexed()` item.
 1. **The trie's diff surface.** `Snapshot::children(prefix)` and
    `records(prefix)`, tested exhaustively: canonical regardless of insert

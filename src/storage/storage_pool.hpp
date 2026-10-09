@@ -85,8 +85,6 @@ class StoragePool final : public ObjectStore {
     mutable std::atomic_int64_t diag_get_report_ns_{};
     mutable std::atomic_uint64_t full_list_scans_{};
     std::atomic_size_t online_backends_cached_{};
-    // Losses of backends that have gone, and one for each going.
-    mutable std::atomic_uint64_t retired_losses_{};
 
     void observe_get(size_t, uint64_t) const;
 
@@ -100,8 +98,8 @@ class StoragePool final : public ObjectStore {
     std::shared_ptr<DurabilityDomain> domain_for(const std::filesystem::path&);
 
   public:
-    // `ledger_cache`: each backend keeps a held ledger under
-    // <state_path>/ledger/, sharing this much page cache; zero keeps none.
+    // Each backend keeps a held ledger under <state_path>/ledger/, the
+    // backends sharing `ledger_cache` bytes of page cache.
     StoragePool(std::filesystem::path state_path, NodeId, std::vector<StorageBackendConfig>,
                 std::array<uint8_t, 32> key,
                 std::chrono::milliseconds durability_batch_window = std::chrono::milliseconds(500),
@@ -136,8 +134,9 @@ class StoragePool final : public ObjectStore {
     std::optional<DurabilityToken> reassert_durable(const ObjectId&);
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const override;
-    uint64_t losses() const noexcept override;
-    bool indexed() const noexcept override;
+    // Every online backend's view, the identity hashed over (disk token,
+    // root) by token; incomplete while an online backend is being seeded.
+    HeldView held_view() const override;
     bool valid(const ObjectId&) const;
     bool remove(const ObjectId&);
     std::vector<ObjectId> list() const;

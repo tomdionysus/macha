@@ -103,8 +103,13 @@ void HeldLedger::flush() {
     }
     // The journal's sync is the write; lookups go on meanwhile.
     write_journal(unique);
+    const auto removed = static_cast<uint64_t>(std::count_if(
+        unique.begin(), unique.end(), [](const ObjectTrie::Change& change) {
+            return !change.value;
+        }));
     Lock lock(trie_mutex_);
     trie_->install(unique);
+    removals_.fetch_add(removed, std::memory_order_acq_rel);
 }
 
 void HeldLedger::write_journal(std::span<const ObjectTrie::Change> changes) {
@@ -122,6 +127,7 @@ void HeldLedger::seed(const std::function<std::vector<ObjectId>()>& snapshot) {
     {
         Lock lock(trie_mutex_);
         trie_->replace_all(std::move(records));
+        removals_.fetch_add(1, std::memory_order_acq_rel);
     }
     durable_replace_file(dir_ / "seeded", "1\n");
     {
@@ -131,6 +137,11 @@ void HeldLedger::seed(const std::function<std::vector<ObjectId>()>& snapshot) {
         seeded_.store(true, std::memory_order_release);
     }
     flush();
+}
+
+HeldLedger::View HeldLedger::view() const {
+    Lock lock(trie_mutex_);
+    return {trie_->snapshot(), removals()};
 }
 
 ObjectTrie::Stats HeldLedger::stats() const {

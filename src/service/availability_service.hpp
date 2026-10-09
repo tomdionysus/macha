@@ -87,11 +87,12 @@ class AvailabilityService {
     AvailabilityService& operator=(const AvailabilityService&) = delete;
 
     // Brings the roll-up and the survey up to `head` if something that could
-    // change the answer has happened since the last. The roll-up is rebuilt
-    // when the namespace or this node's holdings changed, held to a `share`
-    // duty cycle and not begun while the store's presence index is still
-    // filling. Peers are asked again when the namespace changed or this node
-    // lost something, the membership changed, or a peer's storage shrank; at
+    // change the answer has happened since the last. The roll-up is of a
+    // frozen view of this node's holdings, and is rebuilt when the namespace
+    // or the holdings' identity changed, held to a `share` duty cycle; none is
+    // made while a disk is being seeded. Peers are asked again when the
+    // namespace changed or this node stopped holding something, the
+    // membership changed, or a peer's storage shrank; at
     // the duty cycle when a peer's storage grew while something was
     // unavailable or unknown; and when a peer that could not answer answers
     // a one-node probe. A roll-up after a gain alone asks nobody: what this
@@ -147,10 +148,9 @@ class AvailabilityService {
     // A roll-up or a survey walks the namespace, so the next of each waits
     // this many times the last one's cost: a twentieth of the pass's time.
     static constexpr int share = 20;
-    // While the presence index fills, a roll-up would read the device once
-    // per extent: it waits, checking this often, for at most this long.
-    static constexpr std::chrono::seconds cold_retry{5};
-    static constexpr std::chrono::minutes cold_patience{30};
+    // While a disk is being seeded the holdings cannot be named: the pass
+    // looks again this often.
+    static constexpr std::chrono::seconds seed_retry{5};
     static constexpr std::chrono::seconds retry_floor{1};
     static constexpr std::chrono::minutes retry_ceiling{5};
 
@@ -164,14 +164,16 @@ class AvailabilityService {
     const NodeEvents& events_;
     MessageRoutes& routes_;
     const std::filesystem::path persisted_;
-    // The last roll-up, kept beside the survey: after a restart, peers are
-    // answered from it until the store's presence index has filled and a
-    // roll-up is made again. Dropped once this node loses anything.
+    // The last roll-up, kept beside the survey with the identity it was of:
+    // after a restart, peers are answered from it until a roll-up is made
+    // again, if the holdings are still the ones it was of. Dropped once this
+    // node stops holding anything.
     const std::filesystem::path kept_path_;
     struct Kept {
         std::optional<HoldingsRollup> rollup;
-        // The DATA store's losses() when it was read back.
-        uint64_t losses{};
+        // The view it was read back against.
+        HeldIdentity identity;
+        HeldFn held;
     };
     Published<Kept> kept_;
 
@@ -181,9 +183,10 @@ class AvailabilityService {
     struct Holdings {
         HoldingsRollup rollup;
         std::shared_ptr<const MemoryNamespaceNodeStore> built;
-        // The DATA store's losses() when the roll-up began: once it moves,
-        // a subtree this roll-up calls whole may not be.
-        uint64_t losses{};
+        // The view it was rolled up from. Once the store's removals move past
+        // the view's, a subtree this roll-up calls whole may not be.
+        HeldIdentity identity;
+        HeldFn held;
         // The head it was rolled up at; the survey and the path table read
         // the same one.
         uint64_t generation{};
@@ -203,18 +206,16 @@ class AvailabilityService {
     // The last survey's memo, when every peer answered it.
     std::optional<SurveyMemo> memo_;
     // The tree the published path table is of, when it is of a stored tree,
-    // and the storage events seen when it was made.
+    // and the holdings it was made from.
     std::optional<ObjectId> table_root_;
-    uint64_t table_storage_events_{};
+    Hash256 table_holdings_{};
     // The head the roll-up was built at: its namespace root, or its record
     // hash when the namespace is inline.
     Hash256 rolled_head_{};
-    uint64_t rolled_storage_events_{};
     Clock::time_point rolled_at_{};
     Clock::duration rolled_cost_{};
     Clock::time_point surveyed_at_{};
     Clock::duration surveyed_cost_{};
-    std::optional<Clock::time_point> cold_since_;
     // A peer that could not answer is asked again after this, doubling to
     // retry_ceiling; an answer clears it.
     Clock::duration retry_backoff_{};

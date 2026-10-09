@@ -66,6 +66,9 @@ struct StoragePool::Backend {
     uint64_t instance_id MACHA_GUARDED_BY(mutex){};
     std::shared_ptr<DurabilityDomain> durability_domain MACHA_GUARDED_BY(mutex);
     std::shared_ptr<LocalStore> store MACHA_GUARDED_BY(mutex);
+    // The held removals of every store this backend has let go, and one for
+    // each going: with the current store's, never smaller than before.
+    uint64_t departed_removals MACHA_GUARDED_BY(mutex){};
     std::string last_error MACHA_GUARDED_BY(mutex);
 };
 
@@ -126,7 +129,7 @@ void StoragePool::deactivate(const std::shared_ptr<Backend>& backend,
         log = backend->online || backend->last_error != reason;
         backend->online = false;
         if (backend->store)
-            retired_losses_.fetch_add(backend->store->losses() + 1, std::memory_order_release);
+            backend->departed_removals += backend->store->held_removals() + 1;
         retired = std::move(backend->store);
         backend->durability_domain.reset();
         backend->instance_id = 0;
@@ -239,13 +242,11 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
             options.reserve_free = cfg.reserve_free;
             options.pack_threshold = packing_.threshold;
             options.pack_target_size = packing_.target_size;
-            if (ledger_cache_) {
-                // Named by the disk's own identity token: another disk in the
-                // same place starts its own ledger.
-                options.ledger_dir = state_path_ / "ledger" / ("data-" + to_string(token));
-                options.ledger_cache_bytes =
-                    static_cast<size_t>(ledger_cache_ / std::max<size_t>(1, ledger_shares_.load()));
-            }
+            // Named by the disk's own identity token: another disk in the
+            // same place starts its own ledger.
+            options.ledger_dir = state_path_ / "ledger" / ("data-" + to_string(token));
+            options.ledger_cache_bytes =
+                static_cast<size_t>(ledger_cache_ / std::max<size_t>(1, ledger_shares_.load()));
             store = std::make_shared<LocalStore>(cfg.path, options, key_,
                                                  LocalStoreMode::authoritative,
                                                  durability_domain,
@@ -324,8 +325,8 @@ void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) 
                     ++(*existing)->generation;
                     (*existing)->online = false;
                     if ((*existing)->store)
-                        retired_losses_.fetch_add((*existing)->store->losses() + 1,
-                                                  std::memory_order_release);
+                        (*existing)->departed_removals +=
+                            (*existing)->store->held_removals() + 1;
                     retired.push_back(std::move((*existing)->store));
                 }
             }
@@ -337,8 +338,7 @@ void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) 
                 backend->online = false;
                 ++backend->generation;
                 if (backend->store)
-                    retired_losses_.fetch_add(backend->store->losses() + 1,
-                                              std::memory_order_release);
+                    backend->departed_removals += backend->store->held_removals() + 1;
                 retired.push_back(std::move(backend->store));
                 backend->last_error = "removed from configuration";
             }
@@ -680,32 +680,50 @@ bool StoragePool::valid(const ObjectId& id) const {
     return false;
 }
 
-uint64_t StoragePool::losses() const noexcept {
-    try {
-        uint64_t sum = retired_losses_.load(std::memory_order_acquire);
-        for (const auto& backend : snapshot()) {
+HeldView StoragePool::held_view() const {
+    struct Part {
+        NodeId token;
+        HeldView view;
+    };
+    std::vector<Part> parts;
+    HeldIdentity identity{{}, 0, true};
+    for (const auto& backend : snapshot()) {
+        std::shared_ptr<LocalStore> store;
+        NodeId token;
+        {
             Lock lock(backend->mutex);
-            if (backend->store)
-                sum += backend->store->losses();
+            identity.removals += backend->departed_removals;
+            if (backend->online)
+                store = backend->store;
+            token = backend->token;
         }
-        return sum;
-    } catch (...) {
-        // Unanswerable is reported as a change.
-        return retired_losses_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    }
-}
-
-bool StoragePool::indexed() const noexcept {
-    try {
-        for (const auto& backend : snapshot()) {
-            Lock lock(backend->mutex);
-            if (backend->store && !backend->store->indexed())
-                return false;
+        if (!store)
+            continue;
+        auto view = store->held_view();
+        identity.removals += view.identity.removals;
+        if (!view.identity.complete) {
+            identity.complete = false;
+            continue;
         }
-        return true;
-    } catch (...) {
-        return false;
+        parts.push_back({token, std::move(view)});
     }
+    // By disk: the same disks holding the same ids name the same holdings.
+    std::sort(parts.begin(), parts.end(),
+              [](const Part& a, const Part& b) { return a.token < b.token; });
+    Sha256Hasher hasher;
+    for (const auto& part : parts) {
+        hasher.update(part.token.bytes);
+        hasher.update(part.view.identity.hash.bytes);
+    }
+    identity.hash = hasher.finish();
+    std::vector<std::function<bool(const ObjectId&)>> held;
+    held.reserve(parts.size());
+    for (auto& part : parts)
+        held.push_back(std::move(part.view.held));
+    return {identity, [held = std::move(held)](const ObjectId& id) {
+                return std::any_of(held.begin(), held.end(),
+                                   [&](const auto& one) { return one(id); });
+            }};
 }
 
 bool StoragePool::remove(const ObjectId& id) {

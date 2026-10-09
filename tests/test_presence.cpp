@@ -304,4 +304,66 @@ MACHA_TEST("presence", test_a_backend_offline_and_readopted_leaves_presence_exac
     CHECK(!pool.has(absent));
 }
 
+// The identity names exactly what the pool holds: it moves with every put,
+// removal and disk, comes back to the same value for the same holdings, and
+// its removals never return to where they were. A view stays as it was taken.
+MACHA_TEST("presence", test_the_held_identity_names_exactly_what_the_pool_holds) {
+    Keys k;
+    const auto backend = k.dir.path() / "data";
+    std::filesystem::create_directories(backend);
+    StoragePool pool(k.dir.path() / "pool-state", random_node_id(),
+                     std::vector<StorageBackendConfig>{{backend, 64ULL << 20}}, k.keys.storage);
+    REQUIRE(wait_until([&] { return pool.online_backends() == 1; }, 5s));
+    REQUIRE(wait_until([&] { return pool.held_view().identity.complete; }, 10s));
+    const auto empty = pool.held_view();
+
+    const auto first = numbered(1);
+    const auto second = numbered(2);
+    const auto absent = object_id(numbered(3));
+    REQUIRE(pool.put(object_id(first), first));
+    const auto one = pool.held_view();
+    CHECK(one.identity.complete);
+    CHECK(one.identity.hash != empty.identity.hash);
+    CHECK(one.identity.removals == empty.identity.removals);
+    CHECK(one.held(object_id(first)));
+    CHECK(!one.held(absent));
+
+    REQUIRE(pool.put(object_id(second), second));
+    const auto two = pool.held_view();
+    CHECK(two.identity.hash != one.identity.hash);
+    CHECK(two.held(object_id(second)));
+    CHECK(!one.held(object_id(second)));
+
+    // The same ids, the same identity; the removal is counted.
+    REQUIRE(pool.remove(object_id(second)));
+    const auto removed = pool.held_view();
+    CHECK(removed.identity.hash == one.identity.hash);
+    CHECK(removed.identity.removals > one.identity.removals);
+    CHECK(!removed.held(object_id(second)));
+    CHECK(two.held(object_id(second)));
+
+    // The disk goes: nothing held, and its going counts as a removal.
+    auto away = backend;
+    away += ".away";
+    std::filesystem::rename(backend, away);
+    pool.refresh();
+    REQUIRE(pool.online_backends() == 0);
+    const auto gone = pool.held_view();
+    CHECK(gone.identity.complete);
+    CHECK(gone.identity.hash != removed.identity.hash);
+    CHECK(gone.identity.removals > removed.identity.removals);
+    CHECK(!gone.held(object_id(first)));
+
+    // It comes back holding what it held: the same identity, and the
+    // removals never back where they were.
+    std::filesystem::rename(away, backend);
+    pool.refresh();
+    REQUIRE(pool.online_backends() == 1);
+    REQUIRE(wait_until([&] { return pool.held_view().identity.complete; }, 10s));
+    const auto back = pool.held_view();
+    CHECK(back.identity.hash == removed.identity.hash);
+    CHECK(back.identity.removals >= gone.identity.removals);
+    CHECK(back.held(object_id(first)));
+}
+
 } // namespace

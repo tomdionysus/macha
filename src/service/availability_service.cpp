@@ -296,11 +296,21 @@ AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
         std::ifstream in(kept_path_, std::ios::binary);
         if (in) {
             const Bytes bytes{std::istreambuf_iterator<char>(in), {}};
-            try {
-                kept_.publish(Kept{HoldingsRollup::decode(bytes),
-                                   ledger_.held_losses(RetentionClass::data)});
-            } catch (const DecodeError& error) {
-                Log::warn("availability: ignoring " + kept_path_.string() + ": " + error.what());
+            // Trusted only for the holdings it was of.
+            Hash256 of;
+            auto view = ledger_.held_view(RetentionClass::data);
+            if (bytes.size() >= of.bytes.size()) {
+                std::copy_n(bytes.begin(), of.bytes.size(), of.bytes.begin());
+                if (view.identity.complete && view.identity.hash == of) {
+                    try {
+                        kept_.publish(Kept{HoldingsRollup::decode(std::span(bytes).subspan(
+                                               of.bytes.size())),
+                                           view.identity, std::move(view.held)});
+                    } catch (const DecodeError& error) {
+                        Log::warn("availability: ignoring " + kept_path_.string() + ": " +
+                                  error.what());
+                    }
+                }
             }
         }
     }
@@ -328,13 +338,13 @@ AvailabilityService::~AvailabilityService() {
 RpcMessage AvailabilityService::answer(const RpcMessage& request) const {
     const auto holdings = holdings_.handle();
     const auto kept = kept_.handle();
-    const auto losses = ledger_.held_losses(RetentionClass::data);
+    const auto removals = ledger_.held_view(RetentionClass::data).identity.removals;
     const HoldingsRollup* kept_rollup = kept && kept->rollup ? &*kept->rollup : nullptr;
-    const auto* rollup =
-        answering_rollup(holdings ? &holdings->rollup : nullptr, holdings ? holdings->losses : 0,
-                         kept_rollup, kept ? kept->losses : 0, losses);
-    // A loss since the roll-up: what it calls whole may not be. The pass
-    // rolls up again; until then this node cannot answer.
+    const auto* rollup = answering_rollup(
+        holdings ? &holdings->rollup : nullptr, holdings ? holdings->identity.removals : 0,
+        kept_rollup, kept ? kept->identity.removals : 0, removals);
+    // Something stopped being held since the roll-up: what it calls whole may
+    // not be. The pass rolls up again; until then this node cannot answer.
     if (!rollup)
         return error_reply(holdings ? "holdings changed since they were rolled up"
                                     : "holdings are not rolled up yet");
@@ -344,9 +354,8 @@ RpcMessage AvailabilityService::answer(const RpcMessage& request) const {
     const NamespaceNodeStore& local_nodes =
         holdings && holdings->built ? static_cast<const NamespaceNodeStore&>(*holdings->built)
                                     : stored;
-    const HeldFn held = [this](const ObjectId& id) {
-        return ledger_.held(RetentionClass::data, id);
-    };
+    // The view the roll-up was made from, so the two agree.
+    const HeldFn& held = rollup == kept_rollup ? kept->held : holdings->held;
     std::vector<NodeHoldings> answers;
     answers.reserve(nodes.size());
     for (const auto& node : nodes)
@@ -360,71 +369,67 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         return false;
     const bool tree_backed = head.snapshot->namespace_root.has_value();
     const auto head_key = tree_backed ? *head.snapshot->namespace_root : head.hash;
-    const auto storage_events = events_.count(NodeEvent::storage);
     const auto topology_events = events_.count(NodeEvent::topology);
     const auto stored = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
-    const HeldFn held = [this](const ObjectId& id) {
-        return ledger_.held(RetentionClass::data, id);
-    };
 
     const auto refresh_started = Clock::now();
     auto holdings = holdings_.handle();
     bool rolled = false;
-    const auto losses = ledger_.held_losses(RetentionClass::data);
-    const bool lost = holdings && losses != holdings->losses;
-    // A loss makes the kept roll-up claim what this node may not hold.
+    auto view = ledger_.held_view(RetentionClass::data);
+    // Something held at the roll-up may no longer be.
+    const bool lost = holdings && view.identity.removals != holdings->identity.removals;
     if (const auto kept = kept_.handle();
-        kept && kept->rollup && losses != kept->losses && !kept_path_.empty()) {
+        kept && kept->rollup && view.identity.removals != kept->identity.removals &&
+        !kept_path_.empty()) {
         std::error_code ec;
         std::filesystem::remove(kept_path_, ec);
         kept_.publish(Kept{});
     }
     const bool head_changed = rolled_head_ != head_key;
-    const bool changed = head_changed || storage_events != rolled_storage_events_ || lost;
+    const bool holdings_changed = holdings && view.identity.hash != holdings->identity.hash;
+    const bool changed = head_changed || holdings_changed || lost;
     const auto rollup_due = rolled_at_ + rolled_cost_ * share;
     due_ = retry_at_;
-    if (!holdings || changed) {
-        if (ledger_.held_indexed(RetentionClass::data)) {
-            cold_since_.reset();
-        } else {
-            if (!cold_since_)
-                cold_since_ = now;
-            if (now - *cold_since_ < cold_patience) {
-                due_ = now + cold_retry;
-                return false;
-            }
-        }
+    // A disk being seeded: what this node holds cannot be named yet.
+    if (!view.identity.complete) {
+        due_ = due_ ? std::min(*due_, now + seed_retry) : now + seed_retry;
+        if (!holdings || changed)
+            return false;
     }
-    if (!holdings || (changed && now >= rollup_due)) {
+    if (view.identity.complete && (!holdings || (changed && now >= rollup_due))) {
         const auto started = Clock::now();
         Holdings next;
-        next.losses = losses;
+        next.identity = view.identity;
+        next.held = view.held;
         if (tree_backed) {
-            // With nothing gained or lost here since the last roll-up, only
-            // the tree has moved: what the two trees share keeps its count.
-            const bool carry = holdings && !holdings->built && !lost &&
-                               storage_events == rolled_storage_events_;
-            next.rollup = HoldingsRollup::build(head_key, stored, held, pause,
+            // With the same holdings as the last roll-up, only the tree has
+            // moved: what the two trees share keeps its count.
+            const bool carry = holdings && !holdings->built && !holdings_changed && !lost;
+            next.rollup = HoldingsRollup::build(head_key, stored, next.held, pause,
                                                 carry ? &holdings->rollup : nullptr);
             next.missing = std::make_shared<const std::vector<ObjectId>>(
-                missing_extents(next.rollup, stored, held, pause));
+                missing_extents(next.rollup, stored, next.held, pause));
         } else {
             auto built = std::make_shared<MemoryNamespaceNodeStore>();
             const auto root = build_namespace_tree(head.snapshot->entries, *built);
-            next.rollup = HoldingsRollup::build(root, *built, held, pause);
+            next.rollup = HoldingsRollup::build(root, *built, next.held, pause);
             next.missing = std::make_shared<const std::vector<ObjectId>>(
-                missing_extents(next.rollup, *built, held, pause));
+                missing_extents(next.rollup, *built, next.held, pause));
             next.built = std::move(built);
         }
         next.generation = head.generation;
         next.snapshot = head.snapshot;
         holdings_.publish(std::move(next));
         holdings = holdings_.handle();
-        // Kept for the next start: a stored tree's roll-up only, since an
-        // inline namespace's tree is rebuilt from the snapshot.
+        // Kept for the next start with the holdings it is of: a stored tree's
+        // roll-up only, since an inline namespace's tree is rebuilt from the
+        // snapshot.
         if (!kept_path_.empty() && tree_backed) {
             try {
-                const auto bytes = holdings->rollup.encode();
+                Bytes bytes(holdings->identity.hash.bytes.begin(),
+                            holdings->identity.hash.bytes.end());
+                const auto rollup = holdings->rollup.encode();
+                bytes.insert(bytes.end(), rollup.begin(), rollup.end());
                 durable_replace_file(kept_path_,
                                      std::string_view(reinterpret_cast<const char*>(bytes.data()),
                                                       bytes.size()));
@@ -434,7 +439,6 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
             }
         }
         rolled_head_ = head_key;
-        rolled_storage_events_ = storage_events;
         rolled_at_ = now;
         rolled = true;
         observations().record("availability.rollup_us", elapsed_us(started));
@@ -446,6 +450,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         if (lost)
             return false;
     }
+    const HeldFn& held = holdings->held;
     const NamespaceNodeStore& nodes =
         holdings->built ? static_cast<const NamespaceNodeStore&>(*holdings->built) : stored;
     const auto* rollup = &holdings->rollup;
@@ -590,7 +595,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         const auto& root = holdings->snapshot->namespace_root;
         // Only the tree moved: the table follows what moved in it.
         if (remembered && !holdings->built && root && table_root_ &&
-            storage_events == table_storage_events_ && previous->survey.unknown.empty() &&
+            holdings->identity.hash == table_holdings_ && previous->survey.unknown.empty() &&
             next.survey.unknown.empty()) {
             update_path_table(next, *previous, diff_namespace_trees(*table_root_, *root, stored),
                               *holdings->snapshot, stored, held);
@@ -600,7 +605,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
             table = "walked";
         }
         table_root_ = holdings->built ? std::nullopt : root;
-        table_storage_events_ = storage_events;
+        table_holdings_ = holdings->identity.hash;
         table_changed = true;
     }
     if (ask)
