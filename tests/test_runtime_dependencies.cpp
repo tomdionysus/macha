@@ -846,9 +846,10 @@ MACHA_FAST_TEST("runtime_dependencies", test_password_checks_may_never_fill_the_
     CHECK(!parse(2, 3));
 }
 
-// runtime.memory_bytes is the node's one budget: the metadata cache and the
-// ledger caches come out of it, in-flight work gets the rest; a budget that
-// cannot hold them all, or set beside retained_memory_bytes, is refused.
+// runtime.memory_bytes is a limit on the configured parts (the metadata
+// cache, the ledger caches, the in-flight capacity); 0 is none. Over it, each
+// shrinks by the same fraction, the in-flight reserves with it, and the node
+// starts.
 MACHA_FAST_TEST("runtime_dependencies", test_memory_bytes_is_one_budget) {
     TempDir t;
     const auto keyfile = t.path() / "cluster.key";
@@ -881,17 +882,29 @@ MACHA_FAST_TEST("runtime_dependencies", test_memory_bytes_is_one_budget) {
             return std::nullopt;
         }
     };
-    const auto budget = parse("  memory_bytes: 1G\n");
-    REQUIRE(budget.has_value());
-    CHECK(budget->runtime.retained_memory_bytes == (1024ULL - 256 - 64) * 1024 * 1024);
-    // Without a budget, the in-flight capacity is as set.
-    const auto unset = parse("  retained_memory_bytes: 700M\n");
-    REQUIRE(unset.has_value());
-    CHECK(unset->runtime.retained_memory_bytes == 700ULL * 1024 * 1024);
-    CHECK(!parse("  memory_bytes: 1G\n  retained_memory_bytes: 700M\n"));
-    // 256M + 64M of caches and 352M of in-flight reserves need 672M.
-    CHECK(!parse("  memory_bytes: 600M\n"));
-    CHECK(parse("  memory_bytes: 672M\n").has_value());
+    const auto mib = [](uint64_t n) { return n * 1024 * 1024; };
+    // 256M + 64M + 768M of parts fit under 2G: unchanged.
+    const auto roomy = parse("  memory_bytes: 2G\n");
+    REQUIRE(roomy.has_value());
+    CHECK(roomy->metadata_materialization_cache_bytes == mib(256));
+    CHECK(roomy->runtime.retained_memory_bytes == mib(768));
+    // Under 544M (half of 1088M), each part is halved, the reserves too.
+    const auto tight = parse("  memory_bytes: 544M\n");
+    REQUIRE(tight.has_value());
+    CHECK(tight->metadata_materialization_cache_bytes == mib(128));
+    CHECK(tight->ledger_cache == mib(32));
+    CHECK(tight->runtime.retained_memory_bytes == mib(384));
+    CHECK(tight->runtime.viewer_memory_reserve_bytes == mib(96));
+    CHECK(tight->metadata_materialization_cache_bytes + tight->ledger_cache +
+              tight->runtime.retained_memory_bytes <=
+          mib(544));
+    // No limit, and a limit beside an explicit in-flight capacity, both start.
+    const auto none = parse("  memory_bytes: 0\n");
+    REQUIRE(none.has_value());
+    CHECK(none->runtime.retained_memory_bytes == mib(768));
+    const auto both = parse("  memory_bytes: 900M\n  retained_memory_bytes: 700M\n");
+    REQUIRE(both.has_value());
+    CHECK(both->runtime.retained_memory_bytes < mib(700));
 }
 
 MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwork) {

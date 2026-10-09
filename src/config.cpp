@@ -706,10 +706,8 @@ void parse_runtime(const ConfigNode& root, Config& c) {
         c.runtime.glibc_arena_max = runtime["glibc_arena_max"].as<size_t>();
     if (runtime["memory_bytes"])
         c.runtime.memory_bytes = yaml_size(runtime["memory_bytes"]);
-    if (runtime["retained_memory_bytes"]) {
+    if (runtime["retained_memory_bytes"])
         c.runtime.retained_memory_bytes = yaml_size(runtime["retained_memory_bytes"]);
-        c.runtime.retained_memory_bytes_set = true;
-    }
     if (runtime["reassembly_memory_reserve_bytes"])
         c.runtime.reassembly_memory_reserve_bytes =
             yaml_size(runtime["reassembly_memory_reserve_bytes"]);
