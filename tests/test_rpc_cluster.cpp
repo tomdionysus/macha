@@ -2346,6 +2346,78 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_orders_each_peer_and_parall
     server.stop();
 }
 
+// A commit's control mutations are taken before queued background history
+// imports, and background imports cannot fill the queue they share.
+MACHA_TEST("rpc_cluster", test_rpc_metadata_control_mutations_go_first) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+    TestGate first;
+    std::mutex order_mutex;
+    std::vector<uint8_t> order;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            const uint8_t tag = request.payload.empty() ? 0 : request.payload[0];
+            if (tag == 1)
+                first.enter_and_wait();
+            {
+                std::lock_guard lock(order_mutex);
+                order.push_back(tag);
+            }
+            return RpcMessage{MessageType::bool_reply, Bytes{1}};
+        },
+        [](const NodeInfo&) {}, 256 * 1024,
+        RpcServerExecutionLimits{
+            .metadata_workers = 1, .metadata_pending_jobs = 4, .metadata_pending_bytes = 64});
+    server.start();
+    struct GateOpener {
+        TestGate* gate;
+        ~GateOpener() { gate->open(); }
+    } open_on_exit{&first};
+
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    NetworkLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+    const auto pending_jobs = [&](size_t jobs) {
+        return wait_until([&] { return server.work_stats().metadata_pending_jobs == jobs; }, 2s);
+    };
+    const Bytes one{1}, two{2}, three{3}, four{4}, five{5}, six{6};
+    auto running = client.call_async(endpoint, MessageType::put_metadata_history_entry, one,
+                                     FrameType::speculative);
+    REQUIRE(first.wait_for_entries(1));
+    auto imports = client.call_async(endpoint, MessageType::put_metadata_history_entry, two,
+                                     FrameType::speculative);
+    auto more = client.call_async(endpoint, MessageType::put_metadata_history_entry, three,
+                                  FrameType::speculative);
+    auto last = client.call_async(endpoint, MessageType::put_metadata_history_entry, four,
+                                  FrameType::speculative);
+    REQUIRE(pending_jobs(3));
+    // Three of four queue slots are background's: a fourth queued import is
+    // refused.
+    auto refused = client.call_async(endpoint, MessageType::put_metadata_history_entry, six,
+                                     FrameType::speculative);
+    REQUIRE(refused.wait_for(scaled(2s)) == std::future_status::ready);
+    CHECK(server.work_stats().metadata_pending_jobs == 3);
+    // The fourth slot takes the commit's accept.
+    auto accept = client.call_async(endpoint, MessageType::accept_metadata_commit, five,
+                                    FrameType::control);
+    REQUIRE(pending_jobs(4));
+    first.open();
+    for (auto* rpc : {&running, &imports, &more, &last, &accept})
+        REQUIRE(rpc->wait_for(scaled(2s)) == std::future_status::ready);
+    {
+        std::lock_guard lock(order_mutex);
+        CHECK(order == std::vector<uint8_t>({1, 5, 2, 3, 4}));
+    }
+    client.stop();
+    server.stop();
+}
+
 // The metadata executor's boundaries: a queued job is removed by cancellation
 // without entering the handler; a running job is not cancelled by losing its
 // reply route, it finishes and the reply is discarded. A server stopping
