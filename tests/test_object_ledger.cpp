@@ -5,6 +5,7 @@
 #include "crypto.hpp"
 #include "ledger/held_ledger.hpp"
 #include "ledger/object_trie.hpp"
+#include "ledger/reference_counts.hpp"
 #include "storage/local_store.hpp"
 #include "storage/sealed_journal.hpp"
 #include "test_support.hpp"
@@ -880,6 +881,62 @@ MACHA_FAST_TEST("object_ledger", test_verification_resumes_after_a_restart) {
     const auto rest = store.verify_step(65536);
     CHECK(rest.complete);
     CHECK(rest.directories == 65536 - 100);
+}
+
+// The namespace's reference counts: counted per reference, kept across a
+// reopen at their root, a bad change refused whole, an interrupted one
+// leaving no root (the next count walks).
+MACHA_FAST_TEST("object_ledger", test_reference_counts_follow_and_survive_a_restart) {
+    TempDir dir;
+    std::mt19937_64 random(23);
+    const auto key = key_of(19);
+    const auto a = id_of(random);
+    const auto b = id_of(random);
+    const auto node = id_of(random);
+    const auto root1 = id_of(random);
+    const auto root2 = id_of(random);
+    const auto count_of = [](const ObjectTrie::Snapshot& view, const ObjectId& id) -> uint64_t {
+        const auto value = view.get(id);
+        if (!value)
+            return 0;
+        Reader reader(*value);
+        return reader.u64();
+    };
+    {
+        ReferenceCounts counts(dir.path() / "referenced", key, 1 << 20);
+        CHECK(!counts.root());
+        // `a` is shared by two files.
+        counts.reset(root1, {a, b, a}, {node}, {3, 3});
+        const auto views = counts.views();
+        CHECK(count_of(views.extents, a) == 2);
+        CHECK(count_of(views.extents, b) == 1);
+        CHECK(views.nodes.size() == 1);
+        // One reference to `a` goes, `b` goes: `a` stays, `b` is gone.
+        CHECK(counts.change(root2, {}, {a, b}, {}, {}, {1, 1}));
+        // The earlier view is frozen.
+        CHECK(count_of(views.extents, b) == 1);
+        // Taking out what is not counted is refused, changing nothing.
+        CHECK(!counts.change(root1, {}, {b}, {}, {}, {0, 0}));
+        CHECK(counts.root() == std::optional(root2));
+    }
+    {
+        ReferenceCounts counts(dir.path() / "referenced", key, 1 << 20);
+        CHECK(counts.root() == std::optional(root2));
+        CHECK(counts.totals().entries == 1);
+        const auto views = counts.views();
+        CHECK(count_of(views.extents, a) == 1);
+        CHECK(!views.extents.get(b));
+        CHECK(views.nodes.get(node).has_value());
+    }
+    // A change interrupted between its first state write and its last.
+    {
+        std::ofstream state(dir.path() / "referenced" / "state",
+                            std::ios::binary | std::ios::in | std::ios::out);
+        state.seekp(8);
+        state.put(0);
+    }
+    ReferenceCounts interrupted(dir.path() / "referenced", key, 1 << 20);
+    CHECK(!interrupted.root());
 }
 
 } // namespace

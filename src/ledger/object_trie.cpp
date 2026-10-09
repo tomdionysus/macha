@@ -682,6 +682,20 @@ std::optional<Bytes> ObjectTrie::Snapshot::get(const ObjectId& id) const {
     });
 }
 
+std::vector<ObjectId> ObjectTrie::Snapshot::ids() const {
+    std::vector<ObjectId> out;
+    out.reserve(size());
+    std::optional<ObjectId> after;
+    while (true) {
+        const auto page = next(after, 4096);
+        for (const auto& record : page)
+            out.push_back(record.first);
+        if (page.size() < 4096)
+            return out;
+        after = page.back().first;
+    }
+}
+
 std::vector<ObjectTrie::Record> ObjectTrie::Snapshot::next(const std::optional<ObjectId>& after,
                                                            size_t limit) const {
     std::vector<Record> out;

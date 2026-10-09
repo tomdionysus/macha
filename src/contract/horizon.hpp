@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/id_lookup.hpp"
+#include "ledger/object_trie.hpp"
 #include "metadata/metadata.hpp"
 #include "storage/retention.hpp"
 
@@ -16,22 +18,42 @@
 // in use.
 namespace macha {
 
-// The objects a head refers to, one sorted, duplicate-free set per class.
+// The objects a head refers to, per class: a frozen view of the namespace's
+// reference counts (on disk, read through their cache) and a small sorted
+// set of others (the catalogue's, conflict alternatives'), or the small set
+// alone.
 class ReferencedSets {
   public:
     // Takes ids in any order, with duplicates; keeps them sorted and unique.
     ReferencedSets(std::vector<ObjectId> data, std::vector<ObjectId> control);
+    struct Views {
+        std::optional<ObjectTrie::Snapshot> data;
+        std::optional<ObjectTrie::Snapshot> control;
+    };
+    ReferencedSets(Views views, std::vector<ObjectId> data, std::vector<ObjectId> control);
 
     bool referenced(RetentionClass, const ObjectId&) const;
-    // In id order.
-    std::span<const ObjectId> referenced_ids(RetentionClass) const;
+    // referenced() as a lookup; it reads this set, which must outlive it.
+    IdLookup lookup(RetentionClass) const;
+    // Up to `limit` ids after `after` (from the first when none), in order.
+    std::vector<ObjectId> next(RetentionClass, const std::optional<ObjectId>& after,
+                               size_t limit) const;
+    // Every id, in order: linear, for tests and the pull list's fallback.
+    std::vector<ObjectId> all(RetentionClass) const;
     size_t size(RetentionClass) const;
 
   private:
-    const std::vector<ObjectId>& of(RetentionClass) const;
+    struct Set {
+        std::optional<ObjectTrie::Snapshot> view;
+        // Sorted and unique.
+        std::vector<ObjectId> others;
+        size_t size{};
+    };
+    const Set& of(RetentionClass) const;
+    static Set make(std::optional<ObjectTrie::Snapshot>, std::vector<ObjectId>);
 
-    std::vector<ObjectId> data_;
-    std::vector<ObjectId> control_;
+    Set data_;
+    Set control_;
 };
 
 // The maintenance inventory at a metadata generation: what repair,
@@ -47,6 +69,9 @@ class InventoryHorizon : public ReferencedSets {
     InventoryHorizon(uint64_t generation, bool catalogue_complete, std::vector<ObjectId> data,
                      std::vector<ObjectId> control, const std::vector<GarbageRef>& garbage,
                      std::vector<ObjectId> outside_namespace = {});
+    InventoryHorizon(uint64_t generation, bool catalogue_complete, ReferencedSets sets,
+                     const std::vector<GarbageRef>& garbage,
+                     std::vector<ObjectId> outside_namespace);
 
     // The stamp: the generation the inventory was built at.
     uint64_t generation() const noexcept { return generation_; }
@@ -70,6 +95,7 @@ class ReleaseHorizon : public ReferencedSets {
   public:
     ReleaseHorizon(Hash256 head, RetentionClock clock, std::vector<ObjectId> data,
                    std::vector<ObjectId> control);
+    ReleaseHorizon(Hash256 head, RetentionClock clock, ReferencedSets sets);
 
     // The stamp: the head's hash and the mutation clock of the claims it saw.
     const Hash256& head() const noexcept { return head_; }

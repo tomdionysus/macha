@@ -670,17 +670,22 @@ void Maintenance::run(std::stop_token stop) {
                     // credit. Bound each repair slice independently.
                     constexpr size_t operation_budget = 16;
                     const auto missing = availability_.missing_here();
-                    if (missing && inventory &&
-                        (missing != pull_missing || inventory != pull_inventory)) {
-                        const auto& outside = inventory->outside_namespace();
-                        pull_list.clear();
-                        pull_list.reserve(missing->size() + outside.size());
-                        std::set_union(missing->begin(), missing->end(), outside.begin(),
-                                       outside.end(), std::back_inserter(pull_list));
+                    if (inventory && (missing != pull_missing || inventory != pull_inventory)) {
+                        // What this node lacks, when the survey knows; every
+                        // referenced object until it does.
+                        if (missing) {
+                            const auto& outside = inventory->outside_namespace();
+                            pull_list.clear();
+                            pull_list.reserve(missing->size() + outside.size());
+                            std::set_union(missing->begin(), missing->end(), outside.begin(),
+                                           outside.end(), std::back_inserter(pull_list));
+                        } else {
+                            pull_list = inventory->all(RetentionClass::data);
+                        }
                         pull_missing = missing;
                         pull_inventory = inventory;
                     }
-                    const bool pulling_listed = missing && inventory;
+                    const bool pulling_listed = inventory != nullptr;
                     // What a peer holds, from its own account of its holdings:
                     // known only for the namespace's objects, and only for a
                     // peer that could say.
@@ -702,8 +707,8 @@ void Maintenance::run(std::stop_token stop) {
                     const auto repair_stage = Clock::now();
                     auto repair = store_.repair_step(
                         byte_budget, operation_budget,
-                        inventory ? std::optional(inventory->referenced_ids(RetentionClass::data))
-                                   : std::nullopt,
+                        inventory ? std::optional(inventory->lookup(RetentionClass::data))
+                                  : std::nullopt,
                         [&] {
                             // Repair's turn ends at the next operation boundary
                             // once its weighted slice is spent; it is paced,
@@ -870,7 +875,7 @@ void Maintenance::run(std::stop_token stop) {
                     enter_stage("control-gc");
                     const auto now_unix_ms = static_cast<uint64_t>(clock_->wall_ns() / 1'000'000);
                     const auto removed = catalogue_.control_gc_step(
-                        inventory->referenced_ids(RetentionClass::control), policy.garbage_grace,
+                        inventory->lookup(RetentionClass::control), policy.garbage_grace,
                         32, &control_unreferenced_, now_unix_ms);
                     save_sightings(control_unreferenced_, control_sightings_saved_);
                     observations().add("catalogue.control_gc.removed", removed);
@@ -942,7 +947,7 @@ void Maintenance::run(std::stop_token stop) {
                     const auto orphan_grace =
                         std::max(policy.garbage_grace, policy.no_progress_backoff);
                     auto gc = local_.data().gc_step(
-                        inventory->referenced_ids(RetentionClass::data), protected_ids,
+                        inventory->lookup(RetentionClass::data), protected_ids,
                         orphan_grace, 64,
                         [this] {
                             const auto quiet = node_.config().maintenance.foreground_quiet;

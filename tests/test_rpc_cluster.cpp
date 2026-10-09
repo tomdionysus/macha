@@ -4605,16 +4605,15 @@ MACHA_TEST("rpc_cluster", test_unlink_retires_an_object_from_the_maintenance_inv
     const auto doomed = fs.getattr("/media/a.bin").extents.front().id;
     fs.unlink("/media/a.bin");
 
-    const auto objects = fs.maintenance_objects();
-    CHECK(std::any_of(objects.garbage.begin(), objects.garbage.end(),
-                      [&](const GarbageRef& garbage) { return garbage.id == doomed; }));
-    CHECK(std::find(objects.live.begin(), objects.live.end(), doomed) == objects.live.end());
+    const auto walked = fs.walk_namespace_references();
+    CHECK(std::find(walked.extents.begin(), walked.extents.end(), doomed) == walked.extents.end());
 
     const auto first = fs.maintenance_objects_cached();
+    CHECK(std::any_of(first->garbage.begin(), first->garbage.end(),
+                      [&](const GarbageRef& garbage) { return garbage.id == doomed; }));
+    CHECK(!first->referenced_extents.get(doomed).has_value());
     CHECK(fs.maintenance_objects_cached().get() == first.get());
     CHECK(first->metadata_generation != 0);
-    CHECK(std::is_sorted(first->live.begin(), first->live.end()));
-    CHECK(std::adjacent_find(first->live.begin(), first->live.end()) == first->live.end());
     CHECK(std::is_sorted(first->garbage.begin(), first->garbage.end()));
     fs.mkdir("/changed", 0755, getuid(), getgid());
     const auto after = fs.maintenance_objects_cached();

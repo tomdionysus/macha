@@ -334,21 +334,19 @@ MACHA_TEST("namespace_migration", test_the_inventory_and_the_media_index_follow_
     const auto extent = config.extent_size;
     const auto agrees = [&] {
         const auto followed = fs.maintenance_objects_cached();
-        const auto walked = fs.maintenance_objects();
-        CHECK(followed->live == walked.live);
-        CHECK(followed->namespace_nodes == walked.namespace_nodes);
-        CHECK(followed->entries == walked.entries);
-        CHECK(followed->extents == walked.extents);
-        CHECK(followed->garbage == walked.garbage);
+        const auto walked = fs.walk_namespace_references();
+        const auto extents = followed->referenced_extents.ids();
+        const auto nodes = followed->referenced_nodes.ids();
+        CHECK(extents == walked.extents);
+        CHECK(nodes == walked.nodes);
         // What the release horizon is given in place of its own walk.
         const auto counted = fs.namespace_references(service.metadata_manager().snapshot());
         CHECK(counted.has_value() == tree);
         if (counted) {
-            CHECK(counted->extents == walked.live);
-            CHECK(counted->nodes == walked.namespace_nodes);
+            CHECK(counted->extents.ids() == walked.extents);
+            CHECK(counted->nodes.ids() == walked.nodes);
         }
-        return followed->live == walked.live &&
-               followed->namespace_nodes == walked.namespace_nodes;
+        return extents == walked.extents && nodes == walked.nodes;
     };
     const auto write = [&](const std::string& path, const Bytes& bytes) {
         try {
@@ -381,7 +379,7 @@ MACHA_TEST("namespace_migration", test_the_inventory_and_the_media_index_follow_
     CHECK(survivor->first == root + "/large-copy.bin");
     const auto still = fs.maintenance_objects_cached();
     for (const auto& extent : fs.getattr(root + "/large-copy.bin").extents)
-        CHECK(std::binary_search(still->live.begin(), still->live.end(), extent.id));
+        CHECK(still->referenced_extents.get(extent.id).has_value());
 
     for (int i = 0; i < 40; ++i)
         fs.mkdir(root + "/d" + std::to_string(i), 0755, getuid(), getgid());

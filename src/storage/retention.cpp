@@ -541,8 +541,7 @@ std::optional<ObjectId> RetentionStore::next_retained(
     }
 }
 
-size_t RetentionStore::release_unreferenced(RetentionClass type,
-                                            std::span<const ObjectId> live,
+size_t RetentionStore::release_unreferenced(RetentionClass type, const IdLookup& live,
                                             const RetentionClock& observed,
                                             size_t operation_budget) {
     if (!operation_budget || observed.empty())
@@ -567,7 +566,7 @@ size_t RetentionStore::release_unreferenced(RetentionClass type,
     candidates.reserve(operation_budget);
     scan_locked(ledger, ledger.release_after, std::max<size_t>(operation_budget * 128, 8192),
                 [&](const ObjectId& id, std::span<const uint8_t> record) {
-                    if (claimed(record) && !std::binary_search(live.begin(), live.end(), id))
+                    if (claimed(record) && !live.contains(id))
                         candidates.push_back(id);
                     return candidates.size() < operation_budget;
                 });

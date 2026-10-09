@@ -8,6 +8,7 @@
 #include "startup_progress.hpp"
 #include "storage/local_store.hpp"
 #include "storage/persistent_cache.hpp"
+#include "ledger/reference_counts.hpp"
 #include "storage/retention.hpp"
 #include "storage/storage_pool.hpp"
 #include "supervised.hpp"
@@ -25,23 +26,27 @@ void stage(const LocalState::StageHook& hook, std::string_view name, std::stop_t
         throw RecoveryCancelled();
 }
 
-// storage.ledger_cache, divided among the ledgers: half to the claims (both
-// classes), a sixteenth to the control store's held ledger, the rest to the
-// data backends'.
-enum class LedgerShare { data_held, control_held, claims };
+// storage.ledger_cache, divided among the ledgers: three eighths to the
+// claims (both classes), a quarter to the namespace's reference counts, a
+// sixteenth to the control store's held ledger, the rest to the data
+// backends'.
+enum class LedgerShare { data_held, control_held, claims, references };
 
 uint64_t ledger_cache_share(const Config& cfg, LedgerShare share) {
-    const auto claims = cfg.ledger_cache / 2;
+    const auto claims = cfg.ledger_cache / 8 * 3;
+    const auto references = cfg.ledger_cache / 4;
     const auto control_held = cfg.ledger_cache / 16;
     switch (share) {
     case LedgerShare::claims:
         return claims;
+    case LedgerShare::references:
+        return references;
     case LedgerShare::control_held:
         return control_held;
     case LedgerShare::data_held:
         break;
     }
-    return cfg.ledger_cache - claims - control_held;
+    return cfg.ledger_cache - claims - references - control_held;
 }
 
 } // namespace
@@ -147,6 +152,9 @@ void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
         stage(hook, "retention", stop);
         retention_ = std::make_unique<RetentionStore>(cfg.state_path, identity.keys.storage,
                                                       ledger_cache_share(cfg, LedgerShare::claims));
+        references_ = std::make_unique<ReferenceCounts>(
+            cfg.state_path / "ledger" / "referenced", identity.keys.storage,
+            ledger_cache_share(cfg, LedgerShare::references));
         note_startup_progress();
         progress.mark(RecoveryProgress::retention);
 

@@ -1,5 +1,41 @@
 # Current release
 
+## 0.90.63: horizons are frozen views of on-disk reference counts (object ledger stage 4, step 2)
+
+No API, wire or protocol changes. New on disk: `<state_path>/ledger/referenced`
+(two tries and a state file).
+
+What the namespace refers to was held in memory up to five times over as
+sorted id vectors (the census, `MaintenanceObjects`, `NamespaceReferences`,
+the inventory and the release horizon), rebuilt by copying one to four times
+a minute (on gbni-1, 0.7 to 1.7 s an inventory, about 0.45 s a release
+horizon), and the census was walked whole at every start. Now:
+
+- `ReferenceCounts` (LocalState's) keeps, per class, an `ObjectTrie` of
+  reference counts: DATA extents one count per reference, so an extent two
+  files share goes with its last reference, and the tree's own nodes. It is
+  brought from root to root by the tree diff the census already used; a
+  change is checked whole before anything is written, and a state file
+  records the root it stands at, written dirty before a change and clean
+  after, so an interrupted change makes the next count walk. A start
+  carries on from the saved root by diff: no walk.
+- Both horizons are `ReferencedSets` over frozen views of those counts
+  (0.90.62), plus small sorted sets beside them (the catalogue's objects,
+  conflict alternatives). Building one copies nothing that grows with the
+  library. The release horizon and the inventory may be views at different
+  heads, each exactly its own head's set, as before (operator, 2026-10-09).
+- Repair, DATA and control GC, and claim release take an `IdLookup` (a
+  sorted span, or a horizon's lookup) instead of a span. When the survey
+  has not said what this node lacks, maintenance lists the inventory once as
+  repair's pull list, as repair walked the live set before.
+- `storage.ledger_cache` is now split three eighths to the claims, a
+  quarter to the reference counts, a sixteenth to the control held ledger,
+  the rest to the DATA held ledgers.
+
+Tests: the census-follow test compares the counts' views with a walk after
+each change; reference counts survive a reopen, refuse a change that takes
+out what is not counted, and an interrupted change leaves no root.
+
 ## 0.90.62: frozen views of a ledger trie (object ledger stage 4, step 1)
 
 No API, wire, protocol or on-disk changes.

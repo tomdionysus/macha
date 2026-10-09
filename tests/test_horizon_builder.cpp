@@ -5,6 +5,7 @@
 #include "ledger/node_horizon_builder.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "test_framework.hpp"
+#include "test_support.hpp"
 
 #include <algorithm>
 #include <map>
@@ -24,6 +25,16 @@ ObjectId id(uint8_t n) {
 }
 
 std::vector<ObjectId> ids_of(std::span<const ObjectId> span) { return {span.begin(), span.end()}; }
+
+// A frozen view of a reference count trie holding `ids`.
+ObjectTrie::Snapshot view_of(const std::filesystem::path& dir, const std::vector<ObjectId>& ids) {
+    ObjectTrie trie(dir, std::array<uint8_t, 32>{}, {});
+    std::vector<ObjectTrie::Change> changes;
+    for (const auto& id : ids)
+        changes.push_back({id, Bytes(8, 1)});
+    trie.apply(changes);
+    return trie.snapshot();
+}
 
 FsEntry file(std::initializer_list<std::pair<uint8_t, bool>> extents) {
     FsEntry entry;
@@ -134,15 +145,16 @@ void check_matches_reference(const MetadataSnapshotView& head, const NamespaceNo
     const auto built = build_release(head, nodes, catalogue);
     const auto expected = reference_release(head, reference_nodes, catalogue);
     CHECK(built.complete == expected.complete);
-    CHECK(ids_of(built.horizon->referenced_ids(RetentionClass::data)) == expected.data);
-    CHECK(ids_of(built.horizon->referenced_ids(RetentionClass::control)) == expected.control);
+    CHECK(ids_of(built.horizon->all(RetentionClass::data)) == expected.data);
+    CHECK(ids_of(built.horizon->all(RetentionClass::control)) == expected.control);
     CHECK(built.horizon->head() == head.hash);
     CHECK(built.horizon->clock() == head.snapshot->mutation_sequences);
 }
 
 MACHA_FAST_TEST("horizon_builder", test_inventory_is_both_live_sets_and_the_catalogue_control_set) {
+    test_support::TempDir dir;
     MaintenanceObjects namespace_objects;
-    namespace_objects.live = {id(3), id(1)};
+    namespace_objects.referenced_extents = view_of(dir.path() / "extents", {id(3), id(1)});
     namespace_objects.metadata_generation = 9;
     GarbageRef revived;
     revived.id = id(2);
@@ -159,9 +171,9 @@ MACHA_FAST_TEST("horizon_builder", test_inventory_is_both_live_sets_and_the_cata
     const auto inventory = build_inventory(namespace_objects, catalogue);
     CHECK(inventory->generation() == 9);
     CHECK(!inventory->catalogue_complete());
-    CHECK((ids_of(inventory->referenced_ids(RetentionClass::data)) ==
+    CHECK((ids_of(inventory->all(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(2), id(3)}));
-    CHECK((ids_of(inventory->referenced_ids(RetentionClass::control)) ==
+    CHECK((ids_of(inventory->all(RetentionClass::control)) ==
            std::vector<ObjectId>{id(6), id(7)}));
     // A tombstone revived by catalogue data is stale, as one the namespace revives is.
     CHECK(inventory->stale_garbage().size() == 1 && inventory->stale_garbage()[0].id == id(2));
@@ -205,8 +217,9 @@ MACHA_FAST_TEST("horizon_builder", test_inventory_control_set_holds_the_namespac
     CHECK(walked.size() == nodes.nodes());
     CHECK(walked.size() > 2);
 
+    test_support::TempDir dir;
     MaintenanceObjects namespace_objects;
-    namespace_objects.namespace_nodes = walked;
+    namespace_objects.referenced_nodes = view_of(dir.path() / "nodes", walked);
     CatalogueMaintenance catalogue;
     catalogue.control_live = {id(7)};
     const auto inventory = build_inventory(namespace_objects, catalogue);
@@ -260,7 +273,7 @@ MACHA_FAST_TEST("horizon_builder", test_release_over_a_tree_matches_the_pass_bui
     check_matches_reference(head, nodes, nodes, catalogue);
     const auto built = build_release(head, nodes, catalogue);
     CHECK(built.complete);
-    CHECK((ids_of(built.horizon->referenced_ids(RetentionClass::data)) ==
+    CHECK((ids_of(built.horizon->all(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(3), id(4), id(6), id(8), id(10)}));
     // Control: both catalogue roots' control objects and every namespace tree node.
     CHECK(built.horizon->referenced(RetentionClass::control, id(9)));
@@ -284,9 +297,9 @@ MACHA_FAST_TEST("horizon_builder", test_an_unreadable_catalogue_root_leaves_the_
     const auto built = build_release(head, nodes, catalogue);
     CHECK(!built.complete);
     // What could be read is still in the horizon.
-    CHECK((ids_of(built.horizon->referenced_ids(RetentionClass::data)) ==
+    CHECK((ids_of(built.horizon->all(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(8)}));
-    CHECK((ids_of(built.horizon->referenced_ids(RetentionClass::control)) ==
+    CHECK((ids_of(built.horizon->all(RetentionClass::control)) ==
            std::vector<ObjectId>{id(9)}));
 }
 
@@ -305,7 +318,7 @@ MACHA_FAST_TEST("horizon_builder", test_an_unreadable_tree_node_leaves_the_relea
     OnceNodeStore again(nodes);
     const auto built = build_release(head, again, catalogue);
     CHECK(!built.complete);
-    CHECK((ids_of(built.horizon->referenced_ids(RetentionClass::data)) ==
+    CHECK((ids_of(built.horizon->all(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(2)}));
 }
 
