@@ -2346,6 +2346,49 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_orders_each_peer_and_parall
     server.stop();
 }
 
+// Torrent and ingest job traffic is not control: a job view's poll travels as
+// loader work and a user's action as viewer work, and both are served.
+MACHA_TEST("rpc_cluster", test_rpc_job_traffic_travels_as_its_own_class) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+    std::mutex seen_mutex;
+    std::vector<FrameType> seen;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
+            {
+                std::lock_guard lock(seen_mutex);
+                seen.push_back(frame_type);
+            }
+            if (request.type == MessageType::get_torrent_jobs)
+                return RpcMessage{MessageType::torrent_jobs_reply, {}};
+            return RpcMessage{MessageType::ingest_job_action_reply, {}};
+        },
+        [](const NodeInfo&) {}, 256 * 1024);
+    server.start();
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    NetworkLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+    auto polled = client.call_async(endpoint, MessageType::get_torrent_jobs, {}, FrameType::loader);
+    REQUIRE(polled.wait_for(scaled(2s)) == std::future_status::ready);
+    CHECK(polled.get().message.type == MessageType::torrent_jobs_reply);
+    auto acted = client.call_async(endpoint, MessageType::ingest_job_action, Bytes{'{', '}'},
+                                   FrameType::foreground);
+    REQUIRE(acted.wait_for(scaled(2s)) == std::future_status::ready);
+    CHECK(acted.get().message.type == MessageType::ingest_job_action_reply);
+    {
+        std::lock_guard lock(seen_mutex);
+        CHECK(seen == std::vector<FrameType>({FrameType::loader, FrameType::foreground}));
+    }
+    client.stop();
+    server.stop();
+}
+
 // A commit's control mutations are taken before queued background history
 // imports, and background imports cannot fill the queue they share.
 MACHA_TEST("rpc_cluster", test_rpc_metadata_control_mutations_go_first) {

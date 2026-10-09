@@ -1050,7 +1050,7 @@ void Maintenance::run(std::stop_token stop) {
             // materialize it. A no-op unless a head is flagged.
             try {
                 enter_stage("head-repair");
-                (void)metadata_upkeep_.repair_unreconstructable_heads();
+                (void)metadata_upkeep_.repair_unreconstructable_heads(FrameType::speculative);
             } catch (const std::exception& error) {
                 Log::debug("maintenance: metadata head repair failed: " +
                            std::string(error.what()));
