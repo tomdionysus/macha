@@ -162,7 +162,6 @@ class LocalStore final : public ObjectStore {
     std::atomic<uint64_t> used_{};
     mutable std::atomic<uint64_t> losses_{};
     // presence_ has listed the store; set once by the warm-up.
-    std::atomic_bool presence_warm_{};
     // The index mutex: memory work only. A holder that reaches the device
     // releases it first (Unlocked in local_store.cpp).
     mutable Mutex m_;
@@ -313,12 +312,15 @@ class LocalStore final : public ObjectStore {
     // disk under the object's lock and a zero-byte file is pruned. Never
     // verifies content: use get()/valid() for that.
     bool has(const ObjectId&) const noexcept override;
-    uint64_t losses() const noexcept override {
+    // Objects this store has stopped holding since it opened.
+    uint64_t losses() const noexcept {
         return losses_.load(std::memory_order_acquire);
     }
-    bool indexed() const noexcept override {
-        return presence_warm_.load(std::memory_order_acquire);
-    }
+    // From the held ledger once seeded. Without a ledger, or before its seed,
+    // the identity is incomplete and `held` answers nothing.
+    HeldView held_view() const override;
+    // The view's removal count alone: an atomic read.
+    uint64_t held_removals() const noexcept { return ledger_ ? ledger_->removals() : 0; }
     // Whether warm-up has finished and has() answers from the index alone.
     bool presence_authoritative() const {
         Lock lock(m_);

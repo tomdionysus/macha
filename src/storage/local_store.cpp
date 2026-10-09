@@ -524,18 +524,35 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
         ledger_ = std::make_unique<HeldLedger>(options.ledger_dir, key_, ledger_options);
     }
     if (ledger_ && ledger_->seeded()) {
-        // The ledger knows what is held: nothing to walk.
+        // The ledger knows what is held: nothing to walk. The packs were
+        // replayed above, so it is brought to list every packed object,
+        // including one a crash left between its record and its journal.
         {
             Lock lock(m_);
             presence_.warmed();
+            for (const auto& [id, entry] : packed_)
+                if (!ledger_->held(id).value_or(true))
+                    ledger_->record(id, true);
         }
-        presence_warm_.store(true, std::memory_order_release);
+        flush_ledger();
         presence_index_entries_.store(ledger_->size(), std::memory_order_relaxed);
         return;
     }
     presence_thread_ = std::jthread([this](std::stop_token stop) {
         run_supervised_once("local-store-presence", [this, stop] { warm_presence_index(stop); });
     });
+}
+
+HeldView LocalStore::held_view() const {
+    if (!ledger_ || !ledger_->seeded())
+        return {{{}, held_removals(), false}, [](const ObjectId&) { return false; }};
+    auto view = ledger_->view();
+    HeldView out;
+    out.identity = {view.records.root_hash(), view.removals, true};
+    out.held = [records = std::move(view.records)](const ObjectId& id) {
+        return records.get(id).has_value();
+    };
+    return out;
 }
 
 void LocalStore::flush_ledger() const {
@@ -548,6 +565,10 @@ void LocalStore::seed_ledger() {
     ledger_->seed([this] {
         Lock lock(m_);
         auto present = presence_.present();
+        for (const auto& [id, entry] : packed_)
+            present.push_back(id);
+        std::sort(present.begin(), present.end());
+        present.erase(std::unique(present.begin(), present.end()), present.end());
         // Every change queued so far is in the snapshot.
         ledger_->drop_queued();
         return present;
@@ -1146,6 +1167,8 @@ bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> 
     if (auto old = packed_.find(id); old != packed_.end())
         pack_dead_bytes_ += old->second.record_size;
     packed_[id] = entry;
+    if (ledger_)
+        ledger_->record(id, true);
     used_.fetch_add(record_size, std::memory_order_relaxed);
 
     generation = 0;
@@ -1393,6 +1416,8 @@ bool LocalStore::remove_locked(const ObjectId& id, Lock& lock) {
         append_pack_record_locked(pack_remove, id, {}, unix_ms(), &tomb, &tomb_size, lock);
         pack_dead_bytes_ += found->second.record_size + tomb_size;
         packed_.erase(found);
+        if (ledger_)
+            ledger_->record(id, false);
         losses_.fetch_add(1, std::memory_order_release);
         used_.fetch_add(tomb_size, std::memory_order_relaxed);
         provisional_generations_.erase(id);
@@ -1944,11 +1969,12 @@ LocalStore::VerifyResult LocalStore::verify_step(size_t directories) {
         if (std::filesystem::exists(path(id), exists_error) || exists_error)
             continue;
         Lock lock(m_);
+        // A packed object has no file of its own.
+        if (packed_.contains(id))
+            continue;
         ledger_->record(id, false);
-        if (!packed_.contains(id)) {
-            ++result.lost;
-            losses_.fetch_add(1, std::memory_order_release);
-        }
+        ++result.lost;
+        losses_.fetch_add(1, std::memory_order_release);
     }
     flush_ledger();
     ledger_->set_verify_next(static_cast<uint16_t>(next));
@@ -1996,7 +2022,6 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
                 Lock lock(m_);
                 presence_.warmed();
             }
-            presence_warm_.store(true, std::memory_order_release);
             Log::debug("storage presence index warmed path=" + root_.string() +
                        " objects=" + std::to_string(entries) +
                        " elapsed_ms=" + std::to_string(elapsed_ms));

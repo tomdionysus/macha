@@ -1433,3 +1433,49 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
     second.stop();
     first.stop();
 }
+
+// A disk that comes back is seen without anything else changing: the survey
+// follows the holdings' identity, not the namespace or the writes.
+MACHA_TEST("availability", test_a_disk_coming_back_is_surveyed_without_a_namespace_change) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("availability-disk");
+    config.replication = 1;
+    config.write_copies = 1;
+    config.metadata_write_copies = 1;
+    config.catalogue.scanner.enabled = false;
+    config.ingest.enabled = false;
+    config.torrent.enabled = false;
+    Service service(config, cluster.keys(), test_durability_window);
+    service.start();
+    (void)service.filesystem();
+
+    const auto extent = config.extent_size;
+    REQUIRE(retry_while_not_ready(
+        [&] { write_file(service.filesystem(), "/held.bin", pattern(extent * 2, 1)); }));
+    const auto local = [&]() -> std::optional<uint64_t> {
+        const auto snapshot = service.availability().snapshot();
+        if (!snapshot)
+            return {};
+        const auto found = snapshot->paths.find("/held.bin");
+        if (found == snapshot->paths.end())
+            return {};
+        return found->second.extents_local;
+    };
+    REQUIRE(wait_until([&] { return local() == 2u; }, 20s));
+
+    const auto backend = config.storage_backends.at(0).path;
+    auto away = backend;
+    away += ".away";
+    std::filesystem::rename(backend, away);
+    service.local_state().data().refresh();
+    REQUIRE(service.local_state().data().online_backends() == 0);
+    REQUIRE(wait_until([&] { return local() == 0u; }, 20s));
+
+    const auto head = service.metadata_manager().snapshot_view().hash;
+    std::filesystem::rename(away, backend);
+    service.local_state().data().refresh();
+    REQUIRE(service.local_state().data().online_backends() == 1);
+    CHECK(wait_until([&] { return local() == 2u; }, 20s));
+    CHECK(service.metadata_manager().snapshot_view().hash == head);
+    service.stop();
+}
