@@ -29,17 +29,12 @@ both horizons as frozen views of them. Still to do:
 From the lock audit (done, 0.90.45 to 0.90.49) and the CPU and memory audit
 of 2026-10-08, ranked:
 
-1. Background work travels as control: maintenance's head repair
-   (`maintenance.cpp:1045`, a full history record on the peer) and cluster
-   job polling and torrent actions run on the 2-worker RPC control lane;
-   `class_allowed` forces it (`net.cpp:438-445`). It can also take the 64 MB
-   control memory reserve.
-2. Whole-record copies inline on control threads (`get_metadata`,
+1. Whole-record copies inline on control threads (`get_metadata`,
    `get_committed_metadata`, `accept_commit`'s decode).
-3. The memory ledger counts few large structures (metadata, catalogue and
+2. The memory ledger counts few large structures (metadata, catalogue and
    cache owners declared, never charged), so the control reserve protects
    counted bytes only; `restore()` overcommits without the reserve.
-4. Not fully traced in the lock audit: `RpcClient::mutex_` holders and
+3. Not fully traced in the lock audit: `RpcClient::mutex_` holders and
    `Membership::m_` bodies.
 
 Waiting on the operator (section 9): CPU priority for background threads

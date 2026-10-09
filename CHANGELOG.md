@@ -1,5 +1,22 @@
 # Current release
 
+## 0.90.66: job traffic and head repair are not control
+
+No API or on-disk changes. Wire: torrent and ingest job messages
+(`get_torrent_jobs`, `torrent_job_action`, `torrent_intent`,
+`get_ingest_jobs`, `ingest_job_action` and their replies) are accepted in any
+frame class; a node before 0.90.66 refuses them outside control, so during a
+rolling deploy a peer's jobs read as unreachable until both nodes run it.
+
+Every peer message that was not bulk data had to travel as control, so
+background work rode the two-worker RPC control lane and could take its
+memory reserve: the job view's polling every few seconds, the torrent
+coordinator's intents and retries, and maintenance's head repair (a whole
+history record from a peer). The job view's polling and the coordinator's
+calls now travel as loader work, a user's ingest job action as viewer work
+(`foreground`), and head repair as speculative work. Test: a job listing
+sent as loader work and a job action sent as viewer work are both served.
+
 ## 0.90.65: a commit's metadata mutations go before background imports
 
 No API, wire, protocol or on-disk changes.

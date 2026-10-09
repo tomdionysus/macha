@@ -433,10 +433,31 @@ bool is_priority_data_message(MessageType type) {
     }
 }
 
+// Torrent and ingest jobs: a user's listing or action travels as the viewer
+// work it is, the job view's polling and the torrent coordinator's calls as
+// loader work; none of it is control.
+bool is_acquisition_message(MessageType type) {
+    switch (type) {
+    case MessageType::get_torrent_jobs:
+    case MessageType::torrent_jobs_reply:
+    case MessageType::torrent_job_action:
+    case MessageType::torrent_job_action_reply:
+    case MessageType::torrent_intent:
+    case MessageType::torrent_intent_reply:
+    case MessageType::get_ingest_jobs:
+    case MessageType::ingest_jobs_reply:
+    case MessageType::ingest_job_action:
+    case MessageType::ingest_job_action_reply:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool class_allowed(MessageType type, FrameType frame_type) {
     if (is_bulk_message(type))
         return frame_type != FrameType::control;
-    if (is_priority_data_message(type))
+    if (is_priority_data_message(type) || is_acquisition_message(type))
         return true;
     if (type == MessageType::ok || type == MessageType::error)
         return true; // Replies inherit the request's frame type.
