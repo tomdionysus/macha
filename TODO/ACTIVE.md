@@ -62,10 +62,10 @@ A failing test is P0: reproduce it before deciding whose it is.
   transcode, and a `FUSE mount disappeared` ERROR during a restart. *Carried.*
 - **Transport backoff after a peer restart**: up to 4 s before a restarted
   peer is dialled. *Carried.*
-- **Known defects of 2026-09-24/25**: `metadata replica is still recovering`
-  and `local metadata replica unavailable` raise a bare `runtime_error` an
-  ingest would fail on; the acquisition API audit's four findings; unverified
-  package names in the install docs. *Carried.*
+- **Known defects of 2026-09-24/25**: the acquisition API audit's four
+  findings; unverified package names in the install docs. *Carried.* (The
+  bare metadata errors: one is gone, the other throws `MetadataNotReady`
+  since 0.90.78.)
 
 ## 2. Replication by diff (the next large piece)
 

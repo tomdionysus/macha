@@ -1,5 +1,19 @@
 # Current release
 
+## 0.90.78: a missing local replica is not ready, not a failure
+
+No API, wire or on-disk changes.
+
+`FileSystem::local_snapshot()` and `local_snapshot_view()` threw a bare
+`runtime_error` ("local metadata replica unavailable") when this node had no
+local metadata record yet. An ingest failed on it (`import_failed`) instead
+of blocking as `metadata_unavailable` and retrying, and the FUSE frontend's
+startup wait, written to wait out `MetadataNotReady` within
+`initial_namespace_timeout`, never caught it, so the mount's construction
+failed into supervisor backoff. Both now throw `MetadataNotReady`. No test:
+a started node creates its local record before anything can ask, even with
+its peer unreachable, so the state is reached only through damaged metadata.
+
 ## 0.90.77: catalogue objects nobody holds are unavailable
 
 No API, wire or on-disk changes.
