@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.79.
+Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.80.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -58,8 +58,6 @@ A failing test is P0: reproduce it before deciding whose it is.
   ways control could wait; watch for a recurrence.
 - **A rejoin or follower convergence retry waits out its backoff**: wake it,
   debounced, with a cap from the first trigger. *Carried.*
-- **Torrent and ingest staging has no mount check**: with node-f's disk absent,
-  staging wrote to the SD card under the mount point. *Carried.*
 - **node-f, 2026-09-29**: a playback `PATCH` 503 after 19.9 s under software
   transcode, and a `FUSE mount disappeared` ERROR during a restart. *Carried.*
 - **Transport backoff after a peer restart**: up to 4 s before a restarted
@@ -264,7 +262,7 @@ on control threads no longer grow with deletes. Left:
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.79**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.80**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.

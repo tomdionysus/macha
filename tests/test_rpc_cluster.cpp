@@ -1236,6 +1236,7 @@ MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_never_a_sur
     CatalogueHintQueue hints(fixture.config().state_path / "catalogue-hints");
     IngestConfig ingest_config;
     ingest_config.staging_path = fixture.path() / "staging";
+    std::filesystem::create_directories(ingest_config.staging_path);
     IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
     SubsystemRegistry registry;
     ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
@@ -3814,6 +3815,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_on_a_node_with_no_namespace_yet_r
     IngestConfig ingest_config;
     ingest_config.enabled = true;
     ingest_config.staging_path = cluster.path() / "staging";
+    std::filesystem::create_directories(ingest_config.staging_path);
     ingest_config.source_roots = {root};
     ingest_config.blocked_retry = 200ms;
     IngestManager ingest(s1.node(), s1.filesystem(), s1.catalogue_hints(), ingest_config);
