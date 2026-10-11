@@ -35,6 +35,10 @@ Bytes json_bytes(Json value) {
 std::optional<StagingStatus> parse_staging(const Json* value) {
     if (!value || !value->isObject()) return std::nullopt;
     StagingStatus out;
+    // A node before 0.90.80 does not say: it made its staging directory
+    // whenever it was missing, so staging was always there.
+    const auto* available = value->find("available");
+    out.available = !available || available->asBool();
     if (const auto* v = value->find("limit_bytes")) out.limit = v->asUInt64();
     if (const auto* v = value->find("disk_bytes")) out.disk_bytes = v->asUInt64();
     if (const auto* v = value->find("reserved_bytes")) out.reserved_bytes = v->asUInt64();

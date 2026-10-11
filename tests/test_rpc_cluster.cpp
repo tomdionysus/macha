@@ -5648,6 +5648,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         CHECK(nodes.front().find("accepting")->asBool());
         CHECK(nodes.front().find("max_active")->asUInt64() == c1.torrent.max_active);
         CHECK(nodes.front().find("staging")->find("limit_bytes")->asUInt64() > 0);
+        // A peer's staging, as polled, says whether its directory is there.
+        CHECK(nodes.front().find("staging")->find("available")->asBool());
     }
 
     // --- Torrent: added through node 2, which runs none; node 1 claims it ---
