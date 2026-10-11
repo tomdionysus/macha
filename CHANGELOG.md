@@ -1,5 +1,23 @@
 # Current release
 
+## 0.90.79: an ingest re-bases when a merge rolls its partial back
+
+No API, wire or on-disk changes.
+
+On 2026-09-23 three torrent-sourced ingests on es-1 died with `concurrent
+file content change`: a reconciliation merge had rolled each partial back
+to an earlier checkpoint of its own writes, and the copy's next checkpoint
+commit found its basis stale and failed the job. A stale basis now throws
+`FsStaleBasis`, still `EAGAIN` to every caller that reads only the code, and
+the ingest catches it: it reopens the partial, continues from the smaller of
+its size and what the copy had written (a partial is the job's alone, so
+what it holds is a prefix of the copy), seeks the source there and logs
+`ingest re-based`. Three re-bases with no commit between them fail the job
+as before. The merge rule and the reconciler (the incident's other two
+parts) are unchanged. Test: an ingest whose partial is rolled back to empty
+while a checkpoint is held completes byte for byte; refusing to re-base
+fails it exactly as the incident did.
+
 ## 0.90.78: a missing local replica is not ready, not a failure
 
 No API, wire or on-disk changes.

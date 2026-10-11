@@ -2378,7 +2378,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
             // replays the generation from the spool against current state.
             if (stale_basis_is_replayable)
                 fail(ESTALE, "publication basis is stale; replay against the current entry");
-            fail(EAGAIN, "concurrent file content change");
+            throw FsStaleBasis("concurrent file content change");
         }
 
         // Keep an mtime set explicitly while open (cp -p, macOS copyfile set

@@ -34,6 +34,14 @@ class FsError : public std::runtime_error {
         return c_;
     }
 };
+// A commit whose basis is stale: the entry's content changed since the
+// handle opened (another writer, or a reconciliation merge rolling the file
+// back to an earlier state of its own writes). EAGAIN like any FsError to a
+// caller that reads only the code; a writer that can re-base catches this.
+class FsStaleBasis final : public FsError {
+  public:
+    explicit FsStaleBasis(const std::string& s) : FsError(EAGAIN, s) {}
+};
 class FileSystem;
 class PlaybackTracker;
 

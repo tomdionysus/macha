@@ -1648,6 +1648,34 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     }
 
     auto output = fs_.open_write(file.temporary_path, false, true);
+    // Commits what has been written. A reconciliation merge can roll the
+    // partial's committed checkpoints back to an earlier state of its own
+    // writes; the commit's basis is then stale, and the copy re-bases on the
+    // entry as it is now and continues from there, the source being at hand.
+    // A partial is this job's alone, so what it holds is a prefix of the copy.
+    constexpr size_t max_rebases = 3;
+    size_t rebases = 0;
+    const auto commit_progress = [&] {
+        try {
+            output->commit();
+            file.copied = output->size();
+            rebases = 0;
+        } catch (const FsStaleBasis& stale) {
+            if (++rebases > max_rebases)
+                throw;
+            output = fs_.open_write(file.temporary_path, false, true);
+            const auto at = std::min<uint64_t>(output->size(), file.copied);
+            Log::warn("ingest re-based id=" + job.id + " path=" + file.temporary_path +
+                      " from=" + std::to_string(file.copied) + " to=" + std::to_string(at) +
+                      ": " + stale.what());
+            file.copied = at;
+            input.clear();
+            input.seekg(static_cast<std::streamoff>(at));
+            if (!input)
+                throw IngestError("source_seek_failed",
+                                  "cannot seek source to re-base: " + source.string());
+        }
+    };
     size_t copy_chunk_bytes = 0;
     {
         Lock lock(mutex_);
@@ -1669,8 +1697,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
             checkpoint_bytes = config_.checkpoint_bytes;
         }
         if (control == IngestJobState::paused || control == IngestJobState::cancelled) {
-            output->commit();
-            file.copied = output->size();
+            commit_progress();
             refresh_progress(job);
             job.state = control;
             job.updated_unix_ms = now_ms();
@@ -1693,8 +1720,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(wanted));
         const auto got = static_cast<size_t>(input.gcount());
         if (!got) {
-            output->commit();
-            file.copied = output->size();
+            commit_progress();
             set_blocked(job, "source_short_read", "short read from source: " + source.string());
             return false;
         }
@@ -1703,8 +1729,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         file.copied += written;
 
         if (file.copied - checkpoint_start >= checkpoint_bytes || file.copied == file.size) {
-            output->commit();
-            file.copied = output->size();
+            commit_progress();
             checkpoint_start = file.copied;
             const auto sample_now = std::chrono::steady_clock::now();
             refresh_progress(job);
@@ -1726,8 +1751,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         }
     }
     if (stop.stop_requested()) {
-        output->commit();
-        file.copied = output->size();
+        commit_progress();
         refresh_progress(job);
         job.updated_unix_ms = now_ms();
         Lock lock(mutex_);
