@@ -2422,14 +2422,14 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
 MetadataSnapshot FileSystem::local_snapshot() const {
     const auto record = local_.replica().current();
     if (!valid_metadata_record(record))
-        throw std::runtime_error("local metadata replica unavailable");
+        throw MetadataNotReady("local metadata replica unavailable");
     return decode_snapshot(record.payload);
 }
 
 MetadataSnapshotView FileSystem::local_snapshot_view() {
     const auto record = local_.replica().current();
     if (!valid_metadata_record(record))
-        throw std::runtime_error("local metadata replica unavailable");
+        throw MetadataNotReady("local metadata replica unavailable");
 
     Lock lock(local_snapshot_mutex_);
     if (!local_snapshot_cache_ || local_snapshot_generation_ != record.generation ||
