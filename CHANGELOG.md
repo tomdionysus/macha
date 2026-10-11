@@ -1,5 +1,22 @@
 # Current release
 
+## 0.90.74: a trie diff asks in larger batches
+
+No API or on-disk changes. Wire: a `trie_diff` records question carries up to
+512 prefixes (children questions stay at 64); a 0.90.73 peer refuses one
+larger than 64 and the asker surveys the tree instead.
+
+Measured on 0.90.73 (2026-10-09): gbni-1's diff against fi-1 sent 955
+questions for 12 MB of replies in 622 s, 618 s of it waiting on fi-1; fi-1's
+against gbni-1 sent 955 for 38 MB in 173 s. The nodes differ by about
+570,000 extents, so most questions read records, 64 prefixes at a time, and
+the cost was per question, not per byte. Records now go 512 prefixes a
+question, and a peer refuses a prefix holding more than a leaf without
+reading it (`ObjectTrie::Snapshot::records` takes a limit) instead of
+reading each prefix twice. Tests: a records question of 512 prefixes
+round-trips and a children question of 512 is refused; records under the
+root of a 3,000-record trie are refused at a leaf's limit.
+
 ## 0.90.73: a pinned trie lives while it is used
 
 No API, wire or on-disk changes.

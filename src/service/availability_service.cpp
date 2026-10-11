@@ -118,8 +118,8 @@ class RemoteTrie final : public TrieSource {
     std::vector<std::vector<ObjectTrie::Record>>
     records(std::span<const ObjectTrie::Prefix> p) override {
         std::vector<std::vector<ObjectTrie::Record>> out;
-        for (size_t from = 0; from < p.size(); from += trie_question_max) {
-            const auto part = p.subspan(from, std::min(trie_question_max, p.size() - from));
+        for (size_t from = 0; from < p.size(); from += trie_records_max) {
+            const auto part = p.subspan(from, std::min(trie_records_max, p.size() - from));
             auto answers = decode_trie_records(ask(question(TrieQuestionKind::records, part)));
             if (answers.size() != part.size())
                 throw std::runtime_error("peer answered a different number of prefixes");
@@ -439,17 +439,12 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
         return {MessageType::trie_diff_reply,
                 encode_trie_children(trie->children(question.prefixes))};
     // Records only where a diff reads them: below a leaf's worth.
-    for (const auto& prefix : question.prefixes) {
-        if (prefix.length >= 32)
-            continue;
-        uint64_t below = 0;
-        const auto children = trie->children(std::span(&prefix, 1));
-        for (const auto& slot : children.front())
-            below += slot.count;
-        if (below > ObjectTrie::leaf_max)
-            return error_reply("prefix_too_large");
+    try {
+        return {MessageType::trie_diff_reply,
+                encode_trie_records(trie->records(question.prefixes, ObjectTrie::leaf_max))};
+    } catch (const std::length_error&) {
+        return error_reply("prefix_too_large");
     }
-    return {MessageType::trie_diff_reply, encode_trie_records(trie->records(question.prefixes))};
 }
 
 RpcMessage AvailabilityService::answer(const RpcMessage& request) const {

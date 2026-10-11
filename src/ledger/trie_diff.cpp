@@ -174,7 +174,7 @@ uint32_t read_count(Reader& reader, size_t max, const char* what) {
 } // namespace
 
 Bytes encode_trie_question(const TrieQuestion& question) {
-    if (question.prefixes.size() > trie_question_max)
+    if (question.prefixes.size() > trie_question_limit(question.kind))
         throw std::invalid_argument("too many prefixes in one trie question");
     Writer writer;
     writer.u8(static_cast<uint8_t>(question.kind));
@@ -198,7 +198,8 @@ TrieQuestion decode_trie_question(std::span<const uint8_t> encoded) {
         throw DecodeError("unknown trie");
     question.trie = static_cast<TrieName>(trie);
     question.at.bytes = reader.fixed<32>();
-    const auto count = read_count(reader, trie_question_max, "prefixes in one trie question");
+    const auto count =
+        read_count(reader, trie_question_limit(question.kind), "prefixes in one trie question");
     question.prefixes.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         question.prefixes.push_back(read_prefix(reader));
@@ -283,7 +284,7 @@ Bytes encode_trie_records(std::span<const std::vector<ObjectTrie::Record>> answe
 
 std::vector<std::vector<ObjectTrie::Record>> decode_trie_records(std::span<const uint8_t> encoded) {
     Reader reader(encoded);
-    const auto count = read_count(reader, trie_question_max, "answers in one trie reply");
+    const auto count = read_count(reader, trie_records_max, "answers in one trie reply");
     std::vector<std::vector<ObjectTrie::Record>> answers(count);
     for (auto& records : answers) {
         const auto size = read_count(reader, ObjectTrie::leaf_max, "records in one trie answer");

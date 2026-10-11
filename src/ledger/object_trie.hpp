@@ -130,8 +130,11 @@ class ObjectTrie {
         // For each prefix (shorter than an id), the 256 subtrees one byte
         // below it. Reads the nodes on the way down and no others.
         std::vector<Children> children(std::span<const Prefix>) const;
-        // For each prefix, every record below it, in id order.
-        std::vector<std::vector<Record>> records(std::span<const Prefix>) const;
+        // For each prefix, every record below it, in id order. Throws
+        // std::length_error, reading nothing below it, for a prefix with more
+        // than `most` records below.
+        std::vector<std::vector<Record>> records(std::span<const Prefix>,
+                                                 uint64_t most = UINT64_MAX) const;
 
       private:
         friend class ObjectTrie;

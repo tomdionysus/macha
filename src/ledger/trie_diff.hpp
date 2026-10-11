@@ -77,11 +77,17 @@ void records_not_held(const ObjectTrie::Snapshot& wanted,
 // The wire form of a question to a peer's trie and its answers. `root` asks
 // for the summary of the peer's current trie and pins that snapshot under
 // its hash; `children` and `records` ask about prefixes of the snapshot
-// pinned under `at`. At most trie_question_max prefixes. Decoding throws
-// DecodeError.
+// pinned under `at`. At most trie_question_max prefixes for children and
+// trie_records_max for records, each below at most a leaf's worth. Decoding
+// throws DecodeError.
 enum class TrieQuestionKind : uint8_t { root = 0, children = 1, records = 2 };
 enum class TrieName : uint8_t { held_data = 0 };
 inline constexpr size_t trie_question_max = 64;
+inline constexpr size_t trie_records_max = 512;
+// The most prefixes one question of this kind carries.
+constexpr size_t trie_question_limit(TrieQuestionKind kind) noexcept {
+    return kind == TrieQuestionKind::records ? trie_records_max : trie_question_max;
+}
 struct TrieQuestion {
     TrieQuestionKind kind{TrieQuestionKind::root};
     TrieName trie{TrieName::held_data};
