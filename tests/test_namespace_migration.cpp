@@ -422,7 +422,9 @@ MACHA_TEST("namespace_migration", test_tombstones_live_in_batches_in_a_tree_back
         service.stop();
     }
     (void)migrate_state(config, cluster.keys(), {node_id});
-    config.maintenance.garbage_grace = 4s;
+    // Longer than the first passes take: a tombstone already past its grace
+    // when the gate first opens is collected outright, not moved into a batch.
+    config.maintenance.garbage_grace = 20s;
     Service service(config, cluster.keys(), test_durability_window);
     service.start();
     REQUIRE(wait_metadata_writable(service));
