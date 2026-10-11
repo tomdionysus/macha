@@ -3355,6 +3355,68 @@ MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_m
     CHECK(!ingest.job(cleared.id).has_value());
 }
 
+// A reconciliation merge can roll a partial back to an earlier state of its
+// own writes. The copy's next commit then has a stale basis: it
+// re-bases on the partial as it is and continues, and the file arrives whole.
+MACHA_TEST("hydration_catalogue", test_ingest_rebases_when_its_partial_is_rolled_back) {
+    CommitGate gate;
+    CatalogueNode node("ingest-rebase", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    constexpr size_t file_bytes = 1024 * 1024;
+    constexpr size_t checkpoint = 256 * 1024;
+    const auto roots = make_import_roots(node.path(), 1, file_bytes);
+    // The partial's creation, then its first checkpoint; held at the second.
+    gate.hold("Concurrent Movie 0 2024.mkv", 2);
+
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = roots;
+    config.copy_chunk_bytes = 64 * 1024;
+    config.checkpoint_bytes = checkpoint;
+    IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
+    struct ReleaseGate {
+        CommitGate& gate;
+        ~ReleaseGate() { gate.release_all(); }
+    } release_gate{gate};
+    const auto id = ingest.submit_path(roots.front());
+    ingest.start();
+    REQUIRE(wait_until([&] { return gate.held() > 0; }, 30s));
+    const auto partial = ingest.job(id)->files.front().temporary_path;
+
+    // Back to an earlier state of its own writes (empty, as at its creation)
+    // while the second checkpoint is held, as the merge did: the entry
+    // changes under the open handle, not through it.
+    bool rolled_back = false;
+    std::thread rollback([&] {
+        auto& fs = node.filesystem();
+        for (int attempt = 0; attempt < 20 && !rolled_back; ++attempt) {
+            try {
+                fs.commit_file(partial, fs.getattr(partial), 0, {}, nullptr);
+                rolled_back = true;
+            } catch (const FsStaleBasis&) {
+                // The held checkpoint landed first: read it and roll back again.
+            }
+        }
+    });
+    gate.release_all();
+    rollback.join();
+    REQUIRE(rolled_back);
+
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest.job(id);
+            return job && (job->state == IngestJobState::failed || all_imports_copied(ingest, {id}));
+        },
+        60s));
+    const auto job = ingest.job(id);
+    CHECK(job->state != IngestJobState::failed);
+    CHECK(job->error.empty());
+    REQUIRE(all_imports_copied(ingest, {id}));
+    CHECK(read_whole(node.filesystem(), job->files.front().destination_path, file_bytes) ==
+          pattern(file_bytes));
+    ingest.stop();
+}
+
 // Integrated: the refusal is Service's claims barrier on the metadata commit,
 // and the ingest's fallback answers it.
 MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_missing) {
