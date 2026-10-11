@@ -171,6 +171,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             const auto status = ingest_.staging().status();
             Json::Object staging;
             staging["path"] = status.path.string();
+            staging["available"] = status.available;
             staging["limit_bytes"] = status.limit;
             staging["disk_bytes"] = status.disk_bytes;
             staging["reserved_bytes"] = status.reserved_bytes;
