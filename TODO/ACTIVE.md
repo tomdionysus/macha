@@ -103,10 +103,8 @@ the walks stay as the fallback until every node runs stage 3.
    1.34 MB/s and it moves about 0.74 MB/s idle, one extent a minute with a
    viewer. **The path is the limit, not repair:** a raw TCP stream gbni-1 to
    fi-1 (fi-1 dialling, as Macha does) runs at 1.39 MB/s, and four parallel
-   streams total 1.3 MB/s, on a line rated 1 Gbps. Traffic routes through
-   each LAN's gateway (10.44.1.1, 10.35.1.1): a site-to-site tunnel or fi-1's
-   downlink caps it at about 11 Mbps, which is the operator's to look at
-   (section 8). So the pipelined window would not speed repair between these
+   streams total 1.3 MB/s: fi-1 is on a Finnish mobile connection, and its
+   downlink is the cap (gbni-1 is on 1 Gbps fibre). So the pipelined window would not speed repair between these
    nodes; what stage 3 still buys is the push list from the diff instead of
    walking every local object, and no probes (already true when the lacks
    come from a diff, since they carry the inventory's generation). fi-1
@@ -226,9 +224,6 @@ on control threads no longer grow with deletes. Left:
 
 ## 8. Waiting on the operator
 
-- **The gbni-1 to fi-1 path runs at about 11 Mbps** (section 2, stage 3):
-  raw TCP 1.39 MB/s, four streams 1.3 MB/s together, through the
-  site-to-site route; on a 1 Gbps line. The tunnel or fi-1's downlink.
 - The replication-by-diff proposal's three open questions.
 - The bootstrap test (section 1): the first write waits for the bootstrap
   checkpoint survey (not the availability survey), or the test retries the
