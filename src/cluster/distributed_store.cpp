@@ -2644,7 +2644,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                             stop = true;
                             break;
                         }
+                        const auto read_started = Clock::now();
                         auto read = local_.data().get(id);
+                        observations().record("maintenance.repair.push_read_us",
+                                              elapsed_us(read_started));
                         if (!read) {
                             note_repair_local_unreadable(id);
                             unreadable = true;
@@ -2728,6 +2731,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     if (plan.id == send.id)
                         plan.keepers.insert(send.peer.id);
             }
+            if (!sends.empty())
+                observations().record("maintenance.repair.push_wait_us", elapsed_us(dispatched));
             if (delivered) {
                 transferred += delivered;
                 // One sample for the batch: its sends shared the link.
