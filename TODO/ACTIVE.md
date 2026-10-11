@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.75.
+Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.78.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -110,7 +110,15 @@ the walks stay as the fallback until every node runs stage 3.
    come from a diff, since they carry the inventory's generation). fi-1
    lacks about 570,000 extents gbni-1 holds (about 2 TB): about 18 days at
    the path's full rate, about 30 at repair's idle rate.
-4. **Catalogue DATA as a `referenced` source** (the catalogue plan's stage
+4. **Catalogue DATA: first part built, 0.90.77.** The inventory's referenced
+   set already held the catalogue's objects, so diff-based lacks (0.90.72)
+   and the push list (0.90.76) cover them; the survey now counts a catalogue
+   object no node holds as `unavailable` (442 on fi-1's first 0.90.77
+   survey, 2026-10-11), so repair stops asking for it. Left: the artwork
+   route still asks peers for a poster nobody holds (1 to 2 s each showing;
+   operator's call, section 8); re-fetching lost artwork from its provider
+   is the catalogue's.
+   Previously planned as: **Catalogue DATA as a `referenced` source** (the catalogue plan's stage
    10). Closes: **artwork held by no online node** (60 of 296 posters,
    2026-09-27) found and pulled, or reported `lost`; the 1 to 2 s remote
    probe per missing poster; `GET catalogue/status` asking the store for
@@ -225,6 +233,12 @@ on control threads no longer grow with deletes. Left:
 ## 8. Waiting on the operator
 
 - The replication-by-diff proposal's three open questions.
+- **Lost posters on the viewer's path**: the artwork route could answer 404
+  at once for an object the last survey found no node holding (442 catalogue
+  objects today), saving 1 to 2 s per showing; the cost is that a poster a
+  peer gained since that survey is refused until the next one. Or the
+  catalogue re-fetches lost artwork from its provider and nothing changes on
+  the read path.
 - The bootstrap test (section 1): the first write waits for the bootstrap
   checkpoint survey (not the availability survey), or the test retries the
   refusal.
@@ -248,7 +262,7 @@ on control threads no longer grow with deletes. Left:
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.75**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.78**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
