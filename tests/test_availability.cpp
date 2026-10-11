@@ -868,6 +868,20 @@ MACHA_FAST_TEST("availability", test_trie_questions_and_answers_survive_the_wire
     auto whole = question;
     whole.prefixes = {ObjectTrie::Prefix{{}, 32}};
     CHECK(refused(decode_trie_question, encode_trie_question(whole)));
+
+    // A records question carries more prefixes than a children question.
+    TrieQuestion many;
+    many.kind = TrieQuestionKind::records;
+    many.prefixes.assign(trie_records_max, ObjectTrie::Prefix{{}, 2});
+    CHECK(decode_trie_question(encode_trie_question(many)) == many);
+    many.kind = TrieQuestionKind::children;
+    bool too_many = false;
+    try {
+        (void)encode_trie_question(many);
+    } catch (const std::invalid_argument&) {
+        too_many = true;
+    }
+    CHECK(too_many);
 }
 
 // One peer's trie as a source that fails after a few questions.
