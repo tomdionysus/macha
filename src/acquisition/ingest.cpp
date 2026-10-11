@@ -389,6 +389,7 @@ IngestJob parse_ingest_job_wire(const Json& value) {
 
 Json staging_capacity_json(const StagingStatus& status) {
     Json::Object out;
+    out["available"] = status.available;
     out["limit_bytes"] = status.limit;
     out["disk_bytes"] = status.disk_bytes;
     out["reserved_bytes"] = status.reserved_bytes;
@@ -398,8 +399,13 @@ Json staging_capacity_json(const StagingStatus& status) {
 }
 
 StagingArea::StagingArea(IngestConfig config)
-    : config_(std::move(config)), limit_(config_.staging_limit) {
-    if (!config_.staging_path.empty()) std::filesystem::create_directories(config_.staging_path);
+    : config_(std::move(config)), limit_(config_.staging_limit) {}
+
+bool StagingArea::available() const {
+    if (config_.staging_path.empty())
+        return false;
+    std::error_code ec;
+    return std::filesystem::is_directory(config_.staging_path, ec) && !ec;
 }
 
 uint64_t StagingArea::disk_usage_locked() const { return directory_bytes(config_.staging_path); }
@@ -489,6 +495,7 @@ StagingStatus StagingArea::status() const {
     Lock lock(mutex_);
     StagingStatus out;
     out.path = config_.staging_path;
+    out.available = available();
     out.limit = limit_.load(std::memory_order_relaxed);
     out.disk_bytes = disk_usage_locked();
     for (const auto& [_, value] : reservations_)
@@ -505,9 +512,17 @@ IngestManager::IngestManager(NodeRuntime& node, FileSystem& fs, CatalogueHintQue
       config_(std::move(config)), enabled_(config_.enabled),
       max_concurrent_jobs_(config_.max_concurrent_jobs), staging_(config_),
       state_file_(node_.config().state_path / "ingest" / "jobs.json") {
+    // Staging under the node's own state directory (the default) is made
+    // here; one configured elsewhere, typically on a disk of its own, is made
+    // by the operator, so a missing disk cannot be staged around.
+    if (!config_.staging_path.empty() && path_under(config_.staging_path, node_.config().state_path))
+        std::filesystem::create_directories(config_.staging_path);
     if (config_.enabled) {
         std::filesystem::create_directories(state_file_.parent_path());
-        if (!config_.staging_path.empty()) std::filesystem::create_directories(config_.staging_path);
+        if (!config_.staging_path.empty() && !staging_.available())
+            Log::warn("ingest staging directory " + config_.staging_path.string() +
+                      " does not exist; nothing is staged until it does (create it on the "
+                      "disk meant to hold it)");
         load_state();
     }
 }
@@ -1281,6 +1296,11 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
 
 bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     std::error_code ec;
+    if (staging_.contains(job.source_path) && !staging_.available()) {
+        set_blocked(job, "staging_unavailable",
+                    "staging directory is missing: " + staging_.path().string());
+        return false;
+    }
     if (!std::filesystem::exists(job.source_path, ec) || ec) {
         set_blocked(job, "source_unavailable", "source path is unavailable");
         return false;
@@ -1560,6 +1580,11 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     if (file.completed) return true;
     const std::filesystem::path source(file.source_path);
     std::error_code ec;
+    if (staging_.contains(source) && !staging_.available()) {
+        set_blocked(job, "staging_unavailable",
+                    "staging directory is missing: " + staging_.path().string());
+        return false;
+    }
     if (!std::filesystem::exists(source, ec) || ec) {
         set_blocked(job, "source_disappeared", "source disappeared while importing: " + source.string());
         return false;

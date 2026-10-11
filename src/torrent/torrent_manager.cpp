@@ -55,6 +55,13 @@ struct TorrentAlreadyAdded : std::runtime_error {
         : std::runtime_error("job " + holder + " already holds this torrent"), job_id(std::move(holder)) {}
 };
 
+// An add while the staging directory is missing: nothing may be created
+// under a mount point whose disk is absent. Never leaves this file.
+struct TorrentStagingUnavailable : std::runtime_error {
+    explicit TorrentStagingUnavailable(const std::filesystem::path& path)
+        : std::runtime_error("staging directory is missing: " + path.string()) {}
+};
+
 std::string info_hash_hex(const lt::info_hash_t& hashes) { return torrent_info_hash_hex(hashes); }
 
 std::string sanitize_text(std::string value, size_t limit = 1024) {
@@ -307,6 +314,9 @@ TorrentService::Placement TorrentManager::place(std::string_view magnet_or_uri, 
         placement.error = held.what();
         placement.job_id = held.job_id;
         placement.job = job(held.job_id);
+    } catch (const TorrentStagingUnavailable& missing) {
+        placement.reason = "staging_unavailable";
+        placement.error = missing.what();
     } catch (const std::exception& error) {
         placement.reason = "add_failed";
         placement.error = error.what();
@@ -339,6 +349,8 @@ TorrentService::Offer TorrentManager::offer() const {
     const auto staging = ingest_.staging().status();
     if (!accept_new_jobs)
         out.not_accepting_reason = "draining";
+    else if (!staging.available)
+        out.not_accepting_reason = "staging_unavailable";
     else if (out.max_active && out.active_jobs >= out.max_active)
         out.not_accepting_reason = "slots_full";
     else if (staging.accounted_bytes >= staging.limit)
@@ -519,6 +531,9 @@ void TorrentManager::restore_jobs() {
         return a.created_unix_ms < b.created_unix_ms;
     });
     std::map<std::string, std::string, std::less<>> restored_by_hash;
+    // Without its staging directory a torrent is added held and blocked, so
+    // nothing is written under the mount point until the directory returns.
+    const bool staging_available = ingest_.staging().available();
     for (const auto& job : restore) {
         if (!job.info_hash.empty()) {
             const auto [holder, first] = restored_by_hash.try_emplace(job.info_hash, job.id);
@@ -552,11 +567,19 @@ void TorrentManager::restore_jobs() {
             // queue would start an auto-managed torrent. Not staging_full jobs:
             // held, a magnet never learns its size, so the staging check that
             // would release it never runs; it re-holds once the size is known.
-            set_hold_at_add(atp, job.state == TorrentJobState::paused);
+            set_hold_at_add(atp, job.state == TorrentJobState::paused || !staging_available);
             atp.flags |= lt::torrent_flags::duplicate_is_error;
             Lock lock(mutex_);
             harden_add_params(atp, config_);
             impl_->handles[job.id] = impl_->session.add_torrent(std::move(atp));
+            if (!staging_available && job.state != TorrentJobState::paused) {
+                auto& blocked = jobs_[job.id];
+                blocked.state = TorrentJobState::blocked;
+                blocked.error_code = "staging_unavailable";
+                blocked.error = "staging directory is missing: " + ingest_.staging().path().string();
+                blocked.updated_unix_ms = unix_ms();
+                save_state_locked();
+            }
         } catch (const std::exception& e) {
             Lock lock(mutex_);
             auto& mutable_job = jobs_[job.id];
@@ -658,6 +681,8 @@ std::string TorrentManager::add_parsed(std::string id, ParsedAdd& parsed, bool h
             Log::info("torrent add refused: job " + *holder + " already holds info_hash=" + info_hash);
             throw TorrentAlreadyAdded(*holder);
         }
+    if (!ingest_.staging().available())
+        throw TorrentStagingUnavailable(ingest_.staging().path());
     std::filesystem::create_directories(job.save_path);
     lt::torrent_handle handle;
     try {
@@ -1226,6 +1251,7 @@ void TorrentManager::loop(std::stop_token stop) {
 }
 
 void TorrentManager::update_jobs() {
+    const bool staging_available = ingest_.staging().available();
     Lock lock(mutex_);
     bool changed = false;
     bool progress_moved = false;
@@ -1296,6 +1322,27 @@ void TorrentManager::update_jobs() {
 
                 auto hit = impl_->handles.find(id);
                 if (hit == impl_->handles.end()) return;
+                // The staging directory gone (its disk absent): held until it
+                // returns, then released where it stopped.
+                const bool staging_blocked =
+                    job.state == TorrentJobState::blocked && job.error_code == "staging_unavailable";
+                if (!staging_available) {
+                    if (!staging_blocked) {
+                        hold_torrent(hit->second);
+                        job.state = TorrentJobState::blocked;
+                        job.error_code = "staging_unavailable";
+                        job.error = "staging directory is missing: " + ingest_.staging().path().string();
+                        job.download_rate = 0;
+                        job.eta_seconds.reset();
+                    }
+                    return;
+                }
+                if (staging_blocked) {
+                    release_torrent(hit->second);
+                    job.state = TorrentJobState::queued;
+                    job.error.clear();
+                    job.error_code.clear();
+                }
                 auto status = hit->second.status(lt::torrent_handle::query_name | lt::torrent_handle::query_accurate_download_counters |
                                                  lt::torrent_handle::query_distributed_copies);
                 job.name = sanitize_text(status.name, 1024);

@@ -218,7 +218,8 @@ class TorrentService {
     // What this node offers for new jobs, for GET /api/v1/torrents/nodes.
     struct Offer {
         bool accepting{};
-        std::string not_accepting_reason; // slots_full, staging_full, draining
+        // staging_unavailable, slots_full, staging_full, draining
+        std::string not_accepting_reason;
         size_t max_active{};
         size_t active_jobs{};
     };

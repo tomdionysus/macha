@@ -1,5 +1,25 @@
 # Current release
 
+## 0.90.80: nothing is staged without its staging directory
+
+API: the staging object (`GET /api/v1/ingest/status`, `GET /api/v1/torrents/nodes`)
+gains `available`; `not_accepting_reason`, a torrent job's `error_code` and
+an ingest job's blocked `error_code` gain `staging_unavailable`; a placement
+can fail with reason `staging_unavailable`. No wire or on-disk changes.
+
+On 2026-09-24, with fi-1's disk absent, torrent and ingest staging wrote to
+the SD card under the empty mount point: Macha created `ingest.staging_path`
+whenever it was missing. It now creates it only when it lies inside
+`state_path` (the default, `<state_path>/tmp/ingest`); one configured
+elsewhere is created once by the operator, on the disk meant to hold it.
+While it is missing nothing is staged: a torrent add is refused
+(`staging_unavailable`), running downloads are held and blocked, restored
+ones are added held, an ingest of a staged source blocks, and each resumes
+by itself when the directory exists again. Both nodes' staging directories
+exist on their disks. Tests: staging is available only while its directory
+exists; an ingest whose staging directory goes blocks as
+`staging_unavailable`, recreates nothing, and completes once it is back.
+
 ## 0.90.79: an ingest re-bases when a merge rolls its partial back
 
 No API, wire or on-disk changes.

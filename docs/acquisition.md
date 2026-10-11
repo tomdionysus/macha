@@ -90,6 +90,7 @@ POST /api/v1/ingest/jobs/{id}/clear
 | `enabled` | `ingest.enabled` on this node |
 | `cleanup.*` | the configured source-cleanup policy (see [Clear and cancel](#what-clear-and-cancel-delete)) |
 | `staging.path` | the staging directory |
+| `staging.available` | whether the staging directory exists; see below |
 | `staging.limit_bytes` | `ingest.staging_limit` |
 | `staging.disk_bytes` | bytes currently on disk under the staging directory |
 | `staging.reserved_bytes` | bytes reserved by running downloads for what they have still to fetch |
@@ -291,6 +292,7 @@ A `blocked` job is retried every `ingest.blocked_retry_ms` until it succeeds or 
 | `source_unreadable` | a source file could not be opened for reading |
 | `source_seek_failed` | a source file could not be positioned to resume a copy |
 | `source_short_read` | a source file returned fewer bytes than expected |
+| `staging_unavailable` | the source is in the staging area and the staging directory is missing (its disk absent) |
 
 `metadata_unavailable` makes the job `blocked`, and the job completes once metadata is writable again.
 
@@ -339,11 +341,11 @@ The download engine is the `libmacha-torrent` subsystem plugin. **Every route an
  "nodes": [{"node_id": "...", "host": "...", "local": false, "reachable": true,
             "as_of_unix_ms": 1790000000000, "accepting": true, "not_accepting_reason": null,
             "max_active": 4, "active_jobs": 1,
-            "staging": {"limit_bytes": 0, "disk_bytes": 0, "reserved_bytes": 0,
+            "staging": {"available": true, "limit_bytes": 0, "disk_bytes": 0, "reserved_bytes": 0,
                         "accounted_bytes": 0, "free_bytes": 0}}]}
 ```
 
-A node without the plugin is not listed. `accepting` is whether it would take a new job now; when false, `not_accepting_reason` is `slots_full` (`active_jobs` has reached `max_active`), `staging_full` (no staging room left), `draining` (`torrent.accept_new_jobs: false`: it keeps its jobs and takes no new ones) or `unreachable`. Another node's figures are from its last poll (`as_of_unix_ms`). `default_remove_after_ms` is `torrent.remove_on_complete_after_ms`, null when off. Node names are not here: join `node_id` with `nodes[]` from `GET /api/v1/status`.
+A node without the plugin is not listed. `accepting` is whether it would take a new job now; when false, `not_accepting_reason` is `staging_unavailable` (the staging directory is missing), `slots_full` (`active_jobs` has reached `max_active`), `staging_full` (no staging room left), `draining` (`torrent.accept_new_jobs: false`: it keeps its jobs and takes no new ones) or `unreachable`. Another node's figures are from its last poll (`as_of_unix_ms`). `default_remove_after_ms` is `torrent.remove_on_complete_after_ms`, null when off. Node names are not here: join `node_id` with `nodes[]` from `GET /api/v1/status`.
 
 ### Status
 
@@ -621,6 +623,7 @@ A failure before handover (`torrent_error`, `torrent_fault`, `ingest_submit_fail
 
 | `error_code` | state | cause | recovers by itself |
 |---|---|---|---|
+| `staging_unavailable` | `blocked` | the staging directory is missing (its disk absent); the download is held and nothing is written | yes, when the directory exists again |
 | `staging_full` | `blocked` | the remaining download does not fit within `ingest.staging_limit`; the download is paused | yes, when the staging area has room |
 | `torrent_error` | `failed` | the download engine reported an error on the torrent | no |
 | `ingest_submit_failed` | `failed` | the finished payload could not be submitted to ingest | no |
@@ -670,6 +673,7 @@ Ingest is part of core and is not affected. With `ingest.enabled` off the ingest
 
 These keys govern what is described here. Their defaults and ranges are in [Streaming, ingest and acquisition](configuration.md#streaming-ingest-and-acquisition) and [`macha.yaml.example`](../macha.yaml.example).
 
+- `ingest.staging_path` must exist. Macha creates it only when it lies inside `state_path` (the default, `<state_path>/tmp/ingest`). A staging directory elsewhere, typically on a disk of its own, is created once by the operator on that disk: then a missing disk leaves it missing, and nothing is staged (adds are refused and downloads held as `staging_unavailable`) instead of being written onto whatever lies under the mount point. Staging resumes by itself when the directory is there again.
 - `ingest.enabled`, `ingest.source_roots`, `ingest.staging_path`, `ingest.staging_limit`, `ingest.max_concurrent_jobs`, `ingest.blocked_retry_ms`, `ingest.copy_chunk_bytes`, `ingest.checkpoint_bytes`
 - `ingest.cleanup.delete_owned_source_on_clear`, `ingest.cleanup.delete_external_source_on_clear`, `ingest.cleanup.delete_owned_source_on_cancel`
 - `torrent.enabled` (requires `ingest.enabled`), `torrent.max_active`, `torrent.max_download_rate`, `torrent.max_upload_rate`, `torrent.disk_threads`

@@ -121,6 +121,11 @@ struct IngestActionResult {
 
 struct StagingStatus {
     std::filesystem::path path;
+    // The staging directory exists. Macha creates it only under its own state
+    // directory; one configured elsewhere is made once, on the disk meant to
+    // hold it, so an absent disk leaves it missing instead of staging onto
+    // whatever lies under the mount point.
+    bool available{};
     uint64_t limit{};
     uint64_t disk_bytes{};
     uint64_t reserved_bytes{};
@@ -143,6 +148,8 @@ class StagingArea {
   public:
     explicit StagingArea(IngestConfig);
     const std::filesystem::path& path() const noexcept { return config_.staging_path; }
+    // Whether the staging directory exists; nothing is staged while it does not.
+    bool available() const;
     uint64_t limit() const noexcept { return limit_.load(std::memory_order_relaxed); }
     void reconfigure_limit(uint64_t limit);
     bool contains(const std::filesystem::path&) const;
