@@ -1,5 +1,17 @@
 # Current release
 
+## 0.90.75: repair's push is measured
+
+No API, wire or on-disk changes. New observations:
+`maintenance.repair.push_read_us` (each local read of an object to push),
+`maintenance.repair.push_wait_us` (each batch, dispatch to the last answer)
+and the gauge `repair_estimated_network_bps`, the bandwidth estimate repair's
+credit is 0.9 of. gbni-1 pushes about 0.78 MB/s with no viewer and one 4 MiB
+extent a minute with one, on a 1 Gbps line, and a sending step takes about
+6.3 s for two extents while fi-1's data barrier averages 8.7 ms: these say
+whether the time goes to the read, the round trip or the pacing between
+steps, before repair's push changes (replication by diff, stage 3).
+
 ## 0.90.74: a trie diff asks in larger batches
 
 No API or on-disk changes. Wire: a `trie_diff` records question carries up to

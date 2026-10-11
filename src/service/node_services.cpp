@@ -172,6 +172,7 @@ std::map<std::string, uint64_t> NodeServices::observation_gauges() {
     gauges["repair_gate_share"] = repair.gate_share;
     gauges["repair_gate_credit"] = repair.gate_credit;
     gauges["repair_prompt_copies"] = repair.prompt_copies;
+    gauges["repair_estimated_network_bps"] = static_cast<uint64_t>(store_.estimated_network_bps());
     // Held for the call, so a subsystem restart cannot pull the frontend out
     // from under it.
     if (auto frontend = registry_.fuse()) {
