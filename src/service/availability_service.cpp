@@ -686,7 +686,15 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                 }
             };
             try {
-                diffed = survey_by_diff(holdings->tries.front(), *holdings->missing,
+                // What this node lacks: the namespace's extents from the roll-up,
+                // and the catalogue's objects (artwork, media indexes) beside them.
+                std::vector<ObjectId> lacking = *holdings->missing;
+                for (const auto& id : inventory->outside_namespace())
+                    if (!holdings->held(id))
+                        lacking.push_back(id);
+                std::sort(lacking.begin(), lacking.end());
+                lacking.erase(std::unique(lacking.begin(), lacking.end()), lacking.end());
+                diffed = survey_by_diff(holdings->tries.front(), lacking,
                                         inventory->lookup(RetentionClass::data), sources, found,
                                         pause);
                 lacks.generation = inventory->generation();
