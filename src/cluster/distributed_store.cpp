@@ -2363,7 +2363,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                               const std::function<bool(const ObjectId&)>& unavailable,
                               std::optional<std::span<const ObjectId>> pull,
                               const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>&
-                                  known_present) {
+                                  known_present,
+                              std::optional<std::span<const ObjectId>> push) {
     RepairResult result;
     result.complete = false;
     auto& transferred = result.bytes_transferred;
@@ -2402,10 +2403,31 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     if (!pull_list || pull_list->empty())
         repair_pull_complete_ = true;
 
+    // A pass over a list and a walk of the store keep different positions:
+    // a change between them starts the push pass again. A new list keeps the
+    // position, and the pass counts as spanning a change.
+    const bool listed = push.has_value();
+    const std::optional<const ObjectId*> push_identity =
+        push ? std::optional<const ObjectId*>(push->data()) : std::nullopt;
+    if (listed != repair_push_listed_) {
+        repair_push_cursor_ = {};
+        reset_push_window();
+        repair_push_settled_ = 0;
+        repair_push_after_.reset();
+        repair_push_resume_.reset();
+        repair_push_complete_ = false;
+        repair_pass_spans_change_ = true;
+    } else if (listed && push_identity != repair_push_identity_ && repair_push_after_) {
+        repair_pass_spans_change_ = true;
+    }
+    repair_push_listed_ = listed;
+    repair_push_identity_ = push_identity;
+
     auto reset_completed_pass = [&] {
         repair_push_cursor_ = {};
         reset_push_window();
         repair_push_settled_ = 0;
+        repair_push_after_.reset();
         repair_pull_after_.reset();
         repair_push_complete_ = false;
         repair_pull_complete_ = !pull_list || pull_list->empty();
@@ -2449,7 +2471,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         // After a restart, skip the saved number of objects by index (no
         // reads). The store's order can shift, so the pass counts as spanning
         // a change and another follows.
-        if (repair_push_resume_) {
+        if (repair_push_resume_ && !listed) {
             uint64_t skipped = 0;
             while (skipped < *repair_push_resume_) {
                 bool pass_complete = false;
@@ -2496,15 +2518,36 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             return keepers >= target && kept_here;
         };
         size_t push_skipped = 0;
+        // The next object to consider: from the list, skipping what this node
+        // no longer holds, or from the store's own walk.
+        auto list_at = listed ? (repair_push_after_ ? std::upper_bound(push->begin(), push->end(),
+                                                                       *repair_push_after_)
+                                                    : push->begin())
+                              : std::span<const ObjectId>::iterator{};
+        const auto next_to_push = [&]() -> std::optional<ObjectId> {
+            if (!listed) {
+                bool pass_complete = false;
+                auto next = local_.data().next_object(repair_push_cursor_, pass_complete);
+                if (!next && pass_complete)
+                    repair_push_cursor_exhausted_ = true;
+                return next;
+            }
+            while (list_at != push->end()) {
+                const auto id = *list_at++;
+                repair_push_after_ = id;
+                if (local_.data().has(id))
+                    return id;
+                ++repair_push_settled_;
+                ++result.push_examined;
+            }
+            repair_push_cursor_exhausted_ = true;
+            return std::nullopt;
+        };
         while (repair_push_window_.size() < scan_budget && !repair_push_cursor_exhausted_ &&
                push_skipped < repair_skip_budget) {
-            bool pass_complete = false;
-            auto next = local_.data().next_object(repair_push_cursor_, pass_complete);
-            if (!next) {
-                if (pass_complete)
-                    repair_push_cursor_exhausted_ = true;
+            auto next = next_to_push();
+            if (!next)
                 break;
-            }
             if (repair_push_window_.empty() && settled_by_holdings(*next)) {
                 ++repair_push_settled_;
                 ++result.push_examined;

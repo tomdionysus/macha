@@ -342,6 +342,10 @@ void Maintenance::run(std::stop_token stop) {
     std::shared_ptr<const std::vector<ObjectId>> pull_missing;
     std::shared_ptr<const InventoryHorizon> pull_inventory;
     std::vector<ObjectId> pull_list;
+    std::shared_ptr<const AvailabilityService::PeerLacks> push_lacks;
+    std::shared_ptr<const InventoryHorizon> push_inventory;
+    std::vector<ObjectId> push_list;
+    bool pushing_listed = false;
 
     while (!stop.stop_requested()) {
         port_.wakeups.fetch_add(1, std::memory_order_relaxed);
@@ -743,6 +747,25 @@ void Maintenance::run(std::stop_token stop) {
                     // known only for the namespace's objects, and only for a
                     // peer that could say.
                     const auto peer_lacks = availability_.peer_lacks();
+                    // What some peer lacks, when every peer's list is whole and
+                    // of this inventory: the push works from it instead of
+                    // walking the store.
+                    if (peer_lacks != push_lacks || inventory != push_inventory) {
+                        push_list.clear();
+                        if (peer_lacks && peer_lacks->complete && inventory &&
+                            peer_lacks->generation == inventory->generation()) {
+                            for (const auto& [peer, ids] : peer_lacks->lacks)
+                                push_list.insert(push_list.end(), ids->begin(), ids->end());
+                            std::sort(push_list.begin(), push_list.end());
+                            push_list.erase(std::unique(push_list.begin(), push_list.end()),
+                                            push_list.end());
+                            pushing_listed = true;
+                        } else {
+                            pushing_listed = false;
+                        }
+                        push_lacks = peer_lacks;
+                        push_inventory = inventory;
+                    }
                     const auto known_present =
                         [&](const NodeId& peer, const ObjectId& id) -> std::optional<bool> {
                         if (!peer_lacks || !inventory ||
@@ -774,7 +797,9 @@ void Maintenance::run(std::stop_token stop) {
                         [this](const ObjectId& id) { return availability_.unavailable(id); },
                         pulling_listed ? std::optional<std::span<const ObjectId>>(pull_list)
                                        : std::nullopt,
-                        known_present);
+                        known_present,
+                        pushing_listed ? std::optional<std::span<const ObjectId>>(push_list)
+                                       : std::nullopt);
                     {
                         // Split by whether a higher class was active as the
                         // step ended: repair idle against repair on its share.

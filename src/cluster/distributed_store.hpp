@@ -173,6 +173,11 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     uint64_t repair_position_saved_{};
     void save_repair_position(bool force);
     std::optional<ObjectId> repair_pull_after_;
+    // The push pass over a given list: the last object taken from it, the
+    // list's identity, and whether the pass is over a list at all.
+    std::optional<ObjectId> repair_push_after_;
+    std::optional<const ObjectId*> repair_push_identity_;
+    bool repair_push_listed_{};
     // The live set's identity when no generation is given: its data, or none
     // for no live set.
     std::optional<const ObjectId*> repair_live_identity_;
@@ -433,6 +438,9 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // `known_present` says whether a peer holds an object without asking it,
     // or nothing when that is not known: the push pass asks only about what
     // it does not know, and settles at once an object every owner holds.
+    // `push`, sorted, is what the push pass considers instead of walking the
+    // store: the objects some peer is known to lack, so a node whose peers
+    // lack nothing reads no directory to find that out.
     uint64_t repair_once(uint64_t byte_budget = 0,
                          std::optional<std::span<const ObjectId>> live = std::nullopt);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
@@ -442,7 +450,8 @@ class DistributedStore final : public Placement, public ControlObjectSource {
                              const std::function<bool(const ObjectId&)>& unavailable = {},
                              std::optional<std::span<const ObjectId>> pull = std::nullopt,
                              const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>&
-                                 known_present = {});
+                                 known_present = {},
+                             std::optional<std::span<const ObjectId>> push = std::nullopt);
     uint64_t scrub_once(uint64_t byte_budget = 0);
     RepairDiagnostics repair_diagnostics() const;
 
