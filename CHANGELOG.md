@@ -1,5 +1,17 @@
 # Current release
 
+## 0.90.81: staging availability reads true across nodes
+
+No API, wire or on-disk changes beyond 0.90.80's.
+
+Checked on the cluster after 0.90.80: each node reported its own staging
+`available: true`, but its view of the other said `false` (the polled
+staging object was parsed without the new field), and
+`GET /api/v1/ingest/status` built its staging object without `available`.
+Both fixed; a node that does not report the field (before 0.90.80) made its
+staging directory on demand and counts as available. Test: node 2 reads node
+1's staging as available.
+
 ## 0.90.80: nothing is staged without its staging directory
 
 API: the staging object (`GET /api/v1/ingest/status`, `GET /api/v1/torrents/nodes`)
