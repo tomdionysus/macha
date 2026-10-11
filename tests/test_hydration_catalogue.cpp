@@ -5074,6 +5074,62 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_failed_hint_outlives_the_job_that_
     CHECK(!hints.get(matched_id).has_value());
 }
 
+// Staging is there only while its directory is: Macha does not make one
+// outside its state directory, and says whether it exists.
+MACHA_FAST_TEST("hydration_catalogue", test_staging_is_available_only_while_its_directory_exists) {
+    TempDir dir;
+    IngestConfig config;
+    config.staging_path = dir.path() / "disk" / "ingest";
+    config.staging_limit = 1ull << 30;
+    StagingArea staging(config);
+    CHECK(!std::filesystem::exists(config.staging_path));
+    CHECK(!staging.available());
+    CHECK(!staging.status().available);
+    CHECK(!staging_capacity_json(staging.status()).find("available")->asBool());
+    std::filesystem::create_directories(config.staging_path);
+    CHECK(staging.available());
+    CHECK(staging.status().available);
+}
+
+// A staged source whose staging directory goes (its disk absent) blocks as
+// staging_unavailable, writes nothing under the mount point, and the import
+// completes by itself once the directory is back.
+MACHA_TEST("hydration_catalogue", test_an_ingest_waits_out_a_missing_staging_directory) {
+    CatalogueNode node("staging-missing");
+    constexpr size_t file_bytes = 256 * 1024;
+    // Canonical, as submit_path resolves the source (macOS's /var is a link).
+    const auto staging_path = std::filesystem::canonical(node.path()) / "disk" / "ingest";
+    const auto staged = staging_path / "torrents" / "job" / "Staged Movie 2024.mkv";
+    (void)write_host_file(staged, pattern(file_bytes));
+
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = staging_path;
+    config.blocked_retry = 200ms;
+    IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
+    const auto id = ingest.submit_path(staged.parent_path(), "torrent", "job", "Staged Movie", false,
+                                       true, true);
+    // The disk goes before the job runs.
+    auto away = staging_path;
+    away += ".away";
+    std::filesystem::rename(staging_path, away);
+    ingest.start();
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest.job(id);
+            return job && job->state == IngestJobState::blocked;
+        },
+        20s));
+    CHECK(ingest.job(id)->error_code == "staging_unavailable");
+    CHECK(!std::filesystem::exists(staging_path));
+
+    std::filesystem::rename(away, staging_path);
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 30s));
+    CHECK(read_whole(node.filesystem(), ingest.job(id)->files.front().destination_path, file_bytes) ==
+          pattern(file_bytes));
+    ingest.stop();
+}
+
 MACHA_FAST_TEST("hydration_catalogue", test_a_discarded_payload_leaves_at_once_and_is_deleted_later) {
     // A discarded payload is renamed into staging's trash, still counted, and
     // deleted when the trash is emptied.
