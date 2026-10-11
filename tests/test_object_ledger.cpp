@@ -354,6 +354,14 @@ MACHA_FAST_TEST("object_ledger", test_a_subtree_reads_the_same_in_every_trie_hol
     prefixes.push_back(prefix_of(id_of(random), 2)); // nothing below it
     const auto expected_children = whole->snapshot().children(prefixes);
     const auto expected_records = whole->snapshot().records(prefixes);
+    // Asked for at most a leaf, the root's thousands are refused unread.
+    bool refused = false;
+    try {
+        (void)whole->snapshot().records(std::span(&prefixes.front(), 1), ObjectTrie::leaf_max);
+    } catch (const std::length_error&) {
+        refused = true;
+    }
+    CHECK(refused);
     whole->checkpoint();
     whole.reset();
     ObjectTrie reopened(whole_dir.path(), key_of(8), small_options());

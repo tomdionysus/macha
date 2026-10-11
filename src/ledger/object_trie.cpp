@@ -768,7 +768,7 @@ ObjectTrie::Snapshot::children(std::span<const Prefix> prefixes) const {
 }
 
 std::vector<std::vector<ObjectTrie::Record>>
-ObjectTrie::Snapshot::records(std::span<const Prefix> prefixes) const {
+ObjectTrie::Snapshot::records(std::span<const Prefix> prefixes, uint64_t most) const {
     std::vector<std::vector<Record>> out(prefixes.size());
     if (root_.empty())
         return out;
@@ -788,6 +788,8 @@ ObjectTrie::Snapshot::records(std::span<const Prefix> prefixes) const {
                     out[i].push_back(record);
             continue;
         }
+        if (node->count > most)
+            throw std::length_error("object trie: more records below a prefix than asked for");
         Child whole;
         whole.count = node->count;
         whole.hash = node->hash;
