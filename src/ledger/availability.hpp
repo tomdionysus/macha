@@ -158,8 +158,8 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
                                        SurveyMemo* made = nullptr);
 
 // The survey from trie diffs: this node's held trie against each peer's.
-// `missing_here` (sorted) is what the namespace refers to that this node
-// lacks; what any peer holds of it is available, the rest unavailable. Each
+// `missing_here` (sorted) is what is referenced that this node lacks; what
+// any peer holds of it is available, the rest unavailable. Each
 // peer's lacks are what this node holds and the peer does not, within
 // `referenced`, sorted, one list per peer in order. Every peer must answer:
 // a peer that fails throws, and the caller surveys the old way.

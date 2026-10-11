@@ -1,5 +1,20 @@
 # Current release
 
+## 0.90.77: catalogue objects nobody holds are unavailable
+
+No API, wire or on-disk changes.
+
+Replication by diff, stage 4, first part. The survey by trie diff now
+checks the catalogue's DATA (artwork, media indexes: the inventory's
+objects outside the namespace) beside the namespace's extents: one this
+node lacks and no peer holds is `unavailable`, so repair's pull passes it
+without asking anyone, as it does a lost extent. Since 0.90.72 the per-peer
+lacks have covered catalogue objects too (they are filtered by the whole
+referenced set), and since 0.90.76 the push sends them from that list. The
+artwork route still asks peers for a poster nobody holds (1 to 2 s); using
+the survey there would put its staleness on the viewer's path, which is the
+operator's decision.
+
 ## 0.90.76: repair pushes what peers lack, not what the disk holds
 
 No API, wire or on-disk changes.
