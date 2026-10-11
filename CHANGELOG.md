@@ -18,6 +18,13 @@ parts) are unchanged. Test: an ingest whose partial is rolled back to empty
 while a checkpoint is held completes byte for byte; refusing to re-base
 fails it exactly as the incident did.
 
+Also: `namespace_migration/test_tombstones_live_in_batches_in_a_tree_backed_head`
+failed about half its runs (on 0.90.70 too). With a 4 s grace the migrated
+head's one tombstone had often matured by the time the tombstone gate first
+opened, so maintenance collected it, correctly, instead of moving it into a
+batch, and the test waited for a batch that never came. Its grace is now
+20 s, longer than the first passes take; 12 of 12 runs pass.
+
 ## 0.90.78: a missing local replica is not ready, not a failure
 
 No API, wire or on-disk changes.
