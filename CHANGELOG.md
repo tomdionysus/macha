@@ -1,5 +1,25 @@
 # Current release
 
+## 0.90.76: repair pushes what peers lack, not what the disk holds
+
+No API, wire or on-disk changes.
+
+Replication by diff, stage 3. When the survey's per-peer lacks come from
+trie diffs (every extent-hosting peer answered, each list covering all that
+is referenced, at the inventory's generation), the push pass works through
+their union, sorted, instead of walking every object on this node's DATA
+disks: a node whose peers lack nothing lists no directory to find that out.
+A listed object this node no longer holds is passed over by a ledger lookup,
+not read. Without such lists (a peer surveyed the old way, or lacks of
+another generation) the pass walks the store as before; a change between
+the two starts the push pass again. The push already sends a peer what it
+is known to lack without probing. Not changed: how fast repair moves bytes.
+Measured 2026-10-11, the bound between gbni-1 and fi-1 is fi-1's mobile
+downlink, about 11 Mbps whatever the sender does (raw TCP, one stream or
+four). Test: given a list, the push sends what it names and examines nothing
+else, passes over a listed object no longer held, and an empty list
+examines nothing.
+
 ## 0.90.75: repair's push is measured
 
 No API, wire or on-disk changes. New observations:

@@ -225,7 +225,7 @@ business, driven by `lost`; not this proposal. The catalogue plan's stage
    and from the roll-up otherwise. Two-node tests: identical holdings cost
    one round; one lost copy is found in two; a peer that refuses falls
    back; a peer that fails mid-descent leaves its share unknown.
-3. **Repair on the diff.** The pull and push lists come from the survey;
+3. **Repair on the diff. Push list built (0.90.76); the pipelined window is not worth it while fi-1's mobile downlink (about 11 Mbps) is the bound.** The pull and push lists come from the survey;
    no presence probe when the lists are from a diff; the pipelined window.
    Measured on the cluster: bytes per second over the WAN against today's
    4 MB in 5 s; probes per step, which should read zero. The walks stay

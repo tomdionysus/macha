@@ -97,7 +97,7 @@ the walks stay as the fallback until every node runs stage 3.
    **0.90.71 and 0.90.72 are committed but not deployed**: the deploy
    script was refused by the auto-mode classifier; fi-1's suites passed
    for 0.90.71 on a clean build.
-3. **Repair on the diff.** Measured first (0.90.75, 2026-10-11, gbni-1
+3. **Repair on the diff: the push list built, 0.90.76.** Measured first (0.90.75, 2026-10-11, gbni-1
    pushing to fi-1): a local read is 40 ms an extent; a two-extent batch
    waits 3.95 s for its answers; repair's bandwidth estimate is 1.25 to
    1.34 MB/s and it moves about 0.74 MB/s idle, one extent a minute with a

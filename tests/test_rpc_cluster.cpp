@@ -861,6 +861,47 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_pushes_from_what_peers_hold_without_a
     CHECK(peer.batch_requests.load() >= 1);
 }
 
+// Given what peers lack, the push considers only that list: it sends what
+// is listed and held here, examines nothing else the store holds, passes
+// over a listed object this node no longer holds, and an empty list
+// examines nothing.
+MACHA_FAST_TEST("rpc_cluster", test_repair_pushes_only_what_the_list_names) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    std::vector<ObjectId> live;
+    for (uint8_t i = 0; i < 6; ++i) {
+        const auto bytes = pattern(64 * 1024, static_cast<uint8_t>(90 + i));
+        REQUIRE(bench.local.data().put(object_id(bytes), bytes));
+        live.push_back(object_id(bytes));
+    }
+    std::sort(live.begin(), live.end());
+    constexpr uint64_t budget = 64ULL * 1024 * 1024;
+    const auto lacking = live[2];
+    const std::function<std::optional<bool>(const NodeId&, const ObjectId&)> lacks_one =
+        [&](const NodeId&, const ObjectId& id) { return std::optional<bool>(id != lacking); };
+
+    const std::vector<ObjectId> none;
+    const auto idle = bench.store()->repair_step(budget, 16, live, {}, 0, {}, std::nullopt,
+                                                 lacks_one, std::span<const ObjectId>(none));
+    CHECK(idle.push_examined == 0);
+    CHECK(peer.puts.load() == 0);
+
+    // Listed and gone from here: passed over, nothing read or sent for it.
+    const auto gone = pattern(64 * 1024, 99);
+    std::vector<ObjectId> listed{lacking, object_id(gone)};
+    std::sort(listed.begin(), listed.end());
+    size_t examined = 0;
+    for (int step = 0; step < 8 && peer.puts.load() == 0; ++step)
+        examined += bench.store()
+                        ->repair_step(budget, 16, live, {}, 0, {}, std::nullopt, lacks_one,
+                                      std::span<const ObjectId>(listed))
+                        .push_examined;
+    CHECK(peer.puts.load() == 1);
+    CHECK(peer.batch_requests.load() == 0);
+    CHECK(examined <= listed.size());
+    CHECK(bench.store()->repair_diagnostics().local_unreadable == 0);
+}
+
 MACHA_FAST_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_with_it) {
     StoreBench bench([](Config& c) { c.replication = 2; });
     RepairPeer peer(bench);

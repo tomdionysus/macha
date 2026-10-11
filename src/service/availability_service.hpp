@@ -135,6 +135,9 @@ class AvailabilityService {
         // lists say nothing about an object added since.
         uint64_t generation{};
         std::map<NodeId, std::shared_ptr<const std::vector<ObjectId>>> lacks;
+        // Every extent-hosting peer answered, and each list covers all that
+        // is referenced (a trie diff), not only the namespace's extents.
+        bool complete{};
     };
     static constexpr Waits peer_lacks_waits = Waits::none;
     static constexpr ThreadSafety peer_lacks_safety = ThreadSafety::thread_safe;

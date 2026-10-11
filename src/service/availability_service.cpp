@@ -690,6 +690,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                                         inventory->lookup(RetentionClass::data), sources, found,
                                         pause);
                 lacks.generation = inventory->generation();
+                lacks.complete = true;
                 for (size_t i = 0; i < hosts.size(); ++i)
                     lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
                                                          std::move(found[i])));
