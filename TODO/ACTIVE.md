@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-09, on `develop`. Both nodes run 0.90.70.
+Last updated: 2026-10-09, on `develop`. Both nodes run 0.90.75.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -97,9 +97,21 @@ the walks stay as the fallback until every node runs stage 3.
    **0.90.71 and 0.90.72 are committed but not deployed**: the deploy
    script was refused by the auto-mode classifier; fi-1's suites passed
    for 0.90.71 on a clean build.
-3. **Repair on the diff**: no presence probes, a pipelined window. Closes:
-   repair bound by the WAN (one step sends two extents and waits; about
-   4 MB in 5 s); logging the resumed push position (the cursors go).
+3. **Repair on the diff.** Measured first (0.90.75, 2026-10-11, gbni-1
+   pushing to fi-1): a local read is 40 ms an extent; a two-extent batch
+   waits 3.95 s for its answers; repair's bandwidth estimate is 1.25 to
+   1.34 MB/s and it moves about 0.74 MB/s idle, one extent a minute with a
+   viewer. **The path is the limit, not repair:** a raw TCP stream gbni-1 to
+   fi-1 (fi-1 dialling, as Macha does) runs at 1.39 MB/s, and four parallel
+   streams total 1.3 MB/s, on a line rated 1 Gbps. Traffic routes through
+   each LAN's gateway (10.44.1.1, 10.35.1.1): a site-to-site tunnel or fi-1's
+   downlink caps it at about 11 Mbps, which is the operator's to look at
+   (section 8). So the pipelined window would not speed repair between these
+   nodes; what stage 3 still buys is the push list from the diff instead of
+   walking every local object, and no probes (already true when the lacks
+   come from a diff, since they carry the inventory's generation). fi-1
+   lacks about 570,000 extents gbni-1 holds (about 2 TB): about 18 days at
+   the path's full rate, about 30 at repair's idle rate.
 4. **Catalogue DATA as a `referenced` source** (the catalogue plan's stage
    10). Closes: **artwork held by no online node** (60 of 296 posters,
    2026-09-27) found and pulled, or reported `lost`; the 1 to 2 s remote
@@ -214,9 +226,10 @@ on control threads no longer grow with deletes. Left:
 
 ## 8. Waiting on the operator
 
-- **Allow the deploy** of 0.90.71/0.90.72 (section 2), refused by the
-  auto-mode classifier on 2026-10-09; and the proposal's three open
-  questions.
+- **The gbni-1 to fi-1 path runs at about 11 Mbps** (section 2, stage 3):
+  raw TCP 1.39 MB/s, four streams 1.3 MB/s together, through the
+  site-to-site route; on a 1 Gbps line. The tunnel or fi-1's downlink.
+- The replication-by-diff proposal's three open questions.
 - The bootstrap test (section 1): the first write waits for the bootstrap
   checkpoint survey (not the availability survey), or the test retries the
   refusal.
