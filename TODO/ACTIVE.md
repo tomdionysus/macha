@@ -100,7 +100,8 @@ A failing test is P0: reproduce it before deciding whose it is.
   start, 2026-10-12 15:35:30Z): `TorrentManager` decides per alert batch,
   so a first batch holding only the loopback `listen_succeeded` warns
   although every routable address bound in the same second. Not at the
-  16:51 start before it. Diagnosed, not fixed.
+  16:51 start before it. Built, 0.90.90: judged 10 s after the first
+  listen report.
 - **Repair counted lost extents as `unsourceable` whenever nothing could
   say: built, 0.90.88** (operator 2026-10-12: three answers, HTTP numbers
   below as above). Every RPC refusal has a status and code; a fetch is

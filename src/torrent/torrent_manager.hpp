@@ -59,6 +59,13 @@ class TorrentManager final : public TorrentService {
     // below are the worker thread's (drain_alerts).
     size_t routable_listen_endpoints_{};
     bool warned_loopback_only_{};
+    // libtorrent reports its listen sockets over several alert batches, so
+    // "loopback only" is judged listen_settle after the first report.
+    std::optional<Clock::time_point> first_listen_;
+    static constexpr auto listen_settle = std::chrono::seconds(10);
+    bool listen_unsettled() const {
+        return first_listen_ && !routable_listen_endpoints_ && !warned_loopback_only_;
+    }
     // "No inbound port" is logged above debug once per session, not repeatedly.
     bool logged_portmap_{};
     bool warned_portmap_failed_{};
