@@ -1,5 +1,20 @@
 # Current release
 
+## 0.90.92: the pull has its own share of a repair step
+
+No API, wire, config or on-disk changes.
+
+Push and pull counted the objects they examined against one budget per
+repair step, and the push ran first. A push pass that settled a full
+window every step held the pull back until the pass ended: after an
+unclean stop on 2026-10-12, fi-1's push examined 57,082 of its 357,000
+objects in 29 minutes, sending nothing (gbni-1 held them all), and its
+pull examined none. Each now has its own count; the step's operation and
+byte budgets are still shared.
+
+Test: a push with 100 objects to settle and one object to pull fetches
+it in the first step (on the old code the pull examined nothing).
+
 ## 0.90.91: a busy peer still says what it does not hold
 
 No API, config or on-disk changes; the presence reply's meaning is

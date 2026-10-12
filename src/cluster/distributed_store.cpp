@@ -2921,6 +2921,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     // pulled while no local backend could store it.
     if (local_.data().online_backends() && !result.credit_limited) {
         bool stopped = false;
+        // The pull's own share of the step: a push pass that fills every
+        // step must not hold the pull back until it ends.
+        size_t pull_scanned = 0;
         // Fetches one object and stores it; empty when DATA admission refuses
         // (the node is stopping).
         const auto pull = [&](const ObjectId& id) -> std::optional<FetchAnswer> {
@@ -2954,7 +2957,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
         const auto now = Clock::now();
         for (auto retry = repair_pull_retries_.begin();
-             retry != repair_pull_retries_.end() && scanned_total < scan_budget;) {
+             retry != repair_pull_retries_.end() && pull_scanned < scan_budget;) {
             const ObjectId id = retry->first;
             if (retry->second.due > now) {
                 ++retry;
@@ -2975,7 +2978,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 stopped = true;
                 break;
             }
-            ++scanned_total;
+            ++pull_scanned;
             if (*answer != FetchAnswer::try_later) {
                 retry = repair_pull_retries_.erase(retry);
                 continue;
@@ -2999,7 +3002,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 ++skipped;
                 ++result.pull_examined;
             };
-            while (it != pull_list->end() && scanned_total < scan_budget &&
+            while (it != pull_list->end() && pull_scanned < scan_budget &&
                    skipped < repair_skip_budget) {
                 if (skipped % 1024 == 0 && yielded())
                     break;
@@ -3027,7 +3030,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     trace_repair("pull " + to_string(id) + " from-cache");
                     repair_pull_after_ = id;
                     ++it;
-                    ++scanned_total;
+                    ++pull_scanned;
                     ++result.pull_examined;
                     continue;
                 }
@@ -3056,7 +3059,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
                 repair_pull_after_ = id;
                 ++it;
-                ++scanned_total;
+                ++pull_scanned;
                 ++result.pull_examined;
             }
             if (it == pull_list->end()) {

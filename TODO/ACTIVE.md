@@ -165,7 +165,8 @@ A failing test is P0: reproduce it before deciding whose it is.
   lease; only "held" needs the validating read, and only that waits.
   Also seen: after an unclean stop fi-1's push walk restarted from its last
   saved position (48,971 examined in 12 min, 357,000 held), and the pull
-  waits behind it, since the push uses each step's scan budget first.
+  waited behind it, since the push used each step's scan budget first:
+  fixed, 0.90.92 (the pull has its own count).
 - **The torrent backend decides "staging on another device" once, at
   start** (fi-1, 2026-10-12 13:52Z: decided before the USB disk mounted,
   though staging and DATA share it), so its DATA-device monitor stayed off
