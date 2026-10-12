@@ -101,11 +101,21 @@ A failing test is P0: reproduce it before deciding whose it is.
   so a first batch holding only the loopback `listen_succeeded` warns
   although every routable address bound in the same second. Not at the
   16:51 start before it. Diagnosed, not fixed.
-- **fi-1's `unsourceable` after the 2026-10-12 power cut**: 353 at 18:26
-  (cumulative since the 16:51 start; gbni-1 counts 13). The first was
-  counted while the USB disk was still spinning up and the backend offline
-  (the backlog's "fi-1 counts a local failure as unsourceable"). Older
-  losses (5,662 counted in September) or new: not yet established.
+- **Repair counts lost extents as `unsourceable` whenever the survey
+  cannot say** (diagnosed 2026-10-12, not fixed). The power cut lost
+  nothing: gbni-1's diff surveys read 201,372 extents held by no node
+  (of 1,072,291) from 09:54Z before it to 14:12Z after, unchanged. fi-1's
+  counts all fell where repair's `unavailable` predicate had no answer:
+  352 in the first minute after the 13:51Z start (before the first survey,
+  backend still offline), one at shutdown (fetches failing "node is
+  stopping"), and 55 at 15:36:24Z right after a survey that read
+  `unavailable=0 unknown=675615 peers_failed=1` while gbni-1 restarted for
+  0.90.87; none after the 15:38:15Z diff survey. Three causes: a failed or
+  first survey leaves the predicate empty, so repair asks the peer for
+  lost extents; a fetch refused by our own shutdown counts; an offline
+  backend's `has()` false sends repair to the peer (the backlog's "fi-1
+  pulls objects it cannot store"). Of the two survey methods, the tree
+  reads 200,930 (without the 442 catalogue objects), the diff 201,372.
 - **fi-1's speculative DATA waits abandoned** after 120 s, eight between
   14:04Z and 14:07Z on 2026-10-12 with 78 KB of 128 MB used and both
   background slots taken (`lower_active=2/2`), ending as the backend's
