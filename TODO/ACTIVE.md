@@ -56,8 +56,7 @@ A failing test is P0: reproduce it before deciding whose it is.
   fixed): `durability_loop` calls `finish_durability_batch`, which wakes
   `release()`, before it adds the batch to the two counters
   (`fuse_frontend.cpp:2396` against 2405-2406), so a reader in that gap
-  sees the batch uncounted. Fix: count before waking. 0.90.90 not deployed
-  until the gate is green.
+  sees the batch uncounted. Fixed in 0.90.90: counted before the wake.
 - **The macOS torrent segfaults are the laptop's libraries, not Macha**
   (2026-10-12). The five cases that start a session crash every run, in
   libtorrent's own thread opening its listen socket (kqueue descriptor pool,

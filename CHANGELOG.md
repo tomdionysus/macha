@@ -1,6 +1,6 @@
 # Current release
 
-## 0.90.90: "loopback only" is judged once the listen sockets settle
+## 0.90.90: "loopback only" judged once the listen sockets settle; FUSE counts before it wakes
 
 No API, wire, config or on-disk changes.
 
@@ -10,6 +10,13 @@ socket, though every routable address bound in the same second (fi-1,
 2026-10-12 15:35:30Z). The warning is now decided 10 s after the first
 listen report, and the worker wakes to decide it even with nothing else
 to do.
+
+The FUSE durability loop woke a closing writer before it counted the
+batch in `durability_batches` and `durability_writes`, so a status read
+straight after `release()` could miss the writer's own writes (fi-1's
+gate, 2026-10-12, one failure in a full run, none in 20 alone). The batch
+is counted once its journal fsync returns, before the wake; durability
+and its timing are unchanged.
 
 ## 0.90.89: a push waits for a peer that cannot say
 
