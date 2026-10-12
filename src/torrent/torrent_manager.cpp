@@ -1175,25 +1175,50 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
         }
     };
     // The DATA device's monitor hears the torrent's I/O only when staging
-    // shares a DATA backend's device.
-    struct stat staging_stat {};
-    bool shared = false;
-    if (::stat(ingest_.staging().path().c_str(), &staging_stat) == 0) {
-        for (const auto& backend : node_.config().storage_backends) {
-            struct stat backend_stat {};
-            if (::stat(backend.path.c_str(), &backend_stat) == 0 &&
-                backend_stat.st_dev == staging_stat.st_dev)
-                shared = true;
-        }
-    }
-    if (shared) {
-        hooks.observe = [monitor = &local_.data().service_monitor()](
-                            std::chrono::nanoseconds elapsed, uint64_t bytes) {
+    // shares a DATA backend's device. Asked again every 30 s: a disk can be
+    // mounted under staging or a backend after the node starts.
+    struct Device {
+        std::filesystem::path staging;
+        std::vector<std::filesystem::path> backends;
+        Mutex mutex;
+        Clock::time_point checked MACHA_GUARDED_BY(mutex){};
+        bool shared MACHA_GUARDED_BY(mutex){};
+        bool known MACHA_GUARDED_BY(mutex){};
+    };
+    auto device = std::make_shared<Device>();
+    device->staging = ingest_.staging().path();
+    for (const auto& backend : node_.config().storage_backends)
+        device->backends.push_back(backend.path);
+    const auto shares_data_device = [device] {
+        Lock lock(device->mutex);
+        const auto now = Clock::now();
+        if (device->known && now - device->checked < std::chrono::seconds(30))
+            return device->shared;
+        device->checked = now;
+        bool shared = false;
+        struct stat staging_stat {};
+        if (::stat(device->staging.c_str(), &staging_stat) == 0)
+            for (const auto& path : device->backends) {
+                struct stat backend_stat {};
+                if (::stat(path.c_str(), &backend_stat) == 0 &&
+                    backend_stat.st_dev == staging_stat.st_dev)
+                    shared = true;
+            }
+        if (!device->known || shared != device->shared)
+            Log::info(std::string("torrent disk backend monitor=") +
+                      (shared ? "data-device" : "none (staging on another device)"));
+        device->known = true;
+        device->shared = shared;
+        return shared;
+    };
+    (void)shares_data_device();
+    hooks.observe = [monitor = &local_.data().service_monitor(),
+                     shares_data_device](std::chrono::nanoseconds elapsed, uint64_t bytes) {
+        if (shares_data_device())
             monitor->note(elapsed, bytes);
-        };
-    }
+    };
     Log::info("torrent disk backend threads=" + std::to_string(hooks.threads) +
-              " admission=loader monitor=" + (shared ? "data-device" : "none (staging on another device)"));
+              " admission=loader");
     return hooks;
 }
 
