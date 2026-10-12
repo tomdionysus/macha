@@ -49,6 +49,15 @@ A failing test is P0: reproduce it before deciding whose it is.
   `rpc_cluster/test_rpc_metadata_executor_cancellation_disconnect_and_shutdown`
   (laptop, 2026-10-12, `exit=1` with no assertion printed, in a three-test
   group; passed alone and in the group after).
+- **`filesystem_fuse/test_fuse_frontend_local_semantics`** failed in
+  fi-1's 0.90.90 gate (2026-10-12; 20 of 20 alone): after `release()`,
+  `status().durability_writes` was short of the 128 writes and
+  `durability_batches < durability_writes` failed. Mechanism (diagnosed, not
+  fixed): `durability_loop` calls `finish_durability_batch`, which wakes
+  `release()`, before it adds the batch to the two counters
+  (`fuse_frontend.cpp:2396` against 2405-2406), so a reader in that gap
+  sees the batch uncounted. Fix: count before waking. 0.90.90 not deployed
+  until the gate is green.
 - **The macOS torrent segfaults are the laptop's libraries, not Macha**
   (2026-10-12). The five cases that start a session crash every run, in
   libtorrent's own thread opening its listen socket (kqueue descriptor pool,
