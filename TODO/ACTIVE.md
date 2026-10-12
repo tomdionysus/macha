@@ -105,8 +105,10 @@ A failing test is P0: reproduce it before deciding whose it is.
   say: built, 0.90.88** (operator 2026-10-12: three answers, HTTP numbers
   below as above). Every RPC refusal has a status and code; a fetch is
   `ok`, `not_found` or `try_later`; repair counts only `not_found` and
-  backs off on `try_later`. Read after deploy: fi-1's `unsourceable` after
-  a restart, against the 352 and 55 below. Still two-state: repair's
+  backs off on `try_later`. Read after deploy (16:53Z): 0 on both nodes,
+  fi-1 having examined 43,188 through a survey that read `unavailable=0
+  unknown=674400 peers_failed=1` while gbni-1 restarted (the window that
+  counted 55 on 0.90.87). Still two-state: repair's
   presence round (`validated_presence`) answers "absent" for a peer whose
   request failed, so a busy peer may be pushed a copy it holds. Diagnosis
   (2026-10-12): The power cut lost
