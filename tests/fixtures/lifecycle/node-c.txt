@@ -17,7 +17,6 @@ start subsystems
 start maintenance
 services ready
 stop catalogue-http
-cancel-io filesystem
 request_stop maintenance
 request_stop catalogue-installer
 request_stop streaming
@@ -26,6 +25,7 @@ request_stop ingest
 request_stop hydration
 request_stop scanner
 request_stop media-information
+cancel-io filesystem
 stop subsystems
 stop torrent-coordinator
 stop cluster-jobs

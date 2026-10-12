@@ -3272,6 +3272,83 @@ MACHA_TEST("rpc_cluster", test_failed_convergence_retries_once_per_burst_of_even
     s1.stop();
 }
 
+// A node stopping while an ingest copies: the job is interrupted, not failed,
+// and resumes after the restart.
+MACHA_TEST("rpc_cluster", test_an_ingest_interrupted_by_its_node_stopping_resumes) {
+    TestCluster cluster(ConfigProfile::isolated);
+    TempDir sources;
+    const auto source_dir = std::filesystem::canonical(sources.path());
+    constexpr size_t file_bytes = 96 * 1024 * 1024;
+    const auto source = source_dir / "Interrupted Movie 2024.mkv";
+    {
+        std::ofstream out(source, std::ios::binary);
+        const auto bytes = pattern(file_bytes);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    auto config = cluster.node_config("ingest-stop", free_port());
+    // ingest.enabled requires the scanner; the movie root names the
+    // destination, and no provider is asked.
+    config.catalogue.scanner.enabled = true;
+    config.catalogue.scanner.movies.enabled = true;
+    config.catalogue.scanner.movies.roots = {"/Movies"};
+    config.catalogue.scanner.movies.tmdb.enabled = false;
+    config.catalogue.scanner.tv.enabled = false;
+    config.ingest.enabled = true;
+    config.ingest.source_roots = {source_dir};
+
+    // Each step of the stop is held, so whatever the stop cancels has time to
+    // fail before the next step.
+    ServiceInstruments instruments;
+    instruments.lifecycle = [](std::string_view event) {
+        if (event.starts_with("cancel-io") || event.starts_with("request_stop"))
+            std::this_thread::sleep_for(100ms);
+    };
+    std::string id;
+    {
+        Service service(config, cluster.keys(), test_durability_window, {}, {}, {}, instruments);
+        service.start();
+        REQUIRE(wait_until([&] { return service.ready(); }, 30s));
+        id = service.ingest().submit_path(source, "filesystem");
+        REQUIRE(wait_until(
+            [&] {
+                const auto job = service.ingest().job(id);
+                return job && job->state == IngestJobState::importing && job->bytes_completed > 0;
+            },
+            20s));
+        service.stop();
+    }
+
+    Service service(config, cluster.keys(), test_durability_window);
+    service.start();
+    REQUIRE(wait_until([&] { return service.ready(); }, 30s));
+    const auto restored = service.ingest().job(id);
+    REQUIRE(restored.has_value());
+    CHECK(restored->state != IngestJobState::failed);
+    CHECK(restored->error.empty());
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = service.ingest().job(id);
+            return job && (job->state == IngestJobState::completed ||
+                           job->state == IngestJobState::cataloguing);
+        },
+        60s));
+    const auto done = service.ingest().job(id);
+    Bytes copied(file_bytes);
+    auto reader = service.filesystem().open_read(done->files.front().destination_path);
+    size_t read = 0;
+    while (read < copied.size()) {
+        const auto got =
+            reader->read(read, std::span<uint8_t>(copied.data() + read, copied.size() - read));
+        if (!got)
+            break;
+        read += got;
+    }
+    copied.resize(read);
+    CHECK(copied == pattern(file_bytes));
+    service.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_reconciliation) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

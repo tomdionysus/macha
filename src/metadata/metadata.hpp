@@ -9,6 +9,8 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
+#include <vector>
 namespace macha {
 enum class EntryType : uint8_t { directory = 1, file = 2 };
 
@@ -290,9 +292,14 @@ constexpr bool metadata_delta_succession_valid(uint64_t parent_generation,
     return parent_generation < child_generation;
 }
 
+inline constexpr size_t merge_conflict_keys_kept = 16;
+
 struct MetadataMergeResult {
     MetadataSnapshot snapshot;
     size_t conflicts_created{};
+    // The key of each conflict this merge created, at most
+    // `merge_conflict_keys_kept`; `conflicts_created` counts them all.
+    std::vector<std::string> created_keys{};
     // Dropped by prune_superseded_conflicts().
     size_t conflicts_superseded{};
 };
