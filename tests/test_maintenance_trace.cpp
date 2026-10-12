@@ -191,6 +191,10 @@ class TracedNode {
         config.maintenance.foreground_quiet = 50ms;
         config.maintenance.garbage_grace = 1h;
         config.maintenance.no_progress_backoff = 5min;
+        // Traces compare decisions, not retry timing: a convergence retry
+        // runs on its first trigger, as the steps expect.
+        config.maintenance.convergence_settle = 0ms;
+        config.maintenance.convergence_max_delay = 0ms;
         config.maintenance.scrub_fraction = 0.0;
     }
 

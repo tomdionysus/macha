@@ -79,6 +79,12 @@ struct MaintenanceConfig {
     // Pause after a no-op pass, so a settled node stays quiescent instead of
     // rescanning because byte credit remains.
     std::chrono::milliseconds no_progress_backoff{300000};
+    // A metadata or topology event while a failed convergence run backs off
+    // brings its retry forward: the retry runs this long after the last such
+    // event, so a burst is one run,
+    std::chrono::milliseconds convergence_settle{1000};
+    // and no later than this after the first, so a stream cannot hold it.
+    std::chrono::milliseconds convergence_max_delay{10000};
     // Loader/speculative DATA leases (publication and repair, one extent each)
     // active at once; viewer work never counts. 0 = half the hardware threads,
     // minimum 1.
