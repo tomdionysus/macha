@@ -5,6 +5,7 @@
 
 #include "catalogue/catalogue.hpp"
 #include "catalogue/catalogue_hints.hpp"
+#include "catalogue/cluster_unmatched.hpp"
 #include "filesystem/filesystem.hpp"
 #include "http/http.hpp"
 #include "metadata/metadata_manager.hpp"
@@ -27,6 +28,8 @@ class ManageApi {
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
     CatalogueScanner& scanner_;
+    // The peers' unmatched files; none on a node without peers to ask.
+    const ClusterUnmatchedView* peers_unmatched_;
     Mutex identity_audit_mutex_;
     std::condition_variable_any identity_audit_cv_;
     std::map<std::string, IdentityAssociationReset, std::less<>> identity_audit_pending_
@@ -37,10 +40,13 @@ class ManageApi {
     void identity_reset_audit_loop(std::stop_token);
     HttpResponse dispatch(const HttpRequest&);
     HttpResponse title_files(const HttpRequest&);
+    // An unmatched file by hint id, from this node's hints or a peer's.
+    std::optional<CatalogueHint> unmatched_hint(std::string_view id) const;
 
   public:
     ManageApi(NodeRuntime& node, MetadataView& metadata, FileSystem& fs,
-              CatalogueManager& catalogue, CatalogueHintQueue& hints, CatalogueScanner& scanner);
+              CatalogueManager& catalogue, CatalogueHintQueue& hints, CatalogueScanner& scanner,
+              const ClusterUnmatchedView* peers_unmatched = nullptr);
     ~ManageApi();
     void request_stop();
     void stop();

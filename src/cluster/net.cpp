@@ -435,10 +435,11 @@ bool is_priority_data_message(MessageType type) {
     }
 }
 
-// Torrent and ingest jobs: a user's listing or action travels as the viewer
-// work it is, the job view's polling and the torrent coordinator's calls as
-// loader work; none of it is control.
-bool is_acquisition_message(MessageType type) {
+// A node's own records a peer lists or acts on (torrent and ingest jobs,
+// unmatched files): a user's listing or action travels as the viewer work it
+// is, the views' polling and the torrent coordinator's calls as loader work;
+// none of it is control.
+bool is_node_record_message(MessageType type) {
     switch (type) {
     case MessageType::get_torrent_jobs:
     case MessageType::torrent_jobs_reply:
@@ -450,6 +451,8 @@ bool is_acquisition_message(MessageType type) {
     case MessageType::ingest_jobs_reply:
     case MessageType::ingest_job_action:
     case MessageType::ingest_job_action_reply:
+    case MessageType::get_unmatched_hints:
+    case MessageType::unmatched_hints_reply:
         return true;
     default:
         return false;
@@ -459,7 +462,7 @@ bool is_acquisition_message(MessageType type) {
 bool class_allowed(MessageType type, FrameType frame_type) {
     if (is_bulk_message(type))
         return frame_type != FrameType::control;
-    if (is_priority_data_message(type) || is_acquisition_message(type))
+    if (is_priority_data_message(type) || is_node_record_message(type))
         return true;
     if (type == MessageType::ok || type == MessageType::error)
         return true; // Replies inherit the request's frame type.
@@ -711,6 +714,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "tree_holdings";
     case MessageType::trie_diff:
         return "trie_diff";
+    case MessageType::get_unmatched_hints:
+        return "get_unmatched_hints";
     case MessageType::torrent_intent:
         return "torrent_intent";
     case MessageType::dial_request:
@@ -765,6 +770,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "tree_holdings_reply";
     case MessageType::trie_diff_reply:
         return "trie_diff_reply";
+    case MessageType::unmatched_hints_reply:
+        return "unmatched_hints_reply";
     case MessageType::torrent_intent_reply:
         return "torrent_intent_reply";
     case MessageType::user_sync:

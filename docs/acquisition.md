@@ -144,7 +144,7 @@ These four share one code; only the message tells them apart.
 
 Each item is an [ingest job](#the-ingest-job-object) without `files` and without `catalogue.items`, plus `node_id`. `sources` says where the jobs came from and how old they are: the answering node's own are live (`local: true`); another node's are from its last poll, at most about `refresh_interval_ms` old. `reachable: false` means that node's jobs are shown from its last successful poll at `as_of_unix_ms` and may be stale; a node never reached contributes no jobs and has `as_of_unix_ms` null.
 
-`GET /api/v1/ingest/jobs/{id}` answers the one job, with `files` and `catalogue.items` when the answering node owns it, plus `node_id`. `404 not_found` if no node it has heard from has it.
+`GET /api/v1/ingest/jobs/{id}` answers the one job, with `files`, `catalogue.items` and `node_id`. A job another node owns is that node's own answer, asked when the request is made; when that node cannot be asked (unreachable, or before 0.90.84) the job is as last polled and `catalogue.items` is null. `404 not_found` if no node it has heard from has it.
 
 ### Actions
 
@@ -226,7 +226,7 @@ Each item is an [ingest job](#the-ingest-job-object) without `files` and without
 |---|---|
 | `total`, `pending`, `catalogued`, `no_match`, `failed` | file counts |
 | `state` | `processing` while the job is `cataloguing` or any file is pending; otherwise `waiting` if nothing has been counted and the job is not `completed`; otherwise `completed_with_issues` if any file failed or matched nothing; otherwise `completed` |
-| `items` | single-job `GET` only, and only filled when the answering node owns the job; for a job on another node it is an empty array |
+| `items` | single-job `GET` only: the owning node's, or null when that node could not be asked |
 
 Each `catalogue.items` entry:
 
@@ -396,7 +396,7 @@ The query is sent to every enabled Torznab provider on this node. A provider tha
 | `size_bytes`, `seeders`, `leechers` | integer or null | null when the provider did not say |
 | `published` | string or null | the provider's publication date, as the provider wrote it |
 
-The server returns results ordered by `seeders`, highest first, with unknown counts last.
+Results come in provider order (providers as configured, each provider's results as its feed listed them); clients sort.
 
 **An `acquisition_ref` is valid for 30 minutes, and only on the node that ran the search.** The magnet or `.torrent` URL behind it never leaves the server. Up to 4096 references are held per node; beyond that the ones closest to expiry are dropped.
 
@@ -555,7 +555,7 @@ A job with `remove_after_ms` set is removed that long after it completes -- afte
 | `download_rate` | integer | bytes per second. Once linked, the ingest's copy rate |
 | `upload_rate`, `uploaded_total` | integer | bytes per second, and bytes uploaded all-time |
 | `peers`, `seeds` | integer | connected peers and seeds |
-| `catalogue` | object | the linked ingest's catalogue counts, with the same fields as the ingest's `catalogue` minus `items`. `state` is `processing` if anything is pending; otherwise `completed_with_issues` or `completed` if anything was counted; otherwise `waiting` |
+| `catalogue` | object | the linked ingest's catalogue counts, with the same fields as the ingest's `catalogue` minus `items`; `state` follows the ingest's rule, with the torrent's own `cataloguing` and `completed` states |
 | `eta_seconds` | integer or null | null when there is no rate to estimate from. Once linked, the ingest's |
 | `progress` | number or null | `bytes_completed / bytes_total`, capped at 1; null while `bytes_total` is 0 |
 | `ingest_job_id` | string or null | the ingest job the payload was submitted as; null until then |

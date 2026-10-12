@@ -62,6 +62,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                  node_.config().read_ahead_extents),
       ingest_(node_, filesystem_, catalogue_hints_, node_.config().ingest, &media_information_),
       torrent_search_(node_.config().torrent), cluster_jobs_(node_, ingest_, registry_),
+      cluster_unmatched_(node_, catalogue_hints_),
       torrent_coordinator_(node_, metadata_, registry_, cluster_jobs_, node_.config().state_path),
       acquisition_api_(ingest_, registry_, torrent_search_, cluster_jobs_, torrent_coordinator_),
       catalogue_api_(
@@ -90,7 +91,8 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                                                        Clock::now() + std::chrono::seconds(30));
           },
           [this] { return availability_.snapshot(); }),
-      manage_api_(node_, metadata_, filesystem_, catalogue_, catalogue_hints_, scanner_),
+      manage_api_(node_, metadata_, filesystem_, catalogue_, catalogue_hints_, scanner_,
+                  &cluster_unmatched_),
       streaming_(
           filesystem_, resources_.transcode_rates, resources_.memory, catalogue_,
           node_.config().catalogue.api, node_.config().streaming, media_engine_,
@@ -121,6 +123,11 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return RpcMessage{MessageType::ingest_job_action_reply,
                                        ingest_.handle_job_action(request.payload)};
+                 });
+    routes_.bind(MessageType::get_unmatched_hints,
+                 [this](const NodeInfo&, FrameType, const RpcMessage& request) {
+                     return RpcMessage{MessageType::unmatched_hints_reply,
+                                       cluster_unmatched_.handle_query(request.payload)};
                  });
     routes_.bind(MessageType::torrent_intent,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
@@ -189,6 +196,7 @@ std::map<std::string, uint64_t> NodeServices::observation_gauges() {
 NodeServices::~NodeServices() {
     stop();
     routes_.unbind(MessageType::torrent_intent);
+    routes_.unbind(MessageType::get_unmatched_hints);
     routes_.unbind(MessageType::ingest_job_action);
     routes_.unbind(MessageType::get_ingest_jobs);
 }
@@ -207,6 +215,8 @@ void NodeServices::start() {
     ingest_.start();
     note("start cluster-jobs");
     cluster_jobs_.start();
+    note("start cluster-unmatched");
+    cluster_unmatched_.start();
     note("start torrent-coordinator");
     torrent_coordinator_.start();
     note("start streaming");
@@ -259,7 +269,7 @@ void NodeServices::request_stop() {
 }
 
 // Dependants stop before providers. The producers (plugins, torrent
-// coordinator, cluster job view) stop before maintenance, while the node still
+// coordinator, cluster job and unmatched views) stop before maintenance, while the node still
 // admits DATA work and outbound RPC; then outbound calls are cancelled so the
 // joins that follow cannot wait on a slow peer.
 void NodeServices::stop() {
@@ -271,6 +281,8 @@ void NodeServices::stop() {
     subsystems_.stop();
     note("stop torrent-coordinator");
     torrent_coordinator_.stop();
+    note("stop cluster-unmatched");
+    cluster_unmatched_.stop();
     note("stop cluster-jobs");
     cluster_jobs_.stop();
     note("request_stop metadata-replicator");

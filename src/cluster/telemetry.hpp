@@ -16,6 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace macha {
@@ -163,6 +164,13 @@ struct TelemetryView {
     std::chrono::milliseconds age{};
     bool fresh{};
 };
+
+// A release as (major, minor, patch).
+using ReleaseVersion = std::tuple<unsigned, unsigned, unsigned>;
+// "0.82.1+abc" as (0, 82, 1); none if it is not three numbers.
+std::optional<ReleaseVersion> parse_release_version(std::string_view);
+// Whether `peer`'s last telemetry names `first` or later. No telemetry: no.
+bool runs_at_least(const std::vector<NodeTelemetry>&, const NodeId& peer, ReleaseVersion first);
 
 Bytes encode_node_telemetry(const NodeTelemetry&);
 NodeTelemetry decode_node_telemetry(std::span<const uint8_t>);

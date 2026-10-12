@@ -21,7 +21,8 @@ class NodeRuntime;
 
 // Every node's torrent and ingest jobs, as seen from this node: local live
 // state plus each peer's last answer to a background poll, with its age, so
-// job routes never wait on peers. Actions go to the job's owning node.
+// job lists never wait on peers. Actions, and one ingest job's detail, go to
+// the job's owning node.
 // A peer without the torrent plugin answers "torrents not available".
 class ClusterJobView {
   public:
@@ -79,6 +80,10 @@ class ClusterJobView {
     };
     IngestListing ingest_jobs() const;
     std::optional<ClusterIngestJob> ingest_job(std::string_view id) const;
+    // One ingest job as the API shows it, with `files`, `catalogue.items` and
+    // `node_id`: this node's own, else its owner's answer. When the owner
+    // cannot answer, the job as last polled with `catalogue.items` null.
+    std::optional<Json> ingest_job_detail(std::string_view id);
     IngestActionResult ingest_action(std::string_view id, std::string_view action);
 
   private:

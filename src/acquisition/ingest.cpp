@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "acquisition/ingest.hpp"
+#include "acquisition/catalogue_state.hpp"
 #include "durable_file.hpp"
 
 #include "crypto.hpp"
@@ -287,14 +288,9 @@ Json catalogue_summary_json(const IngestJob& job, const CatalogueHintSummary* de
     out["catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
     out["no_match"] = static_cast<uint64_t>(job.catalogue_no_match);
     out["failed"] = static_cast<uint64_t>(job.catalogue_failed);
-    if (job.state == IngestJobState::cataloguing || job.catalogue_pending)
-        out["state"] = "processing";
-    else if (!job.catalogue_total && job.state != IngestJobState::completed)
-        out["state"] = "waiting";
-    else if (job.catalogue_failed || job.catalogue_no_match)
-        out["state"] = "completed_with_issues";
-    else
-        out["state"] = "completed";
+    out["state"] = std::string(catalogue_state(
+        job.catalogue_total, job.catalogue_pending, job.catalogue_no_match, job.catalogue_failed,
+        job.state == IngestJobState::cataloguing, job.state == IngestJobState::completed));
 
     if (detail) {
         Json::Array items;
@@ -543,12 +539,15 @@ Bytes IngestManager::handle_jobs_query(std::span<const uint8_t> request_payload)
         }
     }
     Json::Array out_jobs;
+    Json::Object out;
     if (job_id.empty()) {
         for (const auto& job : jobs()) out_jobs.push_back(ingest_job_wire_json(job));
     } else if (auto found = job(job_id)) {
         out_jobs.push_back(ingest_job_wire_json(*found));
+        // One job asked for: also as the API shows it, with its catalogue items.
+        const auto summary = catalogue_summary(job_id);
+        out["job_api"] = ingest_job_json(*found, true, &summary);
     }
-    Json::Object out;
     out["jobs"] = std::move(out_jobs);
     const auto text = Json(std::move(out)).dump();
     return Bytes(text.begin(), text.end());

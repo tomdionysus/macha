@@ -11,6 +11,7 @@ start scanner
 start hydration
 start ingest
 start cluster-jobs
+start cluster-unmatched
 start torrent-coordinator
 start streaming
 start subsystems
@@ -28,6 +29,7 @@ request_stop media-information
 cancel-io filesystem
 stop subsystems
 stop torrent-coordinator
+stop cluster-unmatched
 stop cluster-jobs
 request_stop metadata-replicator
 cancel-io outbound-rpc

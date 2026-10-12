@@ -1,5 +1,27 @@
 # Current release
 
+## 0.90.87: the unmatched list is the cluster's; the acquisition audit's API changes
+
+API and wire changes, announced to Core and every client before release.
+
+- `GET /api/v1/manage/unmatched` lists every node's unmatched files. A
+  scan's records stay on the node that scanned, so each node listed only
+  what arrived while it coordinated scanning (674 on fi-1, 614 on gbni-1,
+  748 in all, 2026-10-12). Each node now polls its peers' records every
+  30 s with the new `get_unmatched_hints` message (sent only to peers on
+  this release or later, and answered "unchanged" when nothing moved), and
+  the list joins them with its own, never waiting on a peer. A file bound to
+  a movie, episode or track on any node is not listed. Any node acts on any
+  listed id: the actions need only the file's path and media id. Test: node
+  2, with no records of its own, lists node 1's two files, matches one and
+  deletes the other, and both leave both nodes' lists (on the old code node
+  2 listed none).
+- One `catalogue.state` rule for an ingest job and its torrent job.
+- `GET /api/v1/ingest/jobs/{id}` for another node's job asks the owner;
+  `catalogue.items` is null when the owner cannot be asked.
+- `GET /api/v1/torrents/search` returns results in provider order, not
+  sorted by seeders.
+
 ## 0.90.86: a release's cover listing is fetched once
 
 No API, wire, config or on-disk changes.

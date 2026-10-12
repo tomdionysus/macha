@@ -436,6 +436,38 @@ std::string_view node_phase_name(NodePhase phase) {
     return "unknown";
 }
 
+std::optional<ReleaseVersion> parse_release_version(std::string_view text) {
+    unsigned parts[3]{};
+    size_t at = 0;
+    for (auto& part : parts) {
+        const size_t start = at;
+        while (at < text.size() && text[at] >= '0' && text[at] <= '9') {
+            if (part > 100000)
+                return {};
+            part = part * 10 + static_cast<unsigned>(text[at] - '0');
+            ++at;
+        }
+        if (at == start)
+            return {};
+        if (&part != &parts[2]) {
+            if (at >= text.size() || text[at] != '.')
+                return {};
+            ++at;
+        }
+    }
+    return ReleaseVersion{parts[0], parts[1], parts[2]};
+}
+
+bool runs_at_least(const std::vector<NodeTelemetry>& telemetry, const NodeId& peer,
+                   ReleaseVersion first) {
+    const auto seen = std::find_if(telemetry.begin(), telemetry.end(),
+                                   [&](const NodeTelemetry& item) { return item.node_id == peer; });
+    if (seen == telemetry.end())
+        return false;
+    const auto version = parse_release_version(seen->version);
+    return version && *version >= first;
+}
+
 Bytes encode_node_telemetry(const NodeTelemetry& value) {
     Writer writer;
     writer.raw(magic);

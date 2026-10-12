@@ -2850,20 +2850,19 @@ size_t CatalogueScanner::request_media_profiles(const std::vector<std::string>& 
 }
 
 
-std::vector<MediaProbeCandidate> CatalogueScanner::probe_unmatched(std::string_view hint_id) {
-    auto hint = hints_.get(hint_id);
-    if (!hint || hint->state != CatalogueHintState::no_match || hint->media_id.empty())
+std::vector<MediaProbeCandidate> CatalogueScanner::probe_unmatched(const CatalogueHint& hint) {
+    if (hint.state != CatalogueHintState::no_match || hint.media_id.empty())
         return {};
 
     Lock lock(config_mutex_);
     std::string root;
-    auto* provider = provider_for_path(hint->path, root);
-    if (!provider || !provider->accepts_path(hint->path)) return {};
+    auto* provider = provider_for_path(hint.path, root);
+    if (!provider || !provider->accepts_path(hint.path)) return {};
 
-    auto entry = fs_.getattr(hint->path);
-    if (entry.type != EntryType::file || entry.size == 0 || file_media_id(entry) != hint->media_id)
+    auto entry = fs_.getattr(hint.path);
+    if (entry.type != EntryType::file || entry.size == 0 || file_media_id(entry) != hint.media_id)
         return {};
-    return provider->probe_file(fs_, root, hint->path, entry).candidates;
+    return provider->probe_file(fs_, root, hint.path, entry).candidates;
 }
 
 void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
@@ -3137,12 +3136,11 @@ std::vector<ProviderSearchResult> CatalogueScanner::search_providers(
     return results;
 }
 
-ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
+ProviderRefMatch CatalogueScanner::match_unmatched_ref(const CatalogueHint& hint,
                                                        std::string_view ref,
                                                        const ProviderRefNumbers& numbers,
                                                        FrameType frame) {
-    auto hint = hints_.get(hint_id);
-    if (!hint || hint->media_id.empty())
+    if (hint.media_id.empty())
         throw ProviderRequestError(404, "not_found", "unmatched file not found");
     const auto parsed = parse_provider_ref(ref);
     if (!parsed)
@@ -3151,8 +3149,8 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
                                    "musicbrainz:release:<mbid>");
 
     MediaProbe probe;
-    probe.path = hint->path;
-    probe.media_id = hint->media_id;
+    probe.path = hint.path;
+    probe.media_id = hint.media_id;
     std::string_view scan_provider;
     if (parsed->kind == "movie") {
         probe.kind = MediaProbeKind::movie;
@@ -3237,7 +3235,7 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
     const auto barrier_ms = stage_ms();
     catalogue_.reconcile_scanner(match->items, {probe.media_id}, false, {}, {}, {}, frame);
     if (Log::enabled(LogLevel::debug))
-        Log::debug("catalogue match path=" + hint->path + " lookup_ms=" + lookup_ms +
+        Log::debug("catalogue match path=" + hint.path + " lookup_ms=" + lookup_ms +
                    " artwork_ms=" + artwork_ms + " images=" +
                    std::to_string(match->artwork.size()) + " barrier_ms=" + barrier_ms +
                    " commit_ms=" + stage_ms());
@@ -3245,7 +3243,7 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
     ProviderRefMatch out;
     out.leaf_id = leaf_id;
     for (const auto& item : match->items) out.item_ids.push_back(item.id);
-    hints_.mark_catalogued(hint->id, parsed->provider, probe.media_id, out.item_ids,
+    hints_.mark_catalogued(hint.id, parsed->provider, probe.media_id, out.item_ids,
                            "matched_provider_ref");
     if (media_information_ && probe.media_id.starts_with("macha:"))
         (void)media_information_->request({probe.media_id}, MediaInformationPriority::background,

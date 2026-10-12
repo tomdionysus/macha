@@ -234,11 +234,9 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
 
         if (auto target = job_action(request.path, "/api/v1/ingest/jobs/")) {
             if (request.method == "GET" && target->second.empty()) {
-                auto existing = jobs_.ingest_job(target->first);
-                if (!existing) return http_error(404, "not_found", "ingest job not found");
-                auto item = ingest_job_json(existing->job, true, &existing->catalogue);
-                item["node_id"] = to_string(existing->node_id);
-                return http_json(200, item.dump());
+                auto detail = jobs_.ingest_job_detail(target->first);
+                if (!detail) return http_error(404, "not_found", "ingest job not found");
+                return http_json(200, detail->dump());
             }
             if (request.method == "POST") {
                 IngestActionResult result;

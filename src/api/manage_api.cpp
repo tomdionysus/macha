@@ -516,12 +516,18 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
 
 ManageApi::ManageApi(NodeRuntime& node, MetadataView& metadata, FileSystem& fs,
                      CatalogueManager& catalogue, CatalogueHintQueue& hints,
-                     CatalogueScanner& scanner)
+                     CatalogueScanner& scanner, const ClusterUnmatchedView* peers_unmatched)
     : node_(node), metadata_(metadata), fs_(fs), catalogue_(catalogue), hints_(hints),
-      scanner_(scanner),
+      scanner_(scanner), peers_unmatched_(peers_unmatched),
       identity_audit_worker_([this](std::stop_token stop) {
           identity_reset_audit_loop(stop);
       }) {}
+
+std::optional<CatalogueHint> ManageApi::unmatched_hint(std::string_view id) const {
+    if (auto hint = actionable_hint(hints_, id)) return hint;
+    if (peers_unmatched_) return peers_unmatched_->peer_hint(id);
+    return std::nullopt;
+}
 
 ManageApi::~ManageApi() {
     stop();
@@ -921,16 +927,6 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
         if (request.method == "GET" && request.path == "/api/v1/manage/unmatched") {
             PageQuery page;
             if (auto bad = read_page_query(request, page)) return *bad;
-            Json::Array items;
-            for (const auto& hint : hints_.list()) {
-                if (hint.state != CatalogueHintState::no_match || hint.media_id.empty()) continue;
-                const auto current = current_hint_stat(fs_, hint);
-                if (!current) continue;
-                items.push_back(hint_json(hint, current));
-            }
-            // A file bound to more than one playable item, except the one
-            // legitimate case: a multi-episode file, bound to several episodes
-            // of one season.
             std::map<std::string, std::vector<const CatalogueItem*>> bound;
             const auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/manage/unmatched", local_waits));
@@ -940,6 +936,27 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                     continue;
                 for (const auto& media : item.media_ids) bound[media].push_back(&item);
             }
+            // Every node's unmatched files, this node's first. A file matched
+            // since (on any node) or no longer there is not listed.
+            std::vector<CatalogueHint> unmatched;
+            for (auto& hint : hints_.list())
+                if (hint.state == CatalogueHintState::no_match && !hint.media_id.empty())
+                    unmatched.push_back(std::move(hint));
+            if (peers_unmatched_)
+                for (auto& hint : peers_unmatched_->peer_hints())
+                    unmatched.push_back(std::move(hint));
+            std::set<std::string, std::less<>> listed;
+            Json::Array items;
+            for (const auto& hint : unmatched) {
+                if (bound.contains(hint.media_id) || listed.contains(hint.id)) continue;
+                const auto current = current_hint_stat(fs_, hint);
+                if (!current) continue;
+                listed.insert(hint.id);
+                items.push_back(hint_json(hint, current));
+            }
+            // A file bound to more than one playable item, except the one
+            // legitimate case: a multi-episode file, bound to several episodes
+            // of one season.
             Json::Array conflicts;
             for (auto& [media, holders] : bound) {
                 if (holders.size() < 2) continue;
@@ -1078,11 +1095,11 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
         if (request.path.starts_with(unmatched_prefix)) {
             if (auto id = route_id(request.path, unmatched_prefix, "/matches"); !id.empty() &&
                 request.method == "GET") {
-                auto hint = actionable_hint(hints_, id);
+                auto hint = unmatched_hint(id);
                 if (!hint) return http_error(404, "not_found", "unmatched file not found");
                 auto current = current_hint_file(fs_, *hint);
                 if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
-                auto probes = scanner_.probe_unmatched(id);
+                auto probes = scanner_.probe_unmatched(*hint);
                 auto query = request.query.contains("q") ? request.query.at("q") : suggested_query(probes, hint->path);
                 size_t limit = 12;
                 if (auto it = request.query.find("limit"); it != request.query.end() && !it->second.empty()) {
@@ -1105,7 +1122,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
 
             if (auto id = route_id(request.path, unmatched_prefix, "/retry"); !id.empty() &&
                 request.method == "POST") {
-                auto hint = actionable_hint(hints_, id);
+                auto hint = unmatched_hint(id);
                 if (!hint) return http_error(404, "not_found", "unmatched file not found");
                 auto current = current_hint_file(fs_, *hint);
                 if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
@@ -1115,7 +1132,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
 
             if (auto id = route_id(request.path, unmatched_prefix, "/match"); !id.empty() &&
                 request.method == "POST") {
-                auto hint = actionable_hint(hints_, id);
+                auto hint = unmatched_hint(id);
                 if (!hint) return http_error(404, "not_found", "unmatched file not found");
                 auto current = current_hint_file(fs_, *hint);
                 if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
@@ -1127,7 +1144,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                     numbers.disc = optional_i32(root, "disc_number");
                     numbers.track = optional_i32(root, "track_number");
                     const auto matched =
-                        scanner_.match_unmatched_ref(id, ref, numbers, frame_for(request.work));
+                        scanner_.match_unmatched_ref(*hint, ref, numbers, frame_for(request.work));
                     Json::Array items;
                     for (const auto& item_id : matched.item_ids)
                         if (auto item = catalogue_.get(item_id)) items.push_back(catalogue_item_json(*item));
@@ -1155,7 +1172,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
 
             if (auto id = route_id(request.path, unmatched_prefix, "/manual"); !id.empty() &&
                 request.method == "POST") {
-                auto hint = actionable_hint(hints_, id);
+                auto hint = unmatched_hint(id);
                 if (!hint) return http_error(404, "not_found", "unmatched file not found");
                 auto current = current_hint_file(fs_, *hint);
                 if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
@@ -1184,19 +1201,19 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
 
             if (auto id = route_id(request.path, unmatched_prefix); !id.empty()) {
                 if (request.method == "GET") {
-                    auto hint = actionable_hint(hints_, id);
+                    auto hint = unmatched_hint(id);
                     if (!hint) return http_error(404, "not_found", "unmatched file not found");
                     auto current = current_hint_file(fs_, *hint);
                     if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
                     Json::Object out;
                     out["item"] = hint_json(fs_, *hint);
                     Json::Array probes;
-                    for (const auto& probe : scanner_.probe_unmatched(id)) probes.push_back(probe_json(probe));
+                    for (const auto& probe : scanner_.probe_unmatched(*hint)) probes.push_back(probe_json(probe));
                     out["probes"] = std::move(probes);
                     return http_json(200, Json(std::move(out)).dump());
                 }
                 if (request.method == "DELETE") {
-                    auto hint = actionable_hint(hints_, id);
+                    auto hint = unmatched_hint(id);
                     if (!hint) return http_error(404, "not_found", "unmatched file not found");
                     if (!current_hint_file(fs_, *hint))
                         return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
