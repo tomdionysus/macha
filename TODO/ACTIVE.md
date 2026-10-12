@@ -108,9 +108,9 @@ A failing test is P0: reproduce it before deciding whose it is.
   backs off on `try_later`. Read after deploy (16:53Z): 0 on both nodes,
   fi-1 having examined 43,188 through a survey that read `unavailable=0
   unknown=674400 peers_failed=1` while gbni-1 restarted (the window that
-  counted 55 on 0.90.87). Still two-state: repair's
-  presence round (`validated_presence`) answers "absent" for a peer whose
-  request failed, so a busy peer may be pushed a copy it holds. Diagnosis
+  counted 55 on 0.90.87). The push side: built, 0.90.89 (the presence
+  round is three-state per object; a peer that cannot say is retried, not
+  sent a copy). Diagnosis
   (2026-10-12): The power cut lost
   nothing: gbni-1's diff surveys read 201,372 extents held by no node
   (of 1,072,291) from 09:54Z before it to 14:12Z after, unchanged. fi-1's

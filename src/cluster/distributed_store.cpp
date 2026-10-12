@@ -1948,7 +1948,7 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
         }
     }
 
-    const auto one_at_a_time = [&](const NodeInfo& node, const ObjectId& id) {
+    const auto one_at_a_time = [&](const NodeInfo& node, const ObjectId& id) -> std::optional<bool> {
         Writer writer;
         writer.fixed(id.bytes);
         try {
@@ -1956,13 +1956,13 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
                 n_.call_async(node, MessageType::have_object, writer.data(), FrameType::speculative)
                     .get();
             if (reply.message.type != MessageType::bool_reply)
-                return false;
+                return std::nullopt;
             Reader reader(reply.message.payload);
             const bool present = reader.u8() != 0;
             reader.finish();
             return present;
         } catch (...) {
-            return false;
+            return std::nullopt;
         }
     };
 
@@ -1978,10 +1978,12 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
                 } else {
                     auto reply = request.rpc->get();
                     if (reply.message.type == MessageType::have_valid_objects_reply) {
+                        // 1 held intact, 0 not held; anything else, cannot say now.
                         Reader reader(reply.message.payload);
                         if (reader.u32() == request.ids.size()) {
                             for (const auto& id : request.ids)
-                                out[id] = reader.u8() != 0;
+                                if (const auto held = reader.u8(); held <= 1)
+                                    out[id] = held == 1;
                             reader.finish();
                             answered = true;
                         }
@@ -1996,10 +1998,11 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
                            " error=" + error.what());
             }
         }
-        if (answered)
+        if (answered || !unknown_message)
             continue;
         for (const auto& id : request.ids)
-            out[id] = unknown_message ? one_at_a_time(*request.node, id) : false;
+            if (const auto present = one_at_a_time(*request.node, id))
+                out[id] = *present;
     }
     return results;
 }
@@ -2332,6 +2335,16 @@ constexpr auto repair_warning_interval = std::chrono::minutes(1);
 constexpr size_t repair_sample_size = 32;
 } // namespace
 
+void DistributedStore::retry_later(std::map<ObjectId, RepairRetry>& retries, const ObjectId& id,
+                                   Clock::time_point now) {
+    if (auto found = retries.find(id); found != retries.end()) {
+        found->second.delay = std::min(found->second.delay * 2, repair_retry_cap);
+        found->second.due = now + found->second.delay;
+    } else if (retries.size() < repair_retries_max) {
+        retries.emplace(id, RepairRetry{now + repair_retry_first, repair_retry_first});
+    }
+}
+
 void DistributedStore::note_repair_unsourceable(const ObjectId& id) {
     const auto total = repair_pull_unsourceable_.fetch_add(1, std::memory_order_relaxed) + 1;
     bool warn = false;
@@ -2418,6 +2431,13 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     result.complete = false;
     auto& transferred = result.bytes_transferred;
     size_t operations = 0;
+    if (const auto epoch = reachability_epoch(); epoch != repair_retry_epoch_) {
+        repair_retry_epoch_ = epoch;
+        const auto now = Clock::now();
+        for (auto* retries : {&repair_pull_retries_, &repair_push_retries_})
+            for (auto& [id, retry] : *retries)
+                retry = {now, repair_retry_first};
+    }
 
     // Cursor-based: never materialises the store's object list or copies the
     // live set per slice, which would make idle repair O(store).
@@ -2430,6 +2450,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         repair_push_window_.clear();
         repair_push_presence_.clear();
         repair_push_probed_.clear();
+        repair_push_retrying_.clear();
         repair_push_cursor_exhausted_ = false;
     };
     // A new live set does not restart the pass: positions are kept, and a
@@ -2592,6 +2613,27 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             repair_push_cursor_exhausted_ = true;
             return std::nullopt;
         };
+        // Objects a peer could not answer for whose time has come go first,
+        // at most half the window, so the pass still moves.
+        {
+            const auto now = Clock::now();
+            for (auto retry = repair_push_retries_.begin();
+                 retry != repair_push_retries_.end() &&
+                 repair_push_retrying_.size() < std::max<size_t>(1, scan_budget / 2);) {
+                const ObjectId id = retry->first;
+                if (!local_.data().has(id) || (live && !live->contains(id))) {
+                    retry = repair_push_retries_.erase(retry);
+                    continue;
+                }
+                if (retry->second.due <= now && !repair_push_retrying_.contains(id) &&
+                    std::find(repair_push_window_.begin(), repair_push_window_.end(), id) ==
+                        repair_push_window_.end()) {
+                    repair_push_retrying_.insert(id);
+                    repair_push_window_.push_front(id);
+                }
+                ++retry;
+            }
+        }
         while (repair_push_window_.size() < scan_budget && !repair_push_cursor_exhausted_ &&
                push_skipped < repair_skip_budget) {
             auto next = next_to_push();
@@ -2667,6 +2709,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             bool live{true};
             size_t target{};
             std::set<NodeId> keepers;
+            // A peer could not say whether it holds a copy.
+            bool undecided{};
         };
         const auto settle = [&](const ObjectId& id) {
             if (auto at = std::find(repair_push_window_.begin(), repair_push_window_.end(), id);
@@ -2675,8 +2719,11 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             repair_push_probed_.erase(id);
             std::erase_if(repair_push_presence_,
                           [&](const auto& entry) { return entry.first.second == id; });
-            ++repair_push_settled_;
             ++scanned_total;
+            // A retried object was counted when the pass first met it.
+            if (repair_push_retrying_.erase(id))
+                return;
+            ++repair_push_settled_;
             ++result.push_examined;
         };
         const uint64_t batch_bytes_cap = 2 * std::max<uint64_t>(1, n_.config().extent_size);
@@ -2723,6 +2770,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     } else if (auto found = repair_push_presence_.find({peer.id, id});
                                found != repair_push_presence_.end()) {
                         present = found->second;
+                    } else {
+                        // Neither a keeper nor sent a copy until it can say.
+                        plan.undecided = true;
+                        continue;
                     }
                     if (present) {
                         plan.keepers.insert(peer.id);
@@ -2832,9 +2883,14 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             }
 
             size_t settled = 0;
+            const auto now = Clock::now();
             for (const auto& plan : plans) {
                 if (failed.contains(plan.id))
                     continue; // retried from the same place next step
+                if (plan.undecided && plan.keepers.size() < plan.target)
+                    retry_later(repair_push_retries_, plan.id, now);
+                else
+                    repair_push_retries_.erase(plan.id);
                 // No owner known means nowhere it is kept, not every owner
                 // keeping it: the copy stays until a host is known.
                 if (plan.live && plan.target > 0 && plan.keepers.size() >= plan.target &&
@@ -2897,11 +2953,6 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         };
 
         const auto now = Clock::now();
-        if (const auto epoch = reachability_epoch(); epoch != repair_retry_epoch_) {
-            repair_retry_epoch_ = epoch;
-            for (auto& [id, retry] : repair_pull_retries_)
-                retry = {now, repair_retry_first};
-        }
         for (auto retry = repair_pull_retries_.begin();
              retry != repair_pull_retries_.end() && scanned_total < scan_budget;) {
             const ObjectId id = retry->first;
@@ -2929,8 +2980,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 retry = repair_pull_retries_.erase(retry);
                 continue;
             }
-            retry->second.delay = std::min(retry->second.delay * 2, repair_retry_cap);
-            retry->second.due = now + retry->second.delay;
+            retry_later(repair_pull_retries_, id, now);
             ++retry;
         }
 
@@ -3001,10 +3051,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 const auto answer = pull(id);
                 if (!answer)
                     break;
-                if (*answer == FetchAnswer::try_later &&
-                    repair_pull_retries_.size() < repair_pull_retries_max)
-                    repair_pull_retries_[id] = {Clock::now() + repair_retry_first,
-                                                repair_retry_first};
+                if (*answer == FetchAnswer::try_later)
+                    retry_later(repair_pull_retries_, id, Clock::now());
 
                 repair_pull_after_ = id;
                 ++it;

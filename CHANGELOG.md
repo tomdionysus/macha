@@ -1,5 +1,26 @@
 # Current release
 
+## 0.90.89: a push waits for a peer that cannot say
+
+Wire change, compatible both ways; no API, config or on-disk changes.
+
+- Repair's presence round answers each object three ways: held intact,
+  not held, or cannot say now (one of the peer's disks is offline, or its
+  DATA admission is busy from that object on). A busy peer answers the
+  rest of the batch "cannot say" instead of refusing all of it. An older
+  node reads "cannot say" as held, so it sends nothing.
+- A peer that cannot say, by that answer, a refused or failed request, or
+  a timeout, was taken to lack every copy asked about and was sent each in
+  full (up to 4 MB an object over fi-1's 1.3 MB/s link). It is now neither
+  a keeper nor sent a copy: the object is taken up again after a delay
+  doubling from 1 s to 10 minutes, at once when membership or this node's
+  disks change, and the pass moves on. Pull and push share the one retry
+  rule.
+
+Test: a peer that answers "cannot say" for every object, and one that
+refuses the batch as busy, are sent nothing; once each says it lacks the
+copies, all four are pushed.
+
 ## 0.90.88: a refusal says whether asking again may help
 
 Wire change, compatible both ways; no API, config or on-disk changes.

@@ -180,19 +180,28 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     uint64_t repair_position_saved_{};
     void save_repair_position(bool force);
     std::optional<ObjectId> repair_pull_after_;
-    // Pulls a peer answered try_later for, each asked again after its own
-    // delay, doubling from repair_retry_first to repair_retry_cap; all are due
-    // at once when reachability_epoch() changes.
-    struct PullRetry {
+    // Objects repair could not settle because a peer could not say now: a
+    // pull answered try_later, a push whose presence a peer could not give.
+    // Each is taken up again after its own delay, doubling from
+    // repair_retry_first to repair_retry_cap; all are due at once when
+    // reachability_epoch() changes. Beyond repair_retries_max per kind, an
+    // object is met again on the next pass instead.
+    struct RepairRetry {
         Clock::time_point due;
         Clock::duration delay;
     };
-    std::map<ObjectId, PullRetry> repair_pull_retries_;
+    std::map<ObjectId, RepairRetry> repair_pull_retries_;
+    std::map<ObjectId, RepairRetry> repair_push_retries_;
+    // Retried objects now in the push window, which settle without moving the
+    // pass's position.
+    std::set<ObjectId> repair_push_retrying_;
     uint64_t repair_retry_epoch_{};
     static constexpr Clock::duration repair_retry_first = std::chrono::seconds(1);
     static constexpr Clock::duration repair_retry_cap = std::chrono::minutes(10);
-    // Beyond it, an object is met again on the next pass instead.
-    static constexpr size_t repair_pull_retries_max = 4096;
+    static constexpr size_t repair_retries_max = 4096;
+    // Schedules `id` again: first after repair_retry_first, then each time
+    // after twice the delay before, up to repair_retry_cap.
+    static void retry_later(std::map<ObjectId, RepairRetry>&, const ObjectId&, Clock::time_point now);
     // The push pass over a given list: the last object taken from it, the
     // list's identity, and whether the pass is over a list at all.
     std::optional<ObjectId> repair_push_after_;
@@ -333,8 +342,9 @@ class DistributedStore final : public Placement, public ControlObjectSource {
                         FrameType frame_type = FrameType::loader);
     // Repair's presence round: whether each peer holds a copy that reads back
     // intact, have_valid_objects_max ids per request, all requests concurrent.
-    // Peers without have_valid_objects are asked per id via have_object. A
-    // failed request answers false for its ids.
+    // Peers without have_valid_objects are asked per id via have_object. An
+    // id a peer could not answer for now (a failed request, a disk offline,
+    // busy) is left out.
     std::map<NodeId, std::map<ObjectId, bool>>
     validated_presence(const std::map<NodeId, NodeInfo>& node_info,
                        const std::map<NodeId, std::vector<ObjectId>>& ids_by_node);
