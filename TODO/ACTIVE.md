@@ -167,6 +167,16 @@ A failing test is P0: reproduce it before deciding whose it is.
   saved position (48,971 examined in 12 min, 357,000 held), and the pull
   waited behind it, since the push used each step's scan budget first:
   fixed, 0.90.92 (the pull has its own count).
+- **The survey's "unavailable" has two definitions and forgets on
+  failure** (seen 2026-10-12 on 0.90.92, not fixed). The tree method
+  leaves out the 442 catalogue objects no node holds (200,930 against the
+  diff's 201,372), so gbni-1, whose survey runs `tree:no_inventory`, pulls
+  them and counts them unsourceable (442, truthfully: fi-1 answers
+  `not_found`). And a survey that fails while a peer restarts reads
+  `unavailable=0 unknown=671994`, replacing the last known set, so the
+  pull asks about lost extents again until the next good survey (fi-1
+  counted 28 between 19:40:34Z and 19:41:39Z). One definition, and keep
+  the last known set across a failed survey.
 - **The torrent backend decides "staging on another device" once, at
   start** (fi-1, 2026-10-12 13:52Z: decided before the USB disk mounted,
   though staging and DATA share it), so its DATA-device monitor stayed off
