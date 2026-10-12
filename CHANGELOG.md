@@ -1,5 +1,23 @@
 # Current release
 
+## 0.90.91: a busy peer still says what it does not hold
+
+No API, config or on-disk changes; the presence reply's meaning is
+unchanged.
+
+0.90.89 made a peer whose DATA admission was busy answer "cannot say" for
+every object of a presence batch from the first one it could not admit.
+A pushing node sends nothing to a peer that cannot say, so gbni-1's push
+to fi-1 stopped while fi-1 was busy: about 67 MB a minute until 17:40:21Z
+on 2026-10-12, when a build started on fi-1, and nothing after. Absence
+needs no read: an object the index does not list, with every disk
+online, is answered "not held" without admission. Only a held copy, which
+must be read back to count, waits for admission.
+
+Test: with the peer's background admission full, an object it lacks is
+"not held" and one it holds "cannot say", then "held" once admission
+frees (0.90.89 answered "cannot say" for both).
+
 ## 0.90.90: "loopback only" judged once the listen sockets settle; FUSE counts before it wakes
 
 No API, wire, config or on-disk changes.

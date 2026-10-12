@@ -146,8 +146,7 @@ A failing test is P0: reproduce it before deciding whose it is.
   then sample the arbiter and stacks during the scan (operator's call).
   fi-1's clock: no RTC, it jumped about 8.5 min at NTP sync (16:52:28 to
   17:00:58 local), so its pre-sync journal times run behind.
-- **0.90.89 starves the push to a busy peer** (diagnosed 2026-10-12, not
-  fixed). gbni-1 pushed about 67 MB a minute to fi-1 until 17:40:21Z, when
+- **0.90.89 starved the push to a busy peer: fixed, 0.90.91.** gbni-1 pushed about 67 MB a minute to fi-1 until 17:40:21Z, when
   fi-1's gate build began, and nothing since (0 bytes through 0.90.90's
   start). A busy fi-1 answers `have_valid_objects` "cannot say" from the
   first id its `try_acquire` misses, so gbni-1 treats fi-1 as undecided for
