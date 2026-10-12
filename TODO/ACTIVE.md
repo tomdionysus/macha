@@ -52,11 +52,21 @@ A failing test is P0: reproduce it before deciding whose it is.
 - **Ingest and merges**: the ingest re-bases on a stale basis since
   0.90.79; a merge logs each conflict's key and an ingest stopped mid-put
   resumes since 0.90.83 (the stop cancelled filesystem I/O before it told
-  the ingest to stop). Left: the merge rule (take the newer when one side
-  is the other's ancestor) and the reconciler (one merger at a time) from
-  the 2026-09-23 diagnosis. *Carried.*
-- **The unmatched list differs by node** (771 on fi-1, 822 on gbni-1): hints
-  are node-local.
+  the ingest to stop). Publications batch (operator, 2026-10-12: done). The
+  merge rule (take the newer when one side is the other's ancestor) and the
+  reconciler (one pair choice everywhere) from the 2026-09-23 diagnosis are
+  watched, not built: checked 2026-10-12, the only standing conflicts are
+  the seven from before 0.89.0, though both nodes merged up to 69 times a
+  day from 10-04 to 10-10 (the observations' `metadata.reconcile_us`); the
+  braid needs three heads, and two nodes fold the same pair. A
+  `metadata merge recorded a conflict` WARN (0.90.83) reopens it with the key.
+- **The unmatched list differs by node**: diagnosed 2026-10-12, fix waits on
+  the operator (section 8). 674 on fi-1, 614 on gbni-1, 540 on both (same
+  ids), 748 in all. Every file on one list only has no hint at all on the
+  other: the scan coordinator submits the hints and keeps them in its own
+  `catalogue/hints.json`, so each list holds what arrived while that node
+  coordinated (fi-1's 134: Tiesto, Angry Boys; gbni-1's 74: the Enya
+  imports of 2026-10-10).
 - **`RPC stalled (control)`** each way at 09:47Z and 09:50Z on 2026-10-05,
   5 to 15 s without progress, then nothing. 0.90.65/66/68 removed three
   ways control could wait; watch for a recurrence. Recurred 2026-10-11:
@@ -84,7 +94,8 @@ A failing test is P0: reproduce it before deciding whose it is.
   0.90.84; the other three change the API and are built and tested but
   held out of the tree (full files in `build/api-held/`, the laptop's
   scratch directory) until Core and the clients are told (no client
-  session was running, 2026-10-12):
+  session was running, 2026-10-12; operator: send
+  `build/api-held/ANNOUNCEMENT.txt` to Core when it is next up, then ship):
   one `catalogue.state` rule for an ingest and its torrent (a completed
   import with nothing counted read `completed` on the ingest, `waiting` on
   the torrent); a remote job's single `GET` asks its owner, so
@@ -262,6 +273,12 @@ on control threads no longer grow with deletes. Left:
 ## 8. Waiting on the operator
 
 - The replication-by-diff proposal's three open questions.
+- **The unmatched list across nodes** (section 1). Recommended: the list
+  answers the union, as the job lists do (local hints plus each peer's from
+  its last poll, never waiting on a peer), and an action on an id goes to
+  the node holding that hint, as job actions do. The shape is unchanged;
+  what it lists changes, so Core is told first. The alternative, hint
+  outcomes replicated in metadata, is heavier and not needed for the list.
 - **Lost posters on the viewer's path**: the artwork route could answer 404
   at once for an object the last survey found no node holding (442 catalogue
   objects today), saving 1 to 2 s per showing; the cost is that a poster a
