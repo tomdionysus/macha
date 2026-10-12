@@ -2393,6 +2393,10 @@ struct FuseFrontend::State {
                 // Payload is durable before its descriptor, so recovery never
                 // sees a data-op whose spool bytes were not synced.
                 journal_data_batch(batch);
+                // Counted before the waiters wake, so a writer whose release()
+                // returned sees its batch in the status.
+                durability_batches.fetch_add(1, std::memory_order_relaxed);
+                durability_writes.fetch_add(batch.size(), std::memory_order_relaxed);
                 finish_durability_batch(batch);
                 if (spool_under_pressure() ||
                     spool_drain_requested.load(std::memory_order_acquire)) {
@@ -2402,8 +2406,6 @@ struct FuseFrontend::State {
                     for (const auto& inode : pressure_inodes)
                         request_data_publication(inode);
                 }
-                durability_batches.fetch_add(1, std::memory_order_relaxed);
-                durability_writes.fetch_add(batch.size(), std::memory_order_relaxed);
 
                 const auto elapsed =
                     std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started)
