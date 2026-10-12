@@ -972,11 +972,15 @@ void TorrentManager::drain_alerts() {
     impl_->session.pop_alerts(&alerts);
     for (const auto* alert : alerts) {
         if (const auto* failed = lt::alert_cast<lt::listen_failed_alert>(alert)) {
+            if (!first_listen_)
+                first_listen_ = time_.now();
             Log::warn("torrent listen failed interface=" + std::string(failed->listen_interface()) +
                       " " + failed->message());
             continue;
         }
         if (const auto* ok = lt::alert_cast<lt::listen_succeeded_alert>(alert)) {
+            if (!first_listen_)
+                first_listen_ = time_.now();
             const auto address = ok->address;
             if (!address.is_loopback() && !address.is_unspecified())
                 ++routable_listen_endpoints_;
@@ -1068,17 +1072,11 @@ void TorrentManager::drain_alerts() {
     }
 
     // Only loopback sockets reach no peer: a configuration fault, said once.
-    if (!warned_loopback_only_ && !routable_listen_endpoints_ && !alerts.empty()) {
-        bool any_listen = std::any_of(alerts.begin(), alerts.end(), [](const lt::alert* a) {
-            return lt::alert_cast<lt::listen_succeeded_alert>(a) ||
-                   lt::alert_cast<lt::listen_failed_alert>(a);
-        });
-        if (any_listen) {
-            warned_loopback_only_ = true;
-            Log::warn("torrent session bound no routable interface (loopback only): no peer or "
-                      "DHT traffic is possible. Set torrent.listen_interfaces, or check that "
-                      "network.advertise names a live link on this node.");
-        }
+    if (listen_unsettled() && time_.now() - *first_listen_ >= listen_settle) {
+        warned_loopback_only_ = true;
+        Log::warn("torrent session bound no routable interface (loopback only): no peer or "
+                  "DHT traffic is possible. Set torrent.listen_interfaces, or check that "
+                  "network.advertise names a live link on this node.");
     }
 }
 
@@ -1241,6 +1239,11 @@ void TorrentManager::loop(std::stop_token stop) {
             // blocks until woken.
             cv_.wait_for(lock.native(), stop, std::chrono::milliseconds(500), [this]() MACHA_REQUIRES(mutex_) {
                 return !has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire);
+            });
+        } else if (listen_unsettled()) {
+            // Wakes to judge the listen sockets once they have settled.
+            cv_.wait_for(lock.native(), stop, listen_settle, [this]() MACHA_REQUIRES(mutex_) {
+                return has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire);
             });
         } else {
             cv_.wait(lock.native(), stop, [this]() MACHA_REQUIRES(mutex_) {
