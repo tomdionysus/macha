@@ -781,6 +781,25 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_push_probes_by_window_and_sends_toget
     }
 }
 
+// The pull has its own share of a repair step: a push pass with more to
+// settle than a step allows does not hold the pull back until it ends.
+MACHA_FAST_TEST("rpc_cluster", test_a_long_push_pass_does_not_hold_back_the_pull) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    peer.holds_everything = true;
+    const auto missing_bytes = pattern(2048, 7);
+    const auto missing = object_id(missing_bytes);
+    peer.serves = missing_bytes;
+    auto live = local_objects(bench, 100, 1024, 60);
+    live.push_back(missing);
+    std::sort(live.begin(), live.end());
+    auto store = bench.store();
+    const auto step = store->repair_step(8ULL * 1024 * 1024, 16, live);
+    CHECK(step.push_examined < 100);
+    CHECK(step.pull_examined > 0);
+    CHECK(bench.local.data().has(missing));
+}
+
 // A peer that cannot say whether it holds a copy, per id or by refusing the
 // batch as busy, is neither counted as keeping it nor sent one; once it can
 // say it lacks the copy, the copy is pushed.
