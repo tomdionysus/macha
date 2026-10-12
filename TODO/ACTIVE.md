@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-12, on `develop`. Both nodes run 0.90.87.
+Last updated: 2026-10-12, on `develop`. Both nodes run 0.90.93.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -386,7 +386,7 @@ on control threads no longer grow with deletes. Left:
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.87**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.93**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
