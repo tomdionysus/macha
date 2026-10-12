@@ -25,32 +25,9 @@ namespace macha {
 namespace {
 
 // The first release whose transport accepts tree_holdings.
-constexpr std::tuple<unsigned, unsigned, unsigned> first_version{0, 82, 0};
+constexpr ReleaseVersion first_version{0, 82, 0};
 // The first release that answers trie_diff.
-constexpr std::tuple<unsigned, unsigned, unsigned> first_trie_version{0, 90, 72};
-
-// "0.82.1+abc" as (0, 82, 1); none if it is not three numbers.
-std::optional<std::tuple<unsigned, unsigned, unsigned>> parse_version(std::string_view text) {
-    unsigned parts[3]{};
-    size_t at = 0;
-    for (auto& part : parts) {
-        const size_t start = at;
-        while (at < text.size() && text[at] >= '0' && text[at] <= '9') {
-            if (part > 100000)
-                return {};
-            part = part * 10 + static_cast<unsigned>(text[at] - '0');
-            ++at;
-        }
-        if (at == start)
-            return {};
-        if (&part != &parts[2]) {
-            if (at >= text.size() || text[at] != '.')
-                return {};
-            ++at;
-        }
-    }
-    return std::tuple{parts[0], parts[1], parts[2]};
-}
+constexpr ReleaseVersion first_trie_version{0, 90, 72};
 
 // A peer asked over RPC, in questions of at most tree_holdings_max ids.
 class RemotePeer final : public PeerHoldings {
@@ -610,11 +587,8 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     // Every peer answers a trie diff and this node has one held trie.
     bool diffable = holdings->tries.size() == 1;
     for (const auto& peer : hosts) {
-        const auto seen = std::find_if(telemetry.begin(), telemetry.end(),
-                                       [&](const auto& item) { return item.node_id == peer.id; });
-        const auto version = seen == telemetry.end() ? std::nullopt : parse_version(seen->version);
-        remotes.emplace_back(node_, peer, version && *version >= first_version);
-        diffable = diffable && version && *version >= first_trie_version;
+        remotes.emplace_back(node_, peer, runs_at_least(telemetry, peer.id, first_version));
+        diffable = diffable && runs_at_least(telemetry, peer.id, first_trie_version);
     }
     std::vector<PeerHoldings*> asking;
     for (auto& remote : remotes)

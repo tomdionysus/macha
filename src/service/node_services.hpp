@@ -9,6 +9,7 @@
 #include "catalogue/catalogue.hpp"
 #include "catalogue/catalogue_installer.hpp"
 #include "catalogue/catalogue_hints.hpp"
+#include "catalogue/cluster_unmatched.hpp"
 #include "catalogue/media_catalogue.hpp"
 #include "catalogue/media_information.hpp"
 #include "cluster/distributed_store.hpp"
@@ -112,6 +113,7 @@ class NodeServices {
     HydrationManager& hydration() { return hydration_; }
     IngestManager& ingest() { return ingest_; }
     ClusterJobView& cluster_jobs() { return cluster_jobs_; }
+    ClusterUnmatchedView& cluster_unmatched() { return cluster_unmatched_; }
     TorrentCoordinator& torrent_coordinator() { return torrent_coordinator_; }
     AcquisitionApi& acquisition_api() { return acquisition_api_; }
     CatalogueApi& catalogue_api() { return catalogue_api_; }
@@ -158,6 +160,7 @@ class NodeServices {
     IngestManager ingest_;
     TorrentSearchManager torrent_search_;
     ClusterJobView cluster_jobs_;
+    ClusterUnmatchedView cluster_unmatched_;
     TorrentCoordinator torrent_coordinator_;
     AcquisitionApi acquisition_api_;
     CatalogueApi catalogue_api_;

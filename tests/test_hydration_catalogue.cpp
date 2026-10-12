@@ -2227,6 +2227,43 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
     CHECK(*ready_delay == 0ms);
 }
 
+MACHA_FAST_TEST("hydration_catalogue", test_an_ingest_and_its_torrent_read_one_catalogue_state) {
+    // The torrent mirrors its ingest's state and counts; both answer the same
+    // catalogue.state, including where the two rules used to disagree.
+    struct Case {
+        IngestJobState ingest;
+        TorrentJobState torrent;
+        size_t total, pending, no_match;
+        std::string_view expected;
+    };
+    const Case cases[] = {
+        {IngestJobState::importing, TorrentJobState::importing, 0, 0, 0, "waiting"},
+        {IngestJobState::cataloguing, TorrentJobState::cataloguing, 1, 0, 0, "processing"},
+        {IngestJobState::cataloguing, TorrentJobState::cataloguing, 1, 1, 0, "processing"},
+        {IngestJobState::completed, TorrentJobState::completed, 0, 0, 0, "completed"},
+        {IngestJobState::completed, TorrentJobState::completed, 2, 0, 1, "completed_with_issues"},
+        {IngestJobState::completed, TorrentJobState::completed, 2, 0, 0, "completed"},
+    };
+    for (const auto& c : cases) {
+        IngestJob ingest;
+        ingest.id = "i";
+        ingest.state = c.ingest;
+        ingest.catalogue_total = c.total;
+        ingest.catalogue_pending = c.pending;
+        ingest.catalogue_no_match = c.no_match;
+        TorrentJob torrent;
+        torrent.id = "t";
+        torrent.state = c.torrent;
+        torrent.catalogue_total = c.total;
+        torrent.catalogue_pending = c.pending;
+        torrent.catalogue_no_match = c.no_match;
+        CHECK(ingest_job_json(ingest, false).find("catalogue")->find("state")->asString() ==
+              c.expected);
+        CHECK(torrent_job_api_json(torrent).find("catalogue")->find("state")->asString() ==
+              c.expected);
+    }
+}
+
 MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_jobs_publication_travels_the_wire_and_reaches_the_api) {
     // A downloaded torrent waits while its extents are published into the
     // store; the job says how far that has got, and why it is waiting.

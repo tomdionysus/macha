@@ -91,6 +91,11 @@ enum class MessageType : uint16_t {
     // pinned snapshot. Reply: trie_diff_reply. Sent only to peers that
     // advertise a version with it.
     trie_diff = 49,
+    // The files the peer's scanner could not match (catalogue hints), unless
+    // they are unchanged since the revision the asker names. Reply:
+    // unmatched_hints_reply. Sent only to peers that advertise a version with
+    // it.
+    get_unmatched_hints = 50,
     // A history hash's record as a self-contained full-body entry,
     // materialised by the server (get_metadata_history_entry returns the
     // stored frame, possibly a delta the caller cannot replay).
@@ -130,7 +135,8 @@ enum class MessageType : uint16_t {
     torrent_intent_reply = 122,
     have_valid_objects_reply = 123,
     tree_holdings_reply = 124,
-    trie_diff_reply = 125
+    trie_diff_reply = 125,
+    unmatched_hints_reply = 126
 };
 
 // Each id in a have_valid_objects request is a full read on the peer, so a

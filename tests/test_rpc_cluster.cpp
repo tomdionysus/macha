@@ -3349,6 +3349,84 @@ MACHA_TEST("rpc_cluster", test_an_ingest_interrupted_by_its_node_stopping_resume
     service.stop();
 }
 
+// One ingest job read from a node that does not own it carries the owner's
+// catalogue items; with the owner unreachable they are null, not empty.
+MACHA_TEST("rpc_cluster", test_an_ingest_job_read_elsewhere_carries_its_owners_catalogue_items) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    TempDir sources;
+    const auto source_dir = std::filesystem::canonical(sources.path());
+    const auto source = source_dir / "Elsewhere Movie 2024.mkv";
+    {
+        std::ofstream out(source, std::ios::binary);
+        const auto bytes = pattern(256 * 1024);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "detail-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "detail-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    for (auto* c : {&c1, &c2}) {
+        c->replication = 2;
+        c->write_copies = 1;
+        c->metadata_write_copies = 1;
+        c->catalogue.scanner.enabled = true;
+        c->catalogue.scanner.movies.enabled = true;
+        c->catalogue.scanner.movies.roots = {"/Movies"};
+        c->catalogue.scanner.movies.tmdb.enabled = false;
+        c->catalogue.scanner.tv.enabled = false;
+        c->catalogue.api.enabled = false;
+        c->ingest.enabled = true;
+        c->ingest.source_roots = {source_dir};
+        c->torrent.enabled = false;
+    }
+    auto s1 = std::make_unique<Service>(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
+    s1->start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1->node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    const auto id = s1->ingest().submit_path(source, "filesystem");
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = s1->ingest().job(id);
+            return job && job->catalogue_total > 0;
+        },
+        30s));
+    s2.cluster_jobs().refresh_now();
+
+    const auto detail = [&](Service& service) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/ingest/jobs/" + id;
+        const auto response = service.acquisition_api().handle(request);
+        REQUIRE(response.status == 200);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+    const auto own = detail(*s1);
+    const auto* own_items = own.find("catalogue")->find("items");
+    REQUIRE(own_items != nullptr);
+    REQUIRE(own_items->isArray());
+    REQUIRE(!own_items->asArray().empty());
+    const auto elsewhere = detail(s2);
+    CHECK(elsewhere.find("node_id")->asString() == to_string(s1->node().node_id()));
+    const auto* items = elsewhere.find("catalogue")->find("items");
+    REQUIRE(items != nullptr);
+    CHECK(items->dump() == own_items->dump());
+
+    s1->stop();
+    s1.reset();
+    REQUIRE(wait_until([&] { return s2.node().membership().active().size() == 1; }, 10s));
+    const auto unreachable = detail(s2);
+    const auto* unknown = unreachable.find("catalogue")->find("items");
+    REQUIRE(unknown != nullptr);
+    CHECK(unknown->isNull());
+    s2.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_reconciliation) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -5583,6 +5661,94 @@ MACHA_TEST("rpc_cluster", test_a_peer_that_stalls_on_a_commit_is_not_waited_for_
     links->release(peer);
     CHECK(sees(s2, "/while-stalled"));
     CHECK(sees(s2, "/not-asked"));
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_every_nodes_unmatched_files_are_listed_and_handled_anywhere) {
+    // A scan's unmatched files stay on the node that scanned. Node 2, which
+    // never scanned, lists node 1's and handles them; a file handled on one
+    // node leaves both lists.
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "unmatched-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "unmatched-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+    c1.write_copies = c2.write_copies = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    REQUIRE(wait_metadata_writable(s1));
+
+    auto& fs1 = s1.filesystem();
+    fs1.mkdir("/Movies", 0755, getuid(), getgid());
+    write_file(fs1, "/Movies/matched.mkv", pattern(4096, 1));
+    write_file(fs1, "/Movies/deleted.mkv", pattern(4096, 2));
+    const auto matched_media = file_media_id(fs1.getattr("/Movies/matched.mkv"));
+    const auto deleted_media = file_media_id(fs1.getattr("/Movies/deleted.mkv"));
+    const auto matched_id = s1.catalogue_hints().put_unmatched("/Movies/matched.mkv", matched_media);
+    const auto deleted_id = s1.catalogue_hints().put_unmatched("/Movies/deleted.mkv", deleted_media);
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/Movies/deleted.mkv").size == 4096;
+        } catch (const FsError&) {
+            return false;
+        }
+    }, 10s));
+
+    const auto handle = [](Service& service, std::string method, std::string path,
+                           std::string body = {}) {
+        HttpRequest request;
+        request.method = std::move(method);
+        request.path = std::move(path);
+        request.body = Bytes(body.begin(), body.end());
+        return service.manage_api().handle(request);
+    };
+    const auto listed = [&](Service& service) {
+        const auto response = handle(service, "GET", "/api/v1/manage/unmatched");
+        REQUIRE(response.status == 200);
+        const auto parsed = Json::parse(
+            std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+        std::set<std::string> ids;
+        for (const auto& item : parsed.find("items")->asArray()) ids.insert(item.find("id")->asString());
+        return ids;
+    };
+
+    CHECK(s2.catalogue_hints().list().empty());
+    // Node 2 asks only a peer whose telemetry names a release that answers.
+    REQUIRE(wait_until([&] {
+        return runs_at_least(s2.node().telemetry().all(), s1.node().node_id(),
+                             ClusterUnmatchedView::first_version);
+    }, 10s));
+    s2.cluster_unmatched().refresh_now();
+    CHECK((listed(s2) == std::set<std::string>{matched_id, deleted_id}));
+    CHECK((listed(s1) == std::set<std::string>{matched_id, deleted_id}));
+
+    // Matched on node 2 to an item it holds: off both lists.
+    CatalogueItem movie;
+    movie.id = "manual:movie:matched";
+    movie.kind = CatalogueKind::movie;
+    movie.title = "Matched";
+    (void)s2.catalogue().upsert(movie);
+    CHECK(handle(s2, "POST", "/api/v1/manage/unmatched/" + matched_id + "/match",
+                 R"({"catalogue_item_id":"manual:movie:matched"})")
+              .status == 200);
+    CHECK(listed(s2) == std::set<std::string>{deleted_id});
+    CHECK(wait_until([&] { return listed(s1) == std::set<std::string>{deleted_id}; }, 10s));
+
+    // Deleted through node 2: the file goes, and with it the entry.
+    CHECK(handle(s2, "DELETE", "/api/v1/manage/unmatched/" + deleted_id).status == 204);
+    CHECK(listed(s2).empty());
+    CHECK(wait_until([&] { return listed(s1).empty(); }, 10s));
 
     s2.stop();
     s1.stop();
