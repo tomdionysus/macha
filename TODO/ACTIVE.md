@@ -142,8 +142,17 @@ A failing test is P0: reproduce it before deciding whose it is.
   the same window gbni-1's loader polls of fi-1 (`get_torrent_jobs`,
   `get_ingest_jobs`) stalled up to 25 s (14:03:37Z to 14:04:27Z). Only a
   start with a dirty checkpoint scans, so it has not recurred on the clean
-  restarts since. To find the holder: an unclean stop of fi-1's Macha,
-  then sample the arbiter and stacks during the scan (operator's call).
+  restarts since. Reproduction tried on 0.90.91 (operator: find the
+  holder): an unclean stop with a dirty DATA checkpoint and the page cache
+  dropped gave a 7.3 min cold rescan (19:01:41Z to 19:08:58Z; a warm one
+  takes 6 s), sampled every 10 s: the background slots were never both
+  held, no wait was abandoned, gbni-1 logged no stall. What differs from
+  13:52Z is the pull: on 0.90.86 it ran while the disk was offline and
+  then through the rescan, so a pull's put holding its lease on the
+  saturated disk is the likeliest holder. Now the pull waits behind the
+  push walk after an unclean stop and pulls nothing while no disk is
+  online (0.90.88). Not reproduced; reopen on the next "credit wait
+  abandoned".
   fi-1's clock: no RTC, it jumped about 8.5 min at NTP sync (16:52:28 to
   17:00:58 local), so its pre-sync journal times run behind.
 - **0.90.89 starved the push to a busy peer: fixed, 0.90.91.** gbni-1 pushed about 67 MB a minute to fi-1 until 17:40:21Z, when
