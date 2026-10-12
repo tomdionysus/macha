@@ -6,18 +6,26 @@ The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
 by area), `COMPLETED.md` (finished work), `CLIENT-CONTRACTS.md` (what the
 client sessions depend on) and `archive/` (past plans, evidence and
-handovers; a record, not requirements). Rationalised on 2026-10-09 after
-the object ledger, tombstone batches and the memory limit changed the plan;
-the version before is `archive/2026-10-09-ACTIVE-before-rationalisation.md`. Section 2 was
-re-cut the same day around the replication-by-diff proposal: the items it
-closes sit under the stage that closes them.
-Items marked *carried* come from earlier rationalisations and have not been
-re-checked since.
+handovers; a record, not requirements). Rationalised on 2026-10-12 after
+the three-answer repair work (0.90.88 to 0.90.93); the version before is
+`archive/2026-10-12-ACTIVE-before-rationalisation.md`. Items marked
+*carried* come from earlier rationalisations and have not been re-checked
+since.
 
-## 1. Failing tests and defects
+## 1. Next, then failing tests and defects
 
 A failing test is P0: reproduce it before deciding whose it is.
 
+- **Next: one definition of "unavailable", kept across a failed survey**
+  (seen 2026-10-12 on 0.90.92). The tree method leaves out the 442
+  catalogue objects no node holds (200,930 against the diff's 201,372), so
+  gbni-1, whose survey runs `tree:no_inventory`, pulls them and counts them
+  unsourceable (truthfully: fi-1 answers `not_found`). A survey that fails
+  while a peer restarts reads `unavailable=0 unknown=671994`, replacing the
+  last known set, so the pull asks about lost extents again until the next
+  good survey (fi-1 counted 28 between 19:40:34Z and 19:41:39Z). Also find
+  why gbni-1's survey falls back to the tree (`no_inventory`) while fi-1's
+  diffs.
 - **`rpc_cluster/test_two_node_mutual_bootstrap_metadata_write_floor`**:
   failed in full runs on 2026-10-05 and 2026-10-07; 24 of 24 under
   `--repeat`. A first write while two nodes form a set is refused
@@ -43,144 +51,30 @@ A failing test is P0: reproduce it before deciding whose it is.
   `rpc_cluster/test_inbound_incapable_node_is_reached_only_over_its_own_sessions`,
   the pacing check in
   `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
-  under debug logging, and
-  `users/test_accounts_converge_across_nodes` (a sign-in over 2 s under a
-  loaded laptop; with 0.90.64 a busy slot answers `try_later` instead),
+  under debug logging, `users/test_accounts_converge_across_nodes` (a
+  sign-in over 2 s under a loaded laptop; a busy slot now answers
+  `try_later`), and
   `rpc_cluster/test_rpc_metadata_executor_cancellation_disconnect_and_shutdown`
   (laptop, 2026-10-12, `exit=1` with no assertion printed, in a three-test
   group; passed alone and in the group after).
-- **`filesystem_fuse/test_fuse_frontend_local_semantics`** failed in
-  fi-1's 0.90.90 gate (2026-10-12; 20 of 20 alone): after `release()`,
-  `status().durability_writes` was short of the 128 writes and
-  `durability_batches < durability_writes` failed. Mechanism (diagnosed, not
-  fixed): `durability_loop` calls `finish_durability_batch`, which wakes
-  `release()`, before it adds the batch to the two counters
-  (`fuse_frontend.cpp:2396` against 2405-2406), so a reader in that gap
-  sees the batch uncounted. Fixed in 0.90.90: counted before the wake.
 - **The macOS torrent segfaults are the laptop's libraries, not Macha**
-  (2026-10-12). The five cases that start a session crash every run, in
-  libtorrent's own thread opening its listen socket (kqueue descriptor pool,
-  null allocator). The test executable compiles boost.asio from MacPorts
-  (`/opt/local/include`, 1.91) and exports a weak
-  `service_registry::create<kqueue_reactor>`; dyld binds libtorrent's
-  `use_service` to it, so Homebrew's libtorrent (2.1.1) reads a reactor
-  another asio laid out. A bare session, a forked one, one on Macha's disk
-  backend and one linked with every library of the test all run; a build
-  against Homebrew's Boost 1.92 crashes the same, so the bottle's asio
-  differs from that too. Linux is unaffected (distro libtorrent and Boost
-  together). Fix: one Boost and libtorrent from one package manager on the
-  laptop (the operator's machine; not changed). Operator 2026-10-12: ignore
-  these on the MacBook only; anywhere else they are P0.
-- **Ingest and merges**: the ingest re-bases on a stale basis since
-  0.90.79; a merge logs each conflict's key and an ingest stopped mid-put
-  resumes since 0.90.83 (the stop cancelled filesystem I/O before it told
-  the ingest to stop). Publications batch (operator, 2026-10-12: done). The
-  merge rule (take the newer when one side is the other's ancestor) and the
-  reconciler (one pair choice everywhere) from the 2026-09-23 diagnosis are
-  watched, not built: checked 2026-10-12, the only standing conflicts are
-  the seven from before 0.89.0, though both nodes merged up to 69 times a
-  day from 10-04 to 10-10 (the observations' `metadata.reconcile_us`); the
-  braid needs three heads, and two nodes fold the same pair. A
-  `metadata merge recorded a conflict` WARN (0.90.83) reopens it with the key.
-- **`RPC stalled (control)`** each way at 09:47Z and 09:50Z on 2026-10-05,
-  5 to 15 s without progress, then nothing. 0.90.65/66/68 removed three
-  ways control could wait; watch for a recurrence. Recurred 2026-10-11:
-  six control stalls of 5 s between the two nodes (`get_metadata_heads`,
-  `members`; 10:27Z, 11:55Z, 14:27Z, 15:34Z), the 15:34:39Z one both ways
-  in the same second, which points at the link (fi-1's mobile connection)
-  rather than either node; loader polls stalled alongside. None after
-  22:24Z that day (checked 2026-10-12 09:40Z).
-- **A failed convergence run's retry: built, 0.90.82.** Events during its
-  backoff bring it forward, `maintenance.convergence_settle_ms` (1 s) after
-  the last and at most `convergence_max_delay_ms` (10 s) after the first.
-  Diagnosed 2026-10-12: the events did not end the wait, and the unrelated
-  wakes that did (every 4 s at the median on the cluster) each retried at
-  once, so the backoff bounded nothing while events streamed.
+  (2026-10-12): the test executable's MacPorts boost.asio (1.91) exports a
+  weak `service_registry::create<kqueue_reactor>` that dyld binds into
+  Homebrew's libtorrent (2.1.1). Fix: one Boost and libtorrent from one
+  package manager on the laptop (the operator's machine; not changed).
+  Operator 2026-10-12: ignore these on the MacBook only; anywhere else P0.
+- **fi-1's speculative DATA waits abandoned** (2026-10-12 14:04Z to 14:07Z,
+  after the power cut; `lower_active=2/2`, during the cold rescan): not
+  reproduced on 0.90.91 by an unclean stop with the page cache dropped (a
+  7.3 min cold rescan, sampled every 10 s: slots never both held). The
+  likeliest holder was 0.90.86's pull putting through the rescan, which no
+  longer happens. Reopen on the next `credit wait abandoned`.
+- **Watched**: the merge rule and reconciler (the only standing conflicts
+  are the seven from before 0.89.0; a `metadata merge recorded a conflict`
+  WARN reopens it with the key); `RPC stalled (control)` (last 2026-10-11,
+  pointing at fi-1's mobile link; none since).
 - **fi-1, 2026-09-29**: a playback `PATCH` 503 after 19.9 s under software
   transcode, and a `FUSE mount disappeared` ERROR during a restart. *Carried.*
-- **Transport backoff after a peer restart**: measured 2026-10-12 and left
-  as is. Dial backoff is 250 ms doubling to 4 s, cleared by a successful
-  dial. gbni-1's 0.90.81 restart (12:56:34Z listening) had fi-1's control
-  and data lanes up at 12:56:35Z: a deliberate restart is down about 3 s,
-  one refused dial, never near the cap. Only an outage longer than about
-  8 s reaches 4 s, which then adds at most 4 s to it.
-- **The torrent loopback-only WARN is a false alarm** (fi-1, 0.90.87
-  start, 2026-10-12 15:35:30Z): `TorrentManager` decides per alert batch,
-  so a first batch holding only the loopback `listen_succeeded` warns
-  although every routable address bound in the same second. Not at the
-  16:51 start before it. Built, 0.90.90: judged 10 s after the first
-  listen report.
-- **Repair counted lost extents as `unsourceable` whenever nothing could
-  say: built, 0.90.88** (operator 2026-10-12: three answers, HTTP numbers
-  below as above). Every RPC refusal has a status and code; a fetch is
-  `ok`, `not_found` or `try_later`; repair counts only `not_found` and
-  backs off on `try_later`. Read after deploy (16:53Z): 0 on both nodes,
-  fi-1 having examined 43,188 through a survey that read `unavailable=0
-  unknown=674400 peers_failed=1` while gbni-1 restarted (the window that
-  counted 55 on 0.90.87). The push side: built, 0.90.89 (the presence
-  round is three-state per object; a peer that cannot say is retried, not
-  sent a copy). Diagnosis
-  (2026-10-12): The power cut lost
-  nothing: gbni-1's diff surveys read 201,372 extents held by no node
-  (of 1,072,291) from 09:54Z before it to 14:12Z after, unchanged. fi-1's
-  counts all fell where repair's `unavailable` predicate had no answer:
-  352 in the first minute after the 13:51Z start (before the first survey,
-  backend still offline), one at shutdown (fetches failing "node is
-  stopping"), and 55 at 15:36:24Z right after a survey that read
-  `unavailable=0 unknown=675615 peers_failed=1` while gbni-1 restarted for
-  0.90.87; none after the 15:38:15Z diff survey. Three causes: a failed or
-  first survey leaves the predicate empty, so repair asks the peer for
-  lost extents; a fetch refused by our own shutdown counts; an offline
-  backend's `has()` false sends repair to the peer (the backlog's "fi-1
-  pulls objects it cannot store"). Of the two survey methods, the tree
-  reads 200,930 (without the 442 catalogue objects), the diff 201,372.
-- **fi-1's speculative DATA waits abandoned** after 120 s, eight between
-  14:04Z and 14:07Z on 2026-10-12 with 78 KB of 128 MB used and both
-  background slots taken (`lower_active=2/2`), ending as the backend's
-  accounting scan finished (14:08:23Z). The scan takes no DATA lease
-  (`LocalStore::scan`), so something else held both slots past 120 s. In
-  the same window gbni-1's loader polls of fi-1 (`get_torrent_jobs`,
-  `get_ingest_jobs`) stalled up to 25 s (14:03:37Z to 14:04:27Z). Only a
-  start with a dirty checkpoint scans, so it has not recurred on the clean
-  restarts since. Reproduction tried on 0.90.91 (operator: find the
-  holder): an unclean stop with a dirty DATA checkpoint and the page cache
-  dropped gave a 7.3 min cold rescan (19:01:41Z to 19:08:58Z; a warm one
-  takes 6 s), sampled every 10 s: the background slots were never both
-  held, no wait was abandoned, gbni-1 logged no stall. What differs from
-  13:52Z is the pull: on 0.90.86 it ran while the disk was offline and
-  then through the rescan, so a pull's put holding its lease on the
-  saturated disk is the likeliest holder. Now the pull waits behind the
-  push walk after an unclean stop and pulls nothing while no disk is
-  online (0.90.88). Not reproduced; reopen on the next "credit wait
-  abandoned".
-  fi-1's clock: no RTC, it jumped about 8.5 min at NTP sync (16:52:28 to
-  17:00:58 local), so its pre-sync journal times run behind.
-- **0.90.89 starved the push to a busy peer: fixed, 0.90.91.** gbni-1 pushed about 67 MB a minute to fi-1 until 17:40:21Z, when
-  fi-1's gate build began, and nothing since (0 bytes through 0.90.90's
-  start). A busy fi-1 answers `have_valid_objects` "cannot say" from the
-  first id its `try_acquire` misses, so gbni-1 treats fi-1 as undecided for
-  nearly everything and sends nothing; 0.90.88 read the busy refusal as
-  "absent" and sent. Proposed fix: absence needs no read, so an id the
-  index does not hold, with every disk online, is answered 0 without a
-  lease; only "held" needs the validating read, and only that waits.
-  Also seen: after an unclean stop fi-1's push walk restarted from its last
-  saved position (48,971 examined in 12 min, 357,000 held), and the pull
-  waited behind it, since the push used each step's scan budget first:
-  fixed, 0.90.92 (the pull has its own count).
-- **The survey's "unavailable" has two definitions and forgets on
-  failure** (seen 2026-10-12 on 0.90.92, not fixed). The tree method
-  leaves out the 442 catalogue objects no node holds (200,930 against the
-  diff's 201,372), so gbni-1, whose survey runs `tree:no_inventory`, pulls
-  them and counts them unsourceable (442, truthfully: fi-1 answers
-  `not_found`). And a survey that fails while a peer restarts reads
-  `unavailable=0 unknown=671994`, replacing the last known set, so the
-  pull asks about lost extents again until the next good survey (fi-1
-  counted 28 between 19:40:34Z and 19:41:39Z). One definition, and keep
-  the last known set across a failed survey.
-- **The torrent backend decides "staging on another device" once, at
-  start** (fi-1, 2026-10-12 13:52Z: decided before the USB disk mounted,
-  though staging and DATA share it), so its DATA-device monitor stayed off
-  for the whole run. Fixed, 0.90.93: asked again every 30 s.
 
 ## 2. Replication by diff (the next large piece)
 
@@ -207,11 +101,8 @@ the walks stay as the fallback until every node runs stage 3.
    online** (about 203,000 of 940,000; five of 25 sampled movies EIO on
    both nodes, which is correct) as `unavailable`; the memo going stale
    when a peer's holdings grow (the diff has no memo); **per-file
-   readability**'s answer. Read after deploy: `method=diff` in the survey
-   debug line, its rounds, and `availability.survey_us` against before.
-   **0.90.71 and 0.90.72 are committed but not deployed**: the deploy
-   script was refused by the auto-mode classifier; fi-1's suites passed
-   for 0.90.71 on a clean build.
+   readability**'s answer. Deployed; fi-1 surveys by diff (201,372
+   unavailable), gbni-1 often falls back to the tree (section 1).
 3. **Repair on the diff: the push list built, 0.90.76.** Measured first (0.90.75, 2026-10-11, gbni-1
    pushing to fi-1): a local read is 40 ms an extent; a two-extent batch
    waits 3.95 s for its answers; repair's bandwidth estimate is 1.25 to
@@ -320,8 +211,6 @@ on control threads no longer grow with deletes. Left:
   thread when it changes. The fix is a combining writer (a caller finding a
   write in progress leaves its roster to the writer), but an identity reset
   must stay durable before it answers. No stall traced to it yet.
-- Done 0.90.85: the reverse dial's DEBUG lines under `RpcClient::mutex_`;
-  the `mutex_` then `Membership::m_` order, documented at `mutex_`.
 - gbni-1's DATA barrier (`syncfs` on `diskB`) is mean 484 ms, max 5.1 s
   under 20 torrents: it flushes torrent staging and the FUSE spool on the
   same disk, and libtorrent's writes keep no write-behind; viewer and loader
@@ -332,8 +221,6 @@ on control threads no longer grow with deletes. Left:
 
 ## 7. Features, API and optimisation
 
-- **Announce 0.90.64's `try_later` on the account routes** to Core and every
-  client at the next session (recorded in CLIENT-CONTRACTS).
 - **The API is RESTful, all of it**: audit every route; identity resets
   become a resource (decided); `providers/artwork?ref=` and
   `providers/artwork/choose` are among the routes to change.
@@ -379,7 +266,8 @@ on control threads no longer grow with deletes. Left:
 - Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
 - A `CONTRIBUTING.md` line: "A new gate may pace lower-class work; it may
   never stop it."
-- The replica's applier lifetime; fi-1's USB power.
+- The replica's applier lifetime; fi-1's USB power (it lost power again on
+  2026-10-12 and recovered by itself).
 - From the backlog: anonymous access; whether a client should know a
   playback generation existed anywhere in the cluster.
 
@@ -405,8 +293,8 @@ on control threads no longer grow with deletes. Left:
   The head names 64 tombstone batches (control objects) since the 0.90.67
   migration; the head record is 87,546 bytes.
 - Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.70` back to
-  `pre-0.89.0`). A node cannot go back before 0.90.55 (claims) or 0.90.67
+  in place before that version was installed (`pre-0.90.93` back to
+  `pre-0.89.0`, about 90 on each node; prune when convenient). A node cannot go back before 0.90.55 (claims) or 0.90.67
   (tombstone batches) without losing state; see the CHANGELOG.
 - gbni-1 also runs Plex Media Server, which reads `/mnt/diskA` (the exFAT
   ingest source, bound at `/media/Movies` and `/media/TV`); Macha never
@@ -425,7 +313,10 @@ on control threads no longer grow with deletes. Left:
   foreground and check both nodes' versions after: on 2026-10-09 a slow
   copy outran its 90 s fi-1 check and it stopped before installing gbni-1
   (`build/install-<version>.sh` then installs one node by hand).
-  On fi-1 `/root/mapi.sh`, `/root/apitime.sh`, `/root/burst-delete.sh`,
+  On fi-1 `/root/mapi.sh`, `/root/claude-slot-holder.sh` (samples the DATA
+  arbiter, gdb stacks when both background slots are held),
+  `/root/claude-cold-kill.sh` (unclean stop with the page cache dropped),
+  `/root/apitime.sh`, `/root/burst-delete.sh`,
   `/root/ryw-test.sh`, `/root/.macha-cold-read.py`,
   `/root/.macha-writebehind-probe.py`; on gbni-1 `/root/warm-io.sh`,
   `/root/match-trace.sh`, `/root/remove-empty-dirs.py`;
@@ -447,6 +338,12 @@ on control threads no longer grow with deletes. Left:
 - **Local is always fast; the cluster converges behind.** A local operation
   never waits on a peer or walks the namespace.
 - **No vacuous truths.** An empty set never satisfies "all" or "enough".
+- **Three answers, HTTP numbers below as above** (operator, 2026-10-12):
+  every request comes to "here it is", "cannot, and that will not change",
+  or "cannot say now" (try later, bounded exponential backoff). Internal
+  refusals carry an HTTP status and a snake_case code; nothing matches
+  English text. "Not here" is final only when every place it could be was
+  seen.
 - **Proportion.** Account for and control what matters to the user's
   experience; no nit-picking that does not improve it (operator,
   2026-10-09).

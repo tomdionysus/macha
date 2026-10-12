@@ -2,6 +2,35 @@
 
 Last updated: 2026-10-12
 
+## 2026-10-12 -- 0.90.88 to 0.90.93: three answers, and repair's fairness
+
+- **A refusal says whether asking again may help** (0.90.88; operator:
+  three answers, HTTP numbers below as above): every RPC refusal carries an
+  HTTP status and a snake_case code; a fetch is `ok`, `not_found` (every
+  online peer that might hold it says no) or `try_later`; repair counts
+  only `not_found` and backs off 1 s to 10 min on `try_later`, at once on a
+  membership or disk change; nothing is pulled while no disk is online.
+  fi-1's 352 + 1 + 55 unsourceable after the power cut were all survey gaps
+  and shutdown refusals; the power cut lost nothing (201,372 unavailable
+  before and after).
+- **A push waits for a peer that cannot say** (0.90.89), and **a busy peer
+  still says what it does not hold** (0.90.91): absence is an index lookup,
+  final with every disk online; only "held" needs the validating read.
+  0.90.89 alone stopped gbni-1's push to a busy fi-1 (17:40Z to 18:58Z).
+- **The torrent loopback-only WARN judged after the sockets settle, and the
+  FUSE durability counters counted before the wake** (0.90.90; the latter a
+  gate failure, 1 in a full run, 0 in 20 alone).
+- **The pull has its own share of a repair step** (0.90.92): after an
+  unclean stop fi-1's push had examined 57,082 objects and its pull none in
+  29 minutes; gbni-1's pull had not run in any reading that day.
+- **The torrent backend re-checks whether staging shares a DATA disk**
+  every 30 s (0.90.93); fi-1 decided "another device" before its USB disk
+  mounted.
+- fi-1 lost power mid-gate and recovered by itself (USB disk absent at
+  start, online 55 s later); two deliberate unclean stops also recovered by
+  themselves. The 13:52Z abandoned speculative waits were not reproduced
+  on a 7.3 min cold rescan.
+
 ## 2026-10-12 -- 0.90.87: the unmatched list is cluster-wide; the audit's API changes
 
 - **Every node lists every node's unmatched files** (0.90.87): both nodes
@@ -18,6 +47,23 @@ Last updated: 2026-10-12
 - Gate on fi-1: 665, 19 and 21 passed. fi-1 lost power mid-gate and came
   back by itself: the USB DATA disk was absent at start and online 55 s
   later, metadata writable throughout.
+
+## 2026-10-09 to 2026-10-12 -- 0.90.70 to 0.90.86 (summary; the CHANGELOG has each)
+
+- The memory limit shrinks, never refuses (0.90.70).
+- Replication by diff, stages 0 to 4 in part: one holdings identity
+  (0.90.71); the survey diffs held tries (0.90.72 to 0.90.74); repair's
+  push measured (0.90.75: the path, about 1.3 MB/s, is the limit) and fed
+  by what peers lack (0.90.76); catalogue objects nobody holds are
+  unavailable (0.90.77).
+- A missing local replica is not ready, not a failure (0.90.78).
+- Ingest: re-bases when a merge rolls its partial back (0.90.79); nothing
+  staged without its staging directory, announced (0.90.80/81); resumes
+  after a stop mid-put and a merge names its conflicts (0.90.83); a pause
+  or cancel stands over a failing ingest (0.90.84).
+- A failed convergence run retries once things settle (0.90.82).
+- A reverse dial logs without holding the client (0.90.85); a release's
+  cover listing is fetched once (0.90.86).
 
 ## 2026-10-09 -- 0.90.68 and 0.90.69: lock audit finished, one memory budget
 
