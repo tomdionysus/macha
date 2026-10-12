@@ -3199,6 +3199,79 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
     s1.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_failed_convergence_retries_once_per_burst_of_events) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "retry-burst-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "retry-burst-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+    c1.write_copies = c2.write_copies = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
+    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
+    c1.ingest.enabled = c2.ingest.enabled = false;
+    c1.torrent.enabled = c2.torrent.enabled = false;
+    // A failed run's own backoff is 30 s, longer than the whole test.
+    REQUIRE(maintenance_background_interval(c1.maintenance) >= 30s);
+    c1.maintenance.convergence_settle = 1s;
+    c1.maintenance.convergence_max_delay = 20s;
+
+    std::atomic_bool failing{};
+    std::atomic_int failed{};
+    Service s1(c1, keys, test_durability_window, {}, [&](std::string_view stage) {
+        if (stage == "metadata-repair-begin" && failing.load()) {
+            failed.fetch_add(1);
+            throw std::runtime_error("injected convergence failure");
+        }
+    });
+    Service s2(c2, keys, test_durability_window);
+    s1.start();
+    s2.start();
+    (void)s1.filesystem();
+    (void)s2.filesystem();
+    REQUIRE(wait_until(
+        [&] {
+            const auto d1 = s1.metadata_convergence_diagnostics();
+            return s1.node().membership().active().size() >= 2 &&
+                   s1.local_state().replica().committed_generation() > 1 &&
+                   s1.local_state().replica().committed().hash ==
+                       s2.local_state().replica().committed().hash &&
+                   !d1.scheduled && d1.runs_scheduled == d1.runs_completed;
+        },
+        10s));
+
+    // A stream of the peer's changes while runs fail: the first change runs
+    // and fails; the rest are one burst, retried after it, whatever else
+    // wakes the pass meanwhile.
+    failing.store(true);
+    const auto stream_start = Clock::now();
+    for (int i = 0; Clock::now() - stream_start < 5s; ++i) {
+        s2.filesystem().mkdir("/retry-burst-" + std::to_string(i), 0755, getuid(), getgid());
+        std::this_thread::sleep_for(200ms);
+    }
+    CHECK(failed.load() == 1);
+
+    // After the last change the retry runs once the settle has passed, not
+    // when the 30 s backoff ends.
+    failing.store(false);
+    const auto head = s2.local_state().replica().committed();
+    CHECK(wait_until(
+        [&] {
+            const auto d1 = s1.metadata_convergence_diagnostics();
+            return !d1.scheduled && s1.local_state().replica().committed().hash == head.hash;
+        },
+        4s));
+    CHECK(failed.load() == 1);
+
+    s2.stop();
+    s1.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_reconciliation) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

@@ -270,6 +270,12 @@ void parse_maintenance(const ConfigNode& root, Config& c) {
     if (m["no_progress_backoff_ms"])
         c.maintenance.no_progress_backoff =
             milliseconds(m["no_progress_backoff_ms"], "maintenance.no_progress_backoff_ms");
+    if (m["convergence_settle_ms"])
+        c.maintenance.convergence_settle =
+            milliseconds(m["convergence_settle_ms"], "maintenance.convergence_settle_ms");
+    if (m["convergence_max_delay_ms"])
+        c.maintenance.convergence_max_delay =
+            milliseconds(m["convergence_max_delay_ms"], "maintenance.convergence_max_delay_ms");
 }
 
 void parse_filesystem(const ConfigNode& root, Config& c) {
