@@ -39,10 +39,6 @@ size_t provider_cache_weight(const Json& value) {
     return sizeof(Json) + value.dump().size() * 2;
 }
 
-size_t provider_cache_weight(const std::string& value) {
-    return sizeof(std::string) + value.capacity();
-}
-
 template <class T>
 size_t provider_cache_weight(const std::optional<T>& value) {
     return sizeof(std::optional<T>) + (value ? provider_cache_weight(*value) : 0);
@@ -2053,32 +2049,45 @@ std::optional<Json> MusicBrainzProvider::find_recording(const MediaProbe& probe)
     return detail;
 }
 
-std::optional<std::string> MusicBrainzProvider::cover_url(std::string_view release_id) {
+std::optional<Json> MusicBrainzProvider::cover_art(std::string_view release_id) {
     const auto key = std::string(release_id);
-    if (auto it = cover_cache_.find(key); it != cover_cache_.end()) return it->second;
-
-    std::optional<std::string> result;
+    if (auto it = cover_art_cache_.find(key); it != cover_art_cache_.end()) return it->second;
     auto response = http_.get("https://coverartarchive.org/release/" + key,
                               {"Accept: application/json"}, 2 * 1024 * 1024);
-    if (response.status == 200) {
-        auto root = Json::parse(std::string_view(
+    std::optional<Json> listing;
+    // The Cover Art Archive answers 404 for a release with no art.
+    if (response.status == 200)
+        listing = Json::parse(std::string_view(
             reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-        if (auto images = root.find("images"); images && images->isArray()) {
-            for (const auto& image : images->asArray()) {
-                auto front = image.find("front");
-                if (!front || !front->isBool() || !front->asBool()) continue;
-                if (auto thumbs = image.find("thumbnails"); thumbs && thumbs->isObject()) {
-                    auto preferred = json_string(thumbs->find(config_.cover_size));
-                    if (preferred.empty()) preferred = json_string(thumbs->find("500"));
-                    if (!preferred.empty()) { result = std::move(preferred); break; }
-                }
-                auto original = json_string(image.find("image"));
-                if (!original.empty()) { result = std::move(original); break; }
-            }
-        }
+    else if (response.status != 404)
+        throw std::runtime_error("Cover Art Archive returned HTTP " + std::to_string(response.status));
+    provider_cache_store(cover_art_cache_, cache_bytes_, key, listing);
+    return listing;
+}
+
+std::optional<std::string> MusicBrainzProvider::cover_url(std::string_view release_id) {
+    std::optional<Json> listing;
+    try {
+        listing = cover_art(release_id);
+    } catch (const std::exception&) {
+        // A match without its cover still stands.
+        return {};
     }
-    provider_cache_store(cover_cache_, cache_bytes_, key, result);
-    return result;
+    if (!listing) return {};
+    const auto* images = listing->find("images");
+    if (!images || !images->isArray()) return {};
+    for (const auto& image : images->asArray()) {
+        auto front = image.find("front");
+        if (!front || !front->isBool() || !front->asBool()) continue;
+        if (auto thumbs = image.find("thumbnails"); thumbs && thumbs->isObject()) {
+            auto preferred = json_string(thumbs->find(config_.cover_size));
+            if (preferred.empty()) preferred = json_string(thumbs->find("500"));
+            if (!preferred.empty()) return preferred;
+        }
+        auto original = json_string(image.find("image"));
+        if (!original.empty()) return original;
+    }
+    return {};
 }
 
 std::vector<ProviderSearchResult> MusicBrainzProvider::search(const ProviderSearchQuery& query) {
@@ -2113,16 +2122,10 @@ std::vector<ArtworkOption> MusicBrainzProvider::artwork_options(std::string_view
                                                                 std::string_view id,
                                                                 std::string_view role,
                                                                 const ProviderRefNumbers&) {
-    auto response = http_.get("https://coverartarchive.org/release/" + std::string(id),
-                              {"Accept: application/json"}, 2 * 1024 * 1024);
-    // The Cover Art Archive answers 404 for a release with no art.
-    if (response.status == 404) return {};
-    if (response.status != 200)
-        throw std::runtime_error("Cover Art Archive returned HTTP " + std::to_string(response.status));
-    auto root = Json::parse(std::string_view(reinterpret_cast<const char*>(response.body.data()),
-                                             response.body.size()));
+    const auto listing = cover_art(id);
     std::vector<ArtworkOption> out;
-    const auto* images = root.find("images");
+    if (!listing) return out;
+    const auto* images = listing->find("images");
     if (!images || !images->isArray()) return out;
     for (const auto& image : images->asArray()) {
         bool front = false;
