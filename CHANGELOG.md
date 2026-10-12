@@ -1,5 +1,16 @@
 # Current release
 
+## 0.90.93: the torrent backend notices a disk mounted after start
+
+No API, wire, config or on-disk changes.
+
+The torrent backend decided once, as it started, whether its staging
+shares a DATA disk, and reported its I/O to that disk's pressure monitor
+only if so. On fi-1 after the power cut of 2026-10-12 it decided before
+the USB disk was mounted, though staging and DATA both live on it, so the
+monitor never heard the torrent's writes that run. The question is now
+asked again every 30 s, and the answer logged when it changes.
+
 ## 0.90.92: the pull has its own share of a repair step
 
 No API, wire, config or on-disk changes.

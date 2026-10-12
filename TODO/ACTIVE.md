@@ -170,7 +170,7 @@ A failing test is P0: reproduce it before deciding whose it is.
 - **The torrent backend decides "staging on another device" once, at
   start** (fi-1, 2026-10-12 13:52Z: decided before the USB disk mounted,
   though staging and DATA share it), so its DATA-device monitor stayed off
-  for the whole run. Not fixed.
+  for the whole run. Fixed, 0.90.93: asked again every 30 s.
 
 ## 2. Replication by diff (the next large piece)
 
