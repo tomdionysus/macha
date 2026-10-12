@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.84.
+Last updated: 2026-10-12, on `develop`. Both nodes run 0.90.84.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -43,12 +43,25 @@ A failing test is P0: reproduce it before deciding whose it is.
   `rpc_cluster/test_inbound_incapable_node_is_reached_only_over_its_own_sessions`,
   the pacing check in
   `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
-  under debug logging, the macOS-only torrent segfaults, and
+  under debug logging, and
   `users/test_accounts_converge_across_nodes` (a sign-in over 2 s under a
   loaded laptop; with 0.90.64 a busy slot answers `try_later` instead),
   `rpc_cluster/test_rpc_metadata_executor_cancellation_disconnect_and_shutdown`
   (laptop, 2026-10-12, `exit=1` with no assertion printed, in a three-test
   group; passed alone and in the group after).
+- **The macOS torrent segfaults are the laptop's libraries, not Macha**
+  (2026-10-12). The five cases that start a session crash every run, in
+  libtorrent's own thread opening its listen socket (kqueue descriptor pool,
+  null allocator). The test executable compiles boost.asio from MacPorts
+  (`/opt/local/include`, 1.91) and exports a weak
+  `service_registry::create<kqueue_reactor>`; dyld binds libtorrent's
+  `use_service` to it, so Homebrew's libtorrent (2.1.1) reads a reactor
+  another asio laid out. A bare session, a forked one, one on Macha's disk
+  backend and one linked with every library of the test all run; a build
+  against Homebrew's Boost 1.92 crashes the same, so the bottle's asio
+  differs from that too. Linux is unaffected (distro libtorrent and Boost
+  together). Fix: one Boost and libtorrent from one package manager on the
+  laptop (the operator's machine; not changed).
 - **Ingest and merges**: the ingest re-bases on a stale basis since
   0.90.79; a merge logs each conflict's key and an ingest stopped mid-put
   resumes since 0.90.83 (the stop cancelled filesystem I/O before it told
@@ -233,11 +246,17 @@ The control audits are done (lock audit 0.90.45 to 0.90.49 and 0.90.68;
 CPU and memory audit 2026-10-08; control lane fixes 0.90.61, 0.90.64 to
 0.90.66). The head record is 87,546 bytes (0.90.67), so whole-record copies
 on control threads no longer grow with deletes. Left:
-- DNS (`getaddrinfo`, net.cpp) has no timeout of its own.
-- Two `Log::debug` calls under `RpcClient::mutex_` in `await_reverse_dial`.
-- The `RpcClient::mutex_` then `Membership::m_` order is unannotated.
+- DNS (`getaddrinfo`, net.cpp) has no timeout of its own. fi-1 dials
+  gbni-1 by name (`macnessa.macha.network`): 4 to 6 ms through its router,
+  and no `resolve failed` in its journal (2026-10-12). Build only on
+  evidence.
 - A dial's peer observer can wait on another thread's roster fsync
-  (`persist_m_`).
+  (`persist_m_`): `Membership::observe` writes the roster on the caller's
+  thread when it changes. The fix is a combining writer (a caller finding a
+  write in progress leaves its roster to the writer), but an identity reset
+  must stay durable before it answers. No stall traced to it yet.
+- Done 0.90.85: the reverse dial's DEBUG lines under `RpcClient::mutex_`;
+  the `mutex_` then `Membership::m_` order, documented at `mutex_`.
 - gbni-1's DATA barrier (`syncfs` on `diskB`) is mean 484 ms, max 5.1 s
   under 20 torrents: it flushes torrent staging and the FUSE spool on the
   same disk, and libtorrent's writes keep no write-behind; viewer and loader
