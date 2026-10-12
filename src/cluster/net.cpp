@@ -2652,17 +2652,21 @@ void RpcClient::await_reverse_dial(Lock& lock, const NodeId& peer, TransportLane
         } catch (const std::exception& error) {
             failure = std::string("dial request could not be sent: ") + error.what();
         }
+        // Logged with mutex_ released: a slow log sink must not hold the client.
+        if (sent)
+            Log::debug("dial request sent peer=" + to_string(peer).substr(0, 12) +
+                       " lane=" + transport_lane_name(lane));
         lock.lock();
         if (sent) {
             ++dial_requests_sent_;
-            Log::debug("dial request sent peer=" + to_string(peer).substr(0, 12) +
-                       " lane=" + transport_lane_name(lane));
             const bool arrived = connection_cv_.wait_for(
                 lock.native(), connect_timeout_,
                 [&]() MACHA_REQUIRES(mutex_) { return route_usable_locked(peer, lane); });
             if (arrived) {
+                lock.unlock();
                 Log::debug("dial request answered peer=" + to_string(peer).substr(0, 12) +
                            " lane=" + transport_lane_name(lane));
+                lock.lock();
                 return;
             }
             failure = "peer " + to_string(peer).substr(0, 12) +

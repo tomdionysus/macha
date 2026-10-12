@@ -1,5 +1,15 @@
 # Current release
 
+## 0.90.85: a reverse dial logs without holding the client
+
+No API, wire, config or on-disk changes.
+
+A dial request to an inbound-incapable peer logged its `dial request sent`
+and `dial request answered` DEBUG lines while holding the RPC client's lock,
+so a slow log sink held every caller placing a call. Both lines are now
+written with the lock released. The client's lock is documented as taken
+before the node's membership lock, which its local-node callback takes.
+
 ## 0.90.84: a pause or cancel stands over a failing ingest
 
 No API, wire, config or on-disk changes.
