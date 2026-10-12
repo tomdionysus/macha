@@ -146,6 +146,18 @@ A failing test is P0: reproduce it before deciding whose it is.
   then sample the arbiter and stacks during the scan (operator's call).
   node-f's clock: no RTC, it jumped about 8.5 min at NTP sync (16:52:28 to
   17:00:58 local), so its pre-sync journal times run behind.
+- **0.90.89 starves the push to a busy peer** (diagnosed 2026-10-12, not
+  fixed). node-c pushed about 67 MB a minute to node-f until 17:40:21Z, when
+  node-f's gate build began, and nothing since (0 bytes through 0.90.90's
+  start). A busy node-f answers `have_valid_objects` "cannot say" from the
+  first id its `try_acquire` misses, so node-c treats node-f as undecided for
+  nearly everything and sends nothing; 0.90.88 read the busy refusal as
+  "absent" and sent. Proposed fix: absence needs no read, so an id the
+  index does not hold, with every disk online, is answered 0 without a
+  lease; only "held" needs the validating read, and only that waits.
+  Also seen: after an unclean stop node-f's push walk restarted from its last
+  saved position (48,971 examined in 12 min, 357,000 held), and the pull
+  waits behind it, since the push uses each step's scan budget first.
 - **The torrent backend decides "staging on another device" once, at
   start** (node-f, 2026-10-12 13:52Z: decided before the USB disk mounted,
   though staging and DATA share it), so its DATA-device monitor stayed off
