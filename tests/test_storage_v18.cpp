@@ -903,6 +903,60 @@ MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable
     CHECK(repeated.pull_unsourceable >= after.pull_unsourceable);
 }
 
+// A peer whose DATA admission is full still says what it does not hold:
+// absence is an index lookup and needs no admission. Only a held copy, which
+// must be read back to count, is "cannot say now" until admission frees.
+MACHA_TEST("storage_v18", test_a_busy_peer_still_says_what_it_does_not_hold) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto a_port = free_port();
+    StorageClusterNode a(storage_node_config(cluster, "busy-a", a_port, 8ULL * 1024 * 1024, 2, 1),
+                         cluster.keys());
+    StorageClusterNode b(storage_node_config(cluster, "busy-b", free_port(), 8ULL * 1024 * 1024, 2,
+                                             1, {{"127.0.0.1", a_port}}),
+                         cluster.keys());
+    a.start();
+    b.start();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 10s));
+    NodeInfo peer;
+    for (const auto& member : a.node().membership().active())
+        if (member.id == b.node().node_id())
+            peer = member;
+
+    const auto held_bytes = pattern(64 * 1024, 31);
+    const auto held = object_id(held_bytes);
+    REQUIRE(b.local_state().data().put(held, held_bytes));
+    const auto absent = object_id(pattern(64 * 1024, 32));
+    const auto ask = [&] {
+        Writer writer;
+        writer.u32(2);
+        writer.fixed(held.bytes);
+        writer.fixed(absent.bytes);
+        const auto reply = a.node().call(peer, MessageType::have_valid_objects, writer.data(),
+                                         FrameType::speculative);
+        REQUIRE(reply.message.type == MessageType::have_valid_objects_reply);
+        Reader reader(reply.message.payload);
+        REQUIRE(reader.u32() == 2);
+        const auto first = reader.u8();
+        const auto second = reader.u8();
+        return std::pair{first, second};
+    };
+
+    CHECK((ask() == std::pair<uint8_t, uint8_t>{1, 0}));
+    {
+        // Every byte the background classes may hold, held.
+        auto& data = b.node().resources.data;
+        const auto stats = data.stats();
+        auto full = data.try_acquire(DataWorkContext(FrameType::speculative, 0),
+                                     stats.capacity_bytes - stats.viewer_reserve_bytes);
+        REQUIRE(full);
+        CHECK((ask() == std::pair<uint8_t, uint8_t>{2, 0}));
+    }
+    CHECK((ask() == std::pair<uint8_t, uint8_t>{1, 0}));
+}
+
 // Kept integrated: the barrier's answer across a real peer restart, a new
 // durability epoch and backend incarnation read from the peer's own disk.
 //
