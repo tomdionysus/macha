@@ -1,5 +1,16 @@
 # Current release
 
+## 0.90.90: "loopback only" is judged once the listen sockets settle
+
+No API, wire, config or on-disk changes.
+
+The torrent session warned that it had bound no routable interface
+whenever the first batch of libtorrent's alerts held only the loopback
+socket, though every routable address bound in the same second (fi-1,
+2026-10-12 15:35:30Z). The warning is now decided 10 s after the first
+listen report, and the worker wakes to decide it even with nothing else
+to do.
+
 ## 0.90.89: a push waits for a peer that cannot say
 
 Wire change, compatible both ways; no API, config or on-disk changes.
