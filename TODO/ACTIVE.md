@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-12, on `develop`. Both nodes run 0.90.85.
+Last updated: 2026-10-12, on `develop`. Both nodes run 0.90.86.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -330,7 +330,7 @@ on control threads no longer grow with deletes. Left:
 ## Cluster state
 
 - **node-c** (192.0.2.50, `live-a.example.net`) and **node-f**
-  (198.51.100.10) run **0.90.85**, cluster protocol 23. node-e is offline
+  (198.51.100.10) run **0.90.86**, cluster protocol 23. node-e is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
