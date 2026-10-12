@@ -140,9 +140,9 @@ MACHA_TEST("node_services", test_services_never_started_stop_nothing_and_answer_
     bench.services.reset();
     for (const auto type : {MessageType::get_ingest_jobs, MessageType::ingest_job_action,
                             MessageType::torrent_intent}) {
-        const auto gone = bench.ask(type, "{}");
-        CHECK(gone.type == MessageType::error);
-        CHECK(text_of(gone.payload).find("is not available on this node") != std::string::npos);
+        const auto gone = rpc_refusal(bench.ask(type, "{}"));
+        REQUIRE(gone);
+        CHECK(gone->code == "not_implemented");
     }
 }
 

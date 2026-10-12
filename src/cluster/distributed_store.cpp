@@ -6,6 +6,7 @@
 #include "log.hpp"
 #include "observation.hpp"
 #include "cluster/placement.hpp"
+#include "cluster/rpc_refusal.hpp"
 #include "supervised.hpp"
 #include <algorithm>
 #include <chrono>
@@ -1344,7 +1345,8 @@ DistributedStore::ObjectData
 DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType frame_type,
                            const std::shared_ptr<SharedFetch>& shared,
                            Clock::time_point deadline, std::atomic_bool* cancelled,
-                           const std::function<bool()>& abort) {
+                           const std::function<bool()>& abort, FetchAnswer& answer) {
+    answer = FetchAnswer::try_later;
     try {
         if (target.id == n_.node_id()) {
             // A lease for this node's device; a fetch from a peer takes none
@@ -1359,14 +1361,19 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
                 n_.config().extent_size, deadline, cancelled);
             if (!memory)
                 return {};
+            const bool every_backend = local_.data().every_backend_online();
             auto bytes = local_.data().get(id);
-            if (!bytes)
+            if (!bytes) {
+                if (every_backend && local_.data().every_backend_online())
+                    answer = FetchAnswer::not_found;
                 return {};
+            }
             auto object = std::make_shared<ObjectBuffer>();
             object->bytes = std::move(*bytes);
             object->retained_memory =
                 std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
             object->retained_memory->push_back(std::move(*memory));
+            answer = FetchAnswer::ok;
             return object;
         }
 
@@ -1406,10 +1413,14 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
             Lock lock(shared->mutex);
             shared->promote_network = {};
         }
-        if (reply.message.type != MessageType::object_reply)
+        if (reply.message.type != MessageType::object_reply) {
+            if (const auto refusal = rpc_refusal(reply.message); refusal && refusal->status == 404)
+                answer = FetchAnswer::not_found;
             return {};
+        }
         auto data = take_object_reply_payload(std::move(reply.message), id);
         note_network(data->bytes.size(), Clock::now() - started);
+        answer = FetchAnswer::ok;
         return data;
     } catch (const std::exception& e) {
         if (shared) {
@@ -1425,7 +1436,20 @@ DistributedStore::ObjectData
 DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_type,
                              bool foreground, bool opportunistic_persist,
                              Clock::time_point deadline, std::atomic_bool* cancelled,
-                             const std::function<bool()>& abort) {
+                             const std::function<bool()>& abort, FetchAnswer* answer) {
+    // not_found needs every candidate asked and every one saying so.
+    size_t asked = 0;
+    bool all_absent = true;
+    const auto conclude = [&](const ObjectData& data) {
+        return data ? FetchAnswer::ok
+               : asked && all_absent && !read_aborted(deadline, cancelled, abort)
+                   ? FetchAnswer::not_found
+                   : FetchAnswer::try_later;
+    };
+    const auto settle = [&](const ObjectData& data) {
+        if (answer)
+            *answer = conclude(data);
+    };
     // A wall-clock deadline belongs to one caller, so deadline reads use a
     // private transfer whose expiry can abort the RPC. Cancellation-only
     // reads share and dedupe; a stopped caller abandons its wait but does
@@ -1447,12 +1471,18 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
 
                 auto started = Clock::now();
                 replica_selector_.started(target, work);
-                auto data = get_from(target, id, frame_type, nullptr, deadline, cancelled, abort);
+                FetchAnswer one{};
+                auto data =
+                    get_from(target, id, frame_type, nullptr, deadline, cancelled, abort, one);
                 replica_selector_.finished(target, work, data ? data->bytes.size() : 0,
                                            Clock::now() - started, static_cast<bool>(data));
                 if (data) return data;
+                ++asked;
+                all_absent = all_absent && one == FetchAnswer::not_found;
                 ++attempt;
             }
+            if (!candidates.empty())
+                all_absent = false;
             return {};
         };
 
@@ -1472,6 +1502,7 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
             if (opportunistic_persist)
                 enqueue_local_copy(id, data->bytes, should_own(id));
         }
+        settle(data);
         return data;
     }
 
@@ -1516,8 +1547,12 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
         while (!shared->done && !read_aborted(deadline, cancelled, abort))
             shared->cv.wait_for(lock.native(), std::chrono::milliseconds(25));
         shared->waiters.fetch_sub(1, std::memory_order_relaxed);
-        if (!shared->done)
+        if (!shared->done) {
+            settle({});
             return {};
+        }
+        if (answer)
+            *answer = shared->answer;
         if (shared->result) {
             if (foreground && !shared->foreground_accounted) {
                 note_foreground(shared->result->bytes.size());
@@ -1534,6 +1569,9 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
     auto finish = [&](ObjectData result) {
         bool account_foreground = false;
         bool queue_persist = false;
+        const auto concluded = conclude(result);
+        if (answer)
+            *answer = concluded;
         {
             // Hold the fetch-table lock until the result is published: an
             // earlier caller is guaranteed to be a waiter, a later one starts a
@@ -1543,6 +1581,7 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
             const bool has_waiters = shared->waiters.load(std::memory_order_relaxed) != 0;
             if (has_waiters)
                 shared->result = result;
+            shared->answer = concluded;
             if (result) {
                 if (shared->foreground && !shared->foreground_accounted) {
                     shared->foreground_accounted = true;
@@ -1606,7 +1645,9 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
             }
             // The transfer belongs to the ObjectId, not its leader: a cancelled
             // leader may abort the RPC only while no other reader has joined.
-            auto data = get_from(target, id, transfer_type, shared, {}, cancelled, abort);
+            FetchAnswer one{};
+            auto data =
+                get_from(target, id, transfer_type, shared, {}, cancelled, abort, one);
             {
                 Lock lock(shared->mutex);
                 replica_selector_.finished(target, shared->active_class,
@@ -1616,8 +1657,12 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
             }
             if (data)
                 return data;
+            ++asked;
+            all_absent = all_absent && one == FetchAnswer::not_found;
             ++attempt;
         }
+        if (!candidates.empty())
+            all_absent = false;
         return {};
     };
 
@@ -1637,8 +1682,10 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
         if (auto data = try_candidates(std::move(fallback)))
             return finish(std::move(data));
     } catch (const std::exception& error) {
+        all_absent = false;
         Log::debug("remote object scheduling " + to_string(id) + ": " + error.what());
     } catch (...) {
+        all_absent = false;
         Log::debug("remote object scheduling " + to_string(id) + ": unknown error");
     }
     return finish({});
@@ -1938,8 +1985,10 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
                             reader.finish();
                             answered = true;
                         }
-                    } else if (reply.message.type == MessageType::error) {
-                        unknown_message = true;
+                    } else if (const auto refusal = rpc_refusal(reply.message)) {
+                        // Only a peer that does not know the message is asked
+                        // id by id; one that is busy is not asked again now.
+                        unknown_message = refusal->code == "not_implemented" || !refusal->status;
                     }
                 }
             } catch (const std::exception& error) {
@@ -2810,100 +2859,162 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             repair_push_complete_ = true;
     }
 
-    // Pull objects this node should own, walking the ordered pull list (the
-    // live set when none is given) in place with upper_bound().
-    if (!repair_pull_complete_ && pull_list && !pull_list->empty() && !result.credit_limited) {
-        auto it = repair_pull_after_
-                      ? std::upper_bound(pull_list->begin(), pull_list->end(), *repair_pull_after_)
-                      : pull_list->begin();
-        // An object that needs nothing is an index lookup: it does not count
-        // against the scan budget, only against its own, far larger one, so a
-        // settled stretch of the list is passed in one step.
-        size_t skipped = 0;
-        const auto skip = [&](const ObjectId& id) {
-            repair_pull_after_ = id;
-            ++it;
-            ++skipped;
-            ++result.pull_examined;
-        };
-        while (it != pull_list->end() && scanned_total < scan_budget &&
-               skipped < repair_skip_budget) {
-            if (skipped % 1024 == 0 && yielded())
-                break;
-
-            const ObjectId id = *it;
-            bool local_valid = false;
-            if (should_own(id)) {
-                // Index lookup, as in the push: reading every held extent would
-                // never reach the missing ones. Scrub and reads own corruption.
-                local_valid = local_.data().has(id);
-            }
-            if (!should_own(id) || local_valid) {
-                skip(id);
-                continue;
-            }
-
-            // Promote a copy playback already cached before any network I/O,
-            // so convergence never downloads twice.
-            if (auto cached = local_.cache().get(id)) {
-                auto resource = data_resources_.acquire(
-                    DataWorkContext(FrameType::speculative, cached->size()), cached->size());
-                if (!resource)
-                    break;
-                (void)local_.data().put(id, *cached);
-                trace_repair("pull " + to_string(id) + " from-cache");
-                repair_pull_after_ = id;
-                ++it;
-                ++scanned_total;
-                ++result.pull_examined;
-                continue;
-            }
-
-            if (unavailable && unavailable(id)) {
-                static auto& skipped =
-                    observations().counter("maintenance.repair.pull_unavailable");
-                skipped.fetch_add(1, std::memory_order_relaxed);
-                trace_repair("pull " + to_string(id) + " unavailable");
-                skip(id);
-                continue;
-            }
-
-            if (transferred + n_.config().extent_size > byte_budget) {
-                result.credit_limited = true;
-                break;
-            }
-
-            if (!reserve_operation())
-                break;
+    // Pull objects this node should own: first the ones a peer asked to be
+    // asked again whose time has come, then the ordered pull list (the live
+    // set when none is given), walked in place with upper_bound(). Nothing is
+    // pulled while no local backend could store it.
+    if (local_.data().online_backends() && !result.credit_limited) {
+        bool stopped = false;
+        // Fetches one object and stores it; empty when DATA admission refuses
+        // (the node is stopping).
+        const auto pull = [&](const ObjectId& id) -> std::optional<FetchAnswer> {
+            FetchAnswer answer{};
             // The fetch runs to completion and is kept even if repair yields,
             // so a node that is never quiet still pulls.
-            auto data = get_remote(id, 0, FrameType::speculative, false, false, {}, nullptr);
+            auto data = get_remote(id, 0, FrameType::speculative, false, false, {}, nullptr, {},
+                                   &answer);
             if (data) {
                 auto resource = data_resources_.acquire(
                     DataWorkContext(FrameType::speculative, data->bytes.size()),
                     data->bytes.size());
                 if (!resource)
-                    break;
+                    return std::nullopt;
                 if (local_.data().put(id, data->bytes))
                     transferred += data->bytes.size();
                 trace_repair("pull " + to_string(id) + " fetched");
-            } else {
-                // Should own it, not here, not cached, and no peer supplied it:
-                // possibly an unavailable extent, or a transient peer/RPC
-                // failure, so this counts rather than concludes.
+            } else if (answer == FetchAnswer::not_found) {
+                // Should own it, not here, not cached, and every peer online
+                // that might hold it says it does not.
                 note_repair_unsourceable(id);
                 ++result.pull_unsourceable;
                 trace_repair("pull " + to_string(id) + " unsourceable");
+            } else {
+                static auto& later = observations().counter("maintenance.repair.pull_try_later");
+                later.fetch_add(1, std::memory_order_relaxed);
+                trace_repair("pull " + to_string(id) + " try-later");
             }
+            return answer;
+        };
 
-            repair_pull_after_ = id;
-            ++it;
-            ++scanned_total;
-            ++result.pull_examined;
+        const auto now = Clock::now();
+        if (const auto epoch = reachability_epoch(); epoch != repair_retry_epoch_) {
+            repair_retry_epoch_ = epoch;
+            for (auto& [id, retry] : repair_pull_retries_)
+                retry = {now, repair_retry_first};
         }
-        if (it == pull_list->end()) {
-            repair_pull_complete_ = true;
-            repair_pull_after_.reset();
+        for (auto retry = repair_pull_retries_.begin();
+             retry != repair_pull_retries_.end() && scanned_total < scan_budget;) {
+            const ObjectId id = retry->first;
+            if (retry->second.due > now) {
+                ++retry;
+                continue;
+            }
+            if (!should_own(id) || local_.data().has(id) || (unavailable && unavailable(id))) {
+                retry = repair_pull_retries_.erase(retry);
+                continue;
+            }
+            if (transferred + n_.config().extent_size > byte_budget) {
+                result.credit_limited = true;
+                break;
+            }
+            if (!reserve_operation())
+                break;
+            const auto answer = pull(id);
+            if (!answer) {
+                stopped = true;
+                break;
+            }
+            ++scanned_total;
+            if (*answer != FetchAnswer::try_later) {
+                retry = repair_pull_retries_.erase(retry);
+                continue;
+            }
+            retry->second.delay = std::min(retry->second.delay * 2, repair_retry_cap);
+            retry->second.due = now + retry->second.delay;
+            ++retry;
+        }
+
+        if (!stopped && !result.credit_limited && !repair_pull_complete_ && pull_list &&
+            !pull_list->empty()) {
+            auto it = repair_pull_after_
+                          ? std::upper_bound(pull_list->begin(), pull_list->end(), *repair_pull_after_)
+                          : pull_list->begin();
+            // An object that needs nothing is an index lookup: it does not count
+            // against the scan budget, only against its own, far larger one, so a
+            // settled stretch of the list is passed in one step.
+            size_t skipped = 0;
+            const auto skip = [&](const ObjectId& id) {
+                repair_pull_after_ = id;
+                ++it;
+                ++skipped;
+                ++result.pull_examined;
+            };
+            while (it != pull_list->end() && scanned_total < scan_budget &&
+                   skipped < repair_skip_budget) {
+                if (skipped % 1024 == 0 && yielded())
+                    break;
+
+                const ObjectId id = *it;
+                bool local_valid = false;
+                if (should_own(id)) {
+                    // Index lookup, as in the push: reading every held extent would
+                    // never reach the missing ones. Scrub and reads own corruption.
+                    local_valid = local_.data().has(id);
+                }
+                if (!should_own(id) || local_valid || repair_pull_retries_.contains(id)) {
+                    skip(id);
+                    continue;
+                }
+
+                // Promote a copy playback already cached before any network I/O,
+                // so convergence never downloads twice.
+                if (auto cached = local_.cache().get(id)) {
+                    auto resource = data_resources_.acquire(
+                        DataWorkContext(FrameType::speculative, cached->size()), cached->size());
+                    if (!resource)
+                        break;
+                    (void)local_.data().put(id, *cached);
+                    trace_repair("pull " + to_string(id) + " from-cache");
+                    repair_pull_after_ = id;
+                    ++it;
+                    ++scanned_total;
+                    ++result.pull_examined;
+                    continue;
+                }
+
+                if (unavailable && unavailable(id)) {
+                    static auto& skipped =
+                        observations().counter("maintenance.repair.pull_unavailable");
+                    skipped.fetch_add(1, std::memory_order_relaxed);
+                    trace_repair("pull " + to_string(id) + " unavailable");
+                    skip(id);
+                    continue;
+                }
+
+                if (transferred + n_.config().extent_size > byte_budget) {
+                    result.credit_limited = true;
+                    break;
+                }
+
+                if (!reserve_operation())
+                    break;
+                const auto answer = pull(id);
+                if (!answer)
+                    break;
+                if (*answer == FetchAnswer::try_later &&
+                    repair_pull_retries_.size() < repair_pull_retries_max)
+                    repair_pull_retries_[id] = {Clock::now() + repair_retry_first,
+                                                repair_retry_first};
+
+                repair_pull_after_ = id;
+                ++it;
+                ++scanned_total;
+                ++result.pull_examined;
+            }
+            if (it == pull_list->end()) {
+                repair_pull_complete_ = true;
+                repair_pull_after_.reset();
+            }
         }
     }
 

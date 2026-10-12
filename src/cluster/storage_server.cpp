@@ -81,7 +81,7 @@ void StorageServer::bind_routes() {
               auto resource = data_resources_.try_acquire(
                   DataWorkContext(frame_type, extent_size_), extent_size_);
               if (!resource)
-                  return error_reply("DATA resource admission busy or stopping");
+                  return error_reply(503, "storage_busy", "DATA resource admission busy or stopping");
               // Repair/rebalance trust this "present" without re-verifying, so
               // authenticate, decrypt and hash: a corrupt replica never counts as
               // healthy placement. (have_objects and retain_objects check presence.)
@@ -94,7 +94,7 @@ void StorageServer::bind_routes() {
               Reader reader(request.payload);
               const auto count = reader.u32();
               if (!count || count > 200000)
-                  return error_reply("invalid presence batch count");
+                  return error_reply(400, "invalid_request", "invalid presence batch count");
               std::vector<ObjectId> ids;
               ids.reserve(count);
               for (uint32_t i = 0; i < count; ++i) {
@@ -110,7 +110,7 @@ void StorageServer::bind_routes() {
               auto resource = data_resources_.try_acquire(
                   DataWorkContext(frame_type, extent_size_), extent_size_);
               if (!resource)
-                  return error_reply("DATA resource admission busy or stopping");
+                  return error_reply(503, "storage_busy", "DATA resource admission busy or stopping");
               Writer writer;
               writer.u32(count);
               for (const auto& id : ids)
@@ -123,7 +123,7 @@ void StorageServer::bind_routes() {
               Reader reader(request.payload);
               const auto count = reader.u32();
               if (!count || count > have_valid_objects_max)
-                  return error_reply("invalid validated presence batch count");
+                  return error_reply(400, "invalid_request", "invalid validated presence batch count");
               std::vector<ObjectId> ids;
               ids.reserve(count);
               for (uint32_t i = 0; i < count; ++i) {
@@ -140,7 +140,7 @@ void StorageServer::bind_routes() {
                   auto resource = data_resources_.try_acquire(
                       DataWorkContext(frame_type, extent_size_), extent_size_);
                   if (!resource)
-                      return error_reply("DATA resource admission busy or stopping");
+                      return error_reply(503, "storage_busy", "DATA resource admission busy or stopping");
                   writer.u8(local_.valid(id));
               }
               return {MessageType::have_valid_objects_reply, writer.take()};
@@ -154,7 +154,7 @@ void StorageServer::bind_routes() {
               Reader reader(request.payload);
               const auto count = reader.u32();
               if (!count || count > 200000)
-                  return error_reply("invalid control presence batch count");
+                  return error_reply(400, "invalid_request", "invalid control presence batch count");
               std::vector<ObjectId> ids;
               ids.reserve(count);
               for (uint32_t i = 0; i < count; ++i) {
@@ -178,10 +178,15 @@ void StorageServer::bind_routes() {
               auto resource = data_resources_.acquire(DataWorkContext(frame_type, extent_size_),
                                                       extent_size_);
               if (!resource)
-                  return error_reply("DATA resource admission stopping");
+                  return error_reply(503, "stopping", "DATA resource admission stopping");
+              // Not found is final only when no offline backend could hold it.
+              const bool every_backend = local_.every_backend_online();
               auto data = local_.get(id);
               if (!data)
-                  return error_reply("object not found");
+                  return every_backend && local_.every_backend_online()
+                             ? error_reply(404, "not_found", "object not found")
+                             : error_reply(503, "storage_unavailable",
+                                           "object not found on the backends online");
               activity_.note(frame_type, data->size());
               Writer writer;
               writer.fixed(id.bytes);
@@ -196,7 +201,7 @@ void StorageServer::bind_routes() {
               reader.finish();
               auto data = control_.get(id);
               if (!data)
-                  return error_reply("control object not found");
+                  return error_reply(404, "not_found", "control object not found");
               Writer writer;
               writer.fixed(id.bytes);
               writer.bytes(*data);
@@ -211,18 +216,18 @@ void StorageServer::bind_routes() {
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
             if (data.size() > extent_size_)
-                return error_reply("DATA object exceeds configured extent size");
+                return error_reply(413, "too_large", "DATA object exceeds configured extent size");
             auto resource =
                 data_resources_.acquire(DataWorkContext(frame_type, data.size()), data.size());
             if (!resource)
-                return error_reply("DATA resource admission stopping");
+                return error_reply(503, "stopping", "DATA resource admission stopping");
             activity_.note(frame_type, data.size());
             if (!local_.has(id))
                 events_.notify(NodeEvent::storage);
             if (request.type == MessageType::put_object_deferred) {
                 const auto generation = local_.put_deferred(id, data);
                 if (!generation)
-                    return error_reply("storage limit reached");
+                    return error_reply(507, "storage_full", "storage limit reached");
                 node_.advertise_storage(local_.used(), local_.limit());
                 // Bind provisional placement to this process lifetime and
                 // node-wide mutation generation. A later barrier for a covered
@@ -235,7 +240,7 @@ void StorageServer::bind_routes() {
                 return {MessageType::ok, reply.take()};
             }
             if (!local_.put(id, data))
-                return error_reply("storage limit reached");
+                return error_reply(507, "storage_full", "storage limit reached");
             node_.advertise_storage(local_.used(), local_.limit());
             return {MessageType::ok, {}};
         };
@@ -250,7 +255,7 @@ void StorageServer::bind_routes() {
               auto data = reader.bytes(128 * 1024 * 1024);
               reader.finish();
               if (!control_.put(id, data))
-                  return error_reply("control storage limit reached");
+                  return error_reply(507, "storage_full", "control storage limit reached");
               return {MessageType::ok, {}};
           });
     route(MessageType::object_durability_barrier,
@@ -266,7 +271,7 @@ void StorageServer::bind_routes() {
               if (reader.remaining()) {
                   const auto count = reader.u32();
                   if (count > 4096)
-                      return error_reply("too many durability probe ids");
+                      return error_reply(413, "too_large", "too many durability probe ids");
                   probe_ids.reserve(count);
                   for (uint32_t i = 0; i < count; ++i)
                       probe_ids.push_back(ObjectId{reader.fixed<32>()});
@@ -283,7 +288,7 @@ void StorageServer::bind_routes() {
                                  " current=" + to_string(identity_.durability_epoch).substr(0, 8) +
                                  " domain=" + std::to_string(domain) +
                                  " generation=" + std::to_string(required_generation));
-                      return error_reply("storage durability epoch changed");
+                      return error_reply(409, "epoch_changed", "storage durability epoch changed");
                   }
                   Writer reply;
                   reply.fixed(identity_.durability_epoch.bytes);
@@ -313,8 +318,9 @@ void StorageServer::bind_routes() {
                   node_.advertise_storage(local_.used(), local_.limit());
                   return {MessageType::ok, {}};
               } catch (const std::exception& error) {
-                  return error_reply(std::string("storage durability barrier failed: ") +
-                                     error.what());
+                  return error_reply(500, "barrier_failed",
+                                     std::string("storage durability barrier failed: ") +
+                                         error.what());
               }
           });
     route(MessageType::retain_objects,
@@ -324,14 +330,14 @@ void StorageServer::bind_routes() {
               const auto raw_class = reader.u8();
               if (raw_class < static_cast<uint8_t>(RetentionClass::data) ||
                   raw_class > static_cast<uint8_t>(RetentionClass::control))
-                  return error_reply("invalid retention object class");
+                  return error_reply(400, "invalid_request", "invalid retention object class");
               const auto object_class = static_cast<RetentionClass>(raw_class);
               RetentionDot dot;
               dot.origin.bytes = reader.fixed<16>();
               dot.sequence = reader.u64();
               const auto count = reader.u32();
               if (!count || count > 1000000)
-                  return error_reply("invalid retention object count");
+                  return error_reply(400, "invalid_request", "invalid retention object count");
               std::vector<ObjectId> ids;
               ids.reserve(count);
               for (uint32_t i = 0; i < count; ++i) {
@@ -350,7 +356,7 @@ void StorageServer::bind_routes() {
                                            ? local_.has(id)
                                            : control_.has(id);
                   if (!present)
-                      return error_reply("retention object is not durably present");
+                      return error_reply(409, "not_present", "retention object is not durably present");
               }
               claims_.retain_batch(object_class, ids, dot);
               return {MessageType::ok, {}};
@@ -362,11 +368,11 @@ void StorageServer::bind_routes() {
               ObjectId id{reader.fixed<32>()};
               reader.finish();
               if (claims_.retained(RetentionClass::data, id))
-                  return error_reply("object has an active retention claim");
+                  return error_reply(409, "claimed", "object has an active retention claim");
               auto resource = data_resources_.try_acquire(
                   DataWorkContext(frame_type, extent_size_), extent_size_);
               if (!resource)
-                  return error_reply("DATA resource admission busy or stopping");
+                  return error_reply(503, "storage_busy", "DATA resource admission busy or stopping");
               (void)local_.remove(id);
               (void)cache_.remove(id);
               node_.advertise_storage(local_.used(), local_.limit());

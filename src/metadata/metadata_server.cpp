@@ -133,7 +133,7 @@ void MetadataServer::bind_routes() {
               reader.finish();
               auto entry = replica_.history_entry(hash);
               if (!entry)
-                  return error_reply("metadata history entry unavailable");
+                  return error_reply(404, "not_found", "metadata history entry unavailable");
               return {MessageType::metadata_history_entry_reply,
                       encode_metadata_history_entry(*entry)};
           });
@@ -149,7 +149,7 @@ void MetadataServer::bind_routes() {
               reader.finish();
               auto entry = replica_.full_history_record(hash);
               if (!entry)
-                  return error_reply("metadata history record unavailable");
+                  return error_reply(404, "not_found", "metadata history record unavailable");
               return {MessageType::metadata_history_entry_reply,
                       encode_metadata_history_entry(*entry)};
           });

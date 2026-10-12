@@ -801,11 +801,13 @@ MACHA_TEST("storage_v18", test_a_full_preferred_node_spills_data_but_not_control
 }
 
 // Repair does no work that cannot complete, and says what it cannot do: an
-// object the survey marks unavailable is passed without a fetch, and a live
-// object no peer can supply is counted and sampled once, never a held one.
+// object the survey marks unavailable is passed without a fetch; one nobody
+// can answer for now is asked again, not counted; and a live object every
+// peer says it does not hold is counted and sampled once, never a held one.
 MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable_objects) {
     TestCluster cluster;
-    StorageClusterNode node(storage_node_config(cluster, "lonely", free_port(), 8ULL * 1024 * 1024,
+    const auto lonely_port = free_port();
+    StorageClusterNode node(storage_node_config(cluster, "lonely", lonely_port, 8ULL * 1024 * 1024,
                                                 2, 1),
                             cluster.keys());
     node.start();
@@ -863,12 +865,27 @@ MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable
         CHECK(asked.empty());
     }
 
-    // Unmarked, the pass tries to source it and, with no peer, cannot.
+    // Unmarked, with no peer to ask, nothing settles it now: not counted.
     marked = false;
+    (void)step();
+    (void)step();
+    CHECK(node.store().repair_diagnostics().pull_unsourceable == 0);
+
+    // A peer with every disk online that does not hold it says so, and the
+    // peer's arrival makes the waiting object due at once.
+    StorageClusterNode peer(storage_node_config(cluster, "peer", free_port(), 8ULL * 1024 * 1024,
+                                                2, 1, {{"127.0.0.1", lonely_port}}),
+                            cluster.keys());
+    peer.start();
+    REQUIRE(wait_until([&] {
+        return node.node().membership().active().size() == 2 &&
+               peer.node().membership().active().size() == 2;
+    }, 10s));
     REQUIRE(wait_until([&] {
         (void)step();
         return node.store().repair_diagnostics().pull_unsourceable > 0;
-    }));
+    }, 10s));
+    CHECK(!peer.local_state().data().has(missing));
     // With a held object beside it in the live set (sorted: repair
     // binary-searches it), only the missing one is unsourceable.
     live = {present, missing};

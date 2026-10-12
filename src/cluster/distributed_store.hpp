@@ -44,6 +44,12 @@ class DistributedStore final : public Placement, public ControlObjectSource {
         std::shared_ptr<std::vector<RetainedMemoryLedger::Lease>> retained_memory;
     };
     using ObjectData = std::shared_ptr<const ObjectBuffer>;
+    // What asking peers for an object came to: the object; not_found, every
+    // online peer that might hold it said it does not and asking again will
+    // not change that; or try_later, nothing that settles it now (a peer busy,
+    // stopping, unreachable or with a disk offline, no peer online, or the
+    // fetch abandoned).
+    enum class FetchAnswer : uint8_t { ok, not_found, try_later };
 
     struct RepairResult {
         uint64_t bytes_transferred{};
@@ -143,6 +149,7 @@ class DistributedStore final : public Placement, public ControlObjectSource {
         std::optional<NodeInfo> active_peer MACHA_GUARDED_BY(mutex);
         ReplicaWorkClass active_class MACHA_GUARDED_BY(mutex){ReplicaWorkClass::speculative};
         ObjectData result MACHA_GUARDED_BY(mutex);
+        FetchAnswer answer MACHA_GUARDED_BY(mutex){FetchAnswer::try_later};
     };
 
     ClusterNode& n_;
@@ -173,6 +180,19 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     uint64_t repair_position_saved_{};
     void save_repair_position(bool force);
     std::optional<ObjectId> repair_pull_after_;
+    // Pulls a peer answered try_later for, each asked again after its own
+    // delay, doubling from repair_retry_first to repair_retry_cap; all are due
+    // at once when reachability_epoch() changes.
+    struct PullRetry {
+        Clock::time_point due;
+        Clock::duration delay;
+    };
+    std::map<ObjectId, PullRetry> repair_pull_retries_;
+    uint64_t repair_retry_epoch_{};
+    static constexpr Clock::duration repair_retry_first = std::chrono::seconds(1);
+    static constexpr Clock::duration repair_retry_cap = std::chrono::minutes(10);
+    // Beyond it, an object is met again on the next pass instead.
+    static constexpr size_t repair_pull_retries_max = 4096;
     // The push pass over a given list: the last object taken from it, the
     // list's identity, and whether the pass is over a list at all.
     std::optional<ObjectId> repair_push_after_;
@@ -221,11 +241,10 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     std::atomic_uint64_t prompt_skipped_no_room_{};
     std::atomic_uint64_t prompt_dropped_{};
     // Repair's silent failures, counted. Pull: a live object this node should
-    // own that is not here, not cached, and no peer would supply (an
-    // unavailable extent). Push: a listed local object that cannot be read
-    // back (a failing disk). A single miss proves nothing (busy peer, failed
-    // RPC, budget); a total climbing across passes, or ids recurring in the
-    // sample, is the signal.
+    // own that is not here, not cached, and that every online peer that might
+    // hold it says it does not (an unavailable extent); a peer that cannot say
+    // now is asked again, not counted. Push: a listed local object that cannot
+    // be read back (a failing disk).
     std::atomic_uint64_t repair_pull_unsourceable_{};
     std::atomic_uint64_t repair_push_examined_total_{};
     std::atomic_uint64_t repair_pull_examined_total_{};
@@ -322,11 +341,13 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     ObjectData get_from(const NodeInfo&, const ObjectId&, FrameType,
                         const std::shared_ptr<SharedFetch>&,
                         Clock::time_point deadline, std::atomic_bool* cancelled,
-                        const std::function<bool()>& abort = {});
+                        const std::function<bool()>& abort, FetchAnswer& answer);
+    // `answer`, when given, says what the fetch came to.
     ObjectData get_remote(const ObjectId&, size_t stripe, FrameType, bool foreground,
                           bool opportunistic_persist, Clock::time_point deadline = {},
                           std::atomic_bool* cancelled = nullptr,
-                          const std::function<bool()>& abort = {});
+                          const std::function<bool()>& abort = {},
+                          FetchAnswer* answer = nullptr);
     void note_foreground(uint64_t);
     void note_network(uint64_t, Clock::duration);
 

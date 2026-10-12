@@ -23,7 +23,6 @@ class NodeRuntime;
 // state plus each peer's last answer to a background poll, with its age, so
 // job lists never wait on peers. Actions, and one ingest job's detail, go to
 // the job's owning node.
-// A peer without the torrent plugin answers "torrents not available".
 class ClusterJobView {
   public:
     static constexpr auto default_refresh_interval = std::chrono::seconds(5);

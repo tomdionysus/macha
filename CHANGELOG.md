@@ -1,5 +1,42 @@
 # Current release
 
+## 0.90.88: a refusal says whether asking again may help
+
+Wire change, compatible both ways; no API, config or on-disk changes.
+
+- Every RPC refusal carries an HTTP status number and a snake_case code
+  beside its English reason, as the HTTP API's errors do: `404 not_found`,
+  `429 try_later`, `503` for "not now" (`storage_busy`, `stopping`,
+  `storage_unavailable`, `holdings_seeding`), `501 not_implemented` for a
+  message nobody answers here, `500 internal_error` for a handler that
+  threw, and so on. The reason stays first in the payload, so an older
+  node still reads it; a refusal from an older node names no status and is
+  taken as "may change".
+- A peer asked for an object it does not hold answers `404 not_found`
+  only when every one of its disks is online; with one offline it answers
+  `503 storage_unavailable`, since the copy may be there.
+- A fetch from peers comes to one of three answers: the object;
+  `not_found`, every online peer that might hold it said it does not; or
+  `try_later`, nothing settled it now (a peer busy, stopping, unreachable
+  or with a disk offline, no peer online, or the fetch abandoned).
+- Repair counts an object as unsourceable only on `not_found`. On
+  `try_later` it asks again after a delay doubling from 1 s to 10 minutes,
+  and at once when membership or this node's disks change. It pulls
+  nothing while no disk of its own is online. On 2026-10-12 fi-1 counted
+  352 unsourceable objects in its first minute after a power cut (the USB
+  disk spinning up, the survey not yet run), one more at its next
+  shutdown, and 55 while gbni-1 restarted; every one was an extent nobody
+  holds or a peer that could not answer, and none was new loss.
+- The cluster job view knew a peer without the torrent plugin by matching
+  the text "torrents not available", which the refusal never said; it
+  reads `not_implemented` now.
+- Repair's presence round asks a peer id by id only when the peer does not
+  know the batched question, not when it is busy.
+
+Test: a lone node's pull of an object nobody holds counts nothing; when a
+peer that does not hold it joins, the object is asked again at once and
+counted (on the old code the lone node counted it with no peer to ask).
+
 ## 0.90.87: the unmatched list is the cluster's; the acquisition audit's API changes
 
 API and wire changes, announced to Core and every client before release.

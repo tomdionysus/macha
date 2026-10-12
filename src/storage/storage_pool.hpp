@@ -177,6 +177,9 @@ class StoragePool final : public ObjectStore {
     uint64_t used() const;
     uint64_t limit() const;
     size_t online_backends() const;
+    // Whether every configured backend is online now: only then is an object
+    // get() did not find known not to be here.
+    bool every_backend_online() const;
     LocalStoreDiagnostics diagnostics() const;
 };
 } // namespace macha
