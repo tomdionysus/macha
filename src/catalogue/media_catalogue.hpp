@@ -288,7 +288,8 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::map<std::string, std::optional<Json>> release_cache_;
     std::map<std::string, std::optional<Json>> release_id_cache_;
     std::map<std::string, std::optional<Json>> recording_cache_;
-    std::map<std::string, std::optional<std::string>> cover_cache_;
+    // A release's Cover Art Archive listing; empty for a release with no art.
+    std::map<std::string, std::optional<Json>> cover_art_cache_;
     size_t cache_bytes_{};
     std::shared_ptr<MusicBrainzGate> gate_;
     bool interactive_{};
@@ -297,6 +298,9 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::optional<Json> release_by_id(std::string_view);
     std::optional<Json> find_release(const MediaProbe&);
     std::optional<Json> find_recording(const MediaProbe&);
+    // The listing artwork_options() offers and cover_url() chooses from, one
+    // fetch for both. Throws when the archive answers neither 200 nor 404.
+    std::optional<Json> cover_art(std::string_view release_id);
     std::optional<std::string> cover_url(std::string_view release_id);
 
   public:
@@ -316,7 +320,7 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::vector<ProviderReleaseTrack> release_tracks(std::string_view id) override;
     size_t cache_entries() const noexcept {
         return release_cache_.size() + release_id_cache_.size() + recording_cache_.size() +
-               cover_cache_.size();
+               cover_art_cache_.size();
     }
     size_t cache_bytes() const noexcept { return cache_bytes_; }
 };
