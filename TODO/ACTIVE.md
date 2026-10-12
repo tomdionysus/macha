@@ -101,8 +101,15 @@ A failing test is P0: reproduce it before deciding whose it is.
   so a first batch holding only the loopback `listen_succeeded` warns
   although every routable address bound in the same second. Not at the
   16:51 start before it. Diagnosed, not fixed.
-- **Repair counts lost extents as `unsourceable` whenever the survey
-  cannot say** (diagnosed 2026-10-12, not fixed). The power cut lost
+- **Repair counted lost extents as `unsourceable` whenever nothing could
+  say: built, 0.90.88** (operator 2026-10-12: three answers, HTTP numbers
+  below as above). Every RPC refusal has a status and code; a fetch is
+  `ok`, `not_found` or `try_later`; repair counts only `not_found` and
+  backs off on `try_later`. Read after deploy: fi-1's `unsourceable` after
+  a restart, against the 352 and 55 below. Still two-state: repair's
+  presence round (`validated_presence`) answers "absent" for a peer whose
+  request failed, so a busy peer may be pushed a copy it holds. Diagnosis
+  (2026-10-12): The power cut lost
   nothing: gbni-1's diff surveys read 201,372 extents held by no node
   (of 1,072,291) from 09:54Z before it to 14:12Z after, unchanged. fi-1's
   counts all fell where repair's `unavailable` predicate had no answer:
