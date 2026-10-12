@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-12, on `develop`. Both nodes run 0.90.86.
+Last updated: 2026-10-12, on `develop`. Both nodes run 0.90.87.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -74,16 +74,6 @@ A failing test is P0: reproduce it before deciding whose it is.
   day from 10-04 to 10-10 (the observations' `metadata.reconcile_us`); the
   braid needs three heads, and two nodes fold the same pair. A
   `metadata merge recorded a conflict` WARN (0.90.83) reopens it with the key.
-- **The unmatched list differs by node**: built 2026-10-12 (operator: the
-  list is cluster-wide), held in 0.90.87 with the API changes below. 674 on fi-1, 614 on gbni-1, 540 on both (same
-  ids), 748 in all. Every file on one list only has no hint at all on the
-  other: the scan coordinator submits the hints and keeps them in its own
-  `catalogue/hints.json`, so each list holds what arrived while that node
-  coordinated (fi-1's 134: Tiesto, Angry Boys; gbni-1's 74: the Enya
-  imports of 2026-10-10). Each node now polls its peers' hints every 30 s
-  (`get_unmatched_hints`, only to peers on 0.90.87 or later, answered
-  "unchanged" by revision) and lists them with its own; a file bound on any
-  node is dropped; any node acts on any id.
 - **`RPC stalled (control)`** each way at 09:47Z and 09:50Z on 2026-10-05,
   5 to 15 s without progress, then nothing. 0.90.65/66/68 removed three
   ways control could wait; watch for a recurrence. Recurred 2026-10-11:
@@ -106,25 +96,21 @@ A failing test is P0: reproduce it before deciding whose it is.
   and data lanes up at 12:56:35Z: a deliberate restart is down about 3 s,
   one refused dial, never near the cap. Only an outage longer than about
   8 s reaches 4 s, which then adds at most 4 s to it.
-- **Known defects of 2026-09-24/25**: the acquisition API audit's four
-  findings: a pause or cancel overwritten by a failing ingest, fixed
-  0.90.84; the other three change the API and are built and tested but
-  held out of the tree until Core and the clients are told. The whole of
-  0.90.87 (these three, the unmatched list, the version bump, CHANGELOG) is
-  `build/api-held/release-0.90.87.patch` against 0.90.86 (`git apply`, then
-  commit, gate, deploy) (no client
-  session was running, 2026-10-12; operator: send
-  `build/api-held/ANNOUNCEMENT.txt` to Core when it is next up, then ship):
-  one `catalogue.state` rule for an ingest and its torrent (a completed
-  import with nothing counted read `completed` on the ingest, `waiting` on
-  the torrent); a remote job's single `GET` asks its owner, so
-  `catalogue.items` is the owner's, or null when it cannot be asked (was an
-  empty array); torrent search results in provider order, not sorted by
-  seeders. (The install docs' Fedora and MacPorts package names were
-  checked 2026-10-12 against Fedora 43/44 and the MacPorts index: all
-  exist, `zlib-devel` through `zlib-ng-compat-devel`, `macfuse +fs_link`.) (The
-  bare metadata errors: one is gone, the other throws `MetadataNotReady`
-  since 0.90.78.)
+- **The torrent loopback-only WARN is a false alarm** (fi-1, 0.90.87
+  start, 2026-10-12 15:35:30Z): `TorrentManager` decides per alert batch,
+  so a first batch holding only the loopback `listen_succeeded` warns
+  although every routable address bound in the same second. Not at the
+  16:51 start before it. Diagnosed, not fixed.
+- **fi-1's `unsourceable` after the 2026-10-12 power cut**: 353 at 18:26
+  (cumulative since the 16:51 start; gbni-1 counts 13). The first was
+  counted while the USB disk was still spinning up and the backend offline
+  (the backlog's "fi-1 counts a local failure as unsourceable"). Older
+  losses (5,662 counted in September) or new: not yet established.
+- **fi-1's speculative DATA waits abandoned** after 120 s, eight between
+  14:04Z and 14:07Z on 2026-10-12 with 78 KB of 128 MB used and both
+  background slots taken (`lower_active=2/2`), ending as the backend's
+  accounting scan finished (14:08:23Z). Suspected, not proven, that the
+  scan held the slots.
 
 ## 2. Replication by diff (the next large piece)
 
@@ -330,7 +316,7 @@ on control threads no longer grow with deletes. Left:
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.86**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.87**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.

@@ -1,6 +1,23 @@
 # Completed and tested
 
-Last updated: 2026-10-08
+Last updated: 2026-10-12
+
+## 2026-10-12 -- 0.90.87: the unmatched list is cluster-wide; the audit's API changes
+
+- **Every node lists every node's unmatched files** (0.90.87): both nodes
+  list the same 611 after the deploy (674 and 614 of 748 before; files
+  bound on either node dropped); any node acts on any id.
+- **The acquisition audit's three API changes** (0.90.87): one
+  `catalogue.state` rule for an ingest and its torrent; a remote job's
+  `GET` asks its owner (`catalogue.items` null when it cannot); torrent
+  search in provider order.
+- **Announced to Core** with the unannounced 0.90.64 `try_later` on the
+  account routes. Core checked core and all three clients, found no
+  conflict, and made the password-setting user writes retry on `try_later`
+  (core 76ac705, next core release).
+- Gate on fi-1: 665, 19 and 21 passed. fi-1 lost power mid-gate and came
+  back by itself: the USB DATA disk was absent at start and online 55 s
+  later, metadata writable throughout.
 
 ## 2026-10-09 -- 0.90.68 and 0.90.69: lock audit finished, one memory budget
 

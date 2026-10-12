@@ -4,13 +4,21 @@ Contracts settled with the client sessions (from 2026-09-13), kept here
 because they were agreed across sessions and exist nowhere else in this
 repository. A server change that breaks one breaks four clients at once.
 
-**0.90.64 (2026-10-09; NOT YET ANNOUNCED: no Core or client session was
-running; announce at the next one).** `POST /api/v1/users`, and `PATCH
-/api/v1/users/{id}` or `/api/v1/users/me` when the body sets a password, can
-answer `429 try_later` with `Retry-After: 1` when every password slot on the
-node is in use, exactly as `POST /api/v1/session` already does. A client
-retries after a second; nothing was changed. A roles-only `PATCH` never gets
-it.
+**0.90.87 (announced 2026-10-12 to Core, which checked core and all three
+clients; no conflict).** A torrent job's `catalogue.state` follows the ingest
+rule. `GET /api/v1/ingest/jobs/{id}` for a job another node owns asks the
+owner; `catalogue.items` is null when the owner cannot be asked (no client
+calls that route). `GET /api/v1/torrents/search` keeps provider order (no
+client calls it). `GET /api/v1/manage/unmatched` lists every node's files and
+any node acts on any listed id (Core reads it through one routed request).
+
+**0.90.64 (2026-10-09; announced 2026-10-12 with 0.90.87).** `POST
+/api/v1/users`, and `PATCH /api/v1/users/{id}` or `/api/v1/users/me` when the
+body sets a password, can answer `429 try_later` with `Retry-After: 1` when
+every password slot on the node is in use, exactly as `POST /api/v1/session`
+already does. A roles-only `PATCH` never gets it. Core retries those writes
+on `try_later` (Retry-After, default 1 s, capped at 5 s, three attempts) from
+76ac705.
 
 **0.90.35 (announced 2026-10-06 to Core and every client; Core's type
 restored to it in `b4a549f` on 2026-10-08).** `diagnostics.repair.paced_by`
