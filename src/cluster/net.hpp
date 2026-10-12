@@ -471,7 +471,8 @@ class RpcClient {
     RetainedMemoryLedger* retained_memory_{};
     std::shared_ptr<TransportTraffic> traffic_{std::make_shared<TransportTraffic>()};
     // Held across the local_ callback, inbound routes' usable() callbacks and
-    // logging.
+    // logging. Taken before what local_ locks (the node's Membership::m_), so
+    // local_ never calls into this client.
     mutable IoMutex mutex_;
     std::condition_variable connection_cv_;
     // Dialling is expensive (two persistent threads, multi-megabyte DATA
