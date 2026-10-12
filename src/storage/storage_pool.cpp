@@ -1171,6 +1171,15 @@ size_t StoragePool::online_backends() const {
     return online_backends_cached_.load(std::memory_order_relaxed);
 }
 
+bool StoragePool::every_backend_online() const {
+    for (const auto& backend : snapshot()) {
+        Lock lock(backend->mutex);
+        if (backend->configured && (!backend->online || !backend->store))
+            return false;
+    }
+    return true;
+}
+
 LocalStoreDiagnostics StoragePool::diagnostics() const {
     LocalStoreDiagnostics total;
     for (const auto& backend : snapshot()) {

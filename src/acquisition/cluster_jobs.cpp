@@ -2,6 +2,7 @@
 #include "acquisition/cluster_jobs.hpp"
 
 #include "cluster/cluster.hpp"
+#include "cluster/rpc_refusal.hpp"
 #include "json.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
@@ -16,15 +17,6 @@ Json parse_payload(const RpcReply& reply) {
     const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
                            reply.message.payload.size());
     return Json::parse(text);
-}
-
-std::string error_text(const RpcReply& reply) {
-    try {
-        Reader reader(reply.message.payload);
-        return reader.string();
-    } catch (const std::exception&) {
-        return {};
-    }
 }
 
 Bytes json_bytes(Json value) {
@@ -44,12 +36,6 @@ std::optional<StagingStatus> parse_staging(const Json* value) {
     if (const auto* v = value->find("reserved_bytes")) out.reserved_bytes = v->asUInt64();
     if (const auto* v = value->find("accounted_bytes")) out.accounted_bytes = v->asUInt64();
     return out;
-}
-
-// The error a peer without the torrent plugin answers with
-// (NodeRuntime::handle_request).
-bool says_no_torrents(const std::string& error) {
-    return error.find("torrents not available") != std::string::npos;
 }
 
 } // namespace
@@ -130,7 +116,9 @@ void ClusterJobView::poll(const NodeInfo& info) {
                 // No capacity reported: offer it and let the add answer.
                 fresh.offer.accepting = true;
             }
-        } else if (reply.message.type == MessageType::error && says_no_torrents(error_text(reply))) {
+        } else if (const auto refusal = rpc_refusal(reply.message);
+                   refusal && refusal->code == "not_implemented") {
+            // No torrent plugin answers there.
             fresh.torrent_known = true;
         }
     } catch (const std::exception& error) {

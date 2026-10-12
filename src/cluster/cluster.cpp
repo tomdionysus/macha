@@ -759,7 +759,7 @@ void NodeRuntime::bind_control_routes() {
               const auto lane = static_cast<TransportLane>(reader.u8());
               reader.finish();
               if (lane != TransportLane::control && lane != TransportLane::data)
-                  return error_reply("invalid transport lane");
+                  return error_reply(400, "invalid_request", "invalid transport lane");
               Log::debug("dial request received peer=" + to_string(peer.id).substr(0, 12) +
                          " lane=" + transport_lane_name(lane));
               client_.request_lane(peer, lane);
@@ -778,13 +778,13 @@ void NodeRuntime::bind_control_routes() {
               target.port = reader.u16();
               reader.finish();
               if (target.host.empty() || !target.port)
-                  return error_reply("dial-back probe needs a host and port");
+                  return error_reply(400, "invalid_request", "dial-back probe needs a host and port");
               {
                   Lock lock(dial_back_mutex_);
                   const auto now = Clock::now();
                   auto& last = dial_back_last_[peer.id];
                   if (last != Clock::time_point{} && now - last < cfg_.dial_back_probe_min_interval)
-                      return error_reply("dial-back probe rate limited");
+                      return error_reply(429, "try_later", "dial-back probe rate limited");
                   last = now;
               }
               const auto error = client_.probe_dial(target, peer.id);
