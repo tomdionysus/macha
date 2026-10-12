@@ -129,8 +129,19 @@ A failing test is P0: reproduce it before deciding whose it is.
 - **fi-1's speculative DATA waits abandoned** after 120 s, eight between
   14:04Z and 14:07Z on 2026-10-12 with 78 KB of 128 MB used and both
   background slots taken (`lower_active=2/2`), ending as the backend's
-  accounting scan finished (14:08:23Z). Suspected, not proven, that the
-  scan held the slots.
+  accounting scan finished (14:08:23Z). The scan takes no DATA lease
+  (`LocalStore::scan`), so something else held both slots past 120 s. In
+  the same window gbni-1's loader polls of fi-1 (`get_torrent_jobs`,
+  `get_ingest_jobs`) stalled up to 25 s (14:03:37Z to 14:04:27Z). Only a
+  start with a dirty checkpoint scans, so it has not recurred on the clean
+  restarts since. To find the holder: an unclean stop of fi-1's Macha,
+  then sample the arbiter and stacks during the scan (operator's call).
+  fi-1's clock: no RTC, it jumped about 8.5 min at NTP sync (16:52:28 to
+  17:00:58 local), so its pre-sync journal times run behind.
+- **The torrent backend decides "staging on another device" once, at
+  start** (fi-1, 2026-10-12 13:52Z: decided before the USB disk mounted,
+  though staging and DATA share it), so its DATA-device monitor stayed off
+  for the whole run. Not fixed.
 
 ## 2. Replication by diff (the next large piece)
 
