@@ -6,6 +6,7 @@
 #include "torrent/torrent_coordinator.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "cluster/placement.hpp"
+#include "cluster/rpc_refusal.hpp"
 #include "startup_progress.hpp"
 
 #include <cstring>
@@ -671,6 +672,9 @@ struct RepairPeer {
     NodeInfo info{StoreBench::peer()};
     std::atomic_bool knows_batch{true};
     std::atomic_bool holds_everything{};
+    // Answers "cannot say now" for every id, or refuses the batch as busy.
+    std::atomic_bool cannot_say{};
+    std::atomic_bool busy{};
     std::atomic_bool hold_puts{};
     std::atomic_uint batch_requests{};
     std::atomic_uint single_probes{};
@@ -692,6 +696,17 @@ struct RepairPeer {
             if (!knows_batch.load())
                 return {MessageType::error, {}};
             ++batch_requests;
+            if (busy.load())
+                return error_reply(503, "storage_busy", "DATA resource admission busy");
+            if (cannot_say.load()) {
+                Reader reader(request);
+                const auto count = reader.u32();
+                Writer writer;
+                writer.u32(count);
+                for (uint32_t i = 0; i < count; ++i)
+                    writer.u8(2);
+                return {MessageType::have_valid_objects_reply, writer.take()};
+            }
             return presence_reply(request, holds_everything.load());
         case MessageType::have_object:
             ++single_probes;
@@ -763,6 +778,32 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_push_probes_by_window_and_sends_toget
         for (const auto& call : bench.node.calls())
             if (call.type == MessageType::put_object)
                 CHECK(call.frame_type == FrameType::speculative);
+    }
+}
+
+// A peer that cannot say whether it holds a copy, per id or by refusing the
+// batch as busy, is neither counted as keeping it nor sent one; once it can
+// say it lacks the copy, the copy is pushed.
+MACHA_FAST_TEST("rpc_cluster", test_repair_push_sends_nothing_to_a_peer_that_cannot_say) {
+    for (const bool refuses : {false, true}) {
+        StoreBench bench([](Config& c) { c.replication = 2; });
+        RepairPeer peer(bench);
+        (refuses ? peer.busy : peer.cannot_say) = true;
+        const auto live = local_objects(bench, 4, 8 * 1024, 50);
+        auto store = bench.store();
+        const auto step = store->repair_step(8ULL * 1024 * 1024, 16, live);
+        CHECK(step.push_examined == live.size());
+        CHECK(peer.batch_requests.load() > 0);
+        CHECK(peer.puts.load() == 0);
+        for (const auto& id : live)
+            CHECK(bench.local.data().has(id));
+
+        peer.busy = false;
+        peer.cannot_say = false;
+        CHECK(wait_until([&] {
+            (void)store->repair_step(8ULL * 1024 * 1024, 16, live);
+            return peer.puts.load() == live.size();
+        }, 10s));
     }
 }
 

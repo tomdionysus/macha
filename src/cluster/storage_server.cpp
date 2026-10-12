@@ -134,14 +134,21 @@ void StorageServer::bind_routes() {
               reader.finish();
               // Repair trusts "present" as a healthy copy, so each id is read,
               // decrypted and hashed like have_object; one DATA admission per id.
+              // Per id: 1 held intact, 0 not held, 2 cannot say now (a disk is
+              // offline, or admission is busy from that id on).
               Writer writer;
               writer.u32(count);
+              bool busy = false;
               for (const auto& id : ids) {
-                  auto resource = data_resources_.try_acquire(
-                      DataWorkContext(frame_type, extent_size_), extent_size_);
-                  if (!resource)
-                      return error_reply(503, "storage_busy", "DATA resource admission busy or stopping");
-                  writer.u8(local_.valid(id));
+                  uint8_t held = 2;
+                  if (!busy) {
+                      if (auto resource = data_resources_.try_acquire(
+                              DataWorkContext(frame_type, extent_size_), extent_size_))
+                          held = local_.valid(id) ? 1 : local_.every_backend_online() ? 0 : 2;
+                      else
+                          busy = true;
+                  }
+                  writer.u8(held);
               }
               return {MessageType::have_valid_objects_reply, writer.take()};
           });
