@@ -152,6 +152,7 @@ Each item is an [ingest job](#the-ingest-job-object) without `files` and without
 
 - `pause`, `resume` and `cancel` answer `200` with the job as it now stands on the node that owns it, including `node_id`. That is the owning node's own answer, not a guess by the node that relayed it.
 - `clear` removes the job and answers `200` with `{"status": "ok", "cleared": true}`.
+- A pause or cancel accepted while the job's worker is busy stands over whatever the worker then meets, a failure included: the job stays `paused` or `cancelled` and the failure is logged on its node.
 
 | status | code | when |
 |---|---|---|

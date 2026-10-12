@@ -1283,14 +1283,14 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         job.rate_bytes_per_second = 0;
         job.eta_seconds.reset();
         job.updated_unix_ms = now_ms();
-        Lock lock(mutex_);
-        auto it = jobs_.find(id);
-        // A cancel stands over a failure met before the worker noticed it.
-        if (it == jobs_.end() || it->second.state == IngestJobState::cancelled)
-            return;
-        it->second = job;
-        try { save_state_locked(); } catch (...) {}
-        Log::warn("ingest failed id=" + id + ": " + e.what());
+        bool recorded = false;
+        try {
+            recorded = record_progress(job);
+        } catch (const std::exception& save) {
+            Log::warn("ingest state save failed id=" + id + ": " + save.what());
+        }
+        Log::warn("ingest failed id=" + id + ": " + e.what() +
+                  (recorded ? "" : "; the job's pause, cancel or clear stands"));
     }
 }
 
@@ -1935,12 +1935,15 @@ bool IngestManager::record_progress(IngestJob& job) {
     const auto it = jobs_.find(job.id);
     if (it == jobs_.end())
         return false;
-    // A pause or cancel accepted since the worker last looked stands: what
-    // the worker finished is kept under that state.
+    // A pause or cancel accepted since the worker last looked stands over
+    // whatever the worker met (progress, a block, a failure): what it
+    // finished is kept under that state.
     const auto held = it->second.state;
     const bool overridden = held == IngestJobState::paused || held == IngestJobState::cancelled;
     if (overridden) {
         job.state = held;
+        job.error = it->second.error;
+        job.error_code = it->second.error_code;
         job.rate_bytes_per_second = 0;
         job.eta_seconds.reset();
     }
@@ -1956,11 +1959,7 @@ void IngestManager::set_blocked(IngestJob& job, std::string code, std::string me
     job.rate_bytes_per_second = 0;
     job.eta_seconds.reset();
     job.updated_unix_ms = now_ms();
-    Lock lock(mutex_);
-    if (auto it = jobs_.find(job.id); it != jobs_.end()) {
-        it->second = job;
-        save_state_locked();
-    }
+    (void)record_progress(job);
 }
 
 void IngestManager::cleanup_partials(const IngestJob& job) {

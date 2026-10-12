@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.83.
+Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.84.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -75,7 +75,16 @@ A failing test is P0: reproduce it before deciding whose it is.
   one refused dial, never near the cap. Only an outage longer than about
   8 s reaches 4 s, which then adds at most 4 s to it.
 - **Known defects of 2026-09-24/25**: the acquisition API audit's four
-  findings; unverified package names in the install docs. *Carried.* (The
+  findings: a pause or cancel overwritten by a failing ingest, fixed
+  0.90.84; the other three change the API and are built but held,
+  uncommitted in the working tree (copy in `build/api-held/`), until Core
+  and the clients are told (no client session was running, 2026-10-12):
+  one `catalogue.state` rule for an ingest and its torrent (a completed
+  import with nothing counted read `completed` on the ingest, `waiting` on
+  the torrent); a remote job's single `GET` asks its owner, so
+  `catalogue.items` is the owner's, or null when it cannot be asked (was an
+  empty array); torrent search results in provider order, not sorted by
+  seeders. Unverified package names in the install docs. *Carried.* (The
   bare metadata errors: one is gone, the other throws `MetadataNotReady`
   since 0.90.78.)
 
@@ -274,7 +283,7 @@ on control threads no longer grow with deletes. Left:
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.83**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.84**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
