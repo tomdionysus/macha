@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.81.
+Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.82.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -56,20 +56,12 @@ A failing test is P0: reproduce it before deciding whose it is.
 - **`RPC stalled (control)`** each way at 09:47Z and 09:50Z on 2026-10-05,
   5 to 15 s without progress, then nothing. 0.90.65/66/68 removed three
   ways control could wait; watch for a recurrence.
-- **A rejoin or follower convergence retry waits out its backoff**: wake it,
-  debounced, with a cap from the first trigger. *Carried.* Diagnosed
-  2026-10-12: after a failed run (`metadata_retry_backoff`, 30 s doubling to
-  `no_progress_backoff`, 300 s on the cluster), a metadata or topology event
-  finds the demand already scheduled, so `absorb_events` does not end the
-  wait; the loop-top resets that bring the retry forward run only when
-  something else wakes the pass. Something else nearly always does: the
-  cluster's passes wake every 4 s at the median (p10 7.5 s; 22 to 30 of
-  about 1,700 minutes had none), and a two-node test of a peer leaving and
-  rejoining converged in 2 s on unchanged code. The same resets let every
-  wake retry a failing run while events stream, so the backoff bounds
-  nothing then. One failed run on the cluster since 2026-10-01 (fi-1,
-  12:32:51Z on 2026-10-11, gbni-1 restarting). Waits on the operator's
-  call (section 8).
+- **A failed convergence run's retry: built, 0.90.82.** Events during its
+  backoff bring it forward, `maintenance.convergence_settle_ms` (1 s) after
+  the last and at most `convergence_max_delay_ms` (10 s) after the first.
+  Diagnosed 2026-10-12: the events did not end the wait, and the unrelated
+  wakes that did (every 4 s at the median on the cluster) each retried at
+  once, so the backoff bounded nothing while events streamed.
 - **fi-1, 2026-09-29**: a playback `PATCH` 503 after 19.9 s under software
   transcode, and a `FUSE mount disappeared` ERROR during a restart. *Carried.*
 - **Transport backoff after a peer restart**: measured 2026-10-12 and left
@@ -255,10 +247,6 @@ on control threads no longer grow with deletes. Left:
   peer gained since that survey is refused until the next one. Or the
   catalogue re-fetches lost artwork from its provider and nothing changes on
   the read path.
-- **The convergence retry** (section 1): the debounced wake as planned (a
-  settle after the last event, capped from the first), which also makes the
-  backoff bound retries again; or close it, since other wakes already bring
-  the retry within seconds on the cluster.
 - The bootstrap test (section 1): the first write waits for the bootstrap
   checkpoint survey (not the availability survey), or the test retries the
   refusal.
@@ -282,7 +270,7 @@ on control threads no longer grow with deletes. Left:
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.81**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.82**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.

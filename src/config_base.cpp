@@ -290,6 +290,13 @@ void validate(Config& config) {
     if (config.maintenance.no_progress_backoff < std::chrono::milliseconds(500) ||
         config.maintenance.no_progress_backoff > std::chrono::hours(1))
         throw std::runtime_error("maintenance.no_progress_backoff_ms must be 500..3600000");
+    if (config.maintenance.convergence_settle < std::chrono::milliseconds(0) ||
+        config.maintenance.convergence_settle > std::chrono::minutes(5))
+        throw std::runtime_error("maintenance.convergence_settle_ms must be 0..300000");
+    if (config.maintenance.convergence_max_delay < config.maintenance.convergence_settle ||
+        config.maintenance.convergence_max_delay > std::chrono::hours(1))
+        throw std::runtime_error(
+            "maintenance.convergence_max_delay_ms must be convergence_settle_ms..3600000");
     if (config.maintenance.scrub_interval < std::chrono::minutes(1) ||
         config.maintenance.scrub_interval > std::chrono::hours(24 * 365))
         throw std::runtime_error("maintenance.scrub_interval_ms must be 60000..31536000000");

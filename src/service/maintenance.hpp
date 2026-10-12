@@ -114,10 +114,18 @@ class Maintenance final {
     // Turns the events counted since the last call into work: metadata and
     // topology into convergence demand, metadata into a media-information
     // prune. True when they call for a pass: a storage event, or demand that
-    // scheduled a new run. Pass thread only, holding no lock.
+    // scheduled a new run. Demand for a run already scheduled is a retry
+    // trigger instead. Pass thread only, holding no lock.
     bool absorb_events();
-    // Waits until absorb_events() calls for a pass, `deadline`, or `stop`.
+    // Waits until absorb_events() calls for a pass, `deadline`, the retry
+    // triggers fall due, or `stop`.
     void wait_for_events(std::stop_token, Clock::time_point deadline);
+    // When the retry triggers bring a scheduled convergence run forward: at
+    // the first unless the last run failed, else `convergence_settle` after
+    // the last, at most `convergence_max_delay` after the first. Nullopt
+    // without a trigger.
+    std::optional<Clock::time_point> retry_trigger_due() const;
+    void note_retry_trigger(Clock::time_point now);
     std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
     void save_sightings(UnreferencedSince&, Clock::time_point& saved, bool complete = false);
     void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
@@ -156,6 +164,11 @@ class Maintenance final {
     uint64_t absorbed_topology_{};
     uint64_t absorbed_claims_{};
     uint64_t absorbed_total_{};
+    // Convergence demand that found a run already scheduled since that run
+    // began: the first and the last.
+    std::optional<Clock::time_point> retry_trigger_first_;
+    Clock::time_point retry_trigger_last_{};
+    bool convergence_failed_{};
 
     std::jthread thread_;
 };

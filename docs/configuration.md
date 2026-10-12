@@ -654,8 +654,12 @@ maintenance:
   scrub_fraction: 0.02
   scrub_interval_ms: 2592000000
   no_progress_backoff_ms: 300000
+  convergence_settle_ms: 1000
+  convergence_max_delay_ms: 10000
   garbage_grace_ms: 2592000000
 ```
+
+**A failed metadata convergence run retries once things settle.** Its retry backs off from 30 s (`no_progress_backoff_ms` clamped to 5..30 s), doubling to `no_progress_backoff_ms`. A peer joining or leaving, a new head from a peer, or a local commit brings the retry forward: it runs `convergence_settle_ms` after the last such event, so a burst of them costs one run, and never later than `convergence_max_delay_ms` after the first, so a steady stream cannot hold it off. A run that has not failed is not delayed: the first event runs it at once, and the events during it become one follow-up. `convergence_settle_ms` is 0..300000 (0 retries on the first event); `convergence_max_delay_ms` is from `convergence_settle_ms` to 3600000.
 
 `background_concurrency` is the node's background effort ceiling: how many loader or speculative DATA operations (publication and repair, one extent each) may hold an admission lease at once. `0` means half the hardware threads, minimum 1. It counts work on this node's own disk: sending an extent to a peer or fetching one from it holds no slot here, and the peer admits it against its own ceiling. Viewer work is never counted, so playback, its read-ahead and a person's API requests are unaffected; what it bounds is how much CPU (hashing, encryption) and I/O the node spends on its own import and repair traffic at once. The status API reports the ceiling and its use as `data_resources.background_limit` / `background_active` / `peak_background_active`.
 

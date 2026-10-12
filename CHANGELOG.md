@@ -1,5 +1,22 @@
 # Current release
 
+## 0.90.82: a failed convergence run retries once things settle
+
+Config: `maintenance.convergence_settle_ms` (default 1000) and
+`maintenance.convergence_max_delay_ms` (default 10000). No API, wire or
+on-disk changes.
+
+After a failed metadata convergence run, its retry backed off (30 s doubling
+to `no_progress_backoff_ms`, 300 s on the cluster), and a peer rejoining or
+a new head found the run already scheduled and did not end the wait; only an
+unrelated wake brought it forward, and then every such wake retried at once,
+so while events streamed the backoff bounded nothing. Each of these events is
+now a retry trigger: the retry runs `convergence_settle_ms` after the last,
+so a burst is one run, and no later than `convergence_max_delay_ms` after
+the first. A run that has not failed runs on its first event as before. Test:
+with a peer committing every 200 ms for 5 s while runs fail, one run fails
+and the retry runs once the commits stop (the old pass retried three times).
+
 ## 0.90.81: staging availability reads true across nodes
 
 No API, wire or on-disk changes beyond 0.90.80's.

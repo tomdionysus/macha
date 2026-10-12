@@ -279,7 +279,6 @@ void Maintenance::run(std::stop_token stop) {
     auto last_cpu = std::clock();
     auto last_own_cpu_ns = thread_cpu_time_ns();
     uint64_t last_metadata_remote_epoch = node_.remote_metadata_epoch();
-    uint64_t last_metadata_demand_epoch{};
     std::vector<NodeId> last_active_nodes;
     bool metadata_dirty = port_.metadata_convergence.pending();
     bool catalogue_dirty = true;
@@ -356,18 +355,14 @@ void Maintenance::run(std::stop_token stop) {
         auto now = clock_->now();
         absorb_events();
         metadata_dirty = port_.metadata_convergence.pending();
-        const auto metadata_demand = port_.metadata_convergence.diagnostics().requested_epoch;
-        if (metadata_demand != last_metadata_demand_epoch) {
-            metadata_retry_due = Clock::time_point{};
-            last_metadata_demand_epoch = metadata_demand;
-        }
         const auto current_event = events_.total();
         const bool event_changed = current_event != observed_event;
         observed_event = current_event;
         const auto local_metadata_generation = local_.replica().committed_generation();
         if (local_metadata_generation != last_local_metadata_generation) {
             catalogue_dirty = true;
-            metadata_retry_due = Clock::time_point{};
+            if (metadata_dirty)
+                note_retry_trigger(now);
             last_local_metadata_generation = local_metadata_generation;
             gc_quiescent_until = now + policy.foreground_quiet;
         }
@@ -391,11 +386,16 @@ void Maintenance::run(std::stop_token stop) {
         const auto remote_epoch = node_.remote_metadata_epoch();
         const bool topology_changed = active_nodes != last_active_nodes;
         if (remote_epoch != last_metadata_remote_epoch || topology_changed) {
-            metadata_retry_due = Clock::time_point{};
+            if (metadata_dirty)
+                note_retry_trigger(now);
             if (topology_changed)
                 formation_settle_due = now + node_.config().dead_after;
             last_metadata_remote_epoch = remote_epoch;
             last_active_nodes = std::move(active_nodes);
+        }
+        if (const auto due = retry_trigger_due(); due && now >= *due) {
+            metadata_retry_due = Clock::time_point{};
+            retry_trigger_first_.reset();
         }
         auto wall_seconds = std::chrono::duration<double>(now - last_wall).count();
         if (wall_seconds <= 0.0)
@@ -491,6 +491,9 @@ void Maintenance::run(std::stop_token stop) {
                         metadata_retry_due = clock_->now() + metadata_retry_backoff;
                     } else {
                         const auto convergence_run = port_.metadata_convergence.begin();
+                        // This run covers every demand so far.
+                        retry_trigger_first_.reset();
+                        convergence_failed_ = false;
                         if (!convergence_run) {
                             metadata_dirty = false;
                             metadata_ready_for_dependants = true;
@@ -509,6 +512,7 @@ void Maintenance::run(std::stop_token stop) {
                                 metadata_retry_backoff = maintenance_background_interval(policy);
                             } catch (const std::exception& error) {
                                 metadata_upkeep_.note_replica_validation(false, error.what());
+                                convergence_failed_ = true;
                                 metadata_ready_for_dependants = false;
                                 metadata_retry_due = clock_->now() + metadata_retry_backoff;
                                 metadata_retry_backoff =
@@ -529,6 +533,7 @@ void Maintenance::run(std::stop_token stop) {
                             } catch (...) {
                                 metadata_upkeep_.note_replica_validation(false,
                                                                    "metadata validation failed");
+                                convergence_failed_ = true;
                                 metadata_ready_for_dependants = false;
                                 metadata_retry_due = clock_->now() + metadata_retry_backoff;
                                 metadata_retry_backoff =
@@ -1273,10 +1278,13 @@ void Maintenance::run(std::stop_token stop) {
         // another external event, so a dirty owner with no retry delay is runnable
         // now; sleeping would lose the edge and strand metadata and its catalogue
         // dependent. Likewise when catalogue repair leaves one more pass to perform.
-        if (metadata_dirty)
+        if (metadata_dirty) {
             deadline =
                 std::min(deadline, metadata_retry_due == Clock::time_point{} ? now_after_work
                                                                              : metadata_retry_due);
+            if (const auto due = retry_trigger_due())
+                deadline = std::min(deadline, std::max(*due, now_after_work));
+        }
         if (catalogue_dirty && !metadata_dirty)
             deadline = std::min(deadline, catalogue_retry_due == Clock::time_point{}
                                               ? now_after_work
@@ -1391,8 +1399,12 @@ bool Maintenance::absorb_events() {
     bool wake = storage != absorbed_storage_ || claims != absorbed_claims_;
     if (metadata != absorbed_metadata_)
         media_information_.request_prune();
-    if (metadata != absorbed_metadata_ || topology != absorbed_topology_)
-        wake = port_.metadata_convergence.request(metadata_server_.known_generation()) || wake;
+    if (metadata != absorbed_metadata_ || topology != absorbed_topology_) {
+        if (port_.metadata_convergence.request(metadata_server_.known_generation()))
+            wake = true;
+        else
+            note_retry_trigger(clock_->now());
+    }
     absorbed_storage_ = storage;
     absorbed_metadata_ = metadata;
     absorbed_topology_ = topology;
@@ -1404,14 +1416,34 @@ bool Maintenance::absorb_events() {
 void Maintenance::wait_for_events(std::stop_token stop, Clock::time_point deadline) {
     // The predicate only compares counts: absorbing reads the metadata
     // replica, which must not happen under the lock notify() takes.
-    while (!stop.stop_requested() && clock_->now() < deadline) {
+    while (!stop.stop_requested()) {
+        const auto until =
+            std::min(deadline, retry_trigger_due().value_or(Clock::time_point::max()));
+        if (clock_->now() >= until)
+            return;
         {
             Lock wait_lock(events_.wait_mutex);
-            clock_->wait_until(events_.wait_cv, wait_lock.native(), stop, deadline,
+            clock_->wait_until(events_.wait_cv, wait_lock.native(), stop, until,
                                [this] { return events_.total() != absorbed_total_; });
         }
         if (events_.total() != absorbed_total_ && absorb_events())
             return;
     }
+}
+
+void Maintenance::note_retry_trigger(Clock::time_point now) {
+    if (!retry_trigger_first_)
+        retry_trigger_first_ = now;
+    retry_trigger_last_ = now;
+}
+
+std::optional<Clock::time_point> Maintenance::retry_trigger_due() const {
+    if (!retry_trigger_first_)
+        return std::nullopt;
+    if (!convergence_failed_)
+        return *retry_trigger_first_;
+    const auto& policy = node_.config().maintenance;
+    return std::min(*retry_trigger_first_ + policy.convergence_max_delay,
+                    retry_trigger_last_ + policy.convergence_settle);
 }
 } // namespace macha
