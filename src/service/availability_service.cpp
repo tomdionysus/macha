@@ -385,9 +385,9 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
     if (question.kind == TrieQuestionKind::root) {
         auto view = ledger_.held_view(RetentionClass::data);
         if (!view.identity.complete)
-            return error_reply("holdings_seeding");
+            return error_reply(503, "holdings_seeding", "this node is still listing what it holds");
         if (view.tries.size() != 1)
-            return error_reply("several_held_tries");
+            return error_reply(501, "several_held_tries", "this node holds DATA on more than one disk");
         auto& trie = view.tries.front();
         const ObjectTrie::Summary summary{trie.size(), trie.root_hash()};
         Lock lock(pinned_mutex_);
@@ -411,7 +411,7 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
             }
     }
     if (!trie)
-        return error_reply("snapshot_gone");
+        return error_reply(410, "snapshot_gone", "the trie snapshot asked about is no longer pinned");
     if (question.kind == TrieQuestionKind::children)
         return {MessageType::trie_diff_reply,
                 encode_trie_children(trie->children(question.prefixes))};
@@ -420,19 +420,19 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
         return {MessageType::trie_diff_reply,
                 encode_trie_records(trie->records(question.prefixes, ObjectTrie::leaf_max))};
     } catch (const std::length_error&) {
-        return error_reply("prefix_too_large");
+        return error_reply(413, "prefix_too_large", "a prefix asked for holds more than a leaf");
     }
 }
 
 RpcMessage AvailabilityService::answer(const RpcMessage& request) const {
     const auto holdings = holdings_.handle();
     if (!holdings)
-        return error_reply("holdings are not rolled up yet");
+        return error_reply(503, "holdings_rolling_up", "holdings are not rolled up yet");
     // Something stopped being held since the roll-up: what it calls whole may
     // not be. The pass rolls up again; until then this node cannot answer.
     if (ledger_.held_view(RetentionClass::data).identity.removals !=
         holdings->identity.removals)
-        return error_reply("holdings changed since they were rolled up");
+        return error_reply(503, "holdings_changed", "holdings changed since they were rolled up");
     const auto* rollup = &holdings->rollup;
     const auto nodes = decode_tree_holdings_request(request.payload);
     // This node's own copy of each tree node: answering never asks a peer.

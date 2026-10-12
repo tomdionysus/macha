@@ -1815,7 +1815,11 @@ MACHA_FAST_TEST("foundations", test_message_routes_answer_only_while_bound) {
     MessageRoutes routes;
     const NodeInfo peer;
     const RpcMessage request{MessageType::get_ingest_jobs, Bytes{1, 2, 3}};
-    CHECK(routes.dispatch(peer, FrameType::control, request).type == MessageType::error);
+    const auto unbound = rpc_refusal(routes.dispatch(peer, FrameType::control, request));
+    REQUIRE(unbound);
+    CHECK(unbound->status == 501);
+    CHECK(unbound->code == "not_implemented");
+    CHECK(!rpc_try_later(*unbound));
 
     routes.bind(MessageType::get_ingest_jobs,
                 [](const NodeInfo&, FrameType, const RpcMessage& message) {
@@ -1837,11 +1841,43 @@ MACHA_FAST_TEST("foundations", test_message_routes_answer_only_while_bound) {
                 });
     const auto failed = routes.dispatch(peer, FrameType::control, request);
     REQUIRE(failed.type == MessageType::error);
+    // The reason comes first, so a reader that takes only the text reads it.
     Reader reader(failed.payload);
     CHECK(reader.string(4096) == "no jobs here");
+    const auto thrown = rpc_refusal(failed);
+    REQUIRE(thrown);
+    CHECK(thrown->status == 500);
+    CHECK(thrown->code == "internal_error");
+    CHECK(thrown->message == "no jobs here");
+    CHECK(rpc_try_later(*thrown));
 
     routes.unbind(MessageType::get_ingest_jobs);
     CHECK(routes.dispatch(peer, FrameType::control, request).type == MessageType::error);
+}
+
+MACHA_FAST_TEST("foundations", test_rpc_refusals_say_whether_asking_again_may_help) {
+    CHECK(!rpc_refusal(RpcMessage{MessageType::ok, {}}));
+
+    const auto gone = rpc_refusal(error_reply(404, "not_found", "object not found"));
+    REQUIRE(gone);
+    CHECK((gone->status == 404 && gone->code == "not_found" && gone->message == "object not found"));
+    CHECK(!rpc_try_later(*gone));
+    for (const uint16_t status : {429, 500, 502, 503, 504})
+        CHECK(rpc_try_later(*rpc_refusal(error_reply(status, "x", "y"))));
+    for (const uint16_t status : {400, 409, 410, 413, 501, 507})
+        CHECK(!rpc_try_later(*rpc_refusal(error_reply(status, "x", "y"))));
+
+    // A refusal naming no status (an older peer's text, or the transport's
+    // empty refusal) may change.
+    Writer text_only;
+    text_only.string("object not found");
+    const auto older = rpc_refusal(RpcMessage{MessageType::error, text_only.take()});
+    REQUIRE(older);
+    CHECK((older->status == 0 && older->message == "object not found"));
+    CHECK(rpc_try_later(*older));
+    const auto empty = rpc_refusal(RpcMessage{MessageType::error, {}});
+    REQUIRE(empty);
+    CHECK(rpc_try_later(*empty));
 }
 
 MACHA_FAST_TEST("foundations", test_node_events_count_each_kind) {
