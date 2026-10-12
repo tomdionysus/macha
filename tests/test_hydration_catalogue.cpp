@@ -3030,8 +3030,15 @@ class CommitGate {
     std::condition_variable cv_;
     std::vector<Hold> holds_;
     size_t held_{};
+    bool fail_{};
 
   public:
+    // The next held commit fails once released.
+    void fail_on_release() {
+        std::lock_guard lock(mutex_);
+        fail_ = true;
+    }
+
     void hold(std::string name, size_t skip = 0) {
         std::lock_guard lock(mutex_);
         holds_.push_back({std::move(name), skip});
@@ -3073,6 +3080,8 @@ class CommitGate {
         ++held_;
         cv_.wait(lock, [&] { return holds_.empty(); });
         --held_;
+        if (std::exchange(fail_, false))
+            throw std::runtime_error("injected commit failure");
     }
 };
 
@@ -3252,6 +3261,54 @@ MACHA_TEST("hydration_catalogue", test_a_pause_or_cancel_accepted_during_the_fin
                 },
                 30s));
         }
+    }
+}
+
+MACHA_TEST("hydration_catalogue", test_a_pause_or_cancel_accepted_while_the_worker_fails_stands) {
+    // The job is paused or cancelled while its worker is inside a commit
+    // that then fails: the answer given holds over the failure.
+    for (const bool cancel : {true, false}) {
+        CommitGate gate;
+        CatalogueNode node(cancel ? "ingest-failing-cancel" : "ingest-failing-pause", {},
+                           [&](const MetadataPublicationContext& context) { gate(context); });
+        const auto roots = make_import_roots(node.path(), 1, 256 * 1024);
+        gate.hold_ending("Concurrent Movie 0 2024.mkv");
+
+        IngestConfig config;
+        config.enabled = true;
+        config.staging_path = node.path() / "staging";
+        config.source_roots = roots;
+        config.max_concurrent_jobs = 1;
+        IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
+        struct ReleaseGate {
+            CommitGate& gate;
+            ~ReleaseGate() { gate.release_all(); }
+        } release_gate{gate};
+        const auto id = ingest.submit_path(roots.front());
+        ingest.start();
+        REQUIRE(wait_until([&] { return gate.held() == 1; }, 30s));
+
+        REQUIRE(cancel ? ingest.cancel(id) : ingest.pause(id));
+        const auto asked = cancel ? IngestJobState::cancelled : IngestJobState::paused;
+        gate.fail_on_release();
+        gate.release_all();
+        REQUIRE(wait_until([&] { return ingest.active_jobs() == 0; }, 30s));
+
+        const auto job = ingest.job(id);
+        REQUIRE(job.has_value());
+        CHECK(job->state == asked);
+        CHECK(job->error.empty());
+        if (!cancel) {
+            REQUIRE(ingest.resume(id));
+            REQUIRE(wait_until(
+                [&] {
+                    const auto resumed = ingest.job(id);
+                    return resumed && (resumed->state == IngestJobState::cataloguing ||
+                                       resumed->state == IngestJobState::completed);
+                },
+                30s));
+        }
+        ingest.stop();
     }
 }
 

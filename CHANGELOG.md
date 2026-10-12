@@ -1,5 +1,19 @@
 # Current release
 
+## 0.90.84: a pause or cancel stands over a failing ingest
+
+No API, wire, config or on-disk changes.
+
+From the acquisition API audit: a pause accepted while an ingest's worker
+was busy was overwritten when the worker then failed (`pause` had answered
+yes; the job read `failed`), and a job that blocked overwrote a pause or a
+cancel the same way. A failure and a block now go through the rule progress
+already used: a pause or cancel accepted since the worker last looked stands,
+with the failure logged on the node. Test: an ingest paused, or cancelled,
+while its worker is inside a commit that then fails keeps the answer given,
+with no error; the paused one resumes and completes (on the old code the
+pause read `failed`).
+
 ## 0.90.83: an ingest stopped mid-put resumes; a merge names its conflicts
 
 No API, wire, config or on-disk changes.
