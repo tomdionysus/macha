@@ -166,6 +166,7 @@ MACHA_FAST_TEST("metadata_merge", test_concurrent_edits_install_the_later_and_ke
     const auto result = merge(p.a.head, p.b.head);
     const auto& merged = result.snapshot;
     CHECK(result.conflicts_created == 1);
+    CHECK(result.created_keys == std::vector<std::string>{"/d/shared"});
     CHECK(merged.entries.at("/d/shared").size == 30);
     REQUIRE(merged.conflicts.size() == 1);
     const auto& conflict = merged.conflicts.begin()->second;

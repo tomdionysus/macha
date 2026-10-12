@@ -1,5 +1,23 @@
 # Current release
 
+## 0.90.83: an ingest stopped mid-put resumes; a merge names its conflicts
+
+No API, wire, config or on-disk changes.
+
+A node stopping cancelled its filesystem I/O before it told the ingest to
+stop, so a put cut off in between failed the job (`write cancelled`, or
+`object replication quorum unavailable` before 0.88.0) while the ingest still
+counted itself running: the job was saved as failed and stayed failed after
+the restart. The stop now asks every service to stop first and cancels the
+filesystem's I/O last, so the ingest sees its own stop and the job resumes.
+Test: a node stopped while an ingest copies a 96 MB file (each stop step
+held 100 ms) restarts with the job resumed, and the file arrives byte-exact
+(on the old order the job was failed).
+
+A merge that records a conflict now logs each one's key at WARN (up to 16
+per merge, then a count), beside the existing count in `metadata histories
+reconciled`, so a conflict can be traced from the journal alone.
+
 ## 0.90.82: a failed convergence run retries once things settle
 
 Config: `maintenance.convergence_settle_ms` (default 1000) and
