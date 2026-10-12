@@ -323,6 +323,41 @@ std::optional<ClusterIngestJob> ClusterJobView::ingest_job(std::string_view id) 
     return std::nullopt;
 }
 
+std::optional<Json> ClusterJobView::ingest_job_detail(std::string_view id) {
+    if (auto job = ingest_.job(id)) {
+        const auto summary = ingest_.catalogue_summary(id);
+        auto out = ingest_job_json(*job, true, &summary);
+        out["node_id"] = to_string(node_.node_id());
+        return out;
+    }
+    const auto owner = ingest_job(id);
+    if (!owner) return std::nullopt;
+    if (const auto peer = active_peer(owner->node_id)) {
+        Json::Object request;
+        request["job_id"] = std::string(id);
+        try {
+            // A user's read through the API: viewer work.
+            auto reply = node_.call(*peer, MessageType::get_ingest_jobs,
+                                    json_bytes(Json(std::move(request))), FrameType::foreground);
+            if (reply.message.type == MessageType::ingest_jobs_reply) {
+                auto parsed = parse_payload(reply);
+                if (const auto* detail = parsed.find("job_api"); detail && detail->isObject()) {
+                    Json out = *detail;
+                    out["node_id"] = to_string(owner->node_id);
+                    return out;
+                }
+            }
+        } catch (const std::exception& error) {
+            Log::debug("cluster job view: ingest job " + std::string(id) + " from " + peer->host +
+                       ": " + error.what());
+        }
+    }
+    auto out = ingest_job_json(owner->job, true);
+    out["catalogue"]["items"] = Json(nullptr);
+    out["node_id"] = to_string(owner->node_id);
+    return out;
+}
+
 IngestActionResult ClusterJobView::ingest_action(std::string_view id, std::string_view action) {
     IngestActionResult result;
     if (ingest_.job(id)) {

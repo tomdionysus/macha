@@ -557,13 +557,14 @@ class CatalogueScanner {
     }
     void request_rescan();
     size_t request_media_profiles(const std::vector<std::string>& media_ids);
-    std::vector<MediaProbeCandidate> probe_unmatched(std::string_view hint_id);
+    // An unmatched file's candidates; the hint may be this node's or a peer's.
+    std::vector<MediaProbeCandidate> probe_unmatched(const CatalogueHint& hint);
     // Match an unmatched file to a provider reference (`tmdb:movie:<id>`,
     // `tmdb:tv:<id>`, `musicbrainz:release:<mbid>`): fetch the record, build
     // the hierarchy, stage its artwork and bind the file, as a scan match
     // would. Its DATA work carries `frame`, the asking request's class.
     // Throws ProviderRequestError with the API's answer.
-    ProviderRefMatch match_unmatched_ref(std::string_view hint_id, std::string_view ref,
+    ProviderRefMatch match_unmatched_ref(const CatalogueHint& hint, std::string_view ref,
                                          const ProviderRefNumbers& numbers, FrameType frame);
     // Search the provider for a kind (movie, show: TMDB; album: MusicBrainz).
     // A result's catalogue_id is kept only when the catalogue holds that item.

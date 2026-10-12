@@ -214,6 +214,10 @@ class Service {
     ClusterJobView& cluster_jobs() {
         return services_->cluster_jobs();
     }
+    ClusterUnmatchedView& cluster_unmatched() {
+        wait_services_ready();
+        return services_->cluster_unmatched();
+    }
     TorrentCoordinator& torrent_coordinator() {
         return services_->torrent_coordinator();
     }

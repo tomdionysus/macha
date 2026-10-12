@@ -2,6 +2,7 @@
 // BitTorrent acquisition's core half, free of libtorrent: job types, API and
 // wire JSON, URI sanitisers and the Torznab client. The engine is in the plugin.
 #include "torrent/torrent.hpp"
+#include "acquisition/catalogue_state.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -221,14 +222,9 @@ Json torrent_job_api_json(const TorrentJob& job) {
     catalogue["catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
     catalogue["no_match"] = static_cast<uint64_t>(job.catalogue_no_match);
     catalogue["failed"] = static_cast<uint64_t>(job.catalogue_failed);
-    if (job.catalogue_pending)
-        catalogue["state"] = "processing";
-    else if (job.catalogue_total && (job.catalogue_failed || job.catalogue_no_match))
-        catalogue["state"] = "completed_with_issues";
-    else if (job.catalogue_total)
-        catalogue["state"] = "completed";
-    else
-        catalogue["state"] = "waiting";
+    catalogue["state"] = std::string(catalogue_state(
+        job.catalogue_total, job.catalogue_pending, job.catalogue_no_match, job.catalogue_failed,
+        job.state == TorrentJobState::cataloguing, job.state == TorrentJobState::completed));
     out["catalogue"] = std::move(catalogue);
     out["eta_seconds"] = optional_u64(job.eta_seconds);
     out["progress"] = job.bytes_total
@@ -515,9 +511,6 @@ TorrentSearchResponse TorrentSearchManager::search(std::string_view query) {
             response.errors[std::string(provider->name())] = e.what();
         }
     }
-    std::stable_sort(response.results.begin(), response.results.end(), [](const auto& a, const auto& b) {
-        return a.seeders.value_or(0) > b.seeders.value_or(0);
-    });
 
     const auto expires = unix_ms() + 30ULL * 60 * 1000;
     Lock lock(mutex_);
