@@ -1,5 +1,19 @@
 # Current release
 
+## 0.90.86: a release's cover listing is fetched once
+
+No API, wire, config or on-disk changes.
+
+The metadata editor's cover options for a MusicBrainz release fetched the
+release's Cover Art Archive listing, then matching a file to that release
+fetched the same listing again to choose its cover (on gbni-1, 2026-10-06,
+the first track's lookup took 1.4 s of its 4.1 s, and each listing fetch
+1.5 to 2.1 s). Both now read one cached
+listing; a listing that fails to load is no longer remembered as "no cover",
+so the next track asks again. Test: the editor offers a release's covers
+and two of its tracks are matched with one Cover Art Archive request (two
+on the old code).
+
 ## 0.90.85: a reverse dial logs without holding the client
 
 No API, wire, config or on-disk changes.

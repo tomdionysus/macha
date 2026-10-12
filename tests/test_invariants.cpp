@@ -317,7 +317,7 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
                   R"({"id":1399,"name":"Game of Thrones","first_air_date":"2011-04-17"})");
         // Before "/release/", which the cover lookup's URL also contains.
         http->add("coverartarchive.org/release/" + release, 200, "application/json",
-                  R"({"images":[{"front":true,"image":"https://covers.example/full.jpg",
+                  R"({"images":[{"id":1,"front":true,"image":"https://covers.example/full.jpg",
                                  "thumbnails":{"500":"https://covers.example/front-500.jpg"}}]})");
         http->add("covers.example", 200, "image/jpeg", "cover-bytes");
         http->add("/release/" + release, 200, "application/json",
@@ -359,6 +359,17 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         CHECK(episode->title == "The Kingsroad");
         CHECK(episode->media_ids == std::vector<std::string>{episode_media});
         CHECK(catalogue.get(*episode->parent_id)->parent_id == "tmdb:tv:1399");
+
+        // The editor offers the release's covers before the match, which then
+        // chooses its cover from the listing already fetched.
+        {
+            std::map<std::string, std::string, std::less<>> query{
+                {"ref", "musicbrainz:release:" + release}, {"role", "cover"}};
+            auto response = manage.handle(
+                request_for("GET", "/api/v1/manage/providers/artwork", {}, std::move(query)));
+            REQUIRE(response.status == 200);
+            CHECK(body_json(response).find("options")->asArray().size() == 1);
+        }
 
         // A release by MusicBrainz id with a track number.
         auto [track_hint, track_media] = bench.unmatched("/Music/ref-3.flac", 3);
