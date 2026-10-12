@@ -59,7 +59,12 @@ A failing test is P0: reproduce it before deciding whose it is.
   are node-local.
 - **`RPC stalled (control)`** each way at 09:47Z and 09:50Z on 2026-10-05,
   5 to 15 s without progress, then nothing. 0.90.65/66/68 removed three
-  ways control could wait; watch for a recurrence.
+  ways control could wait; watch for a recurrence. Recurred 2026-10-11:
+  six control stalls of 5 s between the two nodes (`get_metadata_heads`,
+  `members`; 10:27Z, 11:55Z, 14:27Z, 15:34Z), the 15:34:39Z one both ways
+  in the same second, which points at the link (fi-1's mobile connection)
+  rather than either node; loader polls stalled alongside. None after
+  22:24Z that day (checked 2026-10-12 09:40Z).
 - **A failed convergence run's retry: built, 0.90.82.** Events during its
   backoff bring it forward, `maintenance.convergence_settle_ms` (1 s) after
   the last and at most `convergence_max_delay_ms` (10 s) after the first.
@@ -76,15 +81,18 @@ A failing test is P0: reproduce it before deciding whose it is.
   8 s reaches 4 s, which then adds at most 4 s to it.
 - **Known defects of 2026-09-24/25**: the acquisition API audit's four
   findings: a pause or cancel overwritten by a failing ingest, fixed
-  0.90.84; the other three change the API and are built but held,
-  uncommitted in the working tree (copy in `build/api-held/`), until Core
-  and the clients are told (no client session was running, 2026-10-12):
+  0.90.84; the other three change the API and are built and tested but
+  held out of the tree (full files in `build/api-held/`, the laptop's
+  scratch directory) until Core and the clients are told (no client
+  session was running, 2026-10-12):
   one `catalogue.state` rule for an ingest and its torrent (a completed
   import with nothing counted read `completed` on the ingest, `waiting` on
   the torrent); a remote job's single `GET` asks its owner, so
   `catalogue.items` is the owner's, or null when it cannot be asked (was an
   empty array); torrent search results in provider order, not sorted by
-  seeders. Unverified package names in the install docs. *Carried.* (The
+  seeders. (The install docs' Fedora and MacPorts package names were
+  checked 2026-10-12 against Fedora 43/44 and the MacPorts index: all
+  exist, `zlib-devel` through `zlib-ng-compat-devel`, `macfuse +fs_link`.) (The
   bare metadata errors: one is gone, the other throws `MetadataNotReady`
   since 0.90.78.)
 
