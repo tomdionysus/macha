@@ -130,8 +130,11 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
         conflict.left_entry = installed;
         conflict.right_entry = other;
         const auto id = metadata_conflict_id(conflict);
-        if (out.conflicts.emplace(id, std::move(conflict)).second)
+        if (out.conflicts.emplace(id, std::move(conflict)).second) {
             ++result.conflicts_created;
+            if (result.created_keys.size() < merge_conflict_keys_kept)
+                result.created_keys.push_back(path);
+        }
     };
 
     // Two differing values for what is one entry: the newer when one head
@@ -289,8 +292,11 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
             conflict.right_catalogue_root =
                 take_left ? right.catalogue_root : left.catalogue_root;
             const auto id = metadata_conflict_id(conflict);
-            if (out.conflicts.emplace(id, std::move(conflict)).second)
+            if (out.conflicts.emplace(id, std::move(conflict)).second) {
                 ++result.conflicts_created;
+                if (result.created_keys.size() < merge_conflict_keys_kept)
+                    result.created_keys.emplace_back("catalogue_root");
+            }
         }
         out.catalogue_root = take_left ? left.catalogue_root : right.catalogue_root;
         out.catalogue_dot = take_left ? left.catalogue_dot : right.catalogue_dot;

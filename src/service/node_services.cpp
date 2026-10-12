@@ -235,10 +235,6 @@ void NodeServices::start() {
 void NodeServices::request_stop() {
     if (!started_ || stopped_)
         return;
-    // A FUSE publication in flight ends promptly rather than holding the
-    // stop on a slow peer.
-    note("cancel-io filesystem");
-    filesystem_.request_io_cancellation();
     note("request_stop maintenance");
     maintenance_.request_stop();
     note("request_stop catalogue-installer");
@@ -255,6 +251,11 @@ void NodeServices::request_stop() {
     scanner_.request_stop();
     note("request_stop media-information");
     media_information_.request_stop();
+    // A FUSE publication in flight ends promptly rather than holding the
+    // stop on a slow peer. Last, so a write it cancels fails a caller already
+    // told to stop: an ingest stopped mid-put resumes rather than fails.
+    note("cancel-io filesystem");
+    filesystem_.request_io_cancellation();
 }
 
 // Dependants stop before providers. The producers (plugins, torrent

@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.82.
+Last updated: 2026-10-11, on `develop`. Both nodes run 0.90.83.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -45,12 +45,16 @@ A failing test is P0: reproduce it before deciding whose it is.
   `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
   under debug logging, the macOS-only torrent segfaults, and
   `users/test_accounts_converge_across_nodes` (a sign-in over 2 s under a
-  loaded laptop; with 0.90.64 a busy slot answers `try_later` instead).
+  loaded laptop; with 0.90.64 a busy slot answers `try_later` instead),
+  `rpc_cluster/test_rpc_metadata_executor_cancellation_disconnect_and_shutdown`
+  (laptop, 2026-10-12, `exit=1` with no assertion printed, in a three-test
+  group; passed alone and in the group after).
 - **Ingest and merges**: the ingest re-bases on a stale basis since
-  0.90.79. Left: log the conflict key when a merge records one; an ingest
-  that dies when its node restarts mid-put; the merge rule (take the newer
-  when one side is the other's ancestor) and the reconciler (one merger at
-  a time) from the 2026-09-23 diagnosis. *Carried.*
+  0.90.79; a merge logs each conflict's key and an ingest stopped mid-put
+  resumes since 0.90.83 (the stop cancelled filesystem I/O before it told
+  the ingest to stop). Left: the merge rule (take the newer when one side
+  is the other's ancestor) and the reconciler (one merger at a time) from
+  the 2026-09-23 diagnosis. *Carried.*
 - **The unmatched list differs by node** (771 on fi-1, 822 on gbni-1): hints
   are node-local.
 - **`RPC stalled (control)`** each way at 09:47Z and 09:50Z on 2026-10-05,
@@ -270,7 +274,7 @@ on control threads no longer grow with deletes. Left:
 ## Cluster state
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.82**, cluster protocol 23. es-1 is offline
+  (10.35.1.10) run **0.90.83**, cluster protocol 23. es-1 is offline
   indefinitely.
 - Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.

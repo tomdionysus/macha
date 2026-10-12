@@ -1333,6 +1333,14 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                   " superseded=" + std::to_string(merged.conflicts_superseded) +
                   " standing=" + std::to_string(merged.snapshot.conflicts.size()) +
                   " remaining_heads=" + std::to_string(heads.size() - 1));
+        for (const auto& key : merged.created_keys)
+            Log::warn("metadata merge recorded a conflict generation=" +
+                      std::to_string(reconciliation.generation) + " key=" + key +
+                      "; resolve it at /api/v1/manage/metadata/conflicts");
+        if (merged.conflicts_created > merged.created_keys.size())
+            Log::warn("metadata merge recorded " +
+                      std::to_string(merged.conflicts_created - merged.created_keys.size()) +
+                      " more conflicts generation=" + std::to_string(reconciliation.generation));
         // accept_commit() drops accepted ancestors from the head set, so the loop
         // folds any remaining heads into this commit.
         } catch (const MergeUnavailable& error) {
