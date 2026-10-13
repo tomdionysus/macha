@@ -1,5 +1,37 @@
 # Current release
 
+## 0.90.94: what only an unreachable node holds is unavailable
+
+No API, wire, config or on-disk changes. The availability values are the
+same; a file whose only holder is out of reach now reads `unavailable`
+where it read `complete`.
+
+The availability survey kept its last answer while every other hosting
+node was out of reach, so a file only the absent node held still read
+`complete` and its title showed as playable. On 2026-10-13 gbni-1 dropped
+out at 11:28Z and fi-1 showed its titles as playable from then on. A node
+with no host in reach now surveys alone: what it lacks is held by no
+reachable node, as `unavailable` already says. When a host comes back, the
+change in peers asks it again.
+
+Two more fixes in the same survey:
+
+- One definition of unavailable. The first survey after a start ran before
+  the first inventory was built and fell back to the namespace tree, which
+  leaves out the catalogue's objects: 200,930 unavailable against the
+  diff's 201,372, held until something else changed. The survey now waits
+  for the inventory (looking again every 5 s).
+- A survey some peer could not finish (a peer restarting) replaced the last
+  set: `unavailable=0 unknown=671994` on fi-1, so repair's pull asked about
+  lost extents again. What was last unavailable now stays so, less what
+  this node has gained, and the survey is asked again with backoff, a
+  failed trie diff included.
+
+Tests: with the only holder out of reach a file reads `unavailable`, and
+`complete` once the holder is back (the old code kept `complete`); a survey
+a peer could not finish keeps the last unavailable set less what is now
+held.
+
 ## 0.90.93: the torrent backend notices a disk mounted after start
 
 No API, wire, config or on-disk changes.
