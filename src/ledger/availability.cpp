@@ -363,6 +363,21 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
     return survey;
 }
 
+void keep_unavailable(AvailabilitySurvey& next, const AvailabilitySurvey& last,
+                      const HeldFn& held) {
+    std::vector<ObjectId> kept;
+    std::copy_if(last.unavailable.begin(), last.unavailable.end(), std::back_inserter(kept),
+                 [&](const ObjectId& id) { return !held(id); });
+    std::vector<ObjectId> unavailable;
+    std::set_union(next.unavailable.begin(), next.unavailable.end(), kept.begin(), kept.end(),
+                   std::back_inserter(unavailable));
+    std::vector<ObjectId> unknown;
+    std::set_difference(next.unknown.begin(), next.unknown.end(), unavailable.begin(),
+                        unavailable.end(), std::back_inserter(unknown));
+    next.unavailable = std::move(unavailable);
+    next.unknown = std::move(unknown);
+}
+
 AvailabilitySurvey survey_by_diff(const ObjectTrie::Snapshot& mine,
                                   const std::vector<ObjectId>& missing_here,
                                   const IdLookup& referenced, std::span<TrieSource* const> peers,

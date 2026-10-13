@@ -884,6 +884,22 @@ MACHA_FAST_TEST("availability", test_trie_questions_and_answers_survive_the_wire
     CHECK(too_many);
 }
 
+MACHA_TEST("availability", test_a_survey_a_peer_could_not_finish_keeps_what_was_unavailable) {
+    AvailabilitySurvey last;
+    last.unavailable = {extent_id(1), extent_id(2), extent_id(3)};
+    std::sort(last.unavailable.begin(), last.unavailable.end());
+    AvailabilitySurvey next;
+    next.unavailable = {extent_id(4)};
+    next.unknown = {extent_id(1), extent_id(5)};
+    std::sort(next.unknown.begin(), next.unknown.end());
+    // This node has since gained the second.
+    keep_unavailable(next, last, holds({extent_id(2)}));
+    std::vector<ObjectId> unavailable{extent_id(1), extent_id(3), extent_id(4)};
+    std::sort(unavailable.begin(), unavailable.end());
+    CHECK(next.unavailable == unavailable);
+    CHECK(next.unknown == std::vector<ObjectId>{extent_id(5)});
+}
+
 // One peer's trie as a source that fails after a few questions.
 class FailingSource final : public TrieSource {
   public:
@@ -1197,10 +1213,9 @@ MACHA_FAST_TEST("availability", test_a_file_the_survey_cannot_decide_takes_its_l
 
 // Two real nodes: the pass rolls up and surveys, a peer answers over RPC, and
 // the path table says what a reader would be told.
-MACHA_TEST("availability", test_a_survey_that_could_ask_no_host_calls_nothing_unavailable) {
-    // The second node alone holds a file. With the second out of reach, the
-    // first knows it exists but can ask it nothing: what the first lacks is
-    // not thereby held by nobody.
+MACHA_TEST("availability", test_what_only_a_host_out_of_reach_holds_is_unavailable) {
+    // The second node alone holds a file. With the second out of reach, what
+    // it holds is not reachable; once it is back, it is again.
     TestCluster cluster(ConfigProfile::isolated);
     const auto first_port = free_port();
     const auto second_port = free_port();
@@ -1216,15 +1231,15 @@ MACHA_TEST("availability", test_a_survey_that_could_ask_no_host_calls_nothing_un
         config->torrent.enabled = false;
     }
     Service first(first_config, cluster.keys(), test_durability_window);
-    Service second(second_config, cluster.keys(), test_durability_window);
+    auto second = std::make_unique<Service>(second_config, cluster.keys(), test_durability_window);
     first.start();
-    second.start();
+    second->start();
     (void)first.filesystem();
-    (void)second.filesystem();
+    (void)second->filesystem();
     REQUIRE(wait_until(
         [&] {
             return first.node().membership().active().size() == 2 &&
-                   second.node().membership().active().size() == 2;
+                   second->node().membership().active().size() == 2;
         },
         10s));
 
@@ -1240,7 +1255,7 @@ MACHA_TEST("availability", test_a_survey_that_could_ask_no_host_calls_nothing_un
     REQUIRE(wait_until(
         [&] {
             return std::all_of(ids.begin(), ids.end(), [&](const ObjectId& id) {
-                return second.local_state().data().has(id);
+                return second->local_state().data().has(id);
             });
         },
         20s));
@@ -1254,24 +1269,25 @@ MACHA_TEST("availability", test_a_survey_that_could_ask_no_host_calls_nothing_un
                    snapshot->survey.peers_asked == 1 && snapshot->survey.unavailable.empty();
         },
         20s));
-    second.stop();
+    second->stop();
+    second.reset();
     REQUIRE(wait_until([&] { return first.node().membership().active().size() == 1; }, 20s));
     for (const auto& id : ids)
         REQUIRE(first.local_state().data().remove(id));
     REQUIRE(retry_while_not_ready(
         [&] { write_file(first.filesystem(), "/after.bin", pattern(extent, 3)); }));
-    // However long the first keeps trying, the second's file is never called
-    // held by no node.
-    const auto deadline = Clock::now() + 15s;
-    bool called_unavailable = false;
-    while (Clock::now() < deadline && !called_unavailable) {
+    const auto kept = [&] {
         const auto snapshot = first.availability().snapshot();
-        for (const auto& id : ids)
-            called_unavailable =
-                called_unavailable || (snapshot && snapshot->survey.is_unavailable(id));
-        std::this_thread::sleep_for(100ms);
-    }
-    CHECK(!called_unavailable);
+        if (!snapshot || !snapshot->paths.contains("/kept.bin"))
+            return Availability::unknown;
+        return availability_of(&snapshot->paths.at("/kept.bin"));
+    };
+    CHECK(wait_until([&] { return kept() == Availability::unavailable; }, 20s));
+
+    second = std::make_unique<Service>(second_config, cluster.keys(), test_durability_window);
+    second->start();
+    CHECK(wait_until([&] { return kept() == Availability::complete; }, 30s));
+    second->stop();
     first.stop();
 }
 

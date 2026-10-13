@@ -563,24 +563,8 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         return false;
     }
 
-    // Asking nobody proves nothing. With every other host this node knows of
-    // out of reach, a survey would call all it lacks unavailable; it waits
-    // for one to come back and keeps the last answer. A node that knows no
-    // other host surveys alone.
-    if (hosts.empty()) {
-        const auto known = node_.membership().all();
-        const bool others = std::any_of(known.begin(), known.end(), [&](const NodeInfo& peer) {
-            return peer.id != node_.node_id() && node_hosts_extents(peer);
-        });
-        if (others) {
-            retry_backoff_ =
-                std::clamp<Clock::duration>(retry_backoff_ * 2, retry_floor, retry_ceiling);
-            retry_at_ = now + retry_backoff_;
-            due_ = due_ ? std::min(*due_, *retry_at_) : *retry_at_;
-            return false;
-        }
-    }
-
+    // A host out of reach holds nothing reachable: with none in reach, what
+    // this node lacks is unavailable until one comes back and is asked.
     const auto telemetry = node_.telemetry().all();
     std::vector<RemotePeer> remotes;
     remotes.reserve(hosts.size());
@@ -589,6 +573,12 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     for (const auto& peer : hosts) {
         remotes.emplace_back(node_, peer, runs_at_least(telemetry, peer.id, first_version));
         diffable = diffable && runs_at_least(telemetry, peer.id, first_trie_version);
+    }
+    // A diff covers the catalogue's objects from the inventory; until the
+    // first is built, the survey waits rather than leave them out.
+    if (ask && diffable && !ledger_.inventory()) {
+        due_ = due_ ? std::min(*due_, now + seed_retry) : now + seed_retry;
+        return false;
     }
     std::vector<PeerHoldings*> asking;
     for (auto& remote : remotes)
@@ -624,6 +614,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     const bool remembered = ask && memo_ && surveyed_ && !lost && same_peers && !shrank &&
                             !(grew && missing) && topology_events == surveyed_topology_events_;
     const char* method = "none";
+    bool failed = false;
     if (ask) {
         // Each peer's held trie against this node's, when every peer can be
         // asked so; otherwise each peer is asked about the namespace tree.
@@ -632,8 +623,6 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         const auto inventory = ledger_.inventory();
         if (!diffable)
             method = holdings->tries.size() == 1 ? "tree:peer_version" : "tree:held_tries";
-        else if (!inventory)
-            method = "tree:no_inventory";
         if (diffable && inventory && holdings->missing) {
             std::vector<RemoteTrie> tries;
             tries.reserve(hosts.size());
@@ -681,6 +670,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                 report("failed");
                 diffed.reset();
                 lacks = {};
+                failed = true;
                 method = "tree:diff_failed";
                 Log::debug(std::string("availability: a trie diff failed, asking about the tree: ") +
                            error.what());
@@ -708,6 +698,9 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                     lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
                                                          std::move(*found)));
         }
+        failed = failed || next.survey.peers_failed;
+        if (failed && surveyed_)
+            keep_unavailable(next.survey, previous->survey, held);
         peer_lacks_.publish(std::move(lacks));
         surveyed_at_ = now;
     } else {
@@ -770,7 +763,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         snapshot_.publish(std::move(next));
         return false;
     }
-    if (next.survey.peers_failed) {
+    if (failed) {
         retry_backoff_ = std::clamp<Clock::duration>(retry_backoff_ * 2, retry_floor, retry_ceiling);
         retry_at_ = now + retry_backoff_;
         due_ = due_ ? std::min(*due_, *retry_at_) : *retry_at_;
