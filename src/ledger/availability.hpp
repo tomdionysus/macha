@@ -157,6 +157,12 @@ AvailabilitySurvey survey_availability(const HoldingsRollup& local,
                                        const SurveyMemo* known = nullptr,
                                        SurveyMemo* made = nullptr);
 
+// For a survey some peer could not finish: what `last` found held by no
+// reachable node stays so in `next`, less what this node now holds, and is no
+// longer unknown.
+void keep_unavailable(AvailabilitySurvey& next, const AvailabilitySurvey& last,
+                      const HeldFn& held);
+
 // The survey from trie diffs: this node's held trie against each peer's.
 // `missing_here` (sorted) is what is referenced that this node lacks; what
 // any peer holds of it is available, the rest unavailable. Each
