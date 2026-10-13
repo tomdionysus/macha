@@ -1,6 +1,22 @@
 # Completed and tested
 
-Last updated: 2026-10-12
+Last updated: 2026-10-13
+
+## 2026-10-13 -- 0.90.94: what only an unreachable node holds is unavailable
+
+- gbni-1 dropped out at 11:28Z (compromised); fi-1 kept its 11:01Z survey
+  (0.90.51's rule) and showed gbni-1-only titles as playable. A node with
+  no host in reach now surveys alone (operator: an unreachable node's
+  extents are unreachable). On fi-1 after the install: `peers=0
+  method=diff unavailable=659602`; the API root reads 697,998 of 1,072,291
+  extents unavailable, the rest local.
+- One definition of unavailable: the survey waits for the first inventory
+  instead of falling back to the tree (which left out 442 catalogue
+  objects); a survey a peer could not finish keeps the last unavailable set.
+- Announced to Core first; Core found no conflict and holds three client
+  notes (web queue drops unavailable titles for good, phone download
+  records keep availability, TV detail screen never re-reads it).
+- Gate on fi-1: 670 + 19 + 21 passed. Installed on fi-1 only.
 
 ## 2026-10-12 -- 0.90.88 to 0.90.93: three answers, and repair's fairness
 

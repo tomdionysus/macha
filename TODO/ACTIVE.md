@@ -1,6 +1,7 @@
 # Active tasks
 
-Last updated: 2026-10-12, on `develop`. Both nodes run 0.90.93.
+Last updated: 2026-10-13, on `develop`. fi-1 runs 0.90.94; gbni-1 is out of
+the cluster (compromised 2026-10-13, last ran 0.90.93; ssh refuses the key).
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -16,16 +17,10 @@ since.
 
 A failing test is P0: reproduce it before deciding whose it is.
 
-- **Next: one definition of "unavailable", kept across a failed survey**
-  (seen 2026-10-12 on 0.90.92). The tree method leaves out the 442
-  catalogue objects no node holds (200,930 against the diff's 201,372), so
-  gbni-1, whose survey runs `tree:no_inventory`, pulls them and counts them
-  unsourceable (truthfully: fi-1 answers `not_found`). A survey that fails
-  while a peer restarts reads `unavailable=0 unknown=671994`, replacing the
-  last known set, so the pull asks about lost extents again until the next
-  good survey (fi-1 counted 28 between 19:40:34Z and 19:41:39Z). Also find
-  why gbni-1's survey falls back to the tree (`no_inventory`) while fi-1's
-  diffs.
+- **gbni-1 compromised (2026-10-13)**: out of the cluster since 11:28Z; its
+  sshd now offers only passwords. Operator's to handle: its VPN identity,
+  Macha account passwords (it held every hash), whether it rejoins. No
+  blocking on fi-1 (operator: unreachable is unavailable).
 - **`rpc_cluster/test_two_node_mutual_bootstrap_metadata_write_floor`**:
   failed in full runs on 2026-10-05 and 2026-10-07; 24 of 24 under
   `--repeat`. A first write while two nodes form a set is refused
