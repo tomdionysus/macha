@@ -549,7 +549,7 @@ HeldView LocalStore::held_view() const {
     auto view = ledger_->view();
     HeldView out;
     out.identity = {view.records.root_hash(), view.removals, true};
-    out.tries = {view.records};
+    out.trie = std::make_shared<const TrieUnion>(std::vector{view.records});
     out.held = [records = std::move(view.records)](const ObjectId& id) {
         return records.get(id).has_value();
     };

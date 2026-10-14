@@ -384,12 +384,10 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
     const auto now = Clock::now();
     if (question.kind == TrieQuestionKind::root) {
         auto view = ledger_.held_view(RetentionClass::data);
-        if (!view.identity.complete)
+        if (!view.identity.complete || !view.trie)
             return error_reply(503, "holdings_seeding", "this node is still listing what it holds");
-        if (view.tries.size() != 1)
-            return error_reply(501, "several_held_tries", "this node holds DATA on more than one disk");
-        auto& trie = view.tries.front();
-        const ObjectTrie::Summary summary{trie.size(), trie.root_hash()};
+        auto& trie = view.trie;
+        const auto summary = trie->root();
         Lock lock(pinned_mutex_);
         std::erase_if(pinned_, [&](const Pinned& pinned) {
             return pinned.hash == summary.hash || now - pinned.used > pinned_for;
@@ -399,7 +397,7 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
         pinned_.push_back({summary.hash, std::move(trie), now});
         return {MessageType::trie_diff_reply, encode_trie_root(summary)};
     }
-    std::optional<ObjectTrie::Snapshot> trie;
+    std::shared_ptr<const TrieUnion> trie;
     {
         Lock lock(pinned_mutex_);
         std::erase_if(pinned_,
@@ -480,7 +478,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         Holdings next;
         next.identity = view.identity;
         next.held = view.held;
-        next.tries = view.tries;
+        next.trie = view.trie;
         if (tree_backed) {
             // With the same holdings as the last roll-up, only the tree has
             // moved: what the two trees share keeps its count.
@@ -568,8 +566,8 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     const auto telemetry = node_.telemetry().all();
     std::vector<RemotePeer> remotes;
     remotes.reserve(hosts.size());
-    // Every peer answers a trie diff and this node has one held trie.
-    bool diffable = holdings->tries.size() == 1;
+    // Every peer answers a trie diff.
+    bool diffable = holdings->trie != nullptr;
     for (const auto& peer : hosts) {
         remotes.emplace_back(node_, peer, runs_at_least(telemetry, peer.id, first_version));
         diffable = diffable && runs_at_least(telemetry, peer.id, first_trie_version);
@@ -622,7 +620,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         std::optional<AvailabilitySurvey> diffed;
         const auto inventory = ledger_.inventory();
         if (!diffable)
-            method = holdings->tries.size() == 1 ? "tree:peer_version" : "tree:held_tries";
+            method = "tree:peer_version";
         if (diffable && inventory && holdings->missing) {
             std::vector<RemoteTrie> tries;
             tries.reserve(hosts.size());
@@ -657,7 +655,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                         lacking.push_back(id);
                 std::sort(lacking.begin(), lacking.end());
                 lacking.erase(std::unique(lacking.begin(), lacking.end()), lacking.end());
-                diffed = survey_by_diff(holdings->tries.front(), lacking,
+                diffed = survey_by_diff(holdings->trie, lacking,
                                         inventory->lookup(RetentionClass::data), sources, found,
                                         pause);
                 lacks.generation = inventory->generation();

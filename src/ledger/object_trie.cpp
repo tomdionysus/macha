@@ -30,7 +30,7 @@ constexpr uint8_t kind_interior = 2;
 constexpr uint8_t journal_version = 2;
 constexpr uint8_t format1_journal_version = 1;
 
-Hash256 leaf_hash(const std::vector<ObjectTrie::Record>& records) {
+Hash256 leaf_hash(std::span<const ObjectTrie::Record> records) {
     if (records.empty())
         return {};
     Writer writer;
@@ -38,6 +38,20 @@ Hash256 leaf_hash(const std::vector<ObjectTrie::Record>& records) {
     for (const auto& [id, value] : records) {
         writer.fixed(id.bytes);
         writer.bytes(value);
+    }
+    return sha256(writer.data());
+}
+
+// Over each non-empty slot's index, hash and count.
+template <typename Slots> Hash256 interior_hash(const Slots& slots) {
+    Writer writer;
+    writer.u8('I');
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (!slots[i].count)
+            continue;
+        writer.u8(static_cast<uint8_t>(i));
+        writer.fixed(slots[i].hash.bytes);
+        writer.u64(slots[i].count);
     }
     return sha256(writer.data());
 }
@@ -165,19 +179,22 @@ ObjectTrie::NodePtr ObjectTrie::make_interior(uint8_t depth, std::vector<Child> 
     auto node = std::make_shared<Node>();
     node->depth = depth;
     node->leaf = false;
-    Writer writer;
-    writer.u8('I');
-    for (size_t i = 0; i < children.size(); ++i) {
-        if (children[i].empty())
-            continue;
-        node->count += children[i].count;
-        writer.u8(static_cast<uint8_t>(i));
-        writer.fixed(children[i].hash.bytes);
-        writer.u64(children[i].count);
-    }
-    node->hash = sha256(writer.data());
+    for (const auto& child : children)
+        node->count += child.count;
+    node->hash = interior_hash(children);
     node->children = std::move(children);
     return node;
+}
+
+ObjectTrie::Summary ObjectTrie::leaf_summary(std::span<const Record> records) {
+    return {records.size(), leaf_hash(records)};
+}
+
+ObjectTrie::Summary ObjectTrie::interior_summary(const Children& children) {
+    Summary out{0, interior_hash(children)};
+    for (const auto& child : children)
+        out.count += child.count;
+    return out;
 }
 
 ObjectTrie::Child ObjectTrie::child_of(NodePtr node) {

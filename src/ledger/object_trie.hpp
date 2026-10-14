@@ -110,6 +110,11 @@ class ObjectTrie {
         bool operator==(const Summary&) const = default;
     };
     using Children = std::array<Summary, 256>;
+    // What a trie's node sums up as: a leaf of `records` (sorted by id,
+    // unique, at most leaf_max), or an interior node over `children` (more
+    // than leaf_max records below them).
+    static Summary leaf_summary(std::span<const Record> records);
+    static Summary interior_summary(const Children& children);
 
     // Saved nodes read from disk, shared by the trie and its snapshots,
     // least recently used out first. Thread safe.

@@ -1,5 +1,32 @@
 # Current release
 
+## 0.90.95: a node with several disks is surveyed by trie diff
+
+No API, config or on-disk changes. On the wire, a node with several DATA
+disks now answers a `trie_diff` root question where it answered 501
+`several_held_tries`; nothing else changes.
+
+A node's held trie is now the union of its online disks' held tries, read
+as one trie whose summaries are those one trie over the same ids would
+have. The availability survey and peers' diffs use it, so a node with
+several disks is surveyed by diff like a node with one, and the node's
+holdings identity is that union's root: any two nodes holding the same ids
+share it, whatever their disks. Nothing is stored or journalled for the
+union. Only subtrees several disks hold differently are worked out, and
+each union reuses the last one's subtrees where the disks are unchanged.
+A one-disk node's union is its disk's trie, at no cost.
+
+This clears the way for the replication-by-diff proposal's stage 5, which
+retires the namespace-tree survey, without dropping nodes with several
+disks.
+
+Tests: a union of one to three tries, records split and shared among them,
+reads as one trie of the same records below every prefix and diffs against
+it as equal; one made from the last after puts and removals reads as one
+made afresh; a pool holding ids across two disks has the same identity as
+a pool holding them on one; the diff survey finds the same answer with
+this node and a peer each on two disks.
+
 ## 0.90.94: what only an unreachable node holds is unavailable
 
 No API, wire, config or on-disk changes. The availability values are the

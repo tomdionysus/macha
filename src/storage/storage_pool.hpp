@@ -85,6 +85,10 @@ class StoragePool final : public ObjectStore {
     mutable std::atomic_int64_t diag_get_report_ns_{};
     mutable std::atomic_uint64_t full_list_scans_{};
     std::atomic_size_t online_backends_cached_{};
+    // The last held union made, the hint for the next: held across the
+    // making, so each is made from the one before.
+    mutable Mutex union_mutex_;
+    mutable std::shared_ptr<const TrieUnion> union_ MACHA_GUARDED_BY(union_mutex_);
 
     void observe_get(size_t, uint64_t) const;
 
@@ -134,8 +138,8 @@ class StoragePool final : public ObjectStore {
     std::optional<DurabilityToken> reassert_durable(const ObjectId&);
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const override;
-    // Every online backend's view, the identity hashed over (disk token,
-    // root) by token; incomplete while an online backend is being seeded.
+    // The union of every online backend's view, its identity the union's
+    // root; incomplete while an online backend is being seeded.
     HeldView held_view() const override;
     bool valid(const ObjectId&) const;
     bool remove(const ObjectId&);

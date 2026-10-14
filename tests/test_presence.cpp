@@ -366,4 +366,36 @@ MACHA_TEST("presence", test_the_held_identity_names_exactly_what_the_pool_holds)
     CHECK(back.held(object_id(first)));
 }
 
+// A pool holding ids across two disks names them as a pool holding the same
+// ids on one disk does.
+MACHA_TEST("presence", test_the_held_identity_is_the_same_on_any_number_of_disks) {
+    Keys k;
+    const auto a = k.dir.path() / "a";
+    const auto b = k.dir.path() / "b";
+    const auto single = k.dir.path() / "single";
+    for (const auto& path : {a, b, single})
+        std::filesystem::create_directories(path);
+    StoragePool two(k.dir.path() / "two-state", random_node_id(),
+                    std::vector<StorageBackendConfig>{{a, 64ULL << 20}, {b, 64ULL << 20}},
+                    k.keys.storage);
+    StoragePool one(k.dir.path() / "one-state", random_node_id(),
+                    std::vector<StorageBackendConfig>{{single, 64ULL << 20}}, k.keys.storage);
+    REQUIRE(wait_until([&] { return two.online_backends() == 2; }, 5s));
+    REQUIRE(wait_until([&] { return one.online_backends() == 1; }, 5s));
+    REQUIRE(wait_until([&] { return two.held_view().identity.complete; }, 10s));
+    REQUIRE(wait_until([&] { return one.held_view().identity.complete; }, 10s));
+    for (uint64_t n = 0; n < 300; ++n) {
+        const auto bytes = numbered(n);
+        REQUIRE(two.put(object_id(bytes), bytes));
+        REQUIRE(one.put(object_id(bytes), bytes));
+    }
+    const auto many = two.held_view();
+    const auto lone = one.held_view();
+    CHECK(many.trie->parts().size() == 2);
+    CHECK(many.trie->parts()[0].size() > 0);
+    CHECK(many.trie->parts()[1].size() > 0);
+    CHECK(many.identity.hash == lone.identity.hash);
+    CHECK(many.trie->root() == lone.trie->root());
+}
+
 } // namespace
