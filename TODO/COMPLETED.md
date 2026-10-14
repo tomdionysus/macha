@@ -2,6 +2,13 @@
 
 Last updated: 2026-10-14
 
+## 2026-10-14 -- 0.91.0: a single node, complete
+
+- Operator: development pauses until a second node is back; Macha works
+  as a single-node system. 0.91.0 is 0.90.96's code, named: `develop`
+  merged to `main`, tagged `0.91.0`, installed on fi-1. The handover is
+  at the top of ACTIVE.
+
 ## 2026-10-14 -- 0.90.96: the availability survey is by trie diff only
 
 - Replication-by-diff stage 5, survey half: the roll-up, tree survey, memo,

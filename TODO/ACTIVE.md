@@ -1,7 +1,37 @@
 # Active tasks
 
-Last updated: 2026-10-14, on `develop`. fi-1 runs 0.90.96; gbni-1 is out of
+Last updated: 2026-10-14, on `develop`. fi-1 runs 0.91.0; gbni-1 is out of
 the cluster (compromised 2026-10-13, last ran 0.90.93; ssh refuses the key).
+
+## Paused at 0.91.0 (2026-10-14): resume here
+
+Operator: at least two nodes are needed to continue development; work
+pauses for a few weeks. Macha works as a single-node system.
+
+- **State.** `main` and `develop` are both at 0.91.0, tagged `0.91.0`.
+  fi-1 runs it alone: referenced 1,011,452, held 353,662, the rest
+  unavailable (held only by gbni-1, out of reach). The survey is by trie
+  diff only (0.90.96); a node's holdings are the union of its disks' tries
+  (0.90.95); unreachable means unavailable (0.90.94, operator ruling).
+- **Proven alone.** Serving, ingest, scanning, writes, deletes, collection,
+  the survey and the path table, restart and recovery after a power cut
+  (twice on 2026-10-14, unattended).
+- **Not provable alone.** Repair by diff (built; last measured on two nodes
+  at 0.90.76), metadata reconciliation and rejoin, the diff against a real
+  peer (tested in-process only since 0.90.94).
+- **First when a second node is back.** (1) Bring it to 0.91.0 before its
+  first start if it is gbni-1 rebuilt or es-1 (section 2, "Bringing es-1
+  back": back up state first, the 0.57-era config is refused). (2) Watch
+  the first survey against it: `method=diff peers=1 peers_failed=0`, and
+  `availability diff done` with its question count. (3) Watch repair pull
+  from the list (`pull_examined` moving, no `have_valid_objects` traffic
+  where a diff gave the answer). (4) Then section 2's stage 5 repair half.
+- **Waiting on the operator.** The offline-disk `unknown` question
+  (section 8); section 8's other items.
+- **Watch on fi-1 meanwhile.** Power: 24 undervoltage warnings in the first
+  8 minutes after the 16:15Z boot, both reboots on 2026-10-14 unexplained
+  (no persistent journal). A powered USB hub or a stronger supply needs
+  someone on site.
 
 The ordered list of open work; work top to bottom unless new evidence
 changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
@@ -283,7 +313,7 @@ on control threads no longer grow with deletes. Left:
 
 ## Cluster state
 
-- **fi-1** (10.35.1.10) runs **0.90.96**, cluster protocol 23, alone.
+- **fi-1** (10.35.1.10) runs **0.91.0**, cluster protocol 23, alone.
   **gbni-1** (10.44.1.50, `macnessa.macha.network`) is out since
   2026-10-13 (compromised; last ran 0.90.93; section 1). es-1 is offline
   indefinitely. Deploys go to fi-1 only (`build/deploy.sh`'s fi-1 lines).

@@ -1,5 +1,35 @@
 # Current release
 
+## 0.91.0: a single node, complete
+
+No code changes from 0.90.96: this release names the state the cluster is
+in. Development pauses here until a second node is back.
+
+Since 0.90.17 the node has been reworked around four rules: absent nodes
+never block (any node may vanish forever; writes, deletes, merges and
+collection proceed with what is present); local is always fast (every
+read and write goes through one journalled mechanism and never waits on a
+peer or walks the namespace); pace, never gate (no subsystem waits for a
+higher class to go idle); and three answers (every request is "here it
+is", "cannot, and that will not change", or "cannot say now" with a
+bounded backoff). What a node holds is one identity, its held tries' root,
+and what the cluster holds is found by diffing those tries, never by
+walking the namespace.
+
+The cluster is one node, fi-1, since 2026-10-13: 1,011,452 referenced
+extents, 353,662 held, the rest on nodes out of reach and reported so.
+Alone it serves, ingests, scans, writes and surveys; a reboot brings it
+back by itself. What one node cannot show is the half of the design that
+needs a peer: repair by diff (built, measured on two nodes through
+0.90.76), metadata reconciliation and rejoin. Those wait for the second
+node.
+
+Open, for when it returns: the repair half of the replication-by-diff
+proposal's stage 5 (the store walk, push cursor and presence probes are
+still there as repair's fallback), whether a configured disk that is not
+yet online should read `unknown` rather than `unavailable`, and the items
+in `TODO/ACTIVE.md`.
+
 ## 0.90.96: the availability survey is by trie diff only
 
 No API or config changes. On the wire, `tree_holdings` (message 48) is
