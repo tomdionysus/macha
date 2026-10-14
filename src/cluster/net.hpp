@@ -79,13 +79,7 @@ enum class MessageType : uint16_t {
     // copy reports absent. At most have_valid_objects_max ids. Reply:
     // have_valid_objects_reply; a peer that errors is probed per object.
     have_valid_objects = 47,
-    // The availability survey's question: for each namespace tree node id,
-    // how many extents lie beneath it, how many this node holds, and which
-    // of its children it holds whole. At most tree_holdings_max ids. Reply:
-    // tree_holdings_reply. A peer older than 0.82.0 drops a connection that
-    // carries it, so it is sent only to peers that advertise a version with
-    // it.
-    tree_holdings = 48,
+    // 48 and 124 are retired; never reuse them.
     // A question to the peer's held trie (ledger/trie_diff): its root,
     // pinning that snapshot, or the subtrees or records below prefixes of a
     // pinned snapshot. Reply: trie_diff_reply. Sent only to peers that
@@ -134,7 +128,6 @@ enum class MessageType : uint16_t {
     have_control_objects_reply = 121,
     torrent_intent_reply = 122,
     have_valid_objects_reply = 123,
-    tree_holdings_reply = 124,
     trie_diff_reply = 125,
     unmatched_hints_reply = 126
 };

@@ -24,59 +24,19 @@ namespace macha {
 
 namespace {
 
-// The first release whose transport accepts tree_holdings.
-constexpr ReleaseVersion first_version{0, 82, 0};
 // The first release that answers trie_diff.
 constexpr ReleaseVersion first_trie_version{0, 90, 72};
-
-// A peer asked over RPC, in questions of at most tree_holdings_max ids.
-class RemotePeer final : public PeerHoldings {
-  public:
-    RemotePeer(NodeRuntime& node, NodeInfo peer, bool supported)
-        : node_(node), peer_(std::move(peer)), supported_(supported) {}
-
-    std::vector<NodeHoldings> ask(std::span<const ObjectId> nodes) override {
-        if (!supported_)
-            throw std::runtime_error("peer does not answer tree_holdings");
-        std::vector<NodeHoldings> answers;
-        answers.reserve(nodes.size());
-        for (size_t from = 0; from < nodes.size(); from += tree_holdings_max) {
-            const auto part = nodes.subspan(from, std::min(tree_holdings_max, nodes.size() - from));
-            const auto payload = encode_tree_holdings_request(part);
-            const auto reply =
-                node_.call(peer_, MessageType::tree_holdings, payload, FrameType::speculative);
-            if (reply.message.type != MessageType::tree_holdings_reply) {
-                std::string reason = "no reason given";
-                if (reply.message.type == MessageType::error) {
-                    try {
-                        Reader why(reply.message.payload);
-                        reason = why.string();
-                    } catch (const std::exception&) {
-                    }
-                }
-                throw std::runtime_error("peer refused tree_holdings: " + reason);
-            }
-            auto decoded = decode_tree_holdings_reply(reply.message.payload);
-            if (decoded.size() != part.size())
-                throw std::runtime_error("peer answered a different number of tree nodes");
-            std::move(decoded.begin(), decoded.end(), std::back_inserter(answers));
-        }
-        return answers;
-    }
-
-  private:
-    NodeRuntime& node_;
-    NodeInfo peer_;
-    bool supported_;
-};
 
 // A peer's held trie asked over RPC, every round of a diff from the snapshot
 // its root question pinned.
 class RemoteTrie final : public TrieSource {
   public:
-    RemoteTrie(NodeRuntime& node, NodeInfo peer) : node_(node), peer_(std::move(peer)) {}
+    RemoteTrie(NodeRuntime& node, NodeInfo peer, bool supported)
+        : node_(node), peer_(std::move(peer)), supported_(supported) {}
 
     ObjectTrie::Summary root() override {
+        if (!supported_)
+            throw std::runtime_error("peer does not answer trie_diff");
         const auto summary = decode_trie_root(ask(question(TrieQuestionKind::root, {})));
         at_ = summary.hash;
         return summary;
@@ -145,6 +105,7 @@ class RemoteTrie final : public TrieSource {
 
     NodeRuntime& node_;
     NodeInfo peer_;
+    bool supported_;
     Hash256 at_{};
     Spent spent_;
 };
@@ -348,11 +309,6 @@ AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
                                          std::filesystem::path persisted)
     : node_(node), local_(local), store_(store), ledger_(ledger), events_(events),
       routes_(routes), persisted_(std::move(persisted)) {
-    // No roll-up is kept across a restart: one an earlier release left goes.
-    if (!persisted_.empty()) {
-        std::error_code ec;
-        std::filesystem::remove(persisted_.parent_path() / "holdings.bin", ec);
-    }
     if (!persisted_.empty()) {
         std::ifstream in(persisted_, std::ios::binary);
         if (in) {
@@ -364,10 +320,6 @@ AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
             }
         }
     }
-    routes_.bind(MessageType::tree_holdings,
-                 [this](const NodeInfo&, FrameType, const RpcMessage& request) {
-                     return answer(request);
-                 });
     routes_.bind(MessageType::trie_diff,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return answer_trie(request);
@@ -376,7 +328,6 @@ AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
 
 AvailabilityService::~AvailabilityService() {
     routes_.unbind(MessageType::trie_diff);
-    routes_.unbind(MessageType::tree_holdings);
 }
 
 RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
@@ -422,99 +373,26 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
     }
 }
 
-RpcMessage AvailabilityService::answer(const RpcMessage& request) const {
-    const auto holdings = holdings_.handle();
-    if (!holdings)
-        return error_reply(503, "holdings_rolling_up", "holdings are not rolled up yet");
-    // Something stopped being held since the roll-up: what it calls whole may
-    // not be. The pass rolls up again; until then this node cannot answer.
-    if (ledger_.held_view(RetentionClass::data).identity.removals !=
-        holdings->identity.removals)
-        return error_reply(503, "holdings_changed", "holdings changed since they were rolled up");
-    const auto* rollup = &holdings->rollup;
-    const auto nodes = decode_tree_holdings_request(request.payload);
-    // This node's own copy of each tree node: answering never asks a peer.
-    const LocalNamespaceNodeStore stored(local_.control());
-    const NamespaceNodeStore& local_nodes =
-        holdings && holdings->built ? static_cast<const NamespaceNodeStore&>(*holdings->built)
-                                    : stored;
-    // The view the roll-up was made from, so the two agree.
-    const HeldFn& held = holdings->held;
-    std::vector<NodeHoldings> answers;
-    answers.reserve(nodes.size());
-    for (const auto& node : nodes)
-        answers.push_back(describe_holdings(*rollup, local_nodes, held, node));
-    return {MessageType::tree_holdings_reply, encode_tree_holdings_reply(answers)};
-}
-
 bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_point now,
                                   uint64_t now_unix_ms, const std::function<void()>& pause) {
     if (!head.snapshot)
         return false;
-    const bool tree_backed = head.snapshot->namespace_root.has_value();
-    const auto head_key = tree_backed ? *head.snapshot->namespace_root : head.hash;
     const auto topology_events = events_.count(NodeEvent::topology);
-    const auto stored = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
-
-    const auto refresh_started = Clock::now();
-    auto holdings = holdings_.handle();
-    bool rolled = false;
+    const auto inventory = ledger_.inventory();
     auto view = ledger_.held_view(RetentionClass::data);
-    // Something held at the roll-up may no longer be.
-    const bool lost = holdings && view.identity.removals != holdings->identity.removals;
-    const bool head_changed = rolled_head_ != head_key;
-    const bool holdings_changed = holdings && view.identity.hash != holdings->identity.hash;
-    const bool changed = head_changed || holdings_changed || lost;
-    const auto rollup_due = rolled_at_ + rolled_cost_ * share;
     due_ = retry_at_;
-    // A disk being seeded: what this node holds cannot be named yet.
-    if (!view.identity.complete) {
+    // A disk being seeded: what this node holds cannot be named yet. The
+    // referenced set is the inventory's: before the first there is nothing
+    // to join.
+    if (!view.identity.complete || !view.trie || !inventory) {
         due_ = due_ ? std::min(*due_, now + seed_retry) : now + seed_retry;
-        if (!holdings || changed)
-            return false;
+        return false;
     }
-    if (view.identity.complete && (!holdings || (changed && now >= rollup_due))) {
-        const auto started = Clock::now();
-        Holdings next;
-        next.identity = view.identity;
-        next.held = view.held;
-        next.trie = view.trie;
-        if (tree_backed) {
-            // With the same holdings as the last roll-up, only the tree has
-            // moved: what the two trees share keeps its count.
-            const bool carry = holdings && !holdings->built && !holdings_changed && !lost;
-            next.rollup = HoldingsRollup::build(head_key, stored, next.held, pause,
-                                                carry ? &holdings->rollup : nullptr);
-            next.missing = std::make_shared<const std::vector<ObjectId>>(
-                missing_extents(next.rollup, stored, next.held, pause));
-        } else {
-            auto built = std::make_shared<MemoryNamespaceNodeStore>();
-            const auto root = build_namespace_tree(head.snapshot->entries, *built);
-            next.rollup = HoldingsRollup::build(root, *built, next.held, pause);
-            next.missing = std::make_shared<const std::vector<ObjectId>>(
-                missing_extents(next.rollup, *built, next.held, pause));
-            next.built = std::move(built);
-        }
-        next.generation = head.generation;
-        next.snapshot = head.snapshot;
-        holdings_.publish(std::move(next));
-        holdings = holdings_.handle();
-        rolled_head_ = head_key;
-        rolled_at_ = now;
-        rolled = true;
-        observations().record("availability.rollup_us", elapsed_us(started));
-    }
-    if (changed && !rolled) {
-        due_ = due_ ? std::min(*due_, rollup_due) : rollup_due;
-        // Overtaken by a loss: a survey from this roll-up could call
-        // available what this node no longer holds.
-        if (lost)
-            return false;
-    }
-    const HeldFn& held = holdings->held;
-    const NamespaceNodeStore& nodes =
-        holdings->built ? static_cast<const NamespaceNodeStore&>(*holdings->built) : stored;
-    const auto* rollup = &holdings->rollup;
+    const auto refresh_started = Clock::now();
+    const bool lost = surveyed_ && view.identity.removals != joined_identity_.removals;
+    const bool changed = !surveyed_ || inventory != joined_inventory_ ||
+                         view.identity.hash != joined_identity_.hash || lost;
+    const bool gained_only = surveyed_ && changed && !lost && inventory == joined_inventory_;
 
     std::vector<NodeInfo> hosts;
     std::vector<std::pair<NodeId, uint64_t>> peers;
@@ -538,215 +416,147 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         grew = grew || peers[i].second > surveyed_peers_[i].second;
     }
     // What must be asked of the peers again, whatever it costs.
-    // The tree is asked about again once it has been rolled up, not while a
-    // roll-up of it is still due: until then the survey would be of the tree
-    // already surveyed.
-    const bool must_ask = !surveyed_ || rollup->root() != surveyed_root_ || lost ||
-                          topology_events != surveyed_topology_events_ || !same_peers || shrank;
+    const bool must_ask = !surveyed_ || topology_events != surveyed_topology_events_ ||
+                          !same_peers || shrank || retry;
     const bool missing = surveyed_ && (!previous->survey.unavailable.empty() ||
                                       !previous->survey.unknown.empty());
-    // A peer holding more could hold something missing: worth asking, but a
-    // peer that is importing grows all the time.
-    const auto ask_due = surveyed_at_ + surveyed_cost_ * share;
-    bool ask = must_ask || retry;
-    if (!ask && grew && missing) {
-        if (now >= ask_due)
-            ask = true;
-        else
-            due_ = due_ ? std::min(*due_, ask_due) : ask_due;
-    }
-    if (!ask && !rolled) {
-        if (!(grew && missing))
-            surveyed_peers_ = std::move(peers); // compare next against these
+    // What the inventory or this node's holdings changed, or a peer holding
+    // more (which could hold something missing, but a peer that is importing
+    // grows all the time), waits for the duty cycle.
+    const auto survey_due = surveyed_at_ + surveyed_cost_ * share;
+    const bool paced = changed || (grew && missing);
+    if (!must_ask && paced && now < survey_due) {
+        due_ = due_ ? std::min(*due_, survey_due) : survey_due;
         return false;
     }
-
-    // A host out of reach holds nothing reachable: with none in reach, what
-    // this node lacks is unavailable until one comes back and is asked.
-    const auto telemetry = node_.telemetry().all();
-    std::vector<RemotePeer> remotes;
-    remotes.reserve(hosts.size());
-    // Every peer answers a trie diff.
-    bool diffable = holdings->trie != nullptr;
-    for (const auto& peer : hosts) {
-        remotes.emplace_back(node_, peer, runs_at_least(telemetry, peer.id, first_version));
-        diffable = diffable && runs_at_least(telemetry, peer.id, first_trie_version);
-    }
-    // A diff covers the catalogue's objects from the inventory; until the
-    // first is built, the survey waits rather than leave them out.
-    if (ask && diffable && !ledger_.inventory()) {
-        due_ = due_ ? std::min(*due_, now + seed_retry) : now + seed_retry;
+    if (!must_ask && !paced) {
+        surveyed_peers_ = std::move(peers); // compare next against these
         return false;
     }
-    std::vector<PeerHoldings*> asking;
-    for (auto& remote : remotes)
-        asking.push_back(&remote);
-
-    // A peer that could not answer is tried with one tree node before the
-    // whole descent is repeated for it.
-    if (retry && !must_ask && !rolled) {
-        const ObjectId root = rollup->root();
-        bool answered = false;
-        for (auto* peer : asking) {
-            try {
-                (void)peer->ask(std::span<const ObjectId>(&root, 1));
-                answered = true;
-            } catch (const std::exception&) {
-            }
-        }
-        if (!answered) {
-            retry_backoff_ =
-                std::clamp<Clock::duration>(retry_backoff_ * 2, retry_floor, retry_ceiling);
-            retry_at_ = now + retry_backoff_;
-            due_ = due_ ? std::min(*due_, *retry_at_) : *retry_at_;
-            return false;
-        }
-    }
+    // A gain alone asks nobody: what this node gained was already available.
+    const bool ask = must_ask || !gained_only || (grew && missing);
 
     const auto started = Clock::now();
+    if (changed) {
+        const auto joined = Clock::now();
+        missing_.publish(
+            inventory->not_held(RetentionClass::data, view.trie->parts(), pause));
+        joined_inventory_ = inventory;
+        joined_identity_ = view.identity;
+        observations().record("availability.join_us", elapsed_us(joined));
+    }
+    const auto missing_here = missing_.handle();
     AvailabilitySnapshot next;
-    next.generation = holdings->generation;
+    next.generation = head.generation;
     next.surveyed_unix_ms = now_unix_ms;
-    // What the last survey settled stands while every peer holds what it
-    // held and this node has lost nothing.
-    const bool remembered = ask && memo_ && surveyed_ && !lost && same_peers && !shrank &&
-                            !(grew && missing) && topology_events == surveyed_topology_events_;
-    const char* method = "none";
+    const HeldFn& held = view.held;
     bool failed = false;
+    bool retry_needed = false;
+    std::map<NodeId, Hash256> roots;
     if (ask) {
-        // Each peer's held trie against this node's, when every peer can be
-        // asked so; otherwise each peer is asked about the namespace tree.
+        // A host out of reach holds nothing reachable: with none in reach,
+        // what this node lacks is unavailable until one comes back.
+        const auto telemetry = node_.telemetry().all();
+        std::vector<RemoteTrie> tries;
+        tries.reserve(hosts.size());
+        std::vector<TrieSource*> sources;
+        std::vector<bool> supported;
+        for (const auto& host : hosts) {
+            supported.push_back(runs_at_least(telemetry, host.id, first_trie_version));
+            sources.push_back(&tries.emplace_back(node_, host, supported.back()));
+        }
+        std::vector<PeerDiff> diffs;
+        next.survey = survey_by_diff(view.trie, *missing_here,
+                                     inventory->lookup(RetentionClass::data), sources, diffs,
+                                     pause);
+        const auto elapsed = Clock::now() - started;
+        observations().record("availability.diff_us",
+                              static_cast<uint64_t>(std::chrono::duration_cast<
+                                  std::chrono::microseconds>(elapsed).count()));
         PeerLacks lacks;
-        std::optional<AvailabilitySurvey> diffed;
-        const auto inventory = ledger_.inventory();
-        if (!diffable)
-            method = "tree:peer_version";
-        if (diffable && inventory && holdings->missing) {
-            std::vector<RemoteTrie> tries;
-            tries.reserve(hosts.size());
-            std::vector<TrieSource*> sources;
-            for (const auto& host : hosts)
-                sources.push_back(&tries.emplace_back(node_, host));
-            std::vector<std::vector<ObjectId>> found;
-            const auto diff_started = Clock::now();
-            const auto report = [&](const char* outcome) {
-                const auto elapsed = Clock::now() - diff_started;
-                observations().record("availability.diff_us",
-                                      static_cast<uint64_t>(std::chrono::duration_cast<
-                                          std::chrono::microseconds>(elapsed).count()));
-                for (size_t i = 0; i < tries.size(); ++i) {
-                    const auto& spent = tries[i].spent();
-                    Log::debug("availability diff " + std::string(outcome) +
-                               " peer=" + to_string(hosts[i].id).substr(0, 12) +
-                               " questions=" + std::to_string(spent.questions) +
-                               " reply_bytes=" + std::to_string(spent.bytes) +
-                               " waited_ms=" + std::to_string(std::chrono::duration_cast<
-                                   std::chrono::milliseconds>(spent.waited).count()) +
-                               " elapsed_ms=" + std::to_string(std::chrono::duration_cast<
-                                   std::chrono::milliseconds>(elapsed).count()));
-                }
-            };
-            try {
-                // What this node lacks: the namespace's extents from the roll-up,
-                // and the catalogue's objects (artwork, media indexes) beside them.
-                std::vector<ObjectId> lacking = *holdings->missing;
-                for (const auto& id : inventory->outside_namespace())
-                    if (!holdings->held(id))
-                        lacking.push_back(id);
-                std::sort(lacking.begin(), lacking.end());
-                lacking.erase(std::unique(lacking.begin(), lacking.end()), lacking.end());
-                diffed = survey_by_diff(holdings->trie, lacking,
-                                        inventory->lookup(RetentionClass::data), sources, found,
-                                        pause);
-                lacks.generation = inventory->generation();
-                lacks.complete = true;
-                for (size_t i = 0; i < hosts.size(); ++i)
-                    lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
-                                                         std::move(found[i])));
-                report("done");
-            } catch (const std::exception& error) {
-                report("failed");
-                diffed.reset();
-                lacks = {};
-                failed = true;
-                method = "tree:diff_failed";
-                Log::debug(std::string("availability: a trie diff failed, asking about the tree: ") +
-                           error.what());
+        lacks.generation = inventory->generation();
+        lacks.complete = true;
+        for (size_t i = 0; i < hosts.size(); ++i) {
+            const auto& spent = tries[i].spent();
+            Log::debug("availability diff " +
+                       std::string(diffs[i].answered ? "done" : "failed") +
+                       " peer=" + to_string(hosts[i].id).substr(0, 12) +
+                       " questions=" + std::to_string(spent.questions) +
+                       " reply_bytes=" + std::to_string(spent.bytes) +
+                       " waited_ms=" +
+                       std::to_string(
+                           std::chrono::duration_cast<std::chrono::milliseconds>(spent.waited)
+                               .count()));
+            if (!diffs[i].answered) {
+                lacks.complete = false;
+                // A peer too old to answer is asked again when the membership
+                // changes, not on a timer.
+                retry_needed = retry_needed || supported[i];
+                continue;
             }
+            roots.emplace(hosts[i].id, diffs[i].root);
+            lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
+                                                 std::move(diffs[i].lacks)));
         }
-        if (diffed) {
-            next.survey = std::move(*diffed);
-            memo_.reset();
-            method = "diff";
-        } else {
-            if (std::string_view(method) == "none")
-                method = "tree";
-            SurveyMemo made;
-            next.survey = survey_availability(*rollup, nodes, held, asking,
-                                              remembered ? &*memo_ : nullptr, &made);
-            if (next.survey.peers_failed)
-                memo_.reset();
-            else
-                memo_ = std::move(made);
-            // What each peer lacks of what this node holds, from the peer's
-            // own account of its holdings.
-            lacks.generation = holdings->generation;
-            for (size_t i = 0; i < remotes.size(); ++i)
-                if (auto found = extents_peer_lacks(*rollup, nodes, held, remotes[i]))
-                    lacks.lacks.emplace(hosts[i].id, std::make_shared<const std::vector<ObjectId>>(
-                                                         std::move(*found)));
-        }
-        failed = failed || next.survey.peers_failed;
+        failed = next.survey.peers_failed > 0;
         if (failed && surveyed_)
             keep_unavailable(next.survey, previous->survey, held);
         peer_lacks_.publish(std::move(lacks));
+        surveyed_roots_ = failed ? std::map<NodeId, Hash256>{} : std::move(roots);
         surveyed_at_ = now;
     } else {
-        // Rolled up after a gain alone: what was missing is still missing,
-        // less what this node now holds.
+        // Gained alone: what was missing is still missing, less what this
+        // node now holds.
         next.survey = previous->survey;
-        std::erase_if(next.survey.unavailable, held);
-        std::erase_if(next.survey.unknown, held);
+        const auto kept = [&](std::vector<ObjectId>& ids) {
+            std::vector<ObjectId> out;
+            std::set_intersection(ids.begin(), ids.end(), missing_here->begin(),
+                                  missing_here->end(), std::back_inserter(out));
+            ids = std::move(out);
+        };
+        kept(next.survey.unavailable);
+        kept(next.survey.unknown);
     }
-    bool table_changed = false;
+    const auto stored = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
+    const auto& root = head.snapshot->namespace_root;
     const char* table = "kept";
-    if (!rolled && surveyed_ && previous->survey.unavailable == next.survey.unavailable &&
+    bool table_changed = false;
+    if (!changed && surveyed_ && previous->survey.unavailable == next.survey.unavailable &&
         previous->survey.unknown == next.survey.unknown) {
         next.paths = previous->paths;
         next.by_hash = previous->by_hash;
     } else {
-        const auto& root = holdings->snapshot->namespace_root;
-        // Only the tree moved: the table follows what moved in it.
-        if (remembered && !holdings->built && root && table_root_ &&
-            holdings->identity.hash == table_holdings_ && previous->survey.unknown.empty() &&
-            next.survey.unknown.empty()) {
+        // Only the tree moved: with the same holdings everywhere, no extent of
+        // an unchanged file has changed hands, so the table follows the tree.
+        if (surveyed_ && root && table_root_ && view.identity.hash == table_holdings_ &&
+            surveyed_roots_.size() == hosts.size() && surveyed_roots_ == table_roots_ &&
+            previous->survey.unknown.empty() && next.survey.unknown.empty()) {
             update_path_table(next, *previous, diff_namespace_trees(*table_root_, *root, stored),
-                              *holdings->snapshot, stored, held);
+                              *head.snapshot, stored, held);
             table = "followed";
         } else {
-            fill_path_table(next, *holdings->snapshot, stored, held, previous.get(), pause);
+            fill_path_table(next, *head.snapshot, stored, held, previous.get(), pause);
             table = "walked";
         }
-        table_root_ = holdings->built ? std::nullopt : root;
-        table_holdings_ = holdings->identity.hash;
+        table_root_ = root;
+        table_holdings_ = view.identity.hash;
+        table_roots_ = surveyed_roots_;
         table_changed = true;
     }
-    if (ask)
-        surveyed_cost_ = Clock::now() - started;
-    if (rolled)
-        rolled_cost_ = Clock::now() - refresh_started;
+    if (ask || changed)
+        surveyed_cost_ = Clock::now() - refresh_started;
     observations().record("availability.survey_us", elapsed_us(started));
+    const auto referenced = inventory->size(RetentionClass::data);
     Log::debug("availability surveyed generation=" + std::to_string(next.generation) +
-               " extents=" + std::to_string(rollup->total().extents) +
-               " local=" + std::to_string(rollup->total().held) +
+               " referenced=" + std::to_string(referenced) +
+               " local=" + std::to_string(referenced - missing_here->size()) +
                " unavailable=" + std::to_string(next.survey.unavailable.size()) +
                " unknown=" + std::to_string(next.survey.unknown.size()) +
                " peers=" + std::to_string(next.survey.peers_asked) +
                " peers_failed=" + std::to_string(next.survey.peers_failed) +
                " rounds=" + std::to_string(next.survey.rounds) +
-               " tree_nodes_asked=" + std::to_string(next.survey.nodes_asked) +
-               " remembered=" + (remembered ? "1" : "0") + " table=" + table +
-               " method=" + method);
+               " prefixes_asked=" + std::to_string(next.survey.nodes_asked) +
+               " table=" + table + " method=" + (ask ? "diff" : "gained"));
     if (table_changed && !persisted_.empty()) {
         try {
             const auto bytes = encode_availability_paths(next);
@@ -757,11 +567,10 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
             Log::warn(std::string("availability: cannot keep the survey: ") + error.what());
         }
     }
-    if (!ask) {
-        snapshot_.publish(std::move(next));
+    snapshot_.publish(std::move(next));
+    if (!ask)
         return false;
-    }
-    if (failed) {
+    if (retry_needed) {
         retry_backoff_ = std::clamp<Clock::duration>(retry_backoff_ * 2, retry_floor, retry_ceiling);
         retry_at_ = now + retry_backoff_;
         due_ = due_ ? std::min(*due_, *retry_at_) : *retry_at_;
@@ -769,9 +578,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         retry_backoff_ = {};
         retry_at_.reset();
     }
-    snapshot_.publish(std::move(next));
     surveyed_ = true;
-    surveyed_root_ = rollup->root();
     surveyed_topology_events_ = topology_events;
     surveyed_peers_ = std::move(peers);
     return true;
