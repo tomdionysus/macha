@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "contract/horizon.hpp"
 
+#include "ledger/trie_diff.hpp"
+
 #include <algorithm>
 #include <iterator>
 #include <utility>
@@ -92,24 +94,41 @@ std::vector<ObjectId> ReferencedSets::all(RetentionClass type) const {
     }
 }
 
+std::vector<ObjectId> ReferencedSets::not_held(RetentionClass type,
+                                               std::span<const ObjectTrie::Snapshot> held,
+                                               const std::function<void()>& pause) const {
+    const auto& set = of(type);
+    std::vector<ObjectId> viewed;
+    if (set.view)
+        records_not_held(
+            *set.view, held,
+            [&](const ObjectTrie::Record& record) { viewed.push_back(record.first); }, pause);
+    std::vector<ObjectId> others;
+    for (const auto& id : set.others)
+        if (std::none_of(held.begin(), held.end(),
+                         [&](const ObjectTrie::Snapshot& part) { return part.get(id).has_value(); }))
+            others.push_back(id);
+    std::vector<ObjectId> out;
+    out.reserve(viewed.size() + others.size());
+    std::set_union(viewed.begin(), viewed.end(), others.begin(), others.end(),
+                   std::back_inserter(out));
+    return out;
+}
+
 size_t ReferencedSets::size(RetentionClass type) const { return of(type).size; }
 
 InventoryHorizon::InventoryHorizon(uint64_t generation, bool catalogue_complete,
                                    std::vector<ObjectId> data, std::vector<ObjectId> control,
-                                   const std::vector<GarbageRef>& garbage,
-                                   std::vector<ObjectId> outside_namespace)
+                                   const std::vector<GarbageRef>& garbage)
     : InventoryHorizon(generation, catalogue_complete,
-                       ReferencedSets(std::move(data), std::move(control)), garbage,
-                       std::move(outside_namespace)) {}
+                       ReferencedSets(std::move(data), std::move(control)), garbage) {}
 
 InventoryHorizon::InventoryHorizon(uint64_t generation, bool catalogue_complete,
                                    ReferencedSets sets,
                                    const std::vector<GarbageRef>& garbage,
-                                   std::vector<ObjectId> outside_namespace,
                                    std::vector<TombstoneBatch> tombstone_batches)
     : ReferencedSets(std::move(sets)), generation_(generation),
       catalogue_complete_(catalogue_complete),
-      outside_namespace_(sorted_unique(std::move(outside_namespace))),
       tombstone_batches_(std::move(tombstone_batches)) {
     garbage_.reserve(garbage.size());
     stale_garbage_.reserve(garbage.size());

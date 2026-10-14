@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -40,6 +41,11 @@ class ReferencedSets {
                                size_t limit) const;
     // Every id, in order: linear, for tests and the pull list's fallback.
     std::vector<ObjectId> all(RetentionClass) const;
+    // The ids none of `held` holds, in order: the view joined against `held`
+    // in step a page at a time, and each of the others looked up. `pause`,
+    // if given, is called between pages.
+    std::vector<ObjectId> not_held(RetentionClass, std::span<const ObjectTrie::Snapshot> held,
+                                   const std::function<void()>& pause = {}) const;
     size_t size(RetentionClass) const;
 
   private:
@@ -63,15 +69,10 @@ class InventoryHorizon : public ReferencedSets {
     // `garbage` is every tombstone the namespace walk found; one whose id is
     // still referenced as data is stale (its object came back to life), the
     // rest collectable. Both lists keep the given order.
-    // `outside_namespace`: the DATA objects among `data` that the namespace
-    // does not refer to (catalogue artwork), kept apart so repair can cover
-    // them without walking the namespace's.
     InventoryHorizon(uint64_t generation, bool catalogue_complete, std::vector<ObjectId> data,
-                     std::vector<ObjectId> control, const std::vector<GarbageRef>& garbage,
-                     std::vector<ObjectId> outside_namespace = {});
+                     std::vector<ObjectId> control, const std::vector<GarbageRef>& garbage);
     InventoryHorizon(uint64_t generation, bool catalogue_complete, ReferencedSets sets,
                      const std::vector<GarbageRef>& garbage,
-                     std::vector<ObjectId> outside_namespace,
                      std::vector<TombstoneBatch> tombstone_batches = {});
 
     // The stamp: the generation the inventory was built at.
@@ -79,8 +80,6 @@ class InventoryHorizon : public ReferencedSets {
     bool catalogue_complete() const noexcept { return catalogue_complete_; }
     const std::vector<GarbageRef>& garbage() const noexcept { return garbage_; }
     const std::vector<GarbageRef>& stale_garbage() const noexcept { return stale_garbage_; }
-    // Sorted and unique.
-    const std::vector<ObjectId>& outside_namespace() const noexcept { return outside_namespace_; }
     // The head's tombstone batches, sorted by id: dropped whole once matured.
     const std::vector<TombstoneBatch>& tombstone_batches() const noexcept {
         return tombstone_batches_;
@@ -91,7 +90,6 @@ class InventoryHorizon : public ReferencedSets {
     bool catalogue_complete_;
     std::vector<GarbageRef> garbage_;
     std::vector<GarbageRef> stale_garbage_;
-    std::vector<ObjectId> outside_namespace_;
     std::vector<TombstoneBatch> tombstone_batches_;
 };
 

@@ -398,8 +398,6 @@ bool is_priority_data_message(MessageType type) {
     case MessageType::have_objects_reply:
     case MessageType::have_valid_objects:
     case MessageType::have_valid_objects_reply:
-    case MessageType::tree_holdings:
-    case MessageType::tree_holdings_reply:
     case MessageType::trie_diff:
     case MessageType::trie_diff_reply:
     case MessageType::retain_objects:
@@ -710,8 +708,6 @@ const char* message_type_name(MessageType type) noexcept {
         return "have_control_objects";
     case MessageType::have_valid_objects:
         return "have_valid_objects";
-    case MessageType::tree_holdings:
-        return "tree_holdings";
     case MessageType::trie_diff:
         return "trie_diff";
     case MessageType::get_unmatched_hints:
@@ -766,8 +762,6 @@ const char* message_type_name(MessageType type) noexcept {
         return "have_control_objects_reply";
     case MessageType::have_valid_objects_reply:
         return "have_valid_objects_reply";
-    case MessageType::tree_holdings_reply:
-        return "tree_holdings_reply";
     case MessageType::trie_diff_reply:
         return "trie_diff_reply";
     case MessageType::unmatched_hints_reply:
@@ -805,7 +799,7 @@ FrameType default_frame_type(MessageType type) noexcept {
     if (type == MessageType::get_control_object || type == MessageType::put_control_object ||
         type == MessageType::telemetry || type == MessageType::have_object ||
         type == MessageType::have_objects || type == MessageType::have_valid_objects ||
-        type == MessageType::tree_holdings || type == MessageType::trie_diff ||
+        type == MessageType::trie_diff ||
         type == MessageType::retain_objects ||
         type == MessageType::delete_object)
         return FrameType::speculative;
