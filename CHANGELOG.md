@@ -19,6 +19,10 @@ codec and the inventory's separate list of catalogue objects are gone;
 repair pulls from the joined list, which covers the catalogue's objects as
 it does the namespace's.
 
+In the maintenance pass the survey now runs after the inventory stage,
+which it reads, and before repair, which reads its lists; it ran before the
+inventory, and would have seen each rebuild one pass late.
+
 The survey's debug line now reads `referenced=` (the inventory's DATA set)
 and `prefixes_asked=` where it read `extents=` and `tree_nodes_asked=`, and
 `method=` is `diff`, or `gained` for a survey after a gain alone, which
