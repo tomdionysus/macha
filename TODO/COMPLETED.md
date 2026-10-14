@@ -2,6 +2,20 @@
 
 Last updated: 2026-10-14
 
+## 2026-10-14 -- 0.90.96: the availability survey is by trie diff only
+
+- Replication-by-diff stage 5, survey half: the roll-up, tree survey, memo,
+  `tree_holdings` (now 501) and `outside_namespace` are gone. What this node
+  lacks is the inventory's referenced set joined against its held union; a
+  peer that fails its diff is `unknown` and the last `unavailable` stands.
+- The fi-1 gate caught the survey running before the inventory stage it now
+  reads (a maintenance trace grew a repair step); it runs after it, before
+  repair. Gate 659 + 19 + 21 (14 tree tests retired, 1 added).
+- Installed on fi-1 (18:43Z): `referenced=1011452 local=353662
+  unavailable=657790 method=diff`, nine seconds after writable.
+- `availability/test_two_nodes_survey_what_neither_holds` missed its 20 s
+  wait once on the laptop (1 of 4 runs; passed alone and 3 of 3 repeated).
+
 ## 2026-10-14 -- 0.90.95: a node with several disks is surveyed by trie diff
 
 - Operator 2026-10-13: Macha is multi-backend by design, so stage 5 may not
