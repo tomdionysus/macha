@@ -599,16 +599,20 @@ void Maintenance::run(std::stop_token stop) {
             // durably-known node has been directly reached by this process and
             // metadata repair has validated/converged that complete replica set.
 
-            // What the reachable nodes hold between them: surveyed when
-            // the namespace, holdings, membership or a peer's storage has
-            // changed, and a no-op otherwise.
-            enter_stage("availability");
-            try {
-                if (const auto head = metadata_.current())
-                    (void)availability_.refresh(*head, clock_->now(), unix_ms());
-            } catch (const std::exception& error) {
-                Log::debug("availability survey deferred: " + std::string(error.what()));
-            }
+            // What the reachable nodes hold between them: surveyed when what
+            // is referenced, this node's holdings, the membership or a peer's
+            // storage has changed, and a no-op otherwise. It reads the
+            // inventory, so it follows the inventory stage, and repair reads
+            // its lists, so it precedes repair.
+            const auto survey = [&] {
+                enter_stage("availability");
+                try {
+                    if (const auto head = metadata_.current())
+                        (void)availability_.refresh(*head, clock_->now(), unix_ms());
+                } catch (const std::exception& error) {
+                    Log::debug("availability survey deferred: " + std::string(error.what()));
+                }
+            };
 
             // Reachability GC, repair and explicit tombstone accounting share
             // one immutable namespace inventory. Rebuild it only when one of
@@ -666,6 +670,7 @@ void Maintenance::run(std::stop_token stop) {
                                " elapsed_ms=" + std::to_string(elapsed_ms(inventory_stage)));
                 }
 
+                survey();
                 if (network_due) {
                     const auto extent = std::max<uint64_t>(1, node_.config().extent_size);
 
@@ -1084,6 +1089,8 @@ void Maintenance::run(std::stop_token stop) {
                         }
                     }
                 }
+            } else {
+                survey();
             }
 
             // Local maintenance advances persistent filesystem cursors: a slice examines
