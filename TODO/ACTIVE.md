@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-14, on `develop`. node-f runs 0.90.95; node-c is out of
+Last updated: 2026-10-14, on `develop`. node-f runs 0.90.96; node-c is out of
 the cluster (compromised 2026-10-13, last ran 0.90.93; ssh refuses the key).
 
 The ordered list of open work; work top to bottom unless new evidence
@@ -128,11 +128,17 @@ the walks stay as the fallback until every node runs stage 3.
    mutations already compute released DATA per touched shard (0.90.33);
    whether stage 4 needs the plan's per-family shards (section 4) is for
    its design.
-5. **Retire** `tree_holdings`, the roll-up, survey and memo,
-   `availability/holdings.bin`, the repair cursors and repair's `have_*`
-   probes, once every node runs stage 3. Nodes with several disks keep the
-   diff (0.90.95, operator 2026-10-13: Macha is multi-backend by design).
-   Next.
+5. **Retire.** The survey half is built (0.90.96): diff only; what this
+   node lacks is the inventory's referenced set joined against its held
+   trie; a peer that cannot finish its diff leaves its share `unknown` and
+   the last `unavailable` stands; `tree_holdings` answers 501;
+   `outside_namespace` gone. Nodes with several disks keep the diff
+   (0.90.95, operator 2026-10-13: Macha is multi-backend by design).
+   Left: repair's store walk, push cursor, `repair_position` file and
+   `have_*` probes (push and pull from the survey's lists only, a peer that
+   could not answer is not sent to). About 75 test call sites drive repair
+   through `repair_once` without lists and need them; and repair cannot be
+   exercised on the cluster while node-f is alone.
 
 The proposal's open questions (for the review): whether `claimed` is diffed
 (decide from the claim walk's probe counts after stage 3); a count bound on
@@ -277,7 +283,7 @@ on control threads no longer grow with deletes. Left:
 
 ## Cluster state
 
-- **node-f** (198.51.100.10) runs **0.90.95**, cluster protocol 23, alone.
+- **node-f** (198.51.100.10) runs **0.90.96**, cluster protocol 23, alone.
   **node-c** (192.0.2.50, `live-a.example.net`) is out since
   2026-10-13 (compromised; last ran 0.90.93; section 1). node-e is offline
   indefinitely. Deploys go to node-f only (`build/deploy.sh`'s node-f lines).

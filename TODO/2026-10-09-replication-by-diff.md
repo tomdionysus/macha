@@ -235,11 +235,15 @@ business, driven by `lost`; not this proposal. The catalogue plan's stage
    for a peer surveyed the old way.
 4. **Catalogue DATA as a `referenced` source**, with the catalogue plan's
    stage 10 note folded in here; `outside_namespace` goes.
-5. **Retire** once every node runs stage 3: `tree_holdings` and its
-   formats, `HoldingsRollup`, `missing_extents`, `extents_peer_lacks`,
-   `survey_availability`, `SurveyMemo`, `PeerHoldings`,
-   the repair cursors and the `have_*` probes
-   in repair, and `ledger/availability.{hpp,cpp}` with them.
+5. **Retire** once every node runs stage 3. **Survey half built
+   (0.90.96):** `tree_holdings` and its formats, `HoldingsRollup`,
+   `missing_extents`, `extents_peer_lacks`, `survey_availability`,
+   `SurveyMemo`, `PeerHoldings` and `outside_namespace` are gone;
+   `missing_here` is `ReferencedSets::not_held` against the held union; a
+   peer that fails its diff is `unknown`, not a fallback.
+   `ledger/availability` keeps the survey's result type, `survey_by_diff`
+   and `keep_unavailable`. **Left:** the repair cursors, the
+   `repair_position` file and the `have_*` probes in repair.
 
 Stage 0 is small and stands on its own; it is the structural answer to the
 `indexed()` defect and the primitive every later stage builds on.
