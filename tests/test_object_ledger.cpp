@@ -6,6 +6,7 @@
 #include "ledger/held_ledger.hpp"
 #include "ledger/object_trie.hpp"
 #include "ledger/trie_diff.hpp"
+#include "ledger/trie_union.hpp"
 #include "ledger/reference_counts.hpp"
 #include "storage/local_store.hpp"
 #include "storage/sealed_journal.hpp"
@@ -540,6 +541,83 @@ MACHA_FAST_TEST("object_ledger", test_records_not_held_are_what_no_held_trie_hol
             records_not_held(wanted_trie->snapshot(), snapshots,
                              [&](const ObjectTrie::Record& record) { found.push_back(record); });
             CHECK(found == expected);
+        }
+}
+
+// Several tries read as one: below every prefix their union reads as one
+// trie holding their records does, however the records are split and shared
+// among the parts, and diffs against it as equal. One made from the last
+// after some puts and removals reads as one made afresh.
+MACHA_FAST_TEST("object_ledger", test_a_union_of_tries_reads_as_one_trie_of_their_records) {
+    std::mt19937_64 random(25);
+    const Bytes one_held{0, 0, 0, 0, 0, 0, 0, 1};
+    for (const size_t size : {size_t{0}, size_t{90}, size_t{3000}})
+        for (const size_t count : {size_t{1}, size_t{2}, size_t{3}}) {
+            std::vector<std::map<ObjectId, Bytes>> held(count);
+            for (size_t i = 0; i < size; ++i) {
+                // On one part, and now and then on another as well.
+                const auto id = clustered_id(random);
+                const auto at = random() % count;
+                held[at].emplace(id, one_held);
+                if (random() % 4 == 0)
+                    held[(at + 1) % count].emplace(id, one_held);
+            }
+            std::vector<TempDir> dirs(count);
+            std::vector<std::unique_ptr<ObjectTrie>> tries;
+            for (size_t i = 0; i < count; ++i)
+                tries.push_back(trie_of(dirs[i].path(), held[i], random));
+            const auto snapshots = [&] {
+                std::vector<ObjectTrie::Snapshot> out;
+                for (const auto& trie : tries)
+                    out.push_back(trie->snapshot());
+                return out;
+            };
+            const auto check = [&](const std::shared_ptr<const TrieUnion>& merged) {
+                std::map<ObjectId, Bytes> all;
+                for (const auto& part : held)
+                    all.insert(part.begin(), part.end());
+                TempDir whole_dir;
+                const auto whole = trie_of(whole_dir.path(), all, random);
+                const auto one = whole->snapshot();
+                CHECK(merged->root() == (ObjectTrie::Summary{one.size(), one.root_hash()}));
+                std::vector<ObjectTrie::Prefix> prefixes{ObjectTrie::Prefix{}};
+                for (uint8_t length = 1; length <= 4 && !all.empty(); ++length)
+                    for (int i = 0; i < 4; ++i) {
+                        auto at = all.begin();
+                        std::advance(at, static_cast<long>(random() % all.size()));
+                        prefixes.push_back(prefix_of(at->first, length));
+                    }
+                prefixes.push_back(prefix_of(id_of(random), 2));
+                CHECK(merged->children(prefixes) == one.children(prefixes));
+                CHECK(merged->records(prefixes) == one.records(prefixes));
+                if (!all.empty()) {
+                    CHECK(merged->get(all.begin()->first) == one_held);
+                    CHECK(!merged->get(id_of(random)));
+                }
+                SnapshotSource a(one);
+                UnionSource b(merged);
+                size_t differences = 0;
+                diff_tries(a, b, [&](const TrieDifference&) { ++differences; });
+                CHECK(differences == 0);
+            };
+            const auto first = std::make_shared<const TrieUnion>(snapshots());
+            check(first);
+
+            for (int change = 0; change < 60; ++change) {
+                const auto at = random() % count;
+                if (random() % 2 == 0 || held[at].empty()) {
+                    const auto id = clustered_id(random);
+                    held[at].emplace(id, one_held);
+                    tries[at]->apply(std::vector<ObjectTrie::Change>{{id, one_held}});
+                } else {
+                    auto victim = held[at].begin();
+                    std::advance(victim, static_cast<long>(random() % held[at].size()));
+                    tries[at]->apply(std::vector<ObjectTrie::Change>{{victim->first, std::nullopt}});
+                    held[at].erase(victim);
+                }
+            }
+            check(std::make_shared<const TrieUnion>(snapshots(), first.get()));
+            check(std::make_shared<const TrieUnion>(snapshots()));
         }
 }
 

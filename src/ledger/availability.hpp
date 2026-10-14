@@ -3,6 +3,7 @@
 
 #include "contract/id_lookup.hpp"
 #include "ledger/trie_diff.hpp"
+#include "ledger/trie_union.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "types.hpp"
 
@@ -169,7 +170,7 @@ void keep_unavailable(AvailabilitySurvey& next, const AvailabilitySurvey& last,
 // peer's lacks are what this node holds and the peer does not, within
 // `referenced`, sorted, one list per peer in order. Every peer must answer:
 // a peer that fails throws, and the caller surveys the old way.
-AvailabilitySurvey survey_by_diff(const ObjectTrie::Snapshot& mine,
+AvailabilitySurvey survey_by_diff(const std::shared_ptr<const TrieUnion>& mine,
                                   const std::vector<ObjectId>& missing_here,
                                   const IdLookup& referenced, std::span<TrieSource* const> peers,
                                   std::vector<std::vector<ObjectId>>& lacks,

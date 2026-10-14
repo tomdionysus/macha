@@ -180,7 +180,7 @@ class AvailabilityService {
         // the view's, a subtree this roll-up calls whole may not be.
         HeldIdentity identity;
         HeldFn held;
-        std::vector<ObjectTrie::Snapshot> tries;
+        std::shared_ptr<const TrieUnion> trie;
         // The head it was rolled up at; the survey and the path table read
         // the same one.
         uint64_t generation{};
@@ -196,7 +196,7 @@ class AvailabilityService {
     // dropped once no question has used it for pinned_for.
     struct Pinned {
         Hash256 hash;
-        ObjectTrie::Snapshot trie;
+        std::shared_ptr<const TrieUnion> trie;
         Clock::time_point used;
     };
     static constexpr size_t pinned_max = 4;
