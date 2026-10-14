@@ -2,7 +2,7 @@
 #pragma once
 
 #include "contract/work.hpp"
-#include "ledger/object_trie.hpp"
+#include "ledger/trie_union.hpp"
 #include "types.hpp"
 
 #include <functional>
@@ -12,9 +12,9 @@
 // of references or claims.
 namespace macha {
 
-// The identity of what a store holds: a hash that depends only on the held
-// ids (and, for a pool, which disk holds them), so it changes when and only
-// when what is held changes. `removals` counts ids that stopped being held
+// The identity of what a store holds: its held trie's root hash, which
+// depends only on the held ids, so it changes when and only when what is
+// held changes, and any two stores holding the same ids share it. `removals` counts ids that stopped being held
 // since the process started (a removal, a loss, a disk going away): a view
 // whose removals equal the store's never claims what the store has dropped,
 // though the store may have gained since. `complete` is false while a disk is
@@ -32,8 +32,10 @@ struct HeldIdentity {
 struct HeldView {
     HeldIdentity identity;
     std::function<bool(const ObjectId&)> held;
-    // The held tries the view reads, one per disk, by disk token.
-    std::vector<ObjectTrie::Snapshot> tries;
+    // Every held id: the union of each online disk's held trie, of those
+    // seeded while the identity is incomplete. Null from a disk's own store
+    // until it is seeded.
+    std::shared_ptr<const TrieUnion> trie;
 };
 
 class ObjectStore {
@@ -50,10 +52,11 @@ class ObjectStore {
     virtual bool has(const ObjectId&) const = 0;
 
     // What this store holds, frozen at one moment, and the identity that
-    // names it. Taken from the held ledgers, so it reads no device and waits
-    // only on a ledger's lookup lock. A memo derived from a view is current
-    // exactly while the store's identity equals the view's.
-    static constexpr Waits held_view_waits = Waits::locks;
+    // names it. Taken from the held ledgers: it reads no DATA device, only
+    // the ledger nodes below what changed on disks holding ids in common. A
+    // memo derived from a view is current exactly while the store's identity
+    // equals the view's.
+    static constexpr Waits held_view_waits = local_waits;
     static constexpr ThreadSafety held_view_safety = ThreadSafety::thread_safe;
     virtual HeldView held_view() const = 0;
 };

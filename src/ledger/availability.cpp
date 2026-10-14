@@ -378,7 +378,7 @@ void keep_unavailable(AvailabilitySurvey& next, const AvailabilitySurvey& last,
     next.unknown = std::move(unknown);
 }
 
-AvailabilitySurvey survey_by_diff(const ObjectTrie::Snapshot& mine,
+AvailabilitySurvey survey_by_diff(const std::shared_ptr<const TrieUnion>& mine,
                                   const std::vector<ObjectId>& missing_here,
                                   const IdLookup& referenced, std::span<TrieSource* const> peers,
                                   std::vector<std::vector<ObjectId>>& lacks,
@@ -387,7 +387,7 @@ AvailabilitySurvey survey_by_diff(const ObjectTrie::Snapshot& mine,
     std::vector<ObjectId> held_elsewhere;
     lacks.assign(peers.size(), {});
     for (size_t i = 0; i < peers.size(); ++i) {
-        SnapshotSource here(mine);
+        UnionSource here(mine);
         const auto cost = diff_tries(
             here, *peers[i],
             [&](const TrieDifference& difference) {

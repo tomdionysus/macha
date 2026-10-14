@@ -921,7 +921,8 @@ class FailingSource final : public TrieSource {
 
 // From diffs: what no peer holds of what this node lacks is unavailable, and
 // each peer lacks what this node holds and it does not, within what is
-// referenced. A peer that fails mid-diff fails the whole survey.
+// referenced, on however many disks either side holds them. A peer that fails
+// mid-diff fails the whole survey.
 MACHA_FAST_TEST("availability", test_the_survey_by_diff_finds_what_no_node_holds) {
     std::set<ObjectId> referenced;
     for (uint32_t i = 0; i < 3000; ++i)
@@ -957,17 +958,30 @@ MACHA_FAST_TEST("availability", test_the_survey_by_diff_finds_what_no_node_holds
         return out;
     };
 
+    // This node and the first peer each hold on two disks, some ids on both.
+    const auto split = [](const std::set<ObjectId>& ids, size_t part) {
+        std::set<ObjectId> out;
+        size_t i = 0;
+        for (const auto& id : ids)
+            if (i++ % 3 != part)
+                out.insert(id);
+        return out;
+    };
     TempDir dir;
-    auto here = held_trie(dir.path() / "here", mine);
-    auto one = held_trie(dir.path() / "one", first);
+    auto here_a = held_trie(dir.path() / "here-a", split(mine, 0));
+    auto here_b = held_trie(dir.path() / "here-b", split(mine, 1));
+    const auto here = std::make_shared<const TrieUnion>(
+        std::vector{here_a->snapshot(), here_b->snapshot()});
+    auto one_a = held_trie(dir.path() / "one-a", split(first, 0));
+    auto one_b = held_trie(dir.path() / "one-b", split(first, 2));
     auto two = held_trie(dir.path() / "two", second);
-    SnapshotSource one_source(one->snapshot());
+    UnionSource one_source(std::make_shared<const TrieUnion>(
+        std::vector{one_a->snapshot(), one_b->snapshot()}));
     SnapshotSource two_source(two->snapshot());
     std::vector<TrieSource*> peers{&one_source, &two_source};
     const std::vector<ObjectId> referenced_list(referenced.begin(), referenced.end());
     std::vector<std::vector<ObjectId>> lacks;
-    const auto survey = survey_by_diff(here->snapshot(), missing_here, IdLookup(referenced_list),
-                                       peers, lacks);
+    const auto survey = survey_by_diff(here, missing_here, IdLookup(referenced_list), peers, lacks);
     CHECK(survey.unavailable == unavailable);
     CHECK(survey.unknown.empty());
     CHECK(survey.peers_asked == 2);
@@ -977,15 +991,14 @@ MACHA_FAST_TEST("availability", test_the_survey_by_diff_finds_what_no_node_holds
 
     // Alone, nothing anyone else holds: everything missing is unavailable.
     std::vector<TrieSource*> none;
-    CHECK(survey_by_diff(here->snapshot(), missing_here, IdLookup(referenced_list), none, lacks)
-              .unavailable == missing_here);
+    CHECK(survey_by_diff(here, missing_here, IdLookup(referenced_list), none, lacks).unavailable ==
+          missing_here);
 
     FailingSource failing(two->snapshot());
     std::vector<TrieSource*> broken{&one_source, &failing};
     bool threw = false;
     try {
-        (void)survey_by_diff(here->snapshot(), missing_here, IdLookup(referenced_list), broken,
-                             lacks);
+        (void)survey_by_diff(here, missing_here, IdLookup(referenced_list), broken, lacks);
     } catch (const std::runtime_error&) {
         threw = true;
     }

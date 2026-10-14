@@ -707,29 +707,22 @@ HeldView StoragePool::held_view() const {
         }
         parts.push_back({token, std::move(view)});
     }
-    // By disk: the same disks holding the same ids name the same holdings.
+    // By disk, so each union lines up with the one before.
     std::sort(parts.begin(), parts.end(),
               [](const Part& a, const Part& b) { return a.token < b.token; });
-    Sha256Hasher hasher;
-    for (const auto& part : parts) {
-        hasher.update(part.token.bytes);
-        hasher.update(part.view.identity.hash.bytes);
-    }
-    identity.hash = hasher.finish();
-    std::vector<std::function<bool(const ObjectId&)>> held;
     std::vector<ObjectTrie::Snapshot> tries;
-    held.reserve(parts.size());
-    for (auto& part : parts) {
-        held.push_back(std::move(part.view.held));
-        for (auto& trie : part.view.tries)
-            tries.push_back(std::move(trie));
+    tries.reserve(parts.size());
+    for (auto& part : parts)
+        tries.insert(tries.end(), part.view.trie->parts().begin(), part.view.trie->parts().end());
+    std::shared_ptr<const TrieUnion> trie;
+    {
+        Lock lock(union_mutex_);
+        union_ = std::make_shared<const TrieUnion>(std::move(tries), union_.get());
+        trie = union_;
     }
-    return {identity,
-            [held = std::move(held)](const ObjectId& id) {
-                return std::any_of(held.begin(), held.end(),
-                                   [&](const auto& one) { return one(id); });
-            },
-            std::move(tries)};
+    identity.hash = trie->root_hash();
+    return {identity, [trie](const ObjectId& id) { return trie->get(id).has_value(); },
+            std::move(trie)};
 }
 
 bool StoragePool::remove(const ObjectId& id) {
