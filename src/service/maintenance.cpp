@@ -736,11 +736,7 @@ void Maintenance::run(std::stop_token stop) {
                         // What this node lacks, when the survey knows; every
                         // referenced object until it does.
                         if (missing) {
-                            const auto& outside = inventory->outside_namespace();
-                            pull_list.clear();
-                            pull_list.reserve(missing->size() + outside.size());
-                            std::set_union(missing->begin(), missing->end(), outside.begin(),
-                                           outside.end(), std::back_inserter(pull_list));
+                            pull_list = *missing;
                         } else {
                             pull_list = inventory->all(RetentionClass::data);
                         }
@@ -748,9 +744,8 @@ void Maintenance::run(std::stop_token stop) {
                         pull_inventory = inventory;
                     }
                     const bool pulling_listed = inventory != nullptr;
-                    // What a peer holds, from its own account of its holdings:
-                    // known only for the namespace's objects, and only for a
-                    // peer that could say.
+                    // What a peer holds, from the diff of its held trie: known
+                    // only for a peer that answered.
                     const auto peer_lacks = availability_.peer_lacks();
                     // What some peer lacks, when every peer's list is whole and
                     // of this inventory: the push works from it instead of
@@ -775,9 +770,6 @@ void Maintenance::run(std::stop_token stop) {
                         [&](const NodeId& peer, const ObjectId& id) -> std::optional<bool> {
                         if (!peer_lacks || !inventory ||
                             peer_lacks->generation != inventory->generation())
-                            return std::nullopt;
-                        const auto& outside = inventory->outside_namespace();
-                        if (std::binary_search(outside.begin(), outside.end(), id))
                             return std::nullopt;
                         const auto found = peer_lacks->lacks.find(peer);
                         if (found == peer_lacks->lacks.end())
@@ -1361,7 +1353,7 @@ void Maintenance::run(std::stop_token stop) {
                 deadline = std::min(deadline, now_after_work + policy.interval);
         }
         credit_deadline(local_credit, local_quiescent_until);
-        // A deferred roll-up, or a peer to ask again.
+        // A deferred survey, or a peer to ask again.
         if (const auto due = availability_.due())
             deadline = std::min(deadline, std::max(*due, now_after_work));
 

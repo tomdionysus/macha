@@ -104,41 +104,34 @@ lookup per item; a response never waits for either.
 
 ## How the survey works
 
-Each node keeps, for every node of the namespace tree, the number of
-extents beneath it and how many of those it holds. Tree nodes are content
-addressed, so nodes at different metadata generations still agree on what a
-subtree is. To learn what the cluster holds, a node asks its peers about
-tree nodes from the root down: a subtree a peer holds whole is settled by
-its id, and only partial subtrees are descended. The cost follows what
-differs between the nodes, not the size of the library, and no extent id is
-sent.
+Each node keeps a held ledger per DATA disk: a trie of the object ids on it,
+whose subtree hashes depend only on the ids beneath them. A node's holdings
+are those tries read as one, whatever the disk count, and their root hash is
+the holdings' identity: it changes when and only when what the node holds
+changes (a write, a removal, a disk going or coming back).
 
-When every peer can answer it (0.90.72 and later, one DATA disk each side),
-a node instead compares its held ledger with each peer's directly: the two
-tries are descended together from the root, a level a round, only where
-their subtree hashes differ, all from one snapshot of the peer's ledger.
-What a peer holds that this node lacks is available; what this node lacks
-and no peer holds is unavailable; what this node holds and a peer lacks,
-among what the namespace and catalogue refer to, is what repair sends it.
-Any peer that cannot answer puts the whole survey back on the tree
-questions above.
+What a node lacks is what the namespace and the catalogue refer to, less
+what it holds: the two are read side by side in id order. To learn what the
+cluster holds, a node compares its holdings with each peer's: the two tries
+are descended together from the root, a level a round, only where their
+subtree hashes differ, all from one snapshot of the peer's. The cost follows
+what differs between the nodes, not the size of the library. What a peer
+holds that this node lacks is available; what this node lacks and no peer
+holds is unavailable; what this node holds and a peer lacks is what repair
+sends it. A peer that cannot answer leaves what only it might hold
+`unknown`, and the node asks it again after a backoff.
 
-The survey runs in the maintenance pass, as background work. A node's
-holdings are read from its held ledgers (see
-[Configuration](configuration.md)) as one frozen view with an identity, a
-hash over every online disk's ledger root that changes when and only when
-what the node holds changes: a write, a removal, a disk going or coming
-back. The node rolls its holdings up the tree again when the namespace or
-that identity changes, and makes none while a disk is still being seeded.
-The survey is repeated when something could change its answer: the
-namespace, this node ceasing to hold something, the membership, or a peer's
-storage shrinking; and, at no more than a twentieth of the pass's time, when
-a peer's storage grows while something is unavailable. Requests read the
-last result and never wait for a survey.
+The survey runs in the maintenance pass, as background work, and none runs
+while a disk is still being seeded. It is repeated when something could
+change its answer: the membership, a peer's storage shrinking, or a peer
+that could not answer; and, at no more than a twentieth of the pass's time,
+when what is referenced or what this node holds changes, or a peer's
+storage grows while something is unavailable. A gain alone asks no peer:
+what this node gained was already available. Requests read the last result
+and never wait for a survey.
 
 Each node keeps its last survey on disk and answers from it after a restart
-until its first new survey. Peers are answered once it has rolled its
-holdings up again, on its first maintenance pass. A survey that cannot ask a peer leaves a file's
+until its first new survey. A survey that cannot ask a peer leaves a file's
 counts to its last decided survey, matched by content identity: the answer
 is the best this node knows, and `surveyed_unix_ms` says when the survey
 ran.

@@ -24,9 +24,7 @@ std::shared_ptr<const InventoryHorizon> build_inventory(const MaintenanceObjects
         namespace_objects.metadata_generation, catalogue.complete,
         ReferencedSets({namespace_objects.referenced_extents, namespace_objects.referenced_nodes},
                        std::move(data), std::move(control)),
-        namespace_objects.garbage,
-        std::vector<ObjectId>(catalogue.live.begin(), catalogue.live.end()),
-        namespace_objects.tombstone_batches);
+        namespace_objects.garbage, namespace_objects.tombstone_batches);
 }
 
 ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNodeStore& nodes,

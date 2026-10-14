@@ -1,5 +1,34 @@
 # Current release
 
+## 0.90.96: the availability survey is by trie diff only
+
+No API or config changes. On the wire, `tree_holdings` (message 48) is
+retired: a node answers it 501 `not_implemented`, and never sends it.
+On disk, nothing changes.
+
+The survey no longer rolls this node's holdings up the namespace tree or
+asks peers about tree nodes. What this node lacks is the inventory's
+referenced set (namespace and catalogue together) read against its held
+trie in id order; each peer's held trie is diffed against this node's.
+A peer that cannot finish its diff no longer puts the survey back on the
+tree: what only it might hold reads `unknown`, the last survey's
+`unavailable` stands, and the peer is asked again after a backoff. A peer
+older than 0.90.72, which cannot answer a diff, is `unknown` until it is
+upgraded. The roll-up, the tree survey and its memo, the tree questions'
+codec and the inventory's separate list of catalogue objects are gone;
+repair pulls from the joined list, which covers the catalogue's objects as
+it does the namespace's.
+
+The survey's debug line now reads `referenced=` (the inventory's DATA set)
+and `prefixes_asked=` where it read `extents=` and `tree_nodes_asked=`, and
+`method=` is `diff`, or `gained` for a survey after a gain alone, which
+asks no peer.
+
+Tests: the diff survey with a peer failing mid-diff leaves what the other
+does not hold unknown and keeps the other's lacks; what this node lacks is
+the referenced set, a trie and a list beside it, less every disk's
+holdings, for none to three disks.
+
 ## 0.90.95: a node with several disks is surveyed by trie diff
 
 No API, config or on-disk changes. On the wire, a node with several DATA

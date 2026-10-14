@@ -85,34 +85,6 @@ HeldFn holds(const std::set<ObjectId>& ids) {
     return [&ids](const ObjectId& id) { return ids.contains(id); };
 }
 
-// A peer with its own tree and holdings, answering as a node would.
-class FakePeer final : public PeerHoldings {
-  public:
-    FakePeer(const ObjectId& root, const NamespaceNodeStore& store, std::set<ObjectId> held)
-        : store_(store), held_(std::move(held)),
-          rollup_(HoldingsRollup::build(root, store, holds(held_))) {}
-
-    std::vector<NodeHoldings> ask(std::span<const ObjectId> nodes) override {
-        ++asks;
-        asked += nodes.size();
-        if (failing)
-            throw std::runtime_error("peer unreachable");
-        std::vector<NodeHoldings> answers;
-        for (const auto& node : nodes)
-            answers.push_back(describe_holdings(rollup_, store_, holds(held_), node));
-        return answers;
-    }
-
-    size_t asks{};
-    size_t asked{};
-    bool failing{};
-
-  private:
-    const NamespaceNodeStore& store_;
-    std::set<ObjectId> held_;
-    HoldingsRollup rollup_;
-};
-
 // Every reference reached by descending children from the root.
 void collect(const ObjectId& node, const NamespaceNodeStore& store, std::vector<ObjectId>& extents,
              size_t& nodes) {
@@ -157,417 +129,6 @@ MACHA_FAST_TEST("availability", test_a_trees_children_are_exactly_its_extent_ref
         refused = true;
     }
     CHECK(refused);
-}
-
-MACHA_FAST_TEST("availability", test_the_rollup_counts_references_and_what_is_held) {
-    MemoryNamespaceNodeStore store;
-    const auto entries = library(40);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    const auto all = references(entries);
-    const auto held = subset(all, 40, 3);
-
-    size_t pauses = 0;
-    const auto rollup = HoldingsRollup::build(root, store, holds(held), [&] { ++pauses; });
-    CHECK(rollup.root() == root);
-    CHECK(rollup.total().extents == all.size());
-    CHECK(rollup.total().held ==
-          static_cast<uint64_t>(std::count_if(all.begin(), all.end(), holds(held))));
-    CHECK(!rollup.total().complete());
-    // One pause per tree node read, and every node read once.
-    CHECK(pauses == rollup.nodes());
-    CHECK(!rollup.find(extent_id(999999)).has_value());
-
-    // Each node's count is the sum over its children.
-    std::vector<ObjectId> pending{root};
-    while (!pending.empty()) {
-        const auto node = pending.back();
-        pending.pop_back();
-        Holding sum;
-        for (const auto& child : namespace_tree_children(*store.get(node))) {
-            if (child.extent) {
-                ++sum.extents;
-                sum.held += held.contains(child.id) ? 1 : 0;
-            } else {
-                const auto beneath = rollup.find(child.id);
-                REQUIRE(beneath.has_value());
-                sum.extents += beneath->extents;
-                sum.held += beneath->held;
-                pending.push_back(child.id);
-            }
-        }
-        CHECK(rollup.find(node) == std::optional<Holding>(sum));
-    }
-
-    // Holding everything, or nothing referenced, is complete.
-    CHECK(HoldingsRollup::build(root, store, [](const ObjectId&) { return true; })
-              .total()
-              .complete());
-    MemoryNamespaceNodeStore empty_store;
-    const auto empty_root = build_namespace_tree(library(0), empty_store, small_limits());
-    CHECK(HoldingsRollup::build(empty_root, empty_store, [](const ObjectId&) { return false; })
-              .total()
-              .complete());
-}
-
-// A roll-up carried to the next tree counts what a fresh one counts, and
-// reads only the nodes the last tree did not have.
-MACHA_FAST_TEST("availability", test_a_rollup_carried_to_the_next_tree_reads_what_changed) {
-    MemoryNamespaceNodeStore store;
-    auto entries = library(60);
-    const auto first_root = build_namespace_tree(entries, store, small_limits());
-    const auto held = subset(references(entries), 40, 3);
-    const auto first = HoldingsRollup::build(first_root, store, holds(held));
-
-    // One file changes, one goes, one arrives.
-    auto changed = std::next(entries.begin(), 20);
-    while (changed->second.type != EntryType::file)
-        ++changed;
-    changed->second = file_of(700000, 9);
-    auto gone = std::next(entries.begin(), 40);
-    while (gone->second.type != EntryType::file)
-        ++gone;
-    entries.erase(gone);
-    entries["/zz-new.bin"] = file_of(800000, 5);
-    const auto next_root = build_namespace_tree(entries, store, small_limits());
-    REQUIRE(next_root != first_root);
-
-    size_t fresh_reads = 0;
-    const auto fresh = HoldingsRollup::build(next_root, store, holds(held), [&] { ++fresh_reads; });
-    size_t carried_reads = 0;
-    const auto carried =
-        HoldingsRollup::build(next_root, store, holds(held), [&] { ++carried_reads; }, &first);
-    CHECK(carried.root() == next_root);
-    CHECK(carried.total() == fresh.total());
-    CHECK(carried_reads * 3 < fresh_reads);
-    std::vector<ObjectId> pending{next_root};
-    while (!pending.empty()) {
-        const auto node = pending.back();
-        pending.pop_back();
-        CHECK(carried.find(node) == fresh.find(node));
-        for (const auto& child : namespace_tree_children(*store.get(node)))
-            if (!child.extent)
-                pending.push_back(child.id);
-    }
-
-    // Carried often enough, a roll-up is made afresh and holds only its tree.
-    auto rollup = carried;
-    for (size_t i = 0; i < HoldingsRollup::carries_max + 1; ++i)
-        rollup = HoldingsRollup::build(next_root, store, holds(held), {}, &rollup);
-    CHECK(rollup.nodes() == fresh.nodes());
-    CHECK(carried.nodes() > fresh.nodes());
-}
-
-MACHA_FAST_TEST("availability", test_the_rollup_reads_a_shared_subtree_once_and_counts_it_twice) {
-    MemoryNamespaceNodeStore store;
-    std::map<std::string, FsEntry> entries;
-    entries["/a"] = file_of(500, 12);
-    entries["/b"] = file_of(500, 12); // the same content: one extent sequence
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    store.forget_reads();
-    size_t asked = 0;
-    const auto rollup = HoldingsRollup::build(root, store, [&](const ObjectId&) {
-        ++asked;
-        return false;
-    });
-    CHECK(rollup.total().extents == 24);
-    CHECK(asked == 12);
-    CHECK(store.reads() == rollup.nodes());
-}
-
-MACHA_FAST_TEST("availability", test_a_rollup_refuses_a_tree_with_a_missing_node) {
-    MemoryNamespaceNodeStore store;
-    const auto root = build_namespace_tree(library(20), store, small_limits());
-    MemoryNamespaceNodeStore damaged;
-    bool first = true;
-    for (const auto& id : store.written()) {
-        if (id != root && first) {
-            first = false;
-            continue;
-        }
-        damaged.put_at(id, *store.get(id));
-    }
-    bool refused = false;
-    try {
-        (void)HoldingsRollup::build(root, damaged, [](const ObjectId&) { return true; });
-    } catch (const DecodeError&) {
-        refused = true;
-    }
-    CHECK(refused);
-}
-
-MACHA_FAST_TEST("availability", test_missing_extents_are_exactly_what_this_node_lacks) {
-    MemoryNamespaceNodeStore store;
-    const auto entries = library(80);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    const auto all = references(entries);
-    for (const unsigned percent : {0U, 10U, 55U, 90U, 100U})
-        for (const unsigned salt : {1U, 3U, 11U}) {
-            const auto held = subset(all, percent, salt);
-            const auto rollup = HoldingsRollup::build(root, store, holds(held));
-            store.forget_reads();
-            const auto missing = missing_extents(rollup, store, holds(held));
-            std::set<ObjectId> expected;
-            for (const auto& id : all)
-                if (!held.contains(id))
-                    expected.insert(id);
-            CHECK(missing == std::vector<ObjectId>(expected.begin(), expected.end()));
-            if (percent == 100)
-                CHECK(store.reads() == 0);
-            // Never more than the subtrees not held whole.
-            CHECK(store.reads() <= rollup.nodes());
-        }
-    // Mostly held: the descent reads a fraction of the tree.
-    const std::set<ObjectId> everything(all.begin(), all.end());
-    auto most = everything;
-    most.erase(entries.at("/f1012").extents.at(3).id);
-    const auto rollup = HoldingsRollup::build(root, store, holds(most));
-    store.forget_reads();
-    const auto missing = missing_extents(rollup, store, holds(most));
-    CHECK(missing == std::vector<ObjectId>{entries.at("/f1012").extents.at(3).id});
-    CHECK(store.reads() < rollup.nodes() / 4);
-}
-
-MACHA_FAST_TEST("availability", test_what_a_peer_lacks_is_exactly_what_it_does_not_hold) {
-    MemoryNamespaceNodeStore store;
-    const auto entries = library(80);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    const auto all = references(entries);
-    for (const unsigned here_percent : {0U, 40U, 100U})
-        for (const unsigned peer_percent : {0U, 30U, 90U, 100U}) {
-            const auto here = subset(all, here_percent, 2);
-            const auto there = subset(all, peer_percent, 13);
-            const auto local = HoldingsRollup::build(root, store, holds(here));
-            FakePeer peer(root, store, there);
-            const auto lacks = extents_peer_lacks(local, store, holds(here), peer);
-            REQUIRE(lacks.has_value());
-            std::set<ObjectId> expected;
-            for (const auto& id : all)
-                if (here.contains(id) && !there.contains(id))
-                    expected.insert(id);
-            CHECK(*lacks == std::vector<ObjectId>(expected.begin(), expected.end()));
-            // Nothing to offer, or a peer that holds everything: one question
-            // at most.
-            if (here_percent == 0 || peer_percent == 100)
-                CHECK(peer.asks <= 1);
-        }
-    // A peer that cannot answer leaves what it holds unknown.
-    const std::set<ObjectId> everything(all.begin(), all.end());
-    const auto local = HoldingsRollup::build(root, store, holds(everything));
-    FakePeer failing(root, store, {});
-    failing.failing = true;
-    CHECK(!extents_peer_lacks(local, store, holds(everything), failing).has_value());
-    // A peer at another tree, unable to describe this one's nodes: unknown.
-    MemoryNamespaceNodeStore other_store;
-    auto other_entries = entries;
-    other_entries.erase("/f1010");
-    const auto other_root = build_namespace_tree(other_entries, other_store, small_limits());
-    FakePeer elsewhere(other_root, other_store, {});
-    CHECK(!extents_peer_lacks(local, store, holds(everything), elsewhere).has_value());
-}
-
-MACHA_FAST_TEST("availability", test_a_node_describes_each_child_it_holds_whole) {
-    MemoryNamespaceNodeStore store;
-    const auto entries = library(40);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    const auto held = subset(references(entries), 70, 5);
-    const auto rollup = HoldingsRollup::build(root, store, holds(held));
-
-    for (const auto& node : store.written()) {
-        const auto answer = describe_holdings(rollup, store, holds(held), node);
-        const auto children = namespace_tree_children(*store.get(node));
-        REQUIRE(answer.children.size() == children.size());
-        CHECK(answer.known == rollup.find(node).has_value());
-        for (size_t c = 0; c < children.size(); ++c) {
-            const bool expected = children[c].extent
-                                      ? held.contains(children[c].id)
-                                      : rollup.find(children[c].id)->complete();
-            CHECK(answer.children[c] == expected);
-        }
-    }
-
-    // A tree node this node has never seen: no count, no flags.
-    const auto stranger = describe_holdings(rollup, store, holds(held), extent_id(424242));
-    CHECK(!stranger.known);
-    CHECK(stranger.children.empty());
-}
-
-MACHA_FAST_TEST("availability", test_the_survey_finds_exactly_what_no_node_holds) {
-    MemoryNamespaceNodeStore store;
-    const auto entries = library(60);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    const auto all = references(entries);
-
-    // Every mix of sparse and dense holdings across this node and two peers.
-    for (const unsigned here_percent : {0U, 15U, 60U, 100U})
-        for (const unsigned a_percent : {0U, 30U, 95U, 100U})
-            for (const unsigned b_percent : {0U, 50U, 100U}) {
-                const auto here = subset(all, here_percent, 1);
-                const auto local = HoldingsRollup::build(root, store, holds(here));
-                FakePeer a(root, store, subset(all, a_percent, 7));
-                FakePeer b(root, store, subset(all, b_percent, 19));
-                std::vector<PeerHoldings*> peers{&a, &b};
-                const auto survey = survey_availability(local, store, holds(here), peers);
-
-                const auto a_held = subset(all, a_percent, 7);
-                const auto b_held = subset(all, b_percent, 19);
-                std::set<ObjectId> nobody;
-                for (const auto& id : all)
-                    if (!here.contains(id) && !a_held.contains(id) && !b_held.contains(id))
-                        nobody.insert(id);
-                CHECK(survey.unavailable ==
-                      std::vector<ObjectId>(nobody.begin(), nobody.end()));
-                CHECK(survey.unknown.empty());
-                CHECK(survey.peers_asked == 2);
-                CHECK(survey.peers_failed == 0);
-                for (const auto& id : all)
-                    CHECK(survey.is_unavailable(id) == nobody.contains(id));
-            }
-}
-
-MACHA_FAST_TEST("availability", test_the_survey_costs_what_differs_not_the_library) {
-    MemoryNamespaceNodeStore store;
-    const auto entries = library(60);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    const auto all = references(entries);
-    const std::set<ObjectId> none;
-    const std::set<ObjectId> everything(all.begin(), all.end());
-
-    // This node holds everything: no question is asked.
-    {
-        const auto local = HoldingsRollup::build(root, store, holds(everything));
-        FakePeer peer(root, store, none);
-        std::vector<PeerHoldings*> peers{&peer};
-        const auto survey = survey_availability(local, store, holds(everything), peers);
-        CHECK(survey.rounds == 0);
-        CHECK(peer.asks == 0);
-        CHECK(survey.unavailable.empty());
-    }
-    // This node holds nothing, a peer everything: one id settles the library.
-    {
-        const auto local = HoldingsRollup::build(root, store, holds(none));
-        FakePeer peer(root, store, everything);
-        std::vector<PeerHoldings*> peers{&peer};
-        const auto survey = survey_availability(local, store, holds(none), peers);
-        CHECK(survey.rounds == 1);
-        CHECK(survey.nodes_asked == 1);
-        CHECK(survey.unavailable.empty());
-    }
-    // The peer lacks one extent of a large file: the descent follows one path.
-    {
-        const auto missing = entries.at("/f1012").extents.at(7).id;
-        auto most = everything;
-        most.erase(missing);
-        const auto local = HoldingsRollup::build(root, store, holds(none));
-        FakePeer peer(root, store, most);
-        std::vector<PeerHoldings*> peers{&peer};
-        const auto survey = survey_availability(local, store, holds(none), peers);
-        CHECK(survey.unavailable == std::vector<ObjectId>{missing});
-        const auto stats = namespace_tree_stats(root, store);
-        // One tree node per level on the way down: the namespace spine, then
-        // the file's extent sequence.
-        CHECK(survey.nodes_asked == survey.rounds);
-        CHECK(survey.rounds <= stats.depth + 4);
-        CHECK(survey.nodes_asked < local.nodes() / 4);
-    }
-    // No peer at all: what this node lacks, nobody reachable holds.
-    {
-        const auto here = subset(all, 50, 2);
-        const auto local = HoldingsRollup::build(root, store, holds(here));
-        const auto survey = survey_availability(local, store, holds(here), {});
-        std::set<ObjectId> lacking;
-        for (const auto& id : all)
-            if (!here.contains(id))
-                lacking.insert(id);
-        CHECK(survey.unavailable == std::vector<ObjectId>(lacking.begin(), lacking.end()));
-    }
-}
-
-MACHA_FAST_TEST("availability", test_a_survey_asks_only_about_what_the_last_did_not_settle) {
-    MemoryNamespaceNodeStore store;
-    auto entries = library(60);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    auto here = subset(references(entries), 30, 1);
-    const auto at_peer = [](const std::map<std::string, FsEntry>& of) {
-        return subset(references(of), 60, 7);
-    };
-
-    SurveyMemo memo;
-    AvailabilitySurvey first;
-    {
-        const auto local = HoldingsRollup::build(root, store, holds(here));
-        FakePeer peer(root, store, at_peer(entries));
-        std::vector<PeerHoldings*> peers{&peer};
-        first = survey_availability(local, store, holds(here), peers, nullptr, &memo);
-        REQUIRE(!first.unavailable.empty());
-
-        // The same tree again: nothing is asked.
-        FakePeer again(root, store, at_peer(entries));
-        std::vector<PeerHoldings*> same{&again};
-        SurveyMemo kept;
-        const auto repeat = survey_availability(local, store, holds(here), same, &memo, &kept);
-        CHECK(repeat.unavailable == first.unavailable);
-        CHECK(repeat.nodes_asked == 0);
-        CHECK(again.asks == 0);
-        CHECK(kept.nodes.size() == memo.nodes.size());
-    }
-
-    // The tree moves; every node holds what it held.
-    entries.erase("/f1030");
-    entries["/new"] = file_of(90000, 9);
-    entries["/f1012"] = file_of(91000, 5);
-    const auto moved = build_namespace_tree(entries, store, small_limits());
-    const auto surveyed = [&](const SurveyMemo* known, SurveyMemo* made) {
-        const auto local = HoldingsRollup::build(moved, store, holds(here));
-        FakePeer peer(moved, store, at_peer(library(60)));
-        std::vector<PeerHoldings*> peers{&peer};
-        return survey_availability(local, store, holds(here), peers, known, made);
-    };
-    const auto fresh = surveyed(nullptr, nullptr);
-    SurveyMemo next;
-    const auto remembered = surveyed(&memo, &next);
-    CHECK(remembered.unavailable == fresh.unavailable);
-    CHECK(remembered.unknown == fresh.unknown);
-    CHECK(remembered.nodes_asked > 0);
-    CHECK(remembered.nodes_asked < fresh.nodes_asked / 2);
-
-    // This node gains some of what was missing: the memo's answer follows.
-    for (size_t i = 0; i < fresh.unavailable.size(); i += 2)
-        here.insert(fresh.unavailable[i]);
-    const auto after_gain = surveyed(nullptr, nullptr);
-    const auto remembered_gain = surveyed(&next, nullptr);
-    CHECK(after_gain.unavailable.size() < fresh.unavailable.size());
-    CHECK(remembered_gain.unavailable == after_gain.unavailable);
-    CHECK(remembered_gain.nodes_asked == 0);
-}
-
-MACHA_FAST_TEST("availability", test_a_node_a_peer_could_not_describe_is_asked_about_again) {
-    MemoryNamespaceNodeStore store;
-    const auto entries = library(30);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    // The peer is at an older tree and has none of this one's changed nodes.
-    MemoryNamespaceNodeStore peer_store;
-    auto peer_entries = entries;
-    peer_entries.erase("/f1010");
-    const auto peer_root = build_namespace_tree(peer_entries, peer_store, small_limits());
-    const auto peer_all = references(peer_entries);
-    const std::set<ObjectId> none;
-    const auto local = HoldingsRollup::build(root, store, holds(none));
-
-    SurveyMemo memo;
-    {
-        FakePeer peer(peer_root, peer_store, {peer_all.begin(), peer_all.end()});
-        std::vector<PeerHoldings*> peers{&peer};
-        const auto survey = survey_availability(local, store, holds(none), peers, nullptr, &memo);
-        REQUIRE(!survey.unknown.empty());
-    }
-    // It catches up: what it could not describe is asked about, and decided.
-    const auto all = references(entries);
-    FakePeer peer(root, store, {all.begin(), all.end()});
-    std::vector<PeerHoldings*> peers{&peer};
-    const auto survey = survey_availability(local, store, holds(none), peers, &memo, nullptr);
-    CHECK(survey.unknown.empty());
-    CHECK(survey.unavailable.empty());
-    CHECK(peer.asks > 0);
 }
 
 MACHA_FAST_TEST("availability", test_the_path_table_follows_a_change_to_the_tree) {
@@ -676,132 +237,6 @@ MACHA_FAST_TEST("availability", test_the_path_table_follows_a_change_to_the_tree
         entries = std::move(next);
         root = next_root;
     }
-}
-
-MACHA_FAST_TEST("availability", test_a_peer_at_another_generation_answers_for_shared_subtrees) {
-    MemoryNamespaceNodeStore store;
-    auto entries = library(60);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    // The peer is one commit behind: it lacks a file this node has, and has
-    // one this node has removed.
-    auto peer_entries = entries;
-    peer_entries.erase("/f1030");
-    peer_entries["/old"] = file_of(90000, 9);
-    const auto peer_root = build_namespace_tree(peer_entries, store, small_limits());
-    REQUIRE(peer_root != root);
-
-    const auto all = references(entries);
-    const auto peer_all = references(peer_entries);
-    const std::set<ObjectId> none;
-    const std::set<ObjectId> peer_held(peer_all.begin(), peer_all.end());
-    const auto local = HoldingsRollup::build(root, store, holds(none));
-    FakePeer peer(peer_root, store, peer_held);
-    std::vector<PeerHoldings*> peers{&peer};
-    const auto survey = survey_availability(local, store, holds(none), peers);
-
-    // Exactly the new file's extents are held by nobody; nothing is undecided,
-    // because the peer has the tree nodes' bytes and answers by child.
-    std::set<ObjectId> expected;
-    for (const auto& extent : entries.at("/f1030").extents)
-        if (!extent.hole)
-            expected.insert(extent.id);
-    CHECK(survey.unavailable == std::vector<ObjectId>(expected.begin(), expected.end()));
-    CHECK(survey.unknown.empty());
-    CHECK(survey.nodes_asked < local.nodes());
-}
-
-MACHA_FAST_TEST("availability", test_what_no_peer_could_describe_is_unknown_not_unavailable) {
-    MemoryNamespaceNodeStore store;
-    const auto entries = library(30);
-    const auto root = build_namespace_tree(entries, store, small_limits());
-    const auto all = references(entries);
-    const std::set<ObjectId> none;
-    const auto local = HoldingsRollup::build(root, store, holds(none));
-
-    // A peer that cannot be reached: everything this node lacks is undecided.
-    {
-        FakePeer peer(root, store, std::set<ObjectId>(all.begin(), all.end()));
-        peer.failing = true;
-        std::vector<PeerHoldings*> peers{&peer};
-        const auto survey = survey_availability(local, store, holds(none), peers);
-        CHECK(survey.peers_failed == 1);
-        CHECK(peer.asks == 1); // not asked again after failing
-        CHECK(survey.unavailable.empty());
-        const std::set<ObjectId> everything(all.begin(), all.end());
-        CHECK(survey.unknown == std::vector<ObjectId>(everything.begin(), everything.end()));
-    }
-    // A peer with a different namespace and none of this tree's nodes: it
-    // cannot describe them, so it decides nothing.
-    {
-        MemoryNamespaceNodeStore other_store;
-        std::map<std::string, FsEntry> other;
-        other["/elsewhere"] = file_of(70000, 5);
-        const auto other_root = build_namespace_tree(other, other_store, small_limits());
-        FakePeer peer(other_root, other_store, none);
-        std::vector<PeerHoldings*> peers{&peer};
-        const auto survey = survey_availability(local, store, holds(none), peers);
-        CHECK(survey.peers_failed == 0);
-        CHECK(survey.unavailable.empty());
-        CHECK(survey.unknown.size() == std::set<ObjectId>(all.begin(), all.end()).size());
-        CHECK(survey.is_unknown(all.front()));
-    }
-    // One peer answers and holds nothing, one fails: still undecided, since
-    // the failed peer might hold it.
-    {
-        FakePeer answering(root, store, none);
-        FakePeer failing(root, store, none);
-        failing.failing = true;
-        std::vector<PeerHoldings*> peers{&answering, &failing};
-        const auto survey = survey_availability(local, store, holds(none), peers);
-        CHECK(survey.unavailable.empty());
-        CHECK(!survey.unknown.empty());
-    }
-}
-
-MACHA_FAST_TEST("availability", test_questions_and_answers_survive_the_wire) {
-    std::vector<ObjectId> nodes;
-    for (uint64_t i = 0; i < 5; ++i)
-        nodes.push_back(extent_id(i));
-    CHECK(decode_tree_holdings_request(encode_tree_holdings_request(nodes)) == nodes);
-    CHECK(decode_tree_holdings_request(encode_tree_holdings_request({})).empty());
-
-    std::vector<NodeHoldings> answers;
-    answers.push_back({});                                // a stranger
-    answers.push_back({true, {12, 12}, {}});              // whole, bytes not held
-    for (const size_t children : {1U, 7U, 8U, 9U, 17U}) { // every byte boundary
-        NodeHoldings answer{true, {children, 0}, {}};
-        for (size_t c = 0; c < children; ++c) {
-            answer.children.push_back(c % 3 == 0);
-            answer.holding.held += c % 3 == 0 ? 1 : 0;
-        }
-        answers.push_back(answer);
-    }
-    CHECK(decode_tree_holdings_reply(encode_tree_holdings_reply(answers)) == answers);
-
-    const auto refused = [](auto decode, Bytes bytes) {
-        try {
-            (void)decode(bytes);
-        } catch (const DecodeError&) {
-            return true;
-        }
-        return false;
-    };
-    auto truncated = encode_tree_holdings_reply(answers);
-    truncated.pop_back();
-    CHECK(refused(decode_tree_holdings_reply, truncated));
-    auto trailing = encode_tree_holdings_request(nodes);
-    trailing.push_back(0);
-    CHECK(refused(decode_tree_holdings_request, trailing));
-    // More held than referenced is not a holding.
-    CHECK(refused(decode_tree_holdings_reply,
-                  encode_tree_holdings_reply(std::vector<NodeHoldings>{{true, {1, 2}, {}}})));
-    bool too_many = false;
-    try {
-        (void)encode_tree_holdings_request(std::vector<ObjectId>(tree_holdings_max + 1));
-    } catch (const std::invalid_argument&) {
-        too_many = true;
-    }
-    CHECK(too_many);
 }
 
 // --- The survey by trie diff -------------------------------------------------
@@ -921,8 +356,7 @@ class FailingSource final : public TrieSource {
 
 // From diffs: what no peer holds of what this node lacks is unavailable, and
 // each peer lacks what this node holds and it does not, within what is
-// referenced, on however many disks either side holds them. A peer that fails
-// mid-diff fails the whole survey.
+// referenced, on however many disks either side holds them.
 MACHA_FAST_TEST("availability", test_the_survey_by_diff_finds_what_no_node_holds) {
     std::set<ObjectId> referenced;
     for (uint32_t i = 0; i < 3000; ++i)
@@ -980,29 +414,80 @@ MACHA_FAST_TEST("availability", test_the_survey_by_diff_finds_what_no_node_holds
     SnapshotSource two_source(two->snapshot());
     std::vector<TrieSource*> peers{&one_source, &two_source};
     const std::vector<ObjectId> referenced_list(referenced.begin(), referenced.end());
-    std::vector<std::vector<ObjectId>> lacks;
-    const auto survey = survey_by_diff(here, missing_here, IdLookup(referenced_list), peers, lacks);
+    std::vector<PeerDiff> diffs;
+    const auto survey = survey_by_diff(here, missing_here, IdLookup(referenced_list), peers, diffs);
     CHECK(survey.unavailable == unavailable);
     CHECK(survey.unknown.empty());
     CHECK(survey.peers_asked == 2);
-    REQUIRE(lacks.size() == 2);
-    CHECK(lacks[0] == lacking(first));
-    CHECK(lacks[1] == lacking(second));
+    CHECK(survey.peers_failed == 0);
+    REQUIRE(diffs.size() == 2);
+    CHECK(diffs[0].answered);
+    CHECK(diffs[0].lacks == lacking(first));
+    CHECK(diffs[1].lacks == lacking(second));
+    CHECK(diffs[1].root == two->snapshot().root_hash());
 
     // Alone, nothing anyone else holds: everything missing is unavailable.
     std::vector<TrieSource*> none;
-    CHECK(survey_by_diff(here, missing_here, IdLookup(referenced_list), none, lacks).unavailable ==
+    CHECK(survey_by_diff(here, missing_here, IdLookup(referenced_list), none, diffs).unavailable ==
           missing_here);
 
+    // A peer that fails mid-diff: what the other does not hold might be its,
+    // so it is unknown, and the other's lacks still stand.
     FailingSource failing(two->snapshot());
     std::vector<TrieSource*> broken{&one_source, &failing};
-    bool threw = false;
-    try {
-        (void)survey_by_diff(here, missing_here, IdLookup(referenced_list), broken, lacks);
-    } catch (const std::runtime_error&) {
-        threw = true;
+    const auto partial =
+        survey_by_diff(here, missing_here, IdLookup(referenced_list), broken, diffs);
+    std::vector<ObjectId> not_first;
+    for (const auto& id : missing_here)
+        if (!first.contains(id))
+            not_first.push_back(id);
+    CHECK(partial.peers_failed == 1);
+    CHECK(partial.unavailable.empty());
+    CHECK(partial.unknown == not_first);
+    CHECK(diffs[0].answered);
+    CHECK(diffs[0].lacks == lacking(first));
+    CHECK(!diffs[1].answered);
+}
+
+// What this node lacks: the referenced set, a trie and a list beside it, less
+// what any of its disks holds, for none to three disks.
+MACHA_FAST_TEST("availability", test_what_this_node_lacks_is_the_referenced_set_less_every_disk) {
+    std::set<ObjectId> viewed;
+    for (uint32_t i = 0; i < 2000; ++i)
+        viewed.insert(numbered_id(i * 104729));
+    // Beside the view: some ids of its own, one the view has as well.
+    std::vector<ObjectId> others{numbered_id(7), numbered_id(11), *viewed.begin()};
+    std::set<ObjectId> referenced(viewed);
+    referenced.insert(others.begin(), others.end());
+    TempDir dir;
+    auto view = held_trie(dir.path() / "view", viewed);
+    const ReferencedSets sets(ReferencedSets::Views{view->snapshot(), std::nullopt}, others, {});
+    REQUIRE(sets.size(RetentionClass::data) == referenced.size());
+
+    std::vector<std::unique_ptr<ObjectTrie>> disks;
+    std::vector<std::set<ObjectId>> held;
+    for (size_t count = 0; count <= 3; ++count) {
+        std::vector<ObjectTrie::Snapshot> parts;
+        for (const auto& disk : disks)
+            parts.push_back(disk->snapshot());
+        std::vector<ObjectId> expected;
+        for (const auto& id : referenced)
+            if (std::none_of(held.begin(), held.end(),
+                             [&](const std::set<ObjectId>& on) { return on.contains(id); }))
+                expected.push_back(id);
+        CHECK(sets.not_held(RetentionClass::data, parts) == expected);
+        // The next disk holds every few referenced ids, one of the others,
+        // and garbage nothing refers to.
+        std::set<ObjectId> next;
+        size_t i = 0;
+        for (const auto& id : referenced)
+            if (i++ % (count + 2) == count)
+                next.insert(id);
+        next.insert(others[count % 2]);
+        next.insert(numbered_id(0xfffffff0 - static_cast<uint32_t>(count)));
+        disks.push_back(held_trie(dir.path() / ("disk" + std::to_string(count)), next));
+        held.push_back(next);
     }
-    CHECK(threw);
 }
 
 MACHA_FAST_TEST("availability", test_a_files_code_follows_its_extent_counts) {
