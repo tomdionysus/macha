@@ -1,6 +1,22 @@
 # Completed and tested
 
-Last updated: 2026-10-13
+Last updated: 2026-10-14
+
+## 2026-10-14 -- 0.90.95: a node with several disks is surveyed by trie diff
+
+- Operator 2026-10-13: Macha is multi-backend by design, so stage 5 may not
+  drop nodes with several DATA disks. A node's held trie is now the union
+  of its disks' tries (`TrieUnion`), with the summaries one trie over the
+  same ids would have; its root is the holdings identity. Nothing stored or
+  journalled; only subtrees several disks hold differently are worked out,
+  and each union reuses the last one's where the disks are unchanged.
+- The wire's 501 `several_held_tries` is gone; no client API change.
+- Gate on fi-1 672 + 19 + 21. Installed on fi-1 only (17:54Z): writable,
+  `peers=0 method=diff local=377868 unavailable=657787`. fi-1 has one DATA
+  disk and no peer, so the several-disk union is proven by the laptop
+  tests only.
+- fi-1 crashed mid-build at 15:39Z and left three empty test objects; the
+  first gate ran 644 tests and passed. After a crash, check the count.
 
 ## 2026-10-13 -- 0.90.94: what only an unreachable node holds is unavailable
 

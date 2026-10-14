@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-13, on `develop`. fi-1 runs 0.90.94; gbni-1 is out of
+Last updated: 2026-10-14, on `develop`. fi-1 runs 0.90.95; gbni-1 is out of
 the cluster (compromised 2026-10-13, last ran 0.90.93; ssh refuses the key).
 
 The ordered list of open work; work top to bottom unless new evidence
@@ -67,7 +67,7 @@ A failing test is P0: reproduce it before deciding whose it is.
 - **Watched**: the merge rule and reconciler (the only standing conflicts
   are the seven from before 0.89.0; a `metadata merge recorded a conflict`
   WARN reopens it with the key); `RPC stalled (control)` (last 2026-10-11,
-  pointing at fi-1's mobile link; none since).
+  on fi-1's link to gbni-1; none since).
 - **fi-1, 2026-09-29**: a playback `PATCH` 503 after 19.9 s under software
   transcode, and a `FUSE mount disappeared` ERROR during a restart. *Carried.*
 
@@ -91,7 +91,8 @@ the walks stay as the fallback until every node runs stage 3.
    objects (watch gbni-1's start time).
 1. **The trie's diff surface: built, 0.90.72.**
 2. **`trie_diff` over the wire: built, 0.90.72.** The survey diffs held
-   tries when every peer runs 0.90.72 with one DATA disk; else the tree.
+   tries when every peer runs 0.90.72; else the tree. A node with several
+   DATA disks diffs as the union of their tries (0.90.95).
    Closes, once deployed and read on the cluster: **extents held by no node
    online** (about 203,000 of 940,000; five of 25 sampled movies EIO on
    both nodes, which is correct) as `unavailable`; the memo going stale
@@ -104,8 +105,8 @@ the walks stay as the fallback until every node runs stage 3.
    1.34 MB/s and it moves about 0.74 MB/s idle, one extent a minute with a
    viewer. **The path is the limit, not repair:** a raw TCP stream gbni-1 to
    fi-1 (fi-1 dialling, as Macha does) runs at 1.39 MB/s, and four parallel
-   streams total 1.3 MB/s: fi-1 is on a Finnish mobile connection, and its
-   downlink is the cap (gbni-1 is on 1 Gbps fibre). So the pipelined window would not speed repair between these
+   streams total 1.3 MB/s: fi-1's downlink is the cap (its link type is
+   unverified; gbni-1 is on 1 Gbps fibre). So the pipelined window would not speed repair between these
    nodes; what stage 3 still buys is the push list from the diff instead of
    walking every local object, and no probes (already true when the lacks
    come from a diff, since they carry the inventory's generation). fi-1
@@ -129,7 +130,9 @@ the walks stay as the fallback until every node runs stage 3.
    its design.
 5. **Retire** `tree_holdings`, the roll-up, survey and memo,
    `availability/holdings.bin`, the repair cursors and repair's `have_*`
-   probes, once every node runs stage 3.
+   probes, once every node runs stage 3. Nodes with several disks keep the
+   diff (0.90.95, operator 2026-10-13: Macha is multi-backend by design).
+   Next.
 
 The proposal's open questions (for the review): whether `claimed` is diffed
 (decide from the claim walk's probe counts after stage 3); a count bound on
@@ -261,17 +264,24 @@ on control threads no longer grow with deletes. Left:
 - Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
 - A `CONTRIBUTING.md` line: "A new gate may pace lower-class work; it may
   never stop it."
-- The replica's applier lifetime; fi-1's USB power (it lost power again on
-  2026-10-12 and recovered by itself).
+- The replica's applier lifetime; fi-1's USB power (it lost power on
+  2026-10-12, and twice on 2026-10-14: 14:20Z, and mid-build at 15:39Z, up
+  16:15Z; 24 undervoltage warnings in its first 8 minutes up; it recovered by
+  itself each time).
+- Operator question: a configured DATA disk not yet online reads every
+  extent it holds `unavailable` (fi-1 after a reboot: 1,005,990 for two to
+  nine minutes until the USB disk mounts); Core's web queue drops
+  unavailable titles. Should it read `unknown` until the disk comes up?
 - From the backlog: anonymous access; whether a client should know a
   playback generation existed anywhere in the cluster.
 
 ## Cluster state
 
-- **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1**
-  (10.35.1.10) run **0.90.93**, cluster protocol 23. es-1 is offline
-  indefinitely.
-- Metadata writable 2/2. `dht.write_copies` and `dht.metadata_write_copies`
+- **fi-1** (10.35.1.10) runs **0.90.95**, cluster protocol 23, alone.
+  **gbni-1** (10.44.1.50, `macnessa.macha.network`) is out since
+  2026-10-13 (compromised; last ran 0.90.93; section 1). es-1 is offline
+  indefinitely. Deploys go to fi-1 only (`build/deploy.sh`'s fi-1 lines).
+- `dht.write_copies` and `dht.metadata_write_copies`
   are copies sought, not floors: a node alone still accepts writes.
 - Both nodes' config: `maintenance.foreground_weight: 80`,
   `repair_weight: 20` (the code default is 95:5); `garbage_grace_ms` 30 days;

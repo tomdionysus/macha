@@ -68,11 +68,12 @@ identity that names it:
 
 ```
 struct HeldIdentity {
-    Hash256 hash;       // a disk: its held trie's root; the pool: over (token, root) by token
+    Hash256 hash;       // the held trie's root: of the disk, or of the union of the pool's disks
     uint64_t removals;  // ids that stopped being held since start; never returns to an earlier value
     bool complete;      // false while an online disk is still being seeded
 };
-struct HeldView { HeldIdentity identity; std::function<bool(const ObjectId&)> held; };
+struct HeldView { HeldIdentity identity; std::function<bool(const ObjectId&)> held;
+                  std::shared_ptr<const TrieUnion> trie; };
 ```
 
 A ledger hands out its snapshot and its removal count under one lock, so a
@@ -122,14 +123,17 @@ reads a side, paced, repeated only when either identity changes.
 whether the two follow the same head; it is informational, since held
 against held needs no shared head.
 
-**Several backends.** A node's held view is its set of online, seeded
-backend tries, each named by its disk's token, and the diff runs per pair.
-This keeps each trie the record of one disk, verified against that disk,
-with no migration; the ledger design's open question "does `held` record
-the backend" is answered by the trie's name rather than a column. The
-rounds multiply by the backend count, which is one on both nodes today.
-If a node ever runs many backends the pool can maintain a union trie; not
-now.
+**Several backends (built, 0.90.95).** Macha is multi-backend by design.
+Each disk keeps its own held trie, the record of that disk, verified
+against it. A node's held trie is the union of its online, seeded disks'
+tries, read as one (`TrieUnion`): its summaries are those one trie over the
+same ids would have, so it diffs against any peer's, whatever the disk count
+on either side, and its root is the node's identity. Nothing is stored or
+journalled for it. A subtree one disk alone holds, or every disk holding it
+holds alike, is that disk's own summary; only subtrees several disks hold
+differently are worked out from their nodes, and each union is made from
+the last, reusing every subtree whose disks are as they were. A one-disk
+node's union is its disk's trie and costs nothing.
 
 **What falls out.** For each peer that answered: what it holds that this
 node lacks (the pull list, placement-ordered), what this node holds that it
@@ -208,10 +212,9 @@ business, driven by `lost`; not this proposal. The catalogue plan's stage
      `records` name that hash. The peer keeps its last few (count and age
      bounded) and answers `snapshot_gone` for an older one, and the asker
      starts again.
-   - *One trie a side.* A diff of one trie against one is exact; a union
-     of several has no canonical summaries. With one DATA backend on each
-     side (every node today) the diff is direct; a peer with several, or
-     facing an asker with several, is surveyed the old way.
+   - *One trie a side.* A diff of one trie against one is exact. A node
+     with several disks diffs as the union of their tries (0.90.95), whose
+     summaries are canonical.
    - *All or nothing.* The survey publishes from diffs only when every
      extent-hosting peer answered and the inventory's `referenced` view is
      of the head; otherwise from the roll-up. From diffs: `missing_here` is
@@ -225,7 +228,7 @@ business, driven by `lost`; not this proposal. The catalogue plan's stage
    and from the roll-up otherwise. Two-node tests: identical holdings cost
    one round; one lost copy is found in two; a peer that refuses falls
    back; a peer that fails mid-descent leaves its share unknown.
-3. **Repair on the diff. Push list built (0.90.76); the pipelined window is not worth it while fi-1's mobile downlink (about 11 Mbps) is the bound.** The pull and push lists come from the survey;
+3. **Repair on the diff. Push list built (0.90.76); the pipelined window is not worth it while fi-1's downlink (about 11 Mbps) is the bound.** The pull and push lists come from the survey;
    no presence probe when the lists are from a diff; the pipelined window.
    Measured on the cluster: bytes per second over the WAN against today's
    4 MB in 5 s; probes per step, which should read zero. The walks stay
