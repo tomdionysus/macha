@@ -90,6 +90,10 @@ enum class MessageType : uint16_t {
     // unmatched_hints_reply. Sent only to peers that advertise a version with
     // it.
     get_unmatched_hints = 50,
+    // An ingest job the API pinned to the peer: it reads `path` on its own
+    // filesystem and runs the job. Reply: ingest_submit_reply, with the job's
+    // id or the peer's refusal. A peer before 0.91.1 answers not_implemented.
+    submit_ingest_job = 51,
     // A history hash's record as a self-contained full-body entry,
     // materialised by the server (get_metadata_history_entry returns the
     // stored frame, possibly a delta the caller cannot replay).
@@ -129,7 +133,8 @@ enum class MessageType : uint16_t {
     torrent_intent_reply = 122,
     have_valid_objects_reply = 123,
     trie_diff_reply = 125,
-    unmatched_hints_reply = 126
+    unmatched_hints_reply = 126,
+    ingest_submit_reply = 127
 };
 
 // Each id in a have_valid_objects request is a full read on the peer, so a

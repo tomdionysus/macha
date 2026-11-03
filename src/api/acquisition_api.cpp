@@ -224,11 +224,32 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 delete_source_on_clear = value->asBool();
             else if (const auto* value = body.find("remove_source"))
                 delete_source_on_clear = value->asBool(); // alias of delete_source_on_clear
-            const auto id = ingest_.submit_path(path->asString(), "filesystem", {},
-                                                std::move(display_name), delete_source_on_clear,
-                                                false, false);
+            // The node whose filesystem `path` is on; absent or null is this node.
+            auto owner = jobs_.local_node_id();
+            if (const auto* node = body.find("node_id")) {
+                std::string error;
+                auto parsed = parse_node_id(*node, error);
+                if (!parsed) return http_error(400, "bad_request", error);
+                if (*parsed != NodeId{}) owner = *parsed;
+            }
+            const auto result = jobs_.submit_ingest(owner, path->asString(), std::move(display_name),
+                                                    delete_source_on_clear);
+            using Outcome = ClusterJobView::IngestSubmitResult::Outcome;
+            switch (result.outcome) {
+            case Outcome::submitted:
+                break;
+            case Outcome::refused:
+                return http_error(400, "bad_request", result.message);
+            case Outcome::not_member:
+                return http_error(409, "placement_failed", result.message, "node_not_member");
+            case Outcome::not_capable:
+                return http_error(409, "placement_failed", result.message, "node_not_ingest_capable");
+            case Outcome::unreachable:
+                return http_error(503, "node_unreachable", result.message);
+            }
             Json::Object out;
-            out["id"] = id;
+            out["id"] = result.id;
+            out["node_id"] = to_string(owner);
             return http_json(202, Json(std::move(out)).dump());
         }
 

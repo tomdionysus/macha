@@ -583,6 +583,30 @@ Bytes IngestManager::handle_job_action(std::span<const uint8_t> request_payload)
     return Bytes(text.begin(), text.end());
 }
 
+Bytes IngestManager::handle_submit(std::span<const uint8_t> request_payload) {
+    Json::Object out;
+    try {
+        const std::string text(reinterpret_cast<const char*>(request_payload.data()),
+                               request_payload.size());
+        const auto request = Json::parse(text);
+        const auto* path = request.find("path");
+        if (!path || !path->isString() || path->asString().empty())
+            throw std::runtime_error("path is required");
+        std::string display_name;
+        if (const auto* value = request.find("display_name"); value && value->isString())
+            display_name = value->asString();
+        std::optional<bool> delete_source_on_clear;
+        if (const auto* value = request.find("delete_source_on_clear"); value && value->isBool())
+            delete_source_on_clear = value->asBool();
+        out["id"] = submit_path(path->asString(), "filesystem", {}, std::move(display_name),
+                                delete_source_on_clear, false, false);
+    } catch (const std::exception& error) {
+        out["error"] = std::string(error.what());
+    }
+    const auto text = Json(std::move(out)).dump();
+    return Bytes(text.begin(), text.end());
+}
+
 
 void IngestManager::load_state() {
     std::vector<std::pair<std::string, std::string>> migration_hints;

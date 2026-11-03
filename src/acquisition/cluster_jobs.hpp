@@ -85,6 +85,19 @@ class ClusterJobView {
     std::optional<Json> ingest_job_detail(std::string_view id);
     IngestActionResult ingest_action(std::string_view id, std::string_view action);
 
+    struct IngestSubmitResult {
+        enum class Outcome { submitted, refused, not_member, not_capable, unreachable };
+        Outcome outcome{};
+        std::string id;
+        // Why it was not submitted; for `refused`, the owner's own reason.
+        std::string message;
+    };
+    // An ingest job on `node`, which reads `path` on its own filesystem: this
+    // node, or an active member asked over the cluster.
+    IngestSubmitResult submit_ingest(const NodeId& node, const std::string& path,
+                                     std::string display_name,
+                                     std::optional<bool> delete_source_on_clear);
+
   private:
     // A peer's last answers. `torrent_known` false: never answered the torrent
     // query; `torrent_capable` false: answered that it has no torrents.
