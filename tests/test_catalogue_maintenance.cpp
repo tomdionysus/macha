@@ -40,9 +40,6 @@ struct FakeMetadataView final : MetadataView {
     }
     std::optional<MetadataSnapshotView> release_head() const override { return view; }
     MetadataClusterStatus status() const noexcept override { return {}; }
-    MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t) override {
-        throw std::runtime_error("read-only fake");
-    }
     // A commit applies to the head and makes the next generation.
     MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>& change,
                                 size_t, std::optional<MetadataMutationIdentity>) override {

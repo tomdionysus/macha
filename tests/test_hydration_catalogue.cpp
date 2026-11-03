@@ -4193,21 +4193,21 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
         const std::string nfd_file = nfd_dir + "/01.Clannad - Na Buachailli\xcc\x81 lainn.mp3";
         const std::string nfc_dir = "/Music/Caf\xc3\xa9 del Mar";
         const std::string nfc_file = nfc_dir + "/01.Clannad - Na Buachaill\xc3\xad lainn.mp3";
-        node.metadata().mutate([&](MetadataSnapshot& snapshot) {
+        node.metadata().mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) {
             FsEntry dir;
             dir.type = EntryType::directory;
             dir.mode = 0755;
             dir.uid = getuid();
             dir.gid = getgid();
             dir.ctime_ns = dir.mtime_ns = wall_time_ns();
-            snapshot.entries[nfd_dir] = dir;
+            delta.upsert_entries[nfd_dir] = dir;
             FsEntry file;
             file.type = EntryType::file;
             file.mode = 0644;
             file.uid = getuid();
             file.gid = getgid();
             file.ctime_ns = file.mtime_ns = wall_time_ns();
-            snapshot.entries[nfd_file] = file;
+            delta.upsert_entries[nfd_file] = file;
         });
         CHECK(node.filesystem().getattr(nfc_dir).type == EntryType::directory);
         CHECK(node.filesystem().getattr(nfc_file).type == EntryType::file);
@@ -4216,7 +4216,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
         CHECK(listed.front().first == "01.Clannad - Na Buachailli\xcc\x81 lainn.mp3");
         const std::string new_nfc = nfc_dir + "/Macha Caf\xc3\xa9 Test.mp3";
         node.filesystem().create_file(new_nfc, 0644, getuid(), getgid());
-        CHECK(node.metadata().snapshot().entries.contains(nfd_dir + "/Macha Caf\xc3\xa9 Test.mp3"));
+        // Stored under the directory's name as it is, not a normalised one.
+        const auto nodes = node.filesystem().namespace_nodes();
+        CHECK(namespace_entry(node.metadata().snapshot(), &nodes,
+                              nfd_dir + "/Macha Caf\xc3\xa9 Test.mp3")
+                  .has_value());
         CHECK(node.filesystem().getattr(new_nfc).type == EntryType::file);
     }
 #endif
@@ -4281,12 +4285,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
         const auto status = node.catalogue().status();
         REQUIRE(status.root.has_value());
         REQUIRE(node.node().control_store().remove(*status.root));
-        node.metadata().mutate([](MetadataSnapshot& snapshot) {
-            auto root = snapshot.entries.find("/");
-            REQUIRE(root != snapshot.entries.end());
-            ++root->second.version;
-            ++root->second.mtime_ns;
-        });
+        auto root = node.filesystem().getattr("/");
+        ++root.version;
+        ++root.mtime_ns;
+        node.metadata().mutate_delta(
+            [&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/"] = root; });
         auto cached = node.catalogue().get("test:movie:1");
         REQUIRE(cached.has_value());
         CHECK(cached->title == "Cached Movie");

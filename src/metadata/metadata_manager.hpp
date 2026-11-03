@@ -85,7 +85,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     IoMutex mutation_mutex_;
     // Guards no state: serialises the multi-head merge-and-publish branch of
     // read_group(), held across its history imports and commit fan-out.
-    // mutate_impl() holds mutation_mutex_ while calling read_group().
+    // mutate_delta() holds mutation_mutex_ while calling read_group().
     IoMutex reconciliation_mutex_ MACHA_ACQUIRED_AFTER(mutation_mutex_);
     // Retry cooldown for peer certificates this replica cannot accept (record
     // fails to materialise locally). read_group() runs on nearly every read;
@@ -195,10 +195,6 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
         const std::vector<NodeInfo>&, FrameType);
     bool replicate_accepted_head(const NodeInfo&, const MetadataRecord&,
                                  const MetadataAcceptance&, FrameType);
-
-    MetadataRecord mutate_impl(
-        const std::function<void(MetadataSnapshot&, MetadataDelta*)>&, bool exact_delta,
-        size_t retries, std::optional<MetadataMutationIdentity> identity);
 
     // What commits accepted here owe the peers: each commit's claims on
     // them, in order, and the newest head, whose history carries the rest.
@@ -320,10 +316,8 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     uint64_t current_namespace_revision() const noexcept override {
         return available_namespace_revision();
     }
-    MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&,
-                          size_t retries = 8) override;
-    // Caller supplies the exact delta; avoids a second deep copy of the
-    // namespace. `identity` is an idempotency key: applied only if
+    // The caller supplies the exact change set, applied to the tree.
+    // `identity` is an idempotency key: applied only if
     // mutation_sequences[identity.origin] < identity.sequence, which it then
     // stamps, so a caller can tell after a crash whether it took effect.
     MetadataRecord mutate_delta(
