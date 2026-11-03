@@ -314,8 +314,9 @@ A `blocked` job is retried every `ingest.blocked_retry_ms` until it succeeds or 
 | `source_seek_failed` | a source file could not be positioned to resume a copy |
 | `source_short_read` | a source file returned fewer bytes than expected |
 | `staging_unavailable` | the source is in the staging area and the staging directory is missing (its disk absent) |
+| `storage_unavailable` | no node present could take the imported bytes: its DATA disk is offline, stalled or full. The job keeps the files and bytes it has copied |
 
-`metadata_unavailable` makes the job `blocked`, and the job completes once metadata is writable again.
+`metadata_unavailable` and `storage_unavailable` make the job `blocked`, and the job completes once metadata is writable, or a disk can take the bytes, again.
 
 | `error_code` (failed) | cause |
 |---|---|

@@ -1,5 +1,15 @@
 # Current release
 
+## 0.91.5: an import waits for its disk
+
+An ingest job whose bytes no node present can take, because the DATA disk
+is offline, stalled or full, is `blocked` with `storage_unavailable` and
+retried every `ingest.blocked_retry_ms`, keeping what it has copied. It
+was `failed` with `import_failed` ("object replication quorum
+unavailable"), so a disk that dropped out for a minute ended a long import.
+The store reports the condition as `StorageUnavailable`, and the
+filesystem's write path as `FsStorageUnavailable`, still `EIO` to FUSE.
+
 ## 0.91.4: the shipped example configuration loads
 
 `macha.yaml.example`, installed as the first `macha.yaml`, set
