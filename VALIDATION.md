@@ -9,7 +9,7 @@ dependencies.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMACHA_WARNINGS_AS_ERRORS=ON
-cmake --build build -j
+cmake --build build --parallel
 ./run-tests.sh build
 ```
 
@@ -34,7 +34,7 @@ eligible one; R=1 logical capacity is the aggregate of eligible nodes rather
 than the smallest node's.
 
 **Placement and the write floor.** An R=1 write spills from a full preferred
-node to the next deterministic candidate; `min_write_replicas: 2` is satisfied
+node to the next deterministic candidate; `write_copies: 2` is satisfied
 by fallback candidates when a preferred owner is full; a W=1 publication later
 converges to R=2 through repair.
 

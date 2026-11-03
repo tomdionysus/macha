@@ -24,7 +24,7 @@ The per-stream instructions name what happens to each stream:
 | `preferences.subtitle_stream` | stream index | which subtitle stream, if any |
 | `preferences.subtitle_language` | language code | the subtitle stream in that language, when exactly one has it |
 
-**The server chooses nothing** (operator, 2026-09-24: "The server supplies facts, operations, then does what it's told"). Where a choice has exactly one candidate it is a fact, and it is used: a file with one audio stream plays that stream without being named. Where there are several and the instruction does not name one, or where it names something the media does not have, the session is refused with the candidates, so the client can choose:
+**The server chooses nothing**. Where a choice has exactly one candidate it is a fact, and it is used: a file with one audio stream plays that stream without being named. Where there are several and the instruction does not name one, or where it names something the media does not have, the session is refused with the candidates, so the client can choose:
 
 ```json
 {
@@ -137,7 +137,7 @@ A refusal is `500` with error code `segment_not_ready`, `Retry-After: 1` and `Ca
 
 The assignment is deliberately the inverse of what the HTTP spec suggests, and a client must not "correct" it. Many players expose only the status code on a fragment error - not the body, not the headers - so the status has to carry the meaning on its own. `503` cannot: every proxy and load balancer emits it when a service is down, so a client taught that `503` means "hold, stay here" would read a dead node as a healthy one and never fail over. Misreading an infrastructure `500` as a hold costs one wasted retry instead. Both stay 5xx because a 4xx stops most players retrying at all. `init.mp4` takes the same hold path as a fragment.
 
-`segment_timeout_ms` must stay below the client's time-to-first-byte deadline. A held request sends no bytes, so a client that gives up first never sees the refusal and takes its timeout path, which retries hard and then fails - worse than not holding at all. The tightest deadline among the clients in use is 8 s, so the 6000 default clears it with margin and **8000 is a hard ceiling on this knob**. Read the deadline out of the client artifact before changing it: the published documentation for these clients has been wrong about which setting governs.
+`segment_timeout_ms` must stay below the client's time-to-first-byte deadline. A held request sends no bytes, so a client that gives up first never sees the refusal and takes its timeout path, which retries hard and then fails - worse than not holding at all. The tightest deadline among the clients in use is 8 s, so the 6000 default clears it with margin and **8000 is a hard ceiling on this knob**. Read the deadline out of the client artifact before changing it.
 
 A held request costs no thread. The handler asks the segment store for the object and, in the same locked step, subscribes to the next publication if it is absent; it then hands the server a deferral -- what it is waiting for, its deadline, and the admitted hold -- and returns. The server parks the connection and re-runs the handler when the store publishes or the deadline passes. `max_concurrent_holds` (64) is therefore a fairness and memory bound rather than a worker-thread ration: it bounds how many requests may be waiting on encoders at once across every session. Steady-state playback on a four-core node transcoding at roughly real time sits at the frontier often, so holds are the ordinary case rather than the exception.
 
@@ -243,7 +243,7 @@ Connections are HTTP/1.1 keep-alive by default, reused for up to `keep_alive_max
 
 Session creation and control require the session bearer token from `POST /api/v1/session`. Returned stream URLs use a separate high-entropy capability in the path so native players can fetch direct files, playlists and fragments without the bearer token. Stream capabilities expire with the playback session.
 
-Every JSON object response carries a top-level snake_case `status`: `"ok"` on success, unless the handler states its own. An error's `status` is its `error.code`, except the two playback errors built outside the common envelope - `account_session_limit` and the `playback_*_failed` stage errors - whose `status` is `"error"`. Branch on `error.code`, which is present on every error. Stream bodies, `204` and non-JSON responses carry no `status`.
+Every JSON object response carries a top-level snake_case `status`: `"ok"` on success, unless the handler states its own. An error's `status` is its `error.code`, except the playback errors built outside the common envelope - `account_session_limit`, `account_transcode_limit` and the `playback_*_failed` stage errors - whose `status` is `"error"`. Branch on `error.code`. The catalogue routes, and any `/api/v1` path no route claims (`404`), carry the code as the string `error` instead, with `message` beside it (see [Catalogue](catalogue.md)). Stream bodies, `204` and non-JSON responses carry no `status`.
 
 ## Status
 
@@ -472,23 +472,36 @@ client must not collapse them:**
 - **`404 not_found`** - nothing here ever produced that: a generation above
   the current one, an unknown session, or a bad capability.
 
+One more answer can reach the stream path: `404 not_ready` when the
+generation's playlist, or an object the playlist does not name, is not
+produced yet. It is retryable, unlike `not_found`; branch on the code, not the
+status.
+
+Other refusals on the playback routes: `503 streaming_disabled`; `400
+bad_request` for a body that is not an object or names no media; `400 bad_seek`
+for a negative `seek_ms`; `400 bad_start` when `start` is not `async`; `416
+bad_range` for an unsatisfiable byte range; `503 subtitle_unavailable` when a
+subtitle cannot be extracted.
+
 Keeping `410` apart from `404` is what lets a client tell a routine
 regenerate from a fault, and stop retrying something that will never come
 back.
 
-Minimal request:
-
-```json
-{
-  "media_id": "path:/Movies/Example.mkv"
-}
-```
-
-A transformed session may also include `seek_ms` in the initial POST. This is the preferred resume path because the first HLS generation is created at the requested position instead of creating a generation at zero and immediately replacing it with PATCH:
+Minimal request (`preferences.mode` is required):
 
 ```json
 {
   "media_id": "path:/Movies/Example.mkv",
+  "preferences": { "mode": "direct" }
+}
+```
+
+A transformed session may also include `seek_ms` in the initial POST. This is the preferred resume path because the first HLS generation is created at the requested position instead of creating a generation at zero and immediately replacing it with PATCH. `remux` and `transcode` also need `preferences.container` (`fmp4` or `mpegts`), or the session is refused with `400 choice_required`, `choice: container`:
+
+```json
+{
+  "media_id": "path:/Movies/Example.mkv",
+  "preferences": { "mode": "remux", "container": "fmp4" },
   "seek_ms": 5040000
 }
 ```
@@ -569,7 +582,7 @@ The response separates requested preferences, resolved playback, original source
     "can_change_quality": true
   },
   "trace_id": "a1b2c3d4",
-  "account": { "sessions": 1, "max_sessions": 32 }
+  "account": { "sessions": 1, "max_sessions": 32, "transcodes": 0, "max_transcodes": 2 }
 }
 ```
 
@@ -581,7 +594,7 @@ The server does what it is told. It does not change the mode a client asked for,
 
 Three flat fields on the session payload, present on create and on every `PATCH`, all milliseconds on the title's timeline:
 
-- **`seek_ms`** - where the generation's media actually begins: the first sample the client receives. This is exactly what the field has always meant, so a client that reads only it is unaffected.
+- **`seek_ms`** - where the generation's media actually begins: the first sample the client receives.
 - **`seek_offset_ms`** - how far into that generation the requested position sits.
 - **`seek_requested_ms`** - the position the server honoured, after clamping to `[0, duration - 1 ms]`.
 

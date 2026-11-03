@@ -1,7 +1,7 @@
 # Macha node configuration.
 #
 # One file per node. Paths, network.advertise and network.failure_domain are
-# per node; the cluster key and the dht section must match on every node.
+# per node; the cluster key must match on every node.
 #
 # Create the state, cache and storage directories before starting. Storage
 # paths are never created: a disk that failed to mount must not become a
@@ -37,6 +37,10 @@ runtime:
   control_memory_reserve_bytes: 64M
   viewer_memory_reserve_bytes: 192M
   loader_memory_reserve_bytes: 64M
+  # Headroom only inbound RPC frame reassembly may use, so a peer's
+  # confirmation can always be received. The four reserves together must fit
+  # in retained_memory_bytes.
+  reassembly_memory_reserve_bytes: 32M
 
 # DATA holds media extents, artwork and other immutable objects. The metadata
 # store has its own quota, so a full DATA backend cannot block it.
@@ -235,7 +239,7 @@ network:
     enabled: false
     timeout_ms: 3000
 
-# Cluster policy; must match on every node. Any node accepts a write on its
+# Cluster policy. Any node accepts a write on its
 # own. replicas is the DATA copy count repair converges to. write_copies and
 # metadata_write_copies are the copies sought before a write returns: with
 # that many nodes present it returns on that many, with fewer it returns on
@@ -248,6 +252,8 @@ dht:
   # A full, offline or stalled owner falls through to the next candidate.
   write_copies: 1
   write_stall_ms: 2500
+  # 4M suits small boards; the built-in default is 16M. Fixed once the
+  # namespace exists.
   extent_size: 4M
   # Blocking DATA work in flight, by bytes, with a reserve ingest and
   # maintenance cannot use. Control traffic does not count against it.
@@ -413,7 +419,7 @@ catalogue:
     # control lane (health, status, sessions, users), so a node busy serving
     # media still answers status.
     workers: 16
-    control_workers: 2
+    control_workers: 4
     # Open connections. An idle connection costs a descriptor, not a thread.
     max_connections: 1024
     # Requests queued for a worker before the server answers 503.
@@ -558,6 +564,14 @@ streaming:
   # session_idle_ms.
   transcode_entitlement_idle_ms: 300000
   startup_timeout_ms: 15000
+  # An async start fails only when its progress has not moved for
+  # startup_no_progress_ms; a start long-poll waits at most start_wait_max_ms;
+  # a failed async start stays readable for start_failed_retention_ms.
+  startup_no_progress_ms: 15000
+  start_wait_max_ms: 25000
+  start_failed_retention_ms: 60000
+  # Sessions of one account that may hold a transcode at once; 0 disables it.
+  max_transcodes_per_account: 2
   segment_duration_ms: 4000
   max_ahead_segments: 8
   segment_memory_bytes: 64M
@@ -589,12 +603,13 @@ streaming:
 #
 # The node that founds the cluster creates two accounts on first start:
 #   root       every role; its password is written to
-#              <state_path>/genesis-root-password (mode 0600). Sign in,
+#              <state_path>/initial-root-password (mode 0600). Sign in,
 #              change it, delete the file.
 #   anonymous  media_viewer; what an unauthenticated visitor is.
 # Neither can be renamed or deleted.
 #
 # Roles:
+#   view_status   cluster and node health; implied by every other role
 #   media_viewer  media, playback, cluster status
 #   importer      torrents and ingest
 #   manager       files, namespaces, catalogue matches, identity resets
@@ -603,7 +618,7 @@ streaming:
 #
 # Offline, with the node stopped:
 #   macha-users <state_path> <cluster.key> passwd root
-#   macha-users /var/lib/macha /etc/macha/cluster.key create tom --roles manager
+#   macha-users /var/lib/macha /etc/macha.key create tom --roles manager
 session:
   # Allow sessions without credentials, bound to the anonymous account. What
   # such a session may do is that account's roles. Turning it off requires a

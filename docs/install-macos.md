@@ -123,9 +123,13 @@ reinstall or upgrade.
 Edit the installed `macha.yaml` for this node. Set its advertised address,
 storage paths, capacities and bootstrap peers (on the first node of a new
 cluster, remove the sample `bootstrap` list, since only a node with no
-bootstrap peers founds the cluster); install the same secret
-cluster-key file on every node. Create all configured state, cache, spool,
-mount and storage directories before starting the server. See
+bootstrap peers founds the cluster). Every node uses the same secret
+cluster-key file: create it once on the first node
+(`umask 077 && openssl rand -hex 32 > macha.key`) and copy it to the others.
+Create `state_path` as an empty directory and create nothing inside it; Macha
+creates the metadata store, cache, spool and mount directories. Create each
+DATA backend `path` as an empty directory, normally a subdirectory of the
+disk's volume: a non-empty directory without Macha's marker is refused. See
 [Configuration](configuration.md) for the complete schema.
 
 ## Run interactively
@@ -187,15 +191,15 @@ Reconfigure and rebuild as your normal user, run the tests, then repeat the
 appropriate `sudo cmake --install` command. Restart the launchd service if it
 is in use.
 
-To remove the installed programs, libraries, plugins and documentation while
-preserving configuration and runtime data:
+To remove the installed programs, libraries, plugins, `macha.yaml.example`
+and documentation while preserving `macha.yaml` and runtime data:
 
 ```bash
 sudo cmake --build build-homebrew --target uninstall
 ```
 
 Use `build-macports` instead when that was the selected build. Unload and
-remove a launchd plist separately if you installed one. Configuration, keys,
+remove a launchd plist separately if you installed one. `macha.yaml`, keys,
 state, cache, spool, mounts and media data are intentionally retained.
 
 ## Package references

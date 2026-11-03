@@ -78,11 +78,9 @@ Forward secrecy protects old transport captures; it does not protect stored encr
 
 ## Metadata safety
 
-Metadata publication is gated on a durability floor, not a majority, so disconnected cohorts of `dht.metadata_min_write_replicas` nodes can each continue writing and produce divergent valid histories. That is an availability decision with a safety consequence: divergence is preserved and reconciled rather than resolved by discarding a branch. Incompatible alternatives become durable first-class conflicts, and no branch is silently chosen. See [Metadata replication and reconciliation](docs/metadata.md).
+Any node accepts a metadata commit on its own; nothing waits for a majority or for peer copies. Separated nodes can therefore each keep writing and produce divergent valid histories. That is an availability decision with a safety consequence: divergence is preserved and reconciled rather than resolved by discarding a branch. When the nodes meet, their heads are merged, incompatible alternatives become durable first-class conflicts, and no branch is silently chosen. See [Metadata replication and reconciliation](docs/metadata.md).
 
-The operational consequence is that a floor well below the cluster size widens the window in which two cohorts write independently. Choose it for the failures you intend to survive, not for the largest number of nodes that can be lost.
-
-Offline ancestry repair (`macha-metadata-repair`) is deliberately narrow: it refuses concurrent or equal clocks, ordinary mergeable histories and insufficient witnesses, so it cannot be used to pick a winner between two live branches.
+`macha-metadata-repair` inspects a stopped replica's heads and can carry an acceptance certificate to a replica that already holds the record. It cannot choose between branches.
 
 Keep cluster policy identical on every node. Failure-domain labels affect placement only; they are trusted operator configuration, not a security boundary.
 
