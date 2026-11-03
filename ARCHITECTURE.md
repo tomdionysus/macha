@@ -20,9 +20,11 @@ This section is how they apply in the node.
 priority within what remains, and law 3 governs everything left. Law 4 takes
 no part in that contention; it is a veto over all three.
 
-**Where each law lives in the node.** The laws are why the node has three
+**Where each law lives in the node.** The laws are why the node has class
 memory reserves rather than one budget (`runtime.control_memory_reserve_bytes`,
-`viewer_memory_reserve_bytes`, `loader_memory_reserve_bytes`), why DATA
+`viewer_memory_reserve_bytes`, `loader_memory_reserve_bytes`, beside
+`reassembly_memory_reserve_bytes`, the headroom inbound RPC frame reassembly
+needs so a peer's confirmation can always be received), why DATA
 execution priority is viewer foreground, viewer read-ahead, user loader, then
 speculative maintenance, why the HTTP server runs separate control and data
 lanes, and why the fast-control RPC executor has a closed allow-list. Each of
@@ -50,13 +52,12 @@ bound is published to the client. Those two cases are documented as such in
 [Streaming](docs/streaming.md); they are the exceptions, and they are not
 precedent for a third.
 
-**Why law 4 exists.** All five kinds of non-recoverable state have been
-observed in this system, several of them on one afternoon: 2026-09-20 produced
-a replica that could not rejoin (a cache smaller than its own unit of work),
-that could not be stopped without `SIGKILL` (a loop that never checked its stop
-token), on hardware that browns out unrecoverably under sustained load and has
-no remote power control. Any one of those is law 4. The combination is why it
-is a law rather than a preference.
+**Why law 4 exists.** Every kind of non-recoverable state it names can
+occur on the hardware Macha runs on: a replica that cannot rejoin because a
+cache is smaller than its own unit of work, a process that cannot be stopped
+without `SIGKILL` because a loop never checks its stop token, and a board that
+browns out under sustained load with no remote power control. Any one of those
+is law 4; together they are why it is a law rather than a preference.
 
 ### The disciplines in the node
 
@@ -76,15 +77,12 @@ is a law rather than a preference.
    recovery path that refuses.
 4. **Compact history out of the hot path.** A metadata snapshot's size is a
    function of the live namespace.
-5. **A bound smaller than one unit of its own work is not a bound.** It
-   arrived on 2026-09-20 from a replica that could not rejoin the cluster: one
-   materialisation of its namespace was ~51 MB against a 128 MiB cache whose two
-   slots were already pinned, so catch-up ran with **zero usable cache**,
-   replayed the delta chain from a snapshot on every single import, and made 28
-   bytes per second of progress while pegging a core. Raising the limit made it
-   577 times faster, but the number was never the point: nothing in the system
-   detected, reported or refused a budget smaller than one unit of its own work,
-   and the counters that said so unambiguously were read by nobody.
+5. **A bound smaller than one unit of its own work is not a bound.** A cache
+   or budget that cannot hold one unit of the work it serves does not slow that
+   work down, it stops it: the work runs with no usable capacity and makes
+   almost no progress while consuming a core. A bound is checked against its
+   unit of work, and a bound that cannot hold one is detected and reported,
+   not left for an operator to find.
 
 ## Design boundary
 
@@ -128,15 +126,15 @@ Each node advertises the configured capacity of its currently eligible authorita
 
 For an object, placement produces preferred owners followed by deterministic fallback candidates. A preferred owner that is offline, stalled or unable to admit the object does not cap the cluster: the writer tries the next candidate.
 
-`dht.min_write_replicas` is the number of durable DATA placements required before foreground publication. `dht.replicas` is the desired converged replica count. When the floor is lower than the target, repair records/converges the missing copies later. Neither cache copies nor failed provisional writes count.
+`dht.write_copies` is the number of DATA copies sought before a write returns. A write returns on the copies that landed once no further node can take one promptly; at least one durable copy always exists before a commit names the object. `dht.replicas` is the desired converged replica count, and repair converges the missing copies later. Neither cache copies nor failed provisional writes count.
 
 Each node may have several local DATA backends. The same stable capacity-aware principle chooses a preferred local backend followed by fallbacks. Backend `limit` controls DATA admission; `reserve_free` additionally preserves real filesystem headroom.
 
 ## CONTROL / metadata
 
-Namespace metadata is an encrypted immutable DAG replicated by every node. A mutation is first stored as the exact same immutable commit on `dht.metadata_min_write_replicas` distinct active replicas; only then is an acceptance certificate for that commit persisted. Every replica counts equally towards that floor, and reaching it is the whole of acceptance: the commit is complete without a vote or a distributed prepare/commit round. A receiving replica may store a commit regardless of its current head. Accepted heads are a set rather than a singleton, so disconnected cohorts may create independently valid branches. Replicas exchange accepted-head certificates and compact ancestry, reconcile divergent maximal heads by common-ancestor semantic merge, and materialise incompatible namespace/catalogue alternatives as durable conflicts rather than overwriting a branch.
+Namespace metadata is an encrypted immutable DAG replicated by every node. A commit is accepted on the committing node alone, once that node durably holds the commit and its acceptance certificate, without a vote or a distributed prepare/commit round; it is then offered to every node present, and repair delivers it to nodes that were away. `dht.metadata_write_copies` is the number of copies a merge commit seeks before it is accepted. A receiving replica may store a commit regardless of its current head. Accepted heads are a set rather than a singleton, so separated nodes may create independently valid branches. Replicas exchange accepted-head certificates, reconcile divergent heads by a deterministic merge computed from the two heads alone (see [Metadata](docs/metadata.md)), and materialise incompatible namespace/catalogue alternatives as durable conflicts rather than overwriting a branch.
 
-A commit's record either inlines the serialised namespace or, on a node re-rooted with `macha-namespace-migrate`, carries the root of a content-addressed Merkle tree over the namespace, keyed by path. An ordinary commit then rewrites the leaf holding the changed path and the branches above it, and the tree's nodes must reach the metadata write floor before a commit may name its root. A reconciliation merge materialises its three branches and re-roots the result.
+A commit's record either inlines the serialised namespace or, on a node re-rooted with `macha-namespace-migrate`, carries the root of a content-addressed Merkle tree over the namespace, keyed by path. An ordinary commit then rewrites the leaf holding the changed path and the branches above it; the tree's new nodes are durably held by the committing node before a commit may name its root, and are sent to the other nodes after it. A reconciliation merge works on what differs between the two trees, or materialises both heads when one is inline, and re-roots the result.
 
 Content-addressed control objects are stored separately from DATA. Their principal users are the namespace tree and the media catalogue. DATA quota exhaustion must not prevent a metadata replica from storing control objects required to represent committed metadata.
 
@@ -150,9 +148,9 @@ A catalogue mutation:
 
 1. constructs only the affected shard contents and a successor manifest;
 2. verifies newly referenced artwork DATA exists through the ordinary distributed store;
-3. durably stores changed control objects on the metadata write floor;
-4. publishes an immutable namespace commit referencing the new manifest root to the metadata write floor;
-5. leaves missing active-replica copies as control convergence debt.
+3. durably stores changed control objects on the committing node;
+4. commits an immutable namespace commit referencing the new manifest root on that node;
+5. sends the control objects and the commit to the other nodes afterwards, leaving any node not reached as control convergence debt.
 
 Maintenance subsequently converges the current manifest and referenced shards onto every active metadata replica. Obsolete control objects are reclaimed by a dedicated control-store reachability sweep after the configured grace period.
 
@@ -177,7 +175,7 @@ No DHT, catalogue or metadata structure contains pack filenames, offsets or leng
 ## Durability domains
 
 Authoritative DATA backends on the same physical filesystem share a durability domain. Deferred writes receive generation/backend-incarnation tickets. Publication waits for the exact required placements to cross a physical durability barrier before committing references into namespace metadata. Linux uses `syncfs()` for the physical domain cut; supported fallback platforms use conservative fsync behavior.
-Accepted object references also install durable causal retention claims on the physical DATA/CONTROL copies before metadata acceptance. Claimed copies cannot be evicted or garbage-collected; if corruption removes one, retention itself drives bounded background repair. GC remains active during partitions: each node compares its local claims with its sole accepted head and may release only claim dots causally observed by that head. Claims created by an unseen/concurrent branch are incomparable or newer and therefore survive automatically. Unclaimed staging and extra copies remain collectible without any global branch survey.
+Accepted object references also install durable causal retention claims. Before a commit is accepted, the committing node claims every object it holds that the commit references; an object the commit introduces that this node does not hold is claimed on a node present, or the commit is refused. The other holders receive their claims after acceptance. Claimed copies cannot be evicted or garbage-collected; if corruption removes one, retention itself drives bounded background repair. GC remains active during partitions: each node compares its local claims with its sole accepted head and may release only claim dots causally observed by that head. Claims created by an unseen/concurrent branch are incomparable or newer and therefore survive automatically. Unclaimed staging and extra copies remain collectible without any global branch survey.
 
 Strict object writes use the same durability machinery with immediate scheduling. Deletion is reachability-safe and may be lazily made physically durable because a lost unlink can only preserve garbage, not remove a referenced object.
 
@@ -209,13 +207,13 @@ External metadata providers are enrichment inputs, not recovery dependencies.
 
 ## Maintenance
 
-Maintenance is low priority and bounded. It performs replica repair, local backend rebalance, reachability GC, catalogue control convergence/GC and scheduled integrity scrub. Foreground playback, mounted MachaDFS traffic and loader work (ingest and acquisition) suppress speculative work.
+Maintenance is low priority and bounded. It performs replica repair, local backend rebalance, reachability GC, catalogue control convergence/GC and scheduled integrity scrub. Foreground playback, mounted MachaDFS traffic and loader work (ingest and acquisition) pace repair to a small share (`maintenance.repair_weight`) and suspend GC, rebalance and scrub.
 
 Logical GC authority is reachability from accepted metadata; physical deletion is additionally fenced by durable local retention claims. DATA and CONTROL have separate physical sweeps. Newly orphaned/unreferenced objects remain protected by the configured grace period, and a physical copy cannot be reclaimed while any local causal claim remains. This lets GC make progress during partitions without deleting data protected by a concurrent accepted branch.
 
 ## Network model
 
-Peers use separate CONTROL and DATA transport lanes. Object payloads travel on DATA; health/membership and metadata/control RPCs travel on CONTROL, isolated from bulk DATA scheduling. A node that accepts no inbound connections (`network.inbound_capable`) keeps both lanes dialled to every capable peer itself and is never dialled; a peer that needs a lane asks for it over the CONTROL session that node opened. The cluster protocol version is 21; a peer offering any other version fails the handshake rather than negotiating down, so a cluster is homogeneous in protocol and a protocol change is a rolling upgrade.
+Peers use separate CONTROL and DATA transport lanes. Object payloads travel on DATA; health/membership and metadata/control RPCs travel on CONTROL, isolated from bulk DATA scheduling. A node that accepts no inbound connections (`network.inbound_capable`) keeps both lanes dialled to every capable peer itself and is never dialled; a peer that needs a lane asks for it over the CONTROL session that node opened. The cluster protocol version is 23; a peer offering any other version fails the handshake rather than negotiating down, so a cluster is homogeneous in protocol and a protocol change is a rolling upgrade.
 
 ## Correctness gates
 
@@ -223,7 +221,7 @@ These are the invariants the storage implementation exists to preserve. Each is 
 
 - R=1 capacity aggregates eligible heterogeneous nodes rather than collapsing to the smallest node;
 - a full preferred owner falls through deterministically;
-- publication never occurs below `min_write_replicas`;
+- publication never names an object before at least one durable copy exists, and `write_copies` copies are sought;
 - repair converges toward `replicas` after nodes/capacity return;
 - DATA exhaustion cannot block control metadata commits;
 - artwork follows DATA placement and remains remotely readable from a full node;
@@ -239,11 +237,13 @@ These are the invariants the storage implementation exists to preserve. Each is 
 | --- | --- |
 | `subsystem/` | Subsystem interface, plugin ABI, registry and supervisor |
 | `storage/` | Local stores, storage pool, durability domains, I/O pressure, block cache, retention |
+| `contract/` | Interfaces between subsystems: gates, the absence horizon, the metadata view and the object store |
+| `ledger/` | Held and retention ledgers, the object trie and reference counts |
 | `cluster/` | Node runtime, RPC transport, membership, placement, replica selection, distributed store, telemetry, UPnP |
 | `metadata/` | Metadata snapshots and history, metadata manager, namespace tree and control store |
 | `auth/` | Users, roles and sessions |
 | `http/` | HTTP server and response compression |
-| `api/` | HTTP API endpoints (status, manage, catalogue, acquisition, session, users, web) |
+| `api/` | HTTP API endpoints (status, manage, catalogue, files and availability, acquisition, session, users, web) |
 | `filesystem/` | Filesystem model, hydration, macOS name normalisation |
 | `fuse/` | FUSE frontend in core, mount adapter and plugin |
 | `media/` | Media engine, containers, segments, timestamps, VOD, subtitles, FFmpeg logging and tag probing |
