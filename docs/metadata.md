@@ -44,7 +44,7 @@ A node writes its mutations under an author id, which is its node id to begin wi
 A node keeps its author id, the sequences it has reserved and the highest it has had accepted in `<state_path>/metadata/author.meta`. It takes a new author id and starts again at 1 whenever it cannot show that its chain continues:
 
 - the head it is about to extend lacks a mutation it had accepted;
-- its head set was replaced by a recovery from the cache seed or by a re-root;
+- its head set was replaced by a recovery from the cache seed;
 - its author record is gone while a head shows that it authored before.
 
 Each head carries a clock, the highest sequence it has incorporated per author, and a legacy clock, the clock as it stood when the head's lineage first recorded provenance.
@@ -151,9 +151,7 @@ tree's shape.
 
 A namespace is a content-addressed Merkle tree keyed by path from its first
 commit: the metadata record carries a 32-byte `namespace_root` and no entry
-map, so no record, replay or checkpoint grows with the library. A record that
-still inlines its namespace as an entry map is re-rooted onto the tree with
-`macha-namespace-migrate` (see the operations guide).
+map, so no record, replay or checkpoint grows with the library.
 
 - Tree nodes live in the control object store and follow the CONTROL rules:
   a commit may reference a new root once this node holds every tree node it

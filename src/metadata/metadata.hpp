@@ -712,14 +712,6 @@ class MetadataReplica {
     bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool install_committed_delta(uint64_t, const Hash256&, std::span<const uint8_t>,
                                  const MetadataRecord&);
-    // Installs `record` as the sole accepted committed head, quarantining the
-    // prior state as recover_from_seed does. Unlike a seed, this grants
-    // authority, which comes from the operator re-rooting every node onto the
-    // same converged record. Only correct offline, cluster stopped, on every
-    // node; `macha-namespace-migrate` is the only caller. `witnesses` becomes
-    // the certificate's replica list and must cover the write floor.
-    bool install_migrated_head(const MetadataRecord&, const std::vector<NodeId>& witnesses,
-                               const std::string& reason);
     bool seed(const MetadataRecord&);
     bool remember_committed(const MetadataRecord&);
     bool remember_current_committed(uint64_t, const Hash256&);
