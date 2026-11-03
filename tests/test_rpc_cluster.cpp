@@ -7531,7 +7531,8 @@ MACHA_TEST("rpc_cluster", test_a_ping_is_admitted_behind_a_full_queue_of_large_m
 
 // A connection holds at most max_pending_rpc_requests calls awaiting replies;
 // the next is refused and the refusal says why, rather than reporting a dead
-// link; the budget returns as replies arrive.
+// link; every admitted call is answered, though the burst of replies is twice
+// what the server's outbound queue holds; the budget returns as replies arrive.
 MACHA_TEST("rpc_cluster", test_a_connection_holds_no_more_than_its_pending_reply_budget) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -7578,12 +7579,31 @@ MACHA_TEST("rpc_cluster", test_a_connection_holds_no_more_than_its_pending_reply
     }
     CHECK(refusal.find("pending reply limit") != std::string::npos);
 
-    // Not asserted: that every admitted call is answered. At 0.91.2 a burst of
-    // more than 256 replies overflows the server's session queue and the
-    // excess is dropped unanswered (Dannan inventory, transport findings).
+    // Released at once: each call gets its reply, or a try-later refusal where
+    // the outbound queue had no room for the reply.
     gate.open();
+    size_t replies = 0;
+    size_t refusals = 0;
+    const auto answered_by = std::chrono::steady_clock::now() + 20s;
+    for (auto& call : pending) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            answered_by - std::chrono::steady_clock::now());
+        REQUIRE(call.wait_for(std::max(left, 0ms)) == std::future_status::ready);
+        const auto reply = call.get();
+        if (reply.message.type == MessageType::bool_reply) {
+            ++replies;
+            continue;
+        }
+        const auto refusal = rpc_refusal(reply.message);
+        REQUIRE(refusal.has_value());
+        CHECK(refusal->status == 503);
+        CHECK(refusal->code == "transport_busy");
+        CHECK(rpc_try_later(*refusal));
+        ++refusals;
+    }
+    CHECK(replies + refusals == max_pending_rpc_requests);
+    CHECK(replies >= max_peer_outbound_messages - small_outbound_reserve_messages);
     CHECK(server.work_stats().rejected_jobs == 0);
-    // With a deadline, so a reply dropped as above is retried, not awaited.
     CHECK(wait_until([&] {
         try {
             return client

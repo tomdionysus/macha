@@ -1,5 +1,18 @@
 # Current release
 
+## 0.91.3: every admitted request is answered
+
+A burst of replies larger than a connection's outbound queue (256
+messages) no longer loses the excess. A caller may await 512 replies on
+one connection, so a burst released together overflowed the queue: the
+reply was refused, its fallback error was refused too, and the caller
+waited for its no-progress deadline, or for ever without one. A reply the
+queue or the retained-memory budget cannot take is now replaced by
+`error_reply(503, "transport_busy")`, a try-later answer, which may pass
+the queue's message limit by one per awaitable reply; past that the
+connection is closed, which answers every call on it. A reply refused on a
+dialled connection no longer closes that connection.
+
 ## 0.91.2: one file of an import at a time
 
 A file in an ingest job can be paused, resumed or cancelled on its own:
