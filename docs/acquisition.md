@@ -109,29 +109,34 @@ POST /api/v1/ingest/jobs/{id}/clear
 {
   "path": "/mnt/import/Some Film (1999)",
   "display_name": "Some Film",
-  "delete_source_on_clear": false
+  "delete_source_on_clear": false,
+  "node_id": null
 }
 ```
 
 | field | required | meaning |
 |---|---|---|
-| `path` | yes | a file or directory on the node that receives the request |
+| `path` | yes | a file or directory on the node that runs the job |
 | `display_name` | no | defaults to the last component of the resolved path |
 | `delete_source_on_clear` | no | overrides `ingest.cleanup.delete_external_source_on_clear` for this job. `remove_source` is accepted as an alias |
+| `node_id` | no | the node that runs the job, which reads `path` on its own filesystem. Absent or null is the node that receives the request |
 
-The job is created on the node that receives the request, because the path is that node's.
+A job for another node is passed to it; it checks `path` against its own `ingest.source_roots` and runs the job.
 
-The response is `202`:
+The response is `202`, with the node that runs the job:
 
 ```json
-{"status": "ok", "id": "4f1c0e9a2b7d4c6e8a1f3b5d7c9e0a12"}
+{"status": "ok", "id": "4f1c0e9a2b7d4c6e8a1f3b5d7c9e0a12", "node_id": "a3c95e0f7d2b41e8b6c4d0f19e7a2b58"}
 ```
 
-| status | code | when |
-|---|---|---|
-| 400 | `bad_request` | `path` is missing or empty; ingest is disabled on this node; the resolved path is outside `ingest.source_roots`; the path does not exist |
+| status | code | reason | when |
+|---|---|---|---|
+| 400 | `bad_request` | | `path` is missing or empty; `node_id` is not 32 hex characters; ingest is disabled on the running node; the resolved path is outside its `ingest.source_roots`; the path does not exist there |
+| 409 | `placement_failed` | `node_not_member` | `node_id` is not an active member of the cluster |
+| 409 | `placement_failed` | `node_not_ingest_capable` | `node_id` runs a release before 0.91.1 |
+| 503 | `node_unreachable` | | `node_id` is a member but could not be asked; try later |
 
-These four share one code; only the message tells them apart.
+The `400`s share one code; only the message, the running node's own, tells them apart.
 
 ### List and inspect
 
@@ -655,7 +660,7 @@ The payload is moved into the staging area's `.trash` at once and deleted in the
 - **Inspecting** (`GET .../jobs/{id}`): answered from the view; `404 not_found` if no node the answering node has heard from owns it. A job placed on another node very recently is known at once when the add went through the answering node, and otherwise within `refresh_interval_ms`.
 - **Acting** (`POST .../jobs/{id}/{action}`): the action runs on the owning node, found in the view, and the job returned is that node's answer. `503 node_unreachable` if the owner cannot be reached.
 - `node_id` on every job object names the owner.
-- **Placement**: an ingest job is always created on the node that received the `POST`, because its `path` is that node's. A torrent job is claimed by a torrent-capable node, or only by `node_id` when it is pinned.
+- **Placement**: an ingest job runs on the node named by `node_id`, or on the node that received the `POST` when none is named, because its `path` is that node's. A torrent job is claimed by a torrent-capable node, or only by `node_id` when it is pinned.
 
 ## When the torrent subsystem is not running
 
