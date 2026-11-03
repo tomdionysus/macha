@@ -263,7 +263,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_unknown_keys) {
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_example_configuration_loads) {
-    // Every key in the shipped example must be one the loader reads.
+    // The shipped example is installed as the default configuration: the
+    // loader accepts it whole, every key and every cross-key rule.
     const auto example = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "macha.yaml.example";
     REQUIRE(std::filesystem::exists(example));
     std::string message;
@@ -272,9 +273,9 @@ MACHA_FAST_TEST("runtime_dependencies", test_example_configuration_loads) {
     } catch (const std::exception& error) {
         message = error.what();
     }
-    CHECK(message.find("unknown configuration key") == std::string::npos);
     if (!message.empty())
         std::cerr << "macha.yaml.example: " << message << "\n";
+    CHECK(message.empty());
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {

@@ -28,13 +28,13 @@ brew update && brew install cmake pkgconf openssl@3 curl yaml-cpp \
 brew install --cask macfuse
 ```
 
-libtorrent-rasterbar (2.0 or later) and miniupnpc are optional: without them the BitTorrent acquisition plugin and UPnP port mapping are simply not built. Everything else is required. Do not install a second Boost alongside the one your libtorrent-rasterbar was built with: the torrent plugin compiled against mismatched Boost headers can crash at runtime. Debian 12 and Ubuntu 22.04 ship FFmpeg versions that are too old. For Arch, MacPorts, the FFmpeg version check and the full installation procedure, see [install-linux.md](install-linux.md) and [install-macos.md](install-macos.md).
+libtorrent-rasterbar (2.0 or later) and miniupnpc are optional: without them the BitTorrent acquisition plugin and UPnP port mapping are simply not built. FUSE 3 or macFUSE builds the mount plugin; without it the node runs with no mount. Everything else is required. Do not install a second Boost alongside the one your libtorrent-rasterbar was built with: the torrent plugin compiled against mismatched Boost headers can crash at runtime. Debian 12 and Ubuntu 22.04 ship FFmpeg versions that are too old. For Arch, MacPorts, the FFmpeg version check and the full installation procedure, see [install-linux.md](install-linux.md) and [install-macos.md](install-macos.md).
 
 Then:
 
 ```bash
 cmake -S . -B build
-cmake --build build -j
+cmake --build build --parallel
 ./run-tests.sh build
 ```
 
@@ -181,6 +181,8 @@ curl http://127.0.0.1:7440/api/v1/health
 
 Node 1 has no bootstrap peers, so it founds the cluster and creates the `root` and `anonymous` accounts on first start. Root's generated password is written to `demo/node1/state/initial-root-password` (mode 0600, owned by the user that started the node). Read it, sign in, change the password and delete the file. Node 2 joins and receives the accounts by replication. See [Management](management.md#bootstrapping-and-recovery).
 
-With `replicas: 1`, the 2 GiB node does not cap the 8 GiB node. DATA objects have one desired authoritative owner and may fall through to the other node when their preferred owner cannot admit them. With `metadata_write_copies: 2`, a metadata commit is on both nodes when the write returns while both are running; with one stopped, the other keeps reading and writing and repair delivers what the stopped node missed when it returns.
+With `replicas: 1`, the 2 GiB node does not cap the 8 GiB node. DATA objects have one desired authoritative owner and may fall through to the other node when their preferred owner cannot admit them. A metadata commit is accepted on the node that takes it and sent to the other at once; with one node stopped, the other keeps reading and writing, and repair delivers what the stopped node missed when it returns.
 
 For a production cluster, choose replica/failure-domain policy according to the failures you intend to survive; do not infer production durability from this R=1 example.
+
+To remove the demo, stop both nodes, then `rm -rf demo`. A node run as root on Linux leaves its mount directory immutable (`chattr +i`) after it stops; clear that first with `sudo chattr -i demo/node1/mount demo/node2/mount`.

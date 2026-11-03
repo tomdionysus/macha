@@ -121,8 +121,9 @@ sudo cmake --install build
 With the `/usr` prefix, this installs:
 
 - `/usr/bin/macha`
-- `/usr/bin/macha-users`, `macha-recover`, `macha-metadata-dump`,
-  `macha-metadata-repair` and `macha-namespace-migrate` (administration tools)
+- `/usr/bin/macha-users`, `macha-metadata-dump`, `macha-metadata-repair` and
+  `macha-namespace-migrate` (administration tools), and `macha-recover`, which
+  prints the procedure for resetting root's password
 - `/usr/lib/macha/libmacha_core.so`
 - `/usr/lib/macha/plugins/libmacha-fuse.so` (when FUSE 3 was found)
 - `/usr/lib/macha/plugins/libmacha-torrent.so` (when libtorrent was found)
@@ -142,14 +143,34 @@ The installer prints the actual configuration and service paths. An existing
 Edit `/etc/macha/macha.yaml` for this node. In particular, set its advertised
 address, storage paths, capacities and bootstrap peers; on the first node of
 a new cluster, remove the sample `bootstrap` list, since only a node with no
-bootstrap peers founds the cluster. Copy the same secret
-cluster-key file to every node, but keep node-local paths and addresses local.
-The sample configuration uses `/etc/macha.key`.
+bootstrap peers founds the cluster. Keep node-local paths and addresses
+local.
 
-Create every configured state, cache, spool, mount and storage directory
-before starting Macha. Storage directories are deliberately not auto-created:
-a missing disk must not silently become a directory on the root filesystem.
-See [Configuration](configuration.md) for the complete schema.
+Every node uses the same secret cluster-key file; the sample configuration
+reads `/etc/macha.key`. Create it once, on the first node, and copy that file
+to every other node:
+
+```bash
+sudo sh -c 'umask 077 && openssl rand -hex 32 > /etc/macha.key'
+```
+
+Create `state_path` as an empty directory: a non-empty one without Macha's
+layout marker is refused. Create nothing inside it; Macha creates the metadata
+store, cache, spool and mount directories itself.
+
+Create each DATA backend `path` as an empty directory, normally a subdirectory
+of the disk's mount point such as `/mnt/disk1/data`. A disk's root is refused,
+because it is not empty (an ext4 root holds `lost+found`), and the backend
+stays offline. Storage directories are deliberately not auto-created: a disk
+that failed to mount must not silently become a directory on the root
+filesystem. See [Configuration](configuration.md) for the complete schema.
+
+On start Macha makes `fuse.mount_path` immutable (`chattr +i`) while no mount
+is present, and the flag stays set after it stops. Anything that writes into
+the mount must wait until it is mounted, for example with
+`until mountpoint -q /srv/media; do sleep 2; done`; `After=macha.service` is
+not enough, since the service starts before the mount is up. Run `chattr -i`
+on the directory before removing it.
 
 ## Start the service
 
@@ -206,8 +227,9 @@ sudo cmake --build build --target uninstall
 sudo systemctl daemon-reload
 ```
 
-Uninstall removes the installed programs, libraries, plugins, systemd unit
-and documentation, but deliberately preserves configuration, keys, state,
+Uninstall removes the installed programs, libraries, plugins, systemd unit,
+`macha.yaml.example` and documentation, but deliberately preserves
+`macha.yaml`, keys, state,
 cache, spool, mounts and media data.
 
 ## Distribution package references

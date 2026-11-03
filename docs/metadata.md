@@ -88,7 +88,7 @@ The commit-store/acceptance model is implemented directly:
 - same-generation sibling discovery invalidates metadata caches through an observation epoch rather than relying solely on numeric generation advancement;
 - virgin founders construct the same deterministic generation-2 root and publish it through the ordinary immutable-commit path, so any founder may publish it;
 - non-destructive DATA repair can continue from an accepted local branch while reconciliation is pending;
-- accepted metadata references install durable causal retention claims on the physical DATA/CONTROL copies before publication; retention claims themselves drive bounded repair if a claimed copy is missing or corrupt;
+- accepted metadata references install durable causal retention claims: before acceptance on the committing node (and, for an object it does not hold, on a node present), and on the other holders after it; retention claims themselves drive bounded repair if a claimed copy is missing or corrupt;
 - GC remains active during partitions. Each node releases only locally-held claims for objects absent from its sole accepted head, and only claim dots dominated by that head's causal mutation clock. An unseen/concurrent branch which touched the object carries a newer/incomparable claim dot and therefore remains protected without any global branch survey. An object's bytes go only once this node has itself seen it unreferenced and unclaimed for `maintenance.garbage_grace_ms`.
 
 Validated historical materializations are shared and bounded. An uncached
@@ -174,12 +174,12 @@ form; a tree-backed node stays tree-backed.
 
 ## Torrent requests
 
-A snapshot also carries `torrent_requests`: the torrents the cluster has been asked to download, one record per request, with who has claimed it, what the operator wants and how far it has got (see the acquisition guide). SM15 is the SM13 layout with every section present followed by the requests; SM16 is SM14 followed by the requests; DLT9 is DLT8 followed by the requests a mutation rewrote and the tombstones it erased. SM15, SM16 and DLT9 are written only by a head with torrent requests and no legacy clock; a head with a legacy clock writes SM17 or SM18, and DLT10 where a mutation carries a dot.
+A snapshot also carries `torrent_requests`: the torrents the cluster has been asked to download, one record per request, with who has claimed it, what the operator wants and how far it has got (see the acquisition guide). SM15 is the SM13 layout with every section present followed by the requests; SM16 is SM14 followed by the requests; DLT9 is DLT8 followed by the requests a mutation rewrote and the tombstones it erased. SM15, SM16 and DLT9 are written only by a head with torrent requests and no legacy clock; a head with a legacy clock writes SM17 or SM18, and DLT10 where a mutation carries a dot. A tree-backed head that names tombstone batches is written as SM19 whatever its clock, and its deltas as DLT11.
 
 Reconciliation joins the collection per request instead of recording conflicts: every field has a deterministic merge (cancel is final; a later claim epoch wins; within one epoch a request never moves backwards; removal wins), so the merge is commutative, associative and idempotent and never needs an operator. Removed requests stay as tombstones for seven days so a branch that has not seen the removal cannot bring one back.
 
-SM17, SM18 and DLT10 belong to cluster protocol 23, which every node in the cluster must run.
+SM17, SM18, SM19, DLT10 and DLT11 belong to cluster protocol 23, which every node in the cluster must run.
 
 ## Clocks and dots in the encodings
 
-SM17 is SM16 (tree-backed) and SM18 is SM15 (inline map), each followed by the legacy clock and the catalogue root's dot. DLT10 is DLT9 with the dot of each append, the legacy clock when a mutation first sets it, and the catalogue root's dot when a mutation moves the root. A head that carries a legacy clock is written as SM17 or SM18, with or without torrent requests; a delta is written as DLT10 only when it carries one of those values. A conflict record notes which alternative is in place.
+SM17 is SM16 (tree-backed) and SM18 is SM15 (inline map), each followed by the legacy clock and the catalogue root's dot. DLT10 is DLT9 with the dot of each append, the legacy clock when a mutation first sets it, and the catalogue root's dot when a mutation moves the root. A head that carries a legacy clock is written as SM17 or SM18, with or without torrent requests, unless it names tombstone batches (SM19); a delta is written as DLT10 only when it carries one of those values. A conflict record notes which alternative is in place.

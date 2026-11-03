@@ -9,9 +9,9 @@
 For one unmatched record:
 
 - `GET /api/v1/manage/unmatched/{id}` returns the failure plus local filename/tag probe hypotheses;
-- `GET /api/v1/manage/unmatched/{id}/matches?q=...` searches existing catalogue leaf items as prospective manual bindings;
-- `POST /api/v1/manage/unmatched/{id}/match` with `{catalogue_item_id}` binds the immutable media identity to an existing movie, episode or track (`400 not_playable_item` for any other kind); with `{ref}` it matches to a provider record instead (see below);
-- `POST /api/v1/manage/unmatched/{id}/manual` creates normal manual catalogue metadata (including show/season or artist/album hierarchy as required) and binds the file (see below);
+- `GET /api/v1/manage/unmatched/{id}/matches?q=...&limit=...` searches existing catalogue leaf items as prospective manual bindings and answers `{query, matches}`; `limit` is 0..50 (default 12, otherwise `400 bad_limit`);
+- `POST /api/v1/manage/unmatched/{id}/match` with `{catalogue_item_id}` binds the immutable media identity to an existing movie, episode or track and answers `{"status": "ok", "item"}` (`400 not_playable_item` for any other kind, `404 catalogue_item_not_found` for an unknown item); with `{ref}` it matches to a provider record instead (see below);
+- `POST /api/v1/manage/unmatched/{id}/manual` creates normal manual catalogue metadata (including show/season or artist/album hierarchy as required), binds the file and answers `201` with `{leaf_item_id, items}` (see below);
 - `POST /api/v1/manage/unmatched/{id}/retry` reopens normal scanner work at manual-rescan priority (`202`);
 - `DELETE /api/v1/manage/unmatched/{id}` deletes the media file through MachaDFS and clears the exception record.
 
@@ -134,7 +134,7 @@ next commit or merge), or an operator resolves it here. A resolution is
 itself a change of the subject, even when it keeps the value in place, so a
 head that has not seen it does not bring the conflict back.
 
-- `GET /api/v1/manage/metadata/conflicts` → `{"generation": N, "conflicts": [{id, kind: "namespace_entry"|"catalogue_root", key, installed: "left"|"base", left_head, right_head, base, left, right}]}` - `installed` names the alternative the namespace holds until the conflict is decided. It is `left` for a conflict recorded by a merge, whose `left` is the value in place, `right` the other alternative and `base` `null`. It is `base` only for a record made by an older build, whose `base` is the common-ancestor value then in place. For a namespace entry `base`/`left`/`right` are `{type, size, mtime_ns, version, extents}` or `null` (absent); for a catalogue root they are object ids or `null`. `left_head` and `right_head` are all zeros on a namespace-entry conflict recorded by a merge.
+- `GET /api/v1/manage/metadata/conflicts` → `{"generation": N, "conflicts": [{id, kind: "namespace_entry"|"catalogue_root", key, installed: "left"|"base", left_head, right_head, base, left, right}]}` - `installed` names the alternative the namespace holds until the conflict is decided. It is `left` for a conflict recorded by a merge, whose `left` is the value in place, `right` the other alternative and `base` `null`. It is `base` on a record whose `base` is the value in place. For a namespace entry `base`/`left`/`right` are `{type, size, mtime_ns, version, extents}` or `null` (absent); for a catalogue root they are object ids or `null`. `left_head` and `right_head` are all zeros on a namespace-entry conflict recorded by a merge.
 - `POST /api/v1/manage/metadata/conflicts/{id}/resolve?choice=left|right|base` - installs that alternative for the subject and drops the record in one metadata commit; `choice=base` on a record whose `base` is `null` removes the path, or clears the catalogue root (`204`; `409 not_standing` if the conflict is no longer standing; `400 bad_choice`). Both routes answer `503 metadata_unavailable` while no metadata snapshot is available.
 
 `diagnostics.metadata.{conflicts, namespace_conflicts, catalogue_conflicts}`
