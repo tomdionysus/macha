@@ -4,7 +4,7 @@ Macha uses one YAML configuration file per node. Node-local paths, endpoints and
 
 Every key in the file must be one Macha reads. A node refuses to start on a file carrying any other key, and names each one with its full path, for example `storage.data.backends[0].reserve`. A `SIGHUP` reload of such a file is refused and the running configuration is kept. Invalid values are refused the same way.
 
-`storage` is a mapping of storage classes. A configuration using a top-level `storage: [ ... ]` sequence is rejected.
+`storage` is a mapping of storage classes.
 
 ## Required identity and paths
 
@@ -17,7 +17,7 @@ fuse:
 
 `state_path` contains node identity, namespace metadata state, maintenance state and-unless overridden-the metadata control-object store. `key_file` must contain the same secret material on every node in a cluster. `fuse.mount_path` is optional; omit it to run without a FUSE mount.
 
-A fresh state namespace is required. Non-empty unversioned state is refused.
+A `state_path` holding Macha state with no layout marker is refused; start from an empty directory.
 
 ```yaml
 service_startup_no_progress_ms: 120000
@@ -54,6 +54,7 @@ runtime:
   control_memory_reserve_bytes: 64M
   viewer_memory_reserve_bytes: 192M
   loader_memory_reserve_bytes: 64M
+  reassembly_memory_reserve_bytes: 32M
 ```
 
 `memory_bytes` is the node's memory limit; 0 (the default) is none. It caps
@@ -73,7 +74,7 @@ minute: `memory_limit_bytes`, `memory_budget_bytes` (the parts' total),
 which survive an asynchronous boundary, including FUSE write/operation state,
 RPC queues and active playback fragment stores.
 
-The three reserves are headroom within that total, and they are the
+The reserves are headroom within that total: each must be non-zero, and together they must fit in `retained_memory_bytes`, or the node refuses to start. The control, viewer and loader reserves are and they are the
 [governing laws](principles-and-laws.md#scheduling-laws) expressed as memory: durable
 loader work cannot consume viewer or control headroom (laws 1 and 2), and
 speculative work preserves a loader floor beneath it (law 3). Reconstructible
@@ -81,7 +82,7 @@ caches may borrow otherwise idle capacity only when they can be shed before
 higher-priority admission. Sizing a reserve is therefore a policy decision about
 which class of work is allowed to fail first, not a tuning knob: shrinking
 `viewer_memory_reserve_bytes` to give publication more room is a decision to let
-playback fail under load. These limits govern owned allocations, not the
+playback fail under load. `reassembly_memory_reserve_bytes` (32M) is headroom only inbound RPC frame reassembly may use: publication holds bytes until a peer confirms, and the confirmation is reassembled into the same budget, so without it publication could wait on itself. These limits govern owned allocations, not the
 allocator's RSS bookkeeping or the on-disk FUSE spool.
 
 On Linux/glibc, Macha applies this process-wide allocator arena limit before it
@@ -171,7 +172,7 @@ the namespace. Keep `state_path` on the fastest device, never on a DATA disk.
 
 ```yaml
 dht:
-  replicas: 1
+  replicas: 3
   metadata_write_copies: 2
   write_copies: 1
   write_stall_ms: 2500
@@ -186,7 +187,7 @@ dht:
   data_credit_no_progress_deadline_ms: 120000
 ```
 
-- `replicas`: desired converged authoritative DATA copies.
+- `replicas`: desired converged authoritative DATA copies (default 3). Changing it requires a restart.
 - `write_copies`: durable DATA copies sought before a write returns (default 1); must be `<= replicas`. With that many nodes present and answering, the write is on that many when it returns; with fewer, or once no further node can take a copy promptly, it returns on the copies it has and repair delivers the rest.
 - `metadata_write_copies`: copies of a merge commit sought before it is accepted (default 2), on the same terms. A namespace or catalogue write seeks none before it returns: it is made on the committing node and sent to every node present afterwards. Every node is metadata-capable and any node accepts a write on its own: nothing is refused for lack of peers, and a single node keeps reading and writing. It is not a convergence target; every commit is delivered to every node. Changing it requires a restart.
 - `write_stall_ms`: how long a stalled preferred DATA placement may block before deterministic fallback is attempted. A peer that stalls past it is not waited for once one copy has landed.
@@ -342,9 +343,9 @@ fuse:
   initial_namespace_timeout_ms: 600000
 ```
 
-`allow_other`, `entry_timeout_ms`, `attr_timeout_ms` and `negative_timeout_ms` are also accepted under `filesystem`.
+`allow_other`, `entry_timeout_ms`, `attr_timeout_ms` and `negative_timeout_ms` are also accepted under `filesystem`; the same keys under `fuse` take precedence.
 
-`unmount_if_mounted` controls startup recovery from an unclean daemon exit. When true, Macha inspects the mount table before starting cluster/storage services and removes a mount only if it is identified as Macha/FUSE. An unrelated filesystem at the configured mount path is a hard startup error.
+`unmount_if_mounted` (default false) controls startup recovery from an unclean daemon exit. When true, Macha inspects the mount table before starting cluster/storage services and removes a mount only if it is identified as Macha/FUSE. An unrelated filesystem at the configured mount path is a hard startup error.
 
 When false, any existing Macha mount is a hard startup error.
 
@@ -524,9 +525,9 @@ streaming:
 ```
 
 `streaming.enabled` requires `catalogue.api.enabled`. `max_sessions` is
-1..1024 and must stay above `max_sessions_per_account` (`0` disables the
-per-account bound), or the node-wide limit refuses first and the account cap
-is never reached. Neither transcode limit may exceed `max_sessions`.
+1..1024. Keep it above `max_sessions_per_account` (`0` disables the
+per-account bound): otherwise the node-wide limit refuses first and the
+account cap is never reached. This is not checked. Neither transcode limit may exceed `max_sessions`.
 `max_transcodes_per_account` (2) bounds how many of one account's sessions on
 this node may hold a transcode entitlement at once, so one account cannot take
 every transcode slot; `0` disables it.
@@ -776,7 +777,7 @@ Validated ranges: `workers` 1..256, `control_workers` 1..64,
 `stream_chunk_bytes` `16K`..`4M`, `client_io_timeout_ms` 1000..300000,
 `max_request_bytes` at least `1K`.
 
-The server is one reactor thread that owns every socket, plus two pools of threads that only compute (see `docs/streaming.md`, "Public HTTP behaviour"). `workers` is the data lane: catalogue, playback, web assets, and every body read that can block on a disk or a replica. `control_workers` is the control lane: status, session and account routes, so they are answered while the data lane is saturated. `/api/v1/health` is answered by the reactor itself, never queued for a worker. Password hashing runs scrypt on the control lane: a sign-in's check, and a new or changed password on the account routes, share one limit of `session.max_concurrent_password_checks`, which must be below `control_workers` (the node refuses to start otherwise), so hashing can never take the whole lane. With every slot in use the route answers `429 try_later` with `Retry-After: 1` at once, never waits. `max_connections` bounds open connections; an idle kept-alive connection is a descriptor and a small struct, not a thread. `max_queued_requests` bounds how many requests may wait for a lane worker before the reactor answers `503 overloaded` with `Retry-After: 1`. `staging_chunks` is how many `stream_chunk_bytes` chunks a streaming response may hold ahead of a slow client, so streaming memory is at most connections × `staging_chunks` × `stream_chunk_bytes`. A handler slower than `slow_request_threshold_ms` is logged with its route; a reactor pass longer than `reactor_stall_threshold_ms` is counted in diagnostics as a stall, which should never happen.
+The server is one reactor thread that owns every socket, plus two pools of threads that only compute (see `docs/streaming.md`, "Public HTTP behaviour"). `workers` is the data lane: catalogue, playback, web assets, and every body read that can block on a disk or a replica. `control_workers` is the control lane: status, session and account routes, so they are answered while the data lane is saturated. `/api/v1/health` is answered by the reactor itself, never queued for a worker. Password hashing runs scrypt on the control lane: a sign-in's check, and a new or changed password on the account routes, share one limit of `session.max_concurrent_password_checks`, which must be below `control_workers` (the node refuses to start otherwise), so hashing can never take the whole lane. It must also be at least 1: at 0 every sign-in and password change is answered `429`, so `control_workers` must be at least 2. With every slot in use the route answers `429 try_later` with `Retry-After: 1` at once, never waits. `max_connections` bounds open connections; an idle kept-alive connection is a descriptor and a small struct, not a thread. `max_queued_requests` bounds how many requests may wait for a lane worker before the reactor answers `503 overloaded` with `Retry-After: 1`. `staging_chunks` is how many `stream_chunk_bytes` chunks a streaming response may hold ahead of a slow client, so streaming memory is at most connections × `staging_chunks` × `stream_chunk_bytes`. A handler slower than `slow_request_threshold_ms` is logged with its route; a reactor pass longer than `reactor_stall_threshold_ms` is counted in diagnostics as a stall, which should never happen.
 
 `compression` gzips text responses on the way out: JSON from the API, and the web client's HTML, CSS and JavaScript. It applies only to complete in-memory bodies above `compression_min_bytes` (at least 64), and only for a client whose `Accept-Encoding` asks for it. Media is never compressed - it is already compressed, it is streamed rather than buffered, and the reactor sends it from resident memory without a copy. Neither are images, fonts or wasm, for the same reason. `compression_level` is the zlib level, 1 to 9; 1 gives most of the ratio for a fraction of the CPU, which is what a Pi-class node wants. Every compressible response carries `Vary: Accept-Encoding` whether or not it was compressed, so a shared cache keys the two representations apart.
 
@@ -786,7 +787,7 @@ Set `compression: false` on a node that sits behind a proxy which already compre
 
 ## Streaming, ingest and acquisition
 
-Streaming, ingest and BitTorrent configuration remain independent of the storage authority model. The complete set of fields is shown in [`../macha.yaml.example`](../macha.yaml.example).
+Streaming, ingest and BitTorrent configuration remain independent of the storage authority model. Their fields are shown, with comments, in [`../macha.yaml.example`](../macha.yaml.example).
 
 `ingest.enabled` requires `catalogue.scanner.enabled`, and `torrent.enabled`
 requires `ingest.enabled`. `ingest.max_concurrent_jobs` is 1..64 (default 10)
@@ -804,6 +805,48 @@ keeps the torrent jobs it has, takes no new one, and stays listed in
 `torrent.remove_on_complete_after_ms` (absent or null = off; 0..86400000) is
 how long after a torrent completes it is removed; it is reported as
 `default_remove_after_ms`. Both apply on live reload.
+
+## Sessions and accounts
+
+```yaml
+session:
+  allow_anonymous: true
+  anonymous_ttl_ms: 2592000000
+  max_sessions: 4096
+  max_users: 4096
+  max_concurrent_password_checks: 2
+  failed_login_attempts: 5
+  failed_login_lockout_ms: 30000
+```
+
+- `allow_anonymous` (default true): `POST /api/v1/session` without credentials mints a session for the `anonymous` account, with that account's current roles. False requires a sign-in for everything.
+- `anonymous_ttl_ms` (30 days, at least 60000): a session's lifetime from creation. There is no renewal; a client signs in again.
+- `max_sessions` (4096, 1..1000000) and `max_users` (4096): limits on sessions and accounts.
+- `max_concurrent_password_checks` (2): scrypt checks in flight on this node, at least 1 and below `catalogue.api.control_workers` (see API server above). It is a local brake and is not replicated.
+- `failed_login_attempts` (5) and `failed_login_lockout_ms` (30000): repeated failed sign-ins lock the account out briefly.
+
+## Cache warming
+
+```yaml
+hydration:
+  enabled: true
+  interval_ms: 100
+  active_timeout_ms: 30000
+  max_inflight: 4
+  catalogue_lookahead: 1
+  engines:
+    read_ahead:
+      enabled: true
+      priority: 1000
+    current_file:
+      enabled: true
+      priority: 700
+    catalogue:
+      enabled: true
+      priority: 300
+```
+
+Hydration fetches DATA objects into the local cache ahead of playback. Three engines propose objects: `read_ahead` (the extents just ahead of a playing position), `current_file` (the rest of the file being played) and `catalogue` (the next `catalogue_lookahead` items, for example the next episode; 0..16). Each engine's share of the fetching is proportional to its `priority`; a priority of 0 or `enabled: false` turns that engine off. Runs stay in order, so a next episode is warmed from its start. `max_inflight` (1..64) bounds fetches in flight, `interval_ms` (at least 10) is how often the scheduler looks for work, and an engine's observation of a playback lapses after `active_timeout_ms` (at least 1000) without a new one.
 
 ## Web client
 

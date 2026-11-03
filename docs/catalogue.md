@@ -118,7 +118,7 @@ not normally a deferral. The order is:
 | a stored profile exists | `200` |
 | no stored profile | probed there and then at foreground priority, persisted, `200` |
 | no stored profile, and this node has no media engine (streaming off) | `404 media_engine_unavailable`: not here; another node may have an engine or the profile |
-| the probe failed | `422 profile_failed`, with `error.reason` when the engine said why (`source_unreadable`, `source_unsupported`, `source_read_timed_out`) |
+| the probe failed | `422 profile_failed`, with `reason` when the engine said why (`source_unreadable`, `source_unsupported`, `source_read_timed_out`) |
 | the media is not resolvable on this node | `202` with `{"status": "pending", "media_id"}`, `Retry-After: 1` and `Location` if background profiling was accepted, otherwise `404 not_found` |
 
 The `202` is a residual fallback rather than the ordinary miss path. It is
@@ -177,7 +177,7 @@ This prevents a temporary cluster outage from permanently marking otherwise vali
 
 A batch reads one namespace snapshot for all its hints. A hint created after that snapshot was taken may name a file the snapshot cannot contain; it is deferred with `path_not_yet_visible` and looked at again in the next batch, rather than failed with `path_missing`. Clearing the ingest job that raised a hint removes only that origin: a `failed` hint stays, as the record that its file was never catalogued.
 
-`GET /api/v1/catalogue/hints` lists every hint with its `state` (`queued`,
+`GET /api/v1/catalogue/hints` lists every hint, under `hints`, with its `state` (`queued`,
 `processing`, `deferred`, `catalogued`, `no_match`, `failed`), attempt and
 failure counts, `candidate_cursor`, `provider`, `media_id`,
 `catalogue_item_ids` and `origins`. `result` is a code
@@ -195,10 +195,12 @@ The `error` text is for people; act on the codes.
 
 Reads need `media_viewer`; every mutation needs `manager`.
 
+Errors on the `/api/v1/catalogue` routes carry the code as the string `error`, with `message` beside it and any further fields (`reason`, `parent_id`, `kind`, `parent_kind`) at the top level: `{"status": "error", "error": "bad_item", "message": "..."}`. An unexpected failure is `503 catalogue_unavailable`.
+
 Every item returned carries `availability` (`complete`, `partial`, `unavailable` or `unknown`) and, for a set, `availability_members`: how much of it the reachable cluster holds, as described in [Files and availability](files.md#catalogue-items). They are not part of the item: a `PUT` or `PATCH` body that names them is ignored there.
 
-- `GET /api/v1/catalogue/status` - `ready`, `metadata_generation`, `known_metadata_generation`, `root`, `items`, `artwork_objects`, `local_artwork_objects`, `last_sync_unix_ms`, and `error_code` (`converging`, `unavailable`) beside `error`.
-- `GET /api/v1/catalogue/items?type=...&parent=...` and `GET /api/v1/catalogue/search?q=...` - `{"items": [...], "next_cursor"}`, paged as every list is ([API conventions](api.md#lists)); search's `limit` defaults to 50. Search also takes `kind`, which may repeat (`kind=movie&kind=show`; `movie`, `show`, `season`, `episode`, `artist`, `album`, `track`), and `parent`, which keeps only that item's children; both filter before `limit`, and an unknown kind is `400 bad_kind`.
+- `GET /api/v1/catalogue/status` - `server_version`, `enabled`, `ready`, `metadata_generation`, `known_metadata_generation`, `root`, `items`, `artwork_objects`, `local_artwork_objects`, `last_sync_unix_ms`, and `error_code` (`converging`, `unavailable`) beside `error`.
+- `GET /api/v1/catalogue/items?type=...&parent=...` and `GET /api/v1/catalogue/search?q=...` - `{"items": [...], "next_cursor"}`, paged as every list is ([API conventions](api.md#lists)); an unknown `type` is `400 bad_type`, and a search without `q` is `400 missing_query`; search's `limit` defaults to 50. Search also takes `kind`, which may repeat (`kind=movie&kind=show`; `movie`, `show`, `season`, `episode`, `artist`, `album`, `track`), and `parent`, which keeps only that item's children; both filter before `limit`, and an unknown kind is `400 bad_kind`.
 - `GET|PUT|PATCH|DELETE /api/v1/catalogue/items/{id}` - the item carries its revision as `ETag: "rev-N"`; `PUT`, `PATCH` and `DELETE` honour `If-Match` with that value and answer a stale one with `409 conflict`.
   - `PUT` replaces the item's descriptive fields; `media_ids` and `artwork` change only when the body names them, so an edit that leaves them out keeps the item's files and artwork. `PATCH` changes only the fields present, and `null` clears an optional one; an unknown item is `404 not_found`.
   - A `parent_id` must name an existing item of the right kind (season under show, episode under season, album under artist, track under album; movie, show and artist take none): otherwise `400 parent_not_found` with `parent_id`, or `400 bad_parent_kind` with `kind` and `parent_kind`. A body that is not a usable item is `400 bad_item`.

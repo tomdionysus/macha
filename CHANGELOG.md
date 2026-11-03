@@ -1,5 +1,25 @@
 # Current release
 
+## 0.91.4: the shipped example configuration loads
+
+`macha.yaml.example`, installed as the first `macha.yaml`, set
+`catalogue.api.control_workers: 2` beside
+`session.max_concurrent_password_checks: 2`, which the loader refuses, so a
+fresh install could not start. The example now uses the default of 4, and its
+test fails on any load error rather than only on unknown keys. The example
+also gains `runtime.reassembly_memory_reserve_bytes` and the streaming start
+and per-account transcode keys, names `initial-root-password` and the
+`view_status` role correctly, and uses one key path throughout.
+
+The documentation was checked against the code and corrected: install steps
+(creating the cluster key, an empty `state_path`, a DATA backend as an empty
+subdirectory, the immutable mountpoint), metadata acceptance and retention
+claims (a commit is accepted on the committing node alone), the protocol
+version (23), the playback request (`preferences.mode` is required), API
+error codes and fields, and new Sessions and Cache warming sections in the
+configuration reference. `systemd/macha.conf.example`, never installed, is
+removed.
+
 ## 0.91.3: every admitted request is answered
 
 A burst of replies larger than a connection's outbound queue (256

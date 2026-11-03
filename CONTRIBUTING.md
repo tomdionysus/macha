@@ -21,7 +21,8 @@ practice that means answering:
   operator action. A new RPC wait needs a deadline.
 - **What happens when it starts up against inconsistent state?** A deterministic
   resolution is resolved, logged once, re-journalled and counted. Only key
-  mismatch or header corruption may refuse to start.
+  mismatch, header corruption or non-empty state without Macha's layout
+  marker may refuse to start.
 - **Does anything here trust bookkeeping over ground truth it could re-derive?**
   If a check can probe the content-addressed store instead, it must.
 - **If this goes wrong on the node furthest away, does it come back without
@@ -53,7 +54,7 @@ are left alone rather than rewritten.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMACHA_WARNINGS_AS_ERRORS=ON
-cmake --build build -j
+cmake --build build --parallel
 ./run-tests.sh build
 ```
 

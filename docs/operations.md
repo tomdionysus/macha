@@ -285,8 +285,8 @@ speculative merely because the process restarted before finishing it.
 
 Optional subsystems ship as `dlopen`'d modules rather than being compiled into
 the server: BitTorrent acquisition
-(`<libdir>/macha/plugins/libmacha-torrent.so`) and the FUSE mount
-(`<libdir>/macha/plugins/libmacha-fuse.so`). The directory scanned is
+(`<prefix>/lib/macha/plugins/libmacha-torrent.so`) and the FUSE mount
+(`<prefix>/lib/macha/plugins/libmacha-fuse.so`). The directory scanned is
 `plugin_path`, which defaults to this build's private plugin directory, and
 every module is checked against the running core's build stamp (project
 version plus git commit) before it is called - a plugin from a different
