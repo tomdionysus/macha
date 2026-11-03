@@ -1,6 +1,0 @@
-# Deprecated compatibility example for pre-0.21 hand-written units.
-#
-# The installed 0.21 unit invokes Macha directly with:
-#   --config /etc/macha/macha.yaml
-# and does not require an EnvironmentFile.
-MACHA_ARGS=--config /etc/macha/macha.yaml
