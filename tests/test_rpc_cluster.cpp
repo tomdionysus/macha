@@ -5814,6 +5814,88 @@ MACHA_TEST("rpc_cluster", test_every_nodes_unmatched_files_are_listed_and_handle
     s1.stop();
 }
 
+// An ingest job pinned to a node runs there, whichever node the API request
+// reached; the path is checked against that node's own source roots.
+MACHA_TEST("rpc_cluster", test_ingest_job_pinned_to_a_node_runs_there) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const auto source_dir = cluster.path() / "pinned-n1-src";
+    std::filesystem::create_directories(source_dir);
+    const auto source_file = source_dir / "movie.mkv";
+    {
+        std::ofstream out(source_file, std::ios::binary);
+        REQUIRE(out.good());
+        out << "not really media, just needs to exist";
+    }
+    auto c1 = config_for(cluster.path() / "pinned-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "pinned-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    for (auto* config : {&c1, &c2}) {
+        config->replication = 1;
+        config->write_copies = 1;
+        config->metadata_write_copies = 1;
+        config->catalogue.scanner.enabled = true;
+        config->catalogue.scanner.movies.enabled = false;
+        config->catalogue.scanner.tv.enabled = false;
+        config->catalogue.api.enabled = false;
+        config->ingest.enabled = true;
+    }
+    // Only node 1 may read the source.
+    c1.ingest.source_roots = {source_dir};
+
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 2 &&
+               s2.node().membership().active().size() == 2;
+    }));
+    const auto node1 = to_string(s1.node().node_id());
+
+    const auto submit = [](Service& service, const std::string& body) {
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/ingest/jobs";
+        request.body = Bytes(body.begin(), body.end());
+        return service.acquisition_api().handle(request);
+    };
+    const auto body_json = [](const HttpResponse& response) {
+        return Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
+                                       response.body.size()));
+    };
+    const auto path_field = "\"path\":\"" + source_file.string() + "\"";
+
+    // Not pinned: the receiving node reads its own filesystem and refuses.
+    CHECK(submit(s2, "{" + path_field + "}").status == 400);
+
+    // Pinned to node 1 through node 2: the job is node 1's.
+    const auto accepted = submit(s2, "{" + path_field + ",\"node_id\":\"" + node1 + "\"}");
+    REQUIRE(accepted.status == 202);
+    const auto parsed = body_json(accepted);
+    CHECK(parsed.find("node_id")->asString() == node1);
+    const auto id = parsed.find("id")->asString();
+    CHECK(s1.ingest().job(id).has_value());
+    CHECK(!s2.ingest().job(id).has_value());
+
+    // Node 1's own refusal comes back as it is.
+    const auto outside = submit(s2, "{\"path\":\"" + cluster.path().string() +
+                                        "\",\"node_id\":\"" + node1 + "\"}");
+    CHECK(outside.status == 400);
+    CHECK(body_json(outside).find("error")->find("message")->asString().find("source_roots") !=
+          std::string::npos);
+
+    // A node that is not a member.
+    const auto stranger = submit(s2, "{" + path_field + ",\"node_id\":\"" +
+                                         to_string(random_node_id()) + "\"}");
+    CHECK(stranger.status == 409);
+    CHECK(body_json(stranger).find("error")->find("reason")->asString() == "node_not_member");
+
+    s2.stop();
+    s1.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

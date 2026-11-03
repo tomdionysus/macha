@@ -449,6 +449,8 @@ bool is_node_record_message(MessageType type) {
     case MessageType::ingest_jobs_reply:
     case MessageType::ingest_job_action:
     case MessageType::ingest_job_action_reply:
+    case MessageType::submit_ingest_job:
+    case MessageType::ingest_submit_reply:
     case MessageType::get_unmatched_hints:
     case MessageType::unmatched_hints_reply:
         return true;
@@ -712,6 +714,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "trie_diff";
     case MessageType::get_unmatched_hints:
         return "get_unmatched_hints";
+    case MessageType::submit_ingest_job:
+        return "submit_ingest_job";
     case MessageType::torrent_intent:
         return "torrent_intent";
     case MessageType::dial_request:
@@ -766,6 +770,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "trie_diff_reply";
     case MessageType::unmatched_hints_reply:
         return "unmatched_hints_reply";
+    case MessageType::ingest_submit_reply:
+        return "ingest_submit_reply";
     case MessageType::torrent_intent_reply:
         return "torrent_intent_reply";
     case MessageType::user_sync:

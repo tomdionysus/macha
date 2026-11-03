@@ -1,5 +1,19 @@
 # Current release
 
+## 0.91.1: an ingest job runs on the node it names
+
+`POST /api/v1/ingest/jobs` takes an optional `node_id`: the node that runs
+the job and reads `path` on its own filesystem, checked against its own
+`ingest.source_roots`. Absent or null is the node that received the
+request, as before. The node that receives it passes the job on over a new
+node-to-node message (`submit_ingest_job`, 51; reply 127). The `202` names
+the running node in `node_id`. A node that is not an active member is
+`409 placement_failed` `node_not_member`, one before 0.91.1 is
+`409 placement_failed` `node_not_ingest_capable`, one that cannot be asked
+is `503 node_unreachable`, and the running node's own refusal is the `400
+bad_request` it gives locally. Listing, inspecting and acting on ingest
+jobs already worked from any node.
+
 ## 0.91.0: a single node, complete
 
 No code changes from 0.90.96: this release names the state the cluster is

@@ -124,6 +124,11 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                      return RpcMessage{MessageType::ingest_job_action_reply,
                                        ingest_.handle_job_action(request.payload)};
                  });
+    routes_.bind(MessageType::submit_ingest_job,
+                 [this](const NodeInfo&, FrameType, const RpcMessage& request) {
+                     return RpcMessage{MessageType::ingest_submit_reply,
+                                       ingest_.handle_submit(request.payload)};
+                 });
     routes_.bind(MessageType::get_unmatched_hints,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return RpcMessage{MessageType::unmatched_hints_reply,
@@ -197,6 +202,7 @@ NodeServices::~NodeServices() {
     stop();
     routes_.unbind(MessageType::torrent_intent);
     routes_.unbind(MessageType::get_unmatched_hints);
+    routes_.unbind(MessageType::submit_ingest_job);
     routes_.unbind(MessageType::ingest_job_action);
     routes_.unbind(MessageType::get_ingest_jobs);
 }

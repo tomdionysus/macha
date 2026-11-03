@@ -260,6 +260,9 @@ class IngestManager {
     // ClusterJobView is built from these replies.
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);
+    // A job another node's API pinned here: {path, display_name?,
+    // delete_source_on_clear?}. Answers {id} or {error}.
+    Bytes handle_submit(std::span<const uint8_t> request_payload);
     IngestManager(NodeRuntime&, FileSystem&, CatalogueHintQueue&, IngestConfig,
                   MediaInformationService* media_information = nullptr);
     ~IngestManager();

@@ -398,4 +398,61 @@ IngestActionResult ClusterJobView::ingest_action(std::string_view id, std::strin
     return result;
 }
 
+ClusterJobView::IngestSubmitResult ClusterJobView::submit_ingest(const NodeId& node, const std::string& path,
+                                                                 std::string display_name,
+                                                                 std::optional<bool> delete_source_on_clear) {
+    using Outcome = IngestSubmitResult::Outcome;
+    IngestSubmitResult result;
+    if (node == node_.node_id()) {
+        try {
+            result.id = ingest_.submit_path(path, "filesystem", {}, std::move(display_name),
+                                            delete_source_on_clear, false, false);
+            result.outcome = Outcome::submitted;
+        } catch (const std::exception& error) {
+            result.outcome = Outcome::refused;
+            result.message = error.what();
+        }
+        return result;
+    }
+    const auto peer = active_peer(node);
+    if (!peer) {
+        result.outcome = Outcome::not_member;
+        result.message = "node " + to_string(node) + " is not an active member of this cluster";
+        return result;
+    }
+    Json::Object request;
+    request["path"] = path;
+    if (!display_name.empty()) request["display_name"] = std::move(display_name);
+    if (delete_source_on_clear) request["delete_source_on_clear"] = *delete_source_on_clear;
+    try {
+        // A user's submission through the API: viewer work.
+        const auto reply = node_.call(*peer, MessageType::submit_ingest_job,
+                                      json_bytes(Json(std::move(request))), FrameType::foreground);
+        if (reply.message.type == MessageType::ingest_submit_reply) {
+            const auto parsed = parse_payload(reply);
+            if (const auto* id = parsed.find("id"); id && id->isString() && !id->asString().empty()) {
+                result.outcome = Outcome::submitted;
+                result.id = id->asString();
+            } else {
+                const auto* error = parsed.find("error");
+                result.outcome = Outcome::refused;
+                result.message = error && error->isString() ? error->asString() : "refused by the node";
+            }
+            return result;
+        }
+        if (const auto refusal = rpc_refusal(reply.message); refusal && refusal->code == "not_implemented") {
+            result.outcome = Outcome::not_capable;
+            result.message = "node " + to_string(node) + " runs a version that cannot take a pinned ingest job";
+            return result;
+        }
+        result.outcome = Outcome::unreachable;
+        result.message = "node " + to_string(node) + " did not take the job";
+    } catch (const std::exception& error) {
+        Log::debug("cluster job view: ingest submission to " + peer->host + ": " + error.what());
+        result.outcome = Outcome::unreachable;
+        result.message = "node " + to_string(node) + " cannot be reached from this node";
+    }
+    return result;
+}
+
 } // namespace macha
