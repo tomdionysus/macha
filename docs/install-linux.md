@@ -121,8 +121,8 @@ sudo cmake --install build
 With the `/usr` prefix, this installs:
 
 - `/usr/bin/macha`
-- `/usr/bin/macha-users`, `macha-metadata-dump`, `macha-metadata-repair` and
-  `macha-namespace-migrate` (administration tools), and `macha-recover`, which
+- `/usr/bin/macha-users`, `macha-metadata-dump` and `macha-metadata-repair`
+  (administration tools), and `macha-recover`, which
   prints the procedure for resetting root's password
 - `/usr/lib/macha/libmacha_core.so`
 - `/usr/lib/macha/plugins/libmacha-fuse.so` (when FUSE 3 was found)

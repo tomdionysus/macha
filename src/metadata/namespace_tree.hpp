@@ -364,22 +364,6 @@ class NamespaceWorkingSet {
     std::set<std::string, std::less<>> erased_;
 };
 
-// What a migration would do to one node, built and verified but not installed.
-struct NamespaceMigration {
-    MetadataRecord record; // the tree-backed head to install
-    ObjectId root{};
-    NamespaceTreeStats stats;
-    size_t entries{};
-    uint64_t previous_payload_bytes{};
-};
-
-// Builds the tree for `head`'s namespace into `nodes`, verifies it entry by
-// entry, and returns the record that would replace the head, without a
-// retention baseline so the cluster claims the tree. Installs nothing.
-// A pure function of the head, so every node computes the same root and record
-// hash without coordination (what makes `--expect-hash` meaningful). Throws if
-// the tree does not read back as the namespace it was built from.
-NamespaceMigration plan_namespace_migration(const MetadataRecord& head, NamespaceNodeStore& nodes);
 
 // The only conversions between namespace forms. `detach_namespace` builds the
 // tree into `store` and returns the snapshot with `namespace_root` set and
