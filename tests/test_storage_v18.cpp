@@ -614,6 +614,7 @@ class StorageClusterNode {
     const ClusterKeys& keys_;
     std::unique_ptr<BareNode> node_;
     std::unique_ptr<DistributedStore> store_;
+    std::unique_ptr<DistributedStore> metadata_store_;
     std::unique_ptr<MetadataManager> metadata_;
     std::unique_ptr<CatalogueManager> catalogue_;
     bool started_{};
@@ -642,7 +643,8 @@ class StorageClusterNode {
         REQUIRE(node_->wait_local_state_ready(10s));
         store_ = std::make_unique<DistributedStore>(*node_, node_->local_state(), node_->resources.activity,
                                                     node_->resources.data, node_->resources.memory, node_->resources.events);
-        metadata_ = std::make_unique<MetadataManager>(*node_, node_->local_state(), node_->metadata_server());
+        metadata_store_ = macha::test_support::distributed_store_for(*node_);
+        metadata_ = std::make_unique<MetadataManager>(*node_, node_->local_state(), node_->metadata_server(), *metadata_store_);
         catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->local_state(), node_->metadata_server(), *store_, *metadata_, node_->ledger());
     }
     // A process restart in miniature: a fresh NodeRuntime over the same

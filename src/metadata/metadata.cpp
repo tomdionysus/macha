@@ -4276,6 +4276,23 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     return true;
 }
 
+namespace {
+
+// Whether merging `incoming` into the held certificate would leave it as it
+// is (the rule accept_commit applies to a head it already holds).
+bool certificate_adds_nothing(const MetadataAcceptance& held, const MetadataAcceptance& incoming) {
+    if (!held.required)
+        return !incoming.required;
+    if (!incoming.required)
+        return true;
+    if (incoming.required < held.required)
+        return false;
+    return std::includes(held.replicas.begin(), held.replicas.end(), incoming.replicas.begin(),
+                         incoming.replicas.end());
+}
+
+} // namespace
+
 bool MetadataReplica::accept_commit(const MetadataAcceptance& input, bool* heads_changed) {
     const HeadsRevisionBump heads_bump(heads_revision_);
     if (heads_changed)
@@ -4296,12 +4313,25 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input, bool* heads
         return false;
     }
 
-    // Warm the cache off-lock so the locked validation below hits it.
+    // A head already accepted under a certificate this one adds nothing to:
+    // accepting it again changes nothing, so it costs a lookup, not a
+    // materialisation.
+    {
+        Lock lock(m_);
+        if (const auto found = accepted_heads_.find(value.hash);
+            found != accepted_heads_.end() && found->second.generation == value.generation &&
+            certificate_adds_nothing(found->second, value))
+            return true;
+    }
+
+    // Warm the cache off-lock so the locked validation below hits it. Parents
+    // are read only by the policy check of a record without a write floor.
     auto prepared = materialized(value.hash);
     if (!prepared || prepared->record.generation != value.generation)
         return false;
-    for (const auto& parent : metadata_record_parents(prepared->record))
-        (void)materialized(parent);
+    if (!prepared->snapshot->metadata_write_replicas_required)
+        for (const auto& parent : metadata_record_parents(prepared->record))
+            (void)materialized(parent);
 
     Lock durable(durable_mutation_m_);
     // A head change rewrites the checkpoint (possibly hundreds of MB): write it

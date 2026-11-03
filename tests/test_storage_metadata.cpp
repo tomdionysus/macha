@@ -2541,6 +2541,98 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     CHECK(after_evicted_lookup.materialization_cache_entries <= 64);
 }
 
+// Accepting a head this replica already holds, under a certificate that adds
+// nothing, is a lookup: no head or parent is materialised, however long the
+// delta chain behind it. A certificate that does add a witness still merges.
+MACHA_FAST_TEST("storage_metadata", test_accepting_a_held_head_again_rebuilds_nothing) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto origin = random_node_id();
+
+    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    snapshot.metadata_voters.clear();
+    snapshot.metadata_write_replicas_required = 1;
+    MetadataRecord head;
+    head.generation = 2;
+    head.previous = genesis_metadata().hash;
+    head.payload = encode_snapshot(snapshot);
+    head.hash = metadata_hash(head.generation, head.previous, head.payload);
+
+    const auto path = t.path() / "re-acceptance";
+    MetadataAcceptance certificate;
+    {
+        MetadataReplica replica(path, keys.storage);
+        REQUIRE(replica.store_commit(head));
+        for (size_t i = 0; i < 30; ++i) {
+            auto next_snapshot = snapshot;
+            next_snapshot.mutation_sequences[origin] = i + 1;
+            FsEntry entry;
+            entry.type = EntryType::file;
+            entry.mode = 0644;
+            entry.version = 1;
+            next_snapshot.entries["/held-" + std::to_string(i)] = entry;
+            auto delta = metadata_delta(snapshot, next_snapshot);
+            REQUIRE(delta.has_value());
+            MetadataRecord child;
+            child.generation = head.generation + 1;
+            child.previous = head.hash;
+            child.payload = encode_snapshot(next_snapshot);
+            child.hash = metadata_hash(child.generation, child.previous, child.payload);
+            REQUIRE(replica.store_commit(child, encode_metadata_delta(*delta)));
+            snapshot = std::move(next_snapshot);
+            head = std::move(child);
+        }
+        certificate = MetadataAcceptance{head.generation, head.hash, 1, {origin}};
+        REQUIRE(replica.accept_commit(certificate));
+    }
+
+    // Reopened, so nothing it materialised while building the chain is cached.
+    MetadataReplica replica(path, keys.storage);
+    const auto before = replica.diagnostics();
+    for (int i = 0; i < 5; ++i) {
+        bool changed = true;
+        CHECK(replica.accept_commit(certificate, &changed));
+        CHECK(!changed);
+    }
+    const auto after = replica.diagnostics();
+    CHECK(after.historical_requests == before.historical_requests);
+    CHECK(after.historical_reconstructions == before.historical_reconstructions);
+    CHECK(after.historical_deltas_applied == before.historical_deltas_applied);
+
+    auto wider = certificate;
+    wider.replicas.push_back(random_node_id());
+    std::sort(wider.replicas.begin(), wider.replicas.end());
+    bool changed = false;
+    CHECK(replica.accept_commit(wider, &changed));
+    CHECK(changed);
+    REQUIRE(replica.acceptance(head.hash).has_value());
+    CHECK(replica.acceptance(head.hash)->replicas.size() == 2);
+}
+
+// A new namespace is a tree from its first commit: the founding record carries
+// the root and no entry map, so nothing in a record grows with the library,
+// and the first write goes onto the tree.
+MACHA_TEST("storage_metadata", test_a_new_namespace_is_a_tree_from_its_first_commit) {
+    TestNode node("tree-founding");
+    node.start();
+    const auto founded = node.metadata().converged();
+    REQUIRE(founded.snapshot != nullptr);
+    CHECK(founded.snapshot->namespace_root.has_value());
+    CHECK(founded.snapshot->entries.empty());
+    const auto root = node.filesystem().getattr("/");
+    CHECK(root.type == EntryType::directory);
+
+    node.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    const auto written = node.metadata().converged();
+    REQUIRE(written.snapshot != nullptr);
+    REQUIRE(written.snapshot->namespace_root.has_value());
+    CHECK(*written.snapshot->namespace_root != *founded.snapshot->namespace_root);
+    CHECK(written.snapshot->entries.empty());
+    CHECK(node.filesystem().getattr("/Movies").type == EntryType::directory);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_history_payloads_are_disk_backed_and_byte_bounded) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -4480,7 +4572,7 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
     config.torrent.enabled = false;
 
     auto& service = fixture.start();
-    MetadataManager metadata(service.node(), service.local_state(), service.metadata_server());
+    MetadataManager metadata(service.node(), service.local_state(), service.metadata_server(), service.store());
     auto committed = metadata.mutate_delta([](MetadataSnapshot& snapshot, MetadataDelta&) {
         FsEntry entry;
         entry.type = EntryType::directory;

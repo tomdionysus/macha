@@ -421,6 +421,14 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     std::unique_ptr<RetentionLedger> ledger_;
 };
 
+// A DistributedStore over a bare node's own parts, built as Service builds
+// one: what a MetadataManager the test constructs keeps its namespace tree in.
+inline std::unique_ptr<DistributedStore> distributed_store_for(BareNode& node) {
+    return std::make_unique<DistributedStore>(node, node.local_state(), node.resources.activity,
+                                              node.resources.data, node.resources.memory,
+                                              node.resources.events);
+}
+
 class TestNode {
     TempDir temp_;
     std::filesystem::path keyfile_;
@@ -495,7 +503,7 @@ class TestNode {
                                                         node_->resources.data,
                                                         node_->resources.memory, node_->resources.events);
             metadata_ = std::make_unique<MetadataManager>(
-                *node_, node_->local_state(), node_->metadata_server(), nullptr,
+                *node_, node_->local_state(), node_->metadata_server(), *store_,
                 MetadataPublicationRetention{
                     [this](const MetadataPublicationContext& context) {
                         if (publication_guard_)
