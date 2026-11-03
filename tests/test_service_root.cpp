@@ -548,9 +548,10 @@ MACHA_TEST("service_root", test_standing_conflicts_are_listed_and_resolved_over_
     catalogue.base_catalogue_root = current_root;
     catalogue.left_catalogue_root = earlier_root;
     const std::vector<MetadataConflict> standing{take_left, take_right, take_base, catalogue};
-    metadata.mutate([&](MetadataSnapshot& snapshot) {
+    metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
         for (const auto& conflict : standing)
             snapshot.conflicts.emplace(metadata_conflict_id(conflict), conflict);
+        delta.replace_conflicts = snapshot.conflicts;
     });
 
     // The list is a read.

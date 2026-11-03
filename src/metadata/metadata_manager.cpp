@@ -1679,9 +1679,9 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
     }
 }
 
-MetadataRecord MetadataManager::mutate_impl(
-    const std::function<void(MetadataSnapshot&, MetadataDelta*)>& mutate, bool exact_delta,
-    size_t retries, std::optional<MetadataMutationIdentity> identity) {
+MetadataRecord MetadataManager::mutate_delta(
+    const std::function<void(MetadataSnapshot&, MetadataDelta&)>& mutate, size_t retries,
+    std::optional<MetadataMutationIdentity> identity) {
     Lock lock(mutation_mutex_);
     // This mutation's dot, kept across retries so an attempt that was
     // accepted after all is recognised rather than made twice.
@@ -1742,9 +1742,8 @@ MetadataRecord MetadataManager::mutate_impl(
         const auto origin = dot->author;
         const std::optional<uint64_t> sequence = dot->sequence;
 
-        std::optional<MetadataSnapshot> before;
-        if (!exact_delta)
-            before.emplace(snapshot);
+        if (!snapshot.namespace_root)
+            throw std::logic_error("metadata head carries no namespace tree");
         snapshot.merge_parents.clear();
         MetadataDelta supplied_delta;
         const auto legacy_metadata_voters = snapshot.metadata_voters;
@@ -1755,8 +1754,8 @@ MetadataRecord MetadataManager::mutate_impl(
         const auto metadata_participants = snapshot.metadata_participants;
         const auto metadata_branch_floor = snapshot.metadata_branch_floor;
         const auto retention_baseline_complete = snapshot.retention_baseline_complete;
-        mutate(snapshot, exact_delta ? &supplied_delta : nullptr);
-        if (exact_delta && !snapshot.node_status.empty() && supplied_delta.upsert_node_status.empty())
+        mutate(snapshot, supplied_delta);
+        if (!snapshot.node_status.empty() && supplied_delta.upsert_node_status.empty())
             supplied_delta.upsert_node_status.emplace(*snapshot.node_status.begin());
         if (!same_legacy_metadata_voters(snapshot.metadata_voters, legacy_metadata_voters))
             throw std::runtime_error(
@@ -1774,67 +1773,29 @@ MetadataRecord MetadataManager::mutate_impl(
             if (!snapshot.legacy_clock) {
                 // Still the parent's clock here.
                 snapshot.legacy_clock = snapshot.mutation_sequences;
-                if (exact_delta)
-                    supplied_delta.set_legacy_clock = snapshot.legacy_clock;
+                supplied_delta.set_legacy_clock = snapshot.legacy_clock;
             }
-            if (exact_delta ? supplied_delta.catalogue != CatalogueDelta::unchanged
-                            : before->catalogue_root != snapshot.catalogue_root) {
+            if (supplied_delta.catalogue != CatalogueDelta::unchanged) {
                 snapshot.catalogue_dot = mutation;
-                if (exact_delta)
-                    supplied_delta.set_catalogue_dot = mutation;
+                supplied_delta.set_catalogue_dot = mutation;
             }
-            if (!exact_delta) {
-                for (auto& [path, entry] : snapshot.entries) {
-                    const auto prior = before->entries.find(path);
-                    if (prior == before->entries.end())
-                        stamp_entry_provenance(entry, path, nullptr, mutation);
-                    else if (prior->second != entry)
-                        stamp_entry_provenance(entry, path, &prior->second, mutation);
-                }
-            } else if (!supplied_delta.upsert_entries.empty() ||
-                       !supplied_delta.append_entries.empty()) {
-                const bool tree = snapshot.namespace_root.has_value();
-                // The parent's namespace: the tree is not yet rewritten; the
-                // map already is, so the parent is decoded again.
-                std::optional<ControlNamespaceNodeStore> reader;
-                std::optional<MetadataSnapshot> parent;
-                if (tree)
-                    reader.emplace(ControlNamespaceNodeStore::for_reading(local_.control(),
-                                                                          namespace_store_));
-                else
-                    parent = decode_snapshot(current.payload);
-                const auto prior_of = [&](const std::string& path) -> std::optional<FsEntry> {
-                    if (tree)
-                        return namespace_entry(snapshot, &*reader, path);
-                    const auto found = parent->entries.find(path);
-                    if (found == parent->entries.end())
-                        return {};
-                    return found->second;
-                };
+            if (!supplied_delta.upsert_entries.empty() || !supplied_delta.append_entries.empty()) {
+                // The parent's namespace: the tree is not yet rewritten.
+                const auto reader =
+                    ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
                 for (auto& [path, entry] : supplied_delta.upsert_entries) {
-                    const auto prior = prior_of(path);
+                    const auto prior = namespace_entry(snapshot, &reader, path);
                     stamp_entry_provenance(entry, path, prior ? &*prior : nullptr, mutation);
-                    if (!tree)
-                        snapshot.entries[path] = entry;
                 }
-                for (auto& [path, append] : supplied_delta.append_entries) {
+                for (auto& [path, append] : supplied_delta.append_entries)
                     append.content = mutation;
-                    if (tree)
-                        continue;
-                    auto& entry = snapshot.entries.at(path);
-                    entry.provenance.content = mutation;
-                    if (entry.provenance.file_id == NodeId{})
-                        entry.provenance.file_id = legacy_file_id(path);
-                }
             }
         }
         snapshot.mutation_sequences[origin] = *sequence;
-        if (exact_delta)
-            supplied_delta.mutation_sequences[origin] = *sequence;
+        supplied_delta.mutation_sequences[origin] = *sequence;
         if (identity) {
             snapshot.mutation_sequences[identity->origin] = identity->sequence;
-            if (exact_delta)
-                supplied_delta.mutation_sequences[identity->origin] = identity->sequence;
+            supplied_delta.mutation_sequences[identity->origin] = identity->sequence;
         }
 
         // Discipline 4. Keep tombstones in canonical order so the next
@@ -1844,17 +1805,13 @@ MetadataRecord MetadataManager::mutate_impl(
         const bool resorted = !garbage_is_canonical(snapshot.garbage);
         if (resorted)
             canonicalise_garbage(snapshot.garbage);
-        if (exact_delta && (resorted || !supplied_delta.upsert_garbage.empty() ||
-                            !supplied_delta.erase_garbage.empty()))
+        if (resorted || !supplied_delta.upsert_garbage.empty() ||
+            !supplied_delta.erase_garbage.empty())
             supplied_delta.canonical_garbage = true;
 
-        // A tree-backed namespace commits by applying this mutation's change set
-        // to the tree.
-        if (snapshot.namespace_root) {
-            // Without an exact delta there is no change set, and diffing both
-            // namespaces is the cost the tree avoids.
-            if (!exact_delta)
-                throw MetadataNotReady("a tree-backed namespace requires an exact delta");
+        // The namespace commits by applying this mutation's change set to the
+        // tree.
+        {
             // A map write is a change the delta does not describe and would be
             // silently dropped; refuse it.
             if (!snapshot.entries.empty())
@@ -1887,32 +1844,24 @@ MetadataRecord MetadataManager::mutate_impl(
             }
             supplied_delta.pending_tombstones.clear();
         }
-        if (!supplied_delta.pending_tombstones.empty())
-            throw std::logic_error("tombstone batches need a tree-backed namespace");
 
         const auto tree_ms = stage_ms();
         // Drop the conflicts this mutation decided by rewriting their subject,
         // read from the namespace as the mutation leaves it.
         if (!snapshot.conflicts.empty()) {
-            NamespaceLookup lookup;
-            std::optional<ControlNamespaceNodeStore> reader;
-            if (snapshot.namespace_root) {
-                reader.emplace(
-                    ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_));
-                lookup = [&](const std::string& path) {
-                    return namespace_entry(snapshot, &*reader, path);
-                };
-            }
+            const auto reader =
+                ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
+            const NamespaceLookup lookup = [&](const std::string& path) {
+                return namespace_entry(snapshot, &reader, path);
+            };
             if (const auto superseded = prune_superseded_conflicts(snapshot, lookup)) {
                 conflicts_superseded_.fetch_add(superseded, std::memory_order_relaxed);
-                if (exact_delta)
-                    supplied_delta.replace_conflicts = snapshot.conflicts;
+                supplied_delta.replace_conflicts = snapshot.conflicts;
             }
         }
 
         const auto conflicts_ms = stage_ms();
-        auto payload =
-            snapshot.namespace_root ? encode_snapshot_v14(snapshot) : encode_snapshot(snapshot);
+        auto payload = encode_snapshot_v14(snapshot);
         if (payload == current.payload)
             return cache_record(current,
                                 std::make_shared<MetadataSnapshot>(std::move(snapshot)));
@@ -1924,18 +1873,13 @@ MetadataRecord MetadataManager::mutate_impl(
         proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
 
         Bytes delta_payload;
-        std::optional<MetadataDelta> delta;
-        if (exact_delta) {
-            delta = std::move(supplied_delta);
-            // An exact caller describes only its own edit; inherited branch topology
-            // (merge_parents, cleared above) is settled here, so the write stays a
-            // delta.
-            if (clear_merge_parent_topology)
-                delta->replace_merge_parents = snapshot.merge_parents;
-        } else {
-            delta = metadata_delta(*before, snapshot);
-        }
-        if (delta) {
+        std::optional<MetadataDelta> delta = std::move(supplied_delta);
+        // The caller describes only its own edit; inherited branch topology
+        // (merge_parents, cleared above) is settled here, so the write stays a
+        // delta.
+        if (clear_merge_parent_topology)
+            delta->replace_merge_parents = snapshot.merge_parents;
+        {
             auto encoded = encode_metadata_delta(*delta);
             if (encoded.size() < proposed.payload.size())
                 delta_payload = std::move(encoded);
@@ -2006,20 +1950,6 @@ MetadataRecord MetadataManager::mutate_impl(
     }
 
     throw MetadataNotReady("metadata mutation could not be accepted");
-}
-
-MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
-                                       size_t retries) {
-    return mutate_impl(
-        [&](MetadataSnapshot& snapshot, MetadataDelta*) { mutate(snapshot); }, false, retries, {});
-}
-
-MetadataRecord MetadataManager::mutate_delta(
-    const std::function<void(MetadataSnapshot&, MetadataDelta&)>& mutate, size_t retries,
-    std::optional<MetadataMutationIdentity> identity) {
-    return mutate_impl(
-        [&](MetadataSnapshot& snapshot, MetadataDelta* delta) { mutate(snapshot, *delta); }, true,
-        retries, identity);
 }
 
 bool MetadataManager::resolve_conflict(const std::string& id, std::string_view choice) {
