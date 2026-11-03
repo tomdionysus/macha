@@ -83,7 +83,10 @@ class ClusterJobView {
     // `node_id`: this node's own, else its owner's answer. When the owner
     // cannot answer, the job as last polled with `catalogue.items` null.
     std::optional<Json> ingest_job_detail(std::string_view id);
-    IngestActionResult ingest_action(std::string_view id, std::string_view action);
+    // `file`: the index of one file in the job, for pause_file, resume_file
+    // and cancel_file.
+    IngestActionResult ingest_action(std::string_view id, std::string_view action,
+                                     std::optional<size_t> file = {});
 
     struct IngestSubmitResult {
         enum class Outcome { submitted, refused, not_member, not_capable, unreachable };

@@ -165,6 +165,20 @@ Each item is an [ingest job](#the-ingest-job-object) without `files` and without
 | 409 | `invalid_state` | the job exists but the action is not allowed in its state (see the table below) |
 | 400 | `bad_request` | the action failed on this node, for example a source it was told to delete could not be removed |
 
+### One file of a job
+
+`POST /api/v1/ingest/jobs/{id}/files/{index}/{action}`, where `index` is the file's `index` in the job's `files` and `action` is `pause`, `resume` or `cancel`. No body. The answer is `200` with the job as it now stands on the node that owns it, as for the job's own actions.
+
+- `pause`: the file's copy stops at its next checkpoint and keeps its partial; the job goes on with its other files. When only paused files are left, the job is `paused` and waits; resuming one of those files puts it back to work.
+- `resume`: the file is queued again. Resuming the job resumes every paused file in it.
+- `cancel`: the file is never imported; its partial is removed and its source left as it is. It no longer counts in the job's `files_total` or `bytes_total`, and a job whose remaining files are all cancelled completes with what it has.
+
+| status | code | when |
+|---|---|---|
+| 404 | `not_found` | no reachable node has the job, or it has no file at `index` |
+| 409 | `invalid_state` | the file is completed, skipped or already cancelled; a `pause` of a paused file or a `resume` of one that is not paused; the job is finished (`cataloguing`, `completed`, `cancelled` or `failed`), or its node runs a release before 0.91.2 |
+| 503 | `node_unreachable` | the owning node cannot be reached |
+
 ## The ingest job object
 
 ```json
@@ -248,7 +262,7 @@ Each `catalogue.items` entry:
 
 Destinations are compared ignoring case: a folder that already exists under another spelling is reused as spelt (a lowercase release goes into `/Movies/The Martian (2015)/`, not a new `/Movies/the martian (2015)/`), and a file whose name differs from one already there only by case gets a ` (2)` suffix like any other collision.
 
-Each `files` entry: `source_path`, `destination_path` (strings), `size`, `copied` (integers), `completed`, `skipped`, `catalogue_candidate` (bools). A file that is not a catalogue candidate (a sidecar) is imported but not sent to the catalogue.
+Each `files` entry: `index` (its position, which per-file actions name), `state` (`queued`, `importing`, `paused`, `completed`, `skipped` or `cancelled`), `source_path`, `destination_path` (strings), `size`, `copied` (integers), `completed`, `skipped`, `catalogue_candidate` (bools). A file that is not a catalogue candidate (a sidecar) is imported but not sent to the catalogue.
 
 ### Ingest job states
 
@@ -258,7 +272,7 @@ Each `files` entry: `source_path`, `destination_path` (strings), `size`, `copied
 | `scanning` | building the file plan from the source | no |
 | `importing` | copying files into the namespace | no |
 | `cataloguing` | every file copied; waiting for the catalogue to finish with them | no |
-| `paused` | stopped by an operator | no |
+| `paused` | stopped by an operator, or waiting because every file left in it is paused | no |
 | `blocked` | stopped by a condition that may pass; **retried by itself** | no |
 | `completed` | copied and catalogued | yes |
 | `cancelled` | stopped by an operator, partial files removed | yes |

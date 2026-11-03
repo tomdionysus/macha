@@ -40,6 +40,9 @@ enum class IngestJobState {
 std::string ingest_job_state_name(IngestJobState);
 std::optional<IngestJobState> parse_ingest_job_state(std::string_view);
 
+// What the user asked of one file in a job: run it, hold it, or leave it out.
+enum class IngestFileControl { active, paused, cancelled };
+
 struct IngestFileProgress {
     std::string source_path;
     std::string destination_path;
@@ -50,6 +53,7 @@ struct IngestFileProgress {
     bool completed{};
     bool skipped{};
     bool catalogue_candidate{true};
+    IngestFileControl control{IngestFileControl::active};
 };
 
 struct IngestJob {
@@ -80,6 +84,9 @@ struct IngestJob {
     // English message.
     std::string error_code;
     std::string error;
+    // Paused because every file left is paused, not by a job pause: resuming
+    // one of those files resumes the job.
+    bool held_by_files{};
     std::vector<IngestFileProgress> files;
 };
 
@@ -110,6 +117,8 @@ struct ClusterIngestJob {
     IngestJob job;
     CatalogueHintSummary catalogue;
 };
+
+std::string ingest_file_state_name(const IngestJob&, size_t index);
 
 struct IngestActionResult {
     bool exists{};
@@ -254,6 +263,8 @@ class IngestManager {
     bool should_pause_or_cancel(const IngestJob&) const;
     void set_blocked(IngestJob&, std::string code, std::string message);
     void cleanup_partials(const IngestJob&);
+    // Removes a file's partial from the namespace; it starts again from zero.
+    void drop_partial(IngestFileProgress&);
 
   public:
     // The ingest job messages' handlers: this node's own jobs only;
@@ -290,6 +301,13 @@ class IngestManager {
     void set_resume_listener(std::function<void(std::string_view)>);
     bool cancel(std::string_view id);
     bool clear(std::string_view id);
+    // One file of a job, by its index in `files`: `pause_file`, `resume_file`
+    // or `cancel_file`. `exists` false: no such job or file.
+    struct FileActionResult {
+        bool exists{};
+        bool changed{};
+    };
+    FileActionResult file_action(std::string_view id, size_t index, std::string_view action);
     CatalogueHintSummary catalogue_summary(std::string_view id) const;
     bool delete_owned_source_on_clear() const;
     bool delete_external_source_on_clear() const;

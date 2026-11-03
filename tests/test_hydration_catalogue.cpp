@@ -3349,6 +3349,87 @@ MACHA_TEST("hydration_catalogue", test_a_pause_or_cancel_accepted_while_the_work
     }
 }
 
+MACHA_TEST("hydration_catalogue", test_ingest_files_are_paused_resumed_and_cancelled_one_by_one) {
+    // One job of three files, its worker held inside the first copy: that
+    // file is paused and another cancelled. The job copies the third, then
+    // waits on the paused file alone; resuming that file finishes the job, and
+    // the cancelled file is never imported and leaves the job's totals.
+    CommitGate gate;
+    CatalogueNode node("ingest-files", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    constexpr size_t file_bytes = 1024 * 1024;
+    const auto root = node.path() / "three-files";
+    const std::vector<std::string> names{"Alpha Movie 2024.mkv", "Beta Movie 2024.mkv", "Gamma Movie 2024.mkv"};
+    for (const auto& name : names) {
+        (void)write_host_file(root / name, pattern(file_bytes));
+        gate.hold(name, 1);
+    }
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = {root};
+    config.copy_chunk_bytes = 64 * 1024;
+    config.checkpoint_bytes = 256 * 1024;
+    IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
+    struct ReleaseGate {
+        CommitGate& gate;
+        ~ReleaseGate() { gate.release_all(); }
+    } release_gate{gate};
+    const auto id = ingest.submit_path(root);
+    ingest.start();
+
+    REQUIRE(wait_until([&] {
+        const auto job = ingest.job(id);
+        return job && job->state == IngestJobState::importing && !job->current_file.empty() && gate.held() > 0;
+    }, 30s));
+    const auto planned = *ingest.job(id);
+    REQUIRE(planned.files.size() == 3);
+    size_t held = 0;
+    while (planned.files[held].source_path != planned.current_file) ++held;
+    const size_t cancelled = (held + 1) % 3;
+    const size_t other = (held + 2) % 3;
+
+    CHECK(ingest.file_action(id, held, "pause_file").changed);
+    CHECK(ingest.file_action(id, cancelled, "cancel_file").changed);
+    // Each says so at once, and the cancelled file leaves the totals.
+    {
+        const auto job = *ingest.job(id);
+        CHECK(ingest_file_state_name(job, held) == "paused");
+        CHECK(ingest_file_state_name(job, cancelled) == "cancelled");
+        CHECK(job.files_total == 2);
+        CHECK(job.bytes_total == 2 * file_bytes);
+    }
+    // Nothing to do twice, and no such file.
+    CHECK(!ingest.file_action(id, held, "pause_file").changed);
+    CHECK(!ingest.file_action(id, 7, "pause_file").exists);
+
+    gate.release_all();
+    // The other file is copied; then only the paused one is left.
+    REQUIRE(wait_until([&] {
+        const auto job = ingest.job(id);
+        return job && job->state == IngestJobState::paused && job->files[other].completed;
+    }, 60s));
+    {
+        const auto job = *ingest.job(id);
+        CHECK(job.held_by_files);
+        CHECK(!job.files[held].completed);
+        CHECK(job.files_completed == 1);
+        CHECK(ingest_file_state_name(job, other) == "completed");
+    }
+    CHECK(!ingest.file_action(id, other, "cancel_file").changed);
+
+    // Resuming the file resumes the job, which finishes with two files.
+    REQUIRE(ingest.file_action(id, held, "resume_file").changed);
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
+    const auto done = *ingest.job(id);
+    CHECK(done.files_completed == 2);
+    CHECK(done.files_total == 2);
+    CHECK(read_whole(node.filesystem(), done.files[held].destination_path, file_bytes) == pattern(file_bytes));
+    CHECK(!done.files[cancelled].completed);
+    CHECK(absent(node.filesystem(), done.files[cancelled].destination_path));
+    CHECK(absent(node.filesystem(), done.files[cancelled].temporary_path));
+    ingest.stop();
+}
+
 MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_mid_copy) {
     // Six jobs, three workers, every copy held at its first checkpoint commit:
     // exactly the bound is claimed; pause, cancel and clear then act on jobs a
