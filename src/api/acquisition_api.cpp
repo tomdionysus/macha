@@ -4,6 +4,7 @@
 
 #include "json.hpp"
 
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,6 +30,24 @@ std::optional<std::pair<std::string, std::string>> job_action(std::string_view p
         return std::pair<std::string, std::string>{std::string(path), {}};
     return std::pair<std::string, std::string>{std::string(path.substr(0, slash)),
                                                std::string(path.substr(slash + 1))};
+}
+
+// "files/{index}/{pause|resume|cancel}" as (index, action).
+std::optional<std::pair<size_t, std::string>> file_action(std::string_view rest) {
+    constexpr std::string_view prefix = "files/";
+    if (!rest.starts_with(prefix)) return {};
+    rest.remove_prefix(prefix.size());
+    const auto slash = rest.find('/');
+    if (slash == std::string_view::npos || slash == 0) return {};
+    const auto digits = rest.substr(0, slash);
+    const auto action = rest.substr(slash + 1);
+    if (action != "pause" && action != "resume" && action != "cancel") return {};
+    size_t index = 0;
+    for (const char c : digits) {
+        if (c < '0' || c > '9' || index > (std::numeric_limits<size_t>::max() - 9) / 10) return {};
+        index = index * 10 + static_cast<size_t>(c - '0');
+    }
+    return std::pair<size_t, std::string>{index, std::string(action)};
 }
 
 Json sources_json(const std::vector<ClusterJobView::Source>& sources) {
@@ -262,9 +281,13 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             if (request.method == "POST") {
                 IngestActionResult result;
                 if (target->second == "pause" || target->second == "resume" ||
-                    target->second == "cancel" || target->second == "clear")
+                    target->second == "cancel" || target->second == "clear") {
                     result = jobs_.ingest_action(target->first, target->second);
-                else return http_error(404, "not_found", "unknown ingest action");
+                } else if (auto file = file_action(target->second)) {
+                    result = jobs_.ingest_action(target->first, file->second + "_file", file->first);
+                } else {
+                    return http_error(404, "not_found", "unknown ingest action");
+                }
                 if (result.unreachable) return unreachable_error();
                 if (!result.changed) return action_error(result.exists);
                 if (target->second == "clear") {

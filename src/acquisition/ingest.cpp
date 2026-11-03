@@ -149,6 +149,8 @@ Json file_json(const IngestFileProgress& file) {
     o["completed"] = file.completed;
     o["skipped"] = file.skipped;
     o["catalogue_candidate"] = file.catalogue_candidate;
+    if (file.control == IngestFileControl::paused) o["control"] = std::string("paused");
+    else if (file.control == IngestFileControl::cancelled) o["control"] = std::string("cancelled");
     return o;
 }
 
@@ -177,6 +179,7 @@ Json job_json(const IngestJob& job) {
     o["updated_unix_ms"] = job.updated_unix_ms;
     o["error_code"] = job.error_code;
     o["error"] = job.error;
+    o["held_by_files"] = job.held_by_files;
     Json::Array files;
     files.reserve(job.files.size());
     for (const auto& file : job.files) files.push_back(file_json(file));
@@ -199,6 +202,13 @@ bool json_bool(const Json& object, std::string_view key, bool fallback = false) 
     return value ? value->asBool() : fallback;
 }
 
+// A worker writes back its own copy of the job; what the user asked of each
+// file since it took that copy is the stored job's.
+void keep_file_controls(IngestJob& worker, const IngestJob& stored) {
+    if (worker.files.size() != stored.files.size()) return;
+    for (size_t i = 0; i < worker.files.size(); ++i) worker.files[i].control = stored.files[i].control;
+}
+
 IngestFileProgress parse_file(const Json& value) {
     IngestFileProgress file;
     file.source_path = json_string(value, "source_path");
@@ -210,6 +220,9 @@ IngestFileProgress parse_file(const Json& value) {
     file.completed = json_bool(value, "completed");
     file.skipped = json_bool(value, "skipped");
     file.catalogue_candidate = json_bool(value, "catalogue_candidate", !sidecar_extension(file.source_path));
+    const auto control = json_string(value, "control");
+    if (control == "paused") file.control = IngestFileControl::paused;
+    else if (control == "cancelled") file.control = IngestFileControl::cancelled;
     return file;
 }
 
@@ -241,6 +254,7 @@ IngestJob parse_job(const Json& value) {
     job.error = json_string(value, "error");
     // A record with an error but no code gets one: an error never shows without a code.
     if (!job.error.empty() && job.error_code.empty()) job.error_code = "import_failed";
+    job.held_by_files = json_bool(value, "held_by_files");
     if (const auto* files = value.find("files")) {
         for (const auto& file : files->asArray()) job.files.push_back(parse_file(file));
     }
@@ -275,6 +289,16 @@ std::optional<IngestJobState> parse_ingest_job_state(std::string_view state) {
     if (state == "cancelled") return IngestJobState::cancelled;
     if (state == "failed") return IngestJobState::failed;
     return {};
+}
+
+std::string ingest_file_state_name(const IngestJob& job, size_t index) {
+    const auto& file = job.files.at(index);
+    if (file.completed) return "completed";
+    if (file.skipped) return "skipped";
+    if (file.control == IngestFileControl::cancelled) return "cancelled";
+    if (file.control == IngestFileControl::paused) return "paused";
+    if (job.state == IngestJobState::importing && job.current_file == file.source_path) return "importing";
+    return "queued";
 }
 
 Json optional_u64(const std::optional<uint64_t>& value) {
@@ -350,8 +374,11 @@ Json ingest_job_json(const IngestJob& job, bool include_files,
     if (include_files) {
         Json::Array files;
         files.reserve(job.files.size());
-        for (const auto& file : job.files) {
+        for (size_t index = 0; index < job.files.size(); ++index) {
+            const auto& file = job.files[index];
             Json::Object item;
+            item["index"] = static_cast<uint64_t>(index);
+            item["state"] = ingest_file_state_name(job, index);
             item["source_path"] = file.source_path;
             item["destination_path"] = file.destination_path;
             item["size"] = file.size;
@@ -555,6 +582,7 @@ Bytes IngestManager::handle_jobs_query(std::span<const uint8_t> request_payload)
 
 Bytes IngestManager::handle_job_action(std::span<const uint8_t> request_payload) {
     std::string job_id, action;
+    std::optional<size_t> file;
     try {
         const std::string text(reinterpret_cast<const char*>(request_payload.data()),
                                request_payload.size());
@@ -562,18 +590,24 @@ Bytes IngestManager::handle_job_action(std::span<const uint8_t> request_payload)
         if (const auto* id = request.find("job_id"); id && id->isString()) job_id = id->asString();
         if (const auto* act = request.find("action"); act && act->isString())
             action = act->asString();
+        if (const auto* index = request.find("file"); index && index->isNumber())
+            file = static_cast<size_t>(index->asUInt64());
     } catch (const std::exception&) {
     }
     Json::Object out;
-    const bool exists = job(job_id).has_value();
-    out["exists"] = exists;
+    bool exists = job(job_id).has_value();
     bool changed = false;
-    if (exists) {
+    if (exists && file) {
+        const auto result = file_action(job_id, *file, action);
+        exists = result.exists;
+        changed = result.changed;
+    } else if (exists) {
         if (action == "pause") changed = pause(job_id);
         else if (action == "resume") changed = resume(job_id);
         else if (action == "cancel") changed = cancel(job_id);
         else if (action == "clear") changed = clear(job_id);
     }
+    out["exists"] = exists;
     out["changed"] = changed;
     if (auto updated = job(job_id))
         out["job"] = ingest_job_wire_json(*updated);
@@ -818,6 +852,7 @@ bool IngestManager::pause(std::string_view id) {
         return false;
     const auto previous = it->second;
     it->second.state = IngestJobState::paused;
+    it->second.held_by_files = false;
     it->second.rate_bytes_per_second = 0;
     it->second.eta_seconds.reset();
     it->second.updated_unix_ms = now_ms();
@@ -854,6 +889,10 @@ bool IngestManager::resume_locked(std::string_view id) {
         return false;
     const auto previous = it->second;
     it->second.state = IngestJobState::queued;
+    it->second.held_by_files = false;
+    // Resuming the job resumes its paused files too.
+    for (auto& file : it->second.files)
+        if (file.control == IngestFileControl::paused) file.control = IngestFileControl::active;
     it->second.error.clear();
     it->second.error_code.clear();
     it->second.updated_unix_ms = now_ms();
@@ -1018,6 +1057,78 @@ bool IngestManager::clear(std::string_view id) {
     Log::info("ingest cleared id=" + terminal_job.id +
               (delete_source ? " source_deleted=true" : " source_deleted=false"));
     return true;
+}
+
+IngestManager::FileActionResult IngestManager::file_action(std::string_view id, size_t index,
+                                                           std::string_view action) {
+    FileActionResult result;
+    std::optional<IngestFileProgress> dropped;
+    bool resumed = false;
+    {
+        Lock lock(mutex_);
+        auto it = jobs_.find(std::string(id));
+        if (it == jobs_.end() || index >= it->second.files.size()) return result;
+        result.exists = true;
+        auto& job = it->second;
+        auto& file = job.files[index];
+        const bool finished = job.state == IngestJobState::completed ||
+                              job.state == IngestJobState::cancelled ||
+                              job.state == IngestJobState::failed ||
+                              job.state == IngestJobState::cataloguing;
+        if (finished || file.completed || file.skipped) return result;
+        const auto previous = job;
+        if (action == "pause_file") {
+            if (file.control != IngestFileControl::active) return result;
+            file.control = IngestFileControl::paused;
+        } else if (action == "resume_file") {
+            if (file.control != IngestFileControl::paused) return result;
+            file.control = IngestFileControl::active;
+            if (job.state == IngestJobState::paused && job.held_by_files) {
+                job.state = IngestJobState::queued;
+                job.held_by_files = false;
+                resumed = true;
+            }
+        } else if (action == "cancel_file") {
+            if (file.control == IngestFileControl::cancelled) return result;
+            file.control = IngestFileControl::cancelled;
+            // Its worker drops the partial when it reaches it; with none, here.
+            if (!active_job_ids_.contains(job.id)) dropped = file;
+            // Held only for files now all cancelled: let the job finish.
+            if (job.state == IngestJobState::paused && job.held_by_files &&
+                std::none_of(job.files.begin(), job.files.end(), [](const IngestFileProgress& f) {
+                    return !f.completed && f.control == IngestFileControl::paused;
+                })) {
+                job.state = IngestJobState::queued;
+                job.held_by_files = false;
+                resumed = true;
+            }
+            refresh_progress(job);
+        } else {
+            return result;
+        }
+        job.updated_unix_ms = now_ms();
+        try {
+            save_state_locked();
+        } catch (...) {
+            job = previous;
+            throw;
+        }
+        result.changed = true;
+    }
+    if (dropped) {
+        drop_partial(*dropped);
+        Lock lock(mutex_);
+        if (auto it = jobs_.find(std::string(id)); it != jobs_.end() && index < it->second.files.size()) {
+            it->second.files[index].copied = 0;
+            refresh_progress(it->second);
+            try { save_state_locked(); } catch (const std::exception& e) {
+                Log::warn("ingest state save failed id=" + std::string(id) + ": " + e.what());
+            }
+        }
+    }
+    if (resumed || dropped) cv_.notify_all();
+    Log::info("ingest file " + std::string(action) + " id=" + std::string(id) + " index=" + std::to_string(index));
+    return result;
 }
 
 CatalogueHintSummary IngestManager::catalogue_summary(std::string_view id) const {
@@ -1273,6 +1384,7 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
             job.updated_unix_ms = now_ms();
             Lock lock(mutex_);
             if (auto it = jobs_.find(id); it != jobs_.end()) {
+                keep_file_controls(job, it->second);
                 it->second = job;
                 try { save_state_locked(); } catch (...) {}
             }
@@ -1338,6 +1450,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
             it->second.state == IngestJobState::cancelled)
             return false;
+        keep_file_controls(job, it->second);
         it->second = job;
         save_state_locked();
     }
@@ -1478,6 +1591,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
             it->second.state == IngestJobState::cancelled)
             return false;
+        keep_file_controls(job, it->second);
         it->second = job;
         save_state_locked();
     }
@@ -1734,15 +1848,26 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     auto sample_start = std::chrono::steady_clock::now();
     uint64_t sample_start_bytes = job.bytes_completed;
 
+    const auto index = static_cast<size_t>(&file - job.files.data());
     while (file.copied < file.size && !stop.stop_requested()) {
         IngestJobState control = IngestJobState::importing;
+        auto file_control = IngestFileControl::active;
         uint64_t checkpoint_bytes = 0;
         {
             Lock lock(mutex_);
             auto it = jobs_.find(job.id);
             if (it == jobs_.end()) return false;
             control = it->second.state;
+            if (index < it->second.files.size()) file_control = it->second.files[index].control;
             checkpoint_bytes = config_.checkpoint_bytes;
+        }
+        // This file alone is held or left out; the job goes on to the next.
+        if (file_control != IngestFileControl::active && control == IngestJobState::importing) {
+            commit_progress();
+            file.control = file_control;
+            if (file_control == IngestFileControl::cancelled) drop_partial(file);
+            refresh_progress(job);
+            return true;
         }
         if (control == IngestJobState::paused || control == IngestJobState::cancelled) {
             commit_progress();
@@ -1758,6 +1883,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
             }
             Lock lock(mutex_);
             if (auto it = jobs_.find(job.id); it != jobs_.end()) {
+                keep_file_controls(job, it->second);
                 it->second = job;
                 save_state_locked();
             }
@@ -1793,6 +1919,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
             if (it == jobs_.end()) return false;
             if (it->second.state == IngestJobState::paused || it->second.state == IngestJobState::cancelled)
                 job.state = it->second.state;
+            keep_file_controls(job, it->second);
             it->second = job;
             save_state_locked();
             if (job.state != IngestJobState::importing) return false;
@@ -1804,6 +1931,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         job.updated_unix_ms = now_ms();
         Lock lock(mutex_);
         if (auto it = jobs_.find(job.id); it != jobs_.end()) {
+            keep_file_controls(job, it->second);
             it->second = job;
             save_state_locked();
         }
@@ -1859,12 +1987,18 @@ std::optional<std::vector<ExtentRef>> IngestManager::published_extents(
 
 void IngestManager::refresh_progress(IngestJob& job, uint64_t sample_bytes,
                                      std::chrono::steady_clock::duration sample_time) {
-    uint64_t total = 0;
-    size_t completed = 0;
+    // A cancelled file is out of the job: neither planned nor done.
+    uint64_t total = 0, planned = 0;
+    size_t completed = 0, files = 0;
     for (const auto& file : job.files) {
+        if (file.control == IngestFileControl::cancelled && !file.completed) continue;
+        ++files;
+        planned += file.size;
         total += std::min(file.copied, file.size);
         if (file.completed) ++completed;
     }
+    job.bytes_total = planned;
+    job.files_total = files;
     job.bytes_completed = total;
     job.files_completed = completed;
     if (sample_bytes && sample_time > std::chrono::steady_clock::duration::zero()) {
@@ -1927,30 +2061,83 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
         if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
             it->second.state == IngestJobState::cancelled)
             return false;
+        keep_file_controls(job, it->second);
         it->second = job;
         save_state_locked();
     }
 
-    for (auto& file : job.files) {
-        if (stop.stop_requested()) return false;
-        if (file.completed) continue;
-        job.current_file = file.source_path;
-        job.current_destination = file.destination_path;
-        job.updated_unix_ms = now_ms();
+    // Passes until no file is left to run: one resumed behind the worker's
+    // position is run on the next pass.
+    for (bool runnable = true; runnable;) {
+        for (auto& file : job.files) {
+            if (stop.stop_requested()) return false;
+            if (file.completed) continue;
+            {
+                Lock lock(mutex_);
+                auto it = jobs_.find(job.id);
+                if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
+                    it->second.state == IngestJobState::cancelled)
+                    return false;
+                keep_file_controls(job, it->second);
+                if (file.control == IngestFileControl::active) {
+                    job.current_file = file.source_path;
+                    job.current_destination = file.destination_path;
+                    job.updated_unix_ms = now_ms();
+                    it->second = job;
+                    save_state_locked();
+                }
+            }
+            if (file.control == IngestFileControl::paused) continue;
+            if (file.control == IngestFileControl::cancelled) {
+                drop_partial(file);
+                refresh_progress(job);
+                if (!record_progress(job)) return false;
+                continue;
+            }
+            if (!copy_file(job, file, stop)) return false;
+            job.updated_unix_ms = now_ms();
+            if (!record_progress(job)) return false;
+        }
         {
             Lock lock(mutex_);
             auto it = jobs_.find(job.id);
-            if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
-                it->second.state == IngestJobState::cancelled)
-                return false;
-            it->second = job;
-            save_state_locked();
+            if (it == jobs_.end()) return false;
+            keep_file_controls(job, it->second);
         }
-        if (!copy_file(job, file, stop)) return false;
-        job.updated_unix_ms = now_ms();
-        if (!record_progress(job)) return false;
+        runnable = std::any_of(job.files.begin(), job.files.end(), [](const IngestFileProgress& file) {
+            return !file.completed && !file.skipped && file.control == IngestFileControl::active;
+        });
     }
+    // Only paused files are left: the job waits for one of them.
+    if (std::any_of(job.files.begin(), job.files.end(), [](const IngestFileProgress& file) {
+            return !file.completed && file.control == IngestFileControl::paused;
+        })) {
+        job.state = IngestJobState::paused;
+        job.held_by_files = true;
+        job.current_file.clear();
+        job.current_destination.clear();
+        job.rate_bytes_per_second = 0;
+        job.eta_seconds.reset();
+        job.updated_unix_ms = now_ms();
+        (void)record_progress(job);
+        return false;
+    }
+    // A file cancelled behind the worker's position kept its partial until now.
+    for (auto& file : job.files)
+        if (!file.completed && file.control == IngestFileControl::cancelled) drop_partial(file);
     return true;
+}
+
+void IngestManager::drop_partial(IngestFileProgress& file) {
+    if (!file.temporary_path.empty()) {
+        try {
+            fs_.unlink(file.temporary_path);
+        } catch (const FsError& e) {
+            if (e.code() != ENOENT)
+                Log::warn("ingest partial cleanup failed path=" + file.temporary_path + " reason=" + e.what());
+        }
+    }
+    file.copied = 0;
 }
 
 bool IngestManager::record_progress(IngestJob& job) {
@@ -1970,6 +2157,7 @@ bool IngestManager::record_progress(IngestJob& job) {
         job.rate_bytes_per_second = 0;
         job.eta_seconds.reset();
     }
+    keep_file_controls(job, it->second);
     it->second = job;
     save_state_locked();
     return !overridden;
