@@ -12,6 +12,7 @@
 #include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -5352,6 +5353,13 @@ class FaultyLinks final : public RpcLinks {
         const auto found = admitted_.find({peer, lane});
         return found == admitted_.end() ? 0 : found->second;
     }
+    // Duplicates of every socket dialled to `endpoint` on `lane`: the same
+    // sockets, so options the transport set on its own are visible on them.
+    std::vector<int> dialled_sockets(const Endpoint& endpoint, TransportLane lane) const {
+        Lock lock(mutex_);
+        const auto found = dialled_.find({endpoint_identity_key(endpoint), lane});
+        return found == dialled_.end() ? std::vector<int>{} : found->second.sockets;
+    }
 
     // Calls to `peer` (every one, or only `message`, or only on `lane`) are
     // held unanswered, with idle_for() advancing as for a dead link.
@@ -6797,6 +6805,1134 @@ MACHA_FAST_TEST("rpc_cluster", test_large_replies_never_crowd_out_a_small_messag
     CHECK(outbound_refusal(0, max_peer_outbound_bytes - 100, 100) == nullptr);
     CHECK(outbound_refusal(0, max_peer_outbound_bytes - 99, 100) != nullptr);
     CHECK(outbound_refusal(0, 0, max_peer_outbound_bytes + 1) != nullptr);
+}
+
+} // namespace
+
+// The transport's behaviours as the Dannan extraction inventory lists them
+// (dannan/TODO/2026-11-03-macha-function-inventory.md, "Transport and
+// lanes"), each written from its specification: docs/cluster.md, the Network
+// section of docs/configuration.md, and the contracts in cluster/net.hpp.
+// They are the gate the transport's rewrite on Asio is held to.
+namespace {
+
+Bytes read_exact(int fd, size_t size) {
+    Bytes out(size);
+    size_t done = 0;
+    while (done < size) {
+        const auto count = ::recv(fd, out.data() + done, size - done, 0);
+        if (count <= 0)
+            throw std::runtime_error("relay: peer closed");
+        done += static_cast<size_t>(count);
+    }
+    return out;
+}
+
+void write_exact(int fd, std::span<const uint8_t> bytes) {
+    size_t done = 0;
+    while (done < bytes.size()) {
+        const auto count = ::send(fd, bytes.data() + done, bytes.size() - done, 0);
+        if (count <= 0)
+            throw std::runtime_error("relay: peer closed");
+        done += static_cast<size_t>(count);
+    }
+}
+
+// One length-prefixed handshake blob, as it crossed the wire.
+Bytes read_blob(int fd) {
+    auto framed = read_exact(fd, 4);
+    Reader reader(framed);
+    const auto body = read_exact(fd, reader.u32());
+    framed.insert(framed.end(), body.begin(), body.end());
+    return framed;
+}
+
+// One sealed fragment, as it crossed the wire: the 28-byte header, the
+// nonce, the tag and the ciphertext.
+Bytes read_sealed_fragment(int fd) {
+    auto fragment = read_exact(fd, 28);
+    Reader header(fragment);
+    (void)header.u32();
+    (void)header.u8();
+    (void)header.u8();
+    (void)header.u16();
+    const auto size = header.u32();
+    const auto rest = read_exact(fd, 12 + 16 + size);
+    fragment.insert(fragment.end(), rest.begin(), rest.end());
+    return fragment;
+}
+
+// A client and a server SecureChannel with the test between them: every byte
+// either way passes through the test, which may forward, alter or repeat it.
+struct RelayedChannels {
+    int client_end{-1}, client_relay{-1}, server_relay{-1}, server_end{-1};
+    std::unique_ptr<SecureChannel> client;
+    std::unique_ptr<SecureChannel> server;
+    std::exception_ptr client_error;
+    std::exception_ptr server_error;
+
+    RelayedChannels(const ClusterKeys& client_keys, size_t client_frame,
+                    const ClusterKeys& server_keys, size_t server_frame) {
+        int to_client[2]{};
+        int to_server[2]{};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, to_client) == 0);
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, to_server) == 0);
+        client_end = to_client[0];
+        client_relay = to_client[1];
+        server_relay = to_server[0];
+        server_end = to_server[1];
+        client = std::make_unique<SecureChannel>(
+            client_end, client_keys, NodeInfo{random_node_id(), "127.0.0.1", "client", 1},
+            client_frame);
+        server = std::make_unique<SecureChannel>(
+            server_end, server_keys, NodeInfo{random_node_id(), "127.0.0.1", "server", 2},
+            server_frame);
+    }
+    ~RelayedChannels() {
+        client.reset();
+        server.reset();
+        ::close(client_relay);
+        ::close(server_relay);
+    }
+
+    // Both handshakes, relayed unaltered. A side that refuses records why.
+    void handshake(TransportLane lane) {
+        std::thread server_side([&] {
+            try {
+                (void)server->server_handshake("127.0.0.1");
+            } catch (...) {
+                server_error = std::current_exception();
+            }
+        });
+        std::thread client_side([&] {
+            try {
+                (void)client->client_handshake(lane);
+            } catch (...) {
+                client_error = std::current_exception();
+            }
+        });
+        write_exact(server_relay, read_blob(client_relay));
+        server_side.join();
+        if (server_error) {
+            server.reset();
+            ::shutdown(client_relay, SHUT_RDWR);
+        } else {
+            write_exact(client_relay, read_blob(server_relay));
+        }
+        client_side.join();
+    }
+};
+
+std::string error_text(const std::exception_ptr& error) {
+    if (!error)
+        return {};
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& e) {
+        return e.what();
+    } catch (...) {
+        return "unknown";
+    }
+}
+
+// A client hello for protocol `version`, signed with `keys`.
+Bytes signed_hello(const ClusterKeys& keys, uint16_t version, uint32_t frame, TransportLane lane) {
+    NodeInfo client{random_node_id(), "127.0.0.1", "hello", free_port()};
+    const auto ephemeral = x25519_generate();
+    const auto nonce_bytes = random_bytes(32);
+    std::array<uint8_t, 32> nonce{};
+    std::copy(nonce_bytes.begin(), nonce_bytes.end(), nonce.begin());
+    Writer hello_writer;
+    hello_writer.u16(version);
+    hello_writer.u32(frame);
+    hello_writer.u8(static_cast<uint8_t>(lane));
+    hello_writer.fixed(keys.cluster_id);
+    hello_writer.fixed(client.id.bytes);
+    hello_writer.fixed(nonce);
+    hello_writer.fixed(ephemeral.public_key);
+    encode_node_info(hello_writer, client);
+    const auto hello = hello_writer.take();
+
+    Bytes authenticated(reinterpret_cast<const uint8_t*>("client/v15"),
+                        reinterpret_cast<const uint8_t*>("client/v15") + 10);
+    authenticated.insert(authenticated.end(), hello.begin(), hello.end());
+    Writer envelope;
+    envelope.bytes(hello);
+    envelope.fixed(hmac_sha256(keys.auth, authenticated));
+    Writer framed;
+    framed.u32(static_cast<uint32_t>(envelope.data().size()));
+    framed.raw(envelope.data());
+    return framed.take();
+}
+
+// Answers the client hello waiting on `fd` with a server ack this test
+// writes: protocol `version` and frame size `frame`, correctly signed.
+void answer_hello(int fd, const ClusterKeys& keys, uint16_t version, uint32_t frame,
+                  TransportLane lane) {
+    const auto blob = read_blob(fd);
+    Reader envelope(std::span<const uint8_t>(blob).subspan(4));
+    const auto hello = envelope.bytes(16384);
+    (void)envelope.fixed<32>();
+    envelope.finish();
+
+    NodeInfo server{random_node_id(), "127.0.0.1", "forged", 1};
+    const auto ephemeral = x25519_generate();
+    const auto nonce_bytes = random_bytes(32);
+    std::array<uint8_t, 32> nonce{};
+    std::copy(nonce_bytes.begin(), nonce_bytes.end(), nonce.begin());
+    Writer ack_writer;
+    ack_writer.u16(version);
+    ack_writer.u32(frame);
+    ack_writer.u8(static_cast<uint8_t>(lane));
+    ack_writer.fixed(keys.cluster_id);
+    ack_writer.fixed(server.id.bytes);
+    ack_writer.fixed(nonce);
+    ack_writer.fixed(ephemeral.public_key);
+    encode_node_info(ack_writer, server);
+    const auto ack = ack_writer.take();
+
+    Bytes authenticated(reinterpret_cast<const uint8_t*>("server/v15"),
+                        reinterpret_cast<const uint8_t*>("server/v15") + 10);
+    authenticated.insert(authenticated.end(), hello.begin(), hello.end());
+    authenticated.insert(authenticated.end(), ack.begin(), ack.end());
+    Writer response;
+    response.bytes(ack);
+    response.fixed(hmac_sha256(keys.auth, authenticated));
+    Writer framed;
+    framed.u32(static_cast<uint32_t>(response.data().size()));
+    framed.raw(response.data());
+    write_exact(fd, framed.data());
+}
+
+// The client's handshake against an ack this test writes; the error, or empty.
+std::string client_against_ack(uint16_t version, uint32_t ack_frame, size_t client_frame) {
+    TempDir dir;
+    write_key(dir.path() / "cluster.key");
+    const auto keys = load_cluster_keys(dir.path() / "cluster.key");
+    int pair[2]{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    SecureChannel client(pair[0], keys, NodeInfo{random_node_id(), "127.0.0.1", "client", 1},
+                         client_frame);
+    std::exception_ptr error;
+    std::thread client_side([&] {
+        try {
+            (void)client.client_handshake(TransportLane::control);
+        } catch (...) {
+            error = std::current_exception();
+        }
+    });
+    answer_hello(pair[1], keys, version, ack_frame, TransportLane::control);
+    client_side.join();
+    ::close(pair[1]);
+    return error ? error_text(error) + " " : std::string{};
+}
+
+// A peer that completes the handshake and then never reads again: whatever is
+// sent to it backs up in the sender's own queue.
+struct SilentPeer {
+    NodeInfo info;
+    int listener{-1};
+    std::unique_ptr<SecureChannel> channel;
+    std::thread accepter;
+
+    explicit SilentPeer(const ClusterKeys& keys)
+        : info{random_node_id(), "127.0.0.1", "silent", free_port()} {
+        listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(listener >= 0);
+        const int on = 1;
+        ::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(info.port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        REQUIRE(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+        REQUIRE(::listen(listener, 4) == 0);
+        accepter = std::thread([this, keys] {
+            const int fd = ::accept(listener, nullptr, nullptr);
+            if (fd < 0)
+                return;
+            channel = std::make_unique<SecureChannel>(fd, keys, info, 256 * 1024);
+            try {
+                (void)channel->server_handshake("127.0.0.1");
+            } catch (...) {
+            }
+        });
+    }
+    // The handshake is done once the caller's call has a route.
+    void close() {
+        if (listener >= 0) {
+            ::shutdown(listener, SHUT_RDWR);
+            ::close(listener);
+            listener = -1;
+        }
+        if (accepter.joinable())
+            accepter.join();
+        if (channel)
+            channel->shutdown();
+    }
+    ~SilentPeer() {
+        close();
+    }
+};
+
+// Every transport socket keeps TCP keepalive probing at 60 s, so a NAT
+// mapping stays warm (docs/configuration.md, Network), and sends without
+// Nagle's delay (net.hpp, peer_socket_options): on the sockets the transport
+// itself dialled, on both lanes, on every platform.
+MACHA_TEST("rpc_cluster", test_peer_sockets_disable_nagle_and_keep_alive) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [](const NodeInfo&, FrameType, const RpcMessage& request) {
+            return RpcMessage{MessageType::ok, request.payload};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    FaultyLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms);
+    const Endpoint endpoint{"127.0.0.1", port};
+    REQUIRE(client.call(endpoint, MessageType::members, Bytes{1}, 1s).message.type ==
+            MessageType::ok);
+    REQUIRE(client.call(endpoint, MessageType::put_object, Bytes{2}, FrameType::foreground, 1s)
+                .message.type == MessageType::ok);
+
+    for (const auto lane : {TransportLane::control, TransportLane::data}) {
+        const auto sockets = links.dialled_sockets(endpoint, lane);
+        REQUIRE(sockets.size() == 1);
+        const int fd = sockets.front();
+        int value = 0;
+        socklen_t length = sizeof(value);
+        REQUIRE(::getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value, &length) == 0);
+        CHECK(value != 0);
+        value = 0;
+        length = sizeof(value);
+        REQUIRE(::getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &value, &length) == 0);
+        CHECK(value != 0);
+        value = 0;
+        length = sizeof(value);
+#ifdef TCP_KEEPIDLE
+        REQUIRE(::getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &value, &length) == 0);
+#else
+        REQUIRE(::getsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &value, &length) == 0);
+#endif
+        CHECK(value == 60);
+    }
+    client.stop();
+    server.stop();
+}
+
+// The frame size is negotiated at the handshake and bounded by each side's
+// configuration: both ends agree on the smaller, whichever side has it, and
+// nothing larger is sent.
+MACHA_FAST_TEST("rpc_cluster", test_peers_with_different_frame_limits_agree_on_the_smaller) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    for (const auto& [client_frame, server_frame] :
+         {std::pair<size_t, size_t>{4096, 65536}, std::pair<size_t, size_t>{65536, 4096}}) {
+        RelayedChannels channels(keys, client_frame, keys, server_frame);
+        channels.handshake(TransportLane::control);
+        REQUIRE(!channels.client_error);
+        REQUIRE(!channels.server_error);
+        CHECK(channels.client->max_frame_size() == 4096);
+        CHECK(channels.server->max_frame_size() == 4096);
+
+        bool oversized_refused = false;
+        try {
+            channels.client->send_fragment(1, FrameType::control, MessageType::ping, true, true,
+                                           Bytes(4097, 0x5a));
+        } catch (const std::exception&) {
+            oversized_refused = true;
+        }
+        CHECK(oversized_refused);
+
+        channels.client->send_fragment(2, FrameType::control, MessageType::ping, true, true,
+                                       Bytes(4096, 0x5a));
+        write_exact(channels.server_relay, read_sealed_fragment(channels.client_relay));
+        const auto received = channels.server->receive_fragment();
+        CHECK(received.request_id == 2);
+        CHECK(received.payload == Bytes(4096, 0x5a));
+    }
+}
+
+// A server that acknowledges a frame size above what the client offered is
+// refused; one that acknowledges the client's own size is accepted.
+MACHA_FAST_TEST("rpc_cluster", test_a_negotiated_frame_above_the_clients_limit_is_refused) {
+    CHECK(client_against_ack(23, 4096, 4096).empty());
+    CHECK(!client_against_ack(23, 8192, 4096).empty());
+}
+
+// Both ends of a session derive the same session id, and no two sessions
+// share one.
+MACHA_FAST_TEST("rpc_cluster", test_both_ends_of_a_session_share_its_id_and_no_other_session_does) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    RelayedChannels first(keys, 65536, keys, 65536);
+    first.handshake(TransportLane::control);
+    RelayedChannels second(keys, 65536, keys, 65536);
+    second.handshake(TransportLane::control);
+    REQUIRE(!first.client_error && !first.server_error);
+    REQUIRE(!second.client_error && !second.server_error);
+    CHECK(first.client->session_id() == first.server->session_id());
+    CHECK(second.client->session_id() == second.server->session_id());
+    CHECK(first.client->session_id() != second.client->session_id());
+}
+
+// Each fragment is authenticated: a fragment altered on the wire, in its
+// body or in its header, is refused by the receiver.
+MACHA_FAST_TEST("rpc_cluster", test_a_tampered_fragment_ends_the_session) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    // The last byte is ciphertext; byte 27 is in the header, which is
+    // authenticated as associated data.
+    for (const size_t from_end : {size_t{1}, size_t{0}}) {
+        RelayedChannels channels(keys, 65536, keys, 65536);
+        channels.handshake(TransportLane::control);
+        REQUIRE(!channels.client_error && !channels.server_error);
+
+        channels.client->send_fragment(1, FrameType::control, MessageType::members, true, true,
+                                       Bytes{1, 2, 3});
+        write_exact(channels.server_relay, read_sealed_fragment(channels.client_relay));
+        CHECK(channels.server->receive_fragment().payload == Bytes({1, 2, 3}));
+
+        channels.client->send_fragment(2, FrameType::control, MessageType::members, true, true,
+                                       Bytes{4, 5, 6});
+        auto altered = read_sealed_fragment(channels.client_relay);
+        altered[from_end ? altered.size() - from_end : 27] ^= 0x01;
+        write_exact(channels.server_relay, altered);
+        bool refused = false;
+        try {
+            (void)channels.server->receive_fragment();
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        CHECK(refused);
+    }
+}
+
+// Fragments are counted: a fragment delivered a second time is refused.
+MACHA_FAST_TEST("rpc_cluster", test_a_replayed_fragment_ends_the_session) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    RelayedChannels channels(keys, 65536, keys, 65536);
+    channels.handshake(TransportLane::control);
+    REQUIRE(!channels.client_error && !channels.server_error);
+
+    channels.client->send_fragment(1, FrameType::control, MessageType::members, true, true,
+                                   Bytes{7});
+    const auto fragment = read_sealed_fragment(channels.client_relay);
+    write_exact(channels.server_relay, fragment);
+    CHECK(channels.server->receive_fragment().payload == Bytes{7});
+
+    write_exact(channels.server_relay, fragment);
+    bool refused = false;
+    try {
+        (void)channels.server->receive_fragment();
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+
+// A peer holding another cluster's key fails the handshake on both sides.
+MACHA_FAST_TEST("rpc_cluster", test_a_peer_with_another_cluster_key_fails_the_handshake) {
+    TempDir dir;
+    write_key(dir.path() / "ours.key");
+    {
+        // write_key gives every file in a case the same key; this one differs.
+        std::ofstream out(dir.path() / "theirs.key", std::ios::binary | std::ios::trunc);
+        out << "another cluster's key " << random_node_id().bytes[0] << '\n';
+    }
+    const auto ours = load_cluster_keys(dir.path() / "ours.key");
+    const auto theirs = load_cluster_keys(dir.path() / "theirs.key");
+    REQUIRE(ours.auth != theirs.auth);
+    RelayedChannels channels(theirs, 65536, ours, 65536);
+    channels.handshake(TransportLane::control);
+    CHECK(channels.server_error != nullptr);
+    CHECK(channels.client_error != nullptr);
+}
+
+// Mixed-version operation is rejected at the handshake, never negotiated
+// down (docs/cluster.md): a hello from a newer protocol is closed without a
+// reply, where the same hello at the cluster's version is answered.
+MACHA_TEST("rpc_cluster", test_a_hello_from_a_newer_protocol_is_refused) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server", port};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [](const NodeInfo&, FrameType, const RpcMessage&) {
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    const auto first_reply_byte = [&](uint16_t version) {
+        const int fd = connect_idle(port);
+        write_exact(fd, signed_hello(keys, version, 256 * 1024, TransportLane::control));
+        timeval timeout{5, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        uint8_t byte{};
+        const auto received = ::recv(fd, &byte, 1, 0);
+        ::close(fd);
+        return received;
+    };
+    CHECK(first_reply_byte(23) == 1);
+    CHECK(first_reply_byte(24) == 0);
+    server.stop();
+}
+
+// The client refuses an acknowledgement of any other protocol version.
+MACHA_FAST_TEST("rpc_cluster", test_a_client_refuses_an_ack_of_another_version) {
+    CHECK(client_against_ack(23, 65536, 65536).empty());
+    CHECK(!client_against_ack(24, 65536, 65536).empty());
+    CHECK(!client_against_ack(22, 65536, 65536).empty());
+}
+
+// Cluster bytes are counted in and out by frame class, every sealed fragment
+// with its overhead, and one count serves the node's client, its server and
+// every session: what one node sends in a class is what the other receives.
+MACHA_TEST("rpc_cluster", test_traffic_counts_both_directions_by_frame_class_in_one_instance) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    NodeInfo a_info{random_node_id(), "127.0.0.1", "a", port};
+    NodeInfo b_info{random_node_id(), "127.0.0.1", "b", free_port()};
+    NetworkLinks a_links;
+    NetworkLinks b_links;
+    // Heartbeats far apart, so nothing but the test's own calls moves.
+    RpcClient a_client(
+        a_links, keys, [a_info] { return a_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
+        1h, 2h);
+    RpcServer a_server(
+        "127.0.0.1", port, keys, a_info,
+        [](const NodeInfo&, FrameType, const RpcMessage& request) {
+            return RpcMessage{MessageType::ok, Bytes(request.payload.size() / 2, 0x41)};
+        },
+        [](const NodeInfo&) {});
+    a_server.attach_client(a_client);
+    a_server.start();
+    RpcClient b_client(
+        b_links, keys, [b_info] { return b_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
+        1h, 2h);
+
+    const auto loader = static_cast<size_t>(FrameType::loader);
+    const auto& a = *a_client.traffic();
+    const auto& b = *b_client.traffic();
+    REQUIRE(
+        b_client.call(a_info, MessageType::put_object, Bytes(10'000, 0x5a), FrameType::loader, 2s)
+            .message.type == MessageType::ok);
+    // One fragment: a 28-byte header, a 12-byte nonce and a 16-byte tag.
+    CHECK(b.out_bytes[loader].load() == 10'000 + 56);
+    CHECK(a.in_bytes[loader].load() == 10'000 + 56);
+    // Received by A's server, counted in A's client: one instance. Every
+    // class agrees across the two nodes once the reply has landed.
+    CHECK(wait_until([&] {
+        for (size_t c = 0; c < TransportTraffic::classes; ++c)
+            if (a.out_bytes[c].load() != b.in_bytes[c].load() ||
+                a.in_bytes[c].load() != b.out_bytes[c].load())
+                return false;
+        return true;
+    }));
+    uint64_t replied = 0;
+    for (size_t c = 0; c < TransportTraffic::classes; ++c)
+        replied += a.out_bytes[c].load();
+    CHECK(replied >= 5'000 + 56);
+    CHECK(a.in_bytes[static_cast<size_t>(FrameType::foreground)].load() == 0);
+
+    b_client.stop();
+    a_client.stop();
+    a_server.stop();
+}
+
+// An in-flight call can be promoted to a more urgent class, and the promotion
+// takes effect on both sides: in the caller's own queue, where it overtakes
+// a transfer already under way, and in the peer's, where it is run as the
+// class it was promoted to.
+MACHA_TEST("rpc_cluster", test_a_promoted_call_overtakes_on_both_sides) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+    TestGate loaders;
+    std::mutex seen_mutex;
+    std::vector<std::pair<uint8_t, FrameType>> seen;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
+            if (request.type == MessageType::put_object && frame_type == FrameType::loader)
+                loaders.enter_and_wait();
+            {
+                std::lock_guard lock(seen_mutex);
+                seen.emplace_back(request.payload.empty() ? 0 : request.payload.front(),
+                                  frame_type);
+            }
+            return RpcMessage{request.type == MessageType::get_object ? MessageType::object_reply
+                                                                      : MessageType::ok,
+                              {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+    struct GateOpener {
+        TestGate& gate;
+        ~GateOpener() {
+            gate.open();
+        }
+    } open_on_exit{loaders};
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    NetworkLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 1h, 2h);
+    const Endpoint endpoint{"127.0.0.1", port};
+    const auto saw = [&](uint8_t tag) -> std::optional<FrameType> {
+        std::lock_guard lock(seen_mutex);
+        for (const auto& [t, frame] : seen)
+            if (t == tag)
+                return frame;
+        return std::nullopt;
+    };
+
+    // The peer: loader puts hold every DATA worker not kept for foreground
+    // work, so a read-ahead waits in its queue until it is promoted.
+    std::vector<AsyncRpc> held;
+    for (uint8_t i = 0; i < 8; ++i)
+        held.push_back(
+            client.call_async(endpoint, MessageType::put_object, Bytes{0x10}, FrameType::loader));
+    REQUIRE(loaders.wait_for_entries(6));
+    auto read_ahead =
+        client.call_async(endpoint, MessageType::get_object, Bytes{0x20}, FrameType::read_ahead);
+    REQUIRE(wait_until([&] { return server.work_stats().data_pending_bytes == 3; }));
+    CHECK(!saw(0x20).has_value());
+    read_ahead.promote(FrameType::foreground);
+    REQUIRE(read_ahead.wait_for(scaled(2s)) == std::future_status::ready);
+    CHECK(read_ahead.get().message.type == MessageType::object_reply);
+    CHECK(saw(0x20) == FrameType::foreground);
+    loaders.open();
+    for (auto& rpc : held)
+        REQUIRE(rpc.wait_for(scaled(5s)) == std::future_status::ready);
+
+    // The caller: a speculative call queued behind a large speculative
+    // transfer leaves first once promoted.
+    auto large = client.call_async(endpoint, MessageType::put_object, Bytes(32 * 1024 * 1024, 0x30),
+                                   FrameType::speculative);
+    auto small =
+        client.call_async(endpoint, MessageType::put_object, Bytes{0x31}, FrameType::speculative);
+    small.promote(FrameType::foreground);
+    REQUIRE(small.wait_for(scaled(5s)) == std::future_status::ready);
+    CHECK(small.get().message.type == MessageType::ok);
+    CHECK(saw(0x31) == FrameType::foreground);
+    CHECK(!saw(0x30).has_value());
+    REQUIRE(large.wait_for(scaled(50s)) == std::future_status::ready);
+    CHECK(large.get().message.type == MessageType::ok);
+
+    client.stop();
+    server.stop();
+}
+
+// broadcast_notify sends on the routes there are: it never dials a peer it
+// has no route to, and never waits on a peer whose route is backed up.
+MACHA_TEST("rpc_cluster", test_broadcast_notify_never_dials_and_never_waits_on_a_silent_peer) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto live_port = free_port();
+    NodeInfo live_info{random_node_id(), "127.0.0.1", "live", live_port};
+    std::atomic_uint64_t live_received{};
+    RpcServer live(
+        "127.0.0.1", live_port, keys, live_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::telemetry)
+                live_received.fetch_add(1);
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    live.start();
+    SilentPeer silent(keys);
+    NodeInfo unrouted{random_node_id(), "127.0.0.1", "unrouted", free_port()};
+
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    FaultyLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 1h, 2h);
+    REQUIRE(client.call(live_info, MessageType::members, Bytes{1}, 1s).message.type ==
+            MessageType::ok);
+    // Back the silent peer's route up past anything a notification may join.
+    std::vector<AsyncRpc> backlog;
+    for (int i = 0; i < 64; ++i)
+        backlog.push_back(client.call_async(silent.info, MessageType::put_control_object,
+                                            Bytes(128 * 1024, 0x42), FrameType::speculative));
+    client.note_peer(unrouted);
+    const auto created = client.stats().connections_created;
+
+    NodeTelemetry telemetry;
+    telemetry.node_id = client_info.id;
+    telemetry.boot_id = random_node_id();
+    telemetry.sequence = 1;
+    telemetry.observed_unix_ms = unix_ms();
+    telemetry.host = client_info.host;
+    telemetry.port = client_info.port;
+    const RpcMessage notice{MessageType::telemetry, encode_telemetry_set({telemetry})};
+    const auto started = Clock::now();
+    const auto queued = client.broadcast_notify(notice, FrameType::speculative);
+    CHECK(Clock::now() - started < scaled(1s));
+    CHECK(queued == 1);
+    CHECK(client.stats().connections_created == created);
+    CHECK(links.dialled_sockets(Endpoint{unrouted.host, unrouted.port}, TransportLane::control)
+              .empty());
+    CHECK(wait_until([&] { return live_received.load() == 1; }));
+
+    client.stop();
+    silent.close();
+    live.stop();
+}
+
+// A connection's outbound queue keeps a reserve that only small messages may
+// use: with the queue full of large messages for a peer that is not reading,
+// a ping is still admitted (net.hpp, outbound_refusal).
+MACHA_TEST("rpc_cluster", test_a_ping_is_admitted_behind_a_full_queue_of_large_messages) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    SilentPeer silent(keys);
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    NetworkLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 1h, 2h);
+
+    std::vector<AsyncRpc> queued;
+    std::string refusal;
+    for (int i = 0; i < 1000 && refusal.empty(); ++i) {
+        try {
+            queued.push_back(client.call_async(silent.info, MessageType::put_control_object,
+                                               Bytes(128 * 1024, 0x42), FrameType::speculative));
+        } catch (const std::exception& error) {
+            refusal = error.what();
+        }
+    }
+    CHECK(!refusal.empty());
+    bool ping_admitted = true;
+    try {
+        queued.push_back(client.call_async(silent.info, MessageType::ping, {}, FrameType::control));
+    } catch (const std::exception&) {
+        ping_admitted = false;
+    }
+    CHECK(ping_admitted);
+
+    client.stop();
+    silent.close();
+}
+
+// A connection holds at most max_pending_rpc_requests calls awaiting replies;
+// the next is refused and the refusal says why, rather than reporting a dead
+// link; the budget returns as replies arrive.
+MACHA_TEST("rpc_cluster", test_a_connection_holds_no_more_than_its_pending_reply_budget) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+    TestGate gate;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::have_object)
+                gate.enter_and_wait();
+            return RpcMessage{MessageType::bool_reply, Bytes{1}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+    struct GateOpener {
+        TestGate& gate;
+        ~GateOpener() {
+            gate.open();
+        }
+    } open_on_exit{gate};
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    NetworkLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 1h, 2h);
+    const Endpoint endpoint{"127.0.0.1", port};
+
+    // Placed in batches the writer drains, so the outbound queue never binds.
+    std::vector<AsyncRpc> pending;
+    while (pending.size() < max_pending_rpc_requests) {
+        for (size_t i = 0; i < 32 && pending.size() < max_pending_rpc_requests; ++i)
+            pending.push_back(client.call_async(endpoint, MessageType::have_object, Bytes{1},
+                                                FrameType::control));
+        REQUIRE(gate.wait_for_entries(std::min<size_t>(2, pending.size())));
+        REQUIRE(wait_until(
+            [&] { return server.work_stats().control_pending_bytes + 2 == pending.size(); }));
+    }
+    std::string refusal;
+    try {
+        (void)client.call_async(endpoint, MessageType::have_object, Bytes{1}, FrameType::control);
+    } catch (const std::exception& error) {
+        refusal = error.what();
+    }
+    CHECK(refusal.find("pending reply limit") != std::string::npos);
+
+    // Not asserted: that every admitted call is answered. At 0.91.2 a burst of
+    // more than 256 replies overflows the server's session queue and the
+    // excess is dropped unanswered (Dannan inventory, transport findings).
+    gate.open();
+    CHECK(server.work_stats().rejected_jobs == 0);
+    // With a deadline, so a reply dropped as above is retried, not awaited.
+    CHECK(wait_until([&] {
+        try {
+            return client
+                       .call(endpoint, MessageType::have_object, Bytes{1}, FrameType::control, 1s,
+                             2s)
+                       .message.type == MessageType::bool_reply;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }, 20s));
+    client.stop();
+    server.stop();
+}
+
+// The no-progress deadline follows the lane the message travels on: a stuck
+// control call fails at the control deadline, an object transfer at the
+// DATA deadline, and a lane whose deadline is 0 waits (docs/configuration.md,
+// control_no_progress_deadline_ms and data_no_progress_deadline_ms).
+MACHA_TEST("rpc_cluster", test_no_progress_deadline_follows_the_lane_configured) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+
+    // One lane bounded at 300 ms, the other unbounded: `stuck`, on the
+    // bounded lane, never answers and fails at the deadline; `slow`, on the
+    // unbounded lane, answers well after it and succeeds.
+    const auto run = [&](const char* name, std::chrono::milliseconds control_deadline,
+                         std::chrono::milliseconds data_deadline, MessageType stuck,
+                         FrameType stuck_frame, MessageType slow, FrameType slow_frame) {
+        const auto port = free_port();
+        NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+        TestGate stuck_gate;
+        TestGate slow_gate;
+        RpcServer server(
+            "127.0.0.1", port, keys, server_info,
+            [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+                if (request.type == stuck)
+                    stuck_gate.enter_and_wait();
+                else if (request.type == slow)
+                    slow_gate.enter_and_wait();
+                if (request.type == MessageType::get_object)
+                    return RpcMessage{MessageType::object_reply, Bytes{1}};
+                if (request.type == MessageType::have_object)
+                    return RpcMessage{MessageType::bool_reply, Bytes{1}};
+                // Liveness pings, on either lane.
+                return RpcMessage{MessageType::ok, {}};
+            },
+            [](const NodeInfo&) {});
+        server.start();
+        struct GateOpener {
+            TestGate& a;
+            TestGate& b;
+            ~GateOpener() {
+                a.open();
+                b.open();
+            }
+        } open_on_exit{stuck_gate, slow_gate};
+        const Endpoint endpoint{"127.0.0.1", port};
+
+        auto config = config_for(cluster.path() / name, cluster.keyfile(), free_port());
+        config.control_no_progress_deadline = control_deadline;
+        config.data_no_progress_deadline = data_deadline;
+        BareNode node(config, keys);
+        node.start();
+
+        const auto started = Clock::now();
+        std::string error;
+        try {
+            (void)node.call(endpoint, stuck, Bytes{1}, stuck_frame);
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        const auto waited = Clock::now() - started;
+        CHECK(error.find("no progress") != std::string::npos);
+        CHECK(waited >= 250ms);
+        CHECK(waited < scaled(3s));
+
+        std::thread releaser([&] {
+            if (slow_gate.wait_for_entries(1, 5s))
+                std::this_thread::sleep_for(800ms); // well past the 300 ms deadline
+            slow_gate.open();
+        });
+        bool slow_ok = false;
+        try {
+            slow_ok =
+                node.call(endpoint, slow, Bytes{2}, slow_frame).message.type != MessageType::error;
+        } catch (const std::exception&) {
+        }
+        releaser.join();
+        CHECK(slow_ok);
+        stuck_gate.open();
+        node.stop();
+        server.stop();
+    };
+    run("control-bound", 300ms, 0ms, MessageType::have_object, FrameType::control,
+        MessageType::get_object, FrameType::foreground);
+    run("data-bound", 0ms, 300ms, MessageType::get_object, FrameType::foreground,
+        MessageType::have_object, FrameType::control);
+}
+
+// Connections that have not authenticated are bounded: beyond the bound an
+// idle connection is closed at once, the rest are held, and the bound frees
+// as they go.
+MACHA_TEST("rpc_cluster", test_unauthenticated_connections_are_bounded_on_every_platform) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server", port};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [](const NodeInfo&, FrameType, const RpcMessage&) {
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    std::vector<int> idle;
+    for (int i = 0; i < 32; ++i)
+        idle.push_back(connect_idle(port));
+    // Within a second (the handshake allows five), count those closed.
+    std::set<int> closed;
+    const auto until = Clock::now() + 1s;
+    while (Clock::now() < until && closed.size() < idle.size()) {
+        std::vector<pollfd> polls;
+        for (const int fd : idle)
+            if (!closed.contains(fd))
+                polls.push_back({fd, POLLIN, 0});
+        if (::poll(polls.data(), polls.size(), 50) <= 0)
+            continue;
+        for (const auto& p : polls) {
+            if (!(p.revents & (POLLIN | POLLHUP)))
+                continue;
+            uint8_t byte{};
+            if (::recv(p.fd, &byte, 1, MSG_DONTWAIT) <= 0)
+                closed.insert(p.fd);
+        }
+    }
+    CHECK(!closed.empty());
+    CHECK(closed.size() < idle.size());
+
+    for (const int fd : idle)
+        ::close(fd);
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client", free_port()};
+    NetworkLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 1h, 2h);
+    CHECK(wait_until([&] {
+        try {
+            return client.call(Endpoint{"127.0.0.1", port}, MessageType::ping, {}, 1s)
+                       .message.type == MessageType::ok;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }));
+    client.stop();
+    server.stop();
+}
+
+// The smoothed CONTROL round trip comes from pings only: replies that take
+// long because of their handler do not feed it (net.hpp, PeerHealth).
+MACHA_TEST("rpc_cluster", test_round_trip_is_smoothed_from_pings_not_from_slow_replies) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::members)
+                std::this_thread::sleep_for(300ms); // a handler that is slow, by design
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    NetworkLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 1h, 2h);
+    const Endpoint endpoint{"127.0.0.1", port};
+
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(client.call(endpoint, MessageType::members, {}, 1s).message.type ==
+                MessageType::ok);
+    if (const auto latency = client.peer_latency(server_info.id))
+        CHECK(*latency < 300ms);
+    REQUIRE(client.call(endpoint, MessageType::ping, {}, 1s).message.type == MessageType::ok);
+    const auto latency = client.peer_latency(server_info.id);
+    REQUIRE(latency.has_value());
+    CHECK(*latency < 300ms);
+    client.stop();
+    server.stop();
+}
+
+// A failed dial backs off for that peer alone: an immediate retry to it does
+// not dial again, and another peer is dialled as usual.
+MACHA_TEST("rpc_cluster", test_dial_backoff_is_per_peer) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto live_port = free_port();
+    NodeInfo live_info{random_node_id(), "127.0.0.1", "live", live_port};
+    RpcServer live(
+        "127.0.0.1", live_port, keys, live_info,
+        [](const NodeInfo&, FrameType, const RpcMessage&) {
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    live.start();
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    FaultyLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 1h, 2h);
+    const Endpoint dead{"127.0.0.1", free_port()}; // nothing listens
+    const auto fails = [&](const Endpoint& endpoint) {
+        try {
+            (void)client.call(endpoint, MessageType::ping, {}, 1s);
+            return false;
+        } catch (const std::exception&) {
+            return true;
+        }
+    };
+    CHECK(fails(dead));
+    const auto dials_after_failure = links.dials(dead, TransportLane::control);
+    CHECK(fails(dead));
+    CHECK(links.dials(dead, TransportLane::control) == dials_after_failure);
+
+    const Endpoint live_endpoint{"127.0.0.1", live_port};
+    CHECK(!fails(live_endpoint));
+    CHECK(links.dials(live_endpoint, TransportLane::control) == 1);
+    client.stop();
+    live.stop();
+}
+
+// A dial-back probe is answered at most once per asking peer per interval:
+// a second ask from the same peer is refused, another peer's is answered.
+MACHA_TEST("rpc_cluster", test_dial_back_probes_are_rate_limited_per_asking_peer) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto hub_config = config_for(cluster.path() / "hub", cluster.keyfile(), free_port());
+    hub_config.dial_back_probe_min_interval = 1h;
+    BareNode hub(hub_config, keys);
+    hub.start();
+    const Endpoint hub_endpoint{"127.0.0.1", hub_config.port};
+
+    struct Asker {
+        NodeInfo info;
+        NetworkLinks links;
+        RpcClient client;
+        RpcServer server;
+        explicit Asker(const ClusterKeys& keys, const char* name)
+            : info{random_node_id(), "127.0.0.1", name, free_port()},
+              client(
+                  links, keys, [this] { return info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 2s,
+                  1h, 2h),
+              server(
+                  "127.0.0.1", info.port, keys, info,
+                  [](const NodeInfo&, FrameType, const RpcMessage&) {
+                      return RpcMessage{MessageType::ok, {}};
+                  },
+                  [](const NodeInfo&) {}) {
+            server.attach_client(client);
+            server.start();
+        }
+        ~Asker() {
+            server.stop();
+            client.stop();
+        }
+        MessageType ask(const Endpoint& hub) {
+            Writer writer;
+            writer.string(info.host);
+            writer.u16(info.port);
+            return client.call(hub, MessageType::dial_back_probe, writer.data(), 5s).message.type;
+        }
+    };
+    Asker first(keys, "first");
+    Asker second(keys, "second");
+    CHECK(wait_until([&] {
+        try {
+            return first.ask(hub_endpoint) == MessageType::dial_back_probe_reply;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }));
+    CHECK(first.ask(hub_endpoint) == MessageType::error);
+    CHECK(second.ask(hub_endpoint) == MessageType::dial_back_probe_reply);
+    hub.stop();
+}
+
+// `inbound_capable: auto` is re-checked every 10 minutes while false and
+// every hour while true (docs/configuration.md, Network); a dial-back is
+// answered at most once per asking peer per 10 s.
+MACHA_FAST_TEST("rpc_cluster", test_reprobe_cadence_defaults_follow_the_resolution) {
+    const Config config;
+    CHECK(config.inbound_reprobe_while_incapable == std::chrono::minutes(10));
+    CHECK(config.inbound_reprobe_while_capable == std::chrono::hours(1));
+    CHECK(config.dial_back_probe_min_interval == std::chrono::seconds(10));
+}
+
+// A peer that cannot be dialled is asked to open the lane; when it never
+// does, the call fails within the connect timeout and says so, rather than
+// waiting on the peer.
+MACHA_TEST("rpc_cluster", test_a_reverse_dial_that_never_comes_fails_within_its_bound) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    struct Node {
+        NodeInfo info;
+        NetworkLinks links;
+        RpcClient client;
+        RpcServer server;
+        Node(const ClusterKeys& keys, NodeInfo node, std::chrono::milliseconds connect_timeout)
+            : info(std::move(node)),
+              client(
+                  links, keys, [this] { return info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+                  connect_timeout, 100ms, 30s),
+              server(
+                  "127.0.0.1", info.port, keys, info,
+                  // Answers everything, dial_request included, and dials nothing.
+                  [](const NodeInfo&, FrameType, const RpcMessage& request) {
+                      return RpcMessage{MessageType::ok, request.payload};
+                  },
+                  [](const NodeInfo&) {}) {
+            server.attach_client(client);
+            server.start();
+        }
+        ~Node() {
+            server.stop();
+            client.stop();
+        }
+    };
+    Node hub(keys, NodeInfo{random_node_id(), "127.0.0.1", "hub", free_port()}, 500ms);
+    NodeInfo site_info{random_node_id(), "192.0.2.1", "cgnat", free_port()};
+    site_info.flags = node_flags_for(false, true);
+    Node site(keys, site_info, 300ms);
+
+    REQUIRE(site.client.call(hub.info, MessageType::members, Bytes{1}, 1s).message.payload ==
+            Bytes{1});
+    const auto started = Clock::now();
+    std::string error;
+    try {
+        (void)hub.client.call(site.info, MessageType::get_object, Bytes{2}, FrameType::foreground,
+                              5s);
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    CHECK(!error.empty());
+    CHECK(Clock::now() - started < scaled(2s));
+    CHECK(hub.client.dial_requests_sent() == 1);
+    CHECK(hub.client.stats().connections_created == 0);
 }
 
 } // namespace
