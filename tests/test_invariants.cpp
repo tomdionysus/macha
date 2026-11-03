@@ -1503,7 +1503,8 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
     BareNode node(config, cluster.keys(), {}, clock.source());
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    auto metadata_store = macha::test_support::distributed_store_for(node);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
     REQUIRE(metadata.snapshot().metadata_voters.empty());
 
     ClusterStatusService status(node, node.accounts(), node.resources.activity,

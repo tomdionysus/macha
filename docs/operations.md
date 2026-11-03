@@ -571,12 +571,12 @@ two heads it holds from what the heads themselves record.
 
 ## Re-rooting the namespace onto the tree
 
-A cluster founds with the namespace inlined in its metadata record.
-`macha-namespace-migrate STATE_PATH KEY_FILE` re-roots one stopped node's
-namespace onto the content-addressed Merkle tree in the control store, after
-which the record carries only the tree's root and a commit rewrites the
-changed leaf and the branches above it. Once re-rooted, a node stays
-tree-backed; nothing migrates by installing a release.
+A namespace is founded on the content-addressed Merkle tree. A node whose
+record still inlines its namespace as an entry map is re-rooted with
+`macha-namespace-migrate STATE_PATH KEY_FILE`, which moves one stopped
+node's namespace onto the tree in the control store, after which the record
+carries only the tree's root and a commit rewrites the changed leaf and the
+branches above it.
 
 It is offline and deliberate. Stop every node, let them converge on one head
 first, then run it on each node: the new record is a pure function of the

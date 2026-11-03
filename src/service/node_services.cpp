@@ -34,7 +34,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                                      instruments_.trace}),
       // The guard reaches the catalogue, declared after this: it runs only
       // for a commit, which nothing makes before construction finishes.
-      metadata_(node_, local_, metadata_server_, &store_,
+      metadata_(node_, local_, metadata_server_, store_,
                 MetadataPublicationRetention{
                     [this](const MetadataPublicationContext& context) {
                         return retain_metadata_publication(context);

@@ -3709,7 +3709,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
     DistributedStore store1(n1, n1.local_state(), n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
-    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server());
+    auto metadata1_store = macha::test_support::distributed_store_for(n1);
+    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), *metadata1_store);
     CatalogueManager catalogue1(n1, n1.local_state(), n1.metadata_server(), store1, metadata1, n1.ledger());
 
     CatalogueItem first;
@@ -3721,7 +3722,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
     DistributedStore store2(n2, n2.local_state(), n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
-    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server());
+    auto metadata2_store = macha::test_support::distributed_store_for(n2);
+    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), *metadata2_store);
     CatalogueManager catalogue2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2, n2.ledger());
 
     // Cold-load node two from node one's committed catalogue. There is no Service
@@ -3846,13 +3848,15 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     // than turning that expected bootstrap state into an unhandled test failure.
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
-    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server());
+    auto metadata1_store = macha::test_support::distributed_store_for(n1);
+    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), *metadata1_store);
     const auto initial1 = metadata1.snapshot_view();
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
     // Node two's decoded cache lives by a clock the test steps.
     SteppedTime time;
-    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), nullptr, {}, time);
+    auto metadata2_store = macha::test_support::distributed_store_for(n2);
+    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), *metadata2_store, {}, time);
 
     std::optional<MetadataSnapshotView> initial2;
     REQUIRE(wait_until([&] {

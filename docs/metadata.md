@@ -149,11 +149,11 @@ tree's shape.
 
 ## The namespace tree
 
-A metadata record either inlines the namespace as an entry map or, once the
-node has been re-rooted with `macha-namespace-migrate` (see the operations
-guide), carries a 32-byte `namespace_root` addressing a content-addressed
-Merkle tree keyed by path, and never both. A cluster founds in the inline
-form; a tree-backed node stays tree-backed.
+A namespace is a content-addressed Merkle tree keyed by path from its first
+commit: the metadata record carries a 32-byte `namespace_root` and no entry
+map, so no record, replay or checkpoint grows with the library. A record that
+still inlines its namespace as an entry map is re-rooted onto the tree with
+`macha-namespace-migrate` (see the operations guide).
 
 - Tree nodes live in the control object store and follow the CONTROL rules:
   a commit may reference a new root once this node holds every tree node it

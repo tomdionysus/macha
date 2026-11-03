@@ -1,5 +1,20 @@
 # Current release
 
+## 0.91.6: a namespace is a tree from its first commit
+
+A new namespace is founded on the content-addressed Merkle tree: the
+founding record carries the root and no entry map. It was founded inline,
+with every file and extent in the record, and stayed inline until re-rooted
+by hand, so the record grew with the library. On a 1.6 TB library it was
+21 MB, and every head materialisation, replayed delta and checkpoint
+rewrote it: a node spent a core re-encoding it, imports slowed to under
+1 MiB/s, and stop and reload waited behind the replay.
+
+Accepting a head the replica already holds, under a certificate that adds
+nothing, is now a lookup rather than a materialisation of the head and its
+parents; parents are materialised only for a record without a write floor,
+whose policy check reads them.
+
 ## 0.91.5: an import waits for its disk
 
 An ingest job whose bytes no node present can take, because the DATA disk
