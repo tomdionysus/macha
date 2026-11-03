@@ -1,5 +1,18 @@
 # Current release
 
+## 0.91.2: one file of an import at a time
+
+A file in an ingest job can be paused, resumed or cancelled on its own:
+`POST /api/v1/ingest/jobs/{id}/files/{index}/{pause|resume|cancel}`,
+answered from any node and relayed to the owner as the job's own actions
+are. A paused file stops at its next checkpoint, keeps its partial, and the
+job goes on with the rest; when only paused files are left the job is
+`paused`, and resuming one of them resumes it. Resuming the job resumes its
+paused files. A cancelled file is never imported, loses its partial, keeps
+its source, and leaves the job's `files_total` and `bytes_total`. Each
+`files` entry now carries its `index` and a `state` (`queued`, `importing`,
+`paused`, `completed`, `skipped`, `cancelled`).
+
 ## 0.91.1: an ingest job runs on the node it names
 
 `POST /api/v1/ingest/jobs` takes an optional `node_id`: the node that runs

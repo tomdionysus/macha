@@ -346,11 +346,16 @@ std::optional<Json> ClusterJobView::ingest_job_detail(std::string_view id) {
     return out;
 }
 
-IngestActionResult ClusterJobView::ingest_action(std::string_view id, std::string_view action) {
+IngestActionResult ClusterJobView::ingest_action(std::string_view id, std::string_view action,
+                                                 std::optional<size_t> file) {
     IngestActionResult result;
     if (ingest_.job(id)) {
         result.exists = true;
-        if (action == "pause") result.changed = ingest_.pause(id);
+        if (file) {
+            const auto done = ingest_.file_action(id, *file, action);
+            result.exists = done.exists;
+            result.changed = done.changed;
+        } else if (action == "pause") result.changed = ingest_.pause(id);
         else if (action == "resume") result.changed = ingest_.resume(id);
         else if (action == "cancel") result.changed = ingest_.cancel(id);
         else if (action == "clear") result.changed = ingest_.clear(id);
@@ -369,6 +374,7 @@ IngestActionResult ClusterJobView::ingest_action(std::string_view id, std::strin
     Json::Object request;
     request["job_id"] = std::string(id);
     request["action"] = std::string(action);
+    if (file) request["file"] = static_cast<uint64_t>(*file);
     try {
         // A user's action through the API: viewer work.
         auto reply = node_.call(*peer, MessageType::ingest_job_action, json_bytes(Json(std::move(request))),
