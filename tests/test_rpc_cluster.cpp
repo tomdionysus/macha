@@ -1266,9 +1266,6 @@ struct SurveyCountingView final : MetadataView {
     }
     std::optional<MetadataSnapshotView> release_head() const override { return view; }
     MetadataClusterStatus status() const noexcept override { return {}; }
-    MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t) override {
-        throw std::runtime_error("read-only view");
-    }
     MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>&,
                                 size_t, std::optional<MetadataMutationIdentity>) override {
         throw std::runtime_error("read-only view");
@@ -3686,7 +3683,7 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
         entry.gid = getgid();
         return entry;
     };
-    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/mine"] = directory(); });
+    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/mine"] = directory(); });
     const auto mine = node.metadata_replica().committed();
     REQUIRE(mine.generation > 1);
 
@@ -3722,7 +3719,7 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     CHECK(node.metadata_replica().accepted_heads().size() == 1);
     CHECK(metadata.head_standing().set_aside == 0);
 
-    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/more"] = directory(); });
+    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/more"] = directory(); });
     CHECK(metadata.snapshot().entries.contains("/theirs"));
     CHECK(metadata.snapshot().entries.contains("/more"));
     node.stop();
@@ -3820,13 +3817,13 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     auto metadata1_store = macha::test_support::distributed_store_for(n1);
     MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), *metadata1_store);
     // One mutation, so the siblings fork from a real post-genesis record.
-    metadata1.mutate([](MetadataSnapshot& snapshot) {
+    metadata1.mutate_delta([](MetadataSnapshot&, MetadataDelta& delta) {
         FsEntry entry;
         entry.type = EntryType::directory;
         entry.mode = 0755;
         entry.uid = getuid();
         entry.gid = getgid();
-        snapshot.entries["/base-concurrent"] = entry;
+        delta.upsert_entries["/base-concurrent"] = entry;
     });
     REQUIRE(n1.metadata_replica().committed_generation() > 1);
 
@@ -6319,7 +6316,7 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
         entry.gid = getgid();
         return entry;
     };
-    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/mine"] = directory(); });
+    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/mine"] = directory(); });
     const auto mine = replica.committed();
 
     // Another author's head, which this node's clock does not cover.

@@ -1992,11 +1992,11 @@ MACHA_TEST("invariants", test_catalogue_keeps_what_the_namespace_holds) {
         file.size = 1234;
         file.ctime_ns = file.mtime_ns = wall_time_ns();
         file.extents.push_back({0, file.size, object_id(pattern(1234, 7)), false});
-        bench.metadata().mutate([&](MetadataSnapshot& snapshot) {
-            snapshot.entries["/Movies"] = dir;
-            snapshot.entries["/Movies/A"] = dir;
-            snapshot.entries["/Movies/B"] = dir;
-            snapshot.entries["/Movies/A/live.mkv"] = file;
+        bench.metadata().mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) {
+            delta.upsert_entries["/Movies"] = dir;
+            delta.upsert_entries["/Movies/A"] = dir;
+            delta.upsert_entries["/Movies/B"] = dir;
+            delta.upsert_entries["/Movies/A/live.mkv"] = file;
         });
         CatalogueItem item;
         item.id = "test:movie:mixed-generation";
@@ -2100,8 +2100,11 @@ MACHA_TEST("invariants", test_catalogue_keeps_what_the_namespace_holds) {
         catalogue.repair_once();
         const auto missing_root = object_id(pattern(32123, 11));
         REQUIRE(!node.local_store().has(missing_root));
-        bench.metadata().mutate(
-            [&](MetadataSnapshot& snapshot) { snapshot.catalogue_root = missing_root; });
+        bench.metadata().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+            snapshot.catalogue_root = missing_root;
+            delta.catalogue = CatalogueDelta::set;
+            delta.catalogue_root = missing_root;
+        });
         const auto maintenance = maintenance_inventory(catalogue);
         CHECK(maintenance.control_live.contains(missing_root));
         CHECK(!maintenance.complete);
