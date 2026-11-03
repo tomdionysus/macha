@@ -43,6 +43,31 @@ the three-answer repair work (0.90.88 to 0.90.93); the version before is
 *carried* come from earlier rationalisations and have not been re-checked
 since.
 
+## Dannan extraction (2026-11-03)
+
+Dannan (the network layer) and Dagda (the store) are being extracted from
+this tree. The plan, the seams, the function inventory and Tom's decisions
+live in `../dannan/TODO/` (`ACTIVE.md` there first, then the extraction
+proposal). Each seam is one session on a `feature/` branch off `develop`,
+gated by the three suites here and the seam gate there, recorded in
+`../dannan/TODO/COMPLETED.md`. The baseline is `0.91.2` at `6c7ec64`. The
+first seam rewrites `cluster/net.cpp` on Boost.Asio with every transport
+behaviour kept and protocol 23 byte for byte; the seams that follow move
+no byte on disk or on the wire. The pause on Macha's own development
+stands; extraction proceeds on the laptop (Tom, 2026-11-03), with fi-1 as
+the deploy gate when convenient. Nothing below this section is changed by
+it.
+
+State (2026-11-03): the laptop is on MacPorts (`build-macports`; the
+configure line is in `../dannan/TODO/COMPLETED.md`), and the 0.91.2
+laptop gate is 661 + 19 + 21. `feature/dannan-transport-proofs`
+(uncommitted) adds 21 transport cases to `tests/test_rpc_cluster.cpp`,
+gate 682 + 19 + 21. Found there and waiting on Tom: a burst of more than
+256 replies on one connection drops the excess unanswered
+(`RpcServer::execute`, `net.cpp:4384`); and
+`availability/test_a_disk_coming_back_is_surveyed_without_a_namespace_change`
+is flaky on macOS at the baseline (1 in 5).
+
 ## 1. Next, then failing tests and defects
 
 A failing test is P0: reproduce it before deciding whose it is.
