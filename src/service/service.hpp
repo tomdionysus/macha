@@ -168,6 +168,10 @@ class Service {
         wait_services_ready();
         return local_->metadata();
     }
+    DistributedStore& store() {
+        wait_services_ready();
+        return services_->store();
+    }
     MetadataManager& metadata_manager() {
         wait_services_ready();
         return services_->metadata();
