@@ -58,7 +58,11 @@ or dropping its byte accounting.
   the corresponding byte ownership. Each peer/session writer also owns a
   128 MiB-bounded outbound queue (plus at most its one currently-written
   message), and pending reply identities are count-bounded and erased by reply,
-  cancellation, disconnect or shutdown.
+  cancellation, disconnect or shutdown. A reply the queue or the retained-memory
+  budget cannot take is replaced by a `503 transport_busy` refusal; those
+  refusals may exceed the queue's message limit by one per reply a caller can
+  await (512), and beyond that the connection is closed, so every admitted
+  request is answered.
 - Retention-before-metadata object checks and claim batches use a bounded
   ordinary-control call. Fast health success cannot leave one of these callers
   waiting forever behind a wedged control worker: the `dead_after` deadline

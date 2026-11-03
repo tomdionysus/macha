@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/net.hpp"
 
+#include "cluster/rpc_refusal.hpp"
 #include "codec.hpp"
 #include "diagnostics.hpp"
 #include "log.hpp"
@@ -34,6 +35,23 @@ const char* outbound_refusal(size_t queued, size_t queued_bytes, size_t payload)
         return "peer outbound byte queue full";
     return nullptr;
 }
+
+namespace {
+
+constexpr const char* retained_memory_refusal = "process retained-memory RPC admission saturated";
+
+// Sent in place of a reply the outbound queue or the memory budget refused: an
+// admitted request is always answered, here with try later.
+RpcMessage reply_not_sent(const char* why) {
+    return error_reply(503, "transport_busy", std::string("reply not sent: ") + why);
+}
+
+// Refusals sent in place of replies may pass the queue's own limit, one per
+// reply a caller can be awaiting; beyond that the connection is closed, which
+// answers every caller on it.
+constexpr size_t max_outbound_with_refusals = max_peer_outbound_messages + max_pending_rpc_requests;
+
+} // namespace
 
 bool peer_socket_options(int fd) {
     int yes = 1;
@@ -1314,12 +1332,16 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                        std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
         std::optional<RetainedMemoryLedger::Lease> memory;
+        const char* memory_refused = nullptr;
         if (retained_memory_) {
             memory = retained_memory_->try_acquire(
                 work_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
-            if (!memory)
-                throw std::runtime_error("process retained-memory RPC admission saturated");
+            if (!memory) {
+                if (!reply)
+                    throw std::runtime_error(retained_memory_refusal);
+                memory_refused = retained_memory_refusal;
+            }
         }
         {
             TimedLock lock(outbound_mutex_, "rpc.client.outbound");
@@ -1334,8 +1356,15 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                     frame_type = more_urgent(found->second, frame_type);
             }
             if (const auto refused =
-                    outbound_refusal(outbound_.size(), outbound_bytes_, message.payload.size()))
-                throw std::runtime_error(refused);
+                    memory_refused ? memory_refused
+                                   : outbound_refusal(outbound_.size(), outbound_bytes_, message.payload.size())) {
+                if (!reply)
+                    throw std::runtime_error(refused);
+                if (outbound_.size() >= max_outbound_with_refusals)
+                    throw std::runtime_error("peer outbound queue full of refusals");
+                message = reply_not_sent(refused);
+                memory.reset();
+            }
             if (!reply && request_id)
                 outbound_classes_[request_id] = frame_type;
             const auto payload_bytes = message.payload.size();
@@ -3279,12 +3308,16 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                        std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
         std::optional<RetainedMemoryLedger::Lease> memory;
+        const char* memory_refused = nullptr;
         if (retained_memory) {
             memory = retained_memory->try_acquire(
                 work_class(frame_type), MemoryOwner::rpc_frame,
                 sizeof(Outbound) + message.payload.size());
-            if (!memory)
-                throw std::runtime_error("process retained-memory RPC admission saturated");
+            if (!memory) {
+                if (!reply)
+                    throw std::runtime_error(retained_memory_refusal);
+                memory_refused = retained_memory_refusal;
+            }
         }
         {
             TimedLock lock(outbound_mutex, "rpc.session.outbound");
@@ -3299,8 +3332,15 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                     frame_type = more_urgent(found->second, frame_type);
             }
             if (const auto refused =
-                    outbound_refusal(outbound.size(), outbound_bytes, message.payload.size()))
-                throw std::runtime_error(refused);
+                    memory_refused ? memory_refused
+                                   : outbound_refusal(outbound.size(), outbound_bytes, message.payload.size())) {
+                if (!reply)
+                    throw std::runtime_error(refused);
+                if (outbound.size() >= max_outbound_with_refusals)
+                    throw std::runtime_error("peer outbound queue full of refusals");
+                message = reply_not_sent(refused);
+                memory.reset();
+            }
             if (!reply && request_id)
                 outbound_classes[request_id] = frame_type;
             const auto payload_bytes = message.payload.size();
@@ -4401,6 +4441,10 @@ void RpcServer::execute(RequestJob job) {
                 (void)job.session->queue_message(job.frame.request_id, job.frame.frame_type,
                                                  {MessageType::error, {}}, true);
             } catch (...) {
+                // No answer can be queued: closing the session answers every
+                // call awaiting a reply on it.
+                if (job.session->channel)
+                    job.session->channel->shutdown();
             }
         }
     }
