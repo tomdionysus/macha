@@ -150,7 +150,7 @@ ObjectId DistributedStore::put(std::span<const uint8_t> data, FrameType frame_ty
     if (!put_impl(id, data, frame_type, cancelled, nullptr)) {
         if (cancelled && cancelled->load(std::memory_order_relaxed))
             throw std::runtime_error("object replication cancelled");
-        throw std::runtime_error("object replication quorum unavailable");
+        throw StorageUnavailable("object replication quorum unavailable");
     }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     if (Log::enabled(LogLevel::all))
@@ -182,7 +182,7 @@ ObjectId DistributedStore::put_deferred(std::span<const uint8_t> data, Durabilit
     if (!put_impl(id, data, frame_type, cancelled, &batch, work)) {
         if (cancelled && cancelled->load(std::memory_order_relaxed))
             throw std::runtime_error("object replication cancelled");
-        throw std::runtime_error("object replication quorum unavailable");
+        throw StorageUnavailable("object replication quorum unavailable");
     }
     return id;
 }

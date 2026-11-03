@@ -42,6 +42,12 @@ class FsStaleBasis final : public FsError {
   public:
     explicit FsStaleBasis(const std::string& s) : FsError(EAGAIN, s) {}
 };
+// StorageUnavailable as the filesystem reports it: EIO to a caller that reads
+// only the code; a writer that can wait catches this.
+class FsStorageUnavailable final : public FsError {
+  public:
+    explicit FsStorageUnavailable(const std::string& s) : FsError(EIO, s) {}
+};
 class FileSystem;
 class PlaybackTracker;
 
