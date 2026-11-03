@@ -3592,6 +3592,67 @@ MACHA_TEST("hydration_catalogue", test_ingest_rebases_when_its_partial_is_rolled
     ingest.stop();
 }
 
+// A disk that cannot take the import's bytes (offline, stalled or full) is a
+// condition that passes: the job blocks as storage_unavailable rather than
+// failing, keeps its place, and completes once the disk is back.
+MACHA_TEST("hydration_catalogue", test_ingest_blocks_while_storage_is_unavailable) {
+    CatalogueNode node("ingest-storage");
+    constexpr size_t file_bytes = 512 * 1024;
+    const auto roots = make_import_roots(node.path(), 1, file_bytes);
+    auto& data = node.node().local_state().data();
+    const auto backend = node.config().storage_backends.front().path;
+    auto away = backend;
+    away += ".away";
+    struct PutBack {
+        std::filesystem::path away;
+        std::filesystem::path backend;
+        ~PutBack() {
+            std::error_code ec;
+            if (std::filesystem::exists(away, ec))
+                std::filesystem::rename(away, backend, ec);
+        }
+    } put_back{away, backend};
+    std::filesystem::rename(backend, away);
+    REQUIRE(wait_until([&] { return data.online_backends() == 0; }, 5s));
+
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = roots;
+    config.copy_chunk_bytes = 64 * 1024;
+    config.checkpoint_bytes = 128 * 1024;
+    config.blocked_retry = 200ms;
+    IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
+    const auto id = ingest.submit_path(roots.front());
+    ingest.start();
+    const auto settled = [&] {
+        const auto job = ingest.job(id);
+        return job && (job->state == IngestJobState::blocked ||
+                       job->state == IngestJobState::failed);
+    };
+    REQUIRE(wait_until(settled, 30s));
+    {
+        const auto job = ingest.job(id);
+        CHECK(job->state == IngestJobState::blocked);
+        CHECK(job->error_code == "storage_unavailable");
+    }
+
+    std::filesystem::rename(away, backend);
+    REQUIRE(wait_until([&] { return data.online_backends() == 1; }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest.job(id);
+            return job && (job->state == IngestJobState::failed || all_imports_copied(ingest, {id}));
+        },
+        60s));
+    const auto job = ingest.job(id);
+    CHECK(job->state != IngestJobState::failed);
+    REQUIRE(all_imports_copied(ingest, {id}));
+    CHECK(read_whole(node.filesystem(), job->files.front().destination_path, file_bytes) ==
+          pattern(file_bytes));
+    ingest.stop();
+}
+
 // Integrated: the refusal is Service's claims barrier on the metadata commit,
 // and the ingest's fallback answers it.
 MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_missing) {

@@ -19,9 +19,17 @@
 #include <optional>
 #include <span>
 #include <set>
+#include <stdexcept>
 #include <vector>
 
 namespace macha {
+// No node present can take a write now: no backend online, none with room,
+// or none answering in time. It passes, so a caller waits and tries again.
+class StorageUnavailable final : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 // Where repair keeps its place across restarts (none: each pass starts at the
 // beginning), and the repair decision trace (tests only).
 struct DistributedStoreOptions {

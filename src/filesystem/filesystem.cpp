@@ -1139,7 +1139,7 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
             if (!ok) {
                 if (fs_.io_cancellation_requested())
                     fail(EINTR, "write cancelled");
-                fail(EIO, "object replication quorum unavailable");
+                throw FsStorageUnavailable("object replication quorum unavailable");
             }
             if (cache_puts_)
                 (void)fs_.store().cache_local(id, data);
