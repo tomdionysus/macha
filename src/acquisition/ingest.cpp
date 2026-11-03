@@ -1344,8 +1344,12 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
             job.state == IngestJobState::cataloguing)
             return;
     }
-    const bool retrying_metadata =
-        job.state == IngestJobState::blocked && job.error_code == "metadata_unavailable";
+    // Blocked on the same condition before: the retry is not news.
+    const auto retrying = [&](std::string_view code) {
+        return job.state == IngestJobState::blocked && job.error_code == code;
+    };
+    const bool retrying_metadata = retrying("metadata_unavailable");
+    const bool retrying_storage = retrying("storage_unavailable");
 
     try {
         if (job.files.empty() && !plan_job(job, stop)) return;
@@ -1402,6 +1406,23 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
                 Log::warn(line);
             try {
                 set_blocked(job, "metadata_unavailable", e.what());
+            } catch (const std::exception& save) {
+                Log::warn("ingest state save failed id=" + id + ": " + save.what());
+            }
+            return;
+        }
+        // No node present can take the bytes now (a disk offline, stalled or
+        // full): the job keeps its progress, blocks as storage_unavailable and
+        // retries after blocked_retry.
+        if (dynamic_cast<const StorageUnavailable*>(&e) ||
+            dynamic_cast<const FsStorageUnavailable*>(&e)) {
+            const auto line = "ingest blocked id=" + id + ": " + e.what() + "; retrying";
+            if (retrying_storage)
+                Log::debug(line);
+            else
+                Log::warn(line);
+            try {
+                set_blocked(job, "storage_unavailable", e.what());
             } catch (const std::exception& save) {
                 Log::warn("ingest state save failed id=" + id + ": " + save.what());
             }
