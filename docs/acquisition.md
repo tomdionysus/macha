@@ -11,7 +11,7 @@ Every route needs a session bearer token (see [Accounts and roles](management.md
 | method | role |
 |---|---|
 | `GET` | `media_viewer` |
-| `POST` | `importer` |
+| `POST`, `PATCH` | `importer` |
 
 A missing role is `403 forbidden`.
 
@@ -133,7 +133,7 @@ The response is `202`, with the node that runs the job:
 |---|---|---|---|
 | 400 | `bad_request` | | `path` is missing or empty; `node_id` is not 32 hex characters; ingest is disabled on the running node; the resolved path is outside its `ingest.source_roots`; the path does not exist there |
 | 409 | `placement_failed` | `node_not_member` | `node_id` is not an active member of the cluster |
-| 409 | `placement_failed` | `node_not_ingest_capable` | `node_id` runs a release before 0.91.1 |
+| 409 | `placement_failed` | `node_not_ingest_capable` | `node_id` cannot take a job pinned to it by another node |
 | 503 | `node_unreachable` | | `node_id` is a member but could not be asked; try later |
 
 The `400`s share one code; only the message, the running node's own, tells them apart.
@@ -149,7 +149,7 @@ The `400`s share one code; only the message, the running node's own, tells them 
 
 Each item is an [ingest job](#the-ingest-job-object) without `files` and without `catalogue.items`, plus `node_id`. `sources` says where the jobs came from and how old they are: the answering node's own are live (`local: true`); another node's are from its last poll, at most about `refresh_interval_ms` old. `reachable: false` means that node's jobs are shown from its last successful poll at `as_of_unix_ms` and may be stale; a node never reached contributes no jobs and has `as_of_unix_ms` null.
 
-`GET /api/v1/ingest/jobs/{id}` answers the one job, with `files`, `catalogue.items` and `node_id`. A job another node owns is that node's own answer, asked when the request is made; when that node cannot be asked (unreachable, or before 0.90.84) the job is as last polled and `catalogue.items` is null. `404 not_found` if no node it has heard from has it.
+`GET /api/v1/ingest/jobs/{id}` answers the one job, with `files`, `catalogue.items` and `node_id`. A job another node owns is that node's own answer, asked when the request is made; when that node cannot be asked (unreachable, or it does not answer job detail) the job is as last polled and `catalogue.items` is null. `404 not_found` if no node it has heard from has it.
 
 ### Actions
 
@@ -164,6 +164,7 @@ Each item is an [ingest job](#the-ingest-job-object) without `files` and without
 | 404 | `not_found` | the action is not one of the four, or no reachable node has the job |
 | 409 | `invalid_state` | the job exists but the action is not allowed in its state (see the table below) |
 | 400 | `bad_request` | the action failed on this node, for example a source it was told to delete could not be removed |
+| 503 | `node_unreachable` | the owning node cannot be reached |
 
 ### One file of a job
 
@@ -176,7 +177,7 @@ Each item is an [ingest job](#the-ingest-job-object) without `files` and without
 | status | code | when |
 |---|---|---|
 | 404 | `not_found` | no reachable node has the job, or it has no file at `index` |
-| 409 | `invalid_state` | the file is completed, skipped or already cancelled; a `pause` of a paused file or a `resume` of one that is not paused; the job is finished (`cataloguing`, `completed`, `cancelled` or `failed`), or its node runs a release before 0.91.2 |
+| 409 | `invalid_state` | the file is completed, skipped or already cancelled; a `pause` of a paused file or a `resume` of one that is not paused; the job is finished (`cataloguing`, `completed`, `cancelled` or `failed`), or its node does not offer per-file actions |
 | 503 | `node_unreachable` | the owning node cannot be reached |
 
 ## The ingest job object
@@ -326,7 +327,7 @@ A `blocked` job is retried every `ingest.blocked_retry_ms` until it succeeds or 
 | `namespace_short_write` | a write into the namespace was short |
 | `size_mismatch` | the committed file's size differs from the source |
 | `filesystem_error` | any other namespace error |
-| `import_failed` | any other error; also given to jobs recorded as failed before error codes existed |
+| `import_failed` | any other error |
 
 ### What clear and cancel delete
 
@@ -438,7 +439,7 @@ A torrent is added to the **cluster**: the add is recorded as a request in clust
 | `acquisition_ref` | one of these two | a reference from a search **on this same node**. `magnet` wins if both are given. A search result's `.torrent` is read by a torrent-capable node (this one, or one it asks) and recorded as its canonical magnet |
 | `node_id` | no | **pins** the job to that node, which must run the torrent subsystem. Absent or null lets the cluster choose |
 | `remove_after_ms` | no | remove the job this long after it completes: 0 (at once) to 86400000 (24 h). Absent copies the cluster default (`default_remove_after_ms` on [`/torrents/nodes`](#torrent-capable-nodes)) into the job; null means never |
-| `paused` | no | `true` records the job already paused (`desired: paused`), in the same metadata write as the add, so it never starts before a pause could land: a node may claim it but adopts it held, so it is never checked and never downloads until resumed. Absent, null or `false` is as before. It sets nothing else: a pin still names the only node that may claim it, and `remove_after_ms` still counts from completion. An add of a torrent already present answers `409 torrent_already_added` and leaves that job as it is |
+| `paused` | no | `true` records the job already paused (`desired: paused`), in the same metadata write as the add, so it never starts before a pause could land: a node may claim it but adopts it held, so it is never checked and never downloads until resumed. Absent, null or `false` records the job active. It sets nothing else: a pin still names the only node that may claim it, and `remove_after_ms` still counts from completion. An add of a torrent already present answers `409 torrent_already_added` and leaves that job as it is |
 
 The response is `202`, sent only once the request is accepted into metadata, so a list from any node includes it:
 
@@ -451,7 +452,7 @@ The response is `202`, sent only once the request is accepted into metadata, so 
 
 | status | code | `error.reason` | when |
 |---|---|---|---|
-| 400 | `bad_request` | | neither `magnet` nor `acquisition_ref` is a string; `node_id` is not 32 hex characters; `remove_after_ms` is not null or 0..86400000 |
+| 400 | `bad_request` | | neither `magnet` nor `acquisition_ref` is a string; `node_id` is not 32 hex characters; `remove_after_ms` is not null or 0..86400000; `paused` is not a boolean |
 | 404 | `not_found` | | `acquisition_ref` is unknown here or has expired |
 | 409 | `placement_failed` | `node_not_member` | `node_id` is not an active member of the cluster |
 | 409 | `placement_failed` | `node_not_torrent_capable` | `node_id` does not run the torrent subsystem |
@@ -501,7 +502,7 @@ Metadata writes merge, so two nodes can change one job at once; every field merg
 
 **With metadata unwritable**, `pause`, `resume` and `cancel` on a job some node holds still work: the answering node forwards them to the owner, which applies them at once and publishes them when metadata is writable again. Everything else answers `503 metadata_unavailable` (scope `node`).
 
-`PATCH /api/v1/torrents/jobs/{id}` with `{"remove_after_ms": null | 0..86400000}` changes removal on an existing job; with `{"node_id": "..." | null}` it re-pins or unpins a job that still awaits a node (otherwise `409 invalid_state`). It answers `200` with the job.
+`PATCH /api/v1/torrents/jobs/{id}` with `{"remove_after_ms": null | 0..86400000}` changes removal on an existing job; with `{"node_id": "..." | null}` it re-pins or unpins a job that still awaits a node (otherwise `409 invalid_state`). It answers `200` with the job. A body with neither field is `400 bad_request`; an unknown job is `404 not_found`; a pin to a node without the torrent subsystem is `409 placement_failed`, reason `node_not_torrent_capable`; with metadata unwritable it is `503 metadata_unavailable`.
 
 ### Removal after completion
 
@@ -663,7 +664,7 @@ A failure before handover (`torrent_error`, `torrent_fault`, `ingest_submit_fail
 
 The payload is moved into the staging area's `.trash` at once and deleted in the background, so the request returns promptly however large the payload; it counts against `ingest.staging_limit` until it is gone.
 
-`clear` on a linked job clears the linked ingest, which deletes the payload under the ingest rules (it is an owned source, so `ingest.cleanup.delete_owned_source_on_clear` decides). On a job with no ingest, `clear` deletes the payload when `ingest.cleanup.delete_owned_source_on_clear` is true. If the linked ingest cannot be cleared, the torrent job is not either (`409 invalid_state`).
+`clear` on a linked job clears the linked ingest, which deletes the payload under the ingest rules (it is an owned source, so `ingest.cleanup.delete_owned_source_on_clear` decides). On a job with no ingest, `clear` deletes the payload when `ingest.cleanup.delete_owned_source_on_clear` is true.
 
 ## Cluster-wide behaviour
 

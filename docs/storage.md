@@ -10,7 +10,7 @@ DATA contains immutable payload objects: media extents, catalogue artwork, subti
 
 ### CONTROL / metadata
 
-Namespace metadata and content-addressed catalogue control objects are control-plane authority. On a namespace re-rooted onto the Merkle tree, the tree's branch, leaf and extent-spine nodes are control objects too, and the metadata record carries only the root (see [Metadata](metadata.md)). Every node stores metadata/control authority. Namespace mutations and catalogue manifests/shards are valid once the committing node durably holds them; `dht.metadata_write_copies` is the number of copies sought before the write returns, and every active node is equally eligible to take one.
+Namespace metadata and content-addressed catalogue control objects are control-plane authority. On a namespace re-rooted onto the Merkle tree, the tree's branch, leaf and extent-spine nodes are control objects too, and the metadata record carries only the root (see [Metadata](metadata.md)). Every node stores metadata/control authority. Namespace mutations and catalogue manifests/shards are valid once the committing node durably holds them, and every node present is sent them afterwards. `dht.metadata_write_copies` is the number of copies a merge commit seeks before it is accepted, and every active node is equally eligible to take one.
 
 CONTROL storage does not consume DATA quota.
 
@@ -90,7 +90,7 @@ Thus a write with `replicas: 3` and `write_copies: 1` returns after one durable 
 
 With `write_copies: 2`, a write is on two nodes when it returns, provided two nodes are present and answering. With fewer, or once no further node can take a copy promptly, it returns on the copies that landed and repair delivers the rest; a peer that stalls past `dht.write_stall_ms` is not waited for once one copy has landed. A write is never refused for lack of peers.
 
-Metadata may reference a new DATA object once a node present holds it, and its retention claim is placed on the holders present. A commit that brings in new bytes no node present holds is refused; the writer still has them and puts them again.
+Metadata may reference a new DATA object once a node present holds it. Before the commit is accepted, the committing node claims the objects it holds, and an object it does not hold is claimed on a node present; the other holders receive their claims after acceptance. A commit that brings in new bytes no node present holds is refused; the writer still has them and puts them again.
 
 ## Local backend selection
 
@@ -122,7 +122,7 @@ No distributed metadata records pack coordinates. Reads still ask `LocalStore` f
 
 Each packed PUT record is independently authenticated and contains enough identity/size information to rebuild the index. A logical removal appends a tombstone. Touch/age state used by GC is likewise represented without changing the logical object.
 
-On restart, the pack index is reconstructed by scanning durable records. A torn final record is truncated to the last valid record boundary. A corrupt committed record is an integrity error rather than being guessed around.
+On restart, the pack index is reconstructed by scanning durable records. A torn final record is truncated to the last valid record boundary. A corrupt region inside a pack is skipped as dead bytes and logged (`pack_recovery_skipped_regions`); the objects recorded there count as absent from this backend and are repaired from replicas, and the backend stays online.
 
 Compaction is copy-on-write:
 
