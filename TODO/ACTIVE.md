@@ -1,9 +1,66 @@
 # Active tasks
 
-Last updated: 2026-10-14, on `develop`. fi-1 runs 0.91.0; gbni-1 is out of
-the cluster (compromised 2026-10-13, last ran 0.90.93; ssh refuses the key).
+Last updated: 2026-11-04, on `develop`.
 
-## Paused at 0.91.0 (2026-10-14): resume here
+## Handover 2026-11-04: resume here
+
+**Live.** macnessa (root@10.44.1.50, builds in `/home/tom/macha`) and inverbeg
+(root@inverbeg.macha.network) both run 0.92.2, commit c4e0d45, one cluster,
+installed under `/usr/local`. `books.enabled` and `books.conversion.enabled` are
+on in both configs; `libmobi-tools` is installed on both. Gate on macnessa:
+744 + 20 + 21.
+
+**Branches.** `develop` holds books (merge e33f408). `experiment/dagda-backend`
+starts from develop, with no work on it yet. `feature/tree-native-namespace` is
+4 WIP commits on the older develop and needs a merge from it. `feature/ebooks`
+is merged; deleting it (local and origin) awaits the operator. `main` was not
+moved, and 0.91.3 to 0.92.2 are untagged.
+
+**Next: the Dagda backend experiment.** The operator asked for a branch to try
+a Dannan/Dagda backend. Nothing is designed or read yet. Open questions for the
+operator: which part it replaces (DATA extent store, metadata store, or both),
+and whether the Dagda and Dannan sessions take part. Both repositories are
+beside this one (`../dagda`, `../dannan`).
+
+**Books, still to confirm.**
+- 0.92.2 moved the book rules to version 3, so the scanner replaces its books.
+  The pass was running at 22:05Z. The web client session re-checks the six
+  catalogue problems on macnessa: split authors, unsplit co-authors, PratWher,
+  title clutter, empty series, timestamp dates. This node has no API account,
+  so the check is the client's; the journal shows only the matching.
+- Series appear only where a title or Open Library names one, so some Discworld
+  books may have none. "Le Guin, Ursula K." still splits into two authors.
+- Conversion is MOBI and AZW3 to EPUB only, through `mobitool`, and has been
+  proven on real books. EPUB-only books cannot reach the operator's old Kindle
+  Paperwhite. Porting Calibre's GPL-3.0 AZW3 writer (`writer8`) is the route if
+  that comes to matter; not started.
+- Audiobooks are a separate media class, for later. Per-user media state (ebooks
+  stage 3) waits for the tree-native merge.
+
+**Other sessions.** Core's fix for sorting free-text `published` values is
+13117a2 on core develop, not pushed; its push waits on the operator. Client
+deploys belong to the client session or the operator.
+
+**Open, in order.**
+1. P0: `maintenance_trace/test_trace_backend_offline_and_back` is intermittent
+   on macnessa (an extra `claim-walk: data #1 not-restored` line). Unfixed.
+2. macnessa's stop hit the systemd timeout on the 0.92.0 deploy, and its FUSE
+   mount times out for about a minute after start. Neither is diagnosed.
+3. Tree-native branch: genesis as a constant hash, removal of legacy authority
+   and of the inline formats. On merge, tell Dagda if tree forms or genesis
+   changed, and produce Dagda's migration fixture (memory `project-branch-state`).
+4. The eight Dagda-found races (memory `project-dagda-found-races`).
+
+**Deploying.** Build on macnessa; `DESTDIR` install; tar `usr`; extract with
+`tar xzf ... -C /`, then `ldconfig`. One node at a time unless a shard format
+changes (both together then). A gate script must stop on a failed build, or it
+reruns the old binary. Laptop: `build-notorrent` and `build-nobooks`, `-j8`;
+plain `build` is stale.
+
+## Paused at 0.91.0 (2026-10-14): a record
+
+Superseded by the handover above: fi-1 and the old gbni-1 are gone. Sections
+below that name them have not been re-checked against the two current nodes.
 
 Operator: at least two nodes are needed to continue development; work
 pauses for a few weeks. Macha works as a single-node system.
