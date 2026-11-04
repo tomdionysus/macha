@@ -81,6 +81,8 @@ class HeldLedger {
     // install happens under flush_mutex_, in order.
     void write_journal(std::span<const ObjectTrie::Change>) MACHA_REQUIRES(flush_mutex_)
         MACHA_NO_THREAD_SAFETY_ANALYSIS;
+    // Journals and installs the queue, whether or not seeded.
+    void install_queued() MACHA_REQUIRES(flush_mutex_);
     Mutex queue_mutex_;
     std::vector<ObjectTrie::Change> queued_ MACHA_GUARDED_BY(queue_mutex_);
 };
