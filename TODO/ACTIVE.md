@@ -10,24 +10,79 @@ installed under `/usr/local`. `books.enabled` and `books.conversion.enabled` are
 on in both configs; `libmobi-tools` is installed on both. Gate on macnessa:
 744 + 20 + 21.
 
-**Branches.** `develop` holds books (merge e33f408). `experiment/dagda-backend`
-starts from develop, with no work on it yet. `feature/tree-native-namespace` is
-4 WIP commits on the older develop and needs a merge from it. `feature/ebooks`
-is merged; deleting it (local and origin) awaits the operator. `main` was not
-moved, and 0.91.3 to 0.92.2 are untagged.
+**Branches.** `develop` holds books (merge e33f408).
+`feature/dagda-found-defects` (off develop, uncommitted at the time of
+writing) is 0.92.3: the defects the Dagda port found, fixed in Macha first
+(below). `experiment/dagda-backend` starts from develop with no work on it.
+`feature/tree-native-namespace` is 4 WIP commits on the older develop and
+needs a merge from it. `feature/ebooks` is merged; deleting it (local and
+origin) awaits the operator. `main` was not moved, and 0.91.3 to 0.92.2 are
+untagged.
 
-**Next: the Dagda backend experiment.** The operator asked for a branch to try
-a Dannan/Dagda backend. Nothing is designed or read yet. Open questions for the
-operator: which part it replaces (DATA extent store, metadata store, or both),
-and whether the Dagda and Dannan sessions take part. Both repositories are
-beside this one (`../dagda`, `../dannan`).
+**The Dannan and Dagda port, evaluated (2026-11-04 night).** The operator
+asked for a researched plan to move the network layer and the store onto
+Dannan and Dagda, with the rule that any loss means those projects change,
+not Macha. The evaluation is
+[`2026-11-04-dannan-dagda-port-evaluation.md`](2026-11-04-dannan-dagda-port-evaluation.md):
+not ready; Dagda has no heads (all thirty head rows missing, waiting on the
+tree-native merge and the fixtures cut from it); the migration tool and
+Dannan's state-file loaders fail on a real Macha node; no performance
+measurement exists in either library; both moves are flag days. Its section
+5 went to the Dannan and Dagda sessions as their respec lists (both accepted,
+with disputes recorded there); section 6 is Macha's prerequisites; section 8
+the questions for the operator, unanswered. Placement known answers for both
+libraries are at `build/macha-fixtures/placement/` (generated on macnessa;
+Dannan's functions match on all 2,704 orders). The operator's ruling the same
+night: **genuine Macha problems the experiment found are fixed in Macha
+first**, and the libraries then match the fix (memory
+`feedback-defects-fixed-in-macha-first`). The Dagda session has finished its
+migration respec (ledgers by name, refusals before any write, a tag derived
+from the old one, `--reverse`); the Dannan session holds its build until the
+operator confirms the instruction.
+
+**0.92.3: the defects, fixed here first** (`feature/dagda-found-defects`).
+Fixed: the LocalStore scan deadlock (wait before the object lock), the ledger
+built before the scan, the lost wakeups (flags under the mutex, the stop
+through the wait's token), the held ledger's seed order (install, marker,
+flag), the claim check-then-delete windows (a striped `ClaimGuard` on the
+claim store, held across each check and its delete and each presence check
+and its claim: GC sweeps, `erase_all`, `delete_object`, `retain_objects`,
+the local retains), the repair list identity (a version per refill in place
+of a buffer address), the torrent tombstone wrap (a future stamp is fresh)
+and the DLT9 decoder accepting an unkeyed request. Gates: laptop
+`build-nobooks` 674 of 675 (the one failure
+`availability/test_a_disk_coming_back_is_surveyed_without_a_namespace_change`,
+the known macOS flake, passing alone); macnessa 745 + 20 + 21, all green,
+23:30Z. Uncommitted and undeployed, awaiting the operator. Not yet done, each
+needing a design or the operator's ruling: the three-concurrent-adds torrent
+merge is not associative (`merge_torrent_requests`); no epoch fence on
+actions under a torrent claim; the local `StoragePool::durability_barrier`
+waits without a deadline; the catalogue's CONTROL sweep compares a wall-clock
+age with a steady span; and the heads-side items of the requirements'
+section 7 (the policy disagreement loop, O(state) work per delta, wire-sized
+allocations, reload silently ignored, no disk I/O control reserve and no
+control store free-space reserve, zero storage reported healthy). The open
+P0s below (items 1 and 2) are in code the port redraws and should be
+diagnosed before it.
 
 **Books, still to confirm.**
 - 0.92.2 moved the book rules to version 3, so the scanner replaces its books.
-  The pass was running at 22:05Z. The web client session re-checks the six
-  catalogue problems on macnessa: split authors, unsplit co-authors, PratWher,
-  title clutter, empty series, timestamp dates. This node has no API account,
-  so the check is the client's; the journal shows only the matching.
+  The web client session re-checked the six catalogue problems on macnessa
+  at about 22:15Z (49 books, pass settled). Fixed: "Pratchett, Terry" merged
+  into Terry Pratchett; comma co-author lists split; "PratWher" is Where's
+  My Cow? and "Unknown" is gone, no book has empty author_ids; title clutter
+  mostly gone (one left: "The Light Fantastic (Discworld)"; Open Library
+  casing shows in "Thief of time", "The last hero", "The folklore of
+  Discworld"). Covers load; reading places carried across (media ids held).
+  Not fixed: the Discworld series holds only 3 of 49 books (Raising Steam
+  index 40, Small Gods and Thief of time index null); three books still
+  send a timestamp `published` (A Hat Full of Sky, Soul Music, I Shall Wear
+  Midnight). Possible 0.92.2 regression: 11 books now send `published` and
+  `language` null (Eric, Hogfather, Jingo, Maskerade, Mort, Pyramids, Snuff,
+  Sourcery, Thud!, Where's My Cow?, Wintersmith); Thud! lost its publisher
+  too (HarperCollins e-books on 0.92.1) while keeping year 2005 and its
+  openlibrary_work; publisher is null on 15 of 49 overall. Unexamined.
+  This node has no API account, so the check is the client's.
 - Series appear only where a title or Open Library names one, so some Discworld
   books may have none. "Le Guin, Ursula K." still splits into two authors.
 - Conversion is MOBI and AZW3 to EPUB only, through `mobitool`, and has been
@@ -49,7 +104,8 @@ deploys belong to the client session or the operator.
 3. Tree-native branch: genesis as a constant hash, removal of legacy authority
    and of the inline formats. On merge, tell Dagda if tree forms or genesis
    changed, and produce Dagda's migration fixture (memory `project-branch-state`).
-4. The eight Dagda-found races (memory `project-dagda-found-races`).
+4. The rest of the Dagda-found defects (above), and the laptop and macnessa
+   gates for 0.92.3, then its deploy.
 
 **Deploying.** Build on macnessa; `DESTDIR` install; tar `usr`; extract with
 `tar xzf ... -C /`, then `ldconfig`. One node at a time unless a shard format

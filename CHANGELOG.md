@@ -1,5 +1,43 @@
 # Current release
 
+## 0.92.3: defects the Dagda port found, fixed here first
+
+Dagda moved Macha's store and read it closely. What it found is fixed in
+Macha, so the libraries match Macha's corrected behaviour, never its old one.
+
+A local store's accounting scan could deadlock a write: a put or remove took
+the object's lock and then waited for the scan, while the scan takes each
+object's lock as it walks, so a write to an object the scan had not reached
+yet waited for ever once it did. The wait now comes before the object lock.
+The scan also started before the held ledger existed, so its records of
+loose objects could be read and written on two threads at once; the ledger is
+built first. A scan's completion or failure was flagged and signalled without
+the waiters' mutex, so a waiter could check, miss the flag, and sleep through
+the wake; the flags are set under the mutex, and a stop wakes the wait through
+its own token. The held ledger marked itself seeded before installing the
+changes queued during its seed, so `has()` could deny an object a put had
+just returned for, and a crash between the marker and the install lost those
+changes on restart; the install comes first, under the flush lock, then the
+marker.
+
+A claim could land between a delete's check that none stood and the delete
+itself, in the garbage sweeps, a cluster-wide erase and a peer's delete
+request; the object was then claimed and gone until the claim walk restored
+it. A striped claim guard is held across each check and its delete, and
+across each presence check and the claim it justifies.
+
+Repair told a refilled pull or push list from the one before by its buffer
+address, which a vector refilled in place keeps, so a changed list could look
+unchanged, a pass report complete, and repair fall quiet until the next event.
+The maintenance pass numbers each refill and repair compares the numbers.
+
+A torrent request's removal stamped by a node whose clock was ahead expired
+at once, the unsigned difference having wrapped, so a branch that had not
+seen the removal could bring the request back; a removal from the future is
+fresh. A delta could carry a torrent request with no id, which the snapshot
+decoder refuses, so a head that applied it wrote a snapshot it could not read
+back; the delta decoder refuses it too.
+
 ## 0.92.2: book credits, titles, series and dates read properly
 
 The first real library showed what a Kindle file's record really holds. An

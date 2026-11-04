@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "contract/claim_store.hpp"
 #include "contract/id_lookup.hpp"
 #include "contract/object_store.hpp"
 #include "storage/io_pressure.hpp"
@@ -156,7 +157,8 @@ class StoragePool final : public ObjectStore {
     // sorted/unique. An unreferenced object is removed only once older than
     // orphan_grace, so uncommitted puts cannot race metadata commit, and,
     // given `sightings`, only once this node has seen it unreferenced and
-    // unclaimed for `unreferenced_grace`.
+    // unclaimed for `unreferenced_grace`. `claim_guard` is held across the
+    // final `is_retained` check and the delete, so no claim lands between.
     MaintenanceResult gc_step(const IdLookup& live,
                               const std::vector<ObjectId>& protected_ids,
                               std::chrono::milliseconds orphan_grace,
@@ -164,7 +166,8 @@ class StoragePool final : public ObjectStore {
                               const std::function<bool()>& should_yield = {},
                               const std::function<bool(const ObjectId&)>& is_retained = {},
                               UnreferencedSince* sightings = nullptr, uint64_t now_unix_ms = 0,
-                              std::chrono::milliseconds unreferenced_grace = {});
+                              std::chrono::milliseconds unreferenced_grace = {},
+                              const std::function<ClaimGuard(const ObjectId&)>& claim_guard = {});
 
     // A complete pass, for tests and explicit callers; maintenance uses
     // rebalance_step().

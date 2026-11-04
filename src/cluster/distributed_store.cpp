@@ -805,6 +805,9 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (target.id == n_.node_id()) {
+        // Under the claim guard, so no delete removes an object between its
+        // presence check here and the claim.
+        const auto guard = local_.retention().guard(ids);
         for (const auto& id : ids) {
             // A retention claim says "this node holds the object": index
             // presence, not a read-decrypt-hash, which inside the metadata
@@ -1054,6 +1057,7 @@ std::vector<ObjectId> DistributedStore::retain_data_here(const std::vector<Objec
     std::vector<ObjectId> held;
     std::vector<ObjectId> elsewhere;
     held.reserve(ids.size());
+    const auto guard = local_.retention().guard(ids);
     for (const auto& id : ids)
         (local_.data().has(id) ? held : elsewhere).push_back(id);
     if (!held.empty())
@@ -2297,8 +2301,12 @@ void DistributedStore::erase_all(const ObjectId& id) {
                 auto resource = data_resources_.acquire(
                     DataWorkContext(FrameType::speculative, n_.config().extent_size),
                     n_.config().extent_size);
-                if (resource && !local_.retention().retained(RetentionClass::data, id))
-                    (void)local_.data().remove(id);
+                if (resource) {
+                    // The claim check and the delete under one guard.
+                    const auto guard = local_.retention().guard(id);
+                    if (!local_.retention().retained(RetentionClass::data, id))
+                        (void)local_.data().remove(id);
+                }
                 (void)local_.cache().remove(id);
             } else {
                 (void)n_.call(target, MessageType::delete_object, writer.data(),
@@ -2426,7 +2434,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                               std::optional<std::span<const ObjectId>> pull,
                               const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>&
                                   known_present,
-                              std::optional<std::span<const ObjectId>> push) {
+                              std::optional<std::span<const ObjectId>> push, uint64_t pull_version,
+                              uint64_t push_version) {
     RepairResult result;
     result.complete = false;
     auto& transferred = result.bytes_transferred;
@@ -2464,9 +2473,15 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     const auto pull_list =
         pull ? pull
              : (live && !live->sorted().empty() ? std::optional(live->sorted()) : std::nullopt);
-    // A new list of what to pull may name objects behind the cursor.
-    const std::optional<const ObjectId*> pull_identity =
-        pull_list ? std::optional<const ObjectId*>(pull_list->data()) : std::nullopt;
+    // A new list of what to pull may name objects behind the cursor. The
+    // caller's version tells a refilled list from the one before; a data
+    // address does not, since a vector refilled in place keeps its buffer.
+    const auto identity_of = [](std::span<const ObjectId> list, uint64_t version) {
+        return version ? version : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(list.data()));
+    };
+    const std::optional<uint64_t> pull_identity =
+        pull_list ? std::optional<uint64_t>(identity_of(*pull_list, pull ? pull_version : 0))
+                  : std::nullopt;
     if (pull_identity != repair_pull_identity_ && repair_pull_after_)
         repair_pass_spans_change_ = true;
     repair_pull_identity_ = pull_identity;
@@ -2477,8 +2492,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     // a change between them starts the push pass again. A new list keeps the
     // position, and the pass counts as spanning a change.
     const bool listed = push.has_value();
-    const std::optional<const ObjectId*> push_identity =
-        push ? std::optional<const ObjectId*>(push->data()) : std::nullopt;
+    const std::optional<uint64_t> push_identity =
+        push ? std::optional<uint64_t>(identity_of(*push, push_version)) : std::nullopt;
     if (listed != repair_push_listed_) {
         repair_push_cursor_ = {};
         reset_push_window();
