@@ -270,10 +270,10 @@ the item's availability says where else), `416 bad_range`.
 
 ### Conversion
 
-A book's file in another format, made on request on the node asked, with
-Calibre's `ebook-convert` (see `books.conversion` in the
-[configuration](configuration.md#books)). The formats are `epub`, `azw3`,
-`mobi`, `pdf` and `fb2`.
+A MOBI or AZW3 book's file as EPUB, made on request on the node asked, with
+libmobi's `mobitool` (see `books.conversion` in the
+[configuration](configuration.md#books)). The one format is `epub`; the
+sources are `.mobi`, `.azw3`, `.azw` and `.prc` files.
 
 ```text
 PUT    /api/v1/catalogue/media/{media-id}/conversions/{format}           start, or find ready
@@ -285,12 +285,14 @@ DELETE /api/v1/catalogue/media/{media-id}/conversions/{format}           drop it
 A conversion is `{"status", "media_id", "format", "size", "mime_type",
 "error_code"}`: `status` is `converting`, `ready` or `failed`; `size` is the
 converted file's bytes when ready, else `null`; `error_code` says why it
-failed (`conversion_failed`, `conversion_timed_out`, `source_unreadable`,
-`source_too_large`), else `null`.
+failed (`unsupported_source`, `encrypted`, `conversion_failed`,
+`conversion_timed_out`, `source_unreadable`, `source_too_large`), else
+`null`. `encrypted` is a book under DRM, which is never converted.
 
 - `PUT` answers `202` with the conversion while it runs (`Retry-After: 2`,
   `Location` the same path), `200` when it is already ready, and `422` with
-  the conversion when it failed at once (`source_too_large`). A `PUT` after
+  the conversion when it failed at once (`unsupported_source`,
+  `source_too_large`). A `PUT` after
   a failure tries again; one while it runs joins it.
 - `GET` answers `200` with the conversion, `404 not_found` when none was
   asked for here (or it was dropped or evicted).
@@ -300,8 +302,8 @@ failed (`conversion_failed`, `conversion_timed_out`, `source_unreadable`,
   runs; `422` with the failure's code when it failed.
 - `DELETE` answers `204`, or `404 not_found` (nothing finished to drop).
 
-Codes for all: `400 bad_media_id`, `400 bad_format` (not one of the
-formats), `400 same_format` (the book's file is already that format),
+Codes for all: `400 bad_media_id`, `400 bad_format` (not `epub`),
+`400 same_format` (the book's file is already EPUB),
 `422 not_a_book` (the media is not a book's file), `404 not_found` (this
 node cannot read the source), and `503 conversion_unavailable` with
 `scope: node` when this node has no conversion (not built, not enabled):

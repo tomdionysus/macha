@@ -371,7 +371,18 @@ class DiscogsProvider final : public MetadataProvider {
 // The version of the rules the scanner catalogues a book by, stamped on each
 // book as external_ids.macha_book_rules: a scanner book stamped otherwise (or
 // not at all) is read again from its file and replaced.
-inline constexpr std::string_view catalogue_book_rules = "2";
+inline constexpr std::string_view catalogue_book_rules = "3";
+
+#if MACHA_HAVE_BOOKS
+// The names a book's author credit lists, given name first, placeholders dropped.
+std::vector<std::string> split_authors(std::string_view value);
+// A file's title without a store's series clutter, and the series it names.
+std::pair<std::string, std::vector<MediaProbeSeries>> book_title_series(std::string title);
+// A publication date as YYYY-MM-DD when it is a timestamp; otherwise as given.
+std::string book_date(std::string value);
+// An Open Library series entry that says it is a series.
+std::optional<MediaProbeSeries> openlibrary_series(std::string_view value);
+#endif
 
 #if MACHA_HAVE_BOOKS
 // Open Library, for books: no key, one request a second, covers by cover id.

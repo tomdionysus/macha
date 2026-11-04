@@ -13,12 +13,13 @@
 
 namespace macha {
 
-// Book conversion with Calibre's ebook-convert, run as a child process at
-// low priority, at most `max_concurrent` at a time. The source is copied to
-// a working file first, so the child never reads the cluster. Converted
-// copies are kept under the cache path until the cache passes its limit,
-// when the least recently served go first. A failure is remembered until
-// asked again.
+// MOBI and AZW3 books into EPUB with libmobi's mobitool, run as a child
+// process at low priority, at most `max_concurrent` at a time, so a book
+// that breaks the parser fails only its own conversion. The source is
+// copied to a working file first, so the child never reads the cluster. An
+// encrypted book is refused. Converted copies are kept under the cache path
+// until the cache passes its limit, when the least recently served go
+// first. A failure is remembered until asked again.
 class BookConversions final : public MediaConversions {
     struct Key {
         std::string media_id;
@@ -48,7 +49,7 @@ class BookConversions final : public MediaConversions {
     void evict();
 
   public:
-    static constexpr std::array<std::string_view, 5> supported{"epub", "azw3", "mobi", "pdf", "fb2"};
+    static constexpr std::array<std::string_view, 1> supported{"epub"};
 
     BookConversions(BookConversionConfig, const std::filesystem::path& state_path);
     ~BookConversions() override;

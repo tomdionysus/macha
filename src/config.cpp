@@ -598,8 +598,7 @@ void parse_books(const ConfigNode& root, Config& c) {
     if (auto conversion = books["conversion"]) {
         auto& out = c.books.conversion;
         if (conversion["enabled"]) out.enabled = conversion["enabled"].as<bool>();
-        if (conversion["ebook_convert"])
-            out.ebook_convert = conversion["ebook_convert"].as<std::string>();
+        if (conversion["mobitool"]) out.mobitool = conversion["mobitool"].as<std::string>();
         if (conversion["cache_path"]) out.cache_path = conversion["cache_path"].as<std::string>();
         if (conversion["cache_limit"]) out.cache_limit = yaml_size(conversion["cache_limit"]);
         if (conversion["timeout_ms"])

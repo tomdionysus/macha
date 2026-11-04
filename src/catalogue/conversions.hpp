@@ -27,8 +27,8 @@ struct ConversionState {
     std::string media_id;
     std::string format;
     uint64_t size{};
-    // When failed: conversion_failed, conversion_timed_out, source_unreadable,
-    // source_too_large.
+    // When failed: unsupported_source, encrypted, conversion_failed,
+    // conversion_timed_out, source_unreadable, source_too_large.
     std::string error_code;
 };
 
