@@ -368,6 +368,12 @@ class DiscogsProvider final : public MetadataProvider {
     size_t cache_bytes() const noexcept { return cache_bytes_; }
 };
 
+// The version of the rules the scanner catalogues a book by, stamped on each
+// book as external_ids.macha_book_rules: a scanner book stamped otherwise (or
+// not at all) is read again from its file and replaced.
+inline constexpr std::string_view catalogue_book_rules = "2";
+
+#if MACHA_HAVE_BOOKS
 // Open Library, for books: no key, one request a second, covers by cover id.
 class OpenLibraryProvider final : public MetadataProvider {
     HttpClient& http_;
@@ -414,6 +420,8 @@ class OpenLibraryProvider final : public MetadataProvider {
 // files scanned on any node meet at the same items. The probe must have a
 // title and an author.
 std::optional<ProviderMatch> book_match_from_probe(const MediaProbe&);
+
+#endif
 
 class CatalogueScanProvider {
   public:
@@ -498,6 +506,7 @@ class MusicScanProvider final : public CatalogueScanProvider {
     MetadataProvider* metadata(std::string_view provider) noexcept override;
 };
 
+#if MACHA_HAVE_BOOKS
 // Books under their roots: an EPUB's own metadata first, then the path, then
 // Open Library; a book the provider cannot find is catalogued from the file.
 class BookScanProvider final : public CatalogueScanProvider {
@@ -520,6 +529,8 @@ class BookScanProvider final : public CatalogueScanProvider {
         return metadata_ && provider == metadata_->name() ? metadata_.get() : nullptr;
     }
 };
+
+#endif
 
 struct ProviderRefMatch {
     std::string leaf_id;
@@ -600,6 +611,8 @@ class CatalogueScanner {
         std::string result;
         unsigned attempts{};
         std::optional<MediaProbeResult> media_profile;
+        // Scanner books under older book rules that this match replaces.
+        std::vector<std::string> superseded;
     };
     struct HintBatchResult {
         size_t claimed{};

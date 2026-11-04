@@ -96,6 +96,10 @@ EpubMetadata read_epub_metadata(
 EpubMetadata read_epub_metadata(const std::filesystem::path& path,
                                 const EpubReadLimits& limits = {});
 
+// A package document on its own, such as the metadata.opf Calibre keeps
+// beside each book. The cover is never read from it.
+EpubMetadata read_opf_metadata(std::string_view opf);
+
 // The ISBN-13 of an identifier text that is an ISBN-10 or ISBN-13, else none.
 std::optional<std::string> normalise_isbn13(std::string_view text);
 

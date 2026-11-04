@@ -682,6 +682,16 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             response.headers["ETag"] = json_escape(media_id);
             return response;
         }
+        if (request.path.starts_with(media_prefix)) {
+            constexpr std::string_view conversions = "/conversions/";
+            const auto rest = std::string_view(request.path).substr(media_prefix.size());
+            if (const auto at = rest.find(conversions); at != std::string_view::npos) {
+                auto media_id = url_decode(rest.substr(0, at));
+                if (!media_id.starts_with("macha:"))
+                    return error(400, "bad_media_id", "immutable macha media ID required");
+                return media_conversion(request, media_id, rest.substr(at + conversions.size()));
+            }
+        }
         constexpr std::string_view content_suffix = "/content";
         if ((request.method == "GET" || request.method == "HEAD") &&
             request.path.starts_with(media_prefix) && request.path.ends_with(content_suffix)) {
@@ -889,6 +899,111 @@ HttpResponse CatalogueApi::media_content(const HttpRequest& request, const std::
     }
     if (request.method == "HEAD") response.stream.reset();
     return response;
+}
+
+namespace {
+
+std::string conversion_json(const ConversionState& state) {
+    std::string out = "{\"status\":" + json_escape(conversion_phase_name(state.phase));
+    out += ",\"media_id\":" + json_escape(state.media_id);
+    out += ",\"format\":" + json_escape(state.format);
+    out += ",\"size\":" + (state.phase == ConversionState::Phase::ready ? std::to_string(state.size)
+                                                                       : std::string("null"));
+    out += ",\"mime_type\":" + json_escape(file_mime("book." + state.format));
+    out += ",\"error_code\":" + (state.error_code.empty() ? "null" : json_escape(state.error_code));
+    return out + "}";
+}
+
+} // namespace
+
+// /api/v1/catalogue/media/{id}/conversions/{format}[/content]: a book in
+// another format, converted on this node on request.
+HttpResponse CatalogueApi::media_conversion(const HttpRequest& request, const std::string& media_id,
+                                            std::string_view rest) {
+    constexpr std::string_view content_suffix = "/content";
+    const bool content_route = rest.ends_with(content_suffix);
+    if (content_route) rest.remove_suffix(content_suffix.size());
+    const auto format = url_decode(rest);
+    if (format.empty() || format.find('/') != std::string::npos)
+        return error(404, "not_found", "endpoint not found");
+    if (!conversions_) {
+        FailureAxes axes;
+        axes.scope = FailureScope::node;
+        axes.node_healthy = true;
+        axes.alternative_may_succeed = false;
+        return http_error(503, "conversion_unavailable", "this node does not convert books", {}, axes);
+    }
+    const auto supported = conversions_->formats();
+    if (std::find(supported.begin(), supported.end(), format) == supported.end())
+        return error(400, "bad_format", "format must be one this node converts into");
+    if (!book_media(media_id))
+        return error(422, "not_a_book", "only a book's file is converted");
+
+    if (content_route) {
+        if (request.method != "GET" && request.method != "HEAD")
+            return error(405, "method", "GET or HEAD required");
+        const auto state = conversions_->state(media_id, format);
+        if (!state) return error(404, "not_found", "no conversion into this format here");
+        if (state->phase == ConversionState::Phase::converting) {
+            auto response = json(409, "{\"error\":\"not_ready\",\"message\":\"the conversion is running\"}");
+            response.headers["Retry-After"] = "2";
+            return response;
+        }
+        if (state->phase == ConversionState::Phase::failed)
+            return json(422, "{\"error\":" + json_escape(state->error_code) +
+                                 ",\"message\":\"the conversion failed\"}");
+        const auto source = conversions_->content(media_id, format);
+        if (!source) return error(404, "not_found", "no conversion into this format here");
+        const auto read = source->read;
+        auto response = ranged_response(request, source->size, file_mime("book." + format),
+                                        [read](uint64_t offset, uint64_t length) {
+                                            return std::make_shared<ReaderBody>(read, offset, length);
+                                        });
+        if (response.status == 416) return response;
+        response.headers["Cache-Control"] = "private, max-age=31536000, immutable";
+        response.headers["ETag"] = json_escape(media_id + "." + format);
+        if (auto it = request.query.find("download"); it != request.query.end() && it->second != "0") {
+            std::string name;
+            if (const auto original = media_content_ ? media_content_(media_id) : std::nullopt) {
+                name = original->name;
+                if (const auto dot = name.find_last_of('.'); dot != std::string::npos) name.resize(dot);
+            }
+            if (name.empty()) name = "book";
+            std::string safe;
+            for (unsigned char c : name)
+                safe.push_back(c < 0x20 || c == '"' || c == '\\' || c == 0x7f ? '_' : static_cast<char>(c));
+            response.headers["Content-Disposition"] = "attachment; filename=\"" + safe + "." + format + "\"";
+        }
+        if (request.method == "HEAD") response.stream.reset();
+        return response;
+    }
+
+    if (request.method == "GET") {
+        const auto state = conversions_->state(media_id, format);
+        if (!state) return error(404, "not_found", "no conversion into this format here");
+        return json(200, conversion_json(*state));
+    }
+    if (request.method == "DELETE") {
+        if (!conversions_->erase(media_id, format))
+            return error(404, "not_found", "no finished conversion into this format here");
+        return {204, "application/json; charset=utf-8", {}, {}};
+    }
+    if (request.method == "PUT") {
+        const auto source = media_content_ ? media_content_(media_id) : std::nullopt;
+        if (!source) return error(404, "not_found", "media is not available on this node");
+        if (path_extension(source->name) == "." + format)
+            return error(400, "same_format", "the book is already in this format");
+        const auto state = conversions_->request(media_id, format, *source);
+        if (state.phase == ConversionState::Phase::failed)
+            return json(422, conversion_json(state));
+        auto response = json(state.phase == ConversionState::Phase::ready ? 200 : 202, conversion_json(state));
+        if (state.phase == ConversionState::Phase::converting) {
+            response.headers["Retry-After"] = "2";
+            response.headers["Location"] = request.path;
+        }
+        return response;
+    }
+    return error(405, "method", "PUT, GET or DELETE required");
 }
 
 bool CatalogueApi::capability_request(const HttpRequest& request) const {
