@@ -1735,6 +1735,10 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
         for (uint32_t i = 0; i < upserts; ++i) {
             auto request = decode_torrent_request(r);
             auto id = request.id;
+            // The same key rule as the snapshot's: a record the snapshot
+            // would refuse must not reach it through a delta.
+            if (id.empty())
+                throw DecodeError("bad torrent request key in delta");
             if (!delta.upsert_torrent_requests.emplace(std::move(id), std::move(request)).second)
                 throw DecodeError("duplicate torrent request in delta");
         }

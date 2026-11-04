@@ -2643,7 +2643,9 @@ size_t CatalogueManager::control_gc_step(const IdLookup& live,
                 continue;
 
             // cache() takes this mutex to publish a new root, so GC never races
-            // a root transition and deletes its staging.
+            // a root transition and deletes its staging. The claim guard keeps
+            // a claim from landing between this check and the delete.
+            const auto claim_guard = ledger_.claim_guard(*id);
             if (!waited || ledger_.retained(RetentionClass::control, *id))
                 continue;
             if (local_.control().remove_if_older_than(*id, grace)) {

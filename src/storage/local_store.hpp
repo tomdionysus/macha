@@ -187,7 +187,9 @@ class LocalStore final : public ObjectStore {
     mutable uint64_t verified_loose_sequence_ MACHA_GUARDED_BY(m_){};
     std::atomic_uint64_t loose_reaffirmation_fast_paths_{};
     std::atomic_uint64_t loose_reaffirmation_full_validations_{};
-    mutable std::condition_variable accounting_cv_;
+    // Waited on with a stop token, so a stop's wake is never lost between a
+    // waiter's check and its sleep.
+    mutable std::condition_variable_any accounting_cv_;
     // Started by the constructor, joined by the destructor.
     std::jthread scan_thread_;
     // Fills presence_ from object directory names at start (readdir only, no
@@ -237,6 +239,10 @@ class LocalStore final : public ObjectStore {
     void wait_for_accounting(Lock&) const MACHA_REQUIRES(m_);
     bool wait_for_accounting(Lock&, std::stop_token, bool exact = false) const
         MACHA_REQUIRES(m_);
+    // Waits for the scan under m_ alone, before a writer takes an object lock.
+    void await_accounting() const MACHA_EXCLUDES(m_);
+    void start_scan();
+    void mark_scan_failed() MACHA_EXCLUDES(m_);
     bool restore_accounting(bool* clean);
     void persist_accounting(uint64_t used, uint8_t operation, const ObjectId&, uint64_t size,
                             bool durable);

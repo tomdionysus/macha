@@ -341,9 +341,13 @@ void Maintenance::run(std::stop_token stop) {
     std::shared_ptr<const std::vector<ObjectId>> pull_missing;
     std::shared_ptr<const InventoryHorizon> pull_inventory;
     std::vector<ObjectId> pull_list;
+    // Advanced at each refill: the lists are refilled in place, so their
+    // addresses say nothing about whether they changed.
+    uint64_t pull_list_version = 0;
     std::shared_ptr<const AvailabilityService::PeerLacks> push_lacks;
     std::shared_ptr<const InventoryHorizon> push_inventory;
     std::vector<ObjectId> push_list;
+    uint64_t push_list_version = 0;
     bool pushing_listed = false;
 
     while (!stop.stop_requested()) {
@@ -745,6 +749,7 @@ void Maintenance::run(std::stop_token stop) {
                         } else {
                             pull_list = inventory->all(RetentionClass::data);
                         }
+                        ++pull_list_version;
                         pull_missing = missing;
                         pull_inventory = inventory;
                     }
@@ -757,6 +762,7 @@ void Maintenance::run(std::stop_token stop) {
                     // walking the store.
                     if (peer_lacks != push_lacks || inventory != push_inventory) {
                         push_list.clear();
+                        ++push_list_version;
                         if (peer_lacks && peer_lacks->complete && inventory &&
                             peer_lacks->generation == inventory->generation()) {
                             for (const auto& [peer, ids] : peer_lacks->lacks)
@@ -801,7 +807,8 @@ void Maintenance::run(std::stop_token stop) {
                                        : std::nullopt,
                         known_present,
                         pushing_listed ? std::optional<std::span<const ObjectId>>(push_list)
-                                       : std::nullopt);
+                                       : std::nullopt,
+                        pull_list_version, push_list_version);
                     {
                         // Split by whether a higher class was active as the
                         // step ended: repair idle against repair on its share.
@@ -1040,7 +1047,8 @@ void Maintenance::run(std::stop_token stop) {
                             return ledger_.retained(RetentionClass::data, id);
                         },
                         &data_unreferenced_, static_cast<uint64_t>(now_ns / 1'000'000),
-                        policy.garbage_grace);
+                        policy.garbage_grace,
+                        [this](const ObjectId& id) { return ledger_.claim_guard(id); });
                     save_sightings(data_unreferenced_, data_sightings_saved_, gc.complete);
                     if (gc.bytes)
                         trace_action("gc", "reclaimed_bytes=" + std::to_string(gc.bytes));
