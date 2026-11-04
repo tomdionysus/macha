@@ -19,6 +19,12 @@ libtorrent-rasterbar 2.0 or later are optional at build time, but are needed
 for UPnP port mapping and BitTorrent acquisition respectively. CMake reports
 clearly when any optional feature is unavailable.
 
+Book support (EPUB and MOBI metadata, Open Library, MOBI to EPUB conversion)
+is built unless `-DMACHA_ENABLE_BOOKS=OFF` is given; it needs nothing extra
+to build. Converting MOBI and AZW3 books to EPUB needs libmobi's `mobitool`
+on the node at run time (Debian: `apt install libmobi-tools`), and nothing
+at build time.
+
 libtorrent is compiled against a particular Boost, and the BitTorrent plugin
 must be built against the same Boost headers. Use the Boost development
 package your distribution's libtorrent-rasterbar package depends on, and do
@@ -107,8 +113,8 @@ ctest --test-dir build --output-on-failure
 build` runs the same executables directly.
 
 Review the configure output. A full build reports `FUSE mount plugin
-enabled`, `UPnP port mapping enabled` and `BitTorrent acquisition plugin
-enabled`.
+enabled`, `UPnP port mapping enabled`, `BitTorrent acquisition plugin
+enabled` and `Book support enabled`.
 
 ## Install and configure
 

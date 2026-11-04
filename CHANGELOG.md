@@ -1,5 +1,101 @@
 # Current release
 
+## 0.92.2: book credits, titles, series and dates read properly
+
+The first real library showed what a Kindle file's record really holds. An
+author stored surname first (`Pratchett, Terry`) is now the same author as
+`Terry Pratchett`; a comma list of full names is split at every comma, not
+only the first; `Unknown` is no author. A title that only repeats the file's
+internal database name (`PratWher`) is no title, so the folders and file name
+give it. Book text keeps its punctuation: `J.R.R. Tolkien`, `Spider-Man` and
+the dash in a subtitle are no longer taken for file name separators.
+
+Store clutter comes off a file's title and names the series, the only series
+information a MOBI has: `Raising Steam: (Discworld novel 40) (Discworld
+Novels)` is Raising Steam in Discworld at 40, and `Small Gods: Discworld
+Novel, A` is Small Gods in Discworld. An Open Library edition's series is used
+when the file gives none and the entry says it is a series. `published` is a
+plain date when the file holds a timestamp, the nearest day to it, since tools
+write a local midnight in UTC.
+
+`.azw` and `.prc` files are catalogued as books, served as
+`application/x-mobipocket-ebook`, read for metadata and converted, from one
+definition of a Kindle file. The book rules move to version 3, so the scanner
+reads its books again and replaces them with no operator action; their ids
+may change, their media ids do not.
+
+## 0.92.1: books read from their own files, and MOBI converted to EPUB
+
+The first library catalogued under 0.92.0 came out wrong: MOBI files laid
+out as `Title/Author/Title - Author.mobi` with a `cover.jpg` beside each were
+catalogued with title and author swapped, no ISBN and no cover. 0.92.0 read
+metadata from EPUB files only, never looked beside a book, assumed
+`Author/Title` folders, and catalogued a book from its first reading of the
+path as soon as Open Library did not know it, so the other reading was never
+tried.
+
+A MOBI or AZW3 header is now read like an EPUB package: title, authors,
+ISBN, publisher, date, description, language and the embedded cover, with
+only the header and the cover image fetched. Calibre's `metadata.opf` beside
+a book fills what the file lacks, the series most often, and a cover image
+beside it (`cover.jpg`, `folder.jpg`, or one named after the book) is used
+when the file has none. A file name `Title - Author` whose two halves are
+both folders above it is read that way round, whatever the folder order,
+and Calibre's `(id)` is not part of a title. Open Library is tried with both
+readings of a path before the file's own reading stands.
+
+Each scanner book records the version of these rules; a scanner book made
+under older rules is read again from its file and replaced, with any author
+or series only it named. A book edited by hand is left alone. The books
+already catalogued are corrected this way with no operator action.
+
+A MOBI or AZW3 book can be converted to EPUB on request:
+`PUT /api/v1/catalogue/media/{id}/conversions/epub` starts a conversion with
+libmobi's `mobitool` (Debian: `libmobi-tools`), run as a low-priority child
+process so a book that breaks the parser fails only itself, and
+`.../content` serves the result with ranges. An encrypted (DRM) book is
+refused with `encrypted`. Converted copies are kept on the node within a
+cache limit.
+
+Book support is switchable like BitTorrent: `-DMACHA_ENABLE_BOOKS=OFF` builds
+without it, and `books.enabled` (default off) turns it on per node, scanning
+and conversion together; `books.conversion.enabled` adds conversion. A node
+without book support still reads catalogues holding books and serves their
+files. The `books` scan provider now follows `books.enabled`.
+
+## 0.92.0: books
+
+Ebooks are a media class beside films, TV and music. The catalogue gains
+`book`, `author` and `series`: none has a parent, and a book names its
+authors and its series by reference, since it may have several of each
+(two authors; a series that changes author; a book in a main series and a
+sub-series). A book carries `author_ids`, `series` (with each position,
+fractional for a novella), `language`, `publisher` and `published`; its
+files are its formats, so an EPUB and a PDF of one edition are one item.
+An author or series left referenced by no book goes with its last book,
+as an album does, and shows a book's cover when it has none of its own.
+
+The `books` scan provider (off until enabled, roots `/Books`) catalogues
+EPUB, PDF, MOBI, AZW3, FB2 and CBZ files. An EPUB's own record is read
+first (title, creators and their roles, ISBN, language, publisher, date,
+description, series, cover) through a reader of Macha's own that fetches
+only the archive's directory, the package and the cover; then the path
+(`Author/Title (Year)/file`, `Author/Series/NN Title/file`,
+`Series/NN Title/file`, `Author - Title.epub`). Open Library is asked by
+ISBN, then by title and author, at most once a second; a title alone
+never matches, and a book the provider does not know is catalogued from
+the file. Ingest files a book under `/Books/<first author>/<title>/`.
+
+`GET /api/v1/catalogue/media/{id}/content` serves any stored file as it is,
+with HTTP ranges and `download=1` for an attachment: a book is read through
+it, never through a playback session, and its profile route answers
+`422 profile_not_applicable`. Listing and search take `author=` and
+`series=`; the metadata editor takes `kind=book` searches,
+`openlibrary:edition:<olid>` and `openlibrary:work:<olid>` references, and
+manual books. Catalogue shards are written as MCAT0023; 0021 and 0022
+shards are still read. A node on an older release cannot load a catalogue
+holding a book, so every node is upgraded before the provider is enabled.
+
 ## 0.91.5: an import waits for its disk
 
 An ingest job whose bytes no node present can take, because the DATA disk

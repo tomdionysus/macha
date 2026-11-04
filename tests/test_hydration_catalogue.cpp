@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "torrent/torrent_extent_journal.hpp"
 #include "stepped_time.hpp"
+#if MACHA_HAVE_BOOKS
+#include "catalogue/book_conversion.hpp"
+#endif
 #include "test_backend_support.hpp"
 #include "api/acquisition_api.hpp"
 #include "api/paging.hpp"
@@ -1156,8 +1159,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // Requests to MusicBrainz are spaced by their gate's interval, a second
     // unless the gate is built with another. Each provider here has its own
     // gate, as the gate also carries the circuit.
-    const auto unpaced = [] { return std::make_shared<MusicBrainzGate>(0ms); };
-    MusicBrainzProvider mb(mb_http, mb_config, std::make_shared<MusicBrainzGate>(25ms));
+    const auto unpaced = [] { return std::make_shared<ProviderGate>(0ms); };
+    MusicBrainzProvider mb(mb_http, mb_config, std::make_shared<ProviderGate>(25ms));
     MediaProbe music_probe;
     music_probe.kind = MediaProbeKind::track;
     music_probe.artist = "Pink Floyd";
@@ -1359,7 +1362,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_musicbrainz_release_tracks) {
     http.add("/ws/2/release/rel-empty", 200, "application/json", R"({"id":"rel-empty"})");
     CatalogueMusicBrainzConfig config;
     config.contact = "https://example.test/macha";
-    auto gate = std::make_shared<MusicBrainzGate>(0ms);
+    auto gate = std::make_shared<ProviderGate>(0ms);
     MusicBrainzProvider mb(http, config, gate);
     {
         Lock lock(gate->mutex);
@@ -4037,16 +4040,49 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_indexes_round_trip_and_older_s
     REQUIRE(roundtrip.media_indexes.contains(media_id));
     CHECK(roundtrip.media_indexes.at(media_id) == index);
 
-    // A shard written before media indexes existed (MCAT0021: no index
-    // section) is data already on disk and must still read.
-    snapshot.media_indexes.clear();
-    auto older = encode_catalogue(snapshot);
-    REQUIRE(older.size() > 12);
-    older[7] = '1';                            // MCAT0022 -> MCAT0021
-    older.resize(older.size() - 4);            // no index count
-    const auto read_back = decode_catalogue(older);
-    CHECK(read_back.items.contains(item.id));
-    CHECK(read_back.media_indexes.empty());
+    // Shards written before media indexes (MCAT0021) and before a book's
+    // fields (MCAT0022) are data already on disk and must still read. Their
+    // item layout is written here as it was.
+    const auto older_item = [&](Writer& w) {
+        w.string(item.id);
+        w.u8(static_cast<uint8_t>(item.kind));
+        w.string(item.title);
+        w.string(item.sort_title);
+        w.string(item.synopsis);
+        w.u8(0);                               // no parent
+        for (int i = 0; i < 5; ++i) w.u8(0);   // year, season, episode, disc, track absent
+        w.u32(0);                              // aliases
+        w.u32(0);                              // external ids
+        w.u32(0);                              // media ids
+        w.u32(0);                              // artwork
+        w.u64(item.revision);
+        w.i64(item.updated_ns);
+    };
+    {
+        Writer w;
+        w.raw(std::array<uint8_t, 8>{'M', 'C', 'A', 'T', '0', '0', '2', '1'});
+        w.u32(1);
+        older_item(w);
+        w.u32(0);                              // profiles; no index section
+        const auto read_back = decode_catalogue(w.take());
+        CHECK(read_back.items.contains(item.id));
+        CHECK(read_back.media_indexes.empty());
+    }
+    {
+        Writer w;
+        w.raw(std::array<uint8_t, 8>{'M', 'C', 'A', 'T', '0', '0', '2', '2'});
+        w.u32(1);
+        older_item(w);
+        w.u32(0);                              // profiles
+        w.u32(1);                              // one index
+        w.string(media_id);
+        w.fixed(index.bytes);
+        const auto read_back = decode_catalogue(w.take());
+        REQUIRE(read_back.items.contains(item.id));
+        CHECK(read_back.items.at(item.id).author_ids.empty());
+        CHECK(read_back.items.at(item.id).series.empty());
+        CHECK(read_back.media_indexes.at(media_id) == index);
+    }
 }
 
 MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and_protects_its_control_objects) {
@@ -5390,4 +5426,635 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_discarded_payload_leaves_at_once_a
     CHECK(!staging.discard(dir.path() / "outside")); // never outside staging
 }
 
+#if MACHA_HAVE_BOOKS
+MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and_served_as_content) {
+    // Books over one node: an EPUB's own record and a path-only PDF become
+    // books, authors and series; nothing is profiled; the API filters by
+    // author and series, checks references, answers a book's profile with
+    // profile_not_applicable and serves the file's bytes with ranges; an
+    // author or series goes with its last book.
+    CatalogueNode node("books");
+    auto& fs = node.filesystem();
+    const auto fixture_bytes = [](const char* name) {
+        auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
+        std::ifstream input(path, std::ios::binary);
+        REQUIRE(input.good());
+        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        return Bytes(bytes.begin(), bytes.end());
+    };
+    node.mkdir("/Books");
+    node.mkdir("/Books/Terry Pratchett");
+    node.mkdir("/Books/Terry Pratchett/Guards! Guards!");
+    node.mkdir("/Books/Neil Gaiman & Terry Pratchett");
+    node.mkdir("/Books/Neil Gaiman & Terry Pratchett/Good Omens (1990)");
+    const std::string epub_path = "/Books/Terry Pratchett/Guards! Guards!/guards.epub";
+    const std::string pdf_path = "/Books/Neil Gaiman & Terry Pratchett/Good Omens (1990)/Good Omens.pdf";
+    const auto epub_bytes = fixture_bytes("guards.epub");
+    const auto epub_id = node.write(epub_path, epub_bytes);
+    const auto pdf_id = node.write(pdf_path, pattern(8192, 7));
+
+    // The file's own record wins: title, author with the author's role, ISBN,
+    // both series with their positions, and the cover.
+    {
+        FakeHttpClient http;
+        CatalogueBookProviderConfig config;
+        config.enabled = true;
+        config.openlibrary.enabled = false;
+        BookScanProvider books(http, config);
+        auto probed = books.probe_file(fs, "/Books", epub_path, fs.getattr(epub_path));
+        REQUIRE(!probed.candidates.empty());
+        const auto& probe = probed.candidates.front().probe;
+        CHECK(probed.candidates.front().generator == "book-embedded");
+        CHECK(probe.kind == MediaProbeKind::book);
+        CHECK(probe.title == "Guards! Guards!");
+        CHECK((probe.authors == std::vector<std::string>{"Terry Pratchett"}));
+        CHECK(probe.isbn == std::optional<std::string>{"9780552134620"});
+        CHECK(probe.language == std::optional<std::string>{"en"});
+        CHECK(probe.publisher == std::optional<std::string>{"Corgi"});
+        CHECK(probe.year == std::optional<int32_t>{1990});
+        REQUIRE(probe.book_series.size() == 2);
+        CHECK(probe.book_series[0].name == "Discworld");
+        CHECK(probe.book_series[0].index == std::optional<double>{8});
+        CHECK(probe.book_series[1].name == "City Watch");
+        CHECK(probe.book_series[1].index == std::optional<double>{1});
+        REQUIRE(probed.artwork.size() == 1);
+        CHECK(probed.artwork.front().role == "cover");
+        CHECK(probed.artwork.front().mime_type == "image/png");
+
+        auto by_path = books.probe_file(fs, "/Books", pdf_path, fs.getattr(pdf_path));
+        REQUIRE(!by_path.candidates.empty());
+        CHECK(by_path.candidates.front().generator == "book-structured-path");
+        CHECK(by_path.candidates.front().probe.title == "Good Omens");
+        CHECK(by_path.candidates.front().probe.year == std::optional<int32_t>{1990});
+        CHECK((by_path.candidates.front().probe.authors ==
+               std::vector<std::string>{"Neil Gaiman", "Terry Pratchett"}));
+        CHECK(by_path.artwork.empty());
+        CHECK(!books.profiles_media());
+    }
+
+    // The scan writes the book, its authors and its series, stores the cover,
+    // and asks for no media profile.
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.movies.enabled = false;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+    scanner_config.books.enabled = true;
+    scanner_config.books.openlibrary.enabled = false;
+    auto profile_engine = std::make_shared<FakeMediaEngine>();
+    CatalogueScanner scanner(node.node(), node.node().metadata_server(), fs, node.catalogue(),
+                             node.hints(), scanner_config, std::make_unique<FakeHttpClient>(), 5s,
+                             profile_engine);
+    CHECK(scanner.scan_once() == 2);
+    CHECK(profile_engine->probes() == 0);
+    auto guards = node.catalogue().get("book:isbn:9780552134620");
+    REQUIRE(guards.has_value());
+    CHECK(guards->kind == CatalogueKind::book);
+    CHECK(guards->title == "Guards! Guards!");
+    CHECK((guards->author_ids == std::vector<std::string>{"author:terry-pratchett"}));
+    REQUIRE(guards->series.size() == 2);
+    CHECK(guards->series[0].series_id == "series:discworld");
+    CHECK(guards->series[0].index == std::optional<double>{8});
+    CHECK(guards->series[1].series_id == "series:city-watch");
+    CHECK(guards->external_ids.at("isbn13") == "9780552134620");
+    CHECK(guards->language == std::optional<std::string>{"en"});
+    CHECK(guards->published == std::optional<std::string>{"1990-11-01"});
+    CHECK(guards->synopsis == "The dragon is back.");
+    CHECK(guards->media_ids == std::vector<std::string>{epub_id});
+    REQUIRE(guards->artwork.size() == 1);
+    CHECK(node.node().local_store().has(guards->artwork.front().id));
+    CHECK(!node.catalogue().media_profile(epub_id).has_value());
+    auto pratchett = node.catalogue().get("author:terry-pratchett");
+    REQUIRE(pratchett.has_value());
+    CHECK(pratchett->kind == CatalogueKind::author);
+    CHECK(pratchett->title == "Terry Pratchett");
+    CHECK(pratchett->media_ids.empty());
+    REQUIRE(node.catalogue().get("series:discworld").has_value());
+    CHECK(node.catalogue().get("series:discworld")->title == "Discworld");
+    auto omens = node.catalogue().get("book:good-omens:neil-gaiman");
+    REQUIRE(omens.has_value());
+    CHECK((omens->author_ids == std::vector<std::string>{"author:neil-gaiman", "author:terry-pratchett"}));
+    CHECK(omens->year == std::optional<int32_t>{1990});
+    CHECK(omens->series.empty());
+    CHECK(omens->media_ids == std::vector<std::string>{pdf_id});
+    CHECK(scanner.scan_once() == 0);
+
+    // The API: filters by author and series, reference checks, the book's
+    // fields in its JSON, the author's effective artwork, the profile
+    // answer and the content route.
+    CatalogueApi api(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(1), {}, {}, {},
+                     [&](const std::string& media_id) -> std::optional<MediaContentSource> {
+                         auto found = fs.find_media(media_id);
+                         if (!found) return std::nullopt;
+                         auto handle = fs.open_read(found->second, found->first, false);
+                         return MediaContentSource{found->second.size,
+                                                   found->first.substr(found->first.find_last_of('/') + 1),
+                                                   [handle](uint64_t offset, std::span<uint8_t> into) {
+                                                       return handle->read(offset, into);
+                                                   }};
+                     });
+    const auto call = [&](std::string method, std::string path,
+                          std::map<std::string, std::string, std::less<>> query = {},
+                          std::string body = {},
+                          std::map<std::string, std::string, std::less<>> headers = {}) {
+        auto request = api_request(std::move(method), std::move(path), Bytes(body.begin(), body.end()),
+                                   std::move(headers));
+        request.query = std::move(query);
+        return api.handle(request);
+    };
+    const auto ids = [](const HttpResponse& response) {
+        std::set<std::string> out;
+        const auto body = api_body(response);
+        for (const auto& item : body.find("items")->asArray())
+            out.insert(item.find("id")->asString());
+        return out;
+    };
+    auto by_author = call("GET", "/api/v1/catalogue/items", {{"type", "book"}, {"author", "author:terry-pratchett"}});
+    REQUIRE(by_author.status == 200);
+    CHECK((ids(by_author) == std::set<std::string>{"book:isbn:9780552134620", "book:good-omens:neil-gaiman"}));
+    auto by_series = call("GET", "/api/v1/catalogue/items", {{"type", "book"}, {"series", "series:city-watch"}});
+    REQUIRE(by_series.status == 200);
+    CHECK((ids(by_series) == std::set<std::string>{"book:isbn:9780552134620"}));
+    auto searched = call("GET", "/api/v1/catalogue/search", {{"q", "guards"}, {"kind", "book"}, {"author", "author:neil-gaiman"}});
+    REQUIRE(searched.status == 200);
+    CHECK(ids(searched).empty());
+    auto item = call("GET", "/api/v1/catalogue/items/book%3Aisbn%3A9780552134620");
+    REQUIRE(item.status == 200);
+    const auto item_json = api_body(item);
+    CHECK(item_json.find("kind")->asString() == "book");
+    CHECK(item_json.find("parent_id")->isNull());
+    REQUIRE(item_json.find("author_ids")->asArray().size() == 1);
+    REQUIRE(item_json.find("series")->asArray().size() == 2);
+    CHECK(item_json.find("series")->asArray().front().find("series_id")->asString() == "series:discworld");
+    CHECK(item_json.find("series")->asArray().front().find("index")->asInt64() == 8);
+    CHECK(item_json.find("language")->asString() == "en");
+    CHECK(item_json.find("publisher")->asString() == "Corgi");
+    CHECK(item_json.find("published")->asString() == "1990-11-01");
+    auto author_json = api_body(call("GET", "/api/v1/catalogue/items/author%3Aterry-pratchett"));
+    CHECK(author_json.find("artwork")->asArray().empty());
+    REQUIRE(author_json.find("effective_artwork")->asArray().size() == 1);
+    CHECK(author_json.find("effective_artwork")->asArray().front().find("id")->asString() ==
+          to_string(guards->artwork.front().id));
+    CHECK(author_json.find("author_ids")->asArray().empty());
+    CHECK(author_json.find("language")->isNull());
+
+    auto missing = call("PUT", "/api/v1/catalogue/items/book%3Ahand", {},
+                        R"({"kind":"book","title":"Hand Book","author_ids":["author:nobody"]})");
+    CHECK(missing.status == 400);
+    CHECK(api_body(missing).find("error")->asString() == "reference_not_found");
+    CHECK(api_body(missing).find("reference_id")->asString() == "author:nobody");
+    auto wrong = call("PUT", "/api/v1/catalogue/items/book%3Ahand", {},
+                      R"({"kind":"book","title":"Hand Book","series":[{"series_id":"author:terry-pratchett","index":2.5}]})");
+    CHECK(wrong.status == 400);
+    CHECK(api_body(wrong).find("error")->asString() == "bad_reference_kind");
+    CHECK(api_body(wrong).find("reference_kind")->asString() == "author");
+    auto not_a_book = call("PUT", "/api/v1/catalogue/items/movie%3Ahand", {},
+                           R"({"kind":"movie","title":"Film","author_ids":["author:terry-pratchett"]})");
+    CHECK(not_a_book.status == 400);
+    auto hand = call("PUT", "/api/v1/catalogue/items/book%3Ahand", {},
+                     R"({"kind":"book","title":"Hand Book","author_ids":["author:terry-pratchett"],"series":[{"series_id":"series:discworld","index":8.5}],"language":"en-GB"})");
+    REQUIRE(hand.status == 201);
+    CHECK(api_body(hand).find("series")->asArray().front().find("index")->asNumber() == 8.5);
+    CHECK(node.catalogue().get("book:hand")->language == std::optional<std::string>{"en-GB"});
+
+    auto profile = call("GET", "/api/v1/catalogue/media/" + epub_id + "/profile");
+    CHECK(profile.status == 422);
+    CHECK(api_body(profile).find("error")->asString() == "profile_not_applicable");
+    CHECK(api_body(profile).find("kind")->asString() == "book");
+
+    auto whole = call("GET", "/api/v1/catalogue/media/" + epub_id + "/content");
+    REQUIRE(whole.status == 200);
+    CHECK(whole.content_type == "application/epub+zip");
+    CHECK(whole.headers.at("Accept-Ranges") == "bytes");
+    CHECK(whole.headers.at("ETag") == "\"" + epub_id + "\"");
+    CHECK(!whole.headers.contains("Content-Disposition"));
+    REQUIRE(whole.stream);
+    CHECK(whole.stream->size() == epub_bytes.size());
+    auto ranged = call("GET", "/api/v1/catalogue/media/" + epub_id + "/content", {{"download", "1"}}, {},
+                       {{"range", "bytes=0-3"}});
+    REQUIRE(ranged.status == 206);
+    CHECK(ranged.headers.at("Content-Range") == "bytes 0-3/" + std::to_string(epub_bytes.size()));
+    CHECK(ranged.headers.at("Content-Disposition") == "attachment; filename=\"guards.epub\"");
+    REQUIRE(ranged.stream);
+    Bytes head(4);
+    REQUIRE(ranged.stream->read(0, head) == 4);
+    CHECK((head == Bytes{'P', 'K', 3, 4}));
+    auto pdf = call("GET", "/api/v1/catalogue/media/" + pdf_id + "/content");
+    REQUIRE(pdf.status == 200);
+    CHECK(pdf.content_type == "application/pdf");
+    CHECK(call("GET", "/api/v1/catalogue/media/" + epub_id + "/content", {}, {}, {{"range", "bytes=99999999-"}}).status == 416);
+    CHECK(call("GET", "/api/v1/catalogue/media/macha%3Aabsent/content").status == 404);
+    CHECK(call("GET", "/api/v1/catalogue/media/path%3A%2Fx/content").status == 400);
+
+    // The last book of an author or series takes it along; a shared author
+    // stays. The hand-made book is locked and keeps its references.
+    fs.unlink(pdf_path);
+    (void)scanner.scan_once();
+    CHECK(!node.catalogue().get("book:good-omens:neil-gaiman").has_value());
+    CHECK(!node.catalogue().get("author:neil-gaiman").has_value());
+    CHECK(node.catalogue().get("author:terry-pratchett").has_value());
+    auto unbound = node.catalogue().unbind_media(std::string_view("book:isbn:9780552134620"), epub_id, {});
+    CHECK(unbound.bound);
+    CHECK(!node.catalogue().get("book:isbn:9780552134620").has_value());
+    CHECK(!node.catalogue().get("series:city-watch").has_value());
+    CHECK(node.catalogue().get("series:discworld").has_value());
+    CHECK(node.catalogue().get("author:terry-pratchett").has_value());
+    CHECK(node.catalogue().get("book:hand").has_value());
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_open_library_enriches_a_book_and_the_probe_alone_catalogues_it) {
+    // OpenLibraryProvider over a fake HTTP client: an ISBN finds the edition,
+    // its work and its authors; a title and author search needs the author to
+    // agree; the editor's search and artwork options; and the ids a probe
+    // alone gives, so a provider match and a file-only match meet.
+    FakeHttpClient http;
+    http.add("/isbn/9780552134620.json", 200, "application/json",
+             R"({"key":"/books/OL1M","title":"Guards! Guards!","authors":[{"key":"/authors/OL2A"}],"works":[{"key":"/works/OL3W"}],"publishers":["Corgi"],"publish_date":"1990","languages":[{"key":"/languages/eng"}],"covers":[123,-1],"isbn_13":["9780552134620"]})");
+    http.add("/authors/OL2A.json", 200, "application/json", R"({"key":"/authors/OL2A","name":"Terry Pratchett"})");
+    http.add("/books/OL1M.json", 200, "application/json",
+             R"({"key":"/books/OL1M","title":"Guards! Guards!","covers":[123]})");
+    http.add("/works/OL3W.json", 200, "application/json",
+             R"({"key":"/works/OL3W","title":"Guards! Guards!","description":{"type":"/type/text","value":"The dragon is back."},"authors":[{"author":{"key":"/authors/OL2A"}}],"covers":[456]})");
+    http.add("/search.json", 200, "application/json",
+             R"({"docs":[{"key":"/works/OL9W","title":"Mort","author_name":["Terry Pratchett"],"author_key":["OL2A"],"first_publish_year":1987,"cover_i":789},{"key":"/works/OL10W","title":"Mort","author_name":["Someone Else"],"first_publish_year":2001}]})");
+    http.add("/works/OL9W.json", 200, "application/json",
+             R"({"key":"/works/OL9W","title":"Mort","authors":[{"author":{"key":"/authors/OL2A"}}]})");
+    http.add("/works/OL10W.json", 200, "application/json", R"({"key":"/works/OL10W","title":"Mort"})");
+    CatalogueOpenLibraryConfig config;
+    OpenLibraryProvider provider(http, config, std::make_shared<ProviderGate>(std::chrono::milliseconds(0)));
+    CHECK(provider.supports(MediaProbeKind::book));
+    CHECK(!provider.supports(MediaProbeKind::track));
+
+    MediaProbe probe;
+    probe.kind = MediaProbeKind::book;
+    probe.media_id = "macha:guards";
+    probe.title = "Guards Guards";
+    probe.isbn = "9780552134620";
+    probe.book_series = {{"Discworld", 8.0}};
+    auto match = provider.lookup(probe);
+    REQUIRE(match.has_value());
+    REQUIRE(match->items.size() == 3);
+    const auto& author = match->items[0];
+    const auto& series = match->items[1];
+    const auto& book = match->items[2];
+    CHECK(author.id == "author:terry-pratchett");
+    CHECK(author.external_ids.at("openlibrary_author") == "OL2A");
+    CHECK(series.id == "series:discworld");
+    CHECK(book.id == "book:isbn:9780552134620");
+    CHECK(book.title == "Guards! Guards!");
+    CHECK(book.external_ids.at("openlibrary_edition") == "OL1M");
+    CHECK(book.external_ids.at("openlibrary_work") == "OL3W");
+    CHECK(book.external_ids.at("isbn13") == "9780552134620");
+    CHECK(book.publisher == std::optional<std::string>{"Corgi"});
+    CHECK(book.published == std::optional<std::string>{"1990"});
+    CHECK(book.language == std::optional<std::string>{"en"});
+    CHECK(book.year == std::optional<int32_t>{1990});
+    CHECK(book.synopsis == "The dragon is back.");
+    CHECK((book.author_ids == std::vector<std::string>{"author:terry-pratchett"}));
+    CHECK(book.media_ids == std::vector<std::string>{"macha:guards"});
+    REQUIRE(match->artwork.size() == 1);
+    CHECK(match->artwork.front().item_id == book.id);
+    CHECK(match->artwork.front().role == "cover");
+    CHECK(match->artwork.front().url == "https://covers.openlibrary.org/b/id/123-L.jpg");
+    CHECK(http.requests_containing("/isbn/") == 1);
+    (void)provider.lookup(probe);
+    CHECK(http.requests_containing("/isbn/") == 1);
+
+    // By title and author: the doc whose author agrees, not the first.
+    MediaProbe mort;
+    mort.kind = MediaProbeKind::book;
+    mort.media_id = "macha:mort";
+    mort.title = "Mort";
+    mort.authors = {"Terry Pratchett"};
+    auto found = provider.lookup(mort);
+    REQUIRE(found.has_value());
+    CHECK(found->items.back().id == "book:mort:terry-pratchett");
+    CHECK(found->items.back().external_ids.at("openlibrary_work") == "OL9W");
+    CHECK(!found->items.back().external_ids.contains("openlibrary_edition"));
+    CHECK(found->items.back().year == std::optional<int32_t>{1987});
+    REQUIRE(found->artwork.size() == 1);
+    CHECK(found->artwork.front().url == "https://covers.openlibrary.org/b/id/789-L.jpg");
+    MediaProbe stranger = mort;
+    stranger.authors = {"Nobody Known"};
+    CHECK(!provider.lookup(stranger).has_value());
+    MediaProbe alone;
+    alone.kind = MediaProbeKind::book;
+    alone.title = "Mort";
+    CHECK(!provider.lookup(alone).has_value());
+
+    ProviderSearchQuery query;
+    query.kind = "book";
+    query.text = "Mort";
+    query.artist = "Pratchett";
+    auto results = provider.search(query);
+    REQUIRE(results.size() == 2);
+    CHECK(results[0].ref == "openlibrary:work:OL9W");
+    CHECK(results[0].kind == "book");
+    CHECK(results[0].artist == "Terry Pratchett");
+    CHECK(results[0].year == std::optional<int32_t>{1987});
+    CHECK(results[0].catalogue_id == "book:mort:terry-pratchett");
+    auto options = provider.artwork_options("work", "OL3W", "cover", {});
+    REQUIRE(options.size() == 1);
+    CHECK(options.front().option_id == "456");
+    CHECK(options.front().preview_url == "https://covers.openlibrary.org/b/id/456-S.jpg");
+    CHECK(options.front().url == "https://covers.openlibrary.org/b/id/456-L.jpg");
+    auto edition_options = provider.artwork_options("edition", "OL1M", "cover", {});
+    REQUIRE(edition_options.size() == 1);
+    CHECK(edition_options.front().option_id == "123");
+
+    // The probe alone: the same ids without the provider; no author, no book.
+    auto local = book_match_from_probe(probe);
+    REQUIRE(!local.has_value());
+    probe.authors = {"Terry Pratchett"};
+    local = book_match_from_probe(probe);
+    REQUIRE(local.has_value());
+    CHECK(local->items.back().id == "book:isbn:9780552134620");
+    CHECK(local->items.front().id == "author:terry-pratchett");
+    CHECK(local->items.back().title == "Guards Guards");
+    CHECK(local->artwork.empty());
+    MediaProbe no_isbn = probe;
+    no_isbn.isbn.reset();
+    CHECK(book_match_from_probe(no_isbn)->items.back().id == "book:guards-guards:terry-pratchett");
+}
+
+MACHA_TEST("hydration_catalogue", test_mobi_books_in_title_author_folders_are_read_and_old_matches_replaced) {
+    // The layout that caught 0.92.0: /Books/<Title>/<Author>/<Title - Author>.mobi
+    // with cover.jpg beside it. The MOBI header gives the record and the
+    // cover; a path-only book reads its title from the file name the folders
+    // confirm and takes the folder's cover.jpg; Calibre's metadata.opf adds a
+    // series; a book catalogued under older rules is replaced by itself with
+    // its wrong author; a hand-edited one is left.
+    CatalogueNode node("books-mobi");
+    auto& fs = node.filesystem();
+    const auto fixture = [](const char* name) {
+        auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
+        std::ifstream input(path, std::ios::binary);
+        REQUIRE(input.good());
+        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        return Bytes(bytes.begin(), bytes.end());
+    };
+    for (const auto* dir : {"/Books", "/Books/A Hat Full of Sky", "/Books/A Hat Full of Sky/Terry Pratchett",
+                            "/Books/Eric", "/Books/Eric/Terry Pratchett", "/Books/Terry Pratchett",
+                            "/Books/Terry Pratchett/Mort (12)", "/Books/Hand", "/Books/Hand/Someone"})
+        node.mkdir(dir);
+    const std::string hat = "/Books/A Hat Full of Sky/Terry Pratchett/A Hat Full of Sky - Terry Pratchett.mobi";
+    const auto hat_id = node.write(hat, fixture("hat-full-of-sky.mobi"));
+    (void)node.write("/Books/A Hat Full of Sky/Terry Pratchett/cover.jpg", Bytes{0xFF, 0xD8, 0xFF, 1, 2});
+    const std::string eric = "/Books/Eric/Terry Pratchett/Eric - Terry Pratchett.pdf";
+    const auto eric_id = node.write(eric, pattern(4096, 3));
+    const Bytes eric_cover{0xFF, 0xD8, 0xFF, 9, 9, 9};
+    (void)node.write("/Books/Eric/Terry Pratchett/cover.jpg", eric_cover);
+    const std::string mort = "/Books/Terry Pratchett/Mort (12)/Mort - Terry Pratchett.pdf";
+    const auto mort_id = node.write(mort, pattern(4096, 4));
+    const std::string opf =
+        R"(<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0">)"
+        R"(<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">)"
+        R"(<dc:title>Mort</dc:title><dc:creator opf:role="aut">Terry Pratchett</dc:creator>)"
+        R"(<meta name="calibre:series" content="Discworld"/><meta name="calibre:series_index" content="4"/>)"
+        R"(</metadata></package>)";
+    (void)node.write("/Books/Terry Pratchett/Mort (12)/metadata.opf", Bytes(opf.begin(), opf.end()));
+    const std::string hand = "/Books/Hand/Someone/Hand - Someone.pdf";
+    const auto hand_id = node.write(hand, pattern(4096, 5));
+
+    // What 0.92.0 made of two of them: title and author swapped, no stamp.
+    // And a book the operator edited, which stays as it is.
+    {
+        CatalogueItem wrong_author;
+        wrong_author.id = "author:a-hat-full-of-sky";
+        wrong_author.kind = CatalogueKind::author;
+        wrong_author.title = "A Hat Full of Sky";
+        wrong_author.external_ids["macha_scanner"] = "1";
+        CatalogueItem wrong_book;
+        wrong_book.id = "book:terry-pratchett:a-hat-full-of-sky";
+        wrong_book.kind = CatalogueKind::book;
+        wrong_book.title = "Terry Pratchett";
+        wrong_book.author_ids = {wrong_author.id};
+        wrong_book.media_ids = {hat_id};
+        wrong_book.external_ids["macha_scanner"] = "1";
+        CatalogueItem eric_author = wrong_author;
+        eric_author.id = "author:eric";
+        eric_author.title = "Eric";
+        CatalogueItem eric_book = wrong_book;
+        eric_book.id = "book:terry-pratchett:eric";
+        eric_book.author_ids = {eric_author.id};
+        eric_book.media_ids = {eric_id};
+        CatalogueItem hand_author = wrong_author;
+        hand_author.id = "author:hand";
+        hand_author.title = "Hand";
+        CatalogueItem hand_book = wrong_book;
+        hand_book.id = "book:someone:hand";
+        hand_book.title = "Edited By Hand";
+        hand_book.author_ids = {hand_author.id};
+        hand_book.media_ids = {hand_id};
+        hand_book.external_ids["macha_metadata_locked"] = "1";
+        node.catalogue().upsert_many({wrong_author, wrong_book, eric_author, eric_book, hand_author, hand_book});
+    }
+
+    CatalogueScannerConfig config;
+    config.enabled = true;
+    config.movies.enabled = false;
+    config.tv.enabled = false;
+    config.music.enabled = false;
+    config.books.enabled = true;
+    config.books.openlibrary.enabled = false;
+    CatalogueScanner scanner(node.node(), node.node().metadata_server(), fs, node.catalogue(), node.hints(),
+                             config, std::make_unique<FakeHttpClient>());
+    CHECK(scanner.scan_once() == 3);
+
+    // The MOBI header: title, author, ISBN, publisher, date, and its own
+    // cover, not the folder's.
+    auto hat_book = node.catalogue().get("book:isbn:9780552551441");
+    REQUIRE(hat_book.has_value());
+    CHECK(hat_book->title == "A Hat Full of Sky");
+    CHECK((hat_book->author_ids == std::vector<std::string>{"author:terry-pratchett"}));
+    CHECK(hat_book->publisher == std::optional<std::string>{"Corgi"});
+    CHECK(hat_book->published == std::optional<std::string>{"2004-05-01"});
+    CHECK(hat_book->language == std::optional<std::string>{"en"});
+    CHECK(hat_book->media_ids == std::vector<std::string>{hat_id});
+    CHECK(hat_book->external_ids.at("macha_book_rules") == std::string(catalogue_book_rules));
+    REQUIRE(hat_book->artwork.size() == 1);
+    CHECK(hat_book->artwork.front().mime_type == "image/jpeg");
+    auto hat_cover = node.catalogue().artwork(hat_book->artwork.front().id);
+    REQUIRE(hat_cover.has_value());
+    CHECK(hat_cover->bytes.size() == 66);
+
+    // A path-only PDF: the file name the folders confirm, the folder's cover.
+    auto eric_book = node.catalogue().get("book:eric:terry-pratchett");
+    REQUIRE(eric_book.has_value());
+    CHECK(eric_book->title == "Eric");
+    CHECK((eric_book->author_ids == std::vector<std::string>{"author:terry-pratchett"}));
+    REQUIRE(eric_book->artwork.size() == 1);
+    CHECK(node.catalogue().artwork(eric_book->artwork.front().id)->bytes == eric_cover);
+
+    // Calibre's folder: the library id is not part of the title, and the
+    // sidecar gives the series.
+    auto mort_book = node.catalogue().get("book:mort:terry-pratchett");
+    REQUIRE(mort_book.has_value());
+    CHECK(mort_book->title == "Mort");
+    CHECK(mort_book->media_ids == std::vector<std::string>{mort_id});
+    REQUIRE(mort_book->series.size() == 1);
+    CHECK(mort_book->series.front().series_id == "series:discworld");
+    CHECK(mort_book->series.front().index == std::optional<double>{4});
+
+    // The swapped items are gone, their wrong authors with them; the edited
+    // book and its author stay.
+    CHECK(!node.catalogue().get("book:terry-pratchett:a-hat-full-of-sky").has_value());
+    CHECK(!node.catalogue().get("author:a-hat-full-of-sky").has_value());
+    CHECK(!node.catalogue().get("book:terry-pratchett:eric").has_value());
+    CHECK(!node.catalogue().get("author:eric").has_value());
+    REQUIRE(node.catalogue().get("book:someone:hand").has_value());
+    CHECK(node.catalogue().get("book:someone:hand")->title == "Edited By Hand");
+    CHECK(node.catalogue().get("author:hand").has_value());
+    CHECK(node.catalogue().list(CatalogueKind::book).size() == 4);
+    // Settled: nothing more to read.
+    CHECK(scanner.scan_once() == 0);
+}
+
+MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue_api) {
+    // The conversion routes over a stand-in mobitool: refused for a file
+    // that is not a book, an unknown format or the book's own format;
+    // started, polled and served with ranges; deleted; and conversion_unavailable
+    // where the node has none.
+    CatalogueNode node("books-convert");
+    auto& fs = node.filesystem();
+    node.mkdir("/Books");
+    node.mkdir("/Movies");
+    const auto book_id = node.write("/Books/Mort.mobi", pattern(2048, 6));
+    const auto movie_id = node.write("/Movies/film.mkv", pattern(2048, 7));
+    CatalogueItem author;
+    author.id = "author:x";
+    author.kind = CatalogueKind::author;
+    author.title = "X";
+    CatalogueItem book;
+    book.id = "book:mort";
+    book.kind = CatalogueKind::book;
+    book.title = "Mort";
+    book.author_ids = {author.id};
+    book.media_ids = {book_id};
+    CatalogueItem movie;
+    movie.id = "movie:film";
+    movie.kind = CatalogueKind::movie;
+    movie.title = "Film";
+    movie.media_ids = {movie_id};
+    node.catalogue().upsert_many({author, book, movie});
+
+    const auto converter = node.path() / "mobitool";
+    {
+        std::ofstream out(converter);
+        out << "#!/bin/sh\nname=$(basename \"$4\")\n{ printf 'EPUB:'; cat \"$4\"; } > \"$3/${name%.*}.epub\"\n";
+    }
+    std::filesystem::permissions(converter, std::filesystem::perms::owner_all);
+    BookConversionConfig conversion;
+    conversion.enabled = true;
+    conversion.mobitool = converter;
+    BookConversions conversions(conversion, node.path() / "conversion-state");
+    conversions.start();
+    const auto content = [&](const std::string& media_id) -> std::optional<MediaContentSource> {
+        auto found = fs.find_media(media_id);
+        if (!found) return std::nullopt;
+        auto handle = fs.open_read(found->second, found->first, false);
+        return MediaContentSource{found->second.size,
+                                  found->first.substr(found->first.find_last_of('/') + 1),
+                                  [handle](uint64_t offset, std::span<uint8_t> into) {
+                                      return handle->read(offset, into);
+                                  }};
+    };
+    CatalogueApi api(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(1), {}, {}, {}, content,
+                     &conversions);
+    CatalogueApi without(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(1), {}, {}, {}, content);
+    const auto call = [](CatalogueApi& on, std::string method, std::string path,
+                         std::map<std::string, std::string, std::less<>> query = {},
+                         std::map<std::string, std::string, std::less<>> headers = {}) {
+        auto request = api_request(std::move(method), std::move(path), {}, std::move(headers));
+        request.query = std::move(query);
+        return on.handle(request);
+    };
+    const auto base = "/api/v1/catalogue/media/" + book_id + "/conversions/";
+
+    auto unavailable = call(without, "PUT", base + "epub");
+    CHECK(unavailable.status == 503);
+    CHECK(api_body(unavailable).find("error")->find("code")->asString() == "conversion_unavailable");
+    CHECK(call(api, "PUT", base + "docx").status == 400);
+    CHECK(api_body(call(api, "PUT", base + "mobi")).find("error")->asString() == "bad_format");
+    auto not_book = call(api, "PUT", "/api/v1/catalogue/media/" + movie_id + "/conversions/epub");
+    CHECK(not_book.status == 422);
+    CHECK(api_body(not_book).find("error")->asString() == "not_a_book");
+    CHECK(call(api, "GET", base + "epub").status == 404);
+
+    auto started = call(api, "PUT", base + "epub");
+    REQUIRE((started.status == 202 || started.status == 200));
+    CHECK(api_body(started).find("format")->asString() == "epub");
+    CHECK(api_body(started).find("mime_type")->asString() == "application/epub+zip");
+    REQUIRE(wait_until([&] {
+        auto state = call(api, "GET", base + "epub");
+        return state.status == 200 && api_body(state).find("status")->asString() == "ready";
+    }, 10s));
+    auto state = api_body(call(api, "GET", base + "epub"));
+    CHECK(state.find("size")->asUInt64() == 2048 + 5);
+    CHECK(state.find("error_code")->isNull());
+    CHECK(call(api, "PUT", base + "epub").status == 200);
+
+    auto whole = call(api, "GET", base + "epub/content", {{"download", "1"}});
+    REQUIRE(whole.status == 200);
+    CHECK(whole.content_type == "application/epub+zip");
+    CHECK(whole.headers.at("Content-Disposition") == "attachment; filename=\"Mort.epub\"");
+    REQUIRE(whole.stream);
+    CHECK(whole.stream->size() == 2048 + 5);
+    auto head = call(api, "GET", base + "epub/content", {}, {{"range", "bytes=0-4"}});
+    REQUIRE(head.status == 206);
+    Bytes prefix(5);
+    REQUIRE(head.stream->read(0, prefix) == 5);
+    CHECK((prefix == Bytes{'E', 'P', 'U', 'B', ':'}));
+
+    CHECK(call(api, "DELETE", base + "epub").status == 204);
+    CHECK(call(api, "GET", base + "epub").status == 404);
+    CHECK(call(api, "GET", base + "epub/content").status == 404);
+    conversions.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_ingest_files_a_book_under_its_first_author) {
+    // A host EPUB is read for its record and planned under the books root.
+    CatalogueNode node("ingest-books", [](Config& config) {
+        config.catalogue.scanner.books.enabled = true;
+    });
+    auto& fs = node.filesystem();
+    node.mkdir("/Books");
+    const auto fixture = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / "guards.epub";
+    std::ifstream input(fixture, std::ios::binary);
+    REQUIRE(input.good());
+    std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const auto external = node.path() / "external-books";
+    (void)write_host_file(external / "guards.epub", Bytes(text.begin(), text.end()));
+    (void)write_host_file(external / "Neil Gaiman - Neverwhere.pdf", pattern(4096, 9));
+
+    auto host_candidates = probe_host_media_candidates(external / "guards.epub", text.size());
+    REQUIRE(!host_candidates.empty());
+    CHECK(host_candidates.front().probe.kind == MediaProbeKind::book);
+    CHECK(host_candidates.front().probe.title == "Guards! Guards!");
+    CHECK((host_candidates.front().probe.authors == std::vector<std::string>{"Terry Pratchett"}));
+
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = {external};
+    IngestManager ingest(node.node(), fs, node.hints(), config);
+    ingest.start();
+    const auto id = ingest.submit_path(external);
+    REQUIRE(wait_until([&] {
+        auto job = ingest.job(id);
+        return job && job->state == IngestJobState::cataloguing;
+    }, 10s));
+    auto job = ingest.job(id);
+    REQUIRE(job.has_value());
+    std::set<std::string> destinations;
+    for (const auto& file : job->files) destinations.insert(file.destination_path);
+    CHECK((destinations == std::set<std::string>{"/Books/Terry Pratchett/Guards! Guards!/guards.epub",
+                                                 "/Books/Neil Gaiman/Neverwhere/Neil Gaiman - Neverwhere.pdf"}));
+    CHECK(fs.getattr("/Books/Terry Pratchett/Guards! Guards!/guards.epub").size == text.size());
+    ingest.stop();
+}
+
+#endif
+
 } // namespace
+

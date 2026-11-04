@@ -549,6 +549,15 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
                             std::filesystem::path(discogs["token_file"].as<std::string>());
                 }
             }
+            if (auto books = providers["books"]) {
+                if (books["enabled"]) c.catalogue.scanner.books.enabled = books["enabled"].as<bool>();
+                parse_roots(books, c.catalogue.scanner.books.roots, "books");
+                if (auto ol = books["openlibrary"]) {
+                    if (ol["enabled"]) c.catalogue.scanner.books.openlibrary.enabled = ol["enabled"].as<bool>();
+                    if (ol["contact"]) c.catalogue.scanner.books.openlibrary.contact = ol["contact"].as<std::string>();
+                    if (ol["cover_size"]) c.catalogue.scanner.books.openlibrary.cover_size = ol["cover_size"].as<std::string>();
+                }
+            }
         }
     }
 }
@@ -579,6 +588,25 @@ void parse_ingest(const ConfigNode& root, Config& c) {
         c.ingest.source_roots.clear();
         for (const auto& value : roots.elements())
             c.ingest.source_roots.emplace_back(value.as<std::string>());
+    }
+}
+
+void parse_books(const ConfigNode& root, Config& c) {
+    auto books = root["books"];
+    if (!books) return;
+    if (books["enabled"]) c.books.enabled = books["enabled"].as<bool>();
+    if (auto conversion = books["conversion"]) {
+        auto& out = c.books.conversion;
+        if (conversion["enabled"]) out.enabled = conversion["enabled"].as<bool>();
+        if (conversion["mobitool"]) out.mobitool = conversion["mobitool"].as<std::string>();
+        if (conversion["cache_path"]) out.cache_path = conversion["cache_path"].as<std::string>();
+        if (conversion["cache_limit"]) out.cache_limit = yaml_size(conversion["cache_limit"]);
+        if (conversion["timeout_ms"])
+            out.timeout = milliseconds(conversion["timeout_ms"], "books.conversion.timeout_ms");
+        if (conversion["max_concurrent"])
+            out.max_concurrent = conversion["max_concurrent"].as<size_t>();
+        if (conversion["max_source_bytes"])
+            out.max_source_bytes = yaml_size(conversion["max_source_bytes"]);
     }
 }
 
@@ -901,6 +929,19 @@ Config load_yaml_config(const std::filesystem::path& path) {
     parse_catalogue(root, c);
     parse_ingest(root, c);
     parse_torrent(root, c);
+    parse_books(root, c);
+    // books.enabled is the one switch for book support: the books scan
+    // provider follows it unless its own block turns it off, and never runs
+    // without it.
+    {
+        bool stated = false;
+        if (auto catalogue = root["catalogue"])
+            if (auto scanner = catalogue["scanner"])
+                if (auto providers = scanner["providers"])
+                    if (auto books = providers["books"]) stated = static_cast<bool>(books["enabled"]);
+        if (!c.books.enabled) c.catalogue.scanner.books.enabled = false;
+        else if (!stated) c.catalogue.scanner.books.enabled = true;
+    }
     parse_streaming(root, c);
     parse_hydration(root, c);
     parse_runtime(root, c);

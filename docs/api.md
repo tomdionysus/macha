@@ -34,8 +34,8 @@ twice. Cursors are opaque. Clients sort for display themselves.
 
 ## Providers
 
-`503 provider_unavailable` means a metadata provider (TMDB, MusicBrainz)
-could not answer. When the node knows how long until it may, the error
-carries `retry_after_ms` and the response a `Retry-After` header. A
-MusicBrainz rate-limit answer is waited out once by the editor's request
-before it is refused.
+`503 provider_unavailable` means a metadata provider (TMDB, MusicBrainz,
+Open Library) could not answer. When the node knows how long until it may,
+the error carries `retry_after_ms` and the response a `Retry-After` header.
+A MusicBrainz or Open Library rate-limit answer is waited out once by the
+editor's request before it is refused.
