@@ -15,6 +15,20 @@ nothing, is now a lookup rather than a materialisation of the head and its
 parents; parents are materialised only for a record without a write floor,
 whose policy check reads them.
 
+Every metadata mutation is an exact delta applied to the tree; the
+whole-snapshot mutation is gone, and so is `macha-namespace-migrate`, which
+re-rooted an inline namespace by hand.
+
+Two defects of tree-backed heads are fixed. A tombstone made stale by the
+same content being written again was erased only from the inline list, so
+in a batch it stayed: every maintenance pass committed another empty
+mutation, and the generation churn kept the CONTROL and DATA collectors
+shut. The batch holding it is now dropped and the rest of it written again
+at its own time. And the availability path table followed the tree while
+what was out of reach changed, so a file whose only copy went out of reach
+kept reporting itself complete; it follows the tree now only when that
+answer is unchanged.
+
 ## 0.91.5: an import waits for its disk
 
 An ingest job whose bytes no node present can take, because the DATA disk

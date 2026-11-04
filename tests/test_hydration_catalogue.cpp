@@ -3873,15 +3873,14 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     REQUIRE(initial2.has_value());
 
     auto base = n1.metadata_replica().current();
-    auto changed = decode_snapshot(base.payload);
-    auto root = changed.entries.find("/");
-    REQUIRE(root != changed.entries.end());
-    ++root->second.version;
+    // The same tree under the next generation: what changed does not matter here.
+    const auto same = decode_snapshot(base.payload);
+    REQUIRE(same.namespace_root.has_value());
 
     MetadataRecord next;
     next.generation = base.generation + 1;
     next.previous = base.hash;
-    next.payload = encode_snapshot(changed);
+    next.payload = encode_snapshot_v14(same);
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
     REQUIRE(n1.metadata_replica().store_commit(next));
     REQUIRE(n1.metadata_replica().accept_commit(
@@ -4263,14 +4262,29 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
         const auto staged_id = object_id(staged);
         REQUIRE(control.put(staged_id, staged));
         std::this_thread::sleep_for(5ms);
-        const std::vector<ObjectId> no_live;
-        for (int i = 0; i < 4; ++i) (void)node.catalogue().control_gc_step(no_live, 0ms, 64);
+        // The namespace tree is live CONTROL too: maintenance's inventory names
+        // its nodes beside the catalogue's.
+        const auto tree_nodes = [&] {
+            std::vector<ObjectId> nodes;
+            const auto reader = node.filesystem().namespace_nodes();
+            for_each_namespace_entry(node.metadata().snapshot(), &reader,
+                                     [](const std::string&, const FsEntry&) {}, nodes);
+            std::sort(nodes.begin(), nodes.end());
+            nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+            return nodes;
+        };
+        const auto no_catalogue = tree_nodes();
+        for (int i = 0; i < 4; ++i) (void)node.catalogue().control_gc_step(no_catalogue, 0ms, 64);
         CHECK(control.has(staged_id));
         (void)node.upsert("movie:control-publication-fence", CatalogueKind::movie, "Control Publication Fence");
         std::this_thread::sleep_for(5ms);
         auto maintenance = maintenance_inventory(node.catalogue());
         REQUIRE(maintenance.complete);
         std::vector<ObjectId> live(maintenance.control_live.begin(), maintenance.control_live.end());
+        for (const auto& id : tree_nodes())
+            live.push_back(id);
+        std::sort(live.begin(), live.end());
+        live.erase(std::unique(live.begin(), live.end()), live.end());
         for (int i = 0; i < 4 && control.has(staged_id); ++i)
             (void)node.catalogue().control_gc_step(live, 0ms, 64);
         CHECK(!control.has(staged_id));

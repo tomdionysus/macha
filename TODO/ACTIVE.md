@@ -3,6 +3,20 @@
 Last updated: 2026-10-14, on `develop`. node-f runs 0.91.0; node-c is out of
 the cluster (compromised 2026-10-13, last ran 0.90.93; ssh refuses the key).
 
+## Macha should be reloadable (operator, 2026-11-03)
+
+- **Every setting reloads.** SIGHUP refuses `dht.replicas` and
+  `dht.metadata_write_copies` ("changes require a restart"), and other keys
+  (spool and journal paths, torrent listen address, API listen) apply only
+  on restart. A config change must apply by reload. The systemd unit has
+  no `ExecReload`, so `systemctl reload macha` fails; add one that sends
+  HUP.
+- **Disagreeing policy must not loop.** With `dht.replicas` 1 on live-a
+  and 2 on live-b, each node committed its own value back ~150 times a
+  minute (`metadata policy transition committed`, 760 commits in 5 min)
+  until both configs matched. Policy disagreement needs one answer that
+  every node accepts, not a commit war.
+
 ## Paused at 0.91.0 (2026-10-14): resume here
 
 Operator: at least two nodes are needed to continue development; work
