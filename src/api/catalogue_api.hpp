@@ -12,9 +12,25 @@
 
 namespace macha {
 
+// A stored file this node can read, served as it is.
+struct MediaContentSource {
+    uint64_t size{};
+    // The file's name, for the download's filename and its type.
+    std::string name;
+    // Reads at an offset; viewer class.
+    std::function<size_t(uint64_t, std::span<uint8_t>)> read;
+};
+
 class CatalogueApi {
+  public:
+    using MediaContent = std::function<std::optional<MediaContentSource>(const std::string&)>;
+
+  private:
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
+    // A media id's file for the content route; absent in fixtures without a
+    // filesystem.
+    MediaContent media_content_;
     std::function<size_t(const std::vector<std::string>&)> request_media_profiles_;
     // Resolves a media profile now, at foreground priority, and persists it:
     // clients need the facts, so "no profile yet" is never an answer. Absent only
@@ -32,6 +48,9 @@ class CatalogueApi {
     // The per-item table for this catalogue snapshot and the last survey.
     std::shared_ptr<const ItemAvailabilityTable>
     item_availability(const std::shared_ptr<const CatalogueView>&);
+    // Whether the media is a book's file, which has no playback profile.
+    bool book_media(const std::string& media_id);
+    HttpResponse media_content(const HttpRequest&, const std::string& media_id);
   public:
     using AvailabilitySource = std::function<std::shared_ptr<const AvailabilitySnapshot>()>;
     CatalogueApi(
@@ -41,8 +60,8 @@ class CatalogueApi {
         std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24 * 30),
         std::function<std::optional<uint64_t>(const std::string&)> media_size = {},
         std::function<std::optional<Bytes>(const std::string&)> keyframe_index = {},
-        AvailabilitySource availability = {})
-        : catalogue_(catalogue), hints_(hints),
+        AvailabilitySource availability = {}, MediaContent media_content = {})
+        : catalogue_(catalogue), hints_(hints), media_content_(std::move(media_content)),
           request_media_profiles_(std::move(request_media_profiles)),
           resolve_media_profile_(std::move(resolve_media_profile)),
           artwork_capability_ttl_(artwork_capability_ttl), media_size_(std::move(media_size)),

@@ -90,14 +90,15 @@ Every catalogue item, wherever one is returned (`GET
 | `availability` | the same four codes |
 | `availability_members` | for a set, `{total, complete, partial, unavailable, unknown}`: the items beneath it that have files, by code; `null` for an item that is not a set |
 
-- **An item with files** (a movie, an episode, a track) takes the best of
-  its files, since any one of them can be played: `complete` if one is
-  complete, otherwise `partial` if one is partial, otherwise `unknown` if
-  one is unknown, otherwise `unavailable`.
-- **A set** (a show, a season, an artist, an album) is judged over its
-  members, at any depth: `complete` if every member is, `unavailable` if
-  every member is, `unknown` if some are unknown and none is short,
-  otherwise `partial`. A set with no members is `unknown`.
+- **An item with files** (a movie, an episode, a track, a book) takes the
+  best of its files, since any one of them can be played or read:
+  `complete` if one is complete, otherwise `partial` if one is partial,
+  otherwise `unknown` if one is unknown, otherwise `unavailable`.
+- **A set** (a show, a season, an artist, an album; an author or a series,
+  whose members are the books naming them) is judged over its members, at
+  any depth: `complete` if every member is, `unavailable` if every member
+  is, `unknown` if some are unknown and none is short, otherwise `partial`.
+  A set with no members is `unknown`.
 
 These come from the last survey and the catalogue as it stands, with one
 lookup per item; a response never waits for either.
