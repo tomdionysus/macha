@@ -362,7 +362,10 @@ void StorageServer::bind_routes() {
               // presence, not a re-read, since a quantum commit re-claims every
               // extent of its file inside the writer's metadata mutation. The
               // bytes were verified when put and on every read; scrub finds later
-              // corruption. No DATA admission: there is no read buffer.
+              // corruption. No DATA admission: there is no read buffer. Under
+              // the claim guard, so no delete removes an object between its
+              // presence check and the claim.
+              const auto guard = claims_.guard(ids);
               for (const auto& id : ids) {
                   const bool present = object_class == RetentionClass::data
                                            ? local_.has(id)
@@ -379,6 +382,8 @@ void StorageServer::bind_routes() {
               Reader reader(request.payload);
               ObjectId id{reader.fixed<32>()};
               reader.finish();
+              // The claim check and the delete under one guard.
+              const auto guard = claims_.guard(id);
               if (claims_.retained(RetentionClass::data, id))
                   return error_reply(409, "claimed", "object has an active retention claim");
               auto resource = data_resources_.try_acquire(

@@ -450,25 +450,7 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
 
     if (mode_ == LocalStoreMode::ephemeral) {
         durability_domain_.reset();
-        scan_thread_ = std::jthread([this](std::stop_token stop) {
-            run_supervised_once("local-store-scan", [this, stop] {
-                try {
-                    scan(stop);
-                } catch (const std::exception& error) {
-                    scan_failed_.store(true, std::memory_order_release);
-                    accounting_cv_.notify_all();
-                    Log::warn("storage accounting scan failed path=" + root_.string() +
-                              " error=" + error.what());
-                    throw;
-                } catch (...) {
-                    scan_failed_.store(true, std::memory_order_release);
-                    accounting_cv_.notify_all();
-                    Log::warn("storage accounting scan failed path=" + root_.string() +
-                              " error=<unknown>");
-                    throw;
-                }
-            });
-        });
+        start_scan();
         return;
     }
 
@@ -477,6 +459,13 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
     accounting_fd_ = ::open(accounting_path_.c_str(), O_RDWR | O_CREAT, 0600);
     if (accounting_fd_ < 0)
         throw std::runtime_error("cannot open accounting state: " + std::string(strerror(errno)));
+
+    // The ledger exists before any walk starts: the walk records into it.
+    if (!options.ledger_dir.empty() && mode_ == LocalStoreMode::authoritative) {
+        ObjectTrie::Options ledger_options;
+        ledger_options.cache_bytes = options.ledger_cache_bytes;
+        ledger_ = std::make_unique<HeldLedger>(options.ledger_dir, key_, ledger_options);
+    }
 
     // Pack indexes are rebuilt from the append-only records at every start. A
     // clean checkpoint is trusted with packs too: ensure_accounting_dirty()
@@ -498,30 +487,7 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
                       " used=" + std::to_string(used_.load(std::memory_order_relaxed)) +
                       " (dirty checkpoint; admitting writes while the scan reconciles)");
         }
-        scan_thread_ = std::jthread([this](std::stop_token stop) {
-            run_supervised_once("local-store-scan", [this, stop] {
-                try {
-                    scan(stop);
-                } catch (const std::exception& error) {
-                    scan_failed_.store(true, std::memory_order_release);
-                    accounting_cv_.notify_all();
-                    Log::warn("storage accounting scan failed path=" + root_.string() +
-                              " error=" + error.what());
-                    throw;
-                } catch (...) {
-                    scan_failed_.store(true, std::memory_order_release);
-                    accounting_cv_.notify_all();
-                    Log::warn("storage accounting scan failed path=" + root_.string() +
-                              " error=<unknown>");
-                    throw;
-                }
-            });
-        });
-    }
-    if (!options.ledger_dir.empty() && mode_ == LocalStoreMode::authoritative) {
-        ObjectTrie::Options ledger_options;
-        ledger_options.cache_bytes = options.ledger_cache_bytes;
-        ledger_ = std::make_unique<HeldLedger>(options.ledger_dir, key_, ledger_options);
+        start_scan();
     }
     if (ledger_ && ledger_->seeded()) {
         // The ledger knows what is held: nothing to walk. The packs were
@@ -541,6 +507,36 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
     presence_thread_ = std::jthread([this](std::stop_token stop) {
         run_supervised_once("local-store-presence", [this, stop] { warm_presence_index(stop); });
     });
+}
+
+void LocalStore::start_scan() {
+    scan_thread_ = std::jthread([this](std::stop_token stop) {
+        run_supervised_once("local-store-scan", [this, stop] {
+            try {
+                scan(stop);
+            } catch (const std::exception& error) {
+                mark_scan_failed();
+                Log::warn("storage accounting scan failed path=" + root_.string() +
+                          " error=" + error.what());
+                throw;
+            } catch (...) {
+                mark_scan_failed();
+                Log::warn("storage accounting scan failed path=" + root_.string() +
+                          " error=<unknown>");
+                throw;
+            }
+        });
+    });
+}
+
+void LocalStore::mark_scan_failed() {
+    {
+        // Under the mutex the waiters check it under, so no waiter decides
+        // to sleep between the store and the wake.
+        Lock lock(m_);
+        scan_failed_.store(true, std::memory_order_release);
+    }
+    accounting_cv_.notify_all();
 }
 
 HeldView LocalStore::held_view() const {
@@ -1186,9 +1182,9 @@ bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> 
 bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                           StoreWriteDurability durability, uint64_t* deferred_generation) {
     if (object_id(data) != id) throw std::runtime_error("object hash mismatch");
+    await_accounting();
     ObjectLock object_guard(object_mutex(id));
     Lock lock(m_);
-    wait_for_accounting(lock);
 
     bool pack = false;
     if (packed_.contains(id)) {
@@ -1504,9 +1500,9 @@ uint64_t LocalStore::durability_domain_id() const noexcept {
 bool LocalStore::remove(const ObjectId& id) {
     bool removed = false;
     {
+        await_accounting();
         ObjectLock object_guard(object_mutex(id));
         Lock lock(m_);
-        wait_for_accounting(lock);
         removed = remove_locked(id, lock);
     }
     flush_ledger();
@@ -1515,9 +1511,9 @@ bool LocalStore::remove(const ObjectId& id) {
 
 bool LocalStore::remove_if_older_than(const ObjectId& id, std::chrono::milliseconds age) {
     const bool removed = [&] {
+        await_accounting();
         ObjectLock object_guard(object_mutex(id));
         Lock lock(m_);
-        wait_for_accounting(lock);
         if (auto found = packed_.find(id); found != packed_.end()) {
             const auto now = unix_ms();
             if (now < found->second.touched_unix_ms ||
@@ -1873,16 +1869,25 @@ void LocalStore::wait_for_accounting(Lock& lock) const {
     (void)wait_for_accounting(lock, {});
 }
 
+void LocalStore::await_accounting() const {
+    // Before the object's lock, never under it: the scan takes object locks
+    // as it walks, so a writer waiting for the scan while holding one waits
+    // for ever once the scan reaches that object.
+    Lock lock(m_);
+    wait_for_accounting(lock);
+}
+
 bool LocalStore::wait_for_accounting(Lock& lock, std::stop_token stop, bool exact) const {
     // Ordinary puts/removes proceed on a checkpoint estimate; only callers
     // that need the reconciled figure (compaction) wait for the walk.
     if (!exact && accounting_estimate_.load(std::memory_order_acquire) &&
         !scan_failed_.load(std::memory_order_acquire))
         return true;
-    std::stop_callback wake_waiter(stop, [this] { accounting_cv_.notify_all(); });
-    accounting_cv_.wait(lock.native(), [this, stop] {
+    // The flags are set under m_ and the stop is registered by the wait
+    // itself, so neither wake can fall between the check and the sleep.
+    (void)accounting_cv_.wait(lock.native(), stop, [this] {
         return scan_complete_.load(std::memory_order_acquire) ||
-               scan_failed_.load(std::memory_order_acquire) || stop.stop_requested();
+               scan_failed_.load(std::memory_order_acquire);
     });
     if (stop.stop_requested()) return false;
     if (scan_failed_.load(std::memory_order_acquire))
@@ -2084,8 +2089,7 @@ void LocalStore::scan(std::stop_token stop) {
         if (error) break;
     }
     if (error) {
-        scan_failed_.store(true, std::memory_order_release);
-        accounting_cv_.notify_all();
+        mark_scan_failed();
         Log::warn("storage accounting scan failed path=" + root_.string() +
                   " error=" + error.message());
         return;
@@ -2099,8 +2103,7 @@ void LocalStore::scan(std::stop_token stop) {
                 last_mutation_generation_ = std::max(last_mutation_generation_, baseline);
             }
         } catch (const std::exception& ex) {
-            scan_failed_.store(true, std::memory_order_release);
-            accounting_cv_.notify_all();
+            mark_scan_failed();
             Log::warn("storage accounting baseline durability failed path=" + root_.string() +
                       " error=" + ex.what());
             return;
@@ -2143,8 +2146,10 @@ void LocalStore::scan(std::stop_token stop) {
             if (failure)
                 std::rethrow_exception(failure);
         }
+        // Under m_, as the waiters check it: a waiter that saw it clear
+        // is blocked in its wait before this store, so the wake reaches it.
+        scan_complete_.store(true, std::memory_order_release);
     }
-    scan_complete_.store(true, std::memory_order_release);
     accounting_cv_.notify_all();
     flush_ledger();
     Log::debug("storage accounting scan complete path=" + root_.string() +

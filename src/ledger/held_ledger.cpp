@@ -81,6 +81,10 @@ void HeldLedger::flush() {
     // Unseeded, nothing reads the record: changes stay queued for the seed.
     if (!seeded())
         return;
+    install_queued();
+}
+
+void HeldLedger::install_queued() {
     std::vector<ObjectTrie::Change> changes;
     {
         Lock lock(queue_mutex_);
@@ -129,14 +133,18 @@ void HeldLedger::seed(const std::function<std::vector<ObjectId>()>& snapshot) {
         trie_->replace_all(std::move(records));
         removals_.fetch_add(1, std::memory_order_acq_rel);
     }
-    durable_replace_file(dir_ / "seeded", "1\n");
     {
-        // Under the flush lock, so a flush either left everything queued or
-        // applies it over the seed.
+        // Under the flush lock, so a write's flush either left its change
+        // queued or finds it installed. What was queued during the build is
+        // journalled and installed before the record is marked seeded, on
+        // disk and in memory: a reader that finds it seeded finds every
+        // change a returned write made, and a restart that finds the marker
+        // finds those changes in the journal.
         Lock flushing(flush_mutex_);
+        install_queued();
+        durable_replace_file(dir_ / "seeded", "1\n");
         seeded_.store(true, std::memory_order_release);
     }
-    flush();
 }
 
 HeldLedger::View HeldLedger::view() const {
