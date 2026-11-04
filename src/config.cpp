@@ -549,6 +549,15 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
                             std::filesystem::path(discogs["token_file"].as<std::string>());
                 }
             }
+            if (auto books = providers["books"]) {
+                if (books["enabled"]) c.catalogue.scanner.books.enabled = books["enabled"].as<bool>();
+                parse_roots(books, c.catalogue.scanner.books.roots, "books");
+                if (auto ol = books["openlibrary"]) {
+                    if (ol["enabled"]) c.catalogue.scanner.books.openlibrary.enabled = ol["enabled"].as<bool>();
+                    if (ol["contact"]) c.catalogue.scanner.books.openlibrary.contact = ol["contact"].as<std::string>();
+                    if (ol["cover_size"]) c.catalogue.scanner.books.openlibrary.cover_size = ol["cover_size"].as<std::string>();
+                }
+            }
         }
     }
 }

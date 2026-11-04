@@ -294,7 +294,13 @@ on control threads no longer grow with deletes. Left:
 - **Placement API asks**: the target `node_id` and a viewer-facing detail on
   `placement_failed`; the peer's own refusal text on a forwarded add; an
   optional node `name` (operator's call).
-- **Movie sets** and **ebooks**: later; each needs a proposal first.
+- **Movie sets**: later; needs a proposal first.
+- **Ebooks**: stages 1 and 2 of `TODO/2026-11-04-ebooks-design.md` are
+  built on `feature/ebooks` (0.92.0): kinds, the EPUB reader, the books
+  provider, Open Library, the content route, the editor. Stage 3, the
+  per-user media state, follows the tree-native merge; OPDS is not started.
+  **Audiobooks** (operator, 2026-11-04): a separate media class of their
+  own, designed after ebooks; they share the per-user media state.
 - Measured small, not now: ingest and data publications commit one
   operation at a time (about 100 ms each); the hint store rewrites its file
   per change (266 KB with 409 hints); the head record's largest part is now

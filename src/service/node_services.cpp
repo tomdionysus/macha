@@ -90,7 +90,20 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
               return media_information_.keyframe_index(media_id,
                                                        Clock::now() + std::chrono::seconds(30));
           },
-          [this] { return availability_.snapshot(); }),
+          [this] { return availability_.snapshot(); },
+          [this](const std::string& media_id) -> std::optional<MediaContentSource> {
+              auto found = filesystem_.find_media(media_id);
+              if (!found)
+                  return std::nullopt;
+              const auto& [path, entry] = *found;
+              auto name = path.substr(path.find_last_of('/') + 1);
+              // One handle per response body; its reads are a viewer's.
+              auto handle = filesystem_.open_read(entry, path, false, FrameType::foreground);
+              return MediaContentSource{entry.size, std::move(name),
+                                        [handle](uint64_t offset, std::span<uint8_t> into) {
+                                            return handle->read(offset, into);
+                                        }};
+          }),
       manage_api_(node_, metadata_, filesystem_, catalogue_, catalogue_hints_, scanner_,
                   &cluster_unmatched_),
       streaming_(

@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.91.5 LANGUAGES CXX)
+project(macha VERSION 0.92.0 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -364,6 +364,7 @@ set(MACHA_CORE_SOURCES
     src/playback/playback.cpp
     src/catalogue/media_information.cpp
     src/catalogue/catalogue.cpp
+    src/catalogue/epub_metadata.cpp
     src/catalogue/catalogue_hints.cpp
     src/catalogue/catalogue_installer.cpp
     src/catalogue/cluster_unmatched.cpp
@@ -605,6 +606,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_rpc_cluster.cpp
         tests/test_filesystem_fuse.cpp
         tests/test_hydration_catalogue.cpp
+        tests/test_epub_metadata.cpp
         tests/test_media_playback.cpp
         tests/test_session.cpp
         tests/test_users.cpp
