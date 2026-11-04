@@ -526,11 +526,13 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         next.paths = previous->paths;
         next.by_hash = previous->by_hash;
     } else {
-        // Only the tree moved: with the same holdings everywhere, no extent of
-        // an unchanged file has changed hands, so the table follows the tree.
+        // Only the tree moved: with the same holdings everywhere and the same
+        // answer to what is out of reach, no unchanged file's facts can
+        // differ, so the table follows the tree.
         if (surveyed_ && root && table_root_ && view.identity.hash == table_holdings_ &&
             surveyed_roots_.size() == hosts.size() && surveyed_roots_ == table_roots_ &&
-            previous->survey.unknown.empty() && next.survey.unknown.empty()) {
+            previous->survey.unknown.empty() && next.survey.unknown.empty() &&
+            previous->survey.unavailable == next.survey.unavailable) {
             update_path_table(next, *previous, diff_namespace_trees(*table_root_, *root, stored),
                               *head.snapshot, stored, held);
             table = "followed";

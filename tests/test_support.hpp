@@ -9,6 +9,8 @@
 #include "ledger/retention_ledger.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "metadata/metadata_manager.hpp"
+#include "metadata/namespace_control_store.hpp"
+#include "metadata/namespace_tree.hpp"
 #include "service/service.hpp"
 #include "supervised.hpp"
 #include "test_framework.hpp"
@@ -427,6 +429,23 @@ inline std::unique_ptr<DistributedStore> distributed_store_for(BareNode& node) {
     return std::make_unique<DistributedStore>(node, node.local_state(), node.resources.activity,
                                               node.resources.data, node.resources.memory,
                                               node.resources.events);
+}
+
+// `snapshot` with `delta` applied to its namespace tree, the new nodes written
+// to `control`: a head built outside any manager, such as a
+// sibling or another author's history.
+inline MetadataSnapshot with_namespace_delta(MetadataSnapshot snapshot, LocalStore& control,
+                                             DistributedStore& store, const MetadataDelta& delta) {
+    auto nodes = ControlNamespaceNodeStore::for_commit(control, store);
+    snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root, nodes, delta);
+    return snapshot;
+}
+
+// Whether `snapshot`'s namespace holds `path`, read through `control`.
+inline bool namespace_holds(const MetadataSnapshot& snapshot, LocalStore& control,
+                            DistributedStore& store, std::string_view path) {
+    const auto nodes = ControlNamespaceNodeStore::for_reading(control, store);
+    return namespace_entry(snapshot, &nodes, path).has_value();
 }
 
 class TestNode {

@@ -1351,7 +1351,18 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
             return false;
         }
     }, 10s));
+    // The namespace tree's nodes are CONTROL objects too, but namespace repair
+    // restores them, not the catalogue's.
+    std::vector<ObjectId> tree;
+    {
+        const auto reader = ControlNamespaceNodeStore::for_reading(a.node().control_store(), a.store());
+        for_each_namespace_entry(a.metadata().snapshot(), &reader,
+                                 [](const std::string&, const FsEntry&) {}, tree);
+    }
     auto referenced = a.node().control_store().list();
+    std::erase_if(referenced, [&](const ObjectId& id) {
+        return std::find(tree.begin(), tree.end(), id) != tree.end();
+    });
     REQUIRE(referenced.size() >= 2);
     REQUIRE(std::find(referenced.begin(), referenced.end(), root) != referenced.end());
 

@@ -2018,7 +2018,8 @@ MACHA_TEST("invariants", test_catalogue_keeps_what_the_namespace_holds) {
 
         fs.rename("/Movies/A/live.mkv", "/Movies/B/live.mkv");
         const auto moved = fs.local_snapshot_view();
-        REQUIRE(moved.snapshot->entries.contains("/Movies/B/live.mkv"));
+        auto moved_nodes = fs.namespace_nodes();
+        REQUIRE(namespace_entry(*moved.snapshot, &moved_nodes, "/Movies/B/live.mkv").has_value());
         CHECK(metadata_namespace_signature(*moved.snapshot) != scanned_signature);
         catalogue.reconcile_scanner({}, active, true, scanned_signature);
         CHECK(catalogue.get(item.id)->media_ids == std::vector<std::string>{file_media_id(file)});

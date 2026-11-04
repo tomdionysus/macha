@@ -3550,19 +3550,21 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
 
     const auto base = s1.local_state().replica().committed();
     auto make_sibling = [&](Service& service, const std::string& path) {
-        auto snapshot = decode_snapshot(base.payload);
         FsEntry entry;
         entry.type = EntryType::directory;
         entry.mode = 0755;
         entry.uid = getuid();
         entry.gid = getgid();
-        snapshot.entries[path] = entry;
+        MetadataDelta delta;
+        delta.upsert_entries[path] = entry;
+        auto snapshot = macha::test_support::with_namespace_delta(
+            decode_snapshot(base.payload), service.local_state().control(), service.store(), delta);
         ++snapshot.mutation_sequences[service.node().node_id()];
 
         MetadataRecord sibling;
         sibling.generation = base.generation + 1;
         sibling.previous = base.hash;
-        sibling.payload = encode_snapshot(snapshot);
+        sibling.payload = encode_snapshot_v14(snapshot);
         sibling.hash = metadata_hash(sibling.generation, sibling.previous, sibling.payload);
         REQUIRE(service.local_state().replica().store_commit(sibling));
         MetadataAcceptance acceptance;
@@ -3640,7 +3642,9 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
         },
         10s));
 
-    // The first write after a reconciliation is a compact delta over the merge commit.
+    // The first write after a reconciliation extends the merge commit and does
+    // not carry its topology. Under a tree either body is compact; the store
+    // keeps the smaller.
     auto merge_heads = s1.local_state().replica().accepted_heads();
     REQUIRE(merge_heads.size() == 1);
     const auto merge_head = merge_heads.front();
@@ -3655,7 +3659,6 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     REQUIRE(after_entry.has_value());
     CHECK(after_entry->previous == merge_head.hash);
     CHECK(after_entry->merge_parents.empty());
-    CHECK(after_entry->body == MetadataHistoryEntry::Body::delta);
 
     s2.stop();
     s1.stop();
@@ -3689,19 +3692,21 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
 
     // Another author's namespace, with nothing of this node's in its clock.
     const MetadataDot theirs{random_node_id(), 9};
-    auto foreign_snapshot = decode_snapshot(genesis_metadata().payload);
-    foreign_snapshot.metadata_write_replicas_required = 1;
-    foreign_snapshot.extent_size = decode_snapshot(mine.payload).extent_size;
-    foreign_snapshot.data_replication = decode_snapshot(mine.payload).data_replication;
-    foreign_snapshot.legacy_clock.emplace();
-    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
+    // Its namespace is this node's with "/mine" gone and "/theirs" added.
     auto made = directory();
     stamp_entry_provenance(made, "/theirs", nullptr, theirs);
-    foreign_snapshot.entries["/theirs"] = made;
+    MetadataDelta foreign_delta;
+    foreign_delta.erase_entries.push_back("/mine");
+    foreign_delta.upsert_entries["/theirs"] = made;
+    auto foreign_snapshot = macha::test_support::with_namespace_delta(
+        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store, foreign_delta);
+    foreign_snapshot.mutation_sequences.clear();
+    foreign_snapshot.legacy_clock.emplace();
+    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
     MetadataRecord foreign;
     foreign.generation = mine.generation + 7;
     foreign.previous = sha256(pattern(64, 201));
-    foreign.payload = encode_snapshot(foreign_snapshot);
+    foreign.payload = encode_snapshot_v14(foreign_snapshot);
     foreign.hash = metadata_hash(foreign.generation, foreign.previous, foreign.payload);
     REQUIRE(node.metadata_replica().store_commit(foreign));
     MetadataAcceptance acceptance;
@@ -3712,16 +3717,19 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     REQUIRE(node.metadata_server().accept_commit(acceptance));
     REQUIRE(node.metadata_replica().accepted_heads().size() == 2);
 
+    const auto holds = [&](const MetadataSnapshot& snapshot, std::string_view path) {
+        return macha::test_support::namespace_holds(snapshot, node.local_state().control(), *metadata_store, path);
+    };
     const auto merged = metadata.snapshot();
-    CHECK(merged.entries.contains("/mine"));
-    CHECK(merged.entries.contains("/theirs"));
+    CHECK(holds(merged, "/mine"));
+    CHECK(holds(merged, "/theirs"));
     CHECK(merged.mutation_sequences.at(theirs.author) == theirs.sequence);
     CHECK(node.metadata_replica().accepted_heads().size() == 1);
     CHECK(metadata.head_standing().set_aside == 0);
 
     metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/more"] = directory(); });
-    CHECK(metadata.snapshot().entries.contains("/theirs"));
-    CHECK(metadata.snapshot().entries.contains("/more"));
+    CHECK(holds(metadata.snapshot(), "/theirs"));
+    CHECK(holds(metadata.snapshot(), "/more"));
     node.stop();
 }
 
@@ -3830,19 +3838,21 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     // A two-head divergence on node 1 alone, from a locally authored sibling.
     const auto base = n1.metadata_replica().committed();
     auto make_sibling = [&](BareNode& node, const std::string& path) {
-        auto snapshot = decode_snapshot(base.payload);
         FsEntry entry;
         entry.type = EntryType::directory;
         entry.mode = 0755;
         entry.uid = getuid();
         entry.gid = getgid();
-        snapshot.entries[path] = entry;
+        MetadataDelta delta;
+        delta.upsert_entries[path] = entry;
+        auto snapshot = macha::test_support::with_namespace_delta(
+            decode_snapshot(base.payload), node.local_state().control(), *metadata1_store, delta);
         ++snapshot.mutation_sequences[node.node_id()];
 
         MetadataRecord sibling;
         sibling.generation = base.generation + 1;
         sibling.previous = base.hash;
-        sibling.payload = encode_snapshot(snapshot);
+        sibling.payload = encode_snapshot_v14(snapshot);
         sibling.hash = metadata_hash(sibling.generation, sibling.previous, sibling.payload);
         REQUIRE(node.metadata_replica().store_commit(sibling));
         MetadataAcceptance acceptance;
@@ -4059,11 +4069,11 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     REQUIRE(heads.size() == 1);
     CHECK(heads.front().hash == final.hash);
     CHECK(s3->local_state().replica().history_contains(final.hash));
-    CHECK(s3->local_state().replica().history_is_ancestor(base.hash, final.hash));
 
+    // A tree-backed record names only its root, so the head stands alone: the
+    // replica takes it whole instead of replaying the burst.
     const auto transfer1 = s1.metadata_manager().history_transfer_diagnostics();
     const auto transfer2 = s2.metadata_manager().history_transfer_diagnostics();
-    CHECK(std::max(transfer1.peak_in_flight, transfer2.peak_in_flight) > 1);
     CHECK(std::max(transfer1.peak_in_flight, transfer2.peak_in_flight) <= 8);
 
     s3->stop();
@@ -6321,19 +6331,21 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
 
     // Another author's head, which this node's clock does not cover.
     const MetadataDot theirs{random_node_id(), 9};
-    auto foreign_snapshot = decode_snapshot(genesis_metadata().payload);
-    foreign_snapshot.metadata_write_replicas_required = 1;
-    foreign_snapshot.extent_size = decode_snapshot(mine.payload).extent_size;
-    foreign_snapshot.data_replication = decode_snapshot(mine.payload).data_replication;
-    foreign_snapshot.legacy_clock.emplace();
-    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
+    // Its namespace is this node's with "/mine" gone and "/theirs" added.
     auto made = directory();
     stamp_entry_provenance(made, "/theirs", nullptr, theirs);
-    foreign_snapshot.entries["/theirs"] = made;
+    MetadataDelta foreign_delta;
+    foreign_delta.erase_entries.push_back("/mine");
+    foreign_delta.upsert_entries["/theirs"] = made;
+    auto foreign_snapshot = macha::test_support::with_namespace_delta(
+        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store, foreign_delta);
+    foreign_snapshot.mutation_sequences.clear();
+    foreign_snapshot.legacy_clock.emplace();
+    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
     MetadataRecord foreign;
     foreign.generation = mine.generation + 7;
     foreign.previous = sha256(pattern(64, 201));
-    foreign.payload = encode_snapshot(foreign_snapshot);
+    foreign.payload = encode_snapshot_v14(foreign_snapshot);
     foreign.hash = metadata_hash(foreign.generation, foreign.previous, foreign.payload);
     REQUIRE(replica.store_commit(foreign));
     MetadataAcceptance acceptance;
@@ -6350,14 +6362,17 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
     CHECK(replica.diagnostics().history_records == records);
     CHECK(replica.accepted_heads().size() == 2);
 
+    const auto holds = [&](const MetadataSnapshot& snapshot, std::string_view path) {
+        return macha::test_support::namespace_holds(snapshot, node.local_state().control(), *metadata_store, path);
+    };
     // Reading merges the two; the one head then becomes the root.
-    CHECK(metadata.snapshot().entries.contains("/theirs"));
+    CHECK(holds(metadata.snapshot(), "/theirs"));
     REQUIRE(replica.accepted_heads().size() == 1);
     metadata.truncate_history(1, 1);
     CHECK(replica.diagnostics().history_records == 1);
     const auto after = metadata.snapshot();
-    CHECK(after.entries.contains("/mine"));
-    CHECK(after.entries.contains("/theirs"));
+    CHECK(holds(after, "/mine"));
+    CHECK(holds(after, "/theirs"));
     node.stop();
 }
 
