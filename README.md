@@ -2,12 +2,12 @@
 
 # Macha
 
-*v0.91.5*
+*v0.92.2*
 
 *Macha - Old Irish /ˈmˠaxə/ - approximately “MAKH-uh”*
 
 Macha is a C++20 distributed filesystem (MachaDFS) and media server for large,
-mostly immutable video and music libraries. Files are split into encrypted
+mostly immutable video, music and book libraries. Files are split into encrypted
 content-addressed extents, placed across ordinary machines, exposed through
 FUSE, indexed in a distributed catalogue, and served directly or through
 in-process FFmpeg remux/transcode pipelines.

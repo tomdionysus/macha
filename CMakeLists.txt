@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.91.5 LANGUAGES CXX)
+project(macha VERSION 0.92.2 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -100,6 +100,7 @@ configure_file(src/version.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/macha_ve
 
 option(MACHA_BUILD_SERVER "Build the macha server executable" ON)
 option(MACHA_ENABLE_FUSE "Build the FUSE mount adapter when available" ON)
+option(MACHA_ENABLE_BOOKS "Build book support: EPUB and MOBI metadata, Open Library, MOBI to EPUB conversion" ON)
 option(MACHA_BUILD_TESTS "Build tests" ON)
 option(MACHA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(MACHA_TEST_COVERAGE "Instrument the backend test build for source/branch coverage" OFF)
@@ -383,6 +384,21 @@ set(MACHA_CORE_SOURCES
 )
 
 add_library(macha_core SHARED ${MACHA_CORE_SOURCES})
+# Book support: the books scan provider, its readers, Open Library and
+# MOBI to EPUB conversion through libmobi's mobitool (a runtime tool, never
+# linked).
+# Without it a node still reads catalogues holding books and serves their
+# files; it does not scan or convert them, and refuses books.enabled.
+if(MACHA_ENABLE_BOOKS)
+    target_sources(macha_core PRIVATE
+        src/catalogue/epub_metadata.cpp
+        src/catalogue/mobi_metadata.cpp
+        src/catalogue/book_conversion.cpp)
+    target_compile_definitions(macha_core PUBLIC MACHA_HAVE_BOOKS=1)
+    message(STATUS "Book support enabled")
+else()
+    message(STATUS "Book support disabled (MACHA_ENABLE_BOOKS=OFF)")
+endif()
 target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
@@ -632,6 +648,12 @@ if(MACHA_BUILD_TESTS)
         tests/test_service_root.cpp
         tests/test_node_services.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
+    if(MACHA_ENABLE_BOOKS)
+        target_sources(macha-tests PRIVATE
+            tests/test_epub_metadata.cpp
+            tests/test_mobi_metadata.cpp
+            tests/test_book_conversion.cpp)
+    endif()
     target_compile_definitions(macha-tests PRIVATE
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         MACHA_TEST_PLUGIN_OK="$<TARGET_FILE:test_plugin_ok>"

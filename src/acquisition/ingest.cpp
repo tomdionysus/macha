@@ -1650,6 +1650,14 @@ std::string IngestManager::choose_destination(const std::filesystem::path& sourc
         auto album = safe_component(probe.album, "Unknown Album");
         return join_namespace(scanner.music.roots.front(), {artist, album, filename});
     }
+    case MediaProbeKind::book: {
+        // A path holds one author; the catalogue item holds them all.
+        if (!scanner.books.enabled || scanner.books.roots.empty()) return {};
+        auto author = safe_component(probe.authors.empty() ? std::string{} : probe.authors.front(),
+                                     "Unknown Author");
+        auto title = safe_component(probe.title, source.stem().string());
+        return join_namespace(scanner.books.roots.front(), {author, title, filename});
+    }
     }
     return {};
 }

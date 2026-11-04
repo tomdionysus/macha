@@ -6,6 +6,7 @@
 #include "contract/thread_safety.hpp"
 #include "types.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -137,6 +138,39 @@ struct FailureAxes {
 HttpResponse http_error(int status, std::string_view code, std::string_view message,
                         std::string_view reason, const FailureAxes& axes);
 std::string http_url_decode(std::string_view value);
+
+// One satisfiable byte range of a body of `size` bytes: the whole body when
+// the request names none.
+struct ByteRange {
+    uint64_t offset{};
+    uint64_t length{};
+    bool partial{};
+};
+// None when the Range header names something this server does not serve: a
+// multi-range, a unit other than bytes, or bytes past the end.
+std::optional<ByteRange> parse_range(const HttpRequest&, uint64_t size);
+// A 200 or 206 whose body `make_body(offset, length)` produces, with the range
+// headers; 416 for an unsatisfiable range.
+HttpResponse ranged_response(
+    const HttpRequest&, uint64_t size, std::string mime,
+    const std::function<std::shared_ptr<HttpBodySource>(uint64_t, uint64_t)>& make_body);
+// A body read through `read(offset, destination)` over [base, base + size).
+class ReaderBody final : public HttpBodySource {
+    std::function<size_t(uint64_t, std::span<uint8_t>)> read_;
+    uint64_t base_{};
+    uint64_t size_{};
+
+  public:
+    ReaderBody(std::function<size_t(uint64_t, std::span<uint8_t>)> read, uint64_t base,
+               uint64_t size)
+        : read_(std::move(read)), base_(base), size_(size) {}
+    uint64_t size() const override { return size_; }
+    size_t read(uint64_t offset, std::span<uint8_t> destination) override {
+        if (offset >= size_) return 0;
+        auto wanted = static_cast<size_t>(std::min<uint64_t>(destination.size(), size_ - offset));
+        return read_(base_ + offset, destination.first(wanted));
+    }
+};
 
 // Runs a handler as HttpServer does, waiting out deferrals on the caller's
 // thread and re-running until it answers.
