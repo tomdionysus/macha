@@ -200,17 +200,73 @@ Errors on the `/api/v1/catalogue` routes carry the code as the string `error`, w
 Every item returned carries `availability` (`complete`, `partial`, `unavailable` or `unknown`) and, for a set, `availability_members`: how much of it the reachable cluster holds, as described in [Files and availability](files.md#catalogue-items). They are not part of the item: a `PUT` or `PATCH` body that names them is ignored there.
 
 - `GET /api/v1/catalogue/status` - `server_version`, `enabled`, `ready`, `metadata_generation`, `known_metadata_generation`, `root`, `items`, `artwork_objects`, `local_artwork_objects`, `last_sync_unix_ms`, and `error_code` (`converging`, `unavailable`) beside `error`.
-- `GET /api/v1/catalogue/items?type=...&parent=...` and `GET /api/v1/catalogue/search?q=...` - `{"items": [...], "next_cursor"}`, paged as every list is ([API conventions](api.md#lists)); an unknown `type` is `400 bad_type`, and a search without `q` is `400 missing_query`; search's `limit` defaults to 50. Search also takes `kind`, which may repeat (`kind=movie&kind=show`; `movie`, `show`, `season`, `episode`, `artist`, `album`, `track`), and `parent`, which keeps only that item's children; both filter before `limit`, and an unknown kind is `400 bad_kind`.
+- `GET /api/v1/catalogue/items?type=...&parent=...&author=...&series=...` and `GET /api/v1/catalogue/search?q=...` - `{"items": [...], "next_cursor"}`, paged as every list is ([API conventions](api.md#lists)); an unknown `type` is `400 bad_type`, and a search without `q` is `400 missing_query`; search's `limit` defaults to 50. Search also takes `kind`, which may repeat (`kind=movie&kind=show`; `movie`, `show`, `season`, `episode`, `artist`, `album`, `track`, `book`, `author`, `series`), and `parent`, which keeps only that item's children; both filter before `limit`, and an unknown kind is `400 bad_kind`. `author=<id>` and `series=<id>` keep only the books naming that author or series, on both routes.
 - `GET|PUT|PATCH|DELETE /api/v1/catalogue/items/{id}` - the item carries its revision as `ETag: "rev-N"`; `PUT`, `PATCH` and `DELETE` honour `If-Match` with that value and answer a stale one with `409 conflict`.
   - `PUT` replaces the item's descriptive fields; `media_ids` and `artwork` change only when the body names them, so an edit that leaves them out keeps the item's files and artwork. `PATCH` changes only the fields present, and `null` clears an optional one; an unknown item is `404 not_found`.
-  - A `parent_id` must name an existing item of the right kind (season under show, episode under season, album under artist, track under album; movie, show and artist take none): otherwise `400 parent_not_found` with `parent_id`, or `400 bad_parent_kind` with `kind` and `parent_kind`. A body that is not a usable item is `400 bad_item`.
+  - A `parent_id` must name an existing item of the right kind (season under show, episode under season, album under artist, track under album; movie, show, artist, book, author and series take none): otherwise `400 parent_not_found` with `parent_id`, or `400 bad_parent_kind` with `kind` and `parent_kind`. A body that is not a usable item is `400 bad_item`.
+  - A book's `author_ids` and `series` must name existing authors and series: otherwise `400 reference_not_found` with `reference_id`, or `400 bad_reference_kind` with `reference_id`, `kind` and `reference_kind`. Only a book carries them.
   - An edit locks the item against the scanner (`external_ids.macha_metadata_locked`) unless the body says `"lock": false`, which removes the lock.
 - `DELETE /api/v1/catalogue/items/{id}/metadata` - Clear Metadata: removes the item and everything beneath it, and puts every file with their content in the unmatched list as it is (`GET /api/v1/manage/unmatched`), to be identified by hand. No provider is asked, so a bad match is not made again. Answers `204`; `404 not_found`, `409 catalogue_conflict` (`If-Match`).
 - `DELETE /api/v1/catalogue/items/{id}/media/{media_id}` - unmatches one file from the item: the binding goes, and every file with that content is put in the unmatched list as it is (`GET /api/v1/manage/unmatched`), to be identified by hand; no provider is asked, and a scan does not reopen it. An item left with no media is removed, with each item above it left with no children, whoever made it. Answers `{"status": "unmatched", "item", "removed_item_ids"}`, without `item` when it was removed. Codes: `404 not_found`, `404 media_not_bound`, `409 catalogue_conflict` (`If-Match`).
 - `POST /api/v1/catalogue/items/{id}/artwork?role=...&mime=...` - stores the body as artwork (DATA, below) and answers `201` with `role`, `id`, `mime_type`.
 - `GET /api/v1/catalogue/artwork/{object id}` - artwork bytes. Items carry signed artwork URLs (`?exp=...&sig=...`) that need no bearer token and stay byte-identical inside a TTL bucket, so a browser cache keeps them; the response is `immutable` with the object id as its `ETag`.
 - `GET /api/v1/catalogue/media/{id}/profile` - above.
+- `GET /api/v1/catalogue/media/{id}/content` - the file's bytes, below.
 - `GET /api/v1/catalogue/hints` - above.
+
+## Books
+
+Books are a class beside films, TV and music, with three kinds: `book`,
+`author` and `series`. None has a parent. A book names its authors and its
+series by reference, since it may have several of each (two authors; a
+series that changes author; one book in a main series and a sub-series):
+
+| field on a `book` | meaning |
+|---|---|
+| `author_ids` | the authors in credited order |
+| `series` | `[{"series_id", "index"}]`; `index` is the book's position, `null` when unknown, fractional for a novella between two numbered books |
+| `language`, `publisher`, `published` | from the file or the provider; `published` is the date as given |
+
+Every item carries the five fields, empty or `null` for other kinds. The
+ISBN is `external_ids.isbn13`; Open Library's ids are
+`external_ids.openlibrary_edition`, `openlibrary_work` and, on an author,
+`openlibrary_author`. A book's `media_ids` are its formats: an EPUB and a
+PDF of one edition are one item with two files.
+
+Authors and series carry title, sort title, synopsis, artwork and external
+ids, never files. The scanner's ids come from the normalised name
+(`author:terry-pratchett`, `series:discworld`), so files scanned on any node
+meet at the same item, and a book's id from its ISBN (`book:isbn:<isbn13>`)
+or its title and first author. An author or series left referenced by no
+book goes with its last book unless it was edited, as an album does.
+Clearing an author's or a series' metadata removes its books with it.
+Without artwork of its own, an author or series shows a book's: the first
+in the series, else the first by sort title.
+
+A book's file has no playback profile:
+`GET /api/v1/catalogue/media/{id}/profile` answers
+`422 profile_not_applicable` with `kind: "book"`, and it is read through its
+content, not a playback session.
+
+### Content
+
+```text
+GET /api/v1/catalogue/media/{url-encoded-macha-media-id}/content
+GET /api/v1/catalogue/media/{url-encoded-macha-media-id}/content?download=1
+```
+
+The file as it is stored, for any media id, not only a book's. `Range` is
+honoured (one range: `206` with `Content-Range`, else `200`;
+`Accept-Ranges: bytes`), the type comes from the file's name
+(`application/epub+zip`, `application/pdf`, `application/x-mobipocket-ebook`,
+`application/vnd.amazon.ebook`, `application/x-fictionbook+xml`,
+`application/vnd.comicbook+zip`; a video or audio file its container's
+type; otherwise `application/octet-stream`), and the response is
+`private, immutable` with the media id as its `ETag`, since a media id names
+its bytes. `download=1` adds `Content-Disposition: attachment` with the
+file's name. The read is viewer work and streams; nothing is staged.
+Codes: `400 bad_media_id`, `404 not_found` (this node cannot read the file;
+the item's availability says where else), `416 bad_range`.
 
 ## Maintenance liveness
 

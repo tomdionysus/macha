@@ -1,5 +1,38 @@
 # Current release
 
+## 0.92.0: books
+
+Ebooks are a media class beside films, TV and music. The catalogue gains
+`book`, `author` and `series`: none has a parent, and a book names its
+authors and its series by reference, since it may have several of each
+(two authors; a series that changes author; a book in a main series and a
+sub-series). A book carries `author_ids`, `series` (with each position,
+fractional for a novella), `language`, `publisher` and `published`; its
+files are its formats, so an EPUB and a PDF of one edition are one item.
+An author or series left referenced by no book goes with its last book,
+as an album does, and shows a book's cover when it has none of its own.
+
+The `books` scan provider (off until enabled, roots `/Books`) catalogues
+EPUB, PDF, MOBI, AZW3, FB2 and CBZ files. An EPUB's own record is read
+first (title, creators and their roles, ISBN, language, publisher, date,
+description, series, cover) through a reader of Macha's own that fetches
+only the archive's directory, the package and the cover; then the path
+(`Author/Title (Year)/file`, `Author/Series/NN Title/file`,
+`Series/NN Title/file`, `Author - Title.epub`). Open Library is asked by
+ISBN, then by title and author, at most once a second; a title alone
+never matches, and a book the provider does not know is catalogued from
+the file. Ingest files a book under `/Books/<first author>/<title>/`.
+
+`GET /api/v1/catalogue/media/{id}/content` serves any stored file as it is,
+with HTTP ranges and `download=1` for an attachment: a book is read through
+it, never through a playback session, and its profile route answers
+`422 profile_not_applicable`. Listing and search take `author=` and
+`series=`; the metadata editor takes `kind=book` searches,
+`openlibrary:edition:<olid>` and `openlibrary:work:<olid>` references, and
+manual books. Catalogue shards are written as MCAT0023; 0021 and 0022
+shards are still read. A node on an older release cannot load a catalogue
+holding a book, so every node is upgraded before the provider is enabled.
+
 ## 0.91.5: an import waits for its disk
 
 An ingest job whose bytes no node present can take, because the DATA disk

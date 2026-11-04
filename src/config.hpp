@@ -303,6 +303,21 @@ struct CatalogueMusicProviderConfig {
     CatalogueDiscogsConfig discogs;
 };
 
+struct CatalogueOpenLibraryConfig {
+    bool enabled{true};
+    std::string contact{"https://github.com/tomdionysus/macha"};
+    // Open Library cover sizes: S, M or L.
+    std::string cover_size{"L"};
+};
+
+// Off until the operator has a books root: a configured root that does not
+// exist makes every scan partial, and a partial scan prunes nothing.
+struct CatalogueBookProviderConfig {
+    bool enabled{false};
+    std::vector<std::string> roots{"/Books"};
+    CatalogueOpenLibraryConfig openlibrary;
+};
+
 struct CatalogueScannerConfig {
     bool enabled{};
     std::chrono::milliseconds interval{std::chrono::hours(6)};
@@ -323,6 +338,7 @@ struct CatalogueScannerConfig {
     CatalogueMovieProviderConfig movies;
     CatalogueTvProviderConfig tv;
     CatalogueMusicProviderConfig music;
+    CatalogueBookProviderConfig books;
 };
 
 struct CatalogueConfig {

@@ -3,6 +3,7 @@
 #include "api/paging.hpp"
 #include "catalogue/media_information.hpp"
 #include "macha_version.hpp"
+#include "media/media_containers.hpp"
 
 #include "crypto.hpp"
 #include "log.hpp"
@@ -10,8 +11,10 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <array>
 #include <charconv>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <netdb.h>
@@ -72,6 +75,25 @@ HttpResponse media_error(int status, std::string_view code, std::string_view mes
 
 std::string optional_number(const std::optional<int32_t>& value) {
     return value ? std::to_string(*value) : "null";
+}
+
+std::string optional_text(const std::optional<std::string>& value) {
+    return value ? json_escape(*value) : "null";
+}
+
+// A series index as JSON: an integer when it is one, else a short decimal.
+std::string series_index_json(const std::optional<double>& value) {
+    if (!value) return "null";
+    if (*value == std::floor(*value) && std::fabs(*value) < 1e15)
+        return std::to_string(static_cast<int64_t>(*value));
+    std::array<char, 32> text{};
+    auto [end, ec] = std::to_chars(text.data(), text.data() + text.size(), *value,
+                                   std::chars_format::fixed, 3);
+    if (ec != std::errc{}) return "null";
+    std::string out(text.data(), end);
+    while (out.size() > 1 && out.back() == '0') out.pop_back();
+    if (out.back() == '.') out.pop_back();
+    return out;
 }
 
 // Signs and verifies artwork capability URLs, so catalogue responses embed an
@@ -192,7 +214,21 @@ std::string item_json(const CatalogueItem& item, const CatalogueView& snapshot,
         if (i) out += ',';
         out += json_escape(item.media_ids[i]);
     }
-    out += "],\"artwork\":" + artwork_json(item.artwork, urls);
+    out += "],\"author_ids\":[";
+    for (size_t i = 0; i < item.author_ids.size(); ++i) {
+        if (i) out += ',';
+        out += json_escape(item.author_ids[i]);
+    }
+    out += "],\"series\":[";
+    for (size_t i = 0; i < item.series.size(); ++i) {
+        if (i) out += ',';
+        out += "{\"series_id\":" + json_escape(item.series[i].series_id) +
+               ",\"index\":" + series_index_json(item.series[i].index) + "}";
+    }
+    out += "],\"language\":" + optional_text(item.language);
+    out += ",\"publisher\":" + optional_text(item.publisher);
+    out += ",\"published\":" + optional_text(item.published);
+    out += ",\"artwork\":" + artwork_json(item.artwork, urls);
     out += ",\"effective_artwork\":" + artwork_json(effective_catalogue_artwork(snapshot, item), urls);
     out += availability_json(item, availability);
     out += ",\"revision\":" + std::to_string(item.revision);
@@ -313,6 +349,47 @@ void apply_item_fields(CatalogueItem& item, const Json& root, bool whole) {
             item.aliases.clear();
             for (const auto& alias : aliases->asArray()) item.aliases.push_back(alias.asString());
         }
+        if (const auto* authors = root.find("author_ids")) {
+            if (!authors->isArray()) throw BadItem("bad_item", "author_ids must be an array");
+            item.author_ids.clear();
+            for (const auto& author : authors->asArray()) {
+                auto id = author.asString();
+                if (id.empty()) throw BadItem("bad_item", "author_ids must not contain an empty id");
+                if (std::find(item.author_ids.begin(), item.author_ids.end(), id) ==
+                    item.author_ids.end())
+                    item.author_ids.push_back(std::move(id));
+            }
+        }
+        if (const auto* series = root.find("series")) {
+            if (!series->isArray()) throw BadItem("bad_item", "series must be an array");
+            item.series.clear();
+            for (const auto& value : series->asArray()) {
+                const auto* id_value = value.find("series_id");
+                if (!id_value || id_value->asString().empty())
+                    throw BadItem("bad_item", "series entries require series_id");
+                CatalogueSeriesRef ref;
+                ref.series_id = id_value->asString();
+                if (const auto* index = value.find("index"); index && !index->isNull()) {
+                    const auto number = index->asNumber();
+                    if (!std::isfinite(number))
+                        throw BadItem("bad_item", "series index must be a number");
+                    ref.index = number;
+                }
+                const bool duplicate = std::any_of(
+                    item.series.begin(), item.series.end(),
+                    [&](const CatalogueSeriesRef& existing) { return existing.series_id == ref.series_id; });
+                if (!duplicate) item.series.push_back(std::move(ref));
+            }
+        }
+        const auto text = [&](std::string_view key, std::optional<std::string>& field) {
+            const auto* value = root.find(key);
+            if (!value) return;
+            if (value->isNull()) field.reset();
+            else field = value->asString();
+        };
+        text("language", item.language);
+        text("publisher", item.publisher);
+        text("published", item.published);
         if (const auto* external = root.find("external_ids")) {
             if (!external->isObject()) throw BadItem("bad_item", "external_ids must be an object");
             item.external_ids.clear();
@@ -379,6 +456,26 @@ void validate_parent(CatalogueManager& catalogue, const CatalogueItem& item) {
         throw BadItem("bad_parent_kind", "parent is the wrong kind for this item",
                       {{"kind", std::string(catalogue_kind_name(item.kind))},
                        {"parent_kind", std::string(catalogue_kind_name(parent->kind))}});
+}
+
+// A book's authors and series must exist and be of those kinds; nothing else
+// refers to anything.
+void validate_references(CatalogueManager& catalogue, const CatalogueItem& item) {
+    if (item.kind != CatalogueKind::book && (!item.author_ids.empty() || !item.series.empty()))
+        throw BadItem("bad_item", "only a book has author_ids or series");
+    const auto check = [&](const std::string& id, CatalogueKind wanted) {
+        const auto found = catalogue.get(id);
+        if (!found)
+            throw BadItem("reference_not_found", "referenced item not found",
+                          {{"reference_id", id}});
+        if (found->kind != wanted)
+            throw BadItem("bad_reference_kind", "referenced item is the wrong kind",
+                          {{"reference_id", id},
+                           {"kind", std::string(catalogue_kind_name(wanted))},
+                           {"reference_kind", std::string(catalogue_kind_name(found->kind))}});
+    };
+    for (const auto& author : item.author_ids) check(author, CatalogueKind::author);
+    for (const auto& ref : item.series) check(ref.series_id, CatalogueKind::series);
 }
 
 std::optional<uint64_t> expected_revision(const HttpRequest& request) {
@@ -490,11 +587,16 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             }
             std::optional<std::string_view> parent;
             if (auto it = request.query.find("parent"); it != request.query.end()) parent = it->second;
+            // A book's author or series, named by either: an id is one or the other.
+            std::optional<std::string_view> refers_to;
+            for (const auto key : {"author", "series"})
+                if (auto it = request.query.find(key); it != request.query.end() && !it->second.empty())
+                    refers_to = it->second;
             PageQuery page;
             if (auto bad = read_page_query(request, page)) return *bad;
             auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/catalogue/items", local_waits));
-            auto items = catalogue_.list(kind, parent);
+            auto items = catalogue_.list(kind, parent, refers_to);
             std::sort(items.begin(), items.end(),
                       [](const auto& a, const auto& b) { return a.id < b.id; });
             const auto range = page_range(
@@ -534,9 +636,14 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             }
             std::optional<std::string> parent;
             if (auto it = request.query.find("parent"); it != request.query.end()) parent = it->second;
+            std::optional<std::string> refers_to;
+            for (const auto key : {"author", "series"})
+                if (auto it = request.query.find(key); it != request.query.end() && !it->second.empty())
+                    refers_to = it->second;
             auto keep = [&](const CatalogueItem& item) {
                 if (!kinds.empty() && !kinds.contains(item.kind)) return false;
                 if (parent && item.parent_id != parent) return false;
+                if (refers_to && !item.refers_to(*refers_to)) return false;
                 return true;
             };
             auto snapshot = catalogue_.snapshot_view(
@@ -575,6 +682,16 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             response.headers["ETag"] = json_escape(media_id);
             return response;
         }
+        constexpr std::string_view content_suffix = "/content";
+        if ((request.method == "GET" || request.method == "HEAD") &&
+            request.path.starts_with(media_prefix) && request.path.ends_with(content_suffix)) {
+            auto encoded = std::string_view(request.path).substr(media_prefix.size());
+            encoded.remove_suffix(content_suffix.size());
+            auto media_id = url_decode(encoded);
+            if (!media_id.starts_with("macha:"))
+                return error(400, "bad_media_id", "immutable macha media ID required");
+            return media_content(request, media_id);
+        }
         constexpr std::string_view profile_suffix = "/profile";
         if (request.method == "GET" && request.path.starts_with(media_prefix) &&
             request.path.ends_with(profile_suffix)) {
@@ -583,6 +700,10 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             auto media_id = url_decode(encoded);
             if (!media_id.starts_with("macha:"))
                 return error(400, "bad_media_id", "immutable macha media ID required");
+            // A book has no streams to profile; it is read through its content.
+            if (book_media(media_id))
+                return json(422, "{\"error\":\"profile_not_applicable\",\"message\":"
+                                 "\"a book's file has no playback profile\",\"kind\":\"book\"}");
             auto profile = catalogue_.media_profile(media_id);
             if (!profile && resolve_media_profile_) {
                 // No stored profile: produce and persist one now on the foreground path a
@@ -678,6 +799,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 }
                 apply_item_fields(item, root, request.method == "PUT");
                 validate_parent(catalogue_, item);
+                validate_references(catalogue_, item);
                 auto saved = catalogue_.upsert(std::move(item), expected_revision(request),
                                                frame_for(request.work));
                 auto snapshot = catalogue_.snapshot_view(
@@ -732,6 +854,41 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
     } catch (const std::exception& e) {
         return error(503, "catalogue_unavailable", e.what());
     }
+}
+
+bool CatalogueApi::book_media(const std::string& media_id) {
+    const auto index = catalogue_.indexes();
+    const auto bound = index->media_bindings.find(media_id);
+    if (bound == index->media_bindings.end()) return false;
+    for (const auto& item_id : bound->second)
+        if (const auto item = catalogue_.get(item_id); item && item->kind == CatalogueKind::book)
+            return true;
+    return false;
+}
+
+HttpResponse CatalogueApi::media_content(const HttpRequest& request, const std::string& media_id) {
+    const auto source = media_content_ ? media_content_(media_id) : std::nullopt;
+    if (!source) return error(404, "not_found", "media is not available on this node");
+    const auto name = source->name;
+    const auto read = source->read;
+    auto response = ranged_response(request, source->size, file_mime(name),
+                                    [read](uint64_t offset, uint64_t length) {
+                                        return std::make_shared<ReaderBody>(read, offset, length);
+                                    });
+    if (response.status == 416) return response;
+    // A media id names its bytes, so the content never changes.
+    response.headers["Cache-Control"] = "private, max-age=31536000, immutable";
+    response.headers["ETag"] = json_escape(media_id);
+    if (auto it = request.query.find("download"); it != request.query.end() && it->second != "0") {
+        // The name is quoted as a token: a quote or a control character in it
+        // would end the header early.
+        std::string safe;
+        for (unsigned char c : name)
+            safe.push_back(c < 0x20 || c == '"' || c == '\\' || c == 0x7f ? '_' : static_cast<char>(c));
+        response.headers["Content-Disposition"] = "attachment; filename=\"" + safe + "\"";
+    }
+    if (request.method == "HEAD") response.stream.reset();
+    return response;
 }
 
 bool CatalogueApi::capability_request(const HttpRequest& request) const {

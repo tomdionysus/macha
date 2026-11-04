@@ -290,6 +290,36 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         CHECK(leaf(body)->parent_id == album_id);
         CHECK(catalogue.list(CatalogueKind::artist).size() == 1);
 
+        // A book by hand: its authors and series by name are created or
+        // joined, an existing author by id is referenced.
+        std::tie(status, body) = post(unmatched(), R"({"kind":"book","title":"Hand Book","authors":["Ann Author","Bob Writer"],"series":"Hand Series","series_index":2,"year":2020})");
+        REQUIRE(status == 201);
+        auto book = leaf(body);
+        REQUIRE(book.has_value());
+        CHECK(book->kind == CatalogueKind::book);
+        CHECK(!book->parent_id.has_value());
+        REQUIRE(book->author_ids.size() == 2);
+        const auto ann_id = book->author_ids.front();
+        REQUIRE(catalogue.get(ann_id).has_value());
+        CHECK(catalogue.get(ann_id)->kind == CatalogueKind::author);
+        CHECK(catalogue.get(ann_id)->title == "Ann Author");
+        CHECK(catalogue.get(book->author_ids.back())->title == "Bob Writer");
+        REQUIRE(book->series.size() == 1);
+        const auto series_id = book->series.front().series_id;
+        CHECK(book->series.front().index == std::optional<double>{2});
+        REQUIRE(catalogue.get(series_id).has_value());
+        CHECK(catalogue.get(series_id)->kind == CatalogueKind::series);
+        CHECK(catalogue.get(series_id)->title == "Hand Series");
+        std::tie(status, body) = post(unmatched(), "{\"kind\":\"book\",\"title\":\"Second Hand Book\",\"author_id\":\"" + ann_id +
+                                                       "\",\"series_id\":\"" + series_id + "\"}");
+        REQUIRE(status == 201);
+        CHECK((leaf(body)->author_ids == std::vector<std::string>{ann_id}));
+        CHECK(catalogue.list(CatalogueKind::author).size() == 2);
+        CHECK(catalogue.list(CatalogueKind::book, {}, std::string_view(series_id)).size() == 2);
+        std::tie(status, body) = post(unmatched(), R"({"kind":"book","title":"Third","author_id":"musicbrainz:artist:a"})");
+        CHECK(status == 400);
+        CHECK(error_code(body) == "bad_parent_kind");
+
         // A missing parent is 404 and a wrong kind is 400, both naming the parent.
         const auto refused = unmatched();
         std::tie(status, body) = post(refused, R"({"kind":"episode","season_id":"tmdb:tv:missing","episode_number":1})");

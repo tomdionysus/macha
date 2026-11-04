@@ -468,6 +468,18 @@ void validate(Config& config) {
                             config.catalogue.scanner.tv.roots);
     validate_provider_roots("music", config.catalogue.scanner.music.enabled,
                             config.catalogue.scanner.music.roots);
+    validate_provider_roots("books", config.catalogue.scanner.books.enabled,
+                            config.catalogue.scanner.books.roots);
+    if (config.catalogue.scanner.books.enabled &&
+        config.catalogue.scanner.books.openlibrary.enabled) {
+        const auto& ol = config.catalogue.scanner.books.openlibrary;
+        if (ol.contact.empty())
+            throw std::runtime_error(
+                "catalogue.scanner.providers.books.openlibrary.contact is required");
+        if (ol.cover_size != "S" && ol.cover_size != "M" && ol.cover_size != "L")
+            throw std::runtime_error(
+                "catalogue.scanner.providers.books.openlibrary.cover_size must be S, M or L");
+    }
     if (config.catalogue.scanner.max_artwork_bytes < 64 * 1024 ||
         config.catalogue.scanner.max_artwork_bytes > 128ULL * 1024 * 1024)
         throw std::runtime_error("catalogue.scanner.max_artwork_bytes must be 64K..128M");

@@ -147,6 +147,21 @@ constexpr std::array<GeneratedFact, 5> generated_facts{{
     {".vtt", "text/vtt; charset=utf-8"},
 }};
 
+// Book formats: the name and the type they are served as.
+struct BookFact {
+    std::string_view extension;
+    std::string_view mime;
+};
+
+constexpr std::array<BookFact, 6> book_facts{{
+    {".epub", "application/epub+zip"},
+    {".pdf", "application/pdf"},
+    {".mobi", "application/x-mobipocket-ebook"},
+    {".azw3", "application/vnd.amazon.ebook"},
+    {".fb2", "application/x-fictionbook+xml"},
+    {".cbz", "application/vnd.comicbook+zip"},
+}};
+
 const ExtensionFact* extension_fact(std::string_view ext) {
     for (const auto& fact : extension_facts)
         if (fact.extension == ext) return &fact;
@@ -234,6 +249,21 @@ std::string segment_mime(std::string_view name) {
     const auto ext = path_extension(name);
     for (const auto& fact : generated_facts)
         if (fact.extension == ext) return std::string(fact.mime);
+    return "application/octet-stream";
+}
+
+bool book_extension(std::string_view ext) {
+    for (const auto& fact : book_facts)
+        if (fact.extension == ext) return true;
+    return false;
+}
+
+std::string file_mime(std::string_view path) {
+    const auto ext = path_extension(path);
+    for (const auto& fact : book_facts)
+        if (fact.extension == ext) return std::string(fact.mime);
+    if (const auto* fact = extension_fact(ext); fact && !fact->container.empty())
+        return direct_mime(fact->container, fact->kind == Kind::video);
     return "application/octet-stream";
 }
 

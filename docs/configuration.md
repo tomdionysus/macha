@@ -712,7 +712,23 @@ catalogue:
         musicbrainz:
           enabled: true
           contact: https://example.invalid/macha
+      books:
+        enabled: true
+        roots: [/Books]
+        openlibrary:
+          enabled: true
+          contact: https://example.invalid/macha
+          cover_size: L
 ```
+
+The `books` provider is off unless enabled: a configured root that does
+not exist makes every scan partial, and a partial scan prunes nothing, so
+turn it on once the root is there. It catalogues `.epub`, `.pdf`, `.mobi`,
+`.azw3`, `.fb2` and `.cbz` files, reads an EPUB's own metadata and cover,
+and asks Open Library (no key; `cover_size` is `S`, `M` or `L`) by ISBN,
+then by title and author; a book the provider does not know is catalogued
+from the file. Open Library is asked at most once a second, like
+MusicBrainz.
 
 `ignore_terms` (default `[sample]`) keeps files out of the catalogue: a file
 is not catalogued when a word of its path below the scanner root equals one of
