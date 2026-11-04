@@ -1081,6 +1081,10 @@ EpubMetadata read_epub_metadata(uint64_t size,
     return std::move(parsed.metadata);
 }
 
+EpubMetadata read_opf_metadata(std::string_view opf) {
+    return std::move(parse_opf(parse_xml(opf), {}).metadata);
+}
+
 EpubMetadata read_epub_metadata(const std::filesystem::path& path, const EpubReadLimits& limits) {
     std::ifstream file(path, std::ios::binary);
     if (!file)

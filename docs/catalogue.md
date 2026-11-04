@@ -268,6 +268,46 @@ file's name. The read is viewer work and streams; nothing is staged.
 Codes: `400 bad_media_id`, `404 not_found` (this node cannot read the file;
 the item's availability says where else), `416 bad_range`.
 
+### Conversion
+
+A book's file in another format, made on request on the node asked, with
+Calibre's `ebook-convert` (see `books.conversion` in the
+[configuration](configuration.md#books)). The formats are `epub`, `azw3`,
+`mobi`, `pdf` and `fb2`.
+
+```text
+PUT    /api/v1/catalogue/media/{media-id}/conversions/{format}           start, or find ready
+GET    /api/v1/catalogue/media/{media-id}/conversions/{format}           its state
+GET    /api/v1/catalogue/media/{media-id}/conversions/{format}/content   the converted file
+DELETE /api/v1/catalogue/media/{media-id}/conversions/{format}           drop it
+```
+
+A conversion is `{"status", "media_id", "format", "size", "mime_type",
+"error_code"}`: `status` is `converting`, `ready` or `failed`; `size` is the
+converted file's bytes when ready, else `null`; `error_code` says why it
+failed (`conversion_failed`, `conversion_timed_out`, `source_unreadable`,
+`source_too_large`), else `null`.
+
+- `PUT` answers `202` with the conversion while it runs (`Retry-After: 2`,
+  `Location` the same path), `200` when it is already ready, and `422` with
+  the conversion when it failed at once (`source_too_large`). A `PUT` after
+  a failure tries again; one while it runs joins it.
+- `GET` answers `200` with the conversion, `404 not_found` when none was
+  asked for here (or it was dropped or evicted).
+- `GET .../content` serves the file as the content route does: ranges,
+  `download=1` for an attachment named after the book with the new
+  extension, immutable caching. `409 not_ready` with `Retry-After` while it
+  runs; `422` with the failure's code when it failed.
+- `DELETE` answers `204`, or `404 not_found` (nothing finished to drop).
+
+Codes for all: `400 bad_media_id`, `400 bad_format` (not one of the
+formats), `400 same_format` (the book's file is already that format),
+`422 not_a_book` (the media is not a book's file), `404 not_found` (this
+node cannot read the source), and `503 conversion_unavailable` with
+`scope: node` when this node has no conversion (not built, not enabled):
+another node may have it. Conversions are kept on the node that made them;
+another node converts again.
+
 ## Maintenance liveness
 
 Catalogue maintenance exports two different live sets:

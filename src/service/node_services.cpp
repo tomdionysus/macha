@@ -65,6 +65,12 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       cluster_unmatched_(node_, catalogue_hints_),
       torrent_coordinator_(node_, metadata_, registry_, cluster_jobs_, node_.config().state_path),
       acquisition_api_(ingest_, registry_, torrent_search_, cluster_jobs_, torrent_coordinator_),
+#if MACHA_HAVE_BOOKS
+      book_conversions_(node_.config().books.enabled && node_.config().books.conversion.enabled
+                            ? std::make_unique<BookConversions>(node_.config().books.conversion,
+                                                                node_.config().state_path)
+                            : nullptr),
+#endif
       catalogue_api_(
           catalogue_, catalogue_hints_,
           [this](const std::vector<std::string>& media_ids) {
@@ -103,7 +109,12 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                                         [handle](uint64_t offset, std::span<uint8_t> into) {
                                             return handle->read(offset, into);
                                         }};
-          }),
+          },
+#if MACHA_HAVE_BOOKS
+          book_conversions_.get()),
+#else
+          nullptr),
+#endif
       manage_api_(node_, metadata_, filesystem_, catalogue_, catalogue_hints_, scanner_,
                   &cluster_unmatched_),
       streaming_(
@@ -228,6 +239,9 @@ void NodeServices::start() {
     media_information_.start();
     note("start scanner");
     scanner_.start();
+#if MACHA_HAVE_BOOKS
+    if (book_conversions_) book_conversions_->start();
+#endif
     note("start hydration");
     hydration_.start();
     note("start ingest");
@@ -324,6 +338,9 @@ void NodeServices::stop() {
     hydration_.stop();
     note("stop scanner");
     scanner_.stop();
+#if MACHA_HAVE_BOOKS
+    if (book_conversions_) book_conversions_->stop();
+#endif
     note("stop media-information");
     media_information_.stop();
 }

@@ -223,6 +223,55 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_a_repair_weight_of_zer
     CHECK(refused);
 }
 
+MACHA_FAST_TEST("runtime_dependencies", test_books_enabled_is_the_one_switch_for_books) {
+    // books.enabled turns on the books scan provider unless its own block
+    // turns it off, and never runs it without books.enabled; conversion
+    // needs books; a build without book support refuses books.
+    TempDir t;
+    const auto keyfile = (t.path() / "key").string();
+    const auto yaml = t.path() / "macha.yaml";
+    auto write = [&](std::string body) {
+        std::ofstream out(yaml);
+        out << "state_path: " << (t.path() / "state").string() << "\n"
+            << "key_file: " << keyfile << "\n"
+            << "storage:\n  hosts_extents: false\n  metadata:\n    limit: 1G\n"
+            << "bootstrap:\n  - seed1.example:7437\n"
+            << body;
+    };
+    const auto refusal = [&]() -> std::string {
+        try {
+            (void)load_yaml_config(yaml);
+        } catch (const std::runtime_error& error) {
+            return error.what();
+        }
+        return {};
+    };
+    write("");
+    CHECK(!load_yaml_config(yaml).books.enabled);
+    CHECK(!load_yaml_config(yaml).catalogue.scanner.books.enabled);
+    write("catalogue:\n  scanner:\n    providers:\n      books:\n        enabled: true\n");
+    CHECK(!load_yaml_config(yaml).catalogue.scanner.books.enabled);
+    write("books:\n  conversion:\n    enabled: true\n");
+    CHECK(refusal().find("books.conversion requires books.enabled") != std::string::npos);
+#if MACHA_HAVE_BOOKS
+    write("books:\n  enabled: true\n");
+    CHECK(load_yaml_config(yaml).catalogue.scanner.books.enabled);
+    write("books:\n  enabled: true\ncatalogue:\n  scanner:\n    providers:\n      books:\n        enabled: false\n");
+    CHECK(!load_yaml_config(yaml).catalogue.scanner.books.enabled);
+    write("books:\n  enabled: true\n  conversion:\n    enabled: true\n    ebook_convert: /usr/bin/ebook-convert\n"
+          "    cache_limit: 1G\n    timeout_ms: 60000\n    max_concurrent: 2\n");
+    const auto converting = load_yaml_config(yaml);
+    CHECK(converting.books.conversion.enabled);
+    CHECK(converting.books.conversion.cache_limit == 1024ULL * 1024 * 1024);
+    CHECK(converting.books.conversion.max_concurrent == 2);
+    write("books:\n  enabled: true\n  conversion:\n    enabled: true\n    ebook_convert: ebook-convert\n");
+    CHECK(refusal().find("must be an absolute path") != std::string::npos);
+#else
+    write("books:\n  enabled: true\n");
+    CHECK(refusal().find("no book support") != std::string::npos);
+#endif
+}
+
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_unknown_keys) {
     // Unknown keys are refused, so a misspelt key cannot silently leave its
     // setting at the default. Each is named, at any depth, including in lists.
