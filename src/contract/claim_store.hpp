@@ -2,14 +2,17 @@
 #pragma once
 
 #include "contract/id_lookup.hpp"
+#include "contract/thread_safety.hpp"
 #include "contract/work.hpp"
 #include "types.hpp"
 
+#include <array>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <vector>
@@ -35,9 +38,58 @@ struct RetentionDot {
 // What a metadata head has observed of each node's claim writes.
 using RetentionClock = std::map<NodeId, uint64_t>;
 
+// This node's guard over an object's claims against its copy. A claim's
+// presence check and its write, and a delete's check that no claim stands
+// and its unlink, each hold the guard for the ids they touch, so no claim
+// lands between a delete's check and the delete. Striped by the id's first
+// byte; a batch takes its stripes in ascending order, so two batches never
+// deadlock. Taken before the object store's and the claim store's locks,
+// never under them; a holder waits on the state and DATA devices.
+class ClaimGuard {
+    std::vector<std::unique_lock<std::mutex>> held_;
+    friend class ClaimLocks;
+
+  public:
+    ClaimGuard() = default;
+    ClaimGuard(ClaimGuard&&) noexcept = default;
+    ClaimGuard& operator=(ClaimGuard&&) noexcept = default;
+    ClaimGuard(const ClaimGuard&) = delete;
+    ClaimGuard& operator=(const ClaimGuard&) = delete;
+};
+
+class ClaimLocks {
+    static constexpr size_t stripes = 64;
+    std::array<IoMutex, stripes> stripes_;
+
+  public:
+    ClaimGuard lock(std::span<const ObjectId> ids) MACHA_EXCLUDES(no_io) {
+        std::array<bool, stripes> wanted{};
+        for (const auto& id : ids)
+            wanted[id.bytes[0] % stripes] = true;
+        ClaimGuard guard;
+        for (size_t stripe = 0; stripe < stripes; ++stripe)
+            if (wanted[stripe])
+                guard.held_.emplace_back(stripes_[stripe].native());
+        return guard;
+    }
+};
+
 class ClaimStore {
+    mutable ClaimLocks locks_;
+
   public:
     virtual ~ClaimStore() = default;
+
+    // The guard above, for the ids given. Waits on the devices its other
+    // holders wait on. Const: a guard changes no claim.
+    static constexpr Waits guard_waits = Waits::state_device | Waits::data_device | Waits::locks;
+    static constexpr ThreadSafety guard_safety = ThreadSafety::thread_safe;
+    ClaimGuard guard(std::span<const ObjectId> ids) const MACHA_EXCLUDES(no_io) {
+        return locks_.lock(ids);
+    }
+    ClaimGuard guard(const ObjectId& id) const MACHA_EXCLUDES(no_io) {
+        return locks_.lock(std::span<const ObjectId>(&id, 1));
+    }
 
     // Every operation takes the store's lock, which writes, lookups (a
     // ledger node read) and compaction hold across their state-device I/O
