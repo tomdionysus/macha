@@ -153,10 +153,12 @@ struct BookFact {
     std::string_view mime;
 };
 
-constexpr std::array<BookFact, 6> book_facts{{
+constexpr std::array<BookFact, 8> book_facts{{
     {".epub", "application/epub+zip"},
     {".pdf", "application/pdf"},
     {".mobi", "application/x-mobipocket-ebook"},
+    {".azw", "application/x-mobipocket-ebook"},
+    {".prc", "application/x-mobipocket-ebook"},
     {".azw3", "application/vnd.amazon.ebook"},
     {".fb2", "application/x-fictionbook+xml"},
     {".cbz", "application/vnd.comicbook+zip"},
@@ -250,6 +252,10 @@ std::string segment_mime(std::string_view name) {
     for (const auto& fact : generated_facts)
         if (fact.extension == ext) return std::string(fact.mime);
     return "application/octet-stream";
+}
+
+bool mobi_extension(std::string_view ext) {
+    return ext == ".mobi" || ext == ".azw" || ext == ".azw3" || ext == ".prc";
 }
 
 bool book_extension(std::string_view ext) {

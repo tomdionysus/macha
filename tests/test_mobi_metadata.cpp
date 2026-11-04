@@ -2,6 +2,7 @@
 // The MOBI metadata reader over PDB files built here: the MOBI header and
 // EXTH fields, text encodings, the cover record, KF8 and combined files, and
 // the refusals of malformed databases.
+#include "catalogue/media_catalogue.hpp"
 #include "catalogue/mobi_metadata.hpp"
 #include "test_support.hpp"
 
@@ -229,12 +230,16 @@ MACHA_FAST_TEST("mobi_metadata", test_title_from_full_name_without_exth) {
     CHECK(!metadata.kf8);
 }
 
-MACHA_FAST_TEST("mobi_metadata", test_pdb_name_when_full_name_empty) {
+MACHA_FAST_TEST("mobi_metadata", test_the_internal_database_name_is_no_title) {
+    // No full name: the database's internal name is not the book's title.
     Header header;
     header.full_name = "";
     header.exth = {exth(100, "Someone")};
-    const auto metadata = read_bytes(book(header));
-    CHECK(metadata.title == "Test_Book");
+    CHECK(read_bytes(book(header)).title.empty());
+    // An updated title that only repeats it ("PratWher") is none either.
+    header.full_name = "Test_Book";
+    header.exth = {exth(503, "Test_Book")};
+    CHECK(read_bytes(book(header)).title.empty());
 }
 
 MACHA_FAST_TEST("mobi_metadata", test_updated_title_overrides_full_name) {
@@ -703,4 +708,64 @@ MACHA_FAST_TEST("mobi_metadata", test_truncation_and_flip_fuzz_never_crashes) {
     CHECK(returned + threw == 600);
     CHECK(returned > 0);
     CHECK(threw > 0);
+}
+
+MACHA_FAST_TEST("mobi_metadata", test_book_credits_titles_and_dates_read_as_a_reader_would) {
+    using Names = std::vector<std::string>;
+    CHECK((split_authors("Pratchett, Terry") == Names{"Terry Pratchett"}));
+    CHECK((split_authors("Le Guin, Ursula") == Names{"Ursula Le Guin"}));
+    CHECK((split_authors("Terry Pratchett, Stephen Briggs, Tina Hannan") ==
+           Names{"Terry Pratchett", "Stephen Briggs", "Tina Hannan"}));
+    CHECK((split_authors("Ian Stewart, Jack Cohen") == Names{"Ian Stewart", "Jack Cohen"}));
+    CHECK((split_authors("Pratchett, Terry; Baxter, Stephen") == Names{"Terry Pratchett", "Stephen Baxter"}));
+    CHECK((split_authors("Pratchett, Terry, Baxter, Stephen") == Names{"Terry Pratchett", "Stephen Baxter"}));
+    CHECK((split_authors("Terry Pratchett & Neil Gaiman") == Names{"Terry Pratchett", "Neil Gaiman"}));
+    CHECK((split_authors("Tolkien, J.R.R.") == Names{"J.R.R. Tolkien"}));
+    CHECK((split_authors("Jean-Luc Picard") == Names{"Jean-Luc Picard"}));
+    CHECK(split_authors("Unknown").empty());
+    CHECK((split_authors("Unknown & Terry Pratchett") == Names{"Terry Pratchett"}));
+
+    auto [steam, steam_series] = book_title_series("Raising Steam: (Discworld novel 40) (Discworld Novels)");
+    CHECK(steam == "Raising Steam");
+    REQUIRE(steam_series.size() == 1);
+    CHECK(steam_series.front().name == "Discworld");
+    CHECK(steam_series.front().index == std::optional<double>{40});
+    auto [gods, gods_series] = book_title_series("Small Gods: Discworld Novel, A");
+    CHECK(gods == "Small Gods");
+    REQUIRE(gods_series.size() == 1);
+    CHECK(gods_series.front().name == "Discworld");
+    CHECK(!gods_series.front().index);
+    auto [mort, mort_series] = book_title_series("Mort: A Discworld Novel");
+    CHECK(mort == "Mort");
+    CHECK(mort_series.size() == 1);
+    auto [plain, plain_series] = book_title_series("The Science of Discworld 1 - University of Warwick");
+    CHECK(plain == "The Science of Discworld 1 - University of Warwick");
+    CHECK(plain_series.empty());
+    auto [frank, frank_series] = book_title_series("Frankenstein: A Novel");
+    CHECK(frank == "Frankenstein");
+    CHECK(frank_series.empty());
+    auto [novel, novel_series] = book_title_series("A Novel");
+    CHECK(novel == "A Novel");
+    CHECK(novel_series.empty());
+
+    auto [spider, spider_series] = book_title_series("Spider-Man: Blue");
+    CHECK(spider == "Spider-Man: Blue");
+    CHECK(spider_series.empty());
+
+    auto disc = openlibrary_series("Discworld novels ; 4");
+    REQUIRE(disc.has_value());
+    CHECK(disc->name == "Discworld");
+    CHECK(disc->index == std::optional<double>{4});
+    REQUIRE(openlibrary_series("Discworld series").has_value());
+    CHECK(!openlibrary_series("Discworld series")->index);
+    CHECK(!openlibrary_series("Corgi books").has_value());
+    CHECK(!openlibrary_series("Penguin classics").has_value());
+
+    CHECK(book_date("2005-09-12T23:00:00+00:00") == "2005-09-13");
+    CHECK(book_date("2013-11-07T06:00:00+00:00") == "2013-11-07");
+    CHECK(book_date("1998-12-31T23:00:00+00:00") == "1999-01-01");
+    CHECK(book_date("2005-09-13T01:00:00+02:00") == "2005-09-13");
+    CHECK(book_date("2005-09-13T00:30:00Z") == "2005-09-13");
+    CHECK(book_date("2005-09-13") == "2005-09-13");
+    CHECK(book_date(" 2005 ") == "2005");
 }

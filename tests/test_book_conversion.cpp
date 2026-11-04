@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// BookConversions with a stand-in for ebook-convert: a shell script that
-// copies, fails or hangs, chosen by the output's extension.
+// BookConversions with a stand-in for mobitool: a shell script that
+// converts, fails or hangs, chosen by the book's contents.
 #include "catalogue/book_conversion.hpp"
 
 #include "test_support.hpp"
@@ -14,22 +14,32 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// Copies with a marker for epub, hangs for pdf, fails for fb2, writes
-// nothing for mobi.
+// Writes "converted:" and the input for an ordinary book; the input's first
+// word picks a failure: HANG sleeps, FAIL exits nonzero, EMPTY writes nothing.
 std::filesystem::path fake_converter(const std::filesystem::path& dir) {
-    const auto path = dir / "ebook-convert";
+    const auto path = dir / "mobitool";
     std::ofstream out(path);
     out << "#!/bin/sh\n"
-           "case \"$2\" in\n"
-           "  *.epub) { printf 'converted:'; cat \"$1\"; } > \"$2\" ;;\n"
-           "  *.azw3) printf 'ok' > \"$2\" ;;\n"
-           "  *.pdf) sleep 30 ;;\n"
-           "  *.fb2) echo 'conversion error: bad input' >&2; exit 3 ;;\n"
-           "  *.mobi) exit 0 ;;\n"
+           "[ \"$1\" = -e ] && [ \"$2\" = -o ] || exit 2\n"
+           "in=\"$4\"; name=$(basename \"$in\"); out=\"$3/${name%.*}.epub\"\n"
+           "case \"$(head -c 5 \"$in\")\" in\n"
+           "  HANG*) sleep 30 ;;\n"
+           "  FAIL*) echo 'bad input' >&2; exit 3 ;;\n"
+           "  EMPTY*) exit 0 ;;\n"
+           "  *) { printf 'converted:'; cat \"$in\"; } > \"$out\" ;;\n"
            "esac\n";
     out.close();
     std::filesystem::permissions(path, std::filesystem::perms::owner_all);
     return path;
+}
+
+// A Palm database whose first record marks its text encrypted.
+std::string encrypted_book() {
+    std::string bytes(86, '\0');
+    bytes[81] = 86; // record 0 at offset 86
+    std::string record0(16, '\0');
+    record0[13] = 2; // encryption type 2
+    return bytes + record0;
 }
 
 MediaContentSource source_of(std::string text, std::string name = "book.mobi") {
@@ -73,14 +83,15 @@ MACHA_TEST("book_conversion", test_conversions_run_report_fail_and_are_kept) {
     TempDir dir;
     BookConversionConfig config;
     config.enabled = true;
-    config.ebook_convert = fake_converter(dir.path());
+    config.mobitool = fake_converter(dir.path());
     config.timeout = 1s;
     config.max_concurrent = 2;
-    const std::string media = "macha:" + std::string(64, 'a');
+    const auto id = [](char c) { return "macha:" + std::string(64, c); };
+    const std::string media = id('a');
     {
         BookConversions conversions(config, dir.path() / "state");
         conversions.start();
-        CHECK((conversions.formats() == std::vector<std::string>{"epub", "azw3", "mobi", "pdf", "fb2"}));
+        CHECK((conversions.formats() == std::vector<std::string>{"epub"}));
         CHECK(!conversions.state(media, "epub").has_value());
         CHECK(!conversions.content(media, "epub").has_value());
 
@@ -95,38 +106,48 @@ MACHA_TEST("book_conversion", test_conversions_run_report_fail_and_are_kept) {
         // Asking again answers ready without converting again.
         CHECK(conversions.request(media, "epub", source_of("OTHER")).phase == ConversionState::Phase::ready);
         CHECK(read_all(*conversions.content(media, "epub")) == "converted:BOOK");
+        // An AZW3 converts the same way.
+        conversions.request(id('e'), "epub", source_of("KF8", "book.AZW3"));
+        CHECK(wait_settled(conversions, id('e'), "epub").phase == ConversionState::Phase::ready);
 
-        auto failed = conversions.request(media, "fb2", source_of("BOOK"));
+        auto failed = conversions.request(id('f'), "epub", source_of("FAIL"));
         CHECK(failed.phase == ConversionState::Phase::converting);
-        auto settled = wait_settled(conversions, media, "fb2");
+        auto settled = wait_settled(conversions, id('f'), "epub");
         CHECK(settled.phase == ConversionState::Phase::failed);
         CHECK(settled.error_code == "conversion_failed");
-        CHECK(!conversions.content(media, "fb2").has_value());
+        CHECK(!conversions.content(id('f'), "epub").has_value());
 
-        auto empty = conversions.request(media, "mobi", source_of("BOOK"));
-        (void)empty;
-        CHECK(wait_settled(conversions, media, "mobi").error_code == "conversion_failed");
+        conversions.request(id('1'), "epub", source_of("EMPTY"));
+        CHECK(wait_settled(conversions, id('1'), "epub").error_code == "conversion_failed");
 
-        conversions.request(media, "pdf", source_of("BOOK"));
-        auto hung = wait_settled(conversions, media, "pdf");
-        CHECK(hung.error_code == "conversion_timed_out");
+        conversions.request(id('2'), "epub", source_of("HANG"));
+        CHECK(wait_settled(conversions, id('2'), "epub").error_code == "conversion_timed_out");
+
+        // An encrypted book is refused without running the converter.
+        conversions.request(id('3'), "epub", source_of(encrypted_book()));
+        CHECK(wait_settled(conversions, id('3'), "epub").error_code == "encrypted");
+
+        // A source mobitool does not read, or another format, is refused at once.
+        auto pdf = conversions.request(id('4'), "epub", source_of("BOOK", "book.pdf"));
+        CHECK(pdf.phase == ConversionState::Phase::failed);
+        CHECK(pdf.error_code == "unsupported_source");
+        CHECK(conversions.request(media, "azw3", source_of("BOOK")).phase == ConversionState::Phase::failed);
 
         // Too large a source is refused before anything runs.
         config.max_source_bytes = 2;
         BookConversions small(config, dir.path() / "small-state");
-        auto refused = small.request(media, "azw3", source_of("BOOK"));
+        auto refused = small.request(media, "epub", source_of("BOOK"));
         CHECK(refused.phase == ConversionState::Phase::failed);
         CHECK(refused.error_code == "source_too_large");
-        CHECK(small.request(media, "docx", source_of("BOOK")).phase == ConversionState::Phase::failed);
 
         // An unreadable source fails as such.
         MediaContentSource broken{100, "book.mobi",
                                   [](uint64_t, std::span<uint8_t>) -> size_t { throw std::runtime_error("gone"); }};
-        conversions.request(media, "azw3", broken);
-        CHECK(wait_settled(conversions, media, "azw3").error_code == "source_unreadable");
+        conversions.request(id('5'), "epub", broken);
+        CHECK(wait_settled(conversions, id('5'), "epub").error_code == "source_unreadable");
         // A failed one is tried again when asked.
-        CHECK(conversions.request(media, "azw3", source_of("BOOK")).phase == ConversionState::Phase::converting);
-        CHECK(wait_settled(conversions, media, "azw3").phase == ConversionState::Phase::ready);
+        CHECK(conversions.request(id('5'), "epub", source_of("BOOK")).phase == ConversionState::Phase::converting);
+        CHECK(wait_settled(conversions, id('5'), "epub").phase == ConversionState::Phase::ready);
         conversions.stop();
     }
 
@@ -148,7 +169,7 @@ MACHA_TEST("book_conversion", test_the_cache_keeps_the_most_recently_served_with
     TempDir dir;
     BookConversionConfig config;
     config.enabled = true;
-    config.ebook_convert = fake_converter(dir.path());
+    config.mobitool = fake_converter(dir.path());
     config.cache_limit = 64ULL * 1024 * 1024;
     BookConversions conversions(config, dir.path() / "state");
     conversions.start();
@@ -170,12 +191,12 @@ MACHA_TEST("book_conversion", test_stop_kills_a_running_conversion) {
     TempDir dir;
     BookConversionConfig config;
     config.enabled = true;
-    config.ebook_convert = fake_converter(dir.path());
+    config.mobitool = fake_converter(dir.path());
     config.timeout = 60s;
     BookConversions conversions(config, dir.path() / "state");
     conversions.start();
     const std::string media = "macha:" + std::string(64, 'd');
-    conversions.request(media, "pdf", source_of("BOOK"));
+    conversions.request(media, "epub", source_of("HANG"));
     std::this_thread::sleep_for(300ms);
     const auto started = std::chrono::steady_clock::now();
     conversions.stop();

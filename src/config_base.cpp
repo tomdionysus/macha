@@ -330,8 +330,8 @@ void validate(Config& config) {
         throw std::runtime_error("books.conversion requires books.enabled");
     if (config.books.conversion.enabled) {
         const auto& conversion = config.books.conversion;
-        if (conversion.ebook_convert.empty() || !conversion.ebook_convert.is_absolute())
-            throw std::runtime_error("books.conversion.ebook_convert must be an absolute path");
+        if (conversion.mobitool.empty() || !conversion.mobitool.is_absolute())
+            throw std::runtime_error("books.conversion.mobitool must be an absolute path");
         if (conversion.max_concurrent < 1 || conversion.max_concurrent > 16)
             throw std::runtime_error("books.conversion.max_concurrent must be 1..16");
         if (conversion.timeout < std::chrono::seconds(10) || conversion.timeout > std::chrono::hours(2))

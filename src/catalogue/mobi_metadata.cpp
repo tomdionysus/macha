@@ -513,9 +513,12 @@ MobiMetadata read_mobi_metadata(uint64_t size,
         }
     }
 
+    // A title that is only the database's internal name ("PratWher") is no
+    // title; the folders and file name say what the book is called.
     out.title = header_title(header);
-    if (out.title.empty())
-        out.title = collapse_whitespace(trim(database.name));
+    if (out.title.find(' ') == std::string::npos &&
+        out.title == collapse_whitespace(trim(database.name)))
+        out.title.clear();
 
     for (const auto& record : header.exth) {
         if (record.type != exth_author)

@@ -543,15 +543,15 @@ torrent:
 #   root: /var/lib/macha/web
 #   index: index.html
 
-# Book support: the books scan provider and conversion between formats.
-# Conversion runs Calibre's ebook-convert, installed separately.
+# Book support: the books scan provider and MOBI to EPUB conversion.
+# Conversion runs libmobi's mobitool, installed separately (libmobi-tools).
 books:
   enabled: false
   conversion:
     enabled: false
-    ebook_convert: /usr/bin/ebook-convert
+    mobitool: /usr/bin/mobitool
     cache_limit: 10G
-    timeout_ms: 600000
+    timeout_ms: 60000
     max_concurrent: 1
 
 # Playback and transcoding, through linked FFmpeg libraries.

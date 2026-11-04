@@ -1,6 +1,30 @@
 # Current release
 
-## 0.92.1: books read from their own files, and converted
+## 0.92.2: book credits, titles, series and dates read properly
+
+The first real library showed what a Kindle file's record really holds. An
+author stored surname first (`Pratchett, Terry`) is now the same author as
+`Terry Pratchett`; a comma list of full names is split at every comma, not
+only the first; `Unknown` is no author. A title that only repeats the file's
+internal database name (`PratWher`) is no title, so the folders and file name
+give it. Book text keeps its punctuation: `J.R.R. Tolkien`, `Spider-Man` and
+the dash in a subtitle are no longer taken for file name separators.
+
+Store clutter comes off a file's title and names the series, the only series
+information a MOBI has: `Raising Steam: (Discworld novel 40) (Discworld
+Novels)` is Raising Steam in Discworld at 40, and `Small Gods: Discworld
+Novel, A` is Small Gods in Discworld. An Open Library edition's series is used
+when the file gives none and the entry says it is a series. `published` is a
+plain date when the file holds a timestamp, the nearest day to it, since tools
+write a local midnight in UTC.
+
+`.azw` and `.prc` files are catalogued as books, served as
+`application/x-mobipocket-ebook`, read for metadata and converted, from one
+definition of a Kindle file. The book rules move to version 3, so the scanner
+reads its books again and replaces them with no operator action; their ids
+may change, their media ids do not.
+
+## 0.92.1: books read from their own files, and MOBI converted to EPUB
 
 The first library catalogued under 0.92.0 came out wrong: MOBI files laid
 out as `Title/Author/Title - Author.mobi` with a `cover.jpg` beside each were
@@ -25,11 +49,13 @@ under older rules is read again from its file and replaced, with any author
 or series only it named. A book edited by hand is left alone. The books
 already catalogued are corrected this way with no operator action.
 
-Books can be converted between EPUB, AZW3, MOBI, PDF and FB2 on request:
-`PUT /api/v1/catalogue/media/{id}/conversions/{format}` starts a conversion
-with Calibre's `ebook-convert`, run as a low-priority child process, and
-`.../content` serves the result with ranges. Converted copies are kept on
-the node within a cache limit.
+A MOBI or AZW3 book can be converted to EPUB on request:
+`PUT /api/v1/catalogue/media/{id}/conversions/epub` starts a conversion with
+libmobi's `mobitool` (Debian: `libmobi-tools`), run as a low-priority child
+process so a book that breaks the parser fails only itself, and
+`.../content` serves the result with ranges. An encrypted (DRM) book is
+refused with `encrypted`. Converted copies are kept on the node within a
+cache limit.
 
 Book support is switchable like BitTorrent: `-DMACHA_ENABLE_BOOKS=OFF` builds
 without it, and `books.enabled` (default off) turns it on per node, scanning
