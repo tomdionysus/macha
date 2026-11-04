@@ -377,16 +377,16 @@ struct TorrentSearchProviderConfig {
     size_t max_results{100};
 };
 
-// Converting a book into another format with Calibre's ebook-convert, which
-// is installed separately; nothing links it.
+// Converting MOBI and AZW3 books into EPUB with libmobi's mobitool, which is
+// installed separately; nothing links it.
 struct BookConversionConfig {
     bool enabled{false};
-    std::filesystem::path ebook_convert{"/usr/bin/ebook-convert"};
+    std::filesystem::path mobitool{"/usr/bin/mobitool"};
     // Converted copies, kept on this node only. Empty means
     // <state_path>/book-conversions.
     std::filesystem::path cache_path;
     uint64_t cache_limit{10ULL * 1024 * 1024 * 1024};
-    std::chrono::milliseconds timeout{std::chrono::minutes(10)};
+    std::chrono::milliseconds timeout{std::chrono::minutes(1)};
     size_t max_concurrent{1};
     // The source a conversion may read; larger books are refused.
     uint64_t max_source_bytes{512ULL * 1024 * 1024};

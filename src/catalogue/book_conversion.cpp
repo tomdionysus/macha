@@ -34,6 +34,25 @@ bool supported_format(std::string_view format) {
            BookConversions::supported.end();
 }
 
+bool supported_source(const std::string& name) { return mobi_extension(path_extension(name)); }
+
+uint32_t be32(const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+
+// Whether the Palm database's first record says the text is encrypted (DRM).
+// An unreadable header is left to the converter to refuse.
+bool encrypted_mobi(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    uint8_t header[86]{};
+    if (!in.read(reinterpret_cast<char*>(header), sizeof header)) return false;
+    const auto record0 = be32(header + 78);
+    uint8_t palmdoc[14]{};
+    in.seekg(record0);
+    if (!in.read(reinterpret_cast<char*>(palmdoc), sizeof palmdoc)) return false;
+    return (uint16_t(palmdoc[12]) << 8 | palmdoc[13]) != 0;
+}
+
 // Runs `argv` in its own process group at low priority, output to `log`.
 // The pid, or -1.
 pid_t spawn(const std::vector<std::string>& argv, const std::filesystem::path& log) {
@@ -56,8 +75,6 @@ pid_t spawn(const std::vector<std::string>& argv, const std::filesystem::path& l
         dup2(null, STDIN_FILENO);
         close(null);
     }
-    // Calibre's tools need no display for conversion.
-    setenv("QT_QPA_PLATFORM", "offscreen", 1);
     execve(args[0], args.data(), environ);
     _exit(127);
 }
@@ -124,6 +141,11 @@ ConversionState BookConversions::request(const std::string& media_id, const std:
     if (!supported_format(format)) {
         state.phase = ConversionState::Phase::failed;
         state.error_code = "conversion_failed";
+        return state;
+    }
+    if (!supported_source(source.name)) {
+        state.phase = ConversionState::Phase::failed;
+        state.error_code = "unsupported_source";
         return state;
     }
     if (const auto ready = this->state(media_id, format);
@@ -212,29 +234,26 @@ void BookConversions::work(std::stop_token stop) {
             queue_.pop_front();
         }
         auto result = convert(job);
+        // Evicted first: a conversion reported ready finds the cache within its limit.
+        if (result.phase == ConversionState::Phase::ready) evict();
         {
             Lock lock(mutex_);
             states_[job.key] = result;
         }
-        if (result.phase == ConversionState::Phase::ready) evict();
     }
 }
 
 ConversionState BookConversions::convert(const Job& job) {
     ConversionState result{ConversionState::Phase::failed, job.key.media_id, job.key.format, 0, {}};
-    const auto stem = cache_stem(job.key.media_id);
-    const auto work = cache_path_ / "work";
-    auto source_ext = path_extension(job.source.name);
-    if (source_ext.empty()) source_ext = ".bin";
-    const auto input = work / (stem + "-" + job.key.format + "-in" + source_ext);
-    const auto output = work / (stem + "-" + job.key.format + "-out." + job.key.format);
-    const auto log = work / (stem + "-" + job.key.format + ".log");
+    const auto work = cache_path_ / "work" / (cache_stem(job.key.media_id) + "-" + job.key.format);
+    // mobitool names its output after the input: book.<ext> becomes out/book.epub.
+    const auto input = work / ("book" + path_extension(job.source.name));
+    const auto output = work / "out" / ("book." + job.key.format);
+    const auto log = work / "log";
     std::error_code ec;
-    const auto cleanup = [&] {
-        std::filesystem::remove(input, ec);
-        std::filesystem::remove(output, ec);
-        std::filesystem::remove(log, ec);
-    };
+    const auto cleanup = [&] { std::filesystem::remove_all(work, ec); };
+    std::filesystem::remove_all(work, ec);
+    std::filesystem::create_directories(work / "out", ec);
 
     // The source, copied whole first: the child reads a plain file.
     {
@@ -259,9 +278,15 @@ ConversionState BookConversions::convert(const Job& job) {
             return result;
         }
     }
+    if (encrypted_mobi(input)) {
+        cleanup();
+        result.error_code = "encrypted";
+        Log::info("book conversion refused media=" + job.key.media_id + ": the book is encrypted");
+        return result;
+    }
 
     const auto started = std::chrono::steady_clock::now();
-    const auto pid = spawn({config_.ebook_convert.string(), input.string(), output.string()}, log);
+    const auto pid = spawn({config_.mobitool.string(), "-e", "-o", (work / "out").string(), input.string()}, log);
     if (pid < 0) {
         cleanup();
         result.error_code = "conversion_failed";

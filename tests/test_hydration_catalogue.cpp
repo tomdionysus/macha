@@ -5911,8 +5911,8 @@ MACHA_TEST("hydration_catalogue", test_mobi_books_in_title_author_folders_are_re
 }
 
 MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue_api) {
-    // The conversion routes over a stand-in ebook-convert: refused for a
-    // file that is not a book, an unknown format or the book's own format;
+    // The conversion routes over a stand-in mobitool: refused for a file
+    // that is not a book, an unknown format or the book's own format;
     // started, polled and served with ranges; deleted; and conversion_unavailable
     // where the node has none.
     CatalogueNode node("books-convert");
@@ -5938,15 +5938,15 @@ MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue
     movie.media_ids = {movie_id};
     node.catalogue().upsert_many({author, book, movie});
 
-    const auto converter = node.path() / "ebook-convert";
+    const auto converter = node.path() / "mobitool";
     {
         std::ofstream out(converter);
-        out << "#!/bin/sh\n{ printf 'EPUB:'; cat \"$1\"; } > \"$2\"\n";
+        out << "#!/bin/sh\nname=$(basename \"$4\")\n{ printf 'EPUB:'; cat \"$4\"; } > \"$3/${name%.*}.epub\"\n";
     }
     std::filesystem::permissions(converter, std::filesystem::perms::owner_all);
     BookConversionConfig conversion;
     conversion.enabled = true;
-    conversion.ebook_convert = converter;
+    conversion.mobitool = converter;
     BookConversions conversions(conversion, node.path() / "conversion-state");
     conversions.start();
     const auto content = [&](const std::string& media_id) -> std::optional<MediaContentSource> {
@@ -5975,8 +5975,7 @@ MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue
     CHECK(unavailable.status == 503);
     CHECK(api_body(unavailable).find("error")->find("code")->asString() == "conversion_unavailable");
     CHECK(call(api, "PUT", base + "docx").status == 400);
-    CHECK(call(api, "PUT", base + "mobi").status == 400);
-    CHECK(api_body(call(api, "PUT", base + "mobi")).find("error")->asString() == "same_format");
+    CHECK(api_body(call(api, "PUT", base + "mobi")).find("error")->asString() == "bad_format");
     auto not_book = call(api, "PUT", "/api/v1/catalogue/media/" + movie_id + "/conversions/epub");
     CHECK(not_book.status == 422);
     CHECK(api_body(not_book).find("error")->asString() == "not_a_book");

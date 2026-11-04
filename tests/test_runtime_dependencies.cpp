@@ -258,13 +258,13 @@ MACHA_FAST_TEST("runtime_dependencies", test_books_enabled_is_the_one_switch_for
     CHECK(load_yaml_config(yaml).catalogue.scanner.books.enabled);
     write("books:\n  enabled: true\ncatalogue:\n  scanner:\n    providers:\n      books:\n        enabled: false\n");
     CHECK(!load_yaml_config(yaml).catalogue.scanner.books.enabled);
-    write("books:\n  enabled: true\n  conversion:\n    enabled: true\n    ebook_convert: /usr/bin/ebook-convert\n"
+    write("books:\n  enabled: true\n  conversion:\n    enabled: true\n    mobitool: /usr/bin/mobitool\n"
           "    cache_limit: 1G\n    timeout_ms: 60000\n    max_concurrent: 2\n");
     const auto converting = load_yaml_config(yaml);
     CHECK(converting.books.conversion.enabled);
     CHECK(converting.books.conversion.cache_limit == 1024ULL * 1024 * 1024);
     CHECK(converting.books.conversion.max_concurrent == 2);
-    write("books:\n  enabled: true\n  conversion:\n    enabled: true\n    ebook_convert: ebook-convert\n");
+    write("books:\n  enabled: true\n  conversion:\n    enabled: true\n    mobitool: mobitool\n");
     CHECK(refusal().find("must be an absolute path") != std::string::npos);
 #else
     write("books:\n  enabled: true\n");

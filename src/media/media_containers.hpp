@@ -34,6 +34,8 @@ std::string segment_mime(std::string_view name);
 
 // Whether the name is a book's (EPUB, PDF, MOBI, AZW3, FB2, CBZ).
 bool book_extension(std::string_view ext);
+// A Mobipocket or Kindle file: .mobi, .azw, .azw3, .prc.
+bool mobi_extension(std::string_view ext);
 // Content-Type for serving a stored file as it is, by its name alone: books
 // by their format, media by their container, anything else as octet-stream.
 std::string file_mime(std::string_view path);

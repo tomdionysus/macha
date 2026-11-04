@@ -1016,14 +1016,41 @@ std::string name_slug(std::string_view value) {
     return out;
 }
 
-// "Terry Pratchett & Neil Gaiman", "A, B", "A and B", "A; B": the credited
-// names. "Pratchett, Terry" is one name: a comma splits only names of more
-// than one word each.
+// A title or name as a book records it: "Spider-Man" and "J.R.R. Tolkien"
+// keep their punctuation, which clean_title takes for file name separators.
+std::string book_text(std::string value) {
+    std::replace(value.begin(), value.end(), '_', ' ');
+    std::string out;
+    bool space = true;
+    for (unsigned char c : value) {
+        if (std::isspace(c)) {
+            if (!space) out.push_back(' ');
+            space = true;
+        } else {
+            out.push_back(static_cast<char>(c));
+            space = false;
+        }
+    }
+    return trim(out);
+}
+
+// A credit that names nobody: "Unknown", which tools write for no author.
+bool placeholder_author(std::string_view name) {
+    const auto key = comparable_title(name);
+    return key == "unknown" || key == "unknown author" || key == "unknown authors" || key == "author";
+}
+
+} // namespace
+
+// "Terry Pratchett & Neil Gaiman", "A, B, C", "A and B", "A; B": the credited
+// names. "Pratchett, Terry" and "Le Guin, Ursula" are one name, surname
+// first, and become "Terry Pratchett"; a comma splits names of more than one
+// word each. A placeholder such as "Unknown" is no name.
 std::vector<std::string> split_authors(std::string_view value) {
     std::vector<std::string> out;
     const auto add = [&](std::string name) {
-        name = clean_title(std::move(name));
-        if (name.empty()) return;
+        name = book_text(std::move(name));
+        if (name.empty() || placeholder_author(name)) return;
         for (const auto& existing : out)
             if (comparable_title(existing) == comparable_title(name)) return;
         out.push_back(std::move(name));
@@ -1051,30 +1078,149 @@ std::vector<std::string> split_authors(std::string_view value) {
         if (at == std::string::npos) break;
         pos = at + 1;
     }
+    const auto words = [](const std::string& name) { return name.find(' ') != std::string::npos; };
     for (const auto& part : parts) {
-        const auto comma = part.find(',');
-        if (comma != std::string::npos) {
-            const auto left = clean_title(part.substr(0, comma));
-            const auto right = clean_title(part.substr(comma + 1));
-            const bool both_full = left.find(' ') != std::string::npos &&
-                                   right.find(' ') != std::string::npos;
-            if (both_full) {
-                add(left);
-                add(right);
-                continue;
-            }
+        std::vector<std::string> pieces;
+        size_t from = 0;
+        while (true) {
+            const auto comma = part.find(',', from);
+            auto piece = book_text(part.substr(from, comma == std::string::npos ? std::string::npos : comma - from));
+            if (!piece.empty()) pieces.push_back(std::move(piece));
+            if (comma == std::string::npos) break;
+            from = comma + 1;
         }
-        add(part);
+        if (pieces.size() < 2) {
+            add(part);
+        } else if (std::all_of(pieces.begin(), pieces.end(), words)) {
+            // Full names in a list. Two pieces that are both full names are
+            // a list too ("Ian Stewart, Jack Cohen").
+            for (const auto& piece : pieces) add(piece);
+        } else if (pieces.size() == 2) {
+            add(pieces[1] + " " + pieces[0]);
+        } else if (pieces.size() % 2 == 0 &&
+                   std::none_of(pieces.begin(), pieces.end(), words)) {
+            // "Pratchett, Terry, Baxter, Stephen": surname-first pairs.
+            for (size_t i = 0; i < pieces.size(); i += 2) add(pieces[i + 1] + " " + pieces[i]);
+        } else {
+            add(part);
+        }
     }
     return out;
 }
+
+// A file's title with a store's series clutter taken off, and the series it
+// names: "Raising Steam: (Discworld novel 40) (Discworld Novels)" is
+// "Raising Steam" in Discworld at 40; "Small Gods: Discworld Novel, A" is
+// "Small Gods" in Discworld.
+std::pair<std::string, std::vector<MediaProbeSeries>> book_title_series(std::string title) {
+    std::vector<MediaProbeSeries> series;
+    const auto note = [&](std::string name, std::optional<double> index) {
+        name = book_text(std::move(name));
+        static const std::regex article(R"(^(?:an?|the)\s+)", std::regex::icase);
+        name = std::regex_replace(name, article, "");
+        const auto key = comparable_title(name);
+        if (key.empty() || key == "a" || key == "an" || key == "the") return;
+        for (auto& existing : series)
+            if (comparable_title(existing.name) == comparable_title(name)) {
+                if (!existing.index) existing.index = index;
+                return;
+            }
+        series.push_back({std::move(name), index});
+    };
+    static const std::regex bracketed(
+        R"(^(.*?)\s*[:\-]?\s*\(\s*([^()]*?)\s+(?:novel|novels|book|books|series)\s*#?\s*([0-9]+(?:\.[0-9]+)?)?\s*\)\s*$)",
+        std::regex::icase);
+    static const std::regex trailing(
+        R"(^(.*\S)\s*[:\-]\s*(?:an?\s+)?([^:()]*?)\s+novel(?:\s*,\s*an?)?\s*$)", std::regex::icase);
+    std::smatch match;
+    for (int guard = 0; guard < 4; ++guard) {
+        if (std::regex_match(title, match, bracketed) && !match[1].str().empty()) {
+            note(match[2].str(), match[3].matched ? std::optional<double>(std::stod(match[3].str())) : std::nullopt);
+            title = match[1].str();
+        } else if (std::regex_match(title, match, trailing)) {
+            note(match[2].str(), std::nullopt);
+            title = match[1].str();
+        } else {
+            break;
+        }
+    }
+    title = book_text(std::move(title));
+    while (!title.empty() && (title.back() == ':' || title.back() == '-' || title.back() == ' ')) title.pop_back();
+    return {title, series};
+}
+
+// An Open Library edition's series entry, when it says it is a series:
+// "Discworld series", "Discworld novels ; 4". A bare "Corgi books" is usually
+// the publisher's imprint and is not taken.
+std::optional<MediaProbeSeries> openlibrary_series(std::string_view value) {
+    std::string text = book_text(std::string(value));
+    std::optional<double> index;
+    static const std::regex numbered(
+        R"(^(.*?)\s*(?:--|#|;|,|\bno\.?|\bbook|\bvol\.?|\bnumber)\s*([0-9]+(?:\.[0-9]+)?)\s*$)",
+        std::regex::icase);
+    std::smatch match;
+    if (std::regex_match(text, match, numbered)) {
+        index = std::stod(match[2].str());
+        text = match[1].str();
+    }
+    static const std::regex named(R"(^(?:(?:an?|the)\s+)?(.*\S)\s+(?:series|novels?|sequence|saga)$)",
+                                  std::regex::icase);
+    if (!std::regex_match(text, match, named)) return std::nullopt;
+    return MediaProbeSeries{book_text(match[1].str()), index};
+}
+
+// A book's publication date as a date. A timestamp ("2005-09-12T23:00:00+00:00",
+// a local midnight a tool wrote in UTC) is the nearest day to it.
+std::string book_date(std::string value) {
+    value = trim(value);
+    static const std::regex stamp(
+        R"(^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?\s*(Z|[+-]\d{2}:?\d{2})?$)");
+    std::smatch m;
+    if (!std::regex_match(value, m, stamp)) return value;
+    // Days from 1970-01-01 for a proleptic Gregorian date, and back.
+    const auto days_from_civil = [](int64_t y, int64_t mo, int64_t d) {
+        y -= mo <= 2;
+        const int64_t era = (y >= 0 ? y : y - 399) / 400;
+        const int64_t yoe = y - era * 400;
+        const int64_t doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+        const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        return era * 146097 + doe - 719468;
+    };
+    int64_t minutes = days_from_civil(std::stoll(m[1]), std::stoll(m[2]), std::stoll(m[3])) * 1440 +
+                      std::stoll(m[4]) * 60 + std::stoll(m[5]);
+    if (m[6].matched && m[6].str() != "Z") {
+        const auto zone = m[6].str();
+        const int64_t sign = zone[0] == '-' ? -1 : 1;
+        const auto digits = zone.substr(1);
+        const int64_t hours = std::stoll(digits.substr(0, 2));
+        const int64_t mins = std::stoll(digits.substr(digits.size() - 2));
+        minutes -= sign * (hours * 60 + mins);
+    }
+    int64_t z = (minutes + 720) / 1440 - ((minutes + 720) % 1440 < 0 ? 1 : 0);
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const int64_t doe = z - era * 146097;
+    const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const int64_t mp = (5 * doy + 2) / 153;
+    const int64_t d = doy - (153 * mp + 2) / 5 + 1;
+    const int64_t mo = mp + (mp < 10 ? 3 : -9);
+    const int64_t y = yoe + era * 400 + (mo <= 2);
+    char out[64];
+    std::snprintf(out, sizeof out, "%04lld-%02lld-%02lld", static_cast<long long>(y),
+                  static_cast<long long>(mo), static_cast<long long>(d));
+    return out;
+}
+
+namespace {
 
 // What an EPUB says about itself, as a probe: authors are the creators with
 // no role or the author's role.
 MediaProbe probe_from_epub(const EpubMetadata& epub) {
     MediaProbe probe;
     probe.kind = MediaProbeKind::book;
-    probe.title = clean_title(epub.title);
+    auto [title, title_series] = book_title_series(book_text(epub.title));
+    probe.title = std::move(title);
     for (const auto& creator : epub.creators) {
         if (!creator.role.empty() && creator.role != "aut") continue;
         for (auto& name : split_authors(creator.name))
@@ -1082,15 +1228,16 @@ MediaProbe probe_from_epub(const EpubMetadata& epub) {
                 probe.authors.push_back(std::move(name));
     }
     for (const auto& collection : epub.series) {
-        const auto name = clean_title(collection.name);
+        const auto name = book_text(collection.name);
         if (name.empty()) continue;
         probe.book_series.push_back({name, collection.position});
     }
+    if (probe.book_series.empty()) probe.book_series = std::move(title_series);
     probe.isbn = epub.isbn13;
     if (epub.language && !epub.language->empty()) probe.language = trim(*epub.language);
     if (epub.publisher && !epub.publisher->empty()) probe.publisher = trim(*epub.publisher);
     if (epub.date && !epub.date->empty()) {
-        probe.published = trim(*epub.date);
+        probe.published = book_date(*epub.date);
         probe.year = year_from(*probe.published);
     }
     if (epub.description) probe.description = *epub.description;
@@ -1669,7 +1816,7 @@ std::vector<MediaProbeCandidate> probe_host_media_candidates(const std::filesyst
         embedded = embedded_music_metadata_from_host(path);
     }
 #if MACHA_HAVE_BOOKS
-    else if (ext == ".epub" || ext == ".mobi" || ext == ".azw3" || ext == ".azw") {
+    else if (ext == ".epub" || mobi_extension(ext)) {
         try {
             embedded = ext == ".epub" ? probe_from_epub(read_epub_metadata(path))
                                       : probe_from_mobi_file(path);
@@ -3256,7 +3403,16 @@ std::optional<ProviderMatch> OpenLibraryProvider::lookup(const MediaProbe& probe
         }
         if (!enriched.published) {
             const auto date = json_string(edition->find("publish_date"));
-            if (!date.empty()) enriched.published = date;
+            if (!date.empty()) enriched.published = book_date(date);
+        }
+        if (enriched.book_series.empty()) {
+            if (const auto* series = edition->find("series"); series && series->isArray())
+                for (const auto& entry : series->asArray())
+                    if (entry.isString())
+                        if (auto parsed = openlibrary_series(entry.asString())) {
+                            enriched.book_series.push_back(std::move(*parsed));
+                            break;
+                        }
         }
         if (!enriched.language) {
             if (const auto* languages = edition->find("languages"); languages && languages->isArray() &&
@@ -3530,7 +3686,7 @@ MediaProbeFile BookScanProvider::probe_file(FileSystem& fs, std::string_view roo
     std::vector<LocalArtworkCandidate> artwork;
     const auto normalized_path = normalize_path(std::string(path));
     const auto ext = path_extension(path);
-    if (entry.size && (ext == ".epub" || ext == ".mobi" || ext == ".azw3" || ext == ".azw")) {
+    if (entry.size && (ext == ".epub" || mobi_extension(ext))) {
         try {
             auto handle = fs.open_read(entry, normalized_path, false,
                                        catalogue_media_profile_frame_type());
