@@ -1,5 +1,42 @@
 # Current release
 
+## 0.92.1: books read from their own files, and converted
+
+The first library catalogued under 0.92.0 came out wrong: MOBI files laid
+out as `Title/Author/Title - Author.mobi` with a `cover.jpg` beside each were
+catalogued with title and author swapped, no ISBN and no cover. 0.92.0 read
+metadata from EPUB files only, never looked beside a book, assumed
+`Author/Title` folders, and catalogued a book from its first reading of the
+path as soon as Open Library did not know it, so the other reading was never
+tried.
+
+A MOBI or AZW3 header is now read like an EPUB package: title, authors,
+ISBN, publisher, date, description, language and the embedded cover, with
+only the header and the cover image fetched. Calibre's `metadata.opf` beside
+a book fills what the file lacks, the series most often, and a cover image
+beside it (`cover.jpg`, `folder.jpg`, or one named after the book) is used
+when the file has none. A file name `Title - Author` whose two halves are
+both folders above it is read that way round, whatever the folder order,
+and Calibre's `(id)` is not part of a title. Open Library is tried with both
+readings of a path before the file's own reading stands.
+
+Each scanner book records the version of these rules; a scanner book made
+under older rules is read again from its file and replaced, with any author
+or series only it named. A book edited by hand is left alone. The books
+already catalogued are corrected this way with no operator action.
+
+Books can be converted between EPUB, AZW3, MOBI, PDF and FB2 on request:
+`PUT /api/v1/catalogue/media/{id}/conversions/{format}` starts a conversion
+with Calibre's `ebook-convert`, run as a low-priority child process, and
+`.../content` serves the result with ranges. Converted copies are kept on
+the node within a cache limit.
+
+Book support is switchable like BitTorrent: `-DMACHA_ENABLE_BOOKS=OFF` builds
+without it, and `books.enabled` (default off) turns it on per node, scanning
+and conversion together; `books.conversion.enabled` adds conversion. A node
+without book support still reads catalogues holding books and serves their
+files. The `books` scan provider now follows `books.enabled`.
+
 ## 0.92.0: books
 
 Ebooks are a media class beside films, TV and music. The catalogue gains

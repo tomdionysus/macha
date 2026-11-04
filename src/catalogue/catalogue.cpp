@@ -2136,7 +2136,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                                          std::optional<Hash256> expected_namespace,
                                          const std::map<std::string, MediaProbeResult, std::less<>>& profiles,
                                          const std::set<std::string>& vanished_media,
-                                         FrameType frame) {
+                                         FrameType frame,
+                                         const std::map<std::string, std::set<std::string>>& superseded) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
     auto [expected_root, view] = installed();
@@ -2217,6 +2218,49 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
         item.updated_ns = wall_time_ns();
         current.put(std::move(item));
         changed = true;
+    }
+
+    // A replaced scanner item gives up the files its replacement took, and
+    // goes when it has none left; an author or series it alone named goes
+    // with it.
+    if (!superseded.empty()) {
+        std::set<std::string> discovered_ids;
+        for (const auto& item : discovered) discovered_ids.insert(item.id);
+        for (const auto& [id, files] : superseded) {
+            if (discovered_ids.contains(id)) continue;
+            const auto* found = current.item(id);
+            if (!found || catalogue_item_locked(*found)) continue;
+            auto item = *found;
+            std::erase_if(item.media_ids, [&](const std::string& media) { return files.contains(media); });
+            if (item.media_ids.empty()) {
+                current.erase(id);
+            } else {
+                ++item.revision;
+                item.updated_ns = wall_time_ns();
+                current.put(std::move(item));
+            }
+            changed = true;
+        }
+        for (bool removed = true; removed;) {
+            removed = false;
+            std::set<std::string> referenced;
+            current.for_each_item([&](const std::string&, const CatalogueItem& item) {
+                referenced.insert(item.author_ids.begin(), item.author_ids.end());
+                for (const auto& ref : item.series) referenced.insert(ref.series_id);
+            });
+            std::vector<std::string> orphans;
+            current.for_each_item([&](const std::string& id, const CatalogueItem& item) {
+                const auto marker = item.external_ids.find("macha_scanner");
+                const bool scanner = marker != item.external_ids.end() && marker->second == "1";
+                if (scanner && catalogue_referenced_kind(item.kind) && !catalogue_item_locked(item) &&
+                    !referenced.contains(id))
+                    orphans.push_back(id);
+            });
+            for (const auto& id : orphans) {
+                current.erase(id);
+                removed = true;
+            }
+        }
     }
 
     if (prune_missing) {

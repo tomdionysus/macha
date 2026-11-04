@@ -321,6 +321,24 @@ void validate(Config& config) {
         throw std::runtime_error("torrent.listen_port must be nonzero");
     if (config.torrent.enabled && !config.ingest.enabled)
         throw std::runtime_error("torrent requires ingest.enabled");
+#if !MACHA_HAVE_BOOKS
+    if (config.books.enabled)
+        throw std::runtime_error(
+            "books.enabled: this build has no book support (MACHA_ENABLE_BOOKS was off)");
+#endif
+    if (config.books.conversion.enabled && !config.books.enabled)
+        throw std::runtime_error("books.conversion requires books.enabled");
+    if (config.books.conversion.enabled) {
+        const auto& conversion = config.books.conversion;
+        if (conversion.ebook_convert.empty() || !conversion.ebook_convert.is_absolute())
+            throw std::runtime_error("books.conversion.ebook_convert must be an absolute path");
+        if (conversion.max_concurrent < 1 || conversion.max_concurrent > 16)
+            throw std::runtime_error("books.conversion.max_concurrent must be 1..16");
+        if (conversion.timeout < std::chrono::seconds(10) || conversion.timeout > std::chrono::hours(2))
+            throw std::runtime_error("books.conversion.timeout_ms must be 10000..7200000");
+        if (conversion.cache_limit < 64ULL * 1024 * 1024)
+            throw std::runtime_error("books.conversion.cache_limit must be at least 64M");
+    }
     // Plugin presence is a runtime fact: without libmacha-torrent the
     // subsystem shows unavailable in Status and /api/v1/torrents/* answers 503.
     if (!config.torrent.max_active || config.torrent.max_active > 64)

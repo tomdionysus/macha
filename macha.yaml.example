@@ -400,6 +400,16 @@ catalogue:
           enabled: false
           # token_file: /etc/macha-discogs.token
 
+      # Books under /Books: runs when books.enabled is set (below). Open
+      # Library needs no key but asks for a contact; cover_size is S, M or L.
+      books:
+        roots:
+          - /Books
+        openlibrary:
+          enabled: true
+          contact: https://github.com/tomdionysus/macha
+          cover_size: L
+
   # The HTTP API and web client.
   api:
     enabled: true
@@ -532,6 +542,17 @@ torrent:
 #   enabled: true
 #   root: /var/lib/macha/web
 #   index: index.html
+
+# Book support: the books scan provider and conversion between formats.
+# Conversion runs Calibre's ebook-convert, installed separately.
+books:
+  enabled: false
+  conversion:
+    enabled: false
+    ebook_convert: /usr/bin/ebook-convert
+    cache_limit: 10G
+    timeout_ms: 600000
+    max_concurrent: 1
 
 # Playback and transcoding, through linked FFmpeg libraries.
 streaming:

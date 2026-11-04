@@ -514,7 +514,10 @@ class CatalogueManager {
                            std::optional<Hash256> expected_namespace = std::nullopt,
                            const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {},
                            const std::set<std::string>& vanished_media = {},
-                           FrameType frame = FrameType::speculative);
+                           FrameType frame = FrameType::speculative,
+                           // Items a match replaces, each with the files it
+                           // takes from them; an item left with none goes.
+                           const std::map<std::string, std::set<std::string>>& superseded = {});
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     // The maintenance inventory's catalogue half, called in order (spec A4):
     // the head (may read the committed record when behind), then the read of

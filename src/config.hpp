@@ -310,8 +310,9 @@ struct CatalogueOpenLibraryConfig {
     std::string cover_size{"L"};
 };
 
-// Off until the operator has a books root: a configured root that does not
-// exist makes every scan partial, and a partial scan prunes nothing.
+// Follows books.enabled unless its own block says otherwise; never on
+// without it. A configured root that does not exist makes every scan
+// partial, and a partial scan prunes nothing.
 struct CatalogueBookProviderConfig {
     bool enabled{false};
     std::vector<std::string> roots{"/Books"};
@@ -374,6 +375,28 @@ struct TorrentSearchProviderConfig {
     std::string url;
     std::optional<std::filesystem::path> api_key_file;
     size_t max_results{100};
+};
+
+// Converting a book into another format with Calibre's ebook-convert, which
+// is installed separately; nothing links it.
+struct BookConversionConfig {
+    bool enabled{false};
+    std::filesystem::path ebook_convert{"/usr/bin/ebook-convert"};
+    // Converted copies, kept on this node only. Empty means
+    // <state_path>/book-conversions.
+    std::filesystem::path cache_path;
+    uint64_t cache_limit{10ULL * 1024 * 1024 * 1024};
+    std::chrono::milliseconds timeout{std::chrono::minutes(10)};
+    size_t max_concurrent{1};
+    // The source a conversion may read; larger books are refused.
+    uint64_t max_source_bytes{512ULL * 1024 * 1024};
+};
+
+// Book support on this node: the books scan provider and conversion. A
+// build without MACHA_ENABLE_BOOKS refuses enabled: true.
+struct BooksConfig {
+    bool enabled{false};
+    BookConversionConfig conversion;
 };
 
 struct TorrentConfig {
@@ -579,6 +602,7 @@ struct Config {
     CatalogueConfig catalogue;
     IngestConfig ingest;
     TorrentConfig torrent;
+    BooksConfig books;
     StreamingConfig streaming;
     HydrationConfig hydration;
     RuntimeConfig runtime;

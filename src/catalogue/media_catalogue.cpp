@@ -7,7 +7,10 @@
 #include "supervised.hpp"
 #include "macha_version.hpp"
 #include "media/media_metadata.hpp"
+#if MACHA_HAVE_BOOKS
 #include "catalogue/epub_metadata.hpp"
+#include "catalogue/mobi_metadata.hpp"
+#endif
 #include "media/media_containers.hpp"
 #include "catalogue/media_information.hpp"
 
@@ -1004,6 +1007,7 @@ class TagsWithStructuredPathMusicCandidateGenerator final : public MediaProbeCan
     }
 };
 
+#if MACHA_HAVE_BOOKS
 // "Terry Pratchett" as an id component: "terry-pratchett".
 std::string name_slug(std::string_view value) {
     auto out = normalized(value);
@@ -1093,6 +1097,24 @@ MediaProbe probe_from_epub(const EpubMetadata& epub) {
     return probe;
 }
 
+// A probe from a Mobipocket or KF8 header, shaped as the EPUB one is.
+MediaProbe probe_from_mobi(const MobiMetadata& mobi) {
+    EpubMetadata as_epub;
+    as_epub.title = mobi.title;
+    for (const auto& author : mobi.authors) as_epub.creators.push_back({author, "aut", {}});
+    as_epub.isbn13 = mobi.isbn13;
+    as_epub.language = mobi.language;
+    as_epub.publisher = mobi.publisher;
+    as_epub.date = mobi.date;
+    as_epub.description = mobi.description;
+    as_epub.series = mobi.series;
+    return probe_from_epub(as_epub);
+}
+
+MediaProbe probe_from_mobi_file(const std::filesystem::path& path) {
+    return probe_from_mobi(read_mobi_metadata(path));
+}
+
 // "08 - Guards! Guards!", "8. Guards", "1.5 Novella": a series position and
 // the title after it.
 std::optional<std::pair<double, std::string>> series_numbered_title(std::string_view value) {
@@ -1106,9 +1128,16 @@ std::optional<std::pair<double, std::string>> series_numbered_title(std::string_
 }
 
 // A title folder "The Colour of Magic (1983)": the title and its year.
+// Calibre's "Title (123)" library id is not part of the title.
 std::pair<std::string, std::optional<int32_t>> book_title_and_year(std::string_view value) {
-    const auto year = year_from(value);
     std::string title(value);
+    static const std::regex calibre_id(R"(^(.*\S)\s+\((\d+)\)\s*$)");
+    std::smatch id_match;
+    if (std::regex_match(title, id_match, calibre_id)) {
+        const auto number = std::stoll(id_match[2].str().substr(0, 9));
+        if (number < 1000 || number > plausible_year_ceiling()) title = id_match[1].str();
+    }
+    const auto year = year_from(title);
     if (year) title = remove_year_token(title, *year);
     return {clean_title(title), year};
 }
@@ -1145,6 +1174,31 @@ class StructuredBookCandidateGenerator final : public MediaProbeCandidateGenerat
         auto probe = make_probe(context.path, context.entry, MediaProbeKind::book);
         std::vector<std::string> evidence;
         const auto file_stem = stem(context.path);
+
+        // "Title - Author.ext" whose two halves are both folders above it, in
+        // either order (Title/Author or Calibre's Author/Title): the file name
+        // says which is the title.
+        static const std::regex two_parts(R"(^\s*(.+?)\s+-\s+(.+?)\s*$)");
+        std::smatch halves;
+        if (std::regex_match(file_stem, halves, two_parts)) {
+            std::set<std::string> folders;
+            for (size_t i = root_parts.size(); i + 1 < parts.size(); ++i)
+                folders.insert(comparable_title(book_title_and_year(parts[i]).first));
+            const auto first = book_title_and_year(halves[1].str());
+            const auto second = clean_title(halves[2].str());
+            if (folders.contains(comparable_title(first.first)) &&
+                folders.contains(comparable_title(second))) {
+                probe.title = first.first;
+                probe.year = first.second;
+                probe.authors = split_authors(second);
+                for (size_t i = root_parts.size(); i + 1 < parts.size(); ++i)
+                    if (const auto year = book_title_and_year(parts[i]).second; year && !probe.year)
+                        probe.year = year;
+                if (!probe.title.empty() && !probe.authors.empty())
+                    return {{std::move(probe), 820, std::string(name()),
+                             {"file name as title - author, both halves folders above it"}}};
+            }
+        }
         if (relative == 2) {
             // Author/Title.epub, or Series/NN Title.epub.
             const auto& folder = parts[parts.size() - 2];
@@ -1225,6 +1279,8 @@ class FilenameBookCandidateGenerator final : public MediaProbeCandidateGenerator
     }
 };
 
+#endif
+
 std::vector<std::unique_ptr<MediaProbeCandidateGenerator>> default_candidate_generators() {
     std::vector<std::unique_ptr<MediaProbeCandidateGenerator>> generators;
     generators.push_back(std::make_unique<FilenameEpisodeCandidateGenerator>());
@@ -1238,9 +1294,11 @@ std::vector<std::unique_ptr<MediaProbeCandidateGenerator>> default_candidate_gen
     generators.push_back(std::make_unique<TagsWithStructuredPathMusicCandidateGenerator>());
     generators.push_back(std::make_unique<RecordingFirstStructuredMusicCandidateGenerator>());
     generators.push_back(std::make_unique<StructuredMusicCandidateGenerator>());
+#if MACHA_HAVE_BOOKS
     generators.push_back(std::make_unique<EmbeddedBookCandidateGenerator>());
     generators.push_back(std::make_unique<StructuredBookCandidateGenerator>());
     generators.push_back(std::make_unique<FilenameBookCandidateGenerator>());
+#endif
     return generators;
 }
 
@@ -1609,15 +1667,19 @@ std::vector<MediaProbeCandidate> probe_host_media_candidates(const std::filesyst
     const auto ext = lower(path.extension().string());
     if (audio_extension(ext)) {
         embedded = embedded_music_metadata_from_host(path);
-    } else if (ext == ".epub") {
+    }
+#if MACHA_HAVE_BOOKS
+    else if (ext == ".epub" || ext == ".mobi" || ext == ".azw3" || ext == ".azw") {
         try {
-            embedded = probe_from_epub(read_epub_metadata(path));
+            embedded = ext == ".epub" ? probe_from_epub(read_epub_metadata(path))
+                                      : probe_from_mobi_file(path);
             embedded->path = path.generic_string();
         } catch (const std::exception& e) {
             Log::debug("catalogue book metadata unavailable path=" + path.string() +
                        " reason=" + e.what());
         }
     }
+#endif
     return probe_media_candidates(MediaProbeContext{{}, path.generic_string(), entry,
                                                      embedded ? &*embedded : nullptr});
 }
@@ -2828,6 +2890,7 @@ std::optional<ProviderMatch> DiscogsProvider::lookup(const MediaProbe& probe) {
     add_art(result.artwork, album.id, "cover", discogs_image_url(*release));
     return result;
 }
+#if MACHA_HAVE_BOOKS
 
 std::optional<ProviderMatch> book_match_from_probe(const MediaProbe& probe) {
     if (probe.kind != MediaProbeKind::book || probe.title.empty() || probe.authors.empty())
@@ -2849,6 +2912,7 @@ std::optional<ProviderMatch> book_match_from_probe(const MediaProbe& probe) {
         book.external_ids["openlibrary_edition"] = *probe.openlibrary_edition_id;
     if (probe.openlibrary_work_id) book.external_ids["openlibrary_work"] = *probe.openlibrary_work_id;
     book.media_ids = {probe.media_id};
+    book.external_ids["macha_book_rules"] = std::string(catalogue_book_rules);
     scanner_marker(book);
 
     for (const auto& name : probe.authors) {
@@ -3281,6 +3345,8 @@ std::vector<ArtworkOption> OpenLibraryProvider::artwork_options(std::string_view
     return out;
 }
 
+#endif
+
 MovieScanProvider::MovieScanProvider(HttpClient& http, CatalogueMovieProviderConfig config)
     : roots_(std::move(config.roots)) {
     if (config.tmdb.enabled) {
@@ -3406,6 +3472,7 @@ std::optional<ProviderMatch> MusicScanProvider::lookup(const MediaProbe& probe) 
     return {};
 }
 
+#if MACHA_HAVE_BOOKS
 BookScanProvider::BookScanProvider(HttpClient& http, CatalogueBookProviderConfig config,
                                    size_t max_artwork_bytes,
                                    std::shared_ptr<ProviderGate> openlibrary_gate, bool interactive)
@@ -3419,31 +3486,129 @@ bool BookScanProvider::accepts_path(std::string_view path) const noexcept {
     return book_extension(path_extension(path));
 }
 
+namespace {
+
+// What the sidecar record adds to the file's own: only what the file lacks.
+void fill_from(MediaProbe& probe, const MediaProbe& sidecar) {
+    if (probe.title.empty()) probe.title = sidecar.title;
+    if (probe.authors.empty()) probe.authors = sidecar.authors;
+    if (probe.book_series.empty()) probe.book_series = sidecar.book_series;
+    if (!probe.isbn) probe.isbn = sidecar.isbn;
+    if (!probe.language) probe.language = sidecar.language;
+    if (!probe.publisher) probe.publisher = sidecar.publisher;
+    if (!probe.published) probe.published = sidecar.published;
+    if (!probe.year) probe.year = sidecar.year;
+    if (probe.description.empty()) probe.description = sidecar.description;
+}
+
+std::string image_mime(std::string_view name) {
+    const auto ext = path_extension(name);
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".png") return "image/png";
+    if (ext == ".webp") return "image/webp";
+    return {};
+}
+
+Bytes read_namespace_file(FileSystem& fs, const std::string& path, const FsEntry& entry) {
+    auto handle = fs.open_read(entry, path, false, catalogue_media_profile_frame_type());
+    Bytes bytes(static_cast<size_t>(entry.size));
+    size_t done = 0;
+    while (done < bytes.size()) {
+        const auto read = handle->read(done, std::span<uint8_t>(bytes).subspan(done));
+        if (!read) break;
+        done += read;
+    }
+    bytes.resize(done);
+    return bytes;
+}
+
+} // namespace
+
 MediaProbeFile BookScanProvider::probe_file(FileSystem& fs, std::string_view root,
                                             std::string_view path, const FsEntry& entry) {
     std::optional<MediaProbe> embedded;
     std::vector<LocalArtworkCandidate> artwork;
-    if (path_extension(path) == ".epub" && entry.size) {
+    const auto normalized_path = normalize_path(std::string(path));
+    const auto ext = path_extension(path);
+    if (entry.size && (ext == ".epub" || ext == ".mobi" || ext == ".azw3" || ext == ".azw")) {
         try {
-            auto handle = fs.open_read(entry, std::string(path), false,
+            auto handle = fs.open_read(entry, normalized_path, false,
                                        catalogue_media_profile_frame_type());
-            EpubReadLimits limits;
-            limits.max_cover_bytes = max_artwork_bytes_;
-            const auto epub = read_epub_metadata(
-                entry.size,
-                [&](uint64_t offset, std::span<uint8_t> into) { return handle->read(offset, into); },
-                limits);
-            auto probe = probe_from_epub(epub);
-            probe.path = normalize_path(std::string(path));
+            const auto from = [&](uint64_t offset, std::span<uint8_t> into) {
+                return handle->read(offset, into);
+            };
+            MediaProbe probe;
+            std::optional<EpubCover> cover;
+            if (ext == ".epub") {
+                EpubReadLimits limits;
+                limits.max_cover_bytes = max_artwork_bytes_;
+                auto epub = read_epub_metadata(entry.size, from, limits);
+                probe = probe_from_epub(epub);
+                cover = std::move(epub.cover);
+            } else {
+                MobiReadLimits limits;
+                limits.max_cover_bytes = max_artwork_bytes_;
+                auto mobi = read_mobi_metadata(entry.size, from, limits);
+                probe = probe_from_mobi(mobi);
+                cover = std::move(mobi.cover);
+            }
+            probe.path = normalized_path;
             probe.media_id = file_media_id(entry);
             if (!probe.title.empty()) embedded = std::move(probe);
-            if (epub.cover && !epub.cover->bytes.empty())
-                artwork.push_back({"cover", epub.cover->mime_type, epub.cover->bytes});
+            if (cover && !cover->bytes.empty())
+                artwork.push_back({"cover", cover->mime_type, std::move(cover->bytes)});
         } catch (const std::exception& e) {
             Log::debug("catalogue book metadata unavailable path=" + std::string(path) +
                        " reason=" + e.what());
         }
     }
+
+    // What sits beside the book: Calibre's metadata.opf, and a cover image
+    // when the folder holds this one book or the image is named after it.
+    const auto slash = normalized_path.find_last_of('/');
+    const auto directory = slash == 0 ? std::string("/") : normalized_path.substr(0, slash);
+    try {
+        const auto siblings = fs.readdir(directory);
+        size_t books_here = 0;
+        for (const auto& [name, sibling] : siblings)
+            if (sibling.type == EntryType::file && book_extension(path_extension(name))) ++books_here;
+        const auto book_stem = lower(stem(normalized_path));
+        for (const auto& [name, sibling] : siblings) {
+            if (sibling.type != EntryType::file || !sibling.size) continue;
+            const auto sibling_path = directory == "/" ? "/" + name : directory + "/" + name;
+            const auto lowered = lower(name);
+            if (lowered == "metadata.opf" && sibling.size <= 1024 * 1024) {
+                try {
+                    const auto bytes = read_namespace_file(fs, sibling_path, sibling);
+                    auto opf = probe_from_epub(read_opf_metadata(
+                        std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size())));
+                    opf.path = normalized_path;
+                    opf.media_id = file_media_id(entry);
+                    if (embedded) fill_from(*embedded, opf);
+                    else if (!opf.title.empty()) embedded = std::move(opf);
+                } catch (const std::exception& e) {
+                    Log::debug("catalogue book sidecar unreadable path=" + sibling_path +
+                               " reason=" + e.what());
+                }
+                continue;
+            }
+            const auto mime = image_mime(name);
+            if (mime.empty() || !artwork.empty() || sibling.size > max_artwork_bytes_) continue;
+            const auto image_stem = lower(stem(name));
+            const bool named_for_book = image_stem == book_stem;
+            const bool folder_cover = (image_stem == "cover" || image_stem == "folder") && books_here == 1;
+            if (!named_for_book && !folder_cover) continue;
+            try {
+                artwork.push_back({"cover", mime, read_namespace_file(fs, sibling_path, sibling)});
+            } catch (const std::exception& e) {
+                Log::debug("catalogue book cover unreadable path=" + sibling_path +
+                           " reason=" + e.what());
+            }
+        }
+    } catch (const std::exception& e) {
+        Log::debug("catalogue book folder unreadable path=" + directory + " reason=" + e.what());
+    }
+
     MediaProbeContext context{root, path, entry, embedded ? &*embedded : nullptr};
     auto candidates = probe_media_candidates(context);
     std::erase_if(candidates, [](const auto& candidate) {
@@ -3455,10 +3620,21 @@ MediaProbeFile BookScanProvider::probe_file(FileSystem& fs, std::string_view roo
 
 // The provider's record when it has one; else the file's own. A provider
 // outage never keeps a book out of the catalogue.
+// A path that names one author and a title can be read either way round;
+// the provider decides, and the probe's own reading stands when it cannot.
 std::optional<ProviderMatch> BookScanProvider::lookup(const MediaProbe& probe) {
     if (metadata_ && metadata_->supports(probe.kind)) {
+        std::vector<MediaProbe> readings{probe};
+        const bool from_path = !probe.isbn && probe.authors.size() == 1 && !probe.title.empty();
+        if (from_path) {
+            auto swapped = probe;
+            swapped.title = probe.authors.front();
+            swapped.authors = {probe.title};
+            readings.push_back(std::move(swapped));
+        }
         try {
-            if (auto match = metadata_->lookup(probe)) return match;
+            for (const auto& reading : readings)
+                if (auto match = metadata_->lookup(reading)) return match;
         } catch (const ProviderBudgetExhausted&) {
             throw;
         } catch (const ProviderTemporarilyUnavailable& e) {
@@ -3468,6 +3644,8 @@ std::optional<ProviderMatch> BookScanProvider::lookup(const MediaProbe& probe) {
     }
     return book_match_from_probe(probe);
 }
+
+#endif
 
 CatalogueScanner::CatalogueScanner(NodeRuntime& node, MetadataServer& metadata_server, FileSystem& fs,
                                    CatalogueManager& catalogue, CatalogueHintQueue& hints,
@@ -3496,9 +3674,11 @@ void CatalogueScanner::configure_providers() {
         if (config_.music.enabled)
             out.push_back(std::make_unique<MusicScanProvider>(
                 http, config_.music, config_.max_artwork_bytes, musicbrainz_gate_, interactive));
+#if MACHA_HAVE_BOOKS
         if (config_.books.enabled)
             out.push_back(std::make_unique<BookScanProvider>(
                 http, config_.books, config_.max_artwork_bytes, openlibrary_gate_, interactive));
+#endif
         return out;
     };
     providers_ = build(*provider_http_, false);
@@ -3847,9 +4027,11 @@ std::optional<ProviderRef> parse_provider_ref(std::string_view ref) {
     if (out.provider == "tmdb" && (out.kind == "movie" || out.kind == "tv") && digits(out.id))
         return out;
     if (out.provider == "musicbrainz" && out.kind == "release" && mbid(out.id)) return out;
+#if MACHA_HAVE_BOOKS
     if (out.provider == "openlibrary" && ((out.kind == "edition" && openlibrary_olid(out.id, 'M')) ||
                                           (out.kind == "work" && openlibrary_olid(out.id, 'W'))))
         return out;
+#endif
     return {};
 }
 
@@ -4212,6 +4394,20 @@ CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::st
     return catalogue_.upsert(*item, item->revision, frame);
 }
 
+namespace {
+
+// A book the scanner made under older book rules: its file is read again and
+// the item replaced. A hand-edited book is the operator's and is kept.
+bool stale_scanner_book(const CatalogueItem& item) {
+    if (item.kind != CatalogueKind::book || catalogue_item_locked(item)) return false;
+    const auto scanner = item.external_ids.find("macha_scanner");
+    if (scanner == item.external_ids.end() || scanner->second != "1") return false;
+    const auto rules = item.external_ids.find("macha_book_rules");
+    return rules == item.external_ids.end() || rules->second != catalogue_book_rules;
+}
+
+} // namespace
+
 std::optional<CatalogueScanner::PreparedHintMatch>
 CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
                                const MetadataSnapshot& namespace_snapshot,
@@ -4269,9 +4465,12 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     const auto media_id = file_media_id(entry);
     auto existing = catalogue_.snapshot_view();
     std::vector<std::string> existing_ids;
+    std::vector<std::string> superseded;
     for (const auto& [id, item] : existing->items()) {
-        if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) != item.media_ids.end())
-            existing_ids.push_back(id);
+        if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) == item.media_ids.end())
+            continue;
+        if (stale_scanner_book(item)) superseded.push_back(id);
+        else existing_ids.push_back(id);
     }
 
     const bool manual_refresh = std::any_of(
@@ -4283,7 +4482,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     if (!existing_ids.empty() && !manual_refresh) {
         return PreparedHintMatch{hint.id, std::string(provider->name()), media_id,
                                  std::move(existing_ids), {},
-                                 "already catalogued", hint.attempts, {}};
+                                 "already catalogued", hint.attempts, {}, {}};
     }
 
     auto probed = provider->probe_file(fs_, root, hint.path, entry);
@@ -4330,7 +4529,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         }
         return PreparedHintMatch{hint.id, std::string(provider->name()), media_id,
                                  std::move(existing_ids), std::move(updates),
-                                 "already catalogued", hint.attempts, {}};
+                                 "already catalogued", hint.attempts, {}, {}};
     }
 
     constexpr size_t max_candidate_attempts = 5;
@@ -4448,9 +4647,11 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     std::vector<std::string> item_ids;
     item_ids.reserve(match.items.size());
     for (const auto& item : match.items) item_ids.push_back(item.id);
-    return PreparedHintMatch{hint.id, std::string(provider->name()), probe.media_id,
-                             std::move(item_ids), std::move(match.items),
-                             "matched " + selected_candidate->generator, hint.attempts, {}};
+    PreparedHintMatch prepared{hint.id, std::string(provider->name()), probe.media_id,
+                               std::move(item_ids), std::move(match.items),
+                               "matched " + selected_candidate->generator, hint.attempts, {}, {}};
+    prepared.superseded = std::move(superseded);
+    return prepared;
 }
 
 CatalogueScanner::HintBatchResult
@@ -4571,16 +4772,19 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
     std::vector<CatalogueItem> discovered;
     std::set<std::string> active_media_ids;
     std::map<std::string, MediaProbeResult, std::less<>> media_profiles;
+    std::map<std::string, std::set<std::string>> superseded;
     for (const auto& match : prepared) {
         active_media_ids.insert(match.media_id);
         discovered.insert(discovered.end(), match.items.begin(), match.items.end());
         if (match.media_profile)
             media_profiles[match.media_id] = *match.media_profile;
+        for (const auto& id : match.superseded) superseded[id].insert(match.media_id);
     }
 
     try {
         if (!discovered.empty() || !media_profiles.empty())
-            catalogue_.reconcile_scanner(discovered, active_media_ids, false, {}, media_profiles);
+            catalogue_.reconcile_scanner(discovered, active_media_ids, false, {}, media_profiles,
+                                         {}, FrameType::speculative, superseded);
     } catch (const CatalogueConflict& e) {
         for (const auto& match : prepared)
             hints_.defer(match.hint_id, "catalogue_conflict", e.what(), unix_ms() + 500);
@@ -4686,7 +4890,8 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
     auto existing = catalogue_.snapshot_view();
     std::set<std::string> bound;
     for (const auto& [_, item] : existing->items())
-        bound.insert(item.media_ids.begin(), item.media_ids.end());
+        if (!stale_scanner_book(item))
+            bound.insert(item.media_ids.begin(), item.media_ids.end());
 
     std::set<std::string> active_media_ids;
     std::vector<CatalogueHintSubmission> submissions;
