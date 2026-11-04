@@ -153,16 +153,31 @@ class TracedNode {
     std::unique_ptr<Service> service_;
     std::vector<std::pair<std::string, ObjectId>> watched_;
 
-    // Objects held and claimed per store and class, and for each named object
-    // whether it is held and claimed.
+    // Whether a CONTROL object is a namespace tree node. A node carries its
+    // entries' times and authors, so how many nodes a tree has, and which a
+    // later tree shares, differs from run to run: a trace counts the rest.
+    static bool namespace_node(const std::optional<Bytes>& bytes) {
+        static constexpr std::array<std::string_view, 4> magics{"MNL1", "MNB1", "MNX1", "MNY1"};
+        if (!bytes || bytes->size() < 4)
+            return false;
+        const std::string_view head(reinterpret_cast<const char*>(bytes->data()), 4);
+        return std::find(magics.begin(), magics.end(), head) != magics.end();
+    }
+
+    // Objects held and claimed per store and class (CONTROL without the
+    // namespace tree), and for each named object whether it is held and
+    // claimed.
     std::vector<std::string> state() {
         auto& local = service_->local_state();
+        size_t control_claims = 0;
+        for (const auto& id : local.retention().retained_ids(RetentionClass::control))
+            if (!namespace_node(local.control().get(id)))
+                ++control_claims;
         std::vector<std::string> lines{
             "state: data_objects=" + std::to_string(local.data().list().size()) +
             " data_claims=" +
             std::to_string(local.retention().retained_ids(RetentionClass::data).size()) +
-            " control_claims=" +
-            std::to_string(local.retention().retained_ids(RetentionClass::control).size())};
+            " control_claims=" + std::to_string(control_claims)};
         for (const auto& [name, id] : watched_)
             lines.push_back("object " + name + ": held=" +
                             (local.data().has(id) ? "1" : "0") + " claimed=" +
@@ -214,6 +229,9 @@ class TracedNode {
         return config_;
     }
     Service& start() {
+        // How many claims a pass releases counts superseded tree nodes too
+        // (see namespace_node); what is left claimed is in the state.
+        trace_.ignore("release.control");
         ServiceInstruments instruments;
         instruments.clock = clock_;
         instruments.trace = [this](std::string_view kind, std::string_view detail) {

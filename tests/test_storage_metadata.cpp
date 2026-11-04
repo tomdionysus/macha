@@ -4573,16 +4573,14 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
 
     auto& service = fixture.start();
     MetadataManager metadata(service.node(), service.local_state(), service.metadata_server(), service.store());
-    auto committed = metadata.mutate_delta([](MetadataSnapshot& snapshot, MetadataDelta&) {
-        FsEntry entry;
-        entry.type = EntryType::directory;
-        entry.mode = 0755;
-        snapshot.entries["/full-fallback"] = entry;
-        // The supplied exact delta omits the entry: the local replica must reject it
-        // and retry with the full record, as a remote replica does.
+    const auto root = object_id(pattern(97, 5));
+    auto committed = metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta&) {
+        // The supplied exact delta omits the change: the local replica must reject
+        // it and retry with the full record, as a remote replica does.
+        snapshot.catalogue_root = root;
     });
 
-    CHECK(service.filesystem().getattr("/full-fallback").type == EntryType::directory);
+    CHECK(metadata.snapshot().catalogue_root == root);
     auto history = service.local_state().replica().history_entry(committed.hash);
     REQUIRE(history.has_value());
     CHECK(history->body == MetadataHistoryEntry::Body::full);
