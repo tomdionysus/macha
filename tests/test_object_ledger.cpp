@@ -1259,7 +1259,9 @@ MACHA_FAST_TEST("object_ledger", test_verification_resumes_after_a_restart) {
     const auto key = key_of(17);
     {
         LocalStore store(root, ledgered(ledger), key);
-        REQUIRE(wait_until([&] { return std::filesystem::exists(ledger / "seeded"); }, 10s));
+        // The store's own answer, not the marker file: the marker lands
+        // before the record is seeded in memory.
+        REQUIRE(wait_until([&] { return store.held_view().identity.complete; }, 10s));
         CHECK(store.verify_step(100).directories == 100);
     }
     LocalStore store(root, ledgered(ledger), key);

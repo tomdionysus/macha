@@ -211,14 +211,15 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // after twice the delay before, up to repair_retry_cap.
     static void retry_later(std::map<ObjectId, RepairRetry>&, const ObjectId&, Clock::time_point now);
     // The push pass over a given list: the last object taken from it, the
-    // list's identity, and whether the pass is over a list at all.
+    // list's identity (its version when the caller gives one, else its data
+    // address), and whether the pass is over a list at all.
     std::optional<ObjectId> repair_push_after_;
-    std::optional<const ObjectId*> repair_push_identity_;
+    std::optional<uint64_t> repair_push_identity_;
     bool repair_push_listed_{};
     // The live set's identity when no generation is given: its data, or none
     // for no live set.
     std::optional<const ObjectId*> repair_live_identity_;
-    std::optional<const ObjectId*> repair_pull_identity_;
+    std::optional<uint64_t> repair_pull_identity_;
     uint64_t repair_live_generation_{};
     bool repair_push_complete_{};
     bool repair_pull_complete_{};
@@ -479,7 +480,11 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // it does not know, and settles at once an object every owner holds.
     // `push`, sorted, is what the push pass considers instead of walking the
     // store: the objects some peer is known to lack, so a node whose peers
-    // lack nothing reads no directory to find that out.
+    // lack nothing reads no directory to find that out. A list is told apart
+    // from the one before by `pull_version` and `push_version`, which the
+    // caller advances whenever it refills a list; without a version (zero)
+    // the list's data address stands in, which a caller that refills a
+    // vector in place must not rely on.
     uint64_t repair_once(uint64_t byte_budget = 0,
                          std::optional<std::span<const ObjectId>> live = std::nullopt);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
@@ -490,7 +495,8 @@ class DistributedStore final : public Placement, public ControlObjectSource {
                              std::optional<std::span<const ObjectId>> pull = std::nullopt,
                              const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>&
                                  known_present = {},
-                             std::optional<std::span<const ObjectId>> push = std::nullopt);
+                             std::optional<std::span<const ObjectId>> push = std::nullopt,
+                             uint64_t pull_version = 0, uint64_t push_version = 0);
     uint64_t scrub_once(uint64_t byte_budget = 0);
     RepairDiagnostics repair_diagnostics() const;
 

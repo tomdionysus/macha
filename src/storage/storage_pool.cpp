@@ -1013,7 +1013,8 @@ StoragePool::gc_step(const IdLookup& live,
                      const std::function<bool()>& should_yield,
                      const std::function<bool(const ObjectId&)>& is_retained,
                      UnreferencedSince* sightings, uint64_t now_unix_ms,
-                     std::chrono::milliseconds unreferenced_grace) {
+                     std::chrono::milliseconds unreferenced_grace,
+                     const std::function<ClaimGuard(const ObjectId&)>& claim_guard) {
     MaintenanceResult result;
     while (!operation_budget || result.objects < operation_budget) {
         if (should_yield && should_yield()) {
@@ -1043,9 +1044,14 @@ StoragePool::gc_step(const IdLookup& live,
         }
 
         try {
-            // Re-check immediately before irreversible deletion. A foreground
-            // metadata publication may install a retention claim after this GC
-            // slice acquired its inventory but before it reaches this object.
+            // Re-check immediately before irreversible deletion, under the
+            // claim guard: a foreground metadata publication may install a
+            // retention claim after this GC slice acquired its inventory, and
+            // the guard keeps one from landing between the check and the
+            // delete.
+            std::optional<ClaimGuard> guard;
+            if (claim_guard)
+                guard.emplace(claim_guard(id));
             if (is_retained && is_retained(id))
                 continue;
             // Object age is the orphan grace for data that never reached a
