@@ -406,17 +406,14 @@ MetadataSnapshot populated_snapshot(std::map<std::string, FsEntry> entries) {
 MACHA_TEST("namespace_tree", test_an_sm14_record_points_at_the_namespace_instead_of_carrying_it) {
     const auto entries = library(20, 10);
     const auto snapshot = populated_snapshot(entries);
-    const auto sm13 = encode_snapshot(snapshot);
-
     MemoryNamespaceNodeStore store;
     const auto detached = detach_namespace(snapshot, store);
     REQUIRE(detached.namespace_root.has_value());
     CHECK(detached.entries.empty());
     const auto sm14 = encode_snapshot_v14(detached);
 
-    // SM13 carries the library; SM14 carries cluster state plus a 32-byte root.
+    // SM14 carries cluster state plus a 32-byte root, whatever the library.
     CHECK(sm14.size() < 1024);
-    CHECK(sm13.size() > 100 * sm14.size());
 
     // Decoding needs no store: a record does not materialise its namespace.
     const auto decoded = decode_snapshot(sm14);
@@ -424,12 +421,12 @@ MACHA_TEST("namespace_tree", test_an_sm14_record_points_at_the_namespace_instead
     CHECK(*decoded.namespace_root == *detached.namespace_root);
     CHECK(decoded.entries.empty());
 
-    // Re-encoding the reattached snapshot as SM13 reproduces the original
-    // payload byte for byte, covering every other field.
+    // Detaching the reattached snapshot again reproduces the payload byte for
+    // byte, covering every other field.
     const auto reattached = attach_namespace(decoded, store);
     CHECK(reattached.entries == entries);
     CHECK(!reattached.namespace_root.has_value());
-    CHECK(encode_snapshot(reattached) == sm13);
+    CHECK(encode_snapshot_v14(detach_namespace(reattached, store)) == sm14);
 }
 
 MACHA_TEST("namespace_tree", test_the_record_stops_growing_with_the_library) {
@@ -455,17 +452,8 @@ MACHA_TEST("namespace_tree", test_a_snapshot_never_carries_its_namespace_in_two_
     const auto snapshot = populated_snapshot(library(2, 2));
     const auto detached = detach_namespace(snapshot, store);
 
-    // SM13 has nowhere to put a root, so it refuses rather than dropping it.
+    // SM14 has nowhere to put entries, so it refuses rather than dropping them.
     bool refused = false;
-    try {
-        (void)encode_snapshot(detached);
-    } catch (const std::exception&) {
-        refused = true;
-    }
-    CHECK(refused);
-
-    // SM14 has nowhere to put entries, and refuses for the same reason.
-    refused = false;
     try {
         (void)encode_snapshot_v14(snapshot);
     } catch (const std::exception&) {

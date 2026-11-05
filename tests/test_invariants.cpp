@@ -8,6 +8,7 @@
 #include "api/users_api.hpp"
 
 #if defined(__linux__)
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #endif
@@ -546,6 +547,8 @@ Config config_for(const std::filesystem::path& path, const std::filesystem::path
 std::atomic_bool track_fsync{false};
 std::atomic_uint64_t fsync_calls{0};
 std::atomic_uint64_t syncfs_calls{0};
+// When set, syncfs_calls counts only a barrier on this directory.
+std::atomic<ino_t> syncfs_only_inode{0};
 #endif
 
 
@@ -2993,11 +2996,17 @@ MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_c
         fs.open_write("/generation.bin", true, false, WriteDurability::publication_generation);
     fsync_calls = 0;
     syncfs_calls = 0;
+    // The data store's barrier: the commit's tree nodes have their own, in the
+    // control store.
+    struct stat data_root {};
+    REQUIRE(::stat((fixture.path() / "publication-generation").c_str(), &data_root) == 0);
+    syncfs_only_inode = data_root.st_ino;
     track_fsync = true;
     REQUIRE(writer->write(0, bytes) == bytes.size());
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
     writer->commit();
     track_fsync = false;
+    syncfs_only_inode = 0;
 
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
     auto reader = fs.open_read("/generation.bin");
@@ -3373,8 +3382,12 @@ extern "C" int fsync(int fd) {
 }
 
 extern "C" int syncfs(int fd) {
-    if (track_fsync.load(std::memory_order_relaxed))
-        syncfs_calls.fetch_add(1, std::memory_order_relaxed);
+    if (track_fsync.load(std::memory_order_relaxed)) {
+        const auto only = syncfs_only_inode.load(std::memory_order_relaxed);
+        struct stat target {};
+        if (!only || (::fstat(fd, &target) == 0 && target.st_ino == only))
+            syncfs_calls.fetch_add(1, std::memory_order_relaxed);
+    }
     return static_cast<int>(::syscall(SYS_syncfs, fd));
 }
 #endif

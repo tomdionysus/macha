@@ -19,21 +19,18 @@
 #endif
 namespace macha {
 namespace {
-constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
-    SM6{'D', 'H', 'T', 'M', 'E', 'T', 'A', '6'}, SM7{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'},
-    SM8{'D', 'H', 'T', 'M', 'E', 'T', 'A', '8'}, SM9{'D', 'H', 'T', 'M', 'E', 'T', 'A', '9'},
-    SM10{'D', 'H', 'T', 'M', 'E', 'T', 'B', '0'}, SM11{'D', 'H', 'T', 'M', 'E', 'T', 'B', '1'},
-    SM12{'D', 'H', 'T', 'M', 'E', 'T', 'B', '2'}, SM13{'D', 'H', 'T', 'M', 'E', 'T', 'B', '3'},
-    SM14{'D', 'H', 'T', 'M', 'E', 'T', 'B', '4'},
-    // SM15 is SM13 with every section, then torrent requests; SM16 is SM14
-    // then torrent requests. Written only while the collection is non-empty.
-    SM15{'D', 'H', 'T', 'M', 'E', 'T', 'B', '5'}, SM16{'D', 'H', 'T', 'M', 'E', 'T', 'B', '6'},
-    // SM17 is SM16 and SM18 is SM15, each followed by the legacy clock.
-    SM17{'D', 'H', 'T', 'M', 'E', 'T', 'B', '7'}, SM18{'D', 'H', 'T', 'M', 'E', 'T', 'B', '8'},
+constexpr std::array<uint8_t, 8> SM14{'D', 'H', 'T', 'M', 'E', 'T', 'B', '4'},
+    // SM16 is SM14 then torrent requests. Written only while the collection is
+    // non-empty.
+    SM16{'D', 'H', 'T', 'M', 'E', 'T', 'B', '6'},
+    // SM17 is SM16 followed by the legacy clock.
+    SM17{'D', 'H', 'T', 'M', 'E', 'T', 'B', '7'},
     // SM19 is SM14 with the torrent requests, a legacy clock flag and the
     // clock when set, then the tombstone batches. Written only while the
     // head names a batch.
     SM19{'D', 'H', 'T', 'M', 'E', 'T', 'B', '9'},
+    // The whole of genesis's payload: a namespace begins at the commit after it.
+    GENESIS{'D', 'H', 'T', 'M', 'G', 'E', 'N', '1'},
     TOMBSTONE_BATCH{'M', 'T', 'O', 'M', 'B', '0', '0', '1'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
@@ -408,67 +405,6 @@ IdentityAssociationReset decode_identity_reset(Reader& r) {
     return reset;
 }
 
-Bytes encode_snapshot_v7(const MetadataSnapshot& s) {
-    // SM7 bytes for replaying DLT1 journal records, whose successor hashes
-    // were computed over SM7.
-    Writer w;
-    w.raw(SM7);
-    w.u32(s.metadata_voters.size());
-    for (const auto& v : s.metadata_voters)
-        w.fixed(v.bytes);
-    w.u32(s.data_replication);
-    w.u64(s.extent_size);
-    w.u32(s.mutation_sequences.size());
-    for (const auto& [node, sequence] : s.mutation_sequences) {
-        w.fixed(node.bytes);
-        w.u64(sequence);
-    }
-    w.u32(s.entries.size());
-    for (const auto& [path, value] : s.entries) {
-        w.string(path);
-        entry(w, value);
-    }
-    w.u8(s.catalogue_root.has_value());
-    if (s.catalogue_root)
-        w.fixed(s.catalogue_root->bytes);
-    w.u32(s.garbage.size());
-    for (const auto& garbage : s.garbage)
-        w.fixed(garbage.id.bytes);
-    return w.take();
-}
-
-Bytes encode_snapshot_v8(const MetadataSnapshot& s) {
-    // SM8 bytes for replaying DLT2 journal records, whose successor hashes
-    // were computed over SM8.
-    Writer w;
-    w.raw(SM8);
-    w.u32(s.metadata_voters.size());
-    for (const auto& v : s.metadata_voters)
-        w.fixed(v.bytes);
-    w.u32(s.data_replication);
-    w.u64(s.extent_size);
-    w.u32(s.mutation_sequences.size());
-    for (const auto& [node, sequence] : s.mutation_sequences) {
-        w.fixed(node.bytes);
-        w.u64(sequence);
-    }
-    w.u32(s.entries.size());
-    for (const auto& [path, value] : s.entries) {
-        w.string(path);
-        entry(w, value);
-    }
-    w.u8(s.catalogue_root.has_value());
-    if (s.catalogue_root)
-        w.fixed(s.catalogue_root->bytes);
-    w.u32(s.garbage.size());
-    for (const auto& garbage : s.garbage) {
-        w.fixed(garbage.id.bytes);
-        w.i64(garbage.retired_at_ns);
-        w.fixed(garbage.retirement_id.bytes);
-    }
-    return w.take();
-}
-
 int metadata_delta_version(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 7> prefix{'D', 'H', 'T', 'M', 'D', 'L', 'T'};
     if (data.size() < 8 || !std::equal(prefix.begin(), prefix.end(), data.begin()))
@@ -485,31 +421,9 @@ int metadata_delta_version(std::span<const uint8_t> data) {
 
 
 Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSnapshot& snapshot) {
-    switch (metadata_delta_version(delta)) {
-    case 1:
-        return encode_snapshot_v7(snapshot);
-    case 2:
-        return encode_snapshot_v8(snapshot);
-    case 3:
-        // DLT3 successors are SM9.
-        if (!snapshot.identity_resets.empty())
-            throw DecodeError("DLT3 cannot contain identity resets");
-        return encode_snapshot(snapshot);
-    case 4:
-    case 5:
-    case 6:
-    case 7:
-    case 8:
-    case 9:
-    case 10:
-    case 11:
-        // A tree-backed successor is SM14; encode_snapshot refuses a namespace
-        // root, which would force every commit to a full record.
-        return snapshot.namespace_root ? encode_snapshot_v14(snapshot)
-                                       : encode_snapshot(snapshot);
-    default:
+    if (metadata_delta_version(delta) < 5)
         throw DecodeError("bad metadata delta");
-    }
+    return encode_snapshot_v14(snapshot);
 }
 
 
@@ -684,56 +598,16 @@ TombstoneBatchContent decode_tombstone_batch(std::span<const uint8_t> bytes) {
     return batch;
 }
 
-namespace {
-void record_garbage_upsert(MetadataDelta& delta, const GarbageRef& garbage) {
-    auto existing = std::find_if(delta.upsert_garbage.begin(), delta.upsert_garbage.end(),
-                                 [&](const GarbageRef& value) { return value.id == garbage.id; });
-    if (existing == delta.upsert_garbage.end())
-        delta.upsert_garbage.push_back(garbage);
-    else
-        *existing = garbage;
-}
-} // namespace
-
-void retire_objects(MetadataSnapshot& snapshot, MetadataDelta& delta, std::vector<ObjectId> ids) {
+void retire_objects(MetadataDelta& delta, std::vector<ObjectId> ids) {
     if (ids.empty())
         return;
-    if (snapshot.namespace_root) {
-        auto group = std::find_if(delta.pending_tombstones.begin(), delta.pending_tombstones.end(),
-                                  [](const auto& pending) { return pending.at_commit; });
-        if (group == delta.pending_tombstones.end()) {
-            delta.pending_tombstones.push_back({});
-            group = std::prev(delta.pending_tombstones.end());
-        }
-        group->ids.insert(group->ids.end(), ids.begin(), ids.end());
-        return;
+    auto group = std::find_if(delta.pending_tombstones.begin(), delta.pending_tombstones.end(),
+                              [](const auto& pending) { return pending.at_commit; });
+    if (group == delta.pending_tombstones.end()) {
+        delta.pending_tombstones.push_back({});
+        group = std::prev(delta.pending_tombstones.end());
     }
-    // One pass over the (possibly huge) inline set, not one per object.
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-    std::vector<bool> found(ids.size(), false);
-    for (auto& garbage : snapshot.garbage) {
-        auto target = std::lower_bound(ids.begin(), ids.end(), garbage.id);
-        if (target == ids.end() || *target != garbage.id)
-            continue;
-        const auto index = static_cast<size_t>(target - ids.begin());
-        if (found[index])
-            continue;
-        auto retired = wall_time_ns();
-        if (retired <= garbage.retired_at_ns &&
-            garbage.retired_at_ns < std::numeric_limits<int64_t>::max())
-            retired = garbage.retired_at_ns + 1;
-        garbage.retired_at_ns = retired;
-        garbage.retirement_id = random_node_id();
-        record_garbage_upsert(delta, garbage);
-        found[index] = true;
-    }
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (found[i])
-            continue;
-        snapshot.garbage.push_back({ids[i], wall_time_ns(), random_node_id()});
-        record_garbage_upsert(delta, snapshot.garbage.back());
-    }
+    group->ids.insert(group->ids.end(), ids.begin(), ids.end());
 }
 
 std::vector<GarbageRef>
@@ -874,115 +748,9 @@ void decode_torrent_requests(Reader& r, MetadataSnapshot& s) {
     }
 }
 
-Bytes encode_snapshot(const MetadataSnapshot& s) {
-    // SM13 and earlier cannot carry a namespace root; a tree-backed snapshot's
-    // entries live in the tree, so encoding it would publish an empty namespace.
-    if (s.namespace_root)
-        throw std::runtime_error("namespace root cannot be encoded before SM14");
-    if (!s.tombstone_batches.empty())
-        throw std::runtime_error("tombstone batches need a tree-backed snapshot (SM19)");
-    Writer w;
-    // The smallest format that holds the state: SM11 adds branch topology and
-    // conflicts, SM12 the metadata write floor, SM13 the participant roster
-    // and branch floor.
-    const bool legacy_clock_state = s.legacy_clock.has_value();
-    const bool torrent_state = legacy_clock_state || !s.torrent_requests.empty();
-    const bool branch_state = torrent_state || !s.merge_parents.empty() || !s.conflicts.empty();
-    const bool policy_state = torrent_state || s.metadata_write_replicas_required != 0;
-    const bool governance_state = torrent_state || !s.metadata_participants.empty() ||
-                                  s.metadata_branch_floor != Hash256{} ||
-                                  s.retention_baseline_complete;
-    const bool include_node_status =
-        policy_state || branch_state || !s.node_status.empty() || !s.identity_resets.empty();
-    if (legacy_clock_state)
-        w.raw(SM18);
-    else if (torrent_state)
-        w.raw(SM15);
-    else if (governance_state)
-        w.raw(SM13);
-    else if (policy_state)
-        w.raw(SM12);
-    else if (branch_state)
-        w.raw(SM11);
-    else if (!s.identity_resets.empty())
-        w.raw(SM10);
-    else
-        w.raw(s.node_status.empty() ? SM8 : SM9);
-    w.u32(s.metadata_voters.size());
-    for (auto& v : s.metadata_voters)
-        w.fixed(v.bytes);
-    w.u32(s.data_replication);
-    w.u64(s.extent_size);
-    w.u32(s.mutation_sequences.size());
-    for (const auto& [node, sequence] : s.mutation_sequences) {
-        w.fixed(node.bytes);
-        w.u64(sequence);
-    }
-    w.u32(s.entries.size());
-    for (auto& [p, e] : s.entries) {
-        w.string(p);
-        entry(w, e);
-    }
-    w.u8(s.catalogue_root.has_value());
-    if (s.catalogue_root)
-        w.fixed(s.catalogue_root->bytes);
-    w.u32(s.garbage.size());
-    for (const auto& garbage : s.garbage) {
-        w.fixed(garbage.id.bytes);
-        w.i64(garbage.retired_at_ns);
-        w.fixed(garbage.retirement_id.bytes);
-    }
-    if (include_node_status) {
-        w.u32(static_cast<uint32_t>(s.node_status.size()));
-        for (const auto& [node, status] : s.node_status) {
-            w.fixed(node.bytes);
-            encode_node_status(w, status);
-        }
-    }
-    if (policy_state || !s.identity_resets.empty() || branch_state) {
-        w.u32(static_cast<uint32_t>(s.identity_resets.size()));
-        for (const auto& [key, reset] : s.identity_resets) {
-            w.string(key);
-            encode_identity_reset(w, reset);
-        }
-    }
-    if (policy_state || branch_state) {
-        if (s.merge_parents.size() > 64)
-            throw std::runtime_error("too many metadata merge parents");
-        w.u32(static_cast<uint32_t>(s.merge_parents.size()));
-        for (const auto& parent : s.merge_parents)
-            w.fixed(parent.bytes);
-        if (s.conflicts.size() > 1000000)
-            throw std::runtime_error("too many metadata conflicts");
-        w.u32(static_cast<uint32_t>(s.conflicts.size()));
-        for (const auto& [id, conflict] : s.conflicts) {
-            w.string(id);
-            encode_conflict(w, conflict);
-        }
-    }
-    if (policy_state)
-        w.u32(s.metadata_write_replicas_required);
-    if (governance_state) {
-        if (s.metadata_participants.size() > 65536)
-            throw std::runtime_error("too many metadata participants");
-        w.u32(static_cast<uint32_t>(s.metadata_participants.size()));
-        for (const auto& participant : s.metadata_participants)
-            w.fixed(participant.bytes);
-        w.fixed(s.metadata_branch_floor.bytes);
-        w.u8(s.retention_baseline_complete ? 1 : 0);
-    }
-    if (torrent_state)
-        encode_torrent_requests(w, s);
-    if (legacy_clock_state) {
-        encode_clock(w, *s.legacy_clock);
-        w.fixed(s.catalogue_dot.author.bytes);
-        w.u64(s.catalogue_dot.sequence);
-    }
-    return w.take();
-}
 Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
-    // SM13's fields in the same order, with the inline entry block replaced by
-    // the 32-byte namespace tree root. Every section is unconditional.
+    // The record's fields, with the 32-byte namespace tree root. Every section is
+    // unconditional.
     if (!s.namespace_root)
         throw std::runtime_error("SM14 snapshot has no namespace root");
     // Entries live in the tree or the map, never both; `detach_namespace`
@@ -1217,152 +985,20 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
         return decode_snapshot_v14(r, true, true);
     if (std::equal(m.begin(), m.end(), SM19.begin()))
         return decode_snapshot_v14(r, true, false, true);
-    // SM15 is SM13 with every section present, then the torrent requests;
-    // SM18 is SM15 and then the legacy clock.
-    const bool v18 = std::equal(m.begin(), m.end(), SM18.begin());
-    const bool v15 = v18 || std::equal(m.begin(), m.end(), SM15.begin());
-    const bool v5 = std::equal(m.begin(), m.end(), SM5.begin());
-    const bool v6 = std::equal(m.begin(), m.end(), SM6.begin());
-    const bool v7 = std::equal(m.begin(), m.end(), SM7.begin());
-    const bool v8 = std::equal(m.begin(), m.end(), SM8.begin());
-    const bool v9 = std::equal(m.begin(), m.end(), SM9.begin());
-    const bool v10 = std::equal(m.begin(), m.end(), SM10.begin());
-    const bool v11 = std::equal(m.begin(), m.end(), SM11.begin());
-    const bool v12 = std::equal(m.begin(), m.end(), SM12.begin());
-    const bool v13 = v15 || std::equal(m.begin(), m.end(), SM13.begin());
-    if (!v5 && !v6 && !v7 && !v8 && !v9 && !v10 && !v11 && !v12 && !v13)
-        throw DecodeError("bad snapshot");
-    auto nv = r.u32();
-    if (nv > 1024)
-        throw DecodeError("too many metadata voters");
-    MetadataSnapshot s;
-    for (uint32_t i = 0; i < nv; ++i) {
-        NodeId v{r.fixed<16>()};
-        s.metadata_voters.push_back(v);
+    if (std::equal(m.begin(), m.end(), GENESIS.begin())) {
+        r.finish();
+        // Until the first commit the namespace reads as an empty root directory.
+        MetadataSnapshot genesis;
+        FsEntry root;
+        root.type = EntryType::directory;
+        root.mode = 0755;
+        genesis.entries["/"] = root;
+        return genesis;
     }
-    s.data_replication = r.u32();
-    s.extent_size = r.u64();
-    if (v7 || v8 || v9 || v10 || v11 || v12 || v13) {
-        auto mutations = r.u32();
-        if (mutations > 65536)
-            throw DecodeError("too many metadata mutation origins");
-        for (uint32_t i = 0; i < mutations; ++i) {
-            NodeId node{r.fixed<16>()};
-            auto sequence = r.u64();
-            if (!sequence || !s.mutation_sequences.emplace(node, sequence).second)
-                throw DecodeError("bad metadata mutation sequence");
-        }
-    }
-    auto n = r.u32();
-    if (n > 5000000)
-        throw DecodeError("too many filesystem entries");
-    for (uint32_t i = 0; i < n; ++i) {
-        auto p = normalize_path(r.string());
-        if (!s.entries.emplace(p, entry(r)).second)
-            throw DecodeError("duplicate path");
-    }
-    if ((v6 || v7 || v8 || v9 || v10 || v11 || v12 || v13) && r.u8()) {
-        ObjectId root;
-        root.bytes = r.fixed<32>();
-        s.catalogue_root = root;
-    }
-    auto garbage_count = r.u32();
-    if (garbage_count > 10000000)
-        throw DecodeError("too many garbage records");
-    s.garbage.reserve(garbage_count);
-    for (uint32_t i = 0; i < garbage_count; ++i) {
-        GarbageRef garbage;
-        garbage.id.bytes = r.fixed<32>();
-        if (v8 || v9 || v10 || v11 || v12 || v13) {
-            garbage.retired_at_ns = r.i64();
-            if (garbage.retired_at_ns < 0)
-                throw DecodeError("bad garbage retirement time");
-            garbage.retirement_id.bytes = r.fixed<16>();
-        }
-        s.garbage.push_back(garbage);
-    }
-    if (v9 || v10 || v11 || v12 || v13) {
-        const auto count = r.u32();
-        if (count > 65536)
-            throw DecodeError("too many persisted node status records");
-        for (uint32_t i = 0; i < count; ++i) {
-            NodeId node{r.fixed<16>()};
-            if (!s.node_status.emplace(node, decode_node_status(r)).second)
-                throw DecodeError("duplicate persisted node status");
-        }
-    }
-    if (v10 || v11 || v12 || v13) {
-        const auto count = r.u32();
-        if (count > 65536)
-            throw DecodeError("too many identity reset tombstones");
-        for (uint32_t i = 0; i < count; ++i) {
-            auto key = r.string(8192);
-            auto reset = decode_identity_reset(r);
-            if (key != identity_reset_key(reset.host, reset.port) ||
-                !s.identity_resets.emplace(std::move(key), std::move(reset)).second)
-                throw DecodeError("bad identity reset tombstone key");
-        }
-    }
-    if (v11 || v12 || v13) {
-        const auto parents = r.u32();
-        if (parents > 64)
-            throw DecodeError("too many metadata merge parents");
-        s.merge_parents.reserve(parents);
-        for (uint32_t i = 0; i < parents; ++i) {
-            Hash256 parent;
-            parent.bytes = r.fixed<32>();
-            s.merge_parents.push_back(parent);
-        }
-        const auto conflicts = r.u32();
-        if (conflicts > 1000000)
-            throw DecodeError("too many metadata conflicts");
-        for (uint32_t i = 0; i < conflicts; ++i) {
-            auto id = r.string(256);
-            auto conflict = decode_conflict(r);
-            if (id.empty() || id != metadata_conflict_id(conflict) ||
-                !s.conflicts.emplace(std::move(id), std::move(conflict)).second)
-                throw DecodeError("bad metadata conflict id");
-        }
-    }
-    if (v12 || v13) {
-        s.metadata_write_replicas_required = r.u32();
-        // SM15 writes the floor whether or not one is set.
-        if (!s.metadata_write_replicas_required && !v15)
-            throw DecodeError("bad metadata write replica floor");
-    }
-    if (v13) {
-        const auto participants = r.u32();
-        if (participants > 65536)
-            throw DecodeError("too many metadata participants");
-        for (uint32_t i = 0; i < participants; ++i) {
-            NodeId participant{r.fixed<16>()};
-            if (participant == NodeId{} || !s.metadata_participants.insert(participant).second)
-                throw DecodeError("bad metadata participant");
-        }
-        s.metadata_branch_floor.bytes = r.fixed<32>();
-        const auto baseline = r.u8();
-        if (baseline > 1)
-            throw DecodeError("bad retention baseline state");
-        s.retention_baseline_complete = baseline != 0;
-    }
-    if (v15)
-        decode_torrent_requests(r, s);
-    if (v18) {
-        s.legacy_clock = decode_clock(r);
-        s.catalogue_dot.author.bytes = r.fixed<16>();
-        s.catalogue_dot.sequence = r.u64();
-    }
-    r.finish();
-    auto x = s.entries.find("/");
-    if (x == s.entries.end() || x->second.type != EntryType::directory)
-        throw DecodeError("missing root");
-    return s;
+    throw DecodeError("bad snapshot");
 }
 
 Bytes encode_metadata_delta(const MetadataDelta& delta) {
-    // DLT1-DLT4 are replay-only: their successors reconstruct as SM7-SM9 and
-    // would drop write-floor and governance state. DLT5+ reconstruct with the
-    // current snapshot encoder.
     static constexpr std::array<uint8_t, 8> magic_v5{'D', 'H', 'T', 'M', 'D', 'L', 'T', '5'};
     static constexpr std::array<uint8_t, 8> magic_v6{'D', 'H', 'T', 'M', 'D', 'L', 'T', '6'};
     static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
@@ -1529,10 +1165,6 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
 }
 
 MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
-    static constexpr std::array<uint8_t, 8> magic_v1{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
-    static constexpr std::array<uint8_t, 8> magic_v2{'D', 'H', 'T', 'M', 'D', 'L', 'T', '2'};
-    static constexpr std::array<uint8_t, 8> magic_v3{'D', 'H', 'T', 'M', 'D', 'L', 'T', '3'};
-    static constexpr std::array<uint8_t, 8> magic_v4{'D', 'H', 'T', 'M', 'D', 'L', 'T', '4'};
     static constexpr std::array<uint8_t, 8> magic_v5{'D', 'H', 'T', 'M', 'D', 'L', 'T', '5'};
     static constexpr std::array<uint8_t, 8> magic_v6{'D', 'H', 'T', 'M', 'D', 'L', 'T', '6'};
     static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
@@ -1541,11 +1173,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 8> magic_v10{'D', 'H', 'T', 'M', 'D', 'L', 'T', 'A'};
     static constexpr std::array<uint8_t, 8> magic_v11{'D', 'H', 'T', 'M', 'D', 'L', 'T', 'B'};
     Reader r(data);
-    auto got = r.raw(magic_v1.size());
-    const bool v1 = std::equal(got.begin(), got.end(), magic_v1.begin());
-    const bool v2 = std::equal(got.begin(), got.end(), magic_v2.begin());
-    const bool v3 = std::equal(got.begin(), got.end(), magic_v3.begin());
-    const bool v4 = std::equal(got.begin(), got.end(), magic_v4.begin());
+    auto got = r.raw(magic_v5.size());
     const bool v5 = std::equal(got.begin(), got.end(), magic_v5.begin());
     // DLT10 is DLT9 with a content dot on every append and a trailing legacy
     // clock.
@@ -1560,7 +1188,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     // DLT7 is DLT6 plus a flags byte; everything before the topology sets is
     // shared, so treat v7 as v6 for the common prefix.
     const bool v6 = v7 || std::equal(got.begin(), got.end(), magic_v6.begin());
-    if (!v1 && !v2 && !v3 && !v4 && !v5 && !v6)
+    if (!v5 && !v6)
         throw DecodeError("bad metadata delta");
     MetadataDelta delta;
     auto sequences = r.u32();
@@ -1600,18 +1228,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
         delta.catalogue_root = id;
     }
 
-    if (v1) {
-        // DLT1: journal replay only.
-        auto garbage = r.u32();
-        if (garbage > 10000000)
-            throw DecodeError("too much metadata delta garbage");
-        delta.upsert_garbage.reserve(garbage);
-        for (uint32_t i = 0; i < garbage; ++i) {
-            GarbageRef value;
-            value.id.bytes = r.fixed<32>();
-            delta.upsert_garbage.push_back(value);
-        }
-    } else {
+    {
         auto erased_garbage = r.u32();
         if (erased_garbage > 10000000)
             throw DecodeError("too many metadata delta garbage erases");
@@ -1639,7 +1256,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
             delta.upsert_garbage.push_back(value);
         }
     }
-    if (v3 || v4 || v5 || v6) {
+    {
         const auto count = r.u32();
         if (count > 65536)
             throw DecodeError("too many metadata delta node status records");
@@ -1649,7 +1266,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
                 throw DecodeError("duplicate metadata delta node status");
         }
     }
-    if (v4 || v5 || v6) {
+    {
         const auto count = r.u32();
         if (count > 65536)
             throw DecodeError("too many metadata delta identity resets");
@@ -2291,16 +1908,14 @@ MetadataHistoryEntry decode_metadata_history_entry(std::span<const uint8_t> data
     return entry_value;
 }
 MetadataRecord genesis_metadata() {
-    MetadataSnapshot s;
-    FsEntry r;
-    r.type = EntryType::directory;
-    r.mode = 0755;
-    s.entries["/"] = r;
-    MetadataRecord m;
-    m.generation = 1;
-    m.payload = encode_snapshot(s);
-    m.hash = metadata_hash(1, m.previous, m.payload);
-    return m;
+    static const MetadataRecord genesis = [] {
+        MetadataRecord m;
+        m.generation = 1;
+        m.payload.assign(GENESIS.begin(), GENESIS.end());
+        m.hash = metadata_hash(1, m.previous, m.payload);
+        return m;
+    }();
+    return genesis;
 }
 bool valid_metadata_record(const MetadataRecord& m) {
     return m.generation && metadata_hash(m.generation, m.previous, m.payload) == m.hash;

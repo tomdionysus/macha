@@ -536,8 +536,8 @@ node's or a quarantined (`*.corrupt.<timestamp>`) metadata directory. It never
 constructs a replica, so it cannot trigger recovery. It decodes every history
 frame, reports anomalies, and for each accepted head walks the delta chain with
 the production succession rule and states where materialization would fail.
-`--stats` prints what each reconstructible head is made of. A tree-backed head
-carries only its root; `--objects` names the control object store so the tree
+`--stats` prints what each reconstructible head is made of. A head carries only
+its root; `--objects` names the control object store so the tree
 can be walked, the delta chain actually replayed (naming the first frame that
 diverges), and a stat timed against it.
 

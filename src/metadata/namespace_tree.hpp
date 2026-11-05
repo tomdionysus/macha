@@ -172,15 +172,15 @@ first_namespace_path_under(const MetadataSnapshot& snapshot, const NamespaceNode
                            std::string_view directory,
                            const std::function<bool(const std::string&)>& skip = {});
 
-// The namespace of a snapshot in either form: the inline map, or the tree when
+// The namespace of a snapshot in either form: the working map, or the tree when
 // the snapshot carries a root. Throws if the snapshot is detached and no store
 // is supplied, so a detached namespace is never read as empty.
 void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
                               const NamespaceVisitor& visit);
 
 // The same walk, also appending to `nodes` every tree node it read: branches,
-// leaves and extent spines, which a complete walk reads all of. Nothing for an
-// inline namespace. A node that cannot be read throws, so a walk that returns
+// leaves and extent spines, which a complete walk reads all of. Nothing for a
+// working map. A node that cannot be read throws, so a walk that returns
 // has named the whole tree.
 void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
                               const NamespaceVisitor& visit, std::vector<ObjectId>& nodes);
@@ -321,8 +321,7 @@ void collect_namespace_tree_changes(const std::optional<ObjectId>& before, const
 // the delta is overlaid on it: a path in `upsert_entries` reads as that entry,
 // one in `erase_entries` reads as absent, anything else reads from beneath.
 //
-// On a map-backed snapshot it also writes through to `entries`, since the SM13
-// payload is encoded from that map.
+// On a snapshot in working form it also writes through to `entries`.
 class NamespaceWorkingSet {
   public:
     NamespaceWorkingSet(MetadataSnapshot& snapshot, MetadataDelta& delta,

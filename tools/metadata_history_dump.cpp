@@ -11,8 +11,8 @@
 // Prints anomalous history frames (absent parent, generation not parent+1,
 // duplicate hash, undecodable), a summary, and each accepted head's delta
 // chain walk with the point where materialization would fail. --all prints
-// every frame. --stats materializes each reconstructible head and attributes
-// its encoded bytes to the snapshot's parts. --entries-check (with --objects,
+// every frame. --stats materializes each reconstructible head and describes
+// its record. --entries-check (with --objects,
 // implies --stats) checks that the resumable walk, at several page bounds,
 // visits exactly what the whole-pass walk visits, in order. --merge-deltas
 // (with --objects) lists each merge commit stored whole with the size of the
@@ -119,7 +119,6 @@ int main(int argc, char** argv) {
     }
     bool all = false;
     bool stats = false;
-    bool tree = false;
     bool entries_check = false;
     bool merge_deltas = false;
     std::filesystem::path objects;
@@ -147,8 +146,7 @@ int main(int argc, char** argv) {
             entries_check = true;
             stats = true;
         } else if (std::string(argv[i]) == "--tree") {
-            // Implies --stats, which materialises the head the tree is built from.
-            tree = true;
+            // Implies --stats, which materialises the head.
             stats = true;
         }
         else
@@ -443,11 +441,8 @@ int main(int argc, char** argv) {
                     const auto delta = decode_metadata_delta(body.payload);
                     const auto root_before = snapshot.namespace_root;
                     apply_metadata_delta_in_place(snapshot, delta, applier);
-                    // Mirrors the encoder the replica picks for a delta body's
-                    // successor: SM14 for a tree-backed snapshot, otherwise the
-                    // canonical one.
-                    const auto payload = snapshot.namespace_root ? encode_snapshot_v14(snapshot)
-                                                                 : encode_snapshot(snapshot);
+                    // Mirrors the encoder the replica uses for a delta body's successor.
+                    const auto payload = encode_snapshot_v14(snapshot);
                     const auto reconstructed =
                         metadata_hash(it->generation, it->previous, payload);
                     if (reconstructed != it->hash) {
@@ -531,18 +526,7 @@ int main(int argc, char** argv) {
             std::cout << "  stats unavailable: " << error.what() << '\n';
             continue;
         }
-        size_t files = 0, directories = 0, extents = 0, holes = 0;
-        for (const auto& [path, value] : snapshot.entries) {
-            if (value.type == EntryType::directory)
-                ++directories;
-            else
-                ++files;
-            extents += value.extents.size();
-            for (const auto& extent : value.extents)
-                holes += extent.hole ? 1 : 0;
-        }
-        // A tree-backed head carries a root, not entries, and encode_snapshot refuses
-        // it: describe the record instead. `--tree` reads a tree-backed namespace.
+        // A head carries a root, not entries: describe the record. `--objects` walks it.
         if (snapshot.namespace_root) {
             std::cout << "  snapshot: tree-backed namespace_root="
                       << to_string(*snapshot.namespace_root)
@@ -601,159 +585,7 @@ int main(int argc, char** argv) {
             }
             continue;
         }
-        const auto full = encode_snapshot(snapshot).size();
-        auto without = [&](const std::function<void(MetadataSnapshot&)>& strip) {
-            MetadataSnapshot copy = snapshot;
-            strip(copy);
-            return full - encode_snapshot(copy).size();
-        };
-        const auto garbage_bytes = without([](MetadataSnapshot& c) { c.garbage.clear(); });
-        const auto conflict_bytes = without([](MetadataSnapshot& c) { c.conflicts.clear(); });
-        const auto node_status_bytes = without([](MetadataSnapshot& c) { c.node_status.clear(); });
-        const auto extent_bytes = without([](MetadataSnapshot& c) {
-            for (auto& [path, value] : c.entries)
-                value.extents.clear();
-        });
-        const auto entry_bytes = without([](MetadataSnapshot& c) { c.entries.clear(); });
-        std::cout << "  snapshot: encoded_bytes=" << full << " entries=" << snapshot.entries.size()
-                  << " (files=" << files << " directories=" << directories << ") extents=" << extents
-                  << " holes=" << holes << " tombstones=" << snapshot.garbage.size()
-                  << " conflicts=" << snapshot.conflicts.size()
-                  << " node_status=" << snapshot.node_status.size()
-                  << " identity_resets=" << snapshot.identity_resets.size()
-                  << " torrent_requests=" << snapshot.torrent_requests.size()
-                  << " mutation_sequences=" << snapshot.mutation_sequences.size()
-                  << " merge_parents=" << snapshot.merge_parents.size() << '\n';
-        std::cout << "  bytes: entries=" << entry_bytes << " (of which extents=" << extent_bytes
-                  << ", paths+attrs=" << (entry_bytes - extent_bytes) << ") tombstones="
-                  << garbage_bytes << " conflicts=" << conflict_bytes
-                  << " node_status=" << node_status_bytes << " other="
-                  << (full - entry_bytes - garbage_bytes - conflict_bytes - node_status_bytes)
-                  << '\n';
-        if (tree) {
-            // Cost of a whole-snapshot commit (re-encode and re-hash), timed on the real
-            // head. CPU only: decode, entries comparison and replication are excluded, so
-            // it is a floor.
-            {
-                const auto encode_started = std::chrono::steady_clock::now();
-                const auto payload = encode_snapshot(snapshot);
-                const auto encoded_at = std::chrono::steady_clock::now();
-                const auto digest = sha256(payload);
-                const auto hashed_at = std::chrono::steady_clock::now();
-                (void)digest;
-                const auto ms = [](auto from, auto to) {
-                    return std::chrono::duration<double, std::milli>(to - from).count();
-                };
-                std::cout << "  commit cost today: encode="
-                          << ms(encode_started, encoded_at) << "ms hash="
-                          << ms(encoded_at, hashed_at) << "ms total="
-                          << ms(encode_started, hashed_at) << "ms over "
-                          << payload.size() << " bytes, per namespace write\n";
-            }
-
-            // Offline and read-only: the tree is built in memory from the materialised
-            // head; nothing is written to the record, history or control store.
-            MemoryNamespaceNodeStore nodes;
-            const auto root = build_namespace_tree(snapshot.entries, nodes);
-            const auto shape = namespace_tree_stats(root, nodes);
-            std::cout << "  tree: root=" << to_string(root).substr(0, 16)
-                      << " nodes=" << nodes.nodes() << " bytes=" << nodes.bytes()
-                      << " leaves=" << shape.leaves << " branches=" << shape.branches
-                      << " extent_nodes=" << shape.extent_nodes << " depth=" << shape.depth
-                      << " largest_node=" << shape.largest_node_bytes << '\n';
-
-            // Cost of one ordinary write against the tree, on the median file by extent
-            // count so neither a one-extent file nor the largest skews it.
-            std::vector<std::pair<size_t, std::string>> by_extents;
-            for (const auto& [path, value] : snapshot.entries)
-                if (value.type != EntryType::directory)
-                    by_extents.emplace_back(value.extents.size(), path);
-            if (!by_extents.empty()) {
-                std::sort(by_extents.begin(), by_extents.end());
-                const auto& median = by_extents[by_extents.size() / 2];
-                auto touched = snapshot.entries;
-                auto found = touched.find(median.second);
-                if (found != touched.end()) {
-                    // An mtime bump: the commonest namespace write, and a value change on an
-                    // existing path, the case key-only boundaries keep cheap.
-                    found->second.mtime_ns += 1;
-                    nodes.forget_written();
-                    const auto after = build_namespace_tree(touched, nodes);
-                    uint64_t dirty_bytes = 0;
-                    for (const auto& id : nodes.written())
-                        if (auto body = nodes.get(id)) dirty_bytes += body->size();
-                    std::cout << "  tree: one mtime change on a median file ("
-                              << median.first << " extents) rewrote "
-                              << nodes.written().size() << " nodes, " << dirty_bytes
-                              << " bytes; root " << (after == root ? "UNCHANGED (bug)" : "moved")
-                              << '\n';
-                    std::cout << "  tree: today the same write re-serialises and re-hashes "
-                              << full << " bytes, the whole namespace\n";
-                }
-            }
-        }
-        // Encoded bytes are what replication and the journal carry; resident bytes,
-        // the larger, are what a running node holds. Report both.
-        uint64_t extent_capacity = 0;
-        for (const auto& [path, value] : snapshot.entries)
-            extent_capacity += value.extents.capacity();
-        const auto resident = snapshot_resident_bytes(snapshot);
-        std::cout << "  resident: decoded_bytes=" << resident
-                  << " encoded_payload_bytes=" << full
-                  << " materialization_bytes=" << (resident + full)
-                  << " extent_slots=" << extent_capacity << " (in use " << extents << ")"
-                  << " sizeof_fs_entry=" << sizeof(FsEntry)
-                  << " sizeof_extent_ref=" << sizeof(ExtentRef)
-                  << " sizeof_map_value=" << sizeof(std::map<std::string, FsEntry>::value_type)
-                  << " sizeof_snapshot=" << sizeof(MetadataSnapshot) << '\n';
-        if (snapshot.extent_size && extents) {
-            // Projected per TiB of content: extents, not files, scale with a library.
-            const long double library_tb =
-                static_cast<long double>(extents) *
-                static_cast<long double>(snapshot.extent_size) / (1024.0L * 1024.0L * 1024.0L * 1024.0L);
-            std::cout << "  scaling: extent_size=" << snapshot.extent_size
-                      << " library_tib=" << library_tb << " decoded_bytes_per_tib="
-                      << static_cast<uint64_t>(resident / library_tb)
-                      << " materialization_bytes_per_tib="
-                      << static_cast<uint64_t>((resident + full) / library_tb) << '\n';
-        }
-        if (!snapshot.conflicts.empty()) {
-            size_t namespace_kind = 0, identical = 0, both_files = 0, one_side_absent = 0,
-                   with_base = 0;
-            std::map<std::string, size_t> by_heads;
-            for (const auto& [id, conflict] : snapshot.conflicts) {
-                if (conflict.kind == MetadataConflictKind::namespace_entry)
-                    ++namespace_kind;
-                if (conflict.left_entry && conflict.right_entry &&
-                    *conflict.left_entry == *conflict.right_entry)
-                    ++identical;
-                if (conflict.left_entry && conflict.right_entry)
-                    ++both_files;
-                else
-                    ++one_side_absent;
-                if (conflict.base_entry)
-                    ++with_base;
-                ++by_heads[h(conflict.left_head) + "/" + h(conflict.right_head)];
-            }
-            std::cout << "  conflicts: namespace_entry=" << namespace_kind
-                      << " both_alternatives_present=" << both_files
-                      << " one_side_absent=" << one_side_absent << " identical_alternatives="
-                      << identical << " with_base=" << with_base
-                      << " distinct_head_pairs=" << by_heads.size() << '\n';
-            size_t shown = 0;
-            for (const auto& [id, conflict] : snapshot.conflicts) {
-                if (shown++ >= 5)
-                    break;
-                std::cout << "    " << id << " key=" << conflict.key
-                          << " left=" << (conflict.left_entry ? std::to_string(conflict.left_entry->size) + "B/" + std::to_string(conflict.left_entry->extents.size()) + "x" : "absent")
-                          << " right=" << (conflict.right_entry ? std::to_string(conflict.right_entry->size) + "B/" + std::to_string(conflict.right_entry->extents.size()) + "x" : "absent")
-                          << " base=" << (conflict.base_entry ? "yes" : "no") << '\n';
-            }
-        }
-        if (!snapshot.entries.empty())
-            std::cout << "  per_entry_bytes=" << full / snapshot.entries.size()
-                      << " per_entry_bytes_excluding_extents="
-                      << (full - extent_bytes) / snapshot.entries.size() << '\n';
+        std::cout << "  snapshot: genesis, no namespace yet\n";
     }
     return 0;
 }
