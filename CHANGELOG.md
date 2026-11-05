@@ -1,5 +1,12 @@
 # Current release
 
+## 0.93.1: the legacy write API is gone
+
+`MetadataReplica`'s `cas`, `cas_delta`, `install_committed_delta`, `seed`,
+`remember_committed` and `remember_current_committed` refused every state with
+a write floor, and no caller remained. A commit is stored and accepted. Nothing
+in the replica writes its journal now; what it reads from one is unchanged.
+
 ## 0.93.0: a namespace is a tree from its first commit
 
 A new namespace is founded on the content-addressed Merkle tree: the

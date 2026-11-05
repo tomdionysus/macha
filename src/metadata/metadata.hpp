@@ -657,8 +657,6 @@ class MetadataReplica {
     bool acceptance_matches_record_policy_locked(const MetadataAcceptance&,
                                                  const MetadataMaterialization&) const
         MACHA_REQUIRES(m_);
-    bool legacy_write_api_allowed_locked() const MACHA_REQUIRES(m_);
-    void set_legacy_committed_head_locked(const MetadataRecord&) MACHA_REQUIRES(m_);
     void refresh_materialized_head_locked() MACHA_REQUIRES(m_);
     // The head refreshed in memory; when the committed head moved, the journal
     // is emptied and the record returned for the caller to write as the
@@ -708,13 +706,6 @@ class MetadataReplica {
     // This node's author ids, the current one first.
     std::vector<NodeId> author_ids(const NodeId& node_id,
                                    const std::map<NodeId, uint64_t>& head_clock);
-    bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
-    bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
-    bool install_committed_delta(uint64_t, const Hash256&, std::span<const uint8_t>,
-                                 const MetadataRecord&);
-    bool seed(const MetadataRecord&);
-    bool remember_committed(const MetadataRecord&);
-    bool remember_current_committed(uint64_t, const Hash256&);
     std::optional<MetadataHistoryEntry> history_entry(const Hash256&) const;
     std::optional<MetadataHistoryLinks> history_links(const Hash256&) const;
     // `hash` as a full-body entry, for a peer to re-anchor a head it cannot

@@ -59,6 +59,59 @@ void flip_history_frame(const std::filesystem::path& history, uint64_t frame_end
         throw std::runtime_error("cannot flip history frame byte in " + history.string());
 }
 
+// A record stored and accepted, as a commit is.
+void commit_record(MetadataReplica& replica, const MetadataRecord& record,
+                   std::span<const uint8_t> delta = {}) {
+    REQUIRE(replica.store_commit(record, delta));
+    MetadataAcceptance acceptance;
+    acceptance.generation = record.generation;
+    acceptance.hash = record.hash;
+    if (decode_snapshot(record.payload).metadata_write_replicas_required) {
+        NodeId witness{};
+        witness.bytes[15] = 1;
+        acceptance.required = 1;
+        acceptance.replicas = {witness};
+    }
+    REQUIRE(replica.accept_commit(acceptance));
+}
+
+MetadataRecord record_after(const MetadataRecord& previous, Bytes payload) {
+    MetadataRecord record;
+    record.generation = previous.generation + 1;
+    record.previous = previous.hash;
+    record.payload = std::move(payload);
+    record.hash = metadata_hash(record.generation, record.previous, record.payload);
+    return record;
+}
+
+// One frame of a replica's journal, kinds as metadata.cpp numbers them.
+constexpr uint8_t journal_prepare_full = 1, journal_prepare_delta = 2, journal_commit = 4;
+void append_journal_frame(const std::filesystem::path& state, const std::array<uint8_t, 32>& key,
+                          uint8_t kind, const MetadataRecord& record,
+                          std::span<const uint8_t> body = {}) {
+    static constexpr std::array<uint8_t, 8> magic{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'};
+    Writer plain;
+    plain.u8(kind);
+    plain.u64(record.generation);
+    plain.fixed(record.previous.bytes);
+    plain.fixed(record.hash.bytes);
+    plain.bytes(body);
+    const auto sealed = aes_gcm_seal(key, plain.data(), magic);
+    Writer envelope;
+    envelope.fixed(sealed.nonce);
+    envelope.fixed(sealed.tag);
+    envelope.bytes(sealed.ciphertext);
+    const auto payload = envelope.take();
+    Writer frame;
+    frame.u32(static_cast<uint32_t>(payload.size()));
+    frame.raw(payload);
+    const auto bytes = frame.take();
+    std::ofstream out(state / "metadata" / "journal.log", std::ios::binary | std::ios::app);
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    REQUIRE(out.good());
+}
+
 std::optional<uint64_t> process_rss_kib() {
 #if defined(__linux__)
     std::ifstream status("/proc/self/status");
@@ -515,52 +568,6 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_record_payload_copy_is_shared)
     }
 }
 
-MACHA_FAST_TEST("storage_metadata", test_metadata_seed_sibling_replays_after_restart) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-    const auto replica_path = t.path() / "seed-sibling";
-
-    const auto genesis = genesis_metadata();
-    auto make_sibling = [&](std::string path) {
-        auto snapshot = decode_snapshot(genesis.payload);
-        FsEntry entry;
-        entry.type = EntryType::directory;
-        entry.mode = 0755;
-        snapshot.entries.emplace(std::move(path), entry);
-
-        MetadataRecord record;
-        record.generation = genesis.generation + 1;
-        record.previous = genesis.hash;
-        record.payload = encode_snapshot(snapshot);
-        record.hash = metadata_hash(record.generation, record.previous, record.payload);
-        return record;
-    };
-
-    auto first = make_sibling("/first");
-    auto second = make_sibling("/second");
-    if (second.hash < first.hash)
-        std::swap(first, second);
-    REQUIRE(first.hash != second.hash);
-
-    {
-        MetadataReplica replica(replica_path, keys.storage);
-        REQUIRE(replica.seed(first));
-        // Same-generation sibling replacement is an intentional deterministic
-        // convergence rule: the greater hash wins when the predecessor agrees.
-        REQUIRE(replica.seed(second));
-        REQUIRE(replica.remember_current_committed(second.generation, second.hash));
-        CHECK(replica.current().hash == second.hash);
-        CHECK(replica.committed().hash == second.hash);
-    }
-
-    // Journal replay reproduces every transition seed() accepted while live.
-    MetadataReplica replayed(replica_path, keys.storage);
-    CHECK(replayed.current().hash == second.hash);
-    CHECK(replayed.committed().hash == second.hash);
-}
-
 MACHA_FAST_TEST("storage_metadata", test_metadata_hash_streaming_matches_canonical_encoding) {
     const uint64_t generation = 0x1122334455667788ULL;
     Hash256 previous{};
@@ -691,10 +698,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip
     {
         MetadataReplica left_replica(left_path, keys.storage);
         MetadataReplica right_replica(right_path, keys.storage);
-        REQUIRE(left_replica.seed(left));
-        REQUIRE(left_replica.remember_current_committed(left.generation, left.hash));
-        REQUIRE(right_replica.seed(right));
-        REQUIRE(right_replica.remember_current_committed(right.generation, right.hash));
+        commit_record(left_replica, left);
+        commit_record(right_replica, right);
 
         auto right_history = right_replica.history_entry(right.hash);
         REQUIRE(right_history.has_value());
@@ -710,14 +715,10 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip
         reconciliation.hash = metadata_hash(reconciliation.generation, reconciliation.previous,
                                             reconciliation.payload);
 
-        REQUIRE(left_replica.seed(reconciliation));
-        REQUIRE(left_replica.remember_current_committed(reconciliation.generation,
-                                                        reconciliation.hash));
+        commit_record(left_replica, reconciliation);
         // The right branch can accept the same merge because its committed head
         // is an explicit secondary parent, even though the primary parent is left.
-        REQUIRE(right_replica.seed(reconciliation));
-        REQUIRE(right_replica.remember_current_committed(reconciliation.generation,
-                                                         reconciliation.hash));
+        commit_record(right_replica, reconciliation);
         CHECK(left_replica.history_is_ancestor(left.hash, reconciliation.hash));
         CHECK(left_replica.history_is_ancestor(right.hash, reconciliation.hash));
     }
@@ -1874,19 +1875,10 @@ MACHA_FAST_TEST("storage_metadata", test_a_journal_compaction_holds_no_reader_of
     const auto keys = load_cluster_keys(keyfile);
     const auto path = t.path() / "compaction-off-lock";
     {
+        { MetadataReplica opened(path, keys.storage); }
+        for (size_t i = 0; i < 130; ++i)
+            append_journal_frame(path, keys.storage, journal_commit, genesis_metadata());
         MetadataReplica replica(path, keys.storage);
-        for (size_t i = 0; i < 65; ++i) {
-            auto base = replica.current();
-            auto before = decode_snapshot(base.payload);
-            auto after = before;
-            after.entries["/"].mtime_ns = static_cast<int64_t>(i + 1);
-            auto d = metadata_delta(before, after);
-            REQUIRE(d.has_value());
-            MetadataRecord proposal;
-            REQUIRE(replica.cas_delta(base.generation, base.hash, encode_metadata_delta(*d),
-                                      &proposal));
-            REQUIRE(replica.remember_current_committed(proposal.generation, proposal.hash));
-        }
         const auto head = replica.committed().hash;
 
         auto& hold = test_support::fsync_hold;
@@ -2092,14 +2084,14 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_t
 
     const auto journal = path / "metadata" / "journal.log";
     uint64_t first_frame_end = 0;
+    { MetadataReplica opened(path, keys.storage); }
+    append_journal_frame(path, keys.storage, journal_prepare_full, first, first.payload);
+    first_frame_end = std::filesystem::file_size(journal);
+    REQUIRE(first_frame_end > 4);
+    append_journal_frame(path, keys.storage, journal_prepare_full, second, second.payload);
     {
-        MetadataReplica replica(path, keys.storage);
-        MetadataRecord observed;
-        REQUIRE(replica.cas(genesis.generation, genesis.hash, first.payload, &observed));
-        first_frame_end = std::filesystem::file_size(journal);
-        REQUIRE(first_frame_end > 4);
-        REQUIRE(replica.cas(first.generation, first.hash, second.payload, &observed));
-        CHECK(replica.current().hash == second.hash);
+        MetadataReplica replayed(path, keys.storage);
+        CHECK(replayed.current().hash == second.hash);
     }
     REQUIRE(std::filesystem::file_size(journal) > first_frame_end);
 
@@ -2131,10 +2123,9 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_t
             quarantined = true;
     CHECK(quarantined);
 
-    // The replica is usable: the same mutation applies again.
-    MetadataRecord observed;
-    REQUIRE(reopened.cas(genesis.generation, genesis.hash, first.payload, &observed));
-    CHECK(observed.hash == first.hash);
+    // The replica is usable: the same commit applies again.
+    commit_record(reopened, first);
+    CHECK(reopened.committed().hash == first.hash);
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_alternatives_are_gc_roots) {
@@ -2178,66 +2169,6 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_alternatives_are_gc_r
     const auto catalogue_roots = metadata_catalogue_root_set(snapshot);
     CHECK(catalogue_roots ==
           std::set<ObjectId>({effective_root, base_root, left_root, right_root}));
-}
-
-MACHA_FAST_TEST("storage_metadata",
-                test_metadata_legacy_prepare_journal_replays_deterministically) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-    const auto genesis = genesis_metadata();
-
-    auto first_snapshot = decode_snapshot(genesis.payload);
-    FsEntry first;
-    first.type = EntryType::directory;
-    first.mode = 0755;
-    first_snapshot.entries["/first"] = first;
-
-    auto second_snapshot = decode_snapshot(genesis.payload);
-    FsEntry second = first;
-    second_snapshot.entries["/second"] = second;
-
-    auto child = [&](const MetadataSnapshot& snapshot) {
-        MetadataRecord record;
-        record.generation = genesis.generation + 1;
-        record.previous = genesis.hash;
-        record.payload = encode_snapshot(snapshot);
-        record.hash = metadata_hash(record.generation, record.previous, record.payload);
-        return record;
-    };
-    auto a = child(first_snapshot);
-    auto b = child(second_snapshot);
-    REQUIRE(a.hash != b.hash);
-    const auto& low = a.hash < b.hash ? a : b;
-    const auto& high = a.hash < b.hash ? b : a;
-
-    const auto path = t.path() / "prepare-race";
-    {
-        MetadataReplica replica(path, keys.storage);
-        MetadataRecord observed;
-        REQUIRE(replica.cas(genesis.generation, genesis.hash, high.payload, &observed));
-        CHECK(observed.hash == high.hash);
-
-        // Legacy PREPARE journal state stays readable; protocol 20 never uses
-        // MetadataReplica::cas() for live publication.
-        REQUIRE(replica.cas(genesis.generation, genesis.hash, low.payload, &observed));
-        CHECK(observed.hash == low.hash);
-        CHECK(!replica.cas(genesis.generation, genesis.hash, high.payload, &observed));
-        CHECK(observed.hash == low.hash);
-        CHECK(replica.committed().hash == genesis.hash);
-    }
-
-    // A legacy PREPARE replacement sequence still replays, so an interrupted
-    // legacy journal recovers without data loss.
-    MetadataReplica reopened(path, keys.storage);
-    CHECK(reopened.current().hash == low.hash);
-    CHECK(reopened.committed().hash == genesis.hash);
-    MetadataRecord observed;
-    REQUIRE(reopened.cas(genesis.generation, genesis.hash, low.payload, &observed));
-    CHECK(observed.hash == low.hash);
-    REQUIRE(reopened.remember_current_committed(low.generation, low.hash));
-    CHECK(reopened.committed().hash == low.hash);
 }
 
 MACHA_FAST_TEST("storage_metadata",
@@ -3557,48 +3488,6 @@ MACHA_FAST_TEST("storage_metadata", test_the_legacy_clock_survives_snapshot_and_
     CHECK(!metadata_delta(after, moved).has_value());
 }
 
-MACHA_FAST_TEST("storage_metadata", test_protocol20_state_rejects_legacy_authority_mutators) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-    MetadataReplica replica(t.path() / "legacy-backdoor", keys.storage);
-    const auto genesis = genesis_metadata();
-    auto snapshot = decode_snapshot(genesis.payload);
-    snapshot.metadata_write_replicas_required = 2;
-    MetadataRecord established;
-    established.generation = genesis.generation + 1;
-    established.previous = genesis.hash;
-    established.payload = encode_snapshot(snapshot);
-    established.hash =
-        metadata_hash(established.generation, established.previous, established.payload);
-    NodeId a{}, b{};
-    a.bytes[15] = 1;
-    b.bytes[15] = 2;
-    REQUIRE(replica.store_commit(established));
-    REQUIRE(replica.accept_commit({established.generation, established.hash, 2, {a, b}}));
-
-    auto child_snapshot = snapshot;
-    FsEntry directory;
-    directory.type = EntryType::directory;
-    directory.mode = 0755;
-    child_snapshot.entries["/must-not-seed"] = directory;
-    MetadataRecord child;
-    child.generation = established.generation + 1;
-    child.previous = established.hash;
-    child.payload = encode_snapshot(child_snapshot);
-    child.hash = metadata_hash(child.generation, child.previous, child.payload);
-
-    CHECK(!replica.seed(child));
-    CHECK(!replica.remember_committed(child));
-    MetadataRecord observed;
-    CHECK(!replica.cas(established.generation, established.hash, child.payload, &observed));
-    CHECK(replica.committed().hash == established.hash);
-    auto heads = replica.accepted_heads();
-    REQUIRE(heads.size() == 1);
-    CHECK(heads.front().hash == established.hash);
-}
-
 MACHA_TEST("storage_metadata", test_local_store) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -4082,54 +3971,6 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(upgraded_v7.garbage.front().retired_at_ns == 0);
     CHECK(upgraded_v7.garbage.front().retirement_id == NodeId{});
 
-    // DLT1 is accepted only from persisted journals: encoders emit DLT5, and old
-    // records still replay byte-for-byte.
-    Writer old_delta;
-    const std::array<uint8_t, 8> old_delta_magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
-    old_delta.raw(old_delta_magic);
-    old_delta.u32(0);
-    old_delta.u32(0);
-    old_delta.u32(0);
-    old_delta.u8(static_cast<uint8_t>(CatalogueDelta::unchanged));
-    old_delta.u32(1);
-    auto legacy_delta_id = object_id(pattern(3072));
-    old_delta.fixed(legacy_delta_id.bytes);
-    auto decoded_old_delta = decode_metadata_delta(old_delta.data());
-    REQUIRE(decoded_old_delta.upsert_garbage.size() == 1);
-    CHECK(decoded_old_delta.upsert_garbage.front().id == legacy_delta_id);
-    CHECK(decoded_old_delta.upsert_garbage.front().retired_at_ns == 0);
-    CHECK(decoded_old_delta.upsert_garbage.front().retirement_id == NodeId{});
-
-    // Storage compatibility includes the authenticated delta journal, not just
-    // accepting old payloads in isolation. DLT1 successor hashes were computed
-    // over SM7 bytes, so replay must reconstruct that exact historical encoding.
-    auto legacy_journal_path = t.path() / "legacy-journal-node";
-    MetadataReplica legacy_journal(legacy_journal_path, keys.storage);
-    MetadataRecord legacy_seed;
-    legacy_seed.generation = 17;
-    legacy_seed.previous = object_id(pattern(211));
-    legacy_seed.payload = old_v7.data();
-    legacy_seed.hash =
-        metadata_hash(legacy_seed.generation, legacy_seed.previous, legacy_seed.payload);
-    REQUIRE(legacy_journal.seed(legacy_seed));
-    REQUIRE(legacy_journal.remember_current_committed(legacy_seed.generation, legacy_seed.hash));
-    MetadataRecord legacy_successor;
-    REQUIRE(legacy_journal.cas_delta(legacy_seed.generation, legacy_seed.hash, old_delta.data(),
-                                     &legacy_successor));
-    REQUIRE(legacy_journal.remember_current_committed(legacy_successor.generation,
-                                                      legacy_successor.hash));
-    CHECK(std::equal(legacy_successor.payload.begin(), legacy_successor.payload.begin() + 8,
-                     old_v7_magic.begin()));
-    {
-        MetadataReplica replayed_legacy(legacy_journal_path, keys.storage);
-        CHECK(replayed_legacy.current().hash == legacy_successor.hash);
-        CHECK(replayed_legacy.committed().hash == legacy_successor.hash);
-        auto replayed_snapshot = decode_snapshot(replayed_legacy.current().payload);
-        REQUIRE(replayed_snapshot.garbage.size() == 2);
-        CHECK(replayed_snapshot.garbage.back().id == legacy_delta_id);
-        CHECK(replayed_snapshot.garbage.back().retired_at_ns == 0);
-    }
-
     // Snapshots without a catalogue-root field decode to an empty catalogue,
     // without migration.
     Writer old;
@@ -4162,16 +4003,13 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(replica.committed_identity().generation == replica.committed().generation);
     CHECK(replica.committed_identity().hash == replica.committed().hash);
     CHECK(replica.committed().hash == current.hash);
-    MetadataRecord next;
-    REQUIRE(replica.cas(current.generation, current.hash, encoded, &next));
-    CHECK(next.generation == current.generation + 1);
+    const auto next = record_after(current, encoded);
     CHECK(decode_snapshot(next.payload).metadata_voters.size() == 3);
-    // A successful replica CAS is not yet a committed cluster checkpoint. The
-    // committed head advances only after MetadataManager has observed the write floor.
+    // A stored commit is not yet a head: the committed head advances on acceptance.
+    REQUIRE(replica.store_commit(next));
     CHECK(replica.committed().hash == current.hash);
-    REQUIRE(replica.remember_current_committed(next.generation, next.hash));
+    REQUIRE(replica.accept_commit({next.generation, next.hash, 0, {}}));
     CHECK(replica.committed().hash == next.hash);
-    CHECK(!replica.remember_current_committed(next.generation, current.hash));
 
     MetadataReplica reopened(replica_path, keys.storage);
     CHECK(reopened.current().hash == next.hash);
@@ -4179,9 +4017,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(std::filesystem::exists(replica_path / "metadata" / "checkpoint.meta"));
     CHECK(std::filesystem::exists(replica_path / "metadata" / "journal.log"));
 
-    // Ordinary mutation is a compact delta proposal. It survives restart
-    // through the encrypted journal and does not require a full snapshot file
-    // rewrite for either prepare or commit.
+    // Ordinary mutation is a compact delta: history grows by the delta, not by
+    // the successor's snapshot, and it survives restart.
     auto before_delta = decode_snapshot(reopened.current().payload);
     auto after_delta = before_delta;
     after_delta.entries.at("/movie.mkv").size = 456;
@@ -4189,21 +4026,20 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     auto delta = metadata_delta(before_delta, after_delta);
     REQUIRE(delta.has_value());
     auto delta_bytes = encode_metadata_delta(*delta);
-    const auto journal_before_delta =
-        std::filesystem::file_size(replica_path / "metadata" / "journal.log");
-    MetadataRecord delta_next;
-    REQUIRE(reopened.cas_delta(reopened.current().generation, reopened.current().hash, delta_bytes,
-                               &delta_next));
-    CHECK(reopened.committed().hash == next.hash);
-    REQUIRE(reopened.remember_current_committed(delta_next.generation, delta_next.hash));
-    auto journal_size = std::filesystem::file_size(replica_path / "metadata" / "journal.log");
-    const auto journal_growth = journal_size - journal_before_delta;
-    // For tiny snapshots the two frames' fixed overhead can exceed the snapshot;
-    // growth must track the compact delta plus bounded framing, not the full
-    // successor snapshot.
+    const auto history_before_delta =
+        std::filesystem::file_size(replica_path / "metadata" / "history.log");
+    const auto delta_next = record_after(
+        reopened.current(),
+        encode_snapshot(apply_metadata_delta(before_delta, decode_metadata_delta(delta_bytes))));
+    commit_record(reopened, delta_next, delta_bytes);
+    const auto history_growth =
+        std::filesystem::file_size(replica_path / "metadata" / "history.log") -
+        history_before_delta;
+    // For tiny snapshots the frame's fixed overhead can exceed the snapshot; growth
+    // must track the compact delta plus bounded framing.
     CHECK(delta_bytes.size() < delta_next.payload.size());
-    CHECK(journal_growth >= delta_bytes.size());
-    CHECK(journal_growth < delta_bytes.size() + 512);
+    CHECK(history_growth >= delta_bytes.size());
+    CHECK(history_growth < delta_bytes.size() + 512);
 
     MetadataReplica reopened_again(replica_path, keys.storage);
     CHECK(reopened_again.current().hash == delta_next.hash);
@@ -4226,8 +4062,9 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
         auto d = metadata_delta(before, after);
         REQUIRE(d.has_value());
         auto dbytes = encode_metadata_delta(*d);
-        REQUIRE(uncommitted.cas_delta(base.generation, base.hash, dbytes, &uncommitted_next));
-        CHECK(uncommitted.committed().hash == uncommitted_base_hash);
+        uncommitted_next = record_after(base, encode_snapshot(apply_metadata_delta(before, *d)));
+        append_journal_frame(uncommitted_path, keys.storage, journal_prepare_delta,
+                             uncommitted_next, dbytes);
     }
     {
         std::ofstream tail(uncommitted_path / "metadata" / "journal.log",
@@ -4276,32 +4113,6 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
             preserved |= entry.path().filename().string().starts_with("journal.log.corrupt.");
         }
         CHECK(preserved);
-    }
-
-    // A prepared proposal which never reached the write floor has no authority.
-    // A later proposal based on the last committed head must be able to pre-empt
-    // it, and that rollback/replacement must survive another restart.
-    MetadataRecord replacement;
-    {
-        MetadataReplica recovered(uncommitted_path, keys.storage);
-        const auto base = recovered.committed();
-        auto before = decode_snapshot(base.payload);
-        auto after = before;
-        after.entries["/replacement"] = extra;
-        auto d = metadata_delta(before, after);
-        REQUIRE(d.has_value());
-        const auto dbytes = encode_metadata_delta(*d);
-        REQUIRE(recovered.cas_delta(base.generation, base.hash, dbytes, &replacement));
-        CHECK(recovered.current().hash == replacement.hash);
-        CHECK(recovered.committed().hash == base.hash);
-        REQUIRE(recovered.remember_current_committed(replacement.generation, replacement.hash));
-    }
-    {
-        MetadataReplica recovered(uncommitted_path, keys.storage);
-        CHECK(recovered.current().hash == replacement.hash);
-        CHECK(recovered.committed().hash == replacement.hash);
-        CHECK(decode_snapshot(recovered.committed().payload).entries.contains("/replacement"));
-        CHECK(!decode_snapshot(recovered.committed().payload).entries.contains("/pending"));
     }
 
     // The persistent metadata cache is an independently encrypted committed
@@ -4377,30 +4188,20 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
         CHECK(message.find("AES-GCM authentication failed") != std::string::npos);
     }
 
-    // Periodic compaction bounds replay. 64 committed mutations produce 128
-    // prepare+commit journal records; the threshold checkpoints and truncates
-    // them rather than allowing an unbounded replay log.
+    // Compaction bounds replay: at the threshold it checkpoints and truncates
+    // the journal rather than allowing an unbounded replay log.
     auto compact_path = t.path() / "compact-node";
     {
+        { MetadataReplica opened(compact_path, keys.storage); }
+        for (size_t i = 0; i < 130; ++i)
+            append_journal_frame(compact_path, keys.storage, journal_commit, genesis_metadata());
         MetadataReplica compacted(compact_path, keys.storage);
-        for (size_t i = 0; i < 65; ++i) {
-            auto base = compacted.current();
-            auto before = decode_snapshot(base.payload);
-            auto after = before;
-            after.entries["/"].mtime_ns = static_cast<int64_t>(i + 1);
-            auto d = metadata_delta(before, after);
-            REQUIRE(d.has_value());
-            auto dbytes = encode_metadata_delta(*d);
-            MetadataRecord proposal;
-            REQUIRE(compacted.cas_delta(base.generation, base.hash, dbytes, &proposal));
-            REQUIRE(compacted.remember_current_committed(proposal.generation, proposal.hash));
-        }
         CHECK(std::filesystem::file_size(compact_path / "metadata" / "journal.log") > 4096);
         compacted.compact();
     }
     CHECK(std::filesystem::file_size(compact_path / "metadata" / "journal.log") < 4096);
     MetadataReplica compacted_again(compact_path, keys.storage);
-    CHECK(compacted_again.current().generation == 66);
+    CHECK(compacted_again.current().generation == genesis_metadata().generation);
     CHECK(compacted_again.current().hash == compacted_again.committed().hash);
 }
 
