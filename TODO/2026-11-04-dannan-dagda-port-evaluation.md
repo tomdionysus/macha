@@ -35,8 +35,11 @@ would move.
   certificates, head sets, reconciliation, conflicts, dots, truncation,
   the Merkle tree over keys, genesis, tombstone batches as head state, the
   cache seed, the metadata readiness plane, the ordered registration. The
-  namespace, which is the filesystem, cannot move until this is built,
-  and Dagda has it waiting on Macha's tree-native merge and fixtures.
+  namespace, which is the filesystem, cannot move until this is built.
+  (Corrected 2026-11-05: this was written as waiting on Macha's tree-native
+  merge. That branch is a clean-up that changes no live form, and under the
+  freeze Dagda builds against cac5998, whose heads are tree-backed on both
+  nodes; section 6 item 1.)
 - **Dannan is not extracted code.** It was written from the design with
   its own wire (versions 1 and 2, not protocol 23), its own thread model
   (one Asio strand per connection and 13 shared workers, against Macha's
@@ -448,19 +451,27 @@ Dannan's formats.
 
 ## 6. What Macha must do before any port step
 
-1. **Merge the tree-native branch** (ACTIVE item 3): genesis as a
-   constant, the legacy authority and inline formats gone. Dagda's heads
-   move from the merged code and the fixtures are cut after it, so this
-   is the head of the critical path. Fix the five LocalStore races in
-   Macha, or accept that they are fixed by the replacement and say so.
+1. ~~**Merge the tree-native branch**~~ **Withdrawn 2026-11-05.** The item
+   said the branch makes genesis a constant and removes legacy authority and
+   the inline formats; its diff does none of that (ACTIVE item 2 says what it
+   does). The live heads on both nodes are tree-backed (SM19, re-rooted
+   2026-11-03), so Dagda's heads move from cac5998 as it runs. Macha's code is
+   frozen (operator, 2026-11-05). The five LocalStore races: 0.92.3 fixed what
+   Dagda found (CHANGELOG); the rest stays as Dagda's difference until the freeze
+   lifts.
 2. **Cut the fixtures Dagda waits for**: a real state directory from
    macnessa (metadata included, which is what the migration tool has
    never seen) and `macha-metadata-dump` output, under
-   `build/macha-fixtures/`.
+   `build/macha-fixtures/`. Open: a consistent copy needs a stopped node,
+   with the operator. Done without a stop on 2026-11-05: `state-macnessa/`
+   (three roster files, approved), `state-scratch/` (an inline, map-backed
+   namespace founded at cac5998, so not the live form), `membership-tombstone/`.
 3. **Write the goldens** the extraction gate assumes and nobody has: the
    config dump, the Status surface from a two-node in-process cluster with
    volatile fields masked, the route list. Without them "byte-identical"
-   is a wish.
+   is a wish. Done 2026-11-05 under `build/macha-fixtures/goldens/` from two
+   real processes on macnessa's loopback, with its README's limits (381 of 494
+   Status keys by name, 31 of 83 journal lines, routes read from source).
 4. **Measure the baselines on the two Pis at 0.92.2**, from the status
    API and `observations.jsonl`, and keep them in `TODO/`: DATA-lane
    throughput of one extent between macnessa and inverbeg and the CONTROL
@@ -491,10 +502,10 @@ Dannan's formats.
 Each phase ends green on its gate before the next starts; the gates are
 the baselines of section 6 compared, never a feeling.
 
-**Phase 0, Macha prerequisites** (section 6, items 1 to 7). Exit: tree-
-native merged and deployed; fixtures handed to Dagda; goldens committed;
-baselines recorded; the test mapping written; the build line proven on
-macnessa.
+**Phase 0, Macha prerequisites** (section 6, items 2 to 7; item 1 withdrawn).
+Exit: the namespace tree-backed on both nodes (it is, since 2026-11-03);
+goldens cut (2026-11-05); fixtures handed to Dagda; baselines recorded; the
+test mapping written; the build line proven on macnessa.
 
 **Phase 1, the libraries close their lists** (section 5.1 and 5.2), Dagda
 step 4 among them. Exit: Dagda 0.1.0 tagged with `dagda::Context` v1
