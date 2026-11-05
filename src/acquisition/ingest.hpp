@@ -24,6 +24,7 @@
 namespace macha {
 
 class MediaInformationService;
+enum class MediaProbeKind;
 
 enum class IngestJobState {
     queued,
@@ -54,6 +55,11 @@ struct IngestFileProgress {
     bool skipped{};
     bool catalogue_candidate{true};
     IngestFileControl control{IngestFileControl::active};
+    // Why this file alone could not be imported: the code clients act on, and
+    // its English message. The job goes on without it.
+    std::string error_code;
+    std::string error;
+    bool failed() const noexcept { return !error_code.empty(); }
 };
 
 struct IngestJob {
@@ -69,6 +75,7 @@ struct IngestJob {
     uint64_t bytes_completed{};
     size_t files_total{};
     size_t files_completed{};
+    size_t files_failed{};
     size_t catalogue_total{};
     size_t catalogue_pending{};
     size_t catalogue_catalogued{};
@@ -99,6 +106,12 @@ class IngestError : public std::runtime_error {
 
   private:
     std::string code_;
+};
+
+// An error belonging to one file: that file fails and the job goes on.
+class IngestFileError final : public IngestError {
+  public:
+    using IngestError::IngestError;
 };
 
 // API JSON for an ingest job, shared by the HTTP handler and the cluster RPC
@@ -255,7 +268,8 @@ class IngestManager {
     void refresh_catalogue_jobs();
     void enqueue_catalogue_hints(IngestJob&);
     void cleanup_source(const IngestJob&);
-    std::string choose_destination(const std::filesystem::path&, uint64_t);
+    // `kind`, when a destination is chosen, is what the file probed as.
+    std::string choose_destination(const std::filesystem::path&, uint64_t, MediaProbeKind& kind);
     std::string with_existing_case(const std::string& destination);
     bool exists_ignoring_case(const std::string& path);
     bool allowed_external_source(const std::filesystem::path&) const;

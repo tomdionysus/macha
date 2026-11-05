@@ -174,10 +174,12 @@ Each item is an [ingest job](#the-ingest-job-object) without `files` and without
 - `resume`: the file is queued again. Resuming the job resumes every paused file in it.
 - `cancel`: the file is never imported; its partial is removed and its source left as it is. It no longer counts in the job's `files_total` or `bytes_total`, and a job whose remaining files are all cancelled completes with what it has.
 
+These work on a `failed` job too, which `resume` can restart. A file that is itself `failed` stays failed: `pause` and `resume` of it are refused, and `cancel` leaves it out of `files_failed`. To try it again, deal with what stopped it and submit its source path as a new job.
+
 | status | code | when |
 |---|---|---|
 | 404 | `not_found` | no reachable node has the job, or it has no file at `index` |
-| 409 | `invalid_state` | the file is completed, skipped or already cancelled; a `pause` of a paused file or a `resume` of one that is not paused; the job is finished (`cataloguing`, `completed`, `cancelled` or `failed`), or its node does not offer per-file actions |
+| 409 | `invalid_state` | the file is completed, skipped or already cancelled; a `pause` of a paused file or a `resume` of one that is not paused; a `pause` or `resume` of a failed file; the job is finished (`cataloguing`, `completed` or `cancelled`), or its node does not offer per-file actions |
 | 503 | `node_unreachable` | the owning node cannot be reached |
 
 ## The ingest job object
@@ -197,6 +199,7 @@ Each item is an [ingest job](#the-ingest-job-object) without `files` and without
   "bytes_completed": 536870912,
   "files_total": 2,
   "files_completed": 0,
+  "files_failed": 0,
   "rate_bytes_per_second": 41943040,
   "eta_seconds": 39,
   "progress": 0.25,
@@ -229,7 +232,8 @@ Each item is an [ingest job](#the-ingest-job-object) without `files` and without
 | `delete_source_on_clear` | bool | whether `clear` deletes the imported source (see below) |
 | `state` | string | see [Ingest job states](#ingest-job-states) |
 | `bytes_total`, `bytes_completed` | integer | bytes to copy and bytes copied. Zero until the source has been scanned |
-| `files_total`, `files_completed` | integer | files in the plan and files committed |
+| `files_total`, `files_completed` | integer | files in the plan and files committed. A failed or cancelled file is out of `files_total` and `bytes_total` |
+| `files_failed` | integer | files that failed on an error of their own; see [Ingest error codes](#ingest-error-codes) |
 | `rate_bytes_per_second` | integer | smoothed copy rate; 0 when not copying |
 | `eta_seconds` | integer or null | null when there is no rate to estimate from. `rate_bytes_per_second` and `eta_seconds` are not persisted, so they read 0 and null after the owning node restarts until copying resumes |
 | `progress` | number or null | `bytes_completed / bytes_total`, capped at 1; null while `bytes_total` is 0 |
@@ -263,7 +267,9 @@ Each `catalogue.items` entry:
 
 Destinations are compared ignoring case: a folder that already exists under another spelling is reused as spelt (a lowercase release goes into `/Movies/The Martian (2015)/`, not a new `/Movies/the martian (2015)/`), and a file whose name differs from one already there only by case gets a ` (2)` suffix like any other collision.
 
-Each `files` entry: `index` (its position, which per-file actions name), `state` (`queued`, `importing`, `paused`, `completed`, `skipped` or `cancelled`), `source_path`, `destination_path` (strings), `size`, `copied` (integers), `completed`, `skipped`, `catalogue_candidate` (bools). A file that is not a catalogue candidate (a sidecar) is imported but not sent to the catalogue.
+A file probing as a film, in a folder of extras under a title with episodes, is an extra of that series. A title is the outermost folder of the source with episodes under it (the source itself only when it holds one series), and its series is the one most of those episodes belong to. The file goes under the series' folder, keeping the folders it has below the title: `<Show>/Featurettes/Season 2/Deleted Scenes.mkv` goes to `/TV/Show/Featurettes/Season 2/Deleted Scenes.mkv`. A folder of extras is one whose name has the word `featurette`, `featurettes`, `extra`, `extras` or `bonus`, or is exactly `behind the scenes`, `deleted scenes`, `interviews`, `trailers` or `shorts`, in any case. A film's extras, and those of a title with no episodes, are planned like any other film.
+
+Each `files` entry: `index` (its position, which per-file actions name), `state` (`queued`, `importing`, `paused`, `completed`, `skipped`, `cancelled` or `failed`), `source_path`, `destination_path` (strings), `size`, `copied` (integers), `completed`, `skipped`, `catalogue_candidate` (bools), `error_code`, `error` (strings, null unless `failed`). A file that is not a catalogue candidate (a sidecar, or an extra of a series) is imported but not sent to the catalogue.
 
 ### Ingest job states
 
@@ -275,7 +281,7 @@ Each `files` entry: `index` (its position, which per-file actions name), `state`
 | `cataloguing` | every file copied; waiting for the catalogue to finish with them | no |
 | `paused` | stopped by an operator, or waiting because every file left in it is paused | no |
 | `blocked` | stopped by a condition that may pass; **retried by itself** | no |
-| `completed` | copied and catalogued | yes |
+| `completed` | copied and catalogued. `files_failed` says how many files did not make it | yes |
 | `cancelled` | stopped by an operator, partial files removed | yes |
 | `failed` | stopped by an error that retrying the same job will not fix | yes (`resume` restarts it) |
 
@@ -283,7 +289,8 @@ What moves a job:
 
 - A worker picks up a `queued` job, or a `blocked` job whose `updated_unix_ms` is at least `ingest.blocked_retry_ms` old. At most `ingest.max_concurrent_jobs` run at once.
 - A job with no file plan goes to `scanning`, then `importing`. A job that already has a plan (a resumed or retried one) goes straight to `importing` and continues from the files and bytes already committed.
-- When every file is copied the job goes to `cataloguing` if the catalogue still has any of them pending, otherwise straight to `completed`. A `cataloguing` job becomes `completed` when nothing is pending.
+- A file that meets an error of its own fails alone and the job goes on to the next.
+- When every file is copied or failed the job goes to `cataloguing` if the catalogue still has any of them pending, otherwise straight to `completed`. A `cataloguing` job becomes `completed` when nothing is pending.
 - A job that was `scanning` or `importing` when its node stopped is `queued` again when the node starts.
 
 How the owner's job responds to each action, once the owner applies it (the API's own rules are under [Actions](#actions-1)):
@@ -318,17 +325,23 @@ A `blocked` job is retried every `ingest.blocked_retry_ms` until it succeeds or 
 
 `metadata_unavailable` and `storage_unavailable` make the job `blocked`, and the job completes once metadata is writable, or a disk can take the bytes, again.
 
-| `error_code` (failed) | cause |
+| `error_code` (job `failed`) | cause |
 |---|---|
 | `source_is_symlink` | the source is a symbolic link |
 | `no_supported_media` | the source contains no supported media |
-| `destination_parent_not_directory` | a component of the destination path exists and is not a directory |
-| `partial_not_file` | the job's partial file in the namespace is not a file |
-| `destination_conflict` | the destination appeared with an unexpected type or size |
 | `namespace_short_write` | a write into the namespace was short |
-| `size_mismatch` | the committed file's size differs from the source |
+| `source_seek_failed` | the source could not be positioned again after a re-base |
 | `filesystem_error` | any other namespace error |
 | `import_failed` | any other error |
+
+An error belonging to one file fails that file, with these on its `error_code`, and the job carries on. Its source is left as it is:
+
+| `error_code` (file `failed`) | cause |
+|---|---|
+| `destination_parent_not_directory` | a component of the destination path exists and is not a directory |
+| `partial_not_file` | the job's partial file in the namespace is not a file |
+| `destination_conflict` | the destination appeared with an unexpected type or size, before or during the copy |
+| `size_mismatch` | the committed file's size differs from the source |
 
 ### What clear and cancel delete
 

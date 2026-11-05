@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "contract/stopping.hpp"
 #include "torrent/torrent_extent_journal.hpp"
 #include "stepped_time.hpp"
 #if MACHA_HAVE_BOOKS
@@ -3431,6 +3432,351 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_are_paused_resumed_and_cance
     CHECK(absent(node.filesystem(), done.files[cancelled].destination_path));
     CHECK(absent(node.filesystem(), done.files[cancelled].temporary_path));
     ingest.stop();
+}
+
+// The partial a job would write for a destination.
+std::string partial_of(const std::string& destination, const std::string& id) {
+    return destination + ".macha-ingest-" + id.substr(0, 12) + ".part";
+}
+
+MACHA_TEST("hydration_catalogue", test_an_error_of_one_file_fails_that_file_and_the_job_carries_on) {
+    // Five files, the job paused inside the first real copy. Four meet an
+    // error that is theirs alone, each fails with its code, and the fifth is
+    // imported: the job completes with a count of what failed, the same after
+    // a restart and on the wire.
+    CommitGate gate;
+    CatalogueNode node("ingest-file-failures", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    auto& fs = node.filesystem();
+    constexpr size_t file_bytes = 1024 * 1024;
+    const auto root = node.path() / "five-files";
+    const std::vector<std::string> names{"Alpha Movie 2024.mkv", "Beta Movie 2024.mkv", "Gamma Movie 2024.mkv",
+                                         "Delta Movie 2024.mkv", "Epsilon Movie 2024.mkv"};
+    uint8_t seed = 10;
+    for (const auto& name : names) (void)write_host_file(root / name, pattern(file_bytes, seed++));
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = {root};
+    config.copy_chunk_bytes = 64 * 1024;
+    config.checkpoint_bytes = 256 * 1024;
+    auto ingest = std::make_unique<IngestManager>(node.node(), fs, node.hints(), config);
+    struct ReleaseGate {
+        CommitGate& gate;
+        ~ReleaseGate() { gate.release_all(); }
+    } release_gate{gate};
+    const auto id = ingest->submit_path(root);
+
+    // A directory where Delta's partial goes, before the plan is made.
+    node.mkdir("/Movies");
+    const std::string delta_folder = "/Movies/Delta Movie (2024)";
+    node.mkdir(delta_folder);
+    node.mkdir(partial_of(delta_folder + "/Delta Movie 2024.mkv", id));
+
+    gate.hold(".macha-ingest-", 1);
+    ingest->start();
+    REQUIRE(wait_until([&] {
+        const auto job = ingest->job(id);
+        return job && job->state == IngestJobState::importing && !job->current_file.empty() && gate.held() > 0;
+    }, 30s));
+    const auto planned = *ingest->job(id);
+    REQUIRE(planned.files.size() == 5);
+    std::map<std::string, size_t> role;
+    std::vector<size_t> others;
+    for (size_t i = 0; i < 5; ++i) {
+        const auto& file = planned.files[i];
+        if (file.source_path == planned.current_file) role["renamed_over"] = i;
+        else if (file.source_path.ends_with("Delta Movie 2024.mkv")) role["partial"] = i;
+        else others.push_back(i);
+    }
+    REQUIRE(role.size() == 2);
+    REQUIRE(others.size() == 3);
+    role["conflict"] = others[0];
+    role["parent"] = others[1];
+    role["imported"] = others[2];
+    // Paused, with no commit held, so this test can commit.
+    REQUIRE(ingest->pause(id));
+    gate.release_all();
+    REQUIRE(wait_until([&] { return ingest->active_jobs() == 0; }, 30s));
+    const auto& policy = node.config().filesystem;
+    const auto create = [&](const std::string& path) { fs.create_file(path, 0644, policy.root_uid, policy.root_gid); };
+    const auto dirname = [](const std::string& path) { return std::filesystem::path(path).parent_path().string(); };
+    // The destination appears while the copy runs, and before one starts.
+    create(planned.files[role["renamed_over"]].destination_path);
+    node.mkdir(dirname(planned.files[role["conflict"]].destination_path));
+    create(planned.files[role["conflict"]].destination_path);
+    // A file where a folder of the destination goes.
+    create(dirname(planned.files[role["parent"]].destination_path));
+    REQUIRE(ingest->resume(id));
+
+    REQUIRE(wait_until([&] {
+        const auto job = ingest->job(id);
+        return job && (job->state == IngestJobState::cataloguing || job->state == IngestJobState::completed ||
+                       job->state == IngestJobState::failed);
+    }, 60s));
+    const auto check = [&](const IngestJob& job) {
+        CHECK(job.state != IngestJobState::failed);
+        CHECK(job.error_code.empty());
+        CHECK(job.files_completed == 1);
+        CHECK(job.files_failed == 4);
+        CHECK(job.files_total == 1);
+        CHECK(job.bytes_total == file_bytes);
+        CHECK(job.bytes_completed == file_bytes);
+        CHECK(ingest_file_state_name(job, role["imported"]) == "completed");
+        const std::map<std::string, std::string> codes{{"renamed_over", "destination_conflict"},
+                                                       {"conflict", "destination_conflict"},
+                                                       {"parent", "destination_parent_not_directory"},
+                                                       {"partial", "partial_not_file"}};
+        for (const auto& [name, code] : codes) {
+            const auto& file = job.files[role[name]];
+            CHECK(ingest_file_state_name(job, role[name]) == "failed");
+            CHECK(file.error_code == code);
+            CHECK(!file.error.empty());
+            CHECK(!file.completed);
+        }
+    };
+    const auto done = *ingest->job(id);
+    check(done);
+    CHECK(read_whole(fs, done.files[role["imported"]].destination_path, file_bytes).size() == file_bytes);
+    CHECK(absent(fs, done.files[role["renamed_over"]].temporary_path));
+    // What was already there is untouched, and each source stays.
+    CHECK(fs.getattr(done.files[role["renamed_over"]].destination_path).size == 0);
+    CHECK(fs.getattr(done.files[role["conflict"]].destination_path).size == 0);
+    for (const auto& name : names) CHECK(std::filesystem::exists(root / name));
+
+    // On the wire, and in what the API sends.
+    check(parse_ingest_job_wire(ingest_job_wire_json(done)));
+    const auto api = ingest_job_json(done, true);
+    CHECK(api.find("files_failed")->asUInt64() == 4);
+    const auto& items = api.find("files")->asArray();
+    CHECK(items[role["conflict"]].find("state")->asString() == "failed");
+    CHECK(items[role["conflict"]].find("error_code")->asString() == "destination_conflict");
+    CHECK(!items[role["conflict"]].find("error")->asString().empty());
+    CHECK(items[role["imported"]].find("error_code")->isNull());
+
+    // Across a restart.
+    ingest->stop();
+    ingest.reset();
+    IngestManager restarted(node.node(), fs, node.hints(), config);
+    restarted.start();
+    check(*restarted.job(id));
+    restarted.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_a_failed_file_refuses_pause_and_resume_and_can_be_cancelled) {
+    // The other file held by a file pause, so the job waits with the failure
+    // on record and is not yet finished.
+    CommitGate gate;
+    CatalogueNode node("ingest-failed-file-actions", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    auto& fs = node.filesystem();
+    constexpr size_t file_bytes = 1024 * 1024;
+    const auto root = node.path() / "two-files";
+    (void)write_host_file(root / "Alpha Movie 2024.mkv", pattern(file_bytes, 20));
+    (void)write_host_file(root / "Beta Movie 2024.mkv", pattern(file_bytes, 21));
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = {root};
+    config.copy_chunk_bytes = 64 * 1024;
+    config.checkpoint_bytes = 256 * 1024;
+    IngestManager ingest(node.node(), fs, node.hints(), config);
+    struct ReleaseGate {
+        CommitGate& gate;
+        ~ReleaseGate() { gate.release_all(); }
+    } release_gate{gate};
+    const auto id = ingest.submit_path(root);
+    // A file where Beta's folder goes.
+    node.mkdir("/Movies");
+    const auto& policy = node.config().filesystem;
+    fs.create_file("/Movies/Beta Movie (2024)", 0644, policy.root_uid, policy.root_gid);
+    gate.hold(".macha-ingest-", 1);
+    ingest.start();
+    REQUIRE(wait_until([&] { return gate.held() > 0; }, 30s));
+    const auto planned = *ingest.job(id);
+    REQUIRE(planned.files.size() == 2);
+    const size_t alpha = planned.files[0].source_path.ends_with("Alpha Movie 2024.mkv") ? 0 : 1;
+    const size_t beta = 1 - alpha;
+    REQUIRE(ingest.file_action(id, alpha, "pause_file").changed);
+    gate.release_all();
+    REQUIRE(wait_until([&] {
+        const auto job = ingest.job(id);
+        return job && (job->state == IngestJobState::failed ||
+                       (job->state == IngestJobState::paused && job->held_by_files));
+    }, 60s));
+    {
+        const auto job = *ingest.job(id);
+        CHECK(job.state == IngestJobState::paused);
+        CHECK(ingest_file_state_name(job, beta) == "failed");
+        CHECK(job.files_failed == 1);
+    }
+    CHECK(ingest.file_action(id, beta, "resume_file").exists);
+    CHECK(!ingest.file_action(id, beta, "resume_file").changed);
+    CHECK(!ingest.file_action(id, beta, "pause_file").changed);
+    CHECK(ingest.file_action(id, beta, "cancel_file").changed);
+    {
+        const auto job = *ingest.job(id);
+        CHECK(ingest_file_state_name(job, beta) == "cancelled");
+        CHECK(job.files_failed == 0);
+    }
+    REQUIRE(ingest.file_action(id, alpha, "resume_file").changed);
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
+    CHECK(ingest.job(id)->files_completed == 1);
+    ingest.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_a_files_actions_work_on_a_failed_job) {
+    // A job failed by a commit that failed: it can be restarted, so what it
+    // will run can be changed first.
+    CommitGate gate;
+    CatalogueNode node("ingest-failed-job-actions", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    constexpr size_t file_bytes = 1024 * 1024;
+    const auto root = node.path() / "two-files";
+    (void)write_host_file(root / "Alpha Movie 2024.mkv", pattern(file_bytes, 30));
+    (void)write_host_file(root / "Beta Movie 2024.mkv", pattern(file_bytes, 31));
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = {root};
+    config.copy_chunk_bytes = 64 * 1024;
+    config.checkpoint_bytes = 256 * 1024;
+    IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
+    struct ReleaseGate {
+        CommitGate& gate;
+        ~ReleaseGate() { gate.release_all(); }
+    } release_gate{gate};
+    gate.hold(".macha-ingest-", 1);
+    const auto id = ingest.submit_path(root);
+    ingest.start();
+    REQUIRE(wait_until([&] { return gate.held() > 0; }, 30s));
+    const auto planned = *ingest.job(id);
+    size_t worked = 0;
+    while (planned.files[worked].source_path != planned.current_file) ++worked;
+    const size_t other = 1 - worked;
+    gate.fail_on_release();
+    gate.release_all();
+    REQUIRE(wait_until([&] {
+        const auto job = ingest.job(id);
+        return job && job->state == IngestJobState::failed;
+    }, 30s));
+
+    CHECK(ingest.file_action(id, other, "pause_file").changed);
+    CHECK(ingest.file_action(id, other, "resume_file").changed);
+    CHECK(ingest.file_action(id, other, "cancel_file").changed);
+    {
+        const auto job = *ingest.job(id);
+        CHECK(job.state == IngestJobState::failed);
+        CHECK(ingest_file_state_name(job, other) == "cancelled");
+        CHECK(job.files_total == 1);
+    }
+    REQUIRE(ingest.resume(id));
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
+    const auto done = *ingest.job(id);
+    CHECK(done.files_completed == 1);
+    CHECK(done.files[worked].completed);
+    CHECK(!done.files[other].completed);
+    CHECK(absent(node.filesystem(), done.files[other].destination_path));
+    ingest.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_ingest_files_a_series_extras_under_the_series) {
+    // A file in an extras folder of a title that has episodes goes under that
+    // series, keeping its folders below the title, and is not sent to the
+    // catalogue as a movie. A film's extras, and a title with no episodes, are
+    // not this rule's.
+    CatalogueNode node("ingest-extras", [](Config& config) {
+        config.catalogue.scanner.tv.enabled = true;
+        config.catalogue.scanner.tv.roots = {"/TV"};
+    });
+    node.mkdir("/Movies");
+    node.mkdir("/TV");
+    const auto library = node.path() / "tv-library";
+    const auto write = [&](const std::filesystem::path& relative, uint8_t seed) {
+        (void)write_host_file(library / relative, pattern(4096, seed));
+    };
+    write("The Show (2019)/Season 1/The Show S01E01.mkv", 1);
+    write("The Show (2019)/Featurettes/Deleted Scenes.mkv", 2);
+    write("The Show (2019)/Featurettes/Season 2/Inside/Clip 1.mkv", 3);
+    write("The Show (2019)/Season 1/Extras/Clip 1.mkv", 4);
+    write("Other Show (2020) + Extras/Other Show S01E01.mkv", 5);
+    write("Other Show (2020) + Extras/Bonus Disc/Deleted Scenes.mkv", 6);
+    write("A Film (2015)/A Film (2015).mkv", 7);
+    write("A Film (2015)/Featurettes/Making Of The Film.mkv", 8);
+    write("Unmatched Set/Disc 1 Extras/Garth Commercial.mkv", 9);
+
+    const auto single = node.path() / "Solo Show";
+    (void)write_host_file(single / "Solo Show S01E01.mkv", pattern(4096, 10));
+    (void)write_host_file(single / "Extras/Making Of Solo.mkv", pattern(4096, 11));
+
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = {library, single};
+    IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
+    ingest.start();
+    const auto ids = std::vector{ingest.submit_path(library), ingest.submit_path(single)};
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, ids); }, 60s));
+
+    std::vector<IngestFileProgress> files;
+    for (const auto& id : ids) {
+        const auto job = ingest.job(id);
+        files.insert(files.end(), job->files.begin(), job->files.end());
+    }
+    const auto file_at = [&](std::string_view source) {
+        const auto found = std::find_if(files.begin(), files.end(), [&](const IngestFileProgress& file) {
+            return file.source_path.ends_with(source);
+        });
+        REQUIRE(found != files.end());
+        return *found;
+    };
+    const auto series_of = [&](std::string_view episode) {
+        const std::filesystem::path destination(file_at(episode).destination_path);
+        CHECK(destination.string().starts_with("/TV/"));
+        return destination.parent_path().parent_path().string();
+    };
+    const auto show = series_of("The Show (2019)/Season 1/The Show S01E01.mkv");
+    CHECK(file_at("The Show (2019)/Featurettes/Deleted Scenes.mkv").destination_path ==
+          show + "/Featurettes/Deleted Scenes.mkv");
+    CHECK(file_at("The Show (2019)/Featurettes/Season 2/Inside/Clip 1.mkv").destination_path ==
+          show + "/Featurettes/Season 2/Inside/Clip 1.mkv");
+    CHECK(file_at("The Show (2019)/Season 1/Extras/Clip 1.mkv").destination_path ==
+          show + "/Season 1/Extras/Clip 1.mkv");
+    CHECK(!file_at("The Show (2019)/Featurettes/Deleted Scenes.mkv").catalogue_candidate);
+    CHECK(file_at("The Show (2019)/Season 1/The Show S01E01.mkv").catalogue_candidate);
+
+    const auto other_show = series_of("Other Show (2020) + Extras/Other Show S01E01.mkv");
+    CHECK(file_at("Other Show (2020) + Extras/Bonus Disc/Deleted Scenes.mkv").destination_path ==
+          other_show + "/Bonus Disc/Deleted Scenes.mkv");
+
+    const auto solo = series_of("Solo Show/Solo Show S01E01.mkv");
+    CHECK(file_at("Solo Show/Extras/Making Of Solo.mkv").destination_path == solo + "/Extras/Making Of Solo.mkv");
+
+    CHECK(file_at("A Film (2015)/Featurettes/Making Of The Film.mkv").destination_path.starts_with("/Movies/"));
+    CHECK(file_at("A Film (2015)/Featurettes/Making Of The Film.mkv").catalogue_candidate);
+    CHECK(file_at("Unmatched Set/Disc 1 Extras/Garth Commercial.mkv").destination_path.starts_with("/Movies/"));
+    ingest.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_a_stop_ends_the_inventory_walk) {
+    // The first build walks the namespace; a later one follows the tree. Each
+    // ends when its pause throws, leaving the counts as they stood, and the
+    // next build finishes.
+    CatalogueNode node("inventory-stop");
+    auto& fs = node.filesystem();
+    node.mkdir("/Walked");
+    const auto stops = [&] {
+        try {
+            (void)fs.maintenance_objects_cached([] { throw MaintenanceStopping{}; });
+        } catch (const MaintenanceStopping&) {
+            return true;
+        }
+        return false;
+    };
+    CHECK(stops());
+    const auto walked = fs.maintenance_objects_cached();
+    CHECK(walked->entries >= 1);
+    node.mkdir("/Followed");
+    CHECK(stops());
+    const auto followed = fs.maintenance_objects_cached();
+    CHECK(followed->entries == walked->entries + 1);
 }
 
 MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_mid_copy) {

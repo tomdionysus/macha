@@ -2375,6 +2375,100 @@ MACHA_TEST("invariants", test_rebalance_never_deletes_last_valid_copy_for_corrup
     CHECK(readable);
 }
 
+namespace {
+// The device, failing every read of the objects named as a disk does: the file
+// is there and its size known, the bytes do not come.
+class FailingReads final : public LocalStoreFiles {
+    LocalStoreFiles& device_{posix_local_store_files()};
+    mutable std::mutex mutex_;
+    std::set<std::filesystem::path> failing_;
+
+    void check(const std::filesystem::path& path) const {
+        std::lock_guard lock(mutex_);
+        if (failing_.contains(path))
+            throw std::runtime_error("cannot read object: Input/output error");
+    }
+
+  public:
+    void fail(const std::filesystem::path& path) {
+        std::lock_guard lock(mutex_);
+        failing_.insert(path);
+    }
+    void install(const std::filesystem::path& path, std::span<const uint8_t> head,
+                 std::span<const uint8_t> body) override {
+        device_.install(path, head, body);
+    }
+    Bytes read(const std::filesystem::path& path) override {
+        check(path);
+        return device_.read(path);
+    }
+    std::optional<Bytes> read_at(const std::filesystem::path& path, uint64_t offset, size_t size) override {
+        check(path);
+        return device_.read_at(path, offset, size);
+    }
+    void append(const std::filesystem::path& path, std::span<const uint8_t> head,
+                std::span<const uint8_t> body) override {
+        device_.append(path, head, body);
+    }
+    bool truncate(const std::filesystem::path& path, uint64_t size) override {
+        return device_.truncate(path, size);
+    }
+    std::vector<std::pair<std::filesystem::path, uint64_t>> list(const std::filesystem::path& dir) override {
+        return device_.list(dir);
+    }
+};
+} // namespace
+
+// A read that fails on the device says nothing about the object: it stays and
+// is counted. A record that reads and does not open is removed. Both by a
+// reader and by the scrub.
+MACHA_TEST("invariants", test_a_failed_read_keeps_the_object_and_a_bad_record_is_removed) {
+    TempDir t;
+    const auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto disk = t.path() / "disk";
+    std::filesystem::create_directories(disk);
+    FailingReads device;
+    StoragePool pool(t.path() / "state", random_node_id(), {{disk, 64ULL * 1024 * 1024}}, keys.storage,
+                     std::chrono::milliseconds(500), StoragePackingConfig{0, 0}, 0, device);
+    REQUIRE(wait_until([&] { return pool.online_backends() == 1; }));
+    const auto put = [&](uint8_t seed) {
+        const auto bytes = pattern(64 * 1024, seed);
+        const auto id = object_id(bytes);
+        REQUIRE(pool.put(id, bytes));
+        return id;
+    };
+    const auto unreadable_for_reader = put(1);
+    const auto unreadable_for_scrub = put(2);
+    const auto corrupt_for_reader = put(3);
+    const auto corrupt_for_scrub = put(4);
+    device.fail(object_path(disk, unreadable_for_reader));
+    device.fail(object_path(disk, unreadable_for_scrub));
+    corrupt_object(disk, corrupt_for_reader);
+    corrupt_object(disk, corrupt_for_scrub);
+    auto& failures = observations().counter("storage.read_failures");
+    const auto before = failures.load();
+
+    CHECK(!pool.get(unreadable_for_reader).has_value());
+    CHECK(pool.has(unreadable_for_reader));
+    CHECK(std::filesystem::exists(object_path(disk, unreadable_for_reader)));
+    CHECK(failures.load() == before + 1);
+
+    CHECK(!pool.get(corrupt_for_reader).has_value());
+    CHECK(!pool.has(corrupt_for_reader));
+    CHECK(failures.load() == before + 1);
+
+    bool complete = false;
+    for (int slice = 0; slice < 16 && !complete; ++slice)
+        complete = pool.scrub_step(0, 8).complete;
+    REQUIRE(complete);
+    CHECK(pool.has(unreadable_for_scrub));
+    CHECK(std::filesystem::exists(object_path(disk, unreadable_for_scrub)));
+    CHECK(!pool.has(corrupt_for_scrub));
+    CHECK(failures.load() >= before + 2);
+}
+
 MACHA_TEST("invariants", test_rpc_pre_auth_admission_is_bounded) {
 #if defined(__linux__)
     TempDir t;
