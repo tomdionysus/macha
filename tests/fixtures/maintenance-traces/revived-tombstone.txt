@@ -30,7 +30,7 @@ step: same content written again
   object first: held=1 claimed=1
   object again: held=1 claimed=1
   control-gate-in-rebuilding-pass: shut
-  tombstones: erase=[#1] stamp=[]
+  tombstones: erase=[#1]
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1

@@ -3831,14 +3831,16 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     auto metadata1_store = macha::test_support::distributed_store_for(n1);
     MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), *metadata1_store);
     // One mutation, so the siblings fork from a real post-genesis record.
-    metadata1.mutate_delta([](MetadataSnapshot&, MetadataDelta& delta) {
-        FsEntry entry;
-        entry.type = EntryType::directory;
-        entry.mode = 0755;
-        entry.uid = getuid();
-        entry.gid = getgid();
-        delta.upsert_entries["/base-concurrent"] = entry;
-    });
+    REQUIRE(macha::test_support::retry_while_not_ready([&] {
+        metadata1.mutate_delta([](MetadataSnapshot&, MetadataDelta& delta) {
+            FsEntry entry;
+            entry.type = EntryType::directory;
+            entry.mode = 0755;
+            entry.uid = getuid();
+            entry.gid = getgid();
+            delta.upsert_entries["/base-concurrent"] = entry;
+        });
+    }));
     REQUIRE(n1.metadata_replica().committed_generation() > 1);
 
     // A two-head divergence on node 1 alone, from a locally authored sibling.

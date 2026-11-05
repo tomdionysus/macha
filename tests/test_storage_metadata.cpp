@@ -583,7 +583,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_hash_streaming_matches_canonic
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_delta_in_place_preserves_namespace_storage) {
-    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    auto snapshot = founded_snapshot();
     for (size_t i = 0; i < 4096; ++i) {
         FsEntry entry;
         entry.type = EntryType::file;
@@ -630,7 +630,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip
     const auto keys = load_cluster_keys(keyfile);
 
     const auto genesis = genesis_metadata();
-    auto base = decode_snapshot(genesis.payload);
+    auto base = founded_snapshot();
     base.metadata_write_replicas_required = 1;
 
     FsEntry directory;
@@ -668,7 +668,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip
         MetadataRecord record;
         record.generation = genesis.generation + 1;
         record.previous = genesis.hash;
-        record.payload = encode_snapshot(snapshot);
+        record.payload = tree_payload(snapshot);
         record.hash = metadata_hash(record.generation, record.previous, record.payload);
         return record;
     };
@@ -689,16 +689,16 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip
 
     auto branch_snapshot = merged.snapshot;
     branch_snapshot.merge_parents = {right.hash};
-    const auto branch_encoded = encode_snapshot(branch_snapshot);
-    const auto branch_decoded = decode_snapshot(branch_encoded);
+    const auto branch_encoded = tree_payload(branch_snapshot);
+    const auto branch_decoded = map_snapshot(branch_encoded);
     CHECK(branch_decoded.merge_parents == branch_snapshot.merge_parents);
     CHECK(branch_decoded.conflicts == branch_snapshot.conflicts);
 
     const auto left_path = t.path() / "branch-left";
     const auto right_path = t.path() / "branch-right";
     {
-        MetadataReplica left_replica(left_path, keys.storage);
-        MetadataReplica right_replica(right_path, keys.storage);
+        TestReplica left_replica(left_path, keys.storage);
+        TestReplica right_replica(right_path, keys.storage);
         commit_record(left_replica, left);
         commit_record(right_replica, right);
 
@@ -724,14 +724,14 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip
         CHECK(left_replica.history_is_ancestor(right.hash, reconciliation.hash));
     }
 
-    MetadataReplica reopened_left(left_path, keys.storage);
-    MetadataReplica reopened_right(right_path, keys.storage);
+    TestReplica reopened_left(left_path, keys.storage);
+    TestReplica reopened_right(right_path, keys.storage);
     CHECK(reopened_left.committed().hash == reopened_right.committed().hash);
     CHECK(reopened_left.history_is_ancestor(left.hash, reopened_left.committed().hash));
     CHECK(reopened_left.history_is_ancestor(right.hash, reopened_left.committed().hash));
     auto historical_merge = reopened_left.historical(reopened_left.committed().hash);
     REQUIRE(historical_merge.has_value());
-    const auto reopened_snapshot = decode_snapshot(historical_merge->payload);
+    const auto reopened_snapshot = map_snapshot(historical_merge->payload);
     CHECK(reopened_snapshot.conflicts == branch_snapshot.conflicts);
     CHECK(reopened_snapshot.merge_parents == branch_snapshot.merge_parents);
 }
@@ -749,20 +749,20 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     directory.mode = 0755;
 
     auto make_child = [&](const std::string& name, uint8_t author) {
-        auto snapshot = decode_snapshot(genesis.payload);
+        auto snapshot = founded_snapshot();
         snapshot.metadata_write_replicas_required = 2;
         Mutation(snapshot, author).put(name, directory);
         MetadataRecord record;
         record.generation = genesis.generation + 1;
         record.previous = genesis.hash;
-        record.payload = encode_snapshot(snapshot);
+        record.payload = tree_payload(snapshot);
         record.hash = metadata_hash(record.generation, record.previous, record.payload);
         return record;
     };
     const auto left = make_child("/left", 1);
     const auto right = make_child("/right", 2);
     REQUIRE(left.hash != right.hash);
-    CHECK(decode_snapshot(left.payload).metadata_write_replicas_required == 2);
+    CHECK(map_snapshot(left.payload).metadata_write_replicas_required == 2);
 
     NodeId a{}, b{}, c{};
     a.bytes[15] = 1;
@@ -771,26 +771,26 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     MetadataAcceptance left_accept{left.generation, left.hash, 2, {a, b}};
     MetadataAcceptance right_accept{right.generation, right.hash, 2, {b, c}};
 
-    // The SM13 `metadata_participants` roster is migration bookkeeping, not a
+    // The `metadata_participants` roster is migration bookkeeping, not a
     // voter set: a certificate may name any real metadata replica it omits.
     {
-        auto rostered_snapshot = decode_snapshot(genesis.payload);
+        auto rostered_snapshot = founded_snapshot();
         rostered_snapshot.metadata_write_replicas_required = 2;
         rostered_snapshot.metadata_participants = {a, b};
         rostered_snapshot.entries["/roster-is-not-authority"] = directory;
         MetadataRecord rostered;
         rostered.generation = genesis.generation + 1;
         rostered.previous = genesis.hash;
-        rostered.payload = encode_snapshot(rostered_snapshot);
+        rostered.payload = tree_payload(rostered_snapshot);
         rostered.hash = metadata_hash(rostered.generation, rostered.previous, rostered.payload);
-        MetadataReplica replica(t.path() / "roster-not-authority", keys.storage);
+        TestReplica replica(t.path() / "roster-not-authority", keys.storage);
         REQUIRE(replica.store_commit(rostered));
         CHECK(replica.accept_commit(
             MetadataAcceptance{rostered.generation, rostered.hash, 2, {a, c}}));
     }
 
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(left));
         const auto before_acceptance = replica.diagnostics();
         REQUIRE(replica.accept_commit(left_accept));
@@ -817,15 +817,15 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     MetadataRecord reconciliation;
     MetadataAcceptance merge_accept;
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         auto heads = replica.accepted_heads();
         REQUIRE(heads.size() == 2);
         auto common = replica.history_common_ancestor(left.hash, right.hash);
         REQUIRE(common.has_value());
         CHECK(*common == genesis.hash);
 
-        auto merged = merge_metadata_heads(decode_snapshot(left.payload),
-                                           decode_snapshot(right.payload), left.hash, right.hash);
+        auto merged = merge_metadata_heads(map_snapshot(left.payload),
+                                           map_snapshot(right.payload), left.hash, right.hash);
         CHECK(merged.snapshot.entries.contains("/left"));
         CHECK(merged.snapshot.entries.contains("/right"));
         auto primary = left;
@@ -835,7 +835,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
         merged.snapshot.merge_parents = {secondary.hash};
         reconciliation.generation = std::max(left.generation, right.generation) + 1;
         reconciliation.previous = primary.hash;
-        reconciliation.payload = encode_snapshot(merged.snapshot);
+        reconciliation.payload = tree_payload(merged.snapshot);
         reconciliation.hash = metadata_hash(reconciliation.generation, reconciliation.previous,
                                             reconciliation.payload);
         merge_accept = {reconciliation.generation, reconciliation.hash, 2, {a, c}};
@@ -848,7 +848,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
         CHECK(replica.history_is_ancestor(right.hash, reconciliation.hash));
     }
 
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     auto heads = reopened.accepted_heads();
     REQUIRE(heads.size() == 1);
     CHECK(heads.front().hash == reconciliation.hash);
@@ -867,7 +867,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     CHECK(!reopened.historical(right.hash).has_value());
     REQUIRE(reopened.historical(reconciliation.hash).has_value());
 
-    MetadataReplica rerooted(path, keys.storage);
+    TestReplica rerooted(path, keys.storage);
     CHECK(!rerooted.historical(left.hash).has_value());
     REQUIRE(rerooted.historical(reconciliation.hash).has_value());
     CHECK(rerooted.historical(reconciliation.hash)->payload == reconciliation.payload);
@@ -888,13 +888,13 @@ MACHA_FAST_TEST("storage_metadata",
     directory.type = EntryType::directory;
     directory.mode = 0755;
     auto make_child = [&](const MetadataRecord& parent, std::string name) {
-        auto snapshot = decode_snapshot(parent.payload);
+        auto snapshot = map_snapshot(parent.payload);
         snapshot.metadata_write_replicas_required = 1;
         snapshot.entries[std::move(name)] = directory;
         MetadataRecord record;
         record.generation = parent.generation + 1;
         record.previous = parent.hash;
-        record.payload = encode_snapshot(snapshot);
+        record.payload = tree_payload(snapshot);
         record.hash = metadata_hash(record.generation, record.previous, record.payload);
         return record;
     };
@@ -904,14 +904,14 @@ MACHA_FAST_TEST("storage_metadata",
     NodeId a{};
     a.bytes[15] = 1;
 
-    MetadataReplica replica(path, keys.storage);
+    TestReplica replica(path, keys.storage);
     REQUIRE(replica.store_commit(child));
     // No existing heads: the "changed" path at the end of accept_commit().
     REQUIRE(replica.accept_commit(MetadataAcceptance{child.generation, child.hash, 1, {a}}));
     CHECK(replica.committed().hash == child.hash);
     {
         // Reopening loads the on-disk checkpoint, proving persist() landed.
-        MetadataReplica reopened(path, keys.storage);
+        TestReplica reopened(path, keys.storage);
         CHECK(reopened.committed().hash == child.hash);
     }
 
@@ -925,7 +925,7 @@ MACHA_FAST_TEST("storage_metadata",
     CHECK(heads.front().hash == grandchild.hash);
     CHECK(replica.committed().hash == grandchild.hash);
     {
-        MetadataReplica reopened(path, keys.storage);
+        TestReplica reopened(path, keys.storage);
         CHECK(reopened.committed().hash == grandchild.hash);
     }
 }
@@ -945,24 +945,24 @@ MACHA_FAST_TEST("storage_metadata", test_merge_delta_primary_may_precede_merge_g
     directory.mode = 0755;
     const auto genesis = genesis_metadata();
 
-    auto older_snapshot = decode_snapshot(genesis.payload);
+    auto older_snapshot = founded_snapshot();
     older_snapshot.metadata_write_replicas_required = 2;
     older_snapshot.entries["/older"] = directory;
     MetadataRecord older;
     older.generation = 10;
     older.previous = genesis.hash;
-    older.payload = encode_snapshot(older_snapshot);
+    older.payload = tree_payload(older_snapshot);
     older.hash = metadata_hash(older.generation, older.previous, older.payload);
 
     MetadataRecord newer;
     MetadataSnapshot newer_snapshot;
     for (size_t attempt = 0; attempt < 256; ++attempt) {
-        newer_snapshot = decode_snapshot(genesis.payload);
+        newer_snapshot = founded_snapshot();
         newer_snapshot.metadata_write_replicas_required = 2;
         newer_snapshot.entries["/newer-" + std::to_string(attempt)] = directory;
         newer.generation = 20;
         newer.previous = genesis.hash;
-        newer.payload = encode_snapshot(newer_snapshot);
+        newer.payload = tree_payload(newer_snapshot);
         newer.hash = metadata_hash(newer.generation, newer.previous, newer.payload);
         if (older.hash < newer.hash)
             break;
@@ -975,14 +975,14 @@ MACHA_FAST_TEST("storage_metadata", test_merge_delta_primary_may_precede_merge_g
     merged_snapshot.merge_parents = {newer.hash};
     merge.generation = newer.generation + 1;
     merge.previous = older.hash; // deterministic lower hash, not generation-1
-    merge.payload = encode_snapshot(merged_snapshot);
+    merge.payload = tree_payload(merged_snapshot);
     merge.hash = metadata_hash(merge.generation, merge.previous, merge.payload);
     auto delta = metadata_delta(older_snapshot, merged_snapshot);
     REQUIRE(delta.has_value());
     const auto encoded_delta = encode_metadata_delta(*delta);
 
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(older));
         REQUIRE(replica.accept_commit({older.generation, older.hash, 2, {a, b}}));
         REQUIRE(replica.store_commit(newer));
@@ -995,7 +995,7 @@ MACHA_FAST_TEST("storage_metadata", test_merge_delta_primary_may_precede_merge_g
         CHECK(older.generation + 1 < merge.generation);
     }
 
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     const auto heads = reopened.accepted_heads();
     REQUIRE(heads.size() == 1);
     CHECK(heads.front().hash == merge.hash);
@@ -1023,24 +1023,24 @@ MACHA_FAST_TEST("storage_metadata",
     directory.mode = 0755;
     const auto genesis = genesis_metadata();
 
-    auto older_snapshot = decode_snapshot(genesis.payload);
+    auto older_snapshot = founded_snapshot();
     older_snapshot.metadata_write_replicas_required = 2;
     older_snapshot.entries["/older"] = directory;
     MetadataRecord older;
     older.generation = 10;
     older.previous = genesis.hash;
-    older.payload = encode_snapshot(older_snapshot);
+    older.payload = tree_payload(older_snapshot);
     older.hash = metadata_hash(older.generation, older.previous, older.payload);
 
     MetadataRecord newer;
     MetadataSnapshot newer_snapshot;
     for (size_t attempt = 0; attempt < 256; ++attempt) {
-        newer_snapshot = decode_snapshot(genesis.payload);
+        newer_snapshot = founded_snapshot();
         newer_snapshot.metadata_write_replicas_required = 2;
         newer_snapshot.entries["/newer-" + std::to_string(attempt)] = directory;
         newer.generation = 20;
         newer.previous = genesis.hash;
-        newer.payload = encode_snapshot(newer_snapshot);
+        newer.payload = tree_payload(newer_snapshot);
         newer.hash = metadata_hash(newer.generation, newer.previous, newer.payload);
         if (older.hash < newer.hash)
             break;
@@ -1053,7 +1053,7 @@ MACHA_FAST_TEST("storage_metadata",
     merged_snapshot.merge_parents = {newer.hash};
     merge.generation = newer.generation + 1;
     merge.previous = older.hash;
-    merge.payload = encode_snapshot(merged_snapshot);
+    merge.payload = tree_payload(merged_snapshot);
     merge.hash = metadata_hash(merge.generation, merge.previous, merge.payload);
     auto delta = metadata_delta(older_snapshot, merged_snapshot);
     REQUIRE(delta.has_value());
@@ -1066,13 +1066,13 @@ MACHA_FAST_TEST("storage_metadata",
     divergent_snapshot.entries["/divergent"] = directory;
     divergent.generation = 30;
     divergent.previous = newer.hash;
-    divergent.payload = encode_snapshot(divergent_snapshot);
+    divergent.payload = tree_payload(divergent_snapshot);
     divergent.hash = metadata_hash(divergent.generation, divergent.previous, divergent.payload);
 
     {
         // A one-byte materialization budget: only the pinned current/committed head
         // stays cached, so other reads reconstruct from history.log.
-        MetadataReplica replica(path, keys.storage, {}, true, 1);
+        TestReplica replica(path, keys.storage, {}, true, 1);
         REQUIRE(replica.store_commit(older));
         REQUIRE(replica.accept_commit({older.generation, older.hash, 2, {a, b}}));
         REQUIRE(replica.store_commit(newer));
@@ -1098,7 +1098,7 @@ MACHA_FAST_TEST("storage_metadata",
     }
 
     // A restart does not throw and still sees both heads.
-    MetadataReplica reopened(path, keys.storage, {}, true, 1);
+    TestReplica reopened(path, keys.storage, {}, true, 1);
     const auto heads = reopened.accepted_heads();
     REQUIRE(heads.size() == 2);
     auto reconstructed = reopened.materialized(merge.hash);
@@ -1128,24 +1128,24 @@ MACHA_FAST_TEST("storage_metadata",
     directory.mode = 0755;
     const auto genesis = genesis_metadata();
 
-    auto older_snapshot = decode_snapshot(genesis.payload);
+    auto older_snapshot = founded_snapshot();
     older_snapshot.metadata_write_replicas_required = 2;
     older_snapshot.entries["/older"] = directory;
     MetadataRecord older;
     older.generation = 10;
     older.previous = genesis.hash;
-    older.payload = encode_snapshot(older_snapshot);
+    older.payload = tree_payload(older_snapshot);
     older.hash = metadata_hash(older.generation, older.previous, older.payload);
 
     MetadataRecord newer;
     MetadataSnapshot newer_snapshot;
     for (size_t attempt = 0; attempt < 256; ++attempt) {
-        newer_snapshot = decode_snapshot(genesis.payload);
+        newer_snapshot = founded_snapshot();
         newer_snapshot.metadata_write_replicas_required = 2;
         newer_snapshot.entries["/newer-" + std::to_string(attempt)] = directory;
         newer.generation = 20;
         newer.previous = genesis.hash;
-        newer.payload = encode_snapshot(newer_snapshot);
+        newer.payload = tree_payload(newer_snapshot);
         newer.hash = metadata_hash(newer.generation, newer.previous, newer.payload);
         if (older.hash < newer.hash)
             break;
@@ -1158,7 +1158,7 @@ MACHA_FAST_TEST("storage_metadata",
     merged_snapshot.merge_parents = {newer.hash};
     merge.generation = newer.generation + 1;
     merge.previous = older.hash;
-    merge.payload = encode_snapshot(merged_snapshot);
+    merge.payload = tree_payload(merged_snapshot);
     merge.hash = metadata_hash(merge.generation, merge.previous, merge.payload);
     auto delta = metadata_delta(older_snapshot, merged_snapshot);
     REQUIRE(delta.has_value());
@@ -1169,11 +1169,11 @@ MACHA_FAST_TEST("storage_metadata",
     divergent_snapshot.entries["/divergent"] = directory;
     divergent.generation = 30;
     divergent.previous = newer.hash;
-    divergent.payload = encode_snapshot(divergent_snapshot);
+    divergent.payload = tree_payload(divergent_snapshot);
     divergent.hash = metadata_hash(divergent.generation, divergent.previous, divergent.payload);
 
     // Source: a healthy replica holding both heads (the merge as a delta).
-    MetadataReplica source(source_path, keys.storage, {}, true, 1);
+    TestReplica source(source_path, keys.storage, {}, true, 1);
     const auto source_history = source_path / "metadata" / "history.log";
     REQUIRE(source.store_commit(older));
     REQUIRE(source.accept_commit({older.generation, older.hash, 2, {a, b}}));
@@ -1189,7 +1189,7 @@ MACHA_FAST_TEST("storage_metadata",
     // Target: identical except it never received the merge's history frame,
     // then finds itself with the source's certificate set naming the merge.
     {
-        MetadataReplica target(target_path, keys.storage, {}, true, 1);
+        TestReplica target(target_path, keys.storage, {}, true, 1);
         REQUIRE(target.store_commit(older));
         REQUIRE(target.accept_commit({older.generation, older.hash, 2, {a, b}}));
         REQUIRE(target.store_commit(newer));
@@ -1203,7 +1203,7 @@ MACHA_FAST_TEST("storage_metadata",
                                std::filesystem::copy_options::overwrite_existing);
 
     // (a) Startup keeps the certificate and flags the head instead of throwing.
-    MetadataReplica target(target_path, keys.storage, {}, true, 1);
+    TestReplica target(target_path, keys.storage, {}, true, 1);
     CHECK(!target.recovery_required());
     REQUIRE(target.accepted_head_certificates().size() == 2);
     CHECK(target.accepted_heads().size() == 1); // merge excluded from reads
@@ -1259,13 +1259,13 @@ MACHA_FAST_TEST("storage_metadata",
         CHECK(source.unreconstructable_heads().empty());
         CHECK(source.accepted_heads().size() == 2);
     }
-    MetadataReplica reopened_source(source_path, keys.storage, {}, true, 1);
+    TestReplica reopened_source(source_path, keys.storage, {}, true, 1);
     CHECK(reopened_source.accepted_heads().size() == 2);
     auto reopened_entry = reopened_source.history_entry(merge.hash);
     REQUIRE(reopened_entry.has_value());
     CHECK(reopened_entry->body == MetadataHistoryEntry::Body::full);
     REQUIRE(reopened_source.materialized(merge.hash));
-    MetadataReplica reopened_target(target_path, keys.storage, {}, true, 1);
+    TestReplica reopened_target(target_path, keys.storage, {}, true, 1);
     CHECK(reopened_target.accepted_heads().size() == 2);
     CHECK(reopened_target.unreconstructable_heads().empty());
 }
@@ -1282,13 +1282,13 @@ MACHA_FAST_TEST("storage_metadata", test_full_fallback_boundary_heals_when_paren
     directory.type = EntryType::directory;
     directory.mode = 0755;
     const auto genesis = genesis_metadata();
-    auto parent_snapshot = decode_snapshot(genesis.payload);
+    auto parent_snapshot = founded_snapshot();
     parent_snapshot.metadata_write_replicas_required = 2;
     parent_snapshot.entries["/parent"] = directory;
     MetadataRecord parent;
     parent.generation = 49;
     parent.previous = genesis.hash;
-    parent.payload = encode_snapshot(parent_snapshot);
+    parent.payload = tree_payload(parent_snapshot);
     parent.hash = metadata_hash(parent.generation, parent.previous, parent.payload);
 
     auto child_snapshot = parent_snapshot;
@@ -1296,7 +1296,7 @@ MACHA_FAST_TEST("storage_metadata", test_full_fallback_boundary_heals_when_paren
     MetadataRecord child;
     child.generation = 50;
     child.previous = parent.hash;
-    child.payload = encode_snapshot(child_snapshot);
+    child.payload = tree_payload(child_snapshot);
     child.hash = metadata_hash(child.generation, child.previous, child.payload);
 
     auto descendant_snapshot = child_snapshot;
@@ -1304,7 +1304,7 @@ MACHA_FAST_TEST("storage_metadata", test_full_fallback_boundary_heals_when_paren
     MetadataRecord descendant;
     descendant.generation = 51;
     descendant.previous = child.hash;
-    descendant.payload = encode_snapshot(descendant_snapshot);
+    descendant.payload = tree_payload(descendant_snapshot);
     descendant.hash =
         metadata_hash(descendant.generation, descendant.previous, descendant.payload);
 
@@ -1313,16 +1313,16 @@ MACHA_FAST_TEST("storage_metadata", test_full_fallback_boundary_heals_when_paren
     MetadataRecord sibling;
     sibling.generation = 50;
     sibling.previous = parent.hash;
-    sibling.payload = encode_snapshot(sibling_snapshot);
+    sibling.payload = tree_payload(sibling_snapshot);
     sibling.hash = metadata_hash(sibling.generation, sibling.previous, sibling.payload);
 
-    MetadataReplica source(source_path, keys.storage);
+    TestReplica source(source_path, keys.storage);
     REQUIRE(source.store_commit(parent));
     auto parent_entry = source.history_entry(parent.hash);
     REQUIRE(parent_entry.has_value());
 
     {
-        MetadataReplica target(target_path, keys.storage);
+        TestReplica target(target_path, keys.storage);
         REQUIRE(target.store_commit(child));
         auto boundary = target.history_entry(child.hash);
         REQUIRE(boundary.has_value());
@@ -1346,7 +1346,7 @@ MACHA_FAST_TEST("storage_metadata", test_full_fallback_boundary_heals_when_paren
         CHECK(*common == parent.hash);
     }
 
-    MetadataReplica reopened(target_path, keys.storage);
+    TestReplica reopened(target_path, keys.storage);
     auto common = reopened.history_common_ancestor(descendant.hash, sibling.hash);
     REQUIRE(common.has_value());
     CHECK(*common == parent.hash);
@@ -1364,7 +1364,7 @@ MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_res
     b.bytes[15] = 2;
 
     const auto genesis = genesis_metadata();
-    auto parent_snapshot = decode_snapshot(genesis.payload);
+    auto parent_snapshot = founded_snapshot();
     parent_snapshot.metadata_write_replicas_required = 2;
     FsEntry directory;
     directory.type = EntryType::directory;
@@ -1374,7 +1374,7 @@ MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_res
     MetadataRecord parent;
     parent.generation = genesis.generation + 1;
     parent.previous = genesis.hash;
-    parent.payload = encode_snapshot(parent_snapshot);
+    parent.payload = tree_payload(parent_snapshot);
     parent.hash = metadata_hash(parent.generation, parent.previous, parent.payload);
     const MetadataAcceptance parent_accept{parent.generation, parent.hash, 2, {a, b}};
 
@@ -1383,13 +1383,13 @@ MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_res
     MetadataRecord child;
     child.generation = parent.generation + 1;
     child.previous = parent.hash;
-    child.payload = encode_snapshot(child_snapshot);
+    child.payload = tree_payload(child_snapshot);
     child.hash = metadata_hash(child.generation, child.previous, child.payload);
     const MetadataAcceptance child_accept{child.generation, child.hash, 2, {a, b}};
 
     MetadataHistoryEntry stale_parent;
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(parent));
         REQUIRE(replica.accept_commit(parent_accept));
         REQUIRE(replica.store_commit(child));
@@ -1418,7 +1418,7 @@ MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_res
         CHECK(*common == parent.hash);
     }
 
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     const auto heads = reopened.accepted_heads();
     REQUIRE(heads.size() == 1);
     CHECK(heads.front().hash == child.hash);
@@ -1439,13 +1439,13 @@ MACHA_FAST_TEST("storage_metadata",
     directory.type = EntryType::directory;
     directory.mode = 0755;
     auto make_child = [&](const MetadataRecord& parent, std::string name) {
-        auto snapshot = decode_snapshot(parent.payload);
+        auto snapshot = map_snapshot(parent.payload);
         snapshot.metadata_write_replicas_required = 1;
         snapshot.entries[std::move(name)] = directory;
         MetadataRecord record;
         record.generation = parent.generation + 1;
         record.previous = parent.hash;
-        record.payload = encode_snapshot(snapshot);
+        record.payload = tree_payload(snapshot);
         record.hash = metadata_hash(record.generation, record.previous, record.payload);
         return record;
     };
@@ -1461,7 +1461,7 @@ MACHA_FAST_TEST("storage_metadata",
 
     // Only the committed head is cached, so reconstructing head_a reads its
     // history frame.
-    MetadataReplica replica(path, keys.storage, {}, true, 1);
+    TestReplica replica(path, keys.storage, {}, true, 1);
     NodeId witness{};
     witness.bytes[15] = 1;
     const auto history = path / "metadata" / "history.log";
@@ -1554,7 +1554,7 @@ MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluste
     b.bytes[15] = 2;
 
     const auto genesis = genesis_metadata();
-    auto snapshot = decode_snapshot(genesis.payload);
+    auto snapshot = founded_snapshot();
     snapshot.metadata_write_replicas_required = 2;
     snapshot.mutation_sequences[a] = 7;
     FsEntry directory;
@@ -1565,7 +1565,7 @@ MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluste
     MetadataRecord established;
     established.generation = 50;
     established.previous = genesis.hash;
-    established.payload = encode_snapshot(snapshot);
+    established.payload = tree_payload(snapshot);
     established.hash =
         metadata_hash(established.generation, established.previous, established.payload);
     const MetadataAcceptance established_accept{
@@ -1573,7 +1573,7 @@ MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluste
 
     MetadataHistoryEntry compacted_head;
     {
-        MetadataReplica replica(established_path, keys.storage);
+        TestReplica replica(established_path, keys.storage);
         REQUIRE(replica.store_commit(established));
         REQUIRE(replica.accept_commit(established_accept));
         REQUIRE(replica.compact_history_if_safe(1, 1));
@@ -1586,7 +1586,7 @@ MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluste
 
     MetadataHistoryEntry genesis_entry;
     {
-        MetadataReplica joiner(joiner_path, keys.storage, {}, false);
+        TestReplica joiner(joiner_path, keys.storage, {}, false);
         CHECK(joiner.accepted_heads().empty());
         auto entry = joiner.history_entry(genesis.hash);
         REQUIRE(entry.has_value());
@@ -1603,7 +1603,7 @@ MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluste
     }
 
     {
-        MetadataReplica replica(established_path, keys.storage);
+        TestReplica replica(established_path, keys.storage);
         // Exercise the opposite race: an established replica sees the joiner's
         // genesis certificate before the joiner has adopted the cluster head.
         REQUIRE(replica.import_history(genesis_entry));
@@ -1613,12 +1613,12 @@ MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluste
         CHECK(heads.front().hash == established.hash);
     }
 
-    MetadataReplica reopened_joiner(joiner_path, keys.storage, {}, false);
+    TestReplica reopened_joiner(joiner_path, keys.storage, {}, false);
     auto joiner_heads = reopened_joiner.accepted_heads();
     REQUIRE(joiner_heads.size() == 1);
     CHECK(joiner_heads.front().hash == established.hash);
 
-    MetadataReplica reopened_established(established_path, keys.storage);
+    TestReplica reopened_established(established_path, keys.storage);
     auto established_heads = reopened_established.accepted_heads();
     REQUIRE(established_heads.size() == 1);
     CHECK(established_heads.front().hash == established.hash);
@@ -1630,7 +1630,7 @@ namespace {
 MetadataRecord record_with_clock(uint64_t generation, const Hash256& previous,
                                  std::map<NodeId, uint64_t> clock,
                                  std::initializer_list<const char*> paths) {
-    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    auto snapshot = founded_snapshot();
     snapshot.metadata_write_replicas_required = 2;
     snapshot.mutation_sequences = std::move(clock);
     FsEntry directory;
@@ -1641,7 +1641,7 @@ MetadataRecord record_with_clock(uint64_t generation, const Hash256& previous,
     MetadataRecord record;
     record.generation = generation;
     record.previous = previous;
-    record.payload = encode_snapshot(snapshot);
+    record.payload = tree_payload(snapshot);
     record.hash = metadata_hash(record.generation, record.previous, record.payload);
     return record;
 }
@@ -1691,7 +1691,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_head_with_no_clock_is_nobodys_ancesto
     const auto clockless = record_with_clock(genesis.generation + 4, unseen, {}, {"/only-here"});
     const auto other =
         record_with_clock(genesis.generation + 2, genesis.hash, {{author(2), 1}}, {"/other"});
-    MetadataReplica replica(t.path() / "clockless", keys.storage);
+    TestReplica replica(t.path() / "clockless", keys.storage);
     REQUIRE(replica.import_history(rootless_entry(clockless)));
     REQUIRE(replica.accept_commit(accepted_by_two(clockless)));
     REQUIRE(replica.import_history(rootless_entry(other)));
@@ -1718,7 +1718,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_head_from_before_truncation_is_recogn
         record_with_clock(old.generation + 1, old.hash, {{a, 1}, {b, 1}}, {"/old", "/side"});
 
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         for (const auto* record : {&old, &between, &now}) {
             REQUIRE(replica.store_commit(*record));
             REQUIRE(replica.accept_commit(accepted_by_two(*record)));
@@ -1746,7 +1746,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_head_from_before_truncation_is_recogn
         CHECK(replica.diagnostics().history_records == records);
     }
 
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     CHECK(hashes_of(reopened.accepted_heads()) == hashes_of({now, side}));
 }
 
@@ -1769,7 +1769,7 @@ MACHA_FAST_TEST("storage_metadata",
     // The peer went on from `floor` and truncated: its head is all it serves.
     MetadataHistoryEntry served;
     {
-        MetadataReplica peer(t.path() / "peer", keys.storage);
+        TestReplica peer(t.path() / "peer", keys.storage);
         for (const auto* record : {&floor, &between, &beyond}) {
             REQUIRE(peer.store_commit(*record));
             REQUIRE(peer.accept_commit(accepted_by_two(*record)));
@@ -1783,7 +1783,7 @@ MACHA_FAST_TEST("storage_metadata",
 
     // The returning replica holds `floor` and never saw `between`.
     {
-        MetadataReplica replica(t.path() / "returning", keys.storage);
+        TestReplica replica(t.path() / "returning", keys.storage);
         REQUIRE(replica.store_commit(floor));
         REQUIRE(replica.accept_commit(accepted_by_two(floor)));
         REQUIRE(replica.import_history(served));
@@ -1800,7 +1800,7 @@ MACHA_FAST_TEST("storage_metadata",
         unseen.bytes[0] = 0x77;
         const auto foreign =
             record_with_clock(floor.generation + 5, unseen, {{b, 4}}, {"/foreign"});
-        MetadataReplica replica(t.path() / "diverged", keys.storage);
+        TestReplica replica(t.path() / "diverged", keys.storage);
         REQUIRE(replica.store_commit(floor));
         REQUIRE(replica.accept_commit(accepted_by_two(floor)));
         REQUIRE(replica.import_history(rootless_entry(foreign)));
@@ -1825,7 +1825,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_checkpoint_write_holds_no_reader_of_t
     const auto theirs =
         record_with_clock(genesis.generation + 3, genesis.hash, {{author(2), 1}}, {"/theirs"});
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(mine));
         REQUIRE(replica.accept_commit(accepted_by_two(mine)));
         REQUIRE(replica.import_history(rootless_entry(theirs)));
@@ -1864,7 +1864,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_checkpoint_write_holds_no_reader_of_t
     }
     // The checkpoint written off the lock opens; a set-aside is this run's
     // alone, so a restart holds both heads again.
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     CHECK(hashes_of(reopened.accepted_heads()) == hashes_of({mine, theirs}));
 #endif
 }
@@ -1879,10 +1879,19 @@ MACHA_FAST_TEST("storage_metadata", test_a_journal_compaction_holds_no_reader_of
     const auto keys = load_cluster_keys(keyfile);
     const auto path = t.path() / "compaction-off-lock";
     {
-        { MetadataReplica opened(path, keys.storage); }
+        MetadataRecord last;
+        {
+            TestReplica opened(path, keys.storage);
+            auto snapshot = founded_snapshot();
+            for (size_t i = 0; i < 65; ++i) {
+                snapshot.entries["/"].mtime_ns = static_cast<int64_t>(i + 1);
+                commit_record(opened, record_after(opened.current(), tree_payload(snapshot)));
+            }
+            last = opened.committed();
+        }
         for (size_t i = 0; i < 130; ++i)
-            append_journal_frame(path, keys.storage, journal_commit, genesis_metadata());
-        MetadataReplica replica(path, keys.storage);
+            append_journal_frame(path, keys.storage, journal_commit, last);
+        TestReplica replica(path, keys.storage);
         const auto head = replica.committed().hash;
 
         auto& hold = test_support::fsync_hold;
@@ -1910,7 +1919,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_journal_compaction_holds_no_reader_of
         CHECK(reader.get() == head);
     }
     CHECK(std::filesystem::file_size(path / "metadata" / "journal.log") < 4096);
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     CHECK(reopened.current().generation == 66);
     CHECK(reopened.current().hash == reopened.committed().hash);
 #endif
@@ -1932,7 +1941,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_head_set_aside_for_the_horizon_is_dro
     const auto horizon = 1000ms;
 
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(mine));
         REQUIRE(replica.accept_commit(accepted_by_two(mine)));
 
@@ -1959,7 +1968,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_head_set_aside_for_the_horizon_is_dro
     {
         // A reopened replica holds both heads as usable again, and still
         // counts the wait from the first time the head was set aside.
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         CHECK(hashes_of(replica.usable_heads()) == hashes_of({mine, theirs}));
         CHECK(replica.set_aside_generation() == 0);
         REQUIRE(replica.set_aside(theirs.hash, first + 600));
@@ -1971,7 +1980,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_head_set_aside_for_the_horizon_is_dro
         CHECK(replica.committed().hash == mine.hash);
         CHECK(replica.expire_set_aside(first + 100'000, horizon) == 0);
     }
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     CHECK(hashes_of(reopened.accepted_heads()) == std::vector<Hash256>{mine.hash});
 }
 
@@ -1994,7 +2003,7 @@ MACHA_FAST_TEST("storage_metadata", test_the_set_aside_time_of_a_head_no_longer_
     const auto horizon = 1000ms;
     const auto times = path / "metadata" / "set-aside.meta";
 
-    MetadataReplica replica(path, keys.storage);
+    TestReplica replica(path, keys.storage);
     REQUIRE(replica.store_commit(mine));
     REQUIRE(replica.accept_commit(accepted_by_two(mine)));
     REQUIRE(replica.import_history(rootless_entry(theirs)));
@@ -2020,7 +2029,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_acc
     const auto path = t.path() / "cache-recovery";
 
     auto base = genesis_metadata();
-    auto snapshot = decode_snapshot(base.payload);
+    auto snapshot = map_snapshot(base.payload);
     FsEntry cached_entry;
     cached_entry.type = EntryType::directory;
     cached_entry.mode = 0755;
@@ -2028,7 +2037,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_acc
     MetadataRecord cached;
     cached.generation = base.generation + 1;
     cached.previous = base.hash;
-    cached.payload = encode_snapshot(snapshot);
+    cached.payload = tree_payload(snapshot);
     cached.hash = metadata_hash(cached.generation, cached.previous, cached.payload);
 
     // Force primary-state recovery while providing a valid persistent-cache seed.
@@ -2040,7 +2049,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_acc
         corrupt << "not encrypted metadata";
     }
     {
-        MetadataReplica recovered(path, keys.storage, cached);
+        TestReplica recovered(path, keys.storage, cached);
         CHECK(recovered.recovery_required());
         CHECK(recovered.committed().hash == cached.hash);
         CHECK(recovered.accepted_heads().empty());
@@ -2050,7 +2059,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_acc
     // The durable recovery marker must preserve the same fail-closed state on
     // another restart; merely being able to decrypt the fallback checkpoint does
     // not turn it into historical acceptance evidence.
-    MetadataReplica reopened(path, keys.storage, cached);
+    TestReplica reopened(path, keys.storage, cached);
     CHECK(reopened.recovery_required());
     CHECK(reopened.committed().hash == cached.hash);
     CHECK(reopened.accepted_heads().empty());
@@ -2068,7 +2077,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_t
     const auto genesis = genesis_metadata();
     const auto path = t.path() / "mid-journal-corruption";
 
-    auto snapshot = decode_snapshot(genesis.payload);
+    auto snapshot = founded_snapshot();
     snapshot.metadata_write_replicas_required = 1;
     FsEntry dir;
     dir.type = EntryType::directory;
@@ -2077,25 +2086,25 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_t
     MetadataRecord first;
     first.generation = genesis.generation + 1;
     first.previous = genesis.hash;
-    first.payload = encode_snapshot(snapshot);
+    first.payload = tree_payload(snapshot);
     first.hash = metadata_hash(first.generation, first.previous, first.payload);
 
     snapshot.entries["/second"] = dir;
     MetadataRecord second;
     second.generation = first.generation + 1;
     second.previous = first.hash;
-    second.payload = encode_snapshot(snapshot);
+    second.payload = tree_payload(snapshot);
     second.hash = metadata_hash(second.generation, second.previous, second.payload);
 
     const auto journal = path / "metadata" / "journal.log";
     uint64_t first_frame_end = 0;
-    { MetadataReplica opened(path, keys.storage); }
+    { TestReplica opened(path, keys.storage); }
     append_journal_frame(path, keys.storage, journal_prepare_full, first, first.payload);
     first_frame_end = std::filesystem::file_size(journal);
     REQUIRE(first_frame_end > 4);
     append_journal_frame(path, keys.storage, journal_prepare_full, second, second.payload);
     {
-        MetadataReplica replayed(path, keys.storage);
+        TestReplica replayed(path, keys.storage);
         CHECK(replayed.current().hash == second.hash);
     }
     REQUIRE(std::filesystem::file_size(journal) > first_frame_end);
@@ -2116,7 +2125,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_t
         REQUIRE(file.good());
     }
 
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     CHECK(!reopened.recovery_required());
     CHECK(reopened.current().hash == genesis.hash);
     CHECK(reopened.committed().hash == genesis.hash);
@@ -2185,7 +2194,7 @@ MACHA_FAST_TEST("storage_metadata",
     const auto path = t.path() / "missing-head-certificate";
 
     const auto genesis = genesis_metadata();
-    auto snapshot = decode_snapshot(genesis.payload);
+    auto snapshot = founded_snapshot();
     snapshot.metadata_write_replicas_required = 2;
     FsEntry directory;
     directory.type = EntryType::directory;
@@ -2194,23 +2203,23 @@ MACHA_FAST_TEST("storage_metadata",
     MetadataRecord record;
     record.generation = genesis.generation + 1;
     record.previous = genesis.hash;
-    record.payload = encode_snapshot(snapshot);
+    record.payload = tree_payload(snapshot);
     record.hash = metadata_hash(record.generation, record.previous, record.payload);
 
     NodeId a{}, b{};
     a.bytes[15] = 1;
     b.bytes[15] = 2;
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(record));
         REQUIRE(replica.accept_commit({record.generation, record.hash, 2, {a, b}}));
         CHECK(replica.committed().hash == record.hash);
     }
 
-    // The acceptance-proof file is lost while the SM12 checkpoint/history stays
+    // The acceptance-proof file is lost while the checkpoint/history stays
     // readable: the checkpoint is recovery material, never authority.
     REQUIRE(std::filesystem::remove(path / "metadata" / "heads.meta"));
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     CHECK(reopened.committed().hash == record.hash);
     CHECK(reopened.recovery_required());
     CHECK(reopened.accepted_heads().empty());
@@ -2228,7 +2237,7 @@ MACHA_FAST_TEST("storage_metadata", test_an_author_sequence_never_regresses) {
     const auto node = random_node_id();
     const auto other = random_node_id();
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         CHECK((replica.reserve_mutation_dot(node, {}) == MetadataDot{node, 1}));
         // A head that has seen further (merged from a peer) moves it on.
         CHECK((replica.reserve_mutation_dot(node, {{node, 5}, {other, 9}}) ==
@@ -2236,7 +2245,7 @@ MACHA_FAST_TEST("storage_metadata", test_an_author_sequence_never_regresses) {
         // A head that has seen less does not move it back.
         CHECK((replica.reserve_mutation_dot(node, {{node, 2}}) == MetadataDot{node, 7}));
     }
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     CHECK((reopened.reserve_mutation_dot(node, {{node, 1}}) == MetadataDot{node, 8}));
     CHECK((reopened.reserve_mutation_dot(node, {{node, 100}}) == MetadataDot{node, 101}));
     CHECK((reopened.author_ids(node, {}) == std::vector<NodeId>{node}));
@@ -2254,7 +2263,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_broken_author_chain_starts_a_new_auth
     const auto node = random_node_id();
     NodeId second{};
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         const auto first = replica.reserve_mutation_dot(node, {});
         replica.note_author_accepted(first);
         const auto next = replica.reserve_mutation_dot(node, {{node, 1}});
@@ -2272,7 +2281,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_broken_author_chain_starts_a_new_auth
         CHECK((replica.reserve_mutation_dot(node, {{node, 1}, {second, 1}}) ==
                MetadataDot{second, 2}));
     }
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     CHECK((reopened.author_ids(node, {}) == std::vector<NodeId>{second, node}));
     CHECK((reopened.reserve_mutation_dot(node, {{second, 2}}) == MetadataDot{second, 3}));
 }
@@ -2285,7 +2294,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_lost_author_record_starts_a_new_autho
     write_key(keyfile);
     const auto keys = load_cluster_keys(keyfile);
     const auto node = random_node_id();
-    MetadataReplica replica(t.path() / "author", keys.storage);
+    TestReplica replica(t.path() / "author", keys.storage);
     const auto dot = replica.reserve_mutation_dot(node, {{node, 41}});
     CHECK(dot.author != node);
     CHECK(dot.sequence == 1);
@@ -2304,7 +2313,7 @@ MACHA_FAST_TEST("storage_metadata", test_protocol20_delta_preserves_governance_s
     const auto keys = load_cluster_keys(keyfile);
     const auto replica_id = random_node_id();
 
-    auto parent_snapshot = decode_snapshot(genesis_metadata().payload);
+    auto parent_snapshot = founded_snapshot();
     parent_snapshot.metadata_voters.clear();
     parent_snapshot.metadata_write_replicas_required = 1;
     parent_snapshot.retention_baseline_complete = true;
@@ -2313,10 +2322,10 @@ MACHA_FAST_TEST("storage_metadata", test_protocol20_delta_preserves_governance_s
     MetadataRecord parent;
     parent.generation = 2;
     parent.previous = genesis.hash;
-    parent.payload = encode_snapshot(parent_snapshot);
+    parent.payload = tree_payload(parent_snapshot);
     parent.hash = metadata_hash(parent.generation, parent.previous, parent.payload);
 
-    MetadataReplica replica(t.path() / "protocol20-delta", keys.storage);
+    TestReplica replica(t.path() / "protocol20-delta", keys.storage);
     REQUIRE(replica.store_commit(parent));
     REQUIRE(replica.accept_commit({parent.generation, parent.hash, 1, {replica_id}}));
 
@@ -2333,21 +2342,21 @@ MACHA_FAST_TEST("storage_metadata", test_protocol20_delta_preserves_governance_s
     auto encoded_delta = encode_metadata_delta(*delta);
     REQUIRE(encoded_delta.size() >= 8);
     CHECK(encoded_delta[7] == '5');
-    CHECK(encode_snapshot(
+    CHECK(tree_payload(
               apply_metadata_delta(parent_snapshot, decode_metadata_delta(encoded_delta))) ==
-          encode_snapshot(child_snapshot));
+          tree_payload(child_snapshot));
 
     MetadataRecord child;
     child.generation = parent.generation + 1;
     child.previous = parent.hash;
-    child.payload = encode_snapshot(child_snapshot);
+    child.payload = tree_payload(child_snapshot);
     child.hash = metadata_hash(child.generation, child.previous, child.payload);
     REQUIRE(replica.store_commit(child, encoded_delta));
     REQUIRE(replica.accept_commit({child.generation, child.hash, 1, {replica_id}}));
     REQUIRE(replica.historical(child.hash).has_value());
     CHECK(replica.historical(child.hash)->payload == child.payload);
 
-    MetadataReplica reopened(t.path() / "protocol20-delta", keys.storage);
+    TestReplica reopened(t.path() / "protocol20-delta", keys.storage);
     REQUIRE(reopened.historical(child.hash).has_value());
     CHECK(reopened.historical(child.hash)->payload == child.payload);
     REQUIRE(reopened.acceptance(child.hash).has_value());
@@ -2360,21 +2369,21 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     const auto keys = load_cluster_keys(keyfile);
     const auto origin = random_node_id();
 
-    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    auto snapshot = founded_snapshot();
     snapshot.metadata_voters.clear();
     snapshot.metadata_write_replicas_required = 1;
 
     MetadataRecord head;
     head.generation = 2;
     head.previous = genesis_metadata().hash;
-    head.payload = encode_snapshot(snapshot);
+    head.payload = tree_payload(snapshot);
     head.hash = metadata_hash(head.generation, head.previous, head.payload);
 
     const auto path = t.path() / "delta-reconstruction-amplification";
     constexpr size_t chain_length = 200;
     std::optional<MetadataRecord> early_record;
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(head));
         for (size_t i = 0; i < chain_length; ++i) {
             auto next_snapshot = snapshot;
@@ -2392,7 +2401,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
             MetadataRecord child;
             child.generation = head.generation + 1;
             child.previous = head.hash;
-            child.payload = encode_snapshot(next_snapshot);
+            child.payload = tree_payload(next_snapshot);
             child.hash = metadata_hash(child.generation, child.previous, child.payload);
             REQUIRE(replica.store_commit(child, encoded_delta));
             if (i == 5)
@@ -2405,7 +2414,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     // Reopening removes any process-local materializations produced while the
     // chain was built. Concurrent cache misses share one off-lock computation;
     // later callers reuse the validated immutable result.
-    MetadataReplica replica(path, keys.storage);
+    TestReplica replica(path, keys.storage);
     const auto before = replica.diagnostics();
     constexpr size_t concurrent_readers = 8;
     std::array<std::shared_ptr<const MetadataMaterialization>, concurrent_readers> results;
@@ -2453,7 +2462,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     REQUIRE(second_materialized != nullptr);
     CHECK(first_materialized == second_materialized);
     CHECK(first_materialized->snapshot == second_materialized->snapshot);
-    CHECK(encode_snapshot(*first_materialized->snapshot) == head.payload);
+    CHECK(tree_payload(*first_materialized->snapshot) == head.payload);
 
     // Materialization is an optimization, never authority. This history was
     // deliberately stored without an acceptance certificate.
@@ -2487,19 +2496,19 @@ MACHA_FAST_TEST("storage_metadata", test_accepting_a_held_head_again_rebuilds_no
     const auto keys = load_cluster_keys(keyfile);
     const auto origin = random_node_id();
 
-    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    auto snapshot = founded_snapshot();
     snapshot.metadata_voters.clear();
     snapshot.metadata_write_replicas_required = 1;
     MetadataRecord head;
     head.generation = 2;
     head.previous = genesis_metadata().hash;
-    head.payload = encode_snapshot(snapshot);
+    head.payload = tree_payload(snapshot);
     head.hash = metadata_hash(head.generation, head.previous, head.payload);
 
     const auto path = t.path() / "re-acceptance";
     MetadataAcceptance certificate;
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(head));
         for (size_t i = 0; i < 30; ++i) {
             auto next_snapshot = snapshot;
@@ -2514,7 +2523,7 @@ MACHA_FAST_TEST("storage_metadata", test_accepting_a_held_head_again_rebuilds_no
             MetadataRecord child;
             child.generation = head.generation + 1;
             child.previous = head.hash;
-            child.payload = encode_snapshot(next_snapshot);
+            child.payload = tree_payload(next_snapshot);
             child.hash = metadata_hash(child.generation, child.previous, child.payload);
             REQUIRE(replica.store_commit(child, encode_metadata_delta(*delta)));
             snapshot = std::move(next_snapshot);
@@ -2525,7 +2534,7 @@ MACHA_FAST_TEST("storage_metadata", test_accepting_a_held_head_again_rebuilds_no
     }
 
     // Reopened, so nothing it materialised while building the chain is cached.
-    MetadataReplica replica(path, keys.storage);
+    TestReplica replica(path, keys.storage);
     const auto before = replica.diagnostics();
     for (int i = 0; i < 5; ++i) {
         bool changed = true;
@@ -2577,27 +2586,22 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_history_payloads_are_disk_back
     const auto path = t.path() / "disk-backed-history";
     const auto origin = random_node_id();
 
-    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    auto snapshot = founded_snapshot();
     snapshot.metadata_voters.clear();
     snapshot.metadata_write_replicas_required = 1;
-    for (size_t i = 0; i < 1000; ++i) {
-        FsEntry entry;
-        entry.type = EntryType::file;
-        entry.mode = 0644;
-        entry.size = i * 4096;
-        entry.version = 1;
-        snapshot.entries["/library/long-title-" + std::to_string(i)] = entry;
-    }
+    // A record's size is its cluster state: make it outgrow the cache budget.
+    for (size_t i = 0; i < 4000; ++i)
+        snapshot.mutation_sequences[random_node_id()] = i + 1;
 
     MetadataRecord head = genesis_metadata();
     {
-        MetadataReplica writer(path, keys.storage);
+        TestReplica writer(path, keys.storage);
         for (uint64_t generation = 2; generation <= 42; ++generation) {
             snapshot.mutation_sequences[origin] = generation;
             MetadataRecord next;
             next.generation = generation;
             next.previous = head.hash;
-            next.payload = encode_snapshot(snapshot);
+            next.payload = tree_payload(snapshot);
             next.hash = metadata_hash(next.generation, next.previous, next.payload);
             REQUIRE(writer.store_commit(next));
             head = std::move(next);
@@ -2605,7 +2609,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_history_payloads_are_disk_back
     }
 
     constexpr uint64_t cache_limit = 64 * 1024;
-    MetadataReplica reopened(path, keys.storage, {}, true, cache_limit);
+    CHECK(head.payload.size() > cache_limit);
+    TestReplica reopened(path, keys.storage, {}, true, cache_limit);
     const auto cold = reopened.diagnostics();
     CHECK(cold.history_records >= 41);
     CHECK(cold.history_file_bytes > 1024 * 1024);
@@ -2637,17 +2642,17 @@ MACHA_FAST_TEST("storage_metadata",
     const auto path = t.path() / "cold-accepted-head-ownership";
     auto witness = random_node_id();
 
-    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    auto snapshot = founded_snapshot();
     snapshot.metadata_voters.clear();
     snapshot.metadata_write_replicas_required = 1;
     MetadataRecord head = genesis_metadata();
     constexpr size_t chain_length = 80;
     {
-        MetadataReplica writer(path, keys.storage);
+        TestReplica writer(path, keys.storage);
         MetadataRecord policy_root;
         policy_root.generation = head.generation + 1;
         policy_root.previous = head.hash;
-        policy_root.payload = encode_snapshot(snapshot);
+        policy_root.payload = tree_payload(snapshot);
         policy_root.hash = metadata_hash(policy_root.generation, policy_root.previous,
                                          policy_root.payload);
         REQUIRE(writer.store_commit(policy_root));
@@ -2666,7 +2671,7 @@ MACHA_FAST_TEST("storage_metadata",
             MetadataRecord child;
             child.generation = head.generation + 1;
             child.previous = head.hash;
-            child.payload = encode_snapshot(next_snapshot);
+            child.payload = tree_payload(next_snapshot);
             child.hash = metadata_hash(child.generation, child.previous, child.payload);
             REQUIRE(writer.store_commit(child, encode_metadata_delta(*delta)));
             snapshot = std::move(next_snapshot);
@@ -2679,7 +2684,7 @@ MACHA_FAST_TEST("storage_metadata",
     // Constructor-time accepted-head validation uses materialized_locked(). It
     // may retain the accepted result and its direct policy parent, but never one
     // complete tree for every delta traversed to obtain them.
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     const auto diagnostics = reopened.diagnostics();
     CHECK(diagnostics.materialization_cache_entries <= 2);
     auto accepted = reopened.accepted_heads();
@@ -2697,17 +2702,17 @@ MACHA_FAST_TEST("storage_metadata",
     write_key(keyfile);
     const auto keys = load_cluster_keys(keyfile);
 
-    auto parent_snapshot = decode_snapshot(genesis_metadata().payload);
+    auto parent_snapshot = founded_snapshot();
     parent_snapshot.metadata_voters.clear();
     parent_snapshot.metadata_write_replicas_required = 1;
 
     MetadataRecord parent;
     parent.generation = 2;
     parent.previous = genesis_metadata().hash;
-    parent.payload = encode_snapshot(parent_snapshot);
+    parent.payload = tree_payload(parent_snapshot);
     parent.hash = metadata_hash(parent.generation, parent.previous, parent.payload);
 
-    MetadataReplica replica(t.path() / "corrupt-delta-cache", keys.storage);
+    TestReplica replica(t.path() / "corrupt-delta-cache", keys.storage);
     REQUIRE(replica.store_commit(parent));
     auto cached_parent = replica.materialized(parent.hash);
     REQUIRE(cached_parent != nullptr);
@@ -2724,7 +2729,7 @@ MACHA_FAST_TEST("storage_metadata",
     MetadataRecord child;
     child.generation = parent.generation + 1;
     child.previous = parent.hash;
-    child.payload = encode_snapshot(child_snapshot);
+    child.payload = tree_payload(child_snapshot);
     child.hash = metadata_hash(child.generation, child.previous, child.payload);
 
     // This delta is well-formed and applicable to the cached parent, but it
@@ -2756,7 +2761,7 @@ MACHA_FAST_TEST("storage_metadata",
     auto materialized_child = replica.materialized(child.hash);
     REQUIRE(materialized_child != nullptr);
     CHECK(materialized_child->record.payload == child.payload);
-    CHECK(encode_snapshot(*materialized_child->snapshot) == child.payload);
+    CHECK(tree_payload(*materialized_child->snapshot) == child.payload);
 
     // A later corrupt duplicate with the same claimed identity is rejected
     // before the existing valid history/cache entry is consulted as success.
@@ -2769,7 +2774,7 @@ MACHA_FAST_TEST("storage_metadata",
 
 namespace {
 MetadataSnapshot dlt7_base_snapshot() {
-    auto base = decode_snapshot(genesis_metadata().payload);
+    auto base = founded_snapshot();
     base.metadata_voters.clear();
     base.metadata_write_replicas_required = 1;
     base.retention_baseline_complete = true;
@@ -2814,7 +2819,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_dlt7_presence_flags_round_trip
         CHECK(decoded.replace_merge_parents.has_value() == delta->replace_merge_parents.has_value());
         CHECK(decoded.replace_conflicts.has_value() == delta->replace_conflicts.has_value());
         CHECK(decoded.canonical_garbage == delta->canonical_garbage);
-        CHECK(encode_snapshot(apply_metadata_delta(parent, decoded)) == encode_snapshot(after));
+        CHECK(tree_payload(apply_metadata_delta(parent, decoded)) == tree_payload(after));
         return encoded.size();
     };
 
@@ -2905,14 +2910,14 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_dlt8_append_extents_delta) {
     CHECK(encoded.size() < 256);
     const auto decoded = decode_metadata_delta(encoded);
     CHECK(decoded.append_entries.size() == 1);
-    CHECK(encode_snapshot(apply_metadata_delta(before, decoded)) == encode_snapshot(after));
+    CHECK(tree_payload(apply_metadata_delta(before, decoded)) == tree_payload(after));
 
     // The same edit through the exact-delta helper.
     MetadataDelta exact;
     record_entry_change(exact, "/big.mkv", &before.entries.at("/big.mkv"), grown);
     CHECK(exact.upsert_entries.empty());
     CHECK(exact.append_entries.size() == 1);
-    CHECK(encode_snapshot(apply_metadata_delta(before, exact)) == encode_snapshot(after));
+    CHECK(tree_payload(apply_metadata_delta(before, exact)) == tree_payload(after));
 
     // A base that does not match (the file changed underneath) refuses to
     // replay rather than producing a wrong table.
@@ -2964,9 +2969,9 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_over_append_ordered_tomb
     CHECK(delta->canonical_garbage);
     const auto encoded = encode_metadata_delta(*delta);
     CHECK(encoded[7] == '7');
-    CHECK(encoded.size() < encode_snapshot(merged.snapshot).size());
-    CHECK(encode_snapshot(apply_metadata_delta(left, decode_metadata_delta(encoded))) ==
-          encode_snapshot(merged.snapshot));
+    CHECK(encoded.size() < tree_payload(merged.snapshot).size());
+    CHECK(tree_payload(apply_metadata_delta(left, decode_metadata_delta(encoded))) ==
+          tree_payload(merged.snapshot));
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_superseded_conflicts_leave_the_snapshot) {
@@ -3081,7 +3086,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     const auto keys = load_cluster_keys(keyfile);
 
     const auto genesis = genesis_metadata();
-    auto base = decode_snapshot(genesis.payload);
+    auto base = founded_snapshot();
     base.metadata_voters.clear();
     base.metadata_write_replicas_required = 1;
     base.retention_baseline_complete = true;
@@ -3104,14 +3109,14 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     MetadataRecord base_record;
     base_record.generation = genesis.generation + 1;
     base_record.previous = genesis.hash;
-    base_record.payload = encode_snapshot(base);
+    base_record.payload = tree_payload(base);
     base_record.hash =
         metadata_hash(base_record.generation, base_record.previous, base_record.payload);
     auto make_child = [&](const MetadataSnapshot& snapshot) {
         MetadataRecord record;
         record.generation = base_record.generation + 1;
         record.previous = base_record.hash;
-        record.payload = encode_snapshot(snapshot);
+        record.payload = tree_payload(snapshot);
         record.hash = metadata_hash(record.generation, record.previous, record.payload);
         return record;
     };
@@ -3127,7 +3132,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     MetadataRecord merge;
     merge.generation = left_record.generation + 1;
     merge.previous = left_record.hash;
-    merge.payload = encode_snapshot(merged.snapshot);
+    merge.payload = tree_payload(merged.snapshot);
     merge.hash = metadata_hash(merge.generation, merge.previous, merge.payload);
 
     auto delta = metadata_delta(left, merged.snapshot);
@@ -3142,10 +3147,10 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     CHECK(encoded.size() < 1024);
     const auto replayed = apply_metadata_delta(left, decode_metadata_delta(encoded));
     CHECK(replayed.conflicts.contains(standing_id));
-    CHECK(encode_snapshot(replayed) == merge.payload);
+    CHECK(tree_payload(replayed) == merge.payload);
 
     // The replica's exact-reconstruction check accepts the merge as a delta.
-    MetadataReplica replica(t.path() / "standing-conflict", keys.storage);
+    TestReplica replica(t.path() / "standing-conflict", keys.storage);
     REQUIRE(replica.store_commit(base_record));
     REQUIRE(replica.store_commit(left_record));
     REQUIRE(replica.store_commit(right_record));
@@ -3168,7 +3173,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_re
     const auto origin = random_node_id();
 
     const auto genesis = genesis_metadata();
-    auto parent = decode_snapshot(genesis.payload);
+    auto parent = founded_snapshot();
     parent.metadata_voters.clear();
     parent.metadata_write_replicas_required = 1;
     parent.retention_baseline_complete = true;
@@ -3184,7 +3189,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_re
     MetadataRecord parent_record;
     parent_record.generation = genesis.generation + 1;
     parent_record.previous = genesis.hash;
-    parent_record.payload = encode_snapshot(parent);
+    parent_record.payload = tree_payload(parent);
     parent_record.hash = metadata_hash(parent_record.generation, parent_record.previous,
                                        parent_record.payload);
 
@@ -3200,7 +3205,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_re
     MetadataRecord child_record;
     child_record.generation = parent_record.generation + 1;
     child_record.previous = parent_record.hash;
-    child_record.payload = encode_snapshot(child);
+    child_record.payload = tree_payload(child);
     child_record.hash =
         metadata_hash(child_record.generation, child_record.previous, child_record.payload);
 
@@ -3213,11 +3218,11 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_re
     const auto replayed = apply_metadata_delta(parent, decode_metadata_delta(encoded));
     CHECK(replayed.merge_parents.empty());
     CHECK(replayed.conflicts.contains(standing_id));
-    CHECK(encode_snapshot(replayed) == child_record.payload);
+    CHECK(tree_payload(replayed) == child_record.payload);
 
     const auto path = t.path() / "delta-after-merge";
     {
-        MetadataReplica replica(path, keys.storage);
+        TestReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(parent_record));
         REQUIRE(replica.store_commit(child_record, encoded));
         const auto stored = replica.history_entry(child_record.hash);
@@ -3226,7 +3231,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_re
     }
     // Cold replay walks the delta over the merge-commit anchor and checks the
     // reconstructed merge_parents against the indexed ones.
-    MetadataReplica reopened(path, keys.storage);
+    TestReplica reopened(path, keys.storage);
     REQUIRE(reopened.historical(child_record.hash).has_value());
     CHECK(reopened.historical(child_record.hash)->payload == child_record.payload);
 }
@@ -3260,7 +3265,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_tombstone_edits_are_line
     };
     auto build = [&](uint64_t count, uint64_t edits, MetadataSnapshot& before,
                      MetadataDelta& delta) {
-        before = decode_snapshot(genesis_metadata().payload);
+        before = founded_snapshot();
         before.garbage.reserve(count);
         for (uint64_t i = 0; i < count; ++i)
             before.garbage.push_back(tombstone(i, static_cast<int64_t>(i) + 1));
@@ -3325,13 +3330,31 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_tombstone_edits_are_line
 // provenance behind the flag is refused.
 MACHA_FAST_TEST("storage_metadata", test_an_entrys_provenance_survives_snapshot_and_delta) {
     const auto genesis = genesis_metadata();
-    auto plain = decode_snapshot(genesis.payload);
+    auto plain = founded_snapshot();
     FsEntry file;
     file.type = EntryType::file;
     file.size = 123;
     plain.entries["/a"] = file;
     plain.entries["/b"] = file;
-    const auto plain_bytes = encode_snapshot(plain);
+    const auto plain_bytes = tree_payload(plain);
+    // What a snapshot's namespace costs: the bytes of every node of its tree.
+    class CountingNodes final : public NamespaceNodeStore {
+      public:
+        ObjectId put(std::span<const uint8_t> node) override {
+            bytes += node.size();
+            return nodes.put(node);
+        }
+        std::optional<Bytes> get(const ObjectId& id) const override { return nodes.get(id); }
+        uint64_t bytes{};
+
+      private:
+        MemoryNamespaceNodeStore nodes;
+    };
+    const auto namespace_bytes = [](const MetadataSnapshot& snapshot) {
+        CountingNodes nodes;
+        (void)detach_namespace(snapshot, nodes);
+        return nodes.bytes;
+    };
 
     auto stamped = plain;
     NodeId author{};
@@ -3340,12 +3363,12 @@ MACHA_FAST_TEST("storage_metadata", test_an_entrys_provenance_survives_snapshot_
     entry.provenance.file_id = legacy_file_id("/a");
     entry.provenance.content = {author, 4};
     entry.provenance.name = {author, 2};
-    const auto bytes = encode_snapshot(stamped);
-    CHECK(bytes.size() == plain_bytes.size() + 16 + 24 + 24);
-    const auto decoded = decode_snapshot(bytes);
+    const auto bytes = tree_payload(stamped);
+    CHECK(namespace_bytes(stamped) == namespace_bytes(plain) + 16 + 24 + 24);
+    const auto decoded = map_snapshot(bytes);
     CHECK(decoded.entries.at("/a") == entry);
     CHECK(decoded.entries.at("/b").provenance.empty());
-    CHECK(decode_snapshot(plain_bytes).entries.at("/a").provenance.empty());
+    CHECK(map_snapshot(plain_bytes).entries.at("/a").provenance.empty());
 
     const auto delta = metadata_delta(plain, stamped);
     REQUIRE(delta.has_value());
@@ -3447,7 +3470,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_written_entry_is_stamped_against_what
 // snapshot forms.
 MACHA_FAST_TEST("storage_metadata", test_the_legacy_clock_survives_snapshot_and_delta) {
     const auto genesis = genesis_metadata();
-    auto before = decode_snapshot(genesis.payload);
+    auto before = founded_snapshot();
     NodeId author{};
     author.bytes[0] = 2;
     before.mutation_sequences[author] = 3;
@@ -3456,7 +3479,7 @@ MACHA_FAST_TEST("storage_metadata", test_the_legacy_clock_survives_snapshot_and_
     file.extents.push_back({0, 4, object_id(pattern(4, 1)), false});
     file.size = 4;
     before.entries["/f"] = file;
-    CHECK(!decode_snapshot(encode_snapshot(before)).legacy_clock.has_value());
+    CHECK(!map_snapshot(tree_payload(before)).legacy_clock.has_value());
 
     auto after = before;
     after.legacy_clock = before.mutation_sequences;
@@ -3467,13 +3490,13 @@ MACHA_FAST_TEST("storage_metadata", test_the_legacy_clock_survives_snapshot_and_
     grown.provenance.content = {author, 4};
     grown.provenance.file_id = legacy_file_id("/f");
 
-    const auto decoded = decode_snapshot(encode_snapshot(after));
+    const auto decoded = map_snapshot(tree_payload(after));
     REQUIRE(decoded.legacy_clock.has_value());
     CHECK(*decoded.legacy_clock == before.mutation_sequences);
     // Set but empty is not unset.
     auto empty_clock = before;
     empty_clock.legacy_clock.emplace();
-    const auto empty_decoded = decode_snapshot(encode_snapshot(empty_clock));
+    const auto empty_decoded = map_snapshot(tree_payload(empty_clock));
     REQUIRE(empty_decoded.legacy_clock.has_value());
     CHECK(empty_decoded.legacy_clock->empty());
 
@@ -3485,7 +3508,7 @@ MACHA_FAST_TEST("storage_metadata", test_the_legacy_clock_survives_snapshot_and_
     const auto carried = decode_metadata_delta(encode_metadata_delta(*delta));
     CHECK(carried.set_legacy_clock == delta->set_legacy_clock);
     CHECK(carried.append_entries.at("/f").content == delta->append_entries.at("/f").content);
-    CHECK(encode_snapshot(apply_metadata_delta(before, carried)) == encode_snapshot(after));
+    CHECK(tree_payload(apply_metadata_delta(before, carried)) == tree_payload(after));
 
     // The clock is set once: a delta cannot change it.
     auto moved = after;
@@ -3828,7 +3851,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     write_key(keyfile);
     auto keys = load_cluster_keys(keyfile);
 
-    MetadataSnapshot snap = decode_snapshot(genesis_metadata().payload);
+    MetadataSnapshot snap = founded_snapshot();
     auto a = random_node_id();
     auto b = random_node_id();
     auto c = random_node_id();
@@ -3873,8 +3896,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     identity_reset.reason = "endpoint reassigned";
     snap.identity_resets[identity_reset_key(identity_reset.host, identity_reset.port)] =
         identity_reset;
-    auto encoded = encode_snapshot(snap);
-    auto decoded = decode_snapshot(encoded);
+    auto encoded = tree_payload(snap);
+    auto decoded = map_snapshot(encoded);
     CHECK(decoded.metadata_voters == snap.metadata_voters);
     CHECK(decoded.mutation_sequences == snap.mutation_sequences);
     CHECK(decoded.entries.at("/movie.mkv").size == 123);
@@ -3928,8 +3951,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     auto encoded_delta = encode_metadata_delta(*compact);
     auto decoded_delta = decode_metadata_delta(encoded_delta);
     auto reconstructed = apply_metadata_delta(decoded, decoded_delta);
-    CHECK(encode_snapshot(reconstructed) == encode_snapshot(delta_target));
-    CHECK(encoded_delta.size() < encode_snapshot(delta_target).size());
+    CHECK(tree_payload(reconstructed) == tree_payload(delta_target));
+    CHECK(encoded_delta.size() < tree_payload(delta_target).size());
 
     // The current compact-delta format represents tombstone replacement and
     // pruning directly while preserving the parent's canonical snapshot family.
@@ -3942,67 +3965,11 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(garbage_delta->erase_garbage.size() == 1);
     CHECK(garbage_delta->upsert_garbage.size() == 1);
     auto garbage_delta_roundtrip = decode_metadata_delta(encode_metadata_delta(*garbage_delta));
-    CHECK(encode_snapshot(apply_metadata_delta(delta_target, garbage_delta_roundtrip)) ==
-          encode_snapshot(garbage_compacted));
-
-    // Legacy SM7 snapshots remain valid; their tombstones decode without
-    // retirement time/id and are stamped by GC.
-    Writer old_v7;
-    const std::array<uint8_t, 8> old_v7_magic{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'};
-    old_v7.raw(old_v7_magic);
-    old_v7.u32(1);
-    old_v7.fixed(a.bytes);
-    old_v7.u32(1);
-    old_v7.u64(4ULL * 1024 * 1024);
-    old_v7.u32(1);
-    old_v7.fixed(a.bytes);
-    old_v7.u64(7);
-    old_v7.u32(1);
-    old_v7.string("/");
-    old_v7.u8(static_cast<uint8_t>(EntryType::directory));
-    old_v7.u32(0755);
-    old_v7.u32(0);
-    old_v7.u32(0);
-    old_v7.u64(0);
-    old_v7.i64(0);
-    old_v7.i64(0);
-    old_v7.u64(1);
-    old_v7.u32(0);
-    old_v7.u8(0);
-    old_v7.u32(1);
-    old_v7.fixed(garbage_id.bytes);
-    auto upgraded_v7 = decode_snapshot(old_v7.data());
-    REQUIRE(upgraded_v7.garbage.size() == 1);
-    CHECK(upgraded_v7.garbage.front().id == garbage_id);
-    CHECK(upgraded_v7.garbage.front().retired_at_ns == 0);
-    CHECK(upgraded_v7.garbage.front().retirement_id == NodeId{});
-
-    // Snapshots without a catalogue-root field decode to an empty catalogue,
-    // without migration.
-    Writer old;
-    const std::array<uint8_t, 8> old_magic{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'};
-    old.raw(old_magic);
-    old.u32(0); // metadata voters
-    old.u32(1); // data replication
-    old.u64(4ULL * 1024 * 1024);
-    old.u32(1); // root entry
-    old.string("/");
-    old.u8(static_cast<uint8_t>(EntryType::directory));
-    old.u32(0755);
-    old.u32(0);
-    old.u32(0);
-    old.u64(0);
-    old.i64(0);
-    old.i64(0);
-    old.u64(0);
-    old.u32(0); // extents
-    old.u32(0); // garbage
-    auto upgraded = decode_snapshot(old.data());
-    CHECK(!upgraded.catalogue_root.has_value());
-    CHECK(upgraded.entries.contains("/"));
+    CHECK(tree_payload(apply_metadata_delta(delta_target, garbage_delta_roundtrip)) ==
+          tree_payload(garbage_compacted));
 
     auto replica_path = t.path() / "node";
-    MetadataReplica replica(replica_path, keys.storage);
+    TestReplica replica(replica_path, keys.storage);
     auto current = replica.current();
     CHECK(replica.current_identity().generation == current.generation);
     CHECK(replica.current_identity().hash == current.hash);
@@ -4010,14 +3977,14 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(replica.committed_identity().hash == replica.committed().hash);
     CHECK(replica.committed().hash == current.hash);
     const auto next = record_after(current, encoded);
-    CHECK(decode_snapshot(next.payload).metadata_voters.size() == 3);
+    CHECK(map_snapshot(next.payload).metadata_voters.size() == 3);
     // A stored commit is not yet a head: the committed head advances on acceptance.
     REQUIRE(replica.store_commit(next));
     CHECK(replica.committed().hash == current.hash);
     REQUIRE(replica.accept_commit({next.generation, next.hash, 1, {a}}));
     CHECK(replica.committed().hash == next.hash);
 
-    MetadataReplica reopened(replica_path, keys.storage);
+    TestReplica reopened(replica_path, keys.storage);
     CHECK(reopened.current().hash == next.hash);
     CHECK(reopened.committed().hash == next.hash);
     CHECK(std::filesystem::exists(replica_path / "metadata" / "checkpoint.meta"));
@@ -4025,7 +3992,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
 
     // Ordinary mutation is a compact delta: history grows by the delta, not by
     // the successor's snapshot, and it survives restart.
-    auto before_delta = decode_snapshot(reopened.current().payload);
+    auto before_delta = map_snapshot(reopened.current().payload);
     auto after_delta = before_delta;
     after_delta.entries.at("/movie.mkv").size = 456;
     after_delta.mutation_sequences[a] = 8;
@@ -4036,7 +4003,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
         std::filesystem::file_size(replica_path / "metadata" / "history.log");
     const auto delta_next = record_after(
         reopened.current(),
-        encode_snapshot(apply_metadata_delta(before_delta, decode_metadata_delta(delta_bytes))));
+        tree_payload(apply_metadata_delta(before_delta, decode_metadata_delta(delta_bytes))));
     commit_record(reopened, delta_next, delta_bytes);
     const auto history_growth =
         std::filesystem::file_size(replica_path / "metadata" / "history.log") -
@@ -4047,10 +4014,10 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(history_growth >= delta_bytes.size());
     CHECK(history_growth < delta_bytes.size() + 512);
 
-    MetadataReplica reopened_again(replica_path, keys.storage);
+    TestReplica reopened_again(replica_path, keys.storage);
     CHECK(reopened_again.current().hash == delta_next.hash);
     CHECK(reopened_again.committed().hash == delta_next.hash);
-    CHECK(decode_snapshot(reopened_again.current().payload).entries.at("/movie.mkv").size == 456);
+    CHECK(map_snapshot(reopened_again.current().payload).entries.at("/movie.mkv").size == 456);
 
     // Accepted-but-uncommitted state remains current after restart but does not
     // become a recovery witness. An interrupted trailing journal append is
@@ -4059,16 +4026,18 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     MetadataRecord uncommitted_next;
     Hash256 uncommitted_base_hash;
     {
-        MetadataReplica uncommitted(uncommitted_path, keys.storage);
+        TestReplica uncommitted(uncommitted_path, keys.storage);
+        commit_record(uncommitted,
+                      record_after(uncommitted.current(), tree_payload(founded_snapshot())));
         auto base = uncommitted.current();
         uncommitted_base_hash = base.hash;
-        auto before = decode_snapshot(base.payload);
+        auto before = map_snapshot(base.payload);
         auto after = before;
         after.entries["/pending"] = extra;
         auto d = metadata_delta(before, after);
         REQUIRE(d.has_value());
         auto dbytes = encode_metadata_delta(*d);
-        uncommitted_next = record_after(base, encode_snapshot(apply_metadata_delta(before, *d)));
+        uncommitted_next = record_after(base, tree_payload(apply_metadata_delta(before, *d)));
         append_journal_frame(uncommitted_path, keys.storage, journal_prepare_delta,
                              uncommitted_next, dbytes);
     }
@@ -4078,7 +4047,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
         tail.write("bad", 3);
     }
     {
-        MetadataReplica recovered(uncommitted_path, keys.storage);
+        TestReplica recovered(uncommitted_path, keys.storage);
         CHECK(recovered.current().hash == uncommitted_next.hash);
         CHECK(recovered.committed().hash == uncommitted_base_hash);
     }
@@ -4108,7 +4077,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
                    static_cast<std::streamsize>(bytes.size()));
     }
     {
-        MetadataReplica recovered(uncommitted_path, keys.storage);
+        TestReplica recovered(uncommitted_path, keys.storage);
         CHECK(recovered.current().hash == uncommitted_next.hash);
         CHECK(recovered.committed().hash == uncommitted_base_hash);
         CHECK(std::filesystem::file_size(uncommitted_path / "metadata" / "journal.log") ==
@@ -4128,7 +4097,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     auto damaged_checkpoint_path = t.path() / "damaged-checkpoint-node";
     MetadataRecord recovery_seed;
     {
-        MetadataReplica replica(damaged_checkpoint_path, keys.storage);
+        TestReplica replica(damaged_checkpoint_path, keys.storage);
         recovery_seed = replica.committed();
     }
     {
@@ -4146,7 +4115,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
         REQUIRE(file.good());
     }
     {
-        MetadataReplica recovered(damaged_checkpoint_path, keys.storage, recovery_seed);
+        TestReplica recovered(damaged_checkpoint_path, keys.storage, recovery_seed);
         CHECK(recovered.recovery_required());
         CHECK(recovered.committed().hash == recovery_seed.hash);
         bool preserved = false;
@@ -4160,7 +4129,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     }
     CHECK(!std::filesystem::exists(damaged_checkpoint_path / "metadata" / "recovery.required"));
     {
-        MetadataReplica reopened_recovered(damaged_checkpoint_path, keys.storage);
+        TestReplica reopened_recovered(damaged_checkpoint_path, keys.storage);
         CHECK(reopened_recovered.committed().hash == recovery_seed.hash);
     }
 
@@ -4169,7 +4138,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     // context-free AES error.
     auto no_seed_path = t.path() / "damaged-checkpoint-no-seed";
     {
-        MetadataReplica replica(no_seed_path, keys.storage);
+        TestReplica replica(no_seed_path, keys.storage);
     }
     {
         auto checkpoint = no_seed_path / "metadata" / "checkpoint.meta";
@@ -4186,7 +4155,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
         REQUIRE(file.good());
     }
     try {
-        MetadataReplica should_fail(no_seed_path, keys.storage);
+        TestReplica should_fail(no_seed_path, keys.storage);
         CHECK(false);
     } catch (const std::exception& error) {
         const std::string message = error.what();
@@ -4198,15 +4167,15 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     // the journal rather than allowing an unbounded replay log.
     auto compact_path = t.path() / "compact-node";
     {
-        { MetadataReplica opened(compact_path, keys.storage); }
+        { TestReplica opened(compact_path, keys.storage); }
         for (size_t i = 0; i < 130; ++i)
             append_journal_frame(compact_path, keys.storage, journal_commit, genesis_metadata());
-        MetadataReplica compacted(compact_path, keys.storage);
+        TestReplica compacted(compact_path, keys.storage);
         CHECK(std::filesystem::file_size(compact_path / "metadata" / "journal.log") > 4096);
         compacted.compact();
     }
     CHECK(std::filesystem::file_size(compact_path / "metadata" / "journal.log") < 4096);
-    MetadataReplica compacted_again(compact_path, keys.storage);
+    TestReplica compacted_again(compact_path, keys.storage);
     CHECK(compacted_again.current().generation == genesis_metadata().generation);
     CHECK(compacted_again.current().hash == compacted_again.committed().hash);
 }
@@ -4338,7 +4307,7 @@ MACHA_TEST("storage_metadata", test_genesis_root_configuration) {
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_delta_rejects_unrepresentable_garbage_reordering) {
-    auto before = decode_snapshot(genesis_metadata().payload);
+    auto before = founded_snapshot();
     GarbageRef first{object_id(pattern(4097)), 10, random_node_id()};
     GarbageRef second{object_id(pattern(8193)), 20, random_node_id()};
     if (first.id < second.id)
@@ -4356,7 +4325,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_rejects_unrepresentable_
     auto canonical = metadata_delta(before, reordered);
     REQUIRE(canonical.has_value());
     CHECK(canonical->canonical_garbage);
-    CHECK(encode_snapshot(apply_metadata_delta(before, *canonical)) == encode_snapshot(reordered));
+    CHECK(tree_payload(apply_metadata_delta(before, *canonical)) == tree_payload(reordered));
 
     GarbageRef third{object_id(pattern(12289)), 30, random_node_id()};
     auto three = reordered;
@@ -4396,7 +4365,7 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
 MACHA_FAST_TEST("storage_metadata", test_decoded_extent_vectors_carry_no_allocator_slack) {
     // The decoded head stays pinned in the materialization cache, so extent
     // vectors must carry no capacity beyond their size.
-    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    auto snapshot = founded_snapshot();
     // Sizes either side of a power of two: geometric growth is only visible
     // when the final count is not itself the capacity the doubling lands on.
     for (const auto count : {1u, 3u, 100u, 1000u, 1025u}) {
@@ -4409,7 +4378,7 @@ MACHA_FAST_TEST("storage_metadata", test_decoded_extent_vectors_carry_no_allocat
         snapshot.entries["/f" + std::to_string(count) + ".mkv"] = std::move(file);
     }
 
-    const auto decoded = decode_snapshot(encode_snapshot(snapshot));
+    const auto decoded = map_snapshot(tree_payload(snapshot));
     CHECK(decoded.entries == snapshot.entries);
     for (const auto& [path, entry] : decoded.entries) {
         if (entry.extents.empty())
@@ -4554,7 +4523,7 @@ MACHA_FAST_TEST("storage_metadata", test_torrent_requests_join_without_conflicts
 // batches, the latest retirement per object.
 MACHA_FAST_TEST("storage_metadata", test_tombstone_batches_ride_the_head_and_its_deltas) {
     const auto magic = [](const Bytes& bytes) { return std::string(bytes.begin(), bytes.begin() + 8); };
-    MetadataSnapshot base = decode_snapshot(genesis_metadata().payload);
+    MetadataSnapshot base = founded_snapshot();
     base.metadata_write_replicas_required = 1;
     base.entries.clear();
     base.namespace_root = object_id(pattern(64));
@@ -4635,8 +4604,7 @@ MACHA_FAST_TEST("storage_metadata", test_tombstone_batches_ride_the_head_and_its
     CHECK(tombstones_of(with, read, &unreadable).size() == 2);
     CHECK(unreadable == 1);
 
-    // An inline namespace cannot carry batches; a tree-backed mutation's
-    // retirements wait for the commit.
+    // A mutation's retirements wait for the commit.
     const auto throws = [](const auto& call) {
         try {
             call();
@@ -4645,57 +4613,52 @@ MACHA_FAST_TEST("storage_metadata", test_tombstone_batches_ride_the_head_and_its
         }
         return false;
     };
-    auto inline_head = decode_snapshot(genesis_metadata().payload);
-    inline_head.tombstone_batches = {first};
-    CHECK(throws([&] { (void)encode_snapshot(inline_head); }));
     MetadataDelta delta;
-    auto tree_head = base;
-    retire_objects(tree_head, delta, {a, b});
-    retire_objects(tree_head, delta, {c});
-    CHECK(tree_head.garbage.empty());
+    retire_objects(delta, {a, b});
+    retire_objects(delta, {c});
     REQUIRE(delta.pending_tombstones.size() == 1);
     CHECK(delta.pending_tombstones.front().ids.size() == 3);
     CHECK(throws([&] { (void)encode_metadata_delta(delta); }));
 }
 
 MACHA_FAST_TEST("storage_metadata", test_torrent_requests_ride_the_snapshot_and_its_deltas) {
-    // SM15 (inline namespace), SM16 (tree-backed) and DLT9 carry the
-    // collection; a cluster with none keeps its exact encodings.
+    // SM16 and DLT9 carry the collection; a cluster with none keeps its exact
+    // encodings.
     const auto magic = [](const Bytes& bytes) { return std::string(bytes.begin(), bytes.begin() + 8); };
-    MetadataSnapshot base = decode_snapshot(genesis_metadata().payload);
+    MetadataSnapshot base = founded_snapshot();
     base.metadata_write_replicas_required = 1;
-    const auto base_bytes = encode_snapshot(base);
-    CHECK(magic(base_bytes) != "DHTMETB5");
+    const auto base_bytes = tree_payload(base);
+    CHECK(magic(base_bytes) == "DHTMETB4");
 
     auto with = base;
     auto request = sample_torrent_request(std::string(32, 'd'), std::string(40, '3'), 100);
     request.claim = TorrentClaim{random_node_id(), 1, 150};
     with.torrent_requests[request.id] = request;
-    const auto with_bytes = encode_snapshot(with);
-    CHECK(magic(with_bytes) == "DHTMETB5");
-    CHECK(decode_snapshot(with_bytes).torrent_requests == with.torrent_requests);
-    CHECK(encode_snapshot(decode_snapshot(with_bytes)) == with_bytes);
+    const auto with_bytes = tree_payload(with);
+    CHECK(magic(with_bytes) == "DHTMETB6");
+    CHECK(map_snapshot(with_bytes).torrent_requests == with.torrent_requests);
+    CHECK(tree_payload(map_snapshot(with_bytes)) == with_bytes);
 
     const auto added = metadata_delta(base, with);
     REQUIRE(added.has_value());
     CHECK(added->upsert_torrent_requests.size() == 1);
     const auto added_bytes = encode_metadata_delta(*added);
     CHECK(magic(added_bytes) == "DHTMDLT9");
-    CHECK(encode_snapshot(apply_metadata_delta(base, decode_metadata_delta(added_bytes))) == with_bytes);
+    CHECK(tree_payload(apply_metadata_delta(base, decode_metadata_delta(added_bytes))) == with_bytes);
 
     auto changed = with;
     changed.torrent_requests[request.id].phase = TorrentPhase::downloading;
     changed.torrent_requests[request.id].phase_epoch = 1;
     const auto update = metadata_delta(with, changed);
     REQUIRE(update.has_value());
-    CHECK(encode_snapshot(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(*update)))) ==
-          encode_snapshot(changed));
+    CHECK(tree_payload(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(*update)))) ==
+          tree_payload(changed));
 
     // Erased again: the snapshot returns to its pre-request encoding.
     const auto erased = metadata_delta(changed, base);
     REQUIRE(erased.has_value());
     CHECK(erased->erase_torrent_requests == std::vector<std::string>{request.id});
-    CHECK(encode_snapshot(apply_metadata_delta(changed, decode_metadata_delta(encode_metadata_delta(*erased)))) ==
+    CHECK(tree_payload(apply_metadata_delta(changed, decode_metadata_delta(encode_metadata_delta(*erased)))) ==
           base_bytes);
 
     // A delta that does not touch the collection is still DLT5-8.
@@ -4704,8 +4667,8 @@ MACHA_FAST_TEST("storage_metadata", test_torrent_requests_ride_the_snapshot_and_
     const auto quiet = metadata_delta(with, unrelated);
     REQUIRE(quiet.has_value());
     CHECK(magic(encode_metadata_delta(*quiet)) != "DHTMDLT9");
-    CHECK(encode_snapshot(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(*quiet)))) ==
-          encode_snapshot(unrelated));
+    CHECK(tree_payload(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(*quiet)))) ==
+          tree_payload(unrelated));
 
     // Tree-backed: SM16, and SM14 while empty.
     auto tree = with;

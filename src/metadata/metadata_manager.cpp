@@ -1189,35 +1189,17 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         if (!left_materialized || !right_materialized)
             throw MergeUnavailable("metadata merge head cannot be materialized");
         const auto materialise_ms = stage_ms();
-        // The merge reads the two heads and nothing else. Two trees merge by
-        // what differs between them; a branch still held as a map is
-        // materialised with the other, and the result re-rooted.
+        // The merge reads the two heads and nothing else: two trees merge by
+        // what differs between them.
         const auto& left_snapshot = *left_materialized->snapshot;
         const auto& right_snapshot = *right_materialized->snapshot;
-        const auto tree_backed =
-            left_snapshot.namespace_root.has_value() || right_snapshot.namespace_root.has_value();
-        const bool all_trees = left_snapshot.namespace_root && right_snapshot.namespace_root;
-        MetadataMergeResult merged;
-        std::optional<NamespaceTreeMerge> tree_merge;
-        if (all_trees) {
-            const auto reading =
-                ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
-            tree_merge = merge_tree_backed_heads(left_snapshot, right_snapshot, left.hash,
-                                                 right.hash, reading);
-            merged = std::move(tree_merge->merged);
-        } else {
-            auto reading = std::optional<ControlNamespaceNodeStore>(
-                ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_));
-            const auto materialise = [&](const MetadataSnapshot& snapshot) {
-                if (!snapshot.namespace_root)
-                    return snapshot;
-                if (!reading)
-                    throw MetadataNotReady("no namespace node store is configured");
-                return attach_namespace(snapshot, *reading);
-            };
-            merged = merge_metadata_heads(materialise(left_snapshot),
-                                          materialise(right_snapshot), left.hash, right.hash);
-        }
+        if (!left_snapshot.namespace_root || !right_snapshot.namespace_root)
+            throw MergeUnavailable("a metadata head to merge holds no namespace tree");
+        const auto reading =
+            ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
+        auto tree_merge = merge_tree_backed_heads(left_snapshot, right_snapshot, left.hash,
+                                                  right.hash, reading);
+        auto merged = std::move(tree_merge.merged);
         if (merged.snapshot.extent_size &&
             merged.snapshot.extent_size != node_.config().extent_size)
             throw std::runtime_error("cluster extent size does not match local configuration");
@@ -1235,22 +1217,18 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
 
         // The merged namespace's tree; its nodes are written and replicated
         // before the record naming the root is published.
-        if (tree_backed) {
+        {
             auto commit_nodes =
                 ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
-            if (tree_merge)
-                merged.snapshot.namespace_root =
-                    update_namespace_tree(tree_merge->onto, commit_nodes, tree_merge->changes);
-            else
-                merged.snapshot = detach_namespace(std::move(merged.snapshot), commit_nodes);
+            merged.snapshot.namespace_root =
+                update_namespace_tree(tree_merge.onto, commit_nodes, tree_merge.changes);
         }
 
         const auto tree_ms = stage_ms();
         MetadataRecord reconciliation;
         reconciliation.generation = std::max(left.generation, right.generation) + 1;
         reconciliation.previous = left.hash;
-        reconciliation.payload = tree_backed ? encode_snapshot_v14(merged.snapshot)
-                                             : encode_snapshot(merged.snapshot);
+        reconciliation.payload = encode_snapshot_v14(merged.snapshot);
         reconciliation.hash = metadata_hash(reconciliation.generation,
                                             reconciliation.previous,
                                             reconciliation.payload);
@@ -1260,11 +1238,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             left_materialized->record.hash == reconciliation.previous ? *left_materialized
                                                                       : *right_materialized;
         // A tree merge knows its namespace changes against the primary parent.
-        // A merge of materialised trees does not, and is published whole.
-        const auto delta =
-            tree_merge ? tree_merge_delta(*primary.snapshot, merged.snapshot, tree_merge->changes)
-            : tree_backed ? std::nullopt
-                          : metadata_delta(*primary.snapshot, merged.snapshot);
+        const auto delta = tree_merge_delta(*primary.snapshot, merged.snapshot, tree_merge.changes);
         if (delta) {
             auto encoded = encode_metadata_delta(*delta);
             if (encoded.size() < reconciliation.payload.size())
@@ -1354,8 +1328,7 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
     MetadataRecord proposed;
     proposed.generation = initial.generation + 1;
     proposed.previous = initial.hash;
-    proposed.payload =
-        snapshot.namespace_root ? encode_snapshot_v14(snapshot) : encode_snapshot(snapshot);
+    proposed.payload = encode_snapshot_v14(snapshot);
     proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
     (void)publish_commit(active, proposed, {}, FrameType::control);
     Log::info("metadata policy transition committed generation=" +
@@ -1458,26 +1431,23 @@ MetadataRecord MetadataManager::discover_or_form() {
             return read_group(ids, FrameType::control);
     }
 
-    auto base = genesis_metadata();
-    auto snapshot = decode_snapshot(base.payload);
-    auto root = snapshot.entries.find("/");
-    if (root == snapshot.entries.end())
-        throw std::runtime_error("genesis metadata has no filesystem root");
-    root->second.uid = node_.config().filesystem.root_uid;
-    root->second.gid = node_.config().filesystem.root_gid;
-    root->second.mode = node_.config().filesystem.root_mode;
+    const auto base = genesis_metadata();
+    MetadataSnapshot snapshot;
+    FsEntry root;
+    root.type = EntryType::directory;
+    root.uid = node_.config().filesystem.root_uid;
+    root.gid = node_.config().filesystem.root_gid;
+    root.mode = node_.config().filesystem.root_mode;
 
     // Virgin founders build byte-identical generation 2 without a
     // coordinator, so root timestamps use a fixed non-zero sentinel.
-    root->second.ctime_ns = root->second.mtime_ns = 1;
-    snapshot.metadata_voters.clear();
+    root.ctime_ns = root.mtime_ns = 1;
+    snapshot.entries["/"] = root;
     snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
     snapshot.extent_size = node_.config().extent_size;
     snapshot.metadata_write_replicas_required = 1;
-    snapshot.metadata_participants.clear();
     // Genesis is the first branch point; background convergence advances the
     // horizon to generation 2 once every founder has durably accepted it.
-    snapshot.metadata_branch_floor = {};
     snapshot.retention_baseline_complete = true; // virgin namespace has no inherited objects
 
     // A namespace is a tree from its first commit: the record carries only the
