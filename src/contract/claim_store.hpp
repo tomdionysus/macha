@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -38,13 +39,17 @@ struct RetentionDot {
 // What a metadata head has observed of each node's claim writes.
 using RetentionClock = std::map<NodeId, uint64_t>;
 
-// This node's guard over an object's claims against its copy. A claim's
-// presence check and its write, and a delete's check that no claim stands
-// and its unlink, each hold the guard for the ids they touch, so no claim
-// lands between a delete's check and the delete. Striped by the id's first
-// byte; a batch takes its stripes in ascending order, so two batches never
-// deadlock. Taken before the object store's and the claim store's locks,
-// never under them; a holder waits on the state and DATA devices.
+// This node's guard over an object's claims against its copy, so no claim
+// lands between a delete's check that none stands and the delete. A claim's
+// presence check and its write hold the guard for the ids they touch. A
+// delete holds it only to check and to mark the id as being deleted, then
+// releases it and unlinks under the mark alone, so the unlink waits on no
+// stripe and a claim path never waits on the DATA device: a claim that
+// arrives meanwhile finds the id marked and treats the object as not
+// present. Striped by the id's first byte; a batch takes its stripes in
+// ascending order, so two batches never deadlock. Taken before the object
+// store's and the claim store's locks, never under them; a holder waits on
+// the state device (a claim's journal write).
 class ClaimGuard {
     std::vector<std::unique_lock<std::mutex>> held_;
     friend class ClaimLocks;
@@ -57,9 +62,54 @@ class ClaimGuard {
     ClaimGuard& operator=(const ClaimGuard&) = delete;
 };
 
+// A delete's leave to go: `claimed` when a claim stood at the check, so the
+// delete must not go; otherwise the id is marked until this goes out of
+// scope.
+class ClaimDeletion {
+    class ClaimLocks* locks_{};
+    std::optional<ObjectId> marked_;
+    bool claimed_{};
+    friend class ClaimLocks;
+    friend class ClaimStore;
+
+  public:
+    ClaimDeletion() = default;
+    ClaimDeletion(ClaimDeletion&& other) noexcept
+        : locks_(other.locks_), marked_(std::move(other.marked_)), claimed_(other.claimed_) {
+        other.locks_ = nullptr;
+        other.marked_.reset();
+    }
+    ClaimDeletion& operator=(ClaimDeletion&& other) noexcept {
+        if (this != &other) {
+            release();
+            locks_ = other.locks_;
+            marked_ = std::move(other.marked_);
+            claimed_ = other.claimed_;
+            other.locks_ = nullptr;
+            other.marked_.reset();
+        }
+        return *this;
+    }
+    ClaimDeletion(const ClaimDeletion&) = delete;
+    ClaimDeletion& operator=(const ClaimDeletion&) = delete;
+    ~ClaimDeletion() { release(); }
+    bool claimed() const noexcept { return claimed_; }
+
+  private:
+    inline void release() noexcept;
+};
+
 class ClaimLocks {
     static constexpr size_t stripes = 64;
     std::array<IoMutex, stripes> stripes_;
+    mutable Mutex deleting_mutex_;
+    std::set<ObjectId> deleting_ MACHA_GUARDED_BY(deleting_mutex_);
+    friend class ClaimDeletion;
+
+    void end_deleting(const ObjectId& id) noexcept {
+        Lock lock(deleting_mutex_);
+        deleting_.erase(id);
+    }
 
   public:
     ClaimGuard lock(std::span<const ObjectId> ids) MACHA_EXCLUDES(no_io) {
@@ -72,7 +122,31 @@ class ClaimLocks {
                 guard.held_.emplace_back(stripes_[stripe].native());
         return guard;
     }
+    // Under the id's stripe (held by the caller): whether a delete has it.
+    bool deleting(const ObjectId& id) const {
+        Lock lock(deleting_mutex_);
+        return deleting_.contains(id);
+    }
+    // Under the id's stripe (held by the caller): marks it until the result
+    // goes out of scope.
+    ClaimDeletion begin_deleting(const ObjectId& id) {
+        {
+            Lock lock(deleting_mutex_);
+            deleting_.insert(id);
+        }
+        ClaimDeletion deletion;
+        deletion.locks_ = this;
+        deletion.marked_ = id;
+        return deletion;
+    }
 };
+
+inline void ClaimDeletion::release() noexcept {
+    if (locks_ && marked_)
+        locks_->end_deleting(*marked_);
+    locks_ = nullptr;
+    marked_.reset();
+}
 
 class ClaimStore {
     mutable ClaimLocks locks_;
@@ -80,15 +154,31 @@ class ClaimStore {
   public:
     virtual ~ClaimStore() = default;
 
-    // The guard above, for the ids given. Waits on the devices its other
-    // holders wait on. Const: a guard changes no claim.
-    static constexpr Waits guard_waits = Waits::state_device | Waits::data_device | Waits::locks;
+    // The guard above, for the ids a claim path checks and claims. Waits on
+    // the state device, as other holders do. Const: a guard changes no claim.
+    static constexpr Waits guard_waits = Waits::state_device | Waits::locks;
     static constexpr ThreadSafety guard_safety = ThreadSafety::thread_safe;
     ClaimGuard guard(std::span<const ObjectId> ids) const MACHA_EXCLUDES(no_io) {
         return locks_.lock(ids);
     }
     ClaimGuard guard(const ObjectId& id) const MACHA_EXCLUDES(no_io) {
         return locks_.lock(std::span<const ObjectId>(&id, 1));
+    }
+    // Under the guard: whether a delete has the object, in which case a
+    // claim treats it as not present.
+    bool deleting(const ObjectId& id) const { return locks_.deleting(id); }
+    // A delete's leave: under the id's stripe, no claim stands and the id is
+    // marked, or `claimed`. The stripe is released before this returns.
+    static constexpr Waits deletion_waits = guard_waits;
+    static constexpr ThreadSafety deletion_safety = ThreadSafety::thread_safe;
+    ClaimDeletion deletion(RetentionClass type, const ObjectId& id) const MACHA_EXCLUDES(no_io) {
+        const auto stripe = locks_.lock(std::span<const ObjectId>(&id, 1));
+        if (retained(type, id)) {
+            ClaimDeletion claimed;
+            claimed.claimed_ = true;
+            return claimed;
+        }
+        return locks_.begin_deleting(id);
     }
 
     // Every operation takes the store's lock, which writes, lookups (a

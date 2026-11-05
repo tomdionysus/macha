@@ -1,5 +1,44 @@
 # Current release
 
+## 0.92.4: the stop that hung, and the second loop's defects
+
+A stop issued during the availability survey's walk of the namespace hung
+for the systemd timeout and was killed: the walk, a trie lookup per extent
+over the whole library, checked nothing between objects, and the stop joined
+it. The survey's walks now take a pause that ends them when the pass is
+asked to stop, caught by the pass, which then ends.
+
+0.92.3's claim guard was held across a DATA unlink, so a claim arriving in a
+metadata commit, which is control work, could wait on the DATA device. A
+delete now holds the guard only to check that no claim stands and to mark
+the object as being deleted, and unlinks under the mark alone; a claim that
+arrives meanwhile finds the mark and treats the object as not present.
+
+The Dannan session's reading of Macha for its port found more. Status
+reported the RPC connection counts as literal zeros and the canonical count
+as the peer count less one; the transport's own counts are reported. The
+remote metadata generation was loaded, raised and stored, so two readers
+could put an older value back; it is raised by compare-and-swap. A dial was
+counted as a connection before the peer's identity was checked. The torrent
+disk workers and publisher and the playback start and replacement threads
+ran unsupervised, so an exception escaping one ended the process; they run
+under the supervisor, a disk job's failure is logged and the worker goes
+on, and the source guard that enforces this now sees every thread
+construction. A test asserted on another thread, which would have ended
+the process rather than failed the case. Two held-ledger tests still waited
+on the seed marker rather than the store's answer. The telemetry gossip
+comment, the write-floor comment and the ledger cache comment said what the
+code does not.
+
+A maintenance trace case failed intermittently. A commit that lands ahead of
+the survey makes repair's push leave its list and return to it, and each
+change owes a further pass an interval later, as designed; the fixture's
+clock stopped short of them, so repair ran on into the next step and walked
+a claim that step had just lost. A step now moves past every follow-up the
+pass owes.
+
+The README lists the Samsung Tizen TV client.
+
 ## 0.92.3: defects the Dagda port found, fixed here first
 
 Dagda moved Macha's store and read it closely. What it found is fixed in

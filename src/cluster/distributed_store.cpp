@@ -806,7 +806,8 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (target.id == n_.node_id()) {
         // Under the claim guard, so no delete removes an object between its
-        // presence check here and the claim.
+        // presence check here and the claim; one a delete has marked is not
+        // present.
         const auto guard = local_.retention().guard(ids);
         for (const auto& id : ids) {
             // A retention claim says "this node holds the object": index
@@ -814,9 +815,10 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
             // mutation would hold the store mutex and stall every HTTP request.
             // The bytes were verified when put; scrub finds later corruption.
             // No DATA admission for an index lookup; the remote handler matches.
-            const bool present = object_class == RetentionClass::data
-                                     ? local_.data().has(id)
-                                     : local_.control().has(id);
+            const bool present = !local_.retention().deleting(id) &&
+                                 (object_class == RetentionClass::data
+                                      ? local_.data().has(id)
+                                      : local_.control().has(id));
             if (!present)
                 return false;
         }
@@ -1059,7 +1061,8 @@ std::vector<ObjectId> DistributedStore::retain_data_here(const std::vector<Objec
     held.reserve(ids.size());
     const auto guard = local_.retention().guard(ids);
     for (const auto& id : ids)
-        (local_.data().has(id) ? held : elsewhere).push_back(id);
+        (!local_.retention().deleting(id) && local_.data().has(id) ? held : elsewhere)
+            .push_back(id);
     if (!held.empty())
         local_.retention().retain_batch(RetentionClass::data, held, dot);
     return elsewhere;
@@ -2302,9 +2305,9 @@ void DistributedStore::erase_all(const ObjectId& id) {
                     DataWorkContext(FrameType::speculative, n_.config().extent_size),
                     n_.config().extent_size);
                 if (resource) {
-                    // The claim check and the delete under one guard.
-                    const auto guard = local_.retention().guard(id);
-                    if (!local_.retention().retained(RetentionClass::data, id))
+                    // The claim check marks the object for the delete.
+                    const auto deletion = local_.retention().deletion(RetentionClass::data, id);
+                    if (!deletion.claimed())
                         (void)local_.data().remove(id);
                 }
                 (void)local_.cache().remove(id);
