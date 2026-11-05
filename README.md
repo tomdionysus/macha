@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.92.4*
+*v0.92.5*
 
 *Macha - Old Irish /ˈmˠaxə/ - approximately “MAKH-uh”*
 
