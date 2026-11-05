@@ -145,8 +145,7 @@ struct MetadataSnapshot {
     std::vector<NodeId> metadata_voters;
     uint32_t data_replication{};
     uint64_t extent_size{};
-    // Durability floor under which this commit is valid. Zero means a legacy
-    // snapshot not yet transitioned.
+    // Durability floor under which this commit is valid. Zero only on genesis.
     uint32_t metadata_write_replicas_required{};
     // Roster used only while establishing retention claims for a legacy
     // namespace; never an authority list, cleared once the baseline completes.
@@ -256,7 +255,7 @@ struct MetadataIdentity {
 };
 
 // Evidence a commit reached the write floor: `replicas` durably acknowledged
-// it. `required == 0` marks a migrated legacy checkpoint, authoritative itself.
+// it. `required == 0` is genesis on a founder, which names nobody.
 struct MetadataAcceptance {
     uint64_t generation{};
     Hash256 hash{};
@@ -521,13 +520,10 @@ class MetadataReplica {
         uint64_t bytes{};
     };
 
-    std::filesystem::path p_;
-    std::filesystem::path committed_p_;
     std::filesystem::path checkpoint_p_;
     std::filesystem::path journal_p_;
     std::filesystem::path history_p_;
     std::filesystem::path heads_p_;
-    std::filesystem::path mutation_sequence_p_;
     std::filesystem::path author_p_;
     // Present from the moment the head set is replaced until the next
     // mutation takes a new author id.
@@ -639,8 +635,6 @@ class MetadataReplica {
     std::optional<MetadataRecord> load(const std::filesystem::path&) const;
     // Construction calls the load_* functions and recover_from_seed() before the
     // replica is shared; the analysis does not check constructors.
-    void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {})
-        MACHA_REQUIRES(m_);
     void load_journal() MACHA_REQUIRES(m_);
     Bytes encode_history_frame(const MetadataHistoryEntry&) const;
     MetadataHistoryEntry read_history_entry(const HistoryIndexEntry&) const;
@@ -651,7 +645,7 @@ class MetadataReplica {
     void load_heads() MACHA_REQUIRES(m_);
     void persist_heads_locked() MACHA_REQUIRES(m_);
     void ensure_history_root(const MetadataRecord&) MACHA_REQUIRES(m_);
-    void migrate_legacy_head_locked() MACHA_REQUIRES(m_);
+    void adopt_committed_head_locked() MACHA_REQUIRES(m_);
     bool prune_accepted_heads_locked() MACHA_REQUIRES(m_);
     bool accepted_head_is_ancestor_locked(const Hash256&, const Hash256&) const MACHA_REQUIRES(m_);
     bool acceptance_matches_record_policy_locked(const MetadataAcceptance&,
