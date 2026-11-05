@@ -4838,6 +4838,37 @@ MACHA_FAST_TEST("storage_metadata", test_torrent_requests_ride_the_snapshot_and_
     CHECK(joined.phase == TorrentPhase::downloading);
 }
 
+MACHA_FAST_TEST("storage_metadata", test_a_delete_marks_its_object_and_holds_no_stripe) {
+    TempDir dir;
+    std::array<uint8_t, 32> key{};
+    key.fill(7);
+    RetentionStore store(dir.path(), key);
+    const auto id = object_id(pattern(64));
+    {
+        auto deletion = store.deletion(RetentionClass::data, id);
+        CHECK(!deletion.claimed());
+        // The stripe is free while the delete goes, or this would deadlock:
+        // a claim path gets it and finds the mark.
+        const auto guard = store.guard(id);
+        CHECK(store.deleting(id));
+    }
+    CHECK(!store.deleting(id));
+
+    // Moved, the mark lasts as long as the new owner.
+    {
+        auto first = store.deletion(RetentionClass::data, id);
+        auto second = std::move(first);
+        CHECK(store.deleting(id));
+    }
+    CHECK(!store.deleting(id));
+
+    // A standing claim refuses the delete and marks nothing.
+    store.retain(RetentionClass::data, id, RetentionDot{random_node_id(), 1});
+    const auto refused = store.deletion(RetentionClass::data, id);
+    CHECK(refused.claimed());
+    CHECK(!store.deleting(id));
+}
+
 MACHA_FAST_TEST("storage_metadata", test_a_delta_refuses_a_torrent_request_with_no_id) {
     // The snapshot decoder refuses an unkeyed request; a delta carrying one
     // must be refused too, or a head applies it and cannot read itself back.

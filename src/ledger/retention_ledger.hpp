@@ -35,7 +35,9 @@ class RetentionLedger final : public ObjectLedger {
     bool retained(RetentionClass type, const ObjectId& id) const override {
         return claims_.retained(type, id);
     }
-    ClaimGuard claim_guard(const ObjectId& id) const override { return claims_.guard(id); }
+    ClaimDeletion claim_deletion(RetentionClass type, const ObjectId& id) const override {
+        return claims_.deletion(type, id);
+    }
     size_t release_unreferenced(RetentionClass, const ReleaseHorizon&,
                                 size_t operation_budget) override;
     size_t prune_unclaimed(RetentionClass, size_t operation_budget) override;

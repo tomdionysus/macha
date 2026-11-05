@@ -255,16 +255,22 @@ class TracedNode {
     }
     // Settling first lets every raised event reset its quiet window; stepping
     // past the window (idle_for runs on this clock) makes the next pass idle.
-    // An inventory rebuild schedules a follow-up a quiet window later, so the
-    // final small step makes that follow-up happen here either way.
+    // An inventory rebuild schedules a follow-up a quiet window later, and a
+    // repair pass that spanned a change is followed by another an interval
+    // later. A commit that lands ahead of the survey makes the push leave its
+    // list and return to it, so two such passes can be owed; the final steps
+    // make them all happen here, whichever way the commit raced the pass.
     void advance(Clock::duration by) {
         const auto quiet = config_.maintenance.foreground_quiet * 2;
+        const auto follow_up = std::max<Clock::duration>(quiet, config_.maintenance.interval);
         settle();
         clock_->advance(quiet);
         settle();
         clock_->advance(by);
         settle();
-        clock_->advance(quiet);
+        clock_->advance(follow_up);
+        settle();
+        clock_->advance(follow_up);
         settle();
     }
 

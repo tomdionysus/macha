@@ -2301,7 +2301,6 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
             [this, retry_key](bool success, std::chrono::milliseconds elapsed, bool sample) {
                 observe_result(retry_key, success, elapsed, sample);
             }, retained_memory_);
-        ++connections_created_;
 
         if (expected && fresh->peer().id != *expected) {
             const auto actual_id = fresh->peer().id;
@@ -2311,6 +2310,8 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
                                      to_string(*expected) + ", actual authenticated NodeId " +
                                      to_string(actual_id));
         }
+        // Counted once the connection is one this node keeps.
+        ++connections_created_;
         fresh->set_traffic(traffic_);
         fresh->start();
         if (actual)

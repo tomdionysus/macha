@@ -1066,8 +1066,9 @@ MACHA_FAST_TEST("object_ledger", test_a_store_with_its_ledger_starts_knowing_wha
     std::vector<ObjectId> removed;
     {
         LocalStore store(root, ledgered(ledger), key);
-        // The first start walks its objects once and seeds the ledger.
-        REQUIRE(wait_until([&] { return std::filesystem::exists(ledger / "seeded"); }, 10s));
+        // The first start walks its objects once and seeds the ledger; the
+        // store's own answer, since the marker lands before the flag.
+        REQUIRE(wait_until([&] { return store.held_view().identity.complete; }, 10s));
         for (int i = 0; i < 40; ++i) {
             const auto data = pattern(4096 + i, static_cast<uint8_t>(i));
             const auto id = object_id(data);
@@ -1117,7 +1118,7 @@ MACHA_FAST_TEST("object_ledger", test_verification_corrects_the_ledger_from_the_
     std::vector<ObjectId> held;
     {
         LocalStore store(root, ledgered(ledger), key);
-        REQUIRE(wait_until([&] { return std::filesystem::exists(ledger / "seeded"); }, 10s));
+        REQUIRE(wait_until([&] { return store.held_view().identity.complete; }, 10s));
         for (int i = 0; i < 30; ++i) {
             const auto data = pattern(4096 + i, static_cast<uint8_t>(i));
             held.push_back(object_id(data));

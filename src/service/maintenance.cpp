@@ -262,6 +262,14 @@ void Maintenance::maintain_tombstone_batches(const InventoryHorizon& inventory) 
     });
 }
 
+namespace {
+// Thrown out of a long walk when the pass is asked to stop; caught by the
+// pass, which then sees the stop and ends.
+struct MaintenanceStopping final : std::runtime_error {
+    MaintenanceStopping() : std::runtime_error("maintenance stopping") {}
+};
+} // namespace
+
 double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds,
                             double wall_seconds, double cpu_target) {
     if (wall_seconds <= 0.0)
@@ -611,8 +619,17 @@ void Maintenance::run(std::stop_token stop) {
             const auto survey = [&] {
                 enter_stage("availability");
                 try {
+                    // The survey's walks (the join against this node's
+                    // holdings, the diff, the path table over the whole
+                    // namespace) check the stop between objects, so a stop
+                    // never waits for a million lookups to finish.
                     if (const auto head = metadata_.current())
-                        (void)availability_.refresh(*head, clock_->now(), unix_ms());
+                        (void)availability_.refresh(*head, clock_->now(), unix_ms(), [&stop] {
+                            if (stop.stop_requested())
+                                throw MaintenanceStopping{};
+                        });
+                } catch (const MaintenanceStopping&) {
+                    throw;
                 } catch (const std::exception& error) {
                     Log::debug("availability survey deferred: " + std::string(error.what()));
                 }
@@ -1047,8 +1064,9 @@ void Maintenance::run(std::stop_token stop) {
                             return ledger_.retained(RetentionClass::data, id);
                         },
                         &data_unreferenced_, static_cast<uint64_t>(now_ns / 1'000'000),
-                        policy.garbage_grace,
-                        [this](const ObjectId& id) { return ledger_.claim_guard(id); });
+                        policy.garbage_grace, [this](const ObjectId& id) {
+                            return ledger_.claim_deletion(RetentionClass::data, id);
+                        });
                     save_sightings(data_unreferenced_, data_sightings_saved_, gc.complete);
                     if (gc.bytes)
                         trace_action("gc", "reclaimed_bytes=" + std::to_string(gc.bytes));
@@ -1233,6 +1251,8 @@ void Maintenance::run(std::stop_token stop) {
                 }
             }
 
+        } catch (const MaintenanceStopping&) {
+            // Asked to stop inside a long walk: the loop's condition ends it.
         } catch (const MetadataNotReady&) {
             // Normal startup/recovery state. MetadataManager has already
             // published any availability transition; do not duplicate it on
