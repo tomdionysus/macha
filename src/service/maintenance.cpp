@@ -206,6 +206,39 @@ void Maintenance::maintain_garbage_metadata(const std::vector<GarbageRef>& erase
         delta.erase_garbage.erase(
             std::unique(delta.erase_garbage.begin(), delta.erase_garbage.end()),
             delta.erase_garbage.end());
+
+        // A tree-backed head keeps its tombstones in immutable batches: a batch
+        // holding one to erase is dropped, and the rest of it written again at
+        // its own time. A later retirement of the same object is another batch
+        // and is kept.
+        if (erase_expected.empty() || snapshot.tombstone_batches.empty())
+            return;
+        const auto reader = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
+        std::vector<TombstoneBatch> kept;
+        for (const auto& batch : snapshot.tombstone_batches) {
+            const auto bytes = reader.get(batch.id);
+            if (!bytes) {
+                kept.push_back(batch);
+                continue;
+            }
+            auto content = decode_tombstone_batch(*bytes);
+            MetadataDelta::PendingTombstones rest{false, content.retired_at_ns, {}};
+            for (const auto& id : content.ids) {
+                const auto expected = erase_expected.find(id);
+                if (expected == erase_expected.end() ||
+                    content.retired_at_ns > expected->second.retired_at_ns)
+                    rest.ids.push_back(id);
+            }
+            if (rest.ids.size() == content.ids.size()) {
+                kept.push_back(batch);
+                continue;
+            }
+            delta.drop_tombstone_batches.push_back(batch.id);
+            if (!rest.ids.empty())
+                delta.pending_tombstones.push_back(std::move(rest));
+        }
+        snapshot.tombstone_batches = std::move(kept);
+        std::sort(delta.drop_tombstone_batches.begin(), delta.drop_tombstone_batches.end());
     });
 }
 
@@ -220,6 +253,13 @@ void Maintenance::maintain_tombstone_batches(const InventoryHorizon& inventory) 
             now_ns - batch.retired_at_ns >= grace_ns)
             matured.insert(batch.id);
     const auto view = metadata_.converged();
+    // Only what the head still names: the erase above may have dropped a
+    // matured batch already.
+    std::erase_if(matured, [&](const ObjectId& id) {
+        const auto& named = view.snapshot->tombstone_batches;
+        return std::none_of(named.begin(), named.end(),
+                            [&](const TombstoneBatch& batch) { return batch.id == id; });
+    });
     const bool inline_tombstones =
         view.snapshot->namespace_root && !view.snapshot->garbage.empty();
     if (matured.empty() && !inline_tombstones)
