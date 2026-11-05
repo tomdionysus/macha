@@ -21,12 +21,6 @@
 
 namespace macha {
 namespace {
-bool same_legacy_metadata_voters(std::vector<NodeId> a, std::vector<NodeId> b) {
-    std::sort(a.begin(), a.end());
-    std::sort(b.begin(), b.end());
-    return a == b;
-}
-
 bool newer_than(const MetadataRecord& a, const MetadataRecord& b) {
     return a.generation > b.generation ||
            (a.generation == b.generation && a.hash > b.hash);
@@ -1237,7 +1231,6 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         if (right.hash < left.hash) {
             std::swap(left, right);
         }
-        merged.snapshot.metadata_voters.clear();
         merged.snapshot.merge_parents = {right.hash};
 
         // The merged namespace's tree; its nodes are written and replicated
@@ -1352,19 +1345,10 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
     if (snapshot.extent_size && snapshot.extent_size != node_.config().extent_size)
         throw std::runtime_error("cluster extent size does not match local configuration");
 
-    // Zero marks a legacy snapshot; any other value is only that marker.
-    const bool policy_transition = snapshot.metadata_write_replicas_required == 0;
-    const bool clear_legacy_metadata_voters = !snapshot.metadata_voters.empty();
-    const bool data_policy_change = snapshot.data_replication != node_.config().replication;
-
-    const auto active = node_.membership().active();
-
-    if (!policy_transition && !clear_legacy_metadata_voters && !data_policy_change)
+    if (snapshot.data_replication == node_.config().replication)
         return initial;
 
-    snapshot.metadata_voters.clear();
-    if (policy_transition)
-        snapshot.metadata_write_replicas_required = 1;
+    const auto active = node_.membership().active();
     snapshot.merge_parents.clear();
     snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
     MetadataRecord proposed;
@@ -1746,7 +1730,6 @@ MetadataRecord MetadataManager::mutate_delta(
             throw std::logic_error("metadata head carries no namespace tree");
         snapshot.merge_parents.clear();
         MetadataDelta supplied_delta;
-        const auto legacy_metadata_voters = snapshot.metadata_voters;
         const auto data_replication = snapshot.data_replication;
         const auto extent_size = snapshot.extent_size;
         const auto metadata_write_replicas_required =
@@ -1757,9 +1740,6 @@ MetadataRecord MetadataManager::mutate_delta(
         mutate(snapshot, supplied_delta);
         if (!snapshot.node_status.empty() && supplied_delta.upsert_node_status.empty())
             supplied_delta.upsert_node_status.emplace(*snapshot.node_status.begin());
-        if (!same_legacy_metadata_voters(snapshot.metadata_voters, legacy_metadata_voters))
-            throw std::runtime_error(
-                "filesystem mutation attempted to change legacy metadata replica state");
         if (snapshot.data_replication != data_replication || snapshot.extent_size != extent_size ||
             snapshot.metadata_write_replicas_required != metadata_write_replicas_required ||
             snapshot.metadata_participants != metadata_participants ||

@@ -37,7 +37,6 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     TOMBSTONE_BATCH{'M', 'T', 'O', 'M', 'B', '0', '0', '1'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
-    MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'},
     MAUTHOR{'D', 'H', 'T', 'M', 'A', 'U', 'T', '1'};
 constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2, JOURNAL_SEED_FULL = 3,
                   JOURNAL_COMMIT = 4;
@@ -2145,7 +2144,7 @@ Bytes encode_metadata_acceptance(const MetadataAcceptance& input) {
     if (value.required && value.replicas.size() < value.required)
         throw std::runtime_error("metadata acceptance does not satisfy write floor");
     if (!value.required && !value.replicas.empty())
-        throw std::runtime_error("legacy metadata acceptance cannot name replicas");
+        throw std::runtime_error("metadata acceptance without a floor cannot name replicas");
     if (value.replicas.size() > 1000000)
         throw std::runtime_error("too many metadata acceptance replicas");
 
@@ -2187,7 +2186,7 @@ MetadataAcceptance decode_metadata_acceptance(std::span<const uint8_t> data) {
         if (value.replicas.size() < value.required)
             throw DecodeError("metadata acceptance does not satisfy write floor");
     } else if (!value.replicas.empty()) {
-        throw DecodeError("legacy metadata acceptance cannot name replicas");
+        throw DecodeError("metadata acceptance without a floor cannot name replicas");
     }
     return value;
 }
@@ -2336,10 +2335,8 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
                                  bool accept_pristine_genesis_authority,
                                  uint64_t materialization_cache_limit_bytes,
                                  NamespaceDeltaApplier namespace_applier)
-    : p_(r / "metadata" / "current.meta"), committed_p_(r / "metadata" / "committed.meta"),
-      checkpoint_p_(r / "metadata" / "checkpoint.meta"), journal_p_(r / "metadata" / "journal.log"),
+    : checkpoint_p_(r / "metadata" / "checkpoint.meta"), journal_p_(r / "metadata" / "journal.log"),
       history_p_(r / "metadata" / "history.log"), heads_p_(r / "metadata" / "heads.meta"),
-      mutation_sequence_p_(r / "metadata" / "mutation-sequence.meta"),
       author_p_(r / "metadata" / "author.meta"),
       author_chain_broken_p_(r / "metadata" / "author-chain-broken"),
       set_aside_p_(r / "metadata" / "set-aside.meta"),
@@ -2374,8 +2371,8 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
                 pending_recovered_ = cur_.hash != committed_.hash;
                 ensure_history_root(committed_);
                 load_heads();
-                // This checkpoint may come from the metadata cache: no legacy
-                // acceptance; only heads.meta from a peer recovery grants authority.
+                // This checkpoint may come from the metadata cache: only heads.meta
+                // from a peer recovery grants authority.
                 refresh_materialized_head_locked();
                 Log::warn("metadata replica still requires replica recovery path=" +
                           checkpoint_p_.parent_path().string() +
@@ -2404,60 +2401,19 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
             pending_recovered_ = cur_.hash != committed_.hash;
             ensure_history_root(committed_);
             load_heads();
-            migrate_legacy_head_locked();
+            adopt_committed_head_locked();
             refresh_materialized_head_locked();
             return;
         }
 
-        // current.meta/committed.meta layout: committed becomes the journal
-        // base, a newer current becomes a seed entry, and the old files are
-        // renamed once the new ones are durable.
-        auto current = load(p_);
-        auto committed = load(committed_p_);
-        if (current.has_value() != committed.has_value())
-            throw std::runtime_error(
-                "incomplete metadata state: current.meta and committed.meta are both required");
-
-        if (!current) {
-            cur_ = genesis_metadata();
-            set_committed_locked(cur_);
-            reset_checkpoint(committed_);
-            load_history();
-            ensure_history_root(committed_);
-            load_heads();
-            migrate_legacy_head_locked();
-            refresh_materialized_head_locked();
-            return;
-        }
-
-        if (committed->generation > current->generation)
-            throw std::runtime_error("metadata committed generation is newer than current");
-        if (committed->generation == current->generation && committed->hash != current->hash)
-            throw std::runtime_error("metadata current/committed generation conflict");
-
-        cur_ = *committed;
-        set_committed_locked(*committed);
-        if (current->hash != committed->hash) {
-            writefile(journal_p_, {});
-            journal_records_ = 0;
-            journal_bytes_ = 0;
-            append_journal(JOURNAL_SEED_FULL, *current, current->payload);
-            persist(checkpoint_p_, committed_);
-            cur_ = *current;
-            pending_recovered_ = true;
-        } else {
-            reset_checkpoint(committed_);
-        }
+        cur_ = genesis_metadata();
+        set_committed_locked(cur_);
+        reset_checkpoint(committed_);
         load_history();
         ensure_history_root(committed_);
         load_heads();
-        migrate_legacy_head_locked();
+        adopt_committed_head_locked();
         refresh_materialized_head_locked();
-
-        std::error_code ec;
-        std::filesystem::rename(p_, p_.string() + ".v10", ec);
-        ec.clear();
-        std::filesystem::rename(committed_p_, committed_p_.string() + ".v10", ec);
     } catch (const std::exception& error) {
         auto seed = valid_seed();
         if (!seed)
@@ -2474,7 +2430,7 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
 
     std::vector<std::filesystem::path> quarantined;
     for (const auto& path :
-         {checkpoint_p_, journal_p_, history_p_, heads_p_, p_, committed_p_}) {
+         {checkpoint_p_, journal_p_, history_p_, heads_p_}) {
         if (auto moved = quarantine_metadata_file(path, stamp))
             quarantined.push_back(*moved);
     }
@@ -2590,22 +2546,6 @@ void MetadataReplica::load_author_locked(const NodeId& node_id,
             throw std::runtime_error("metadata author file " + author_p_.string() + ": " +
                                      error.what());
         }
-    } else if (std::filesystem::exists(mutation_sequence_p_)) {
-        // The sequence counter this file replaces: the author is the node.
-        try {
-            const auto plaintext = open_sealed(mutation_sequence_p_, MS);
-            Reader plain(plaintext);
-            author_.id = node_id;
-            author_.reserved = plain.u64();
-            plain.finish();
-        } catch (const std::exception& error) {
-            throw std::runtime_error("metadata mutation-sequence file " +
-                                     mutation_sequence_p_.string() + ": " + error.what());
-        }
-        author_loaded_ = true;
-        persist_author_locked();
-        std::error_code ignored;
-        std::filesystem::remove(mutation_sequence_p_, ignored);
     } else {
         // No record of what this node has authored. If a head says it has
         // authored before, that record was lost: it may not continue the
@@ -2688,59 +2628,6 @@ std::vector<NodeId> MetadataReplica::author_ids(const NodeId& node_id,
     std::vector<NodeId> ids{author_.id};
     ids.insert(ids.end(), author_.past.begin(), author_.past.end());
     return ids;
-}
-
-void MetadataReplica::append_journal(uint8_t kind, const MetadataRecord& record,
-                                     std::span<const uint8_t> body) {
-    Writer plain;
-    plain.u8(kind);
-    plain.u64(record.generation);
-    plain.fixed(record.previous.bytes);
-    plain.fixed(record.hash.bytes);
-    plain.bytes(body);
-    auto sealed = aes_gcm_seal(key_, plain.data(), MJ);
-
-    Writer envelope;
-    envelope.fixed(sealed.nonce);
-    envelope.fixed(sealed.tag);
-    envelope.bytes(sealed.ciphertext);
-    auto payload = envelope.take();
-    if (payload.size() > std::numeric_limits<uint32_t>::max())
-        throw std::runtime_error("metadata journal record too large");
-
-    Writer frame;
-    frame.u32(static_cast<uint32_t>(payload.size()));
-    frame.raw(payload);
-    auto bytes = frame.take();
-
-    int fd = open(journal_p_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
-    if (fd < 0)
-        throw std::runtime_error(strerror(errno));
-    size_t offset = 0;
-    while (offset < bytes.size()) {
-        auto count = write(fd, bytes.data() + offset, bytes.size() - offset);
-        if (count < 0) {
-            if (errno == EINTR)
-                continue;
-            auto error = errno;
-            close(fd);
-            throw std::runtime_error(strerror(error));
-        }
-        offset += static_cast<size_t>(count);
-    }
-    const auto sync_started = Clock::now();
-    if (fsync(fd)) {
-        auto error = errno;
-        close(fd);
-        throw std::runtime_error("cannot sync metadata journal " + journal_p_.string() + ": " +
-                                 strerror(error));
-    }
-    observations().record("metadata.journal_sync_us", elapsed_us(sync_started));
-    if (close(fd) != 0)
-        throw std::runtime_error("cannot close metadata journal " + journal_p_.string() + ": " +
-                                 strerror(errno));
-    ++journal_records_;
-    journal_bytes_ += bytes.size();
 }
 
 void MetadataReplica::load_journal() {
@@ -3304,73 +3191,41 @@ bool MetadataReplica::accepted_head_is_ancestor_locked(const Hash256& ancestor,
            });
 }
 
-void MetadataReplica::migrate_legacy_head_locked() {
+void MetadataReplica::adopt_committed_head_locked() {
     const HeadsRevisionBump heads_bump(heads_revision_);
     ensure_history_root(committed_);
     const auto genesis = genesis_metadata();
-    if (!accept_pristine_genesis_authority_ && committed_.hash == genesis.hash) {
+    if (committed_.hash == genesis.hash) {
         // A joiner (bootstrap peers configured) never holds genesis as an
-        // accepted head; it stays local, non-authoritative material.
-        if (accepted_heads_.erase(genesis.hash))
+        // accepted head; it stays local, non-authoritative material. A founder
+        // holds it until its first commit, or any accepted head subsumes it.
+        if (!accept_pristine_genesis_authority_) {
+            if (accepted_heads_.erase(genesis.hash))
+                persist_heads_locked();
+        } else if (accepted_heads_.empty()) {
+            accepted_heads_.emplace(genesis.hash,
+                                    MetadataAcceptance{genesis.generation, genesis.hash, 0, {}});
             persist_heads_locked();
+        }
         return;
     }
     if (accepted_heads_.contains(committed_.hash))
         return;
 
-    const auto snapshot = decode_snapshot(committed_.payload);
-    if (snapshot.metadata_write_replicas_required != 0) {
-        // Without a certificate a write-floor checkpoint is not authority:
-        // keep it and force peer recovery rather than invent a legacy head.
-        recovery_required_ = true;
-        durable_replace_file(
-            recovery_p_, "protocol-20 metadata checkpoint has no durable acceptance certificate");
-        return;
-    }
-
-    if (!accepted_heads_.empty()) {
-        // Accepted descendants subsume the checkpoint. A JOURNAL_COMMIT newer
-        // than heads.meta (crash between the two writes) replaces them.
-        bool committed_is_ancestor = false;
-        bool all_heads_are_ancestors = true;
-        for (const auto& [head, _] : accepted_heads_) {
-            committed_is_ancestor =
-                committed_is_ancestor || history_is_ancestor_locked(committed_.hash, head);
-            all_heads_are_ancestors =
-                all_heads_are_ancestors && history_is_ancestor_locked(head, committed_.hash);
-        }
-        if (committed_is_ancestor)
-            return;
-        if (!all_heads_are_ancestors)
-            return;
-        accepted_heads_.clear();
-    }
-
-    MetadataAcceptance legacy;
-    legacy.generation = committed_.generation;
-    legacy.hash = committed_.hash;
-    legacy.required = 0;
-    accepted_heads_.emplace(legacy.hash, legacy);
-    persist_heads_locked();
+    // Without a certificate a checkpoint is not authority: keep it and force
+    // peer recovery.
+    recovery_required_ = true;
+    durable_replace_file(recovery_p_, "metadata checkpoint has no durable acceptance certificate");
 }
 
 bool MetadataReplica::acceptance_matches_record_policy_locked(
     const MetadataAcceptance& acceptance, const MetadataMaterialization& materialized) const {
     const auto& record = materialized.record;
     const auto& snapshot = *materialized.snapshot;
-    if (!snapshot.metadata_write_replicas_required) {
-        // required=0 marks legacy authority; metadata_voters set the floor
-        // for leaving it but are not in the certificate.
-        if (acceptance.required != 0 || !acceptance.replicas.empty())
-            return false;
-        // A child of a write-floor parent may not revert to legacy authority.
-        for (const auto& parent_hash : metadata_record_parents(record)) {
-            auto parent = materialized_locked(parent_hash);
-            if (parent && parent->snapshot->metadata_write_replicas_required)
-                return false;
-        }
-        return true;
-    }
+    // Only genesis has no write floor, and its certificate names nobody.
+    if (!snapshot.metadata_write_replicas_required)
+        return record.hash == genesis_metadata().hash && !acceptance.required &&
+               acceptance.replicas.empty();
 
     // `required` records how many nodes held the commit at acceptance; one,
     // the author, suffices.
@@ -4309,14 +4164,10 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input, bool* heads
             return true;
     }
 
-    // Warm the cache off-lock so the locked validation below hits it. Parents
-    // are read only by the policy check of a record without a write floor.
+    // Warm the cache off-lock so the locked validation below hits it.
     auto prepared = materialized(value.hash);
     if (!prepared || prepared->record.generation != value.generation)
         return false;
-    if (!prepared->snapshot->metadata_write_replicas_required)
-        for (const auto& parent : metadata_record_parents(prepared->record))
-            (void)materialized(parent);
 
     Lock durable(durable_mutation_m_);
     // A head change rewrites the checkpoint (possibly hundreds of MB): write it

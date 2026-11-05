@@ -1,5 +1,13 @@
 # Current release
 
+## 0.93.2: legacy authority is gone
+
+A record with no write floor is accepted only as genesis on a founder; any other
+checkpoint without a certificate goes to peer recovery, as one with a floor
+always has. A policy commit changes only the data replication. The
+`current.meta`/`committed.meta` layout and `mutation-sequence.meta` are no longer
+read.
+
 ## 0.93.1: the legacy write API is gone
 
 `MetadataReplica`'s `cas`, `cas_delta`, `install_committed_delta`, `seed`,

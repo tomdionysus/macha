@@ -630,7 +630,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip
     const auto keys = load_cluster_keys(keyfile);
 
     const auto genesis = genesis_metadata();
-    const auto base = decode_snapshot(genesis.payload);
+    auto base = decode_snapshot(genesis.payload);
+    base.metadata_write_replicas_required = 1;
 
     FsEntry directory;
     directory.type = EntryType::directory;
@@ -1439,6 +1440,7 @@ MACHA_FAST_TEST("storage_metadata",
     directory.mode = 0755;
     auto make_child = [&](const MetadataRecord& parent, std::string name) {
         auto snapshot = decode_snapshot(parent.payload);
+        snapshot.metadata_write_replicas_required = 1;
         snapshot.entries[std::move(name)] = directory;
         MetadataRecord record;
         record.generation = parent.generation + 1;
@@ -1460,12 +1462,14 @@ MACHA_FAST_TEST("storage_metadata",
     // Only the committed head is cached, so reconstructing head_a reads its
     // history frame.
     MetadataReplica replica(path, keys.storage, {}, true, 1);
+    NodeId witness{};
+    witness.bytes[15] = 1;
     const auto history = path / "metadata" / "history.log";
     REQUIRE(replica.store_commit(head_a));
     const auto head_a_frame_end = std::filesystem::file_size(history);
-    REQUIRE(replica.accept_commit(MetadataAcceptance{head_a.generation, head_a.hash, 0, {}}));
+    REQUIRE(replica.accept_commit(MetadataAcceptance{head_a.generation, head_a.hash, 1, {witness}}));
     REQUIRE(replica.store_commit(head_z));
-    REQUIRE(replica.accept_commit(MetadataAcceptance{head_z.generation, head_z.hash, 0, {}}));
+    REQUIRE(replica.accept_commit(MetadataAcceptance{head_z.generation, head_z.hash, 1, {witness}}));
     REQUIRE(replica.committed().hash == head_z.hash);
     REQUIRE(replica.accepted_heads().size() == 2);
 
@@ -1475,7 +1479,7 @@ MACHA_FAST_TEST("storage_metadata",
     REQUIRE(replica.store_commit(head_b));
     bool threw = false;
     try {
-        replica.accept_commit(MetadataAcceptance{head_b.generation, head_b.hash, 0, {}});
+        replica.accept_commit(MetadataAcceptance{head_b.generation, head_b.hash, 1, {witness}});
     } catch (const std::exception& error) {
         threw = true;
         CHECK(std::string(error.what()).find("cannot be reconstructed") != std::string::npos);
@@ -1492,7 +1496,7 @@ MACHA_FAST_TEST("storage_metadata",
     REQUIRE(replica.store_commit(head_c));
     bool threw_again = false;
     try {
-        REQUIRE(replica.accept_commit(MetadataAcceptance{head_c.generation, head_c.hash, 0, {}}));
+        REQUIRE(replica.accept_commit(MetadataAcceptance{head_c.generation, head_c.hash, 1, {witness}}));
     } catch (const std::exception&) {
         threw_again = true;
     }
@@ -2065,6 +2069,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_t
     const auto path = t.path() / "mid-journal-corruption";
 
     auto snapshot = decode_snapshot(genesis.payload);
+    snapshot.metadata_write_replicas_required = 1;
     FsEntry dir;
     dir.type = EntryType::directory;
     dir.mode = 0755;
@@ -3828,6 +3833,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     auto b = random_node_id();
     auto c = random_node_id();
     snap.metadata_voters = {a, b, c};
+    snap.metadata_write_replicas_required = 1;
     snap.mutation_sequences[a] = 7;
     snap.mutation_sequences[b] = 11;
     FsEntry file;
@@ -4008,7 +4014,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     // A stored commit is not yet a head: the committed head advances on acceptance.
     REQUIRE(replica.store_commit(next));
     CHECK(replica.committed().hash == current.hash);
-    REQUIRE(replica.accept_commit({next.generation, next.hash, 0, {}}));
+    REQUIRE(replica.accept_commit({next.generation, next.hash, 1, {a}}));
     CHECK(replica.committed().hash == next.hash);
 
     MetadataReplica reopened(replica_path, keys.storage);
