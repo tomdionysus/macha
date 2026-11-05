@@ -1,5 +1,18 @@
 # Current release
 
+## 0.92.5: a stale tombstone in a batch is erased
+
+A tree-backed head keeps its tombstones in batches, immutable control
+objects the head names. A tombstone made stale by its content being written
+again was erased only from the inline list, which a tree-backed head does
+not use, so in a batch it stayed: every maintenance pass committed another
+mutation that changed nothing but its clock, and the generation churn kept
+the CONTROL and DATA collectors shut. The two nodes' recent histories held
+nothing else, about 20 commits a minute. The batch holding a
+stale tombstone is now dropped and the rest of it written again at its own
+retirement time, and a batch the erase has dropped is not dropped again as
+matured.
+
 ## 0.92.4: the stop that hung, and the second loop's defects
 
 A stop issued during the availability survey's walk of the namespace hung
