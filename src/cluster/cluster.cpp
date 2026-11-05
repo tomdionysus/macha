@@ -225,8 +225,7 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryPr
               const auto previous_generation = remote_metadata_generation_.load();
               members_.observe(peer, true);
               signal_telemetry_refresh();
-              remote_metadata_generation_.store(
-                  std::max(previous_generation, peer.metadata_generation));
+              raise_remote_metadata_generation(peer.metadata_generation);
               if (topology_changed || peer.metadata_generation > previous_generation)
                   events_.notify(topology_changed ? NodeEvent::topology
                                                         : NodeEvent::metadata);
@@ -874,7 +873,7 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
         members_.observe(std::move(node));
     }
     reader.finish();
-    remote_metadata_generation_.store(newest_metadata);
+    raise_remote_metadata_generation(newest_metadata);
 
     // Membership exchange is a heartbeat: identical gossip must not wake
     // maintenance (or keep restarting its GC quiet window). Wake only for
@@ -945,11 +944,13 @@ void NodeRuntime::refresh_telemetry() {
     if (cfg_.streaming.enabled)
         playback.transcode_rates = transcode_rates_.summary();
     telemetry_.set_node_name(cfg_.node_name);
+    // The transport's own counts, not a guess from the peer count.
+    const auto rpc = client_.stats();
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
-                             storage_backends_online, peers_known, peers_active, 0, 0,
-                             peers_active > 0 ? peers_active - 1 : 0, phase,
-                             std::move(api_endpoint), playback, cache_activity,
-                             traffic_totals());
+                             storage_backends_online, peers_known, peers_active,
+                             rpc.connections_created, rpc.connections_reused,
+                             rpc.canonical_connections, phase, std::move(api_endpoint), playback,
+                             cache_activity, traffic_totals());
 }
 
 void NodeRuntime::signal_telemetry_refresh() {
@@ -963,7 +964,8 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
     const auto interval = std::max(cfg_.telemetry_interval, std::chrono::milliseconds(250));
     // Wakes follow telemetry demand, which peer churn can raise arbitrarily.
     // Local sampling runs on every wake so phase changes publish promptly, but
-    // broadcast is limited to once a second and never faster than the cadence.
+    // broadcast is spaced by the cadence, or by one second where the cadence
+    // is longer: never faster than a configured interval under a second.
     const auto min_gossip_interval = std::min(interval, std::chrono::milliseconds(1000));
     auto last_gossip = Clock::time_point{};
     const auto gossip_ttl = std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));

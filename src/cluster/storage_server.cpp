@@ -364,12 +364,14 @@ void StorageServer::bind_routes() {
               // bytes were verified when put and on every read; scrub finds later
               // corruption. No DATA admission: there is no read buffer. Under
               // the claim guard, so no delete removes an object between its
-              // presence check and the claim.
+              // presence check and the claim; one a delete has marked is not
+              // present.
               const auto guard = claims_.guard(ids);
               for (const auto& id : ids) {
-                  const bool present = object_class == RetentionClass::data
-                                           ? local_.has(id)
-                                           : control_.has(id);
+                  const bool present = !claims_.deleting(id) &&
+                                       (object_class == RetentionClass::data
+                                            ? local_.has(id)
+                                            : control_.has(id));
                   if (!present)
                       return error_reply(409, "not_present", "retention object is not durably present");
               }
@@ -382,9 +384,9 @@ void StorageServer::bind_routes() {
               Reader reader(request.payload);
               ObjectId id{reader.fixed<32>()};
               reader.finish();
-              // The claim check and the delete under one guard.
-              const auto guard = claims_.guard(id);
-              if (claims_.retained(RetentionClass::data, id))
+              // The claim check marks the object for the delete.
+              const auto deletion = claims_.deletion(RetentionClass::data, id);
+              if (deletion.claimed())
                   return error_reply(409, "claimed", "object has an active retention claim");
               auto resource = data_resources_.try_acquire(
                   DataWorkContext(frame_type, extent_size_), extent_size_);
