@@ -413,6 +413,84 @@ MACHA_TEST("namespace_service", test_tombstones_live_in_batches_in_a_tree_backed
     CHECK(metadata.snapshot().garbage.empty());
     service.stop();
 }
+
+// A tombstone made stale by its content being written again lives in a batch
+// on a tree-backed head. Maintenance drops the batch, writes the rest of it
+// again at its own retirement time, and then has nothing to commit: the
+// generation holds still.
+MACHA_TEST("namespace_service", test_a_stale_tombstone_in_a_batch_is_erased_once) {
+    TestCluster cluster;
+    auto config = cluster.node_config("stale-batch");
+    make_solo(config);
+    const auto extent = config.extent_size;
+    const auto write = [&](FileSystem& fs, const std::string& path, const Bytes& bytes) {
+        fs.create_file(path, 0644, getuid(), getgid());
+        auto writer = fs.open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+    };
+    // Nothing matures: only staleness erases a tombstone here.
+    config.maintenance.garbage_grace = 1h;
+    Service service(config, cluster.keys(), test_durability_window);
+    service.start();
+    REQUIRE(wait_metadata_writable(service));
+    auto& fs = service.filesystem();
+    auto& metadata = service.metadata_manager();
+    REQUIRE(metadata.snapshot().namespace_root.has_value());
+
+    // One file, two extents of different content, one delete: one batch
+    // naming both.
+    auto two = pattern(extent, 31);
+    const auto second = pattern(extent, 32);
+    two.insert(two.end(), second.begin(), second.end());
+    write(fs, "/gone.bin", two);
+    const auto extents = fs.getattr("/gone.bin").extents;
+    REQUIRE(extents.size() == 2);
+    const auto revived = extents[0].id;
+    const auto other = extents[1].id;
+    REQUIRE(revived != other);
+    fs.unlink("/gone.bin");
+    const auto batches_before = metadata.snapshot().tombstone_batches;
+    REQUIRE(!batches_before.empty());
+
+    // The first extent's content is live again: its tombstone is stale.
+    write(fs, "/again.bin", pattern(extent, 31));
+    REQUIRE(fs.getattr("/again.bin").extents.front().id == revived);
+
+    const auto tombstoned = [&](const ObjectId& id) {
+        const auto objects = fs.maintenance_objects_cached();
+        return std::binary_search(objects->garbage.begin(), objects->garbage.end(),
+                                  GarbageRef{id, 0, {}},
+                                  [](const GarbageRef& a, const GarbageRef& b) {
+                                      return a.id < b.id;
+                                  });
+    };
+    REQUIRE(wait_until([&] { return !tombstoned(revived); }, 30s));
+    // The rest of the batch was written again, not lost.
+    CHECK(tombstoned(other));
+    const auto head = metadata.snapshot();
+    CHECK(head.garbage.empty());
+    CHECK(head.tombstone_batches != batches_before);
+    CHECK(encode_snapshot_v14(head).size() < 4096);
+
+    // With the stale tombstone gone the pass has nothing to say: no commit
+    // follows another for as long as it would take the defect to make several.
+    const auto generation = [&] {
+        return service.local_state().replica().committed_generation();
+    };
+    REQUIRE(wait_until([&] {
+        const auto before = generation();
+        std::this_thread::sleep_for(1s);
+        return generation() == before;
+    }, 30s));
+    const auto settled = generation();
+    std::this_thread::sleep_for(4s);
+    CHECK(generation() == settled);
+    CHECK(!tombstoned(revived));
+    CHECK(tombstoned(other));
+    service.stop();
+}
+
 // Namespace operations that arrive while a commit is in flight are committed
 // together by the next one, before and after a restart. One that cannot apply
 // fails alone and leaves the rest of its commit intact.

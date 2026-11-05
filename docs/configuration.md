@@ -712,7 +712,78 @@ catalogue:
         musicbrainz:
           enabled: true
           contact: https://example.invalid/macha
+      books:
+        roots: [/Books]
+        openlibrary:
+          enabled: true
+          contact: https://example.invalid/macha
+          cover_size: L
 ```
+
+The `books` provider runs when `books.enabled` is set (below) and its own
+block does not say `enabled: false`; it never runs without it. Make the root
+before turning it on: a configured root that does not exist makes every scan
+partial, and a partial scan prunes nothing.
+
+It catalogues `.epub`, `.pdf`, `.mobi`, `.azw`, `.azw3`, `.prc`, `.fb2` and
+`.cbz` files.
+For each it reads, in order: the file's own record (an EPUB's package, a
+MOBI or AZW3 header: title, authors, ISBN, publisher, date, description,
+cover); Calibre's `metadata.opf` beside it, for what the file lacks (often
+the series); the folders and file name; and a cover image beside it
+(`cover.jpg`, `cover.png`, `folder.jpg`, or an image named after the book)
+when the file has none. A file name `Title - Author` whose two halves are
+both folders above it is read that way round, whichever folder is the
+title (`Title/Author/` or Calibre's `Author/Title (id)/`). Open Library (no
+key; `cover_size` is `S`, `M` or `L`) is then asked by ISBN, else by title
+and author, trying both readings of a path that could be either; a book it
+does not know is catalogued from the file. Open Library is asked at most
+once a second, like MusicBrainz.
+
+An author credit is read as a reader would: `Pratchett, Terry` is Terry
+Pratchett, a comma list of full names is several authors, and `Unknown` is
+no author. A title that is only the file's internal database name is no
+title, so the folders and file name give it. Store clutter is taken off a
+file's title and names the series: `Raising Steam: (Discworld novel 40)` is
+Raising Steam in Discworld at 40. An Open Library edition's series is used
+when the file gives none and the entry says it is a series. `published` is
+a plain date when the file holds a timestamp, the nearest day to it.
+
+Each book the scanner makes records the version of these rules
+(`external_ids.macha_book_rules`). When the rules change, the scanner reads
+every book it made under older rules again and replaces it, with any author
+or series only it named; a book edited by hand is left alone.
+
+### Books
+
+```yaml
+books:
+  enabled: true
+  conversion:
+    enabled: true
+    mobitool: /usr/bin/mobitool
+    cache_path: /var/cache/macha/book-conversions   # default <state_path>/book-conversions
+    cache_limit: 10G
+    timeout_ms: 60000
+    max_concurrent: 1
+    max_source_bytes: 512M
+```
+
+`books.enabled` (default `false`) is the one switch for book support on a
+node: the books scan provider and conversion. A binary built with
+`-DMACHA_ENABLE_BOOKS=OFF` refuses it at start. Without it a node still
+reads a catalogue holding books, lists them and serves their files; it does
+not scan for them or convert them.
+
+`books.conversion` (default off, needs `books.enabled`) converts a MOBI or
+AZW3 book to EPUB on request with libmobi's `mobitool`, installed separately
+(Debian: `apt install libmobi-tools`). Each conversion runs as a child
+process at low priority, at most `max_concurrent` at once, and is killed at
+`timeout_ms` (10 s to 2 h; a novel takes well under a second). An encrypted
+book is refused. Converted copies stay on the node under
+`cache_path` until it passes `cache_limit` (at least 64M), when the least
+recently served go first. A source larger than `max_source_bytes` is
+refused. The routes are in [the catalogue](catalogue.md#conversion).
 
 `ignore_terms` (default `[sample]`) keeps files out of the catalogue: a file
 is not catalogued when a word of its path below the scanner root equals one of

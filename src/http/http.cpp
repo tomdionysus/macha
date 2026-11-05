@@ -30,6 +30,58 @@
 #include <unistd.h>
 
 namespace macha {
+
+std::optional<ByteRange> parse_range(const HttpRequest& request, uint64_t size) {
+    auto it = request.headers.find("range");
+    if (it == request.headers.end()) return ByteRange{0, size, false};
+    auto value = it->second;
+    if (!value.starts_with("bytes=") || value.find(',') != std::string::npos || !size) return {};
+    value.erase(0, 6);
+    auto dash = value.find('-');
+    if (dash == std::string::npos) return {};
+    auto left = value.substr(0, dash);
+    auto right = value.substr(dash + 1);
+    uint64_t start = 0, end = size - 1;
+    auto parse = [](const std::string& text, uint64_t& out) {
+        if (text.empty()) return false;
+        auto [finish, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
+        return ec == std::errc{} && finish == text.data() + text.size();
+    };
+    if (left.empty()) {
+        uint64_t suffix = 0;
+        if (!parse(right, suffix) || !suffix) return {};
+        if (suffix >= size) start = 0;
+        else start = size - suffix;
+    } else {
+        if (!parse(left, start) || start >= size) return {};
+        if (!right.empty() && (!parse(right, end) || end < start)) return {};
+        end = std::min(end, size - 1);
+    }
+    return ByteRange{start, end - start + 1, true};
+}
+
+HttpResponse ranged_response(
+    const HttpRequest& request, uint64_t size, std::string mime,
+    const std::function<std::shared_ptr<HttpBodySource>(uint64_t, uint64_t)>& make_body) {
+    auto range = parse_range(request, size);
+    if (!range) {
+        auto response = http_error(416, "bad_range", "requested byte range is not satisfiable");
+        response.headers["Content-Range"] = "bytes */" + std::to_string(size);
+        return response;
+    }
+    HttpResponse response;
+    response.status = range->partial ? 206 : 200;
+    response.content_type = std::move(mime);
+    response.stream = make_body(range->offset, range->length);
+    response.headers["Accept-Ranges"] = "bytes";
+    if (range->partial) {
+        response.headers["Content-Range"] = "bytes " + std::to_string(range->offset) + "-" +
+                                            std::to_string(range->offset + range->length - 1) +
+                                            "/" + std::to_string(size);
+    }
+    return response;
+}
+
 namespace {
 
 using namespace std::chrono_literals;

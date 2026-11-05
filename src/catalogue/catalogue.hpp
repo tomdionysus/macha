@@ -30,14 +30,36 @@ enum class CatalogueKind : uint8_t {
     episode = 4,
     artist = 5,
     album = 6,
-    track = 7
+    track = 7,
+    // Books, their authors and their series. None has a parent: a book
+    // names its authors and series by reference, since it may have several
+    // of each.
+    book = 8,
+    author = 9,
+    series = 10
 };
+
+// The kinds that hold files.
+bool catalogue_leaf_kind(CatalogueKind) noexcept;
+// The kinds a book refers to, kept only while some book refers to them.
+bool catalogue_referenced_kind(CatalogueKind) noexcept;
+struct CatalogueItem;
+// Whether a hand edit locked the item against the scanner.
+bool catalogue_item_locked(const CatalogueItem&) noexcept;
 
 struct CatalogueArtwork {
     std::string role;
     ObjectId id{};
     std::string mime_type;
     auto operator<=>(const CatalogueArtwork&) const = default;
+};
+
+// A book's place in one series; `index` is the book's position, fractional
+// for a novella between two numbered books.
+struct CatalogueSeriesRef {
+    std::string series_id;
+    std::optional<double> index;
+    auto operator<=>(const CatalogueSeriesRef&) const = default;
 };
 
 struct CatalogueItem {
@@ -56,9 +78,17 @@ struct CatalogueItem {
     std::map<std::string, std::string> external_ids;
     std::vector<std::string> media_ids;
     std::vector<CatalogueArtwork> artwork;
+    // A book's authors in credited order, and its series.
+    std::vector<std::string> author_ids;
+    std::vector<CatalogueSeriesRef> series;
+    std::optional<std::string> language;
+    std::optional<std::string> publisher;
+    std::optional<std::string> published;
     uint64_t revision{1};
     int64_t updated_ns{};
     auto operator<=>(const CatalogueItem&) const = default;
+    // Whether this item refers to `id` as an author or a series.
+    bool refers_to(std::string_view id) const noexcept;
 };
 
 // Current stored media-profile schema; see CatalogueSnapshot::MediaProfile.
@@ -435,8 +465,10 @@ class CatalogueManager {
     // The stored keyframe byte index; empty when none or unreadable.
     std::optional<Bytes> media_index(std::string_view media_id);
     void put_media_index(std::string media_id, std::span<const uint8_t> bytes);
+    // `refers_to` keeps the books naming that author or series.
     std::vector<CatalogueItem> list(std::optional<CatalogueKind> kind = {},
-                                    std::optional<std::string_view> parent = {});
+                                    std::optional<std::string_view> parent = {},
+                                    std::optional<std::string_view> refers_to = {});
     // `keep` filters before ranking, so `limit` counts only kept items.
     std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50,
                                       const std::function<bool(const CatalogueItem&)>& keep = {});
@@ -482,7 +514,10 @@ class CatalogueManager {
                            std::optional<Hash256> expected_namespace = std::nullopt,
                            const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {},
                            const std::set<std::string>& vanished_media = {},
-                           FrameType frame = FrameType::speculative);
+                           FrameType frame = FrameType::speculative,
+                           // Items a match replaces, each with the files it
+                           // takes from them; an item left with none goes.
+                           const std::map<std::string, std::set<std::string>>& superseded = {});
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     // The maintenance inventory's catalogue half, called in order (spec A4):
     // the head (may read the committed record when behind), then the read of

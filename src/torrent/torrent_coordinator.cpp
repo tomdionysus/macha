@@ -1064,8 +1064,11 @@ void TorrentCoordinator::pass() {
     const bool sweeper = std::none_of(active.begin(), active.end(), [&](const NodeInfo& n) { return n.id < self; });
     if (sweeper) {
         const auto grace = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(tombstone_grace).count());
+        // A removal stamped by a clock ahead of this one is fresh, not
+        // expired: the unsigned difference would wrap.
         for (const auto& [id, r] : requests)
-            if (r.removed_unix_ms && now - r.removed_unix_ms > grace) expired.push_back(id);
+            if (r.removed_unix_ms && now > r.removed_unix_ms && now - r.removed_unix_ms > grace)
+                expired.push_back(id);
     }
 
     if ((updates.empty() && expired.empty()) || !write_available()) return;

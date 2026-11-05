@@ -303,6 +303,22 @@ struct CatalogueMusicProviderConfig {
     CatalogueDiscogsConfig discogs;
 };
 
+struct CatalogueOpenLibraryConfig {
+    bool enabled{true};
+    std::string contact{"https://github.com/tomdionysus/macha"};
+    // Open Library cover sizes: S, M or L.
+    std::string cover_size{"L"};
+};
+
+// Follows books.enabled unless its own block says otherwise; never on
+// without it. A configured root that does not exist makes every scan
+// partial, and a partial scan prunes nothing.
+struct CatalogueBookProviderConfig {
+    bool enabled{false};
+    std::vector<std::string> roots{"/Books"};
+    CatalogueOpenLibraryConfig openlibrary;
+};
+
 struct CatalogueScannerConfig {
     bool enabled{};
     std::chrono::milliseconds interval{std::chrono::hours(6)};
@@ -323,6 +339,7 @@ struct CatalogueScannerConfig {
     CatalogueMovieProviderConfig movies;
     CatalogueTvProviderConfig tv;
     CatalogueMusicProviderConfig music;
+    CatalogueBookProviderConfig books;
 };
 
 struct CatalogueConfig {
@@ -358,6 +375,28 @@ struct TorrentSearchProviderConfig {
     std::string url;
     std::optional<std::filesystem::path> api_key_file;
     size_t max_results{100};
+};
+
+// Converting MOBI and AZW3 books into EPUB with libmobi's mobitool, which is
+// installed separately; nothing links it.
+struct BookConversionConfig {
+    bool enabled{false};
+    std::filesystem::path mobitool{"/usr/bin/mobitool"};
+    // Converted copies, kept on this node only. Empty means
+    // <state_path>/book-conversions.
+    std::filesystem::path cache_path;
+    uint64_t cache_limit{10ULL * 1024 * 1024 * 1024};
+    std::chrono::milliseconds timeout{std::chrono::minutes(1)};
+    size_t max_concurrent{1};
+    // The source a conversion may read; larger books are refused.
+    uint64_t max_source_bytes{512ULL * 1024 * 1024};
+};
+
+// Book support on this node: the books scan provider and conversion. A
+// build without MACHA_ENABLE_BOOKS refuses enabled: true.
+struct BooksConfig {
+    bool enabled{false};
+    BookConversionConfig conversion;
 };
 
 struct TorrentConfig {
@@ -552,8 +591,9 @@ struct Config {
     // without data backends or inbound connectivity, `yes` otherwise.
     Tristate hosts_extents{Tristate::automatic};
     StoragePackingConfig storage_packing;
-    // The held ledgers' page cache: shared by the DATA backends, the control
-    // store keeping an eighth of it.
+    // The ledgers' page cache: three eighths to the claims, a quarter to the
+    // reference counts, a sixteenth to the control store's held ledger, the
+    // rest shared by the DATA backends' (local_state.cpp, ledger_cache_share).
     uint64_t ledger_cache{64ULL * 1024 * 1024};
     MetadataObjectStoreConfig metadata_store;
     CacheConfig cache;
@@ -563,6 +603,7 @@ struct Config {
     CatalogueConfig catalogue;
     IngestConfig ingest;
     TorrentConfig torrent;
+    BooksConfig books;
     StreamingConfig streaming;
     HydrationConfig hydration;
     RuntimeConfig runtime;

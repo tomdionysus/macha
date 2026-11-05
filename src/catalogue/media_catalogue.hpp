@@ -27,9 +27,16 @@ namespace macha {
 
 class MediaInformationService;
 
-enum class MediaProbeKind { movie, episode, track };
+enum class MediaProbeKind { movie, episode, track, book };
 
 enum class MediaProbeLookupStrategy { automatic, music_release_first, music_recording_first };
+
+// A book's place in one series, as a file or a path names it.
+struct MediaProbeSeries {
+    std::string name;
+    std::optional<double> index;
+    auto operator<=>(const MediaProbeSeries&) const = default;
+};
 
 struct MediaProbe {
     MediaProbeKind kind{MediaProbeKind::movie};
@@ -54,6 +61,17 @@ struct MediaProbe {
     std::optional<std::string> tmdb_id;
     std::string track_artist;
     std::string album_artist;
+    // A book's: its authors in credited order, its series, and what its
+    // file says about itself.
+    std::vector<std::string> authors;
+    std::vector<MediaProbeSeries> book_series;
+    std::optional<std::string> isbn;
+    std::optional<std::string> language;
+    std::optional<std::string> publisher;
+    std::optional<std::string> published;
+    std::string description;
+    std::optional<std::string> openlibrary_edition_id;
+    std::optional<std::string> openlibrary_work_id;
     MediaProbeLookupStrategy lookup_strategy{MediaProbeLookupStrategy::automatic};
 };
 
@@ -162,18 +180,19 @@ struct ProviderRequestError : std::runtime_error {
 ProviderRequestError provider_unavailable(std::string_view provider, std::string_view reason);
 ProviderRequestError provider_unavailable(std::string_view provider, const std::exception& error);
 
-// MusicBrainz allows one request a second per client: every MusicBrainzProvider
-// on a node shares this gate and its backoff. After a failure or a rate-limit
-// answer the gate backs off for the Retry-After MusicBrainz gives, else for
-// `backoff_first`, doubling to `backoff_max`; a success resets it.
-struct MusicBrainzGate {
+// A provider that allows one request a second per client (MusicBrainz, Open
+// Library): every provider instance of that service on a node shares one gate
+// and its backoff. After a failure or a rate-limit answer the gate backs off
+// for the Retry-After the service gives, else for `backoff_first`, doubling
+// to `backoff_max`; a success resets it.
+struct ProviderGate {
     // The least time between two requests.
     const std::chrono::steady_clock::duration interval;
     static constexpr std::chrono::seconds backoff_first{2};
     static constexpr std::chrono::seconds backoff_max{60};
-    explicit MusicBrainzGate(std::chrono::steady_clock::duration interval = std::chrono::seconds(1))
+    explicit ProviderGate(std::chrono::steady_clock::duration interval = std::chrono::seconds(1))
         : interval(interval) {}
-    // Held across the pacing sleep and the MusicBrainz HTTP request.
+    // Held across the pacing sleep and the HTTP request.
     IoMutex mutex;
     std::chrono::steady_clock::time_point last_request MACHA_GUARDED_BY(mutex){};
     std::chrono::steady_clock::time_point unavailable_until MACHA_GUARDED_BY(mutex){};
@@ -202,10 +221,10 @@ struct ArtworkOption {
 
 // A metadata editor's search of one provider.
 struct ProviderSearchQuery {
-    std::string kind; // movie, show, album
+    std::string kind; // movie, show, album, book
     std::string text;
     std::optional<int32_t> year;
-    std::string artist; // albums: narrows to releases credited to this artist
+    std::string artist; // albums: narrows to releases credited to this artist; books: the author
     size_t limit{10};
 };
 
@@ -217,7 +236,7 @@ struct ProviderSearchResult {
     std::string title;
     std::optional<int32_t> year;
     std::string overview;
-    std::string artist;       // albums
+    std::string artist;       // albums; books: the first author
     std::string catalogue_id; // the id a match gives the item
 };
 
@@ -291,7 +310,7 @@ class MusicBrainzProvider final : public MetadataProvider {
     // A release's Cover Art Archive listing; empty for a release with no art.
     std::map<std::string, std::optional<Json>> cover_art_cache_;
     size_t cache_bytes_{};
-    std::shared_ptr<MusicBrainzGate> gate_;
+    std::shared_ptr<ProviderGate> gate_;
     bool interactive_{};
 
     Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
@@ -309,7 +328,7 @@ class MusicBrainzProvider final : public MetadataProvider {
     // background one is refused at once.
     static constexpr std::chrono::seconds interactive_wait_max{5};
     MusicBrainzProvider(HttpClient&, CatalogueMusicBrainzConfig,
-                        std::shared_ptr<MusicBrainzGate> gate = {}, bool interactive = false);
+                        std::shared_ptr<ProviderGate> gate = {}, bool interactive = false);
     std::string_view name() const noexcept override { return "musicbrainz"; }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
@@ -349,11 +368,79 @@ class DiscogsProvider final : public MetadataProvider {
     size_t cache_bytes() const noexcept { return cache_bytes_; }
 };
 
+// The version of the rules the scanner catalogues a book by, stamped on each
+// book as external_ids.macha_book_rules: a scanner book stamped otherwise (or
+// not at all) is read again from its file and replaced.
+inline constexpr std::string_view catalogue_book_rules = "3";
+
+#if MACHA_HAVE_BOOKS
+// The names a book's author credit lists, given name first, placeholders dropped.
+std::vector<std::string> split_authors(std::string_view value);
+// A file's title without a store's series clutter, and the series it names.
+std::pair<std::string, std::vector<MediaProbeSeries>> book_title_series(std::string title);
+// A publication date as YYYY-MM-DD when it is a timestamp; otherwise as given.
+std::string book_date(std::string value);
+// An Open Library series entry that says it is a series.
+std::optional<MediaProbeSeries> openlibrary_series(std::string_view value);
+#endif
+
+#if MACHA_HAVE_BOOKS
+// Open Library, for books: no key, one request a second, covers by cover id.
+class OpenLibraryProvider final : public MetadataProvider {
+    HttpClient& http_;
+    CatalogueOpenLibraryConfig config_;
+    std::map<std::string, std::optional<Json>> edition_cache_;
+    std::map<std::string, std::optional<Json>> work_cache_;
+    std::map<std::string, std::optional<Json>> author_cache_;
+    std::map<std::string, std::optional<Json>> search_cache_;
+    size_t cache_bytes_{};
+    std::shared_ptr<ProviderGate> gate_;
+    bool interactive_{};
+
+    Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
+    // None for a record Open Library has not got.
+    std::optional<Json> api_optional(std::string_view path,
+                                     const std::vector<std::pair<std::string, std::string>>& query = {});
+    std::optional<Json> edition_by_isbn(std::string_view isbn);
+    std::optional<Json> edition_by_id(std::string_view olid);
+    std::optional<Json> work_by_id(std::string_view olid);
+    std::optional<Json> author_by_id(std::string_view olid);
+    std::optional<Json> search_books(const MediaProbe&);
+    std::string cover_url(std::string_view cover_id) const;
+
+  public:
+    static constexpr std::chrono::seconds interactive_wait_max{5};
+    OpenLibraryProvider(HttpClient&, CatalogueOpenLibraryConfig,
+                        std::shared_ptr<ProviderGate> gate = {}, bool interactive = false);
+    std::string_view name() const noexcept override { return "openlibrary"; }
+    bool supports(MediaProbeKind) const override;
+    std::optional<ProviderMatch> lookup(const MediaProbe&) override;
+    std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) override;
+    std::vector<ArtworkOption> artwork_options(std::string_view kind, std::string_view id,
+                                               std::string_view role,
+                                               const ProviderRefNumbers& numbers) override;
+    size_t cache_entries() const noexcept {
+        return edition_cache_.size() + work_cache_.size() + author_cache_.size() +
+               search_cache_.size();
+    }
+    size_t cache_bytes() const noexcept { return cache_bytes_; }
+};
+
+// The catalogue items a book probe describes on its own: the book, its
+// authors and its series, with ids from the ISBN or the normalised names so
+// files scanned on any node meet at the same items. The probe must have a
+// title and an author.
+std::optional<ProviderMatch> book_match_from_probe(const MediaProbe&);
+
+#endif
+
 class CatalogueScanProvider {
   public:
     virtual ~CatalogueScanProvider() = default;
     virtual std::string_view name() const noexcept = 0;
     virtual const std::vector<std::string>& roots() const noexcept = 0;
+    // Whether this provider's files have playback profiles to build.
+    virtual bool profiles_media() const noexcept { return true; }
     // Cheap discovery predicate: never reads media; probing is hint processing.
     virtual bool accepts_path(std::string_view path) const noexcept = 0;
     virtual MediaProbeFile probe_file(FileSystem&, std::string_view root,
@@ -419,7 +506,7 @@ class MusicScanProvider final : public CatalogueScanProvider {
   public:
     MusicScanProvider(HttpClient&, CatalogueMusicProviderConfig,
                       size_t max_artwork_bytes = 16 * 1024 * 1024,
-                      std::shared_ptr<MusicBrainzGate> musicbrainz_gate = {},
+                      std::shared_ptr<ProviderGate> musicbrainz_gate = {},
                       bool interactive = false);
     std::string_view name() const noexcept override { return "music"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
@@ -429,6 +516,32 @@ class MusicScanProvider final : public CatalogueScanProvider {
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override;
     MetadataProvider* metadata(std::string_view provider) noexcept override;
 };
+
+#if MACHA_HAVE_BOOKS
+// Books under their roots: an EPUB's own metadata first, then the path, then
+// Open Library; a book the provider cannot find is catalogued from the file.
+class BookScanProvider final : public CatalogueScanProvider {
+    std::vector<std::string> roots_;
+    std::unique_ptr<OpenLibraryProvider> metadata_;
+    size_t max_artwork_bytes_{};
+
+  public:
+    BookScanProvider(HttpClient&, CatalogueBookProviderConfig,
+                     size_t max_artwork_bytes = 16 * 1024 * 1024,
+                     std::shared_ptr<ProviderGate> openlibrary_gate = {}, bool interactive = false);
+    std::string_view name() const noexcept override { return "books"; }
+    const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    bool profiles_media() const noexcept override { return false; }
+    bool accepts_path(std::string_view path) const noexcept override;
+    MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
+                              const FsEntry&) override;
+    std::optional<ProviderMatch> lookup(const MediaProbe& probe) override;
+    MetadataProvider* metadata(std::string_view provider) noexcept override {
+        return metadata_ && provider == metadata_->name() ? metadata_.get() : nullptr;
+    }
+};
+
+#endif
 
 struct ProviderRefMatch {
     std::string leaf_id;
@@ -488,7 +601,8 @@ class CatalogueScanner {
     EditorSeat& editor_seat(std::string_view record) noexcept {
         return editor_seats_[std::hash<std::string_view>{}(record) % editor_seats];
     }
-    std::shared_ptr<MusicBrainzGate> musicbrainz_gate_{std::make_shared<MusicBrainzGate>()};
+    std::shared_ptr<ProviderGate> musicbrainz_gate_{std::make_shared<ProviderGate>()};
+    std::shared_ptr<ProviderGate> openlibrary_gate_{std::make_shared<ProviderGate>()};
     std::atomic_bool rescan_requested_{};
     // Owned by the instantiator's thread (start/stop/reconfigure).
     std::jthread worker_;
@@ -508,6 +622,8 @@ class CatalogueScanner {
         std::string result;
         unsigned attempts{};
         std::optional<MediaProbeResult> media_profile;
+        // Scanner books under older book rules that this match replaces.
+        std::vector<std::string> superseded;
     };
     struct HintBatchResult {
         size_t claimed{};

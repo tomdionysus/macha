@@ -84,11 +84,6 @@ bool webvtt_subtitle_supported(const MediaStreamInfo& stream) {
            webvtt_subtitle_codec_supported(stream.codec);
 }
 
-struct ByteRange {
-    uint64_t offset{};
-    uint64_t length{};
-    bool partial{};
-};
 
 // A well-formed instruction this node cannot carry out (a stream copy into a
 // container that cannot hold the codec). Another node may accept it, so it
@@ -222,51 +217,6 @@ PlaybackStageError stage_error(std::string trace, std::string stage, const std::
     return PlaybackStageError(std::move(trace), std::move(stage), error.what());
 }
 
-std::optional<ByteRange> parse_range(const HttpRequest& request, uint64_t size) {
-    auto it = request.headers.find("range");
-    if (it == request.headers.end()) return ByteRange{0, size, false};
-    auto value = it->second;
-    if (!value.starts_with("bytes=") || value.find(',') != std::string::npos || !size) return {};
-    value.erase(0, 6);
-    auto dash = value.find('-');
-    if (dash == std::string::npos) return {};
-    auto left = value.substr(0, dash);
-    auto right = value.substr(dash + 1);
-    uint64_t start = 0, end = size - 1;
-    auto parse = [](const std::string& text, uint64_t& out) {
-        if (text.empty()) return false;
-        auto [finish, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
-        return ec == std::errc{} && finish == text.data() + text.size();
-    };
-    if (left.empty()) {
-        uint64_t suffix = 0;
-        if (!parse(right, suffix) || !suffix) return {};
-        if (suffix >= size) start = 0;
-        else start = size - suffix;
-    } else {
-        if (!parse(left, start) || start >= size) return {};
-        if (!right.empty() && (!parse(right, end) || end < start)) return {};
-        end = std::min(end, size - 1);
-    }
-    return ByteRange{start, end - start + 1, true};
-}
-
-class LogicalBody final : public HttpBodySource {
-    std::shared_ptr<ReadHandle> handle_;
-    uint64_t base_{};
-    uint64_t size_{};
-  public:
-    LogicalBody(std::shared_ptr<ReadHandle> handle, uint64_t base, uint64_t size)
-        : handle_(std::move(handle)), base_(base), size_(size) {}
-    uint64_t size() const override { return size_; }
-    size_t read(uint64_t offset, std::span<uint8_t> destination) override {
-        if (offset >= size_) return 0;
-        auto wanted = static_cast<size_t>(std::min<uint64_t>(destination.size(), size_ - offset));
-        return handle_->read(base_ + offset, destination.first(wanted));
-    }
-};
-
-
 class LogicalMediaInput final : public MediaInput {
     std::shared_ptr<ReadHandle> handle_;
     uint64_t size_{};
@@ -299,27 +249,6 @@ class MemoryBody final : public HttpBodySource {
     // Resident for the body's lifetime, so the server sends straight from it.
     const uint8_t* resident() const noexcept override { return bytes_->data() + base_; }
 };
-
-HttpResponse ranged_response(const HttpRequest& request, uint64_t size, std::string mime,
-                             std::function<std::shared_ptr<HttpBodySource>(uint64_t, uint64_t)> make_body) {
-    auto range = parse_range(request, size);
-    if (!range) {
-        auto response = http_error(416, "bad_range", "requested byte range is not satisfiable");
-        response.headers["Content-Range"] = "bytes */" + std::to_string(size);
-        return response;
-    }
-    HttpResponse response;
-    response.status = range->partial ? 206 : 200;
-    response.content_type = std::move(mime);
-    response.stream = make_body(range->offset, range->length);
-    response.headers["Accept-Ranges"] = "bytes";
-    if (range->partial) {
-        response.headers["Content-Range"] = "bytes " + std::to_string(range->offset) + "-" +
-                                            std::to_string(range->offset + range->length - 1) + "/" +
-                                            std::to_string(size);
-    }
-    return response;
-}
 
 struct PlaybackPreferences {
     // Required; the server never chooses: "direct" (source over byte ranges),
@@ -2595,7 +2524,12 @@ struct PlaybackManager::Impl {
             return ranged_response(request, session->source_entry.size,
                                    source_mime(session->probe, session->source.logical_path),
                                    [this, path = session->source.logical_path, entry = session->source_entry](uint64_t offset, uint64_t length) {
-                                       return std::make_shared<LogicalBody>(fs.open_read(entry, path, false, FrameType::foreground), offset, length);
+                                       auto handle = fs.open_read(entry, path, false, FrameType::foreground);
+                                       return std::make_shared<ReaderBody>(
+                                           [handle](uint64_t at, std::span<uint8_t> into) {
+                                               return handle->read(at, into);
+                                           },
+                                           offset, length);
                                    });
         }
         auto slash3 = rest.find('/');
@@ -2986,7 +2920,9 @@ struct PlaybackManager::Impl {
                     ++start_workers;
                 }
                 try {
-                    std::thread([this, session, start, trace] { run_start(session, start, trace); }).detach();
+                    std::thread([this, session, start, trace] {
+                        run_supervised_once("playback-start", [&] { run_start(session, start, trace); });
+                    }).detach();
                 } catch (...) {
                     Lock lock(mutex);
                     sessions.erase(session->id);
@@ -3302,7 +3238,10 @@ struct PlaybackManager::Impl {
                 ++start_workers;
             }
             try {
-                std::thread([this, old, pending, trace] { run_replacement(old, pending, trace); }).detach();
+                std::thread([this, old, pending, trace] {
+                    run_supervised_once("playback-replacement",
+                                        [&] { run_replacement(old, pending, trace); });
+                }).detach();
             } catch (...) {
                 {
                     Lock lock(mutex);

@@ -1,233 +1,193 @@
 # Active tasks
 
-Last updated: 2026-10-14, on `develop`. fi-1 runs 0.91.0; gbni-1 is out of
-the cluster (compromised 2026-10-13, last ran 0.90.93; ssh refuses the key).
+Last updated: 2026-11-05 evening, on `develop`, checked against the code and the
+running nodes, not against earlier notes. **State a branch's content from its diff
+and a node's state from its files, never from a prior note** (operator, on this
+file's drift: "We can't afford drift like this."). The version before the morning's
+rationalisation is `archive/2026-11-05-ACTIVE-before-rationalisation.md`.
+Alongside this file: `BACKLOG.md` (everything else, by area), `COMPLETED.md`,
+`CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
 
-## Macha should be reloadable (operator, 2026-11-03)
+## Resume here
 
-- **Every setting reloads.** SIGHUP refuses `dht.replicas` and
-  `dht.metadata_write_copies` ("changes require a restart"), and other keys
-  (spool and journal paths, torrent listen address, API listen) apply only
-  on restart. A config change must apply by reload. The systemd unit has
-  no `ExecReload`, so `systemctl reload macha` fails; add one that sends
-  HUP.
-- **Disagreeing policy must not loop.** With `dht.replicas` 1 on macnessa
-  and 2 on inverbeg, each node committed its own value back ~150 times a
-  minute (`metadata policy transition committed`, 760 commits in 5 min)
-  until both configs matched. Policy disagreement needs one answer that
-  every node accepts, not a commit war.
+**Live.** macnessa (root@10.44.1.50, builds in `/home/tom/macha`) and inverbeg
+(root@inverbeg.macha.network) run **0.92.5**, one cluster, under `/usr/local`, installed
+2026-11-05 14:52Z and 14:54Z. Develop, main and tag 0.92.5 (808fa0f) are pushed.
 
-## Paused at 0.91.0 (2026-10-14): resume here
+**0.92.5 is proven on the nodes.** Before: every recent delta a 61-byte empty DLT5,
+about 20 commits a minute. After: generation 130,059 held still for 180 s on both, same
+head, whose last commit is one DLT11 with `batches+=1 batches-=2`, the fix doing its
+work once. Gate 747, 20 and 21. Not measured: whether the collectors now run. The 0.92.4
+stop took 3 s on macnessa, 4 s on inverbeg.
 
-Operator: at least two nodes are needed to continue development; work
-pauses for a few weeks. Macha works as a single-node system.
+**Next, in the operator's order (2026-11-05):**
+1. **Remove the old code, "right now, before anything else"**: both nodes are confirmed on
+   Merkle. Plan at the end of the rulings below.
+2. **0.92.6**, all in one release (rulings below).
+3. **Pi baselines** on the result, with the version recorded.
+4. The libraries finish their work on that baseline.
+5. **The independent review**, which is the gate for lifting the freeze.
 
-- **State.** `main` and `develop` are both at 0.91.0, tagged `0.91.0`.
-  fi-1 runs it alone: referenced 1,011,452, held 353,662, the rest
-  unavailable (held only by gbni-1, out of reach). The survey is by trie
-  diff only (0.90.96); a node's holdings are the union of its disks' tries
-  (0.90.95); unreachable means unavailable (0.90.94, operator ruling).
-- **Proven alone.** Serving, ingest, scanning, writes, deletes, collection,
-  the survey and the path table, restart and recovery after a power cut
-  (twice on 2026-10-14, unattended).
-- **Not provable alone.** Repair by diff (built; last measured on two nodes
-  at 0.90.76), metadata reconciliation and rejoin, the diff against a real
-  peer (tested in-process only since 0.90.94).
-- **First when a second node is back.** (1) Bring it to 0.91.0 before its
-  first start if it is gbni-1 rebuilt or es-1 (section 2, "Bringing es-1
-  back": back up state first, the 0.57-era config is refused). (2) Watch
-  the first survey against it: `method=diff peers=1 peers_failed=0`, and
-  `availability diff done` with its question count. (3) Watch repair pull
-  from the list (`pull_examined` moving, no `have_valid_objects` traffic
-  where a diff gave the answer). (4) Then section 2's stage 5 repair half.
-- **Waiting on the operator.** The offline-disk `unknown` question
-  (section 8); section 8's other items.
-- **Watch on fi-1 meanwhile.** Power: 24 undervoltage warnings in the first
-  8 minutes after the 16:15Z boot, both reboots on 2026-10-14 unexplained
-  (no persistent journal). A powered USB hub or a stronger supply needs
-  someone on site.
+## The port to Dannan and Dagda
 
-The ordered list of open work; work top to bottom unless new evidence
-changes the order. Alongside it: `BACKLOG.md` (everything else still to do,
-by area), `COMPLETED.md` (finished work), `CLIENT-CONTRACTS.md` (what the
-client sessions depend on) and `archive/` (past plans, evidence and
-handovers; a record, not requirements). Rationalised on 2026-10-12 after
-the three-answer repair work (0.90.88 to 0.90.93); the version before is
-`archive/2026-10-12-ACTIVE-before-rationalisation.md`. Items marked
-*carried* come from earlier rationalisations and have not been re-checked
-since.
+Evaluation: [`2026-11-04-dannan-dagda-port-evaluation.md`](2026-11-04-dannan-dagda-port-evaluation.md),
+kept current. Rulings so far (memory `project-port-rulings`): two cutovers,
+transport first then the disk, with a soak between; a Macha case may be retired
+against a named library case, recorded case by case; reverse migration built
+but not a gate; torrent bytes stay pinned in Macha's tests; Dannan's respec
+confirmed, Pi and real IGD work held.
 
-## Dannan extraction (2026-11-03)
+- **Dannan** planned on cac5998: `../dannan/TODO/ACTIVE.md` "The first cutover",
+  `2026-11-05-first-cutover.md`, `2026-11-05-macha-test-mapping.md`. Branch
+  `feature/macha-parity`, unpushed, steps 1 and 2 of 11 done, at step 3 when the
+  operator says continue. 0.92.5 touches nothing in its layer. Proposing a generic class
+  admission in `dannan::sched`, ledger first, then Dagda; Macha's view sent (the
+  `io_pressure` group is the gate; Macha's own arbiter stays Macha's).
+- **Dagda** planned on cac5998: `../dagda/TODO/ACTIVE.md`,
+  `2026-11-05-second-cutover.md`, `2026-11-05-test-mapping.md` (786 cases),
+  `2026-11-05-heads-plan.md`. Local on develop, unpushed. It took 0.92.4's shapes and
+  three differences of its own (question 1). Told to build heads against cac5998, not
+  to wait on `feature/tree-native-namespace`: that is Macha's finding under the freeze,
+  not a ruling (Open work 2).
+- **Macha's code is frozen until the review passes (operator, 2026-11-05):**
+  "Macha has a working, tested codebase, this shouldn't be modified until they're
+  ready." Exceptions: 0.92.5 (deployed), the old-code removal and 0.92.6; each moves
+  the libraries' baseline, and they are told at each commit. Artefacts for their
+  plans are fine, changing no tracked file, under `build/macha-fixtures/`, each with a
+  README: `placement/`; `goldens/` (Status 381 of 494 keys by name, journal 31 of 83
+  lines, 46 config fields, routes read from source); `state-scratch/` (inline, **not the
+  live form**); `membership-tombstone/`; `state-macnessa/` (three roster files, read-only
+  off the running node, approved through Dannan). `gen/` holds the generators.
+- **Pi baselines**: Macha's, later, at his word, with the deployed version.
 
-Dannan (the network layer) and Dagda (the store) are being extracted from
-this tree. The plan, the seams, the function inventory and Tom's decisions
-live in `../dannan/TODO/` (`ACTIVE.md` there first, then the extraction
-proposal). Each seam is one session on a `feature/` branch off `develop`,
-gated by the three suites here and the seam gate there, recorded in
-`../dannan/TODO/COMPLETED.md`. The baseline is `0.91.2` at `6c7ec64`. The
-first seam rewrites `cluster/net.cpp` on Boost.Asio with every transport
-behaviour kept and protocol 23 byte for byte; the seams that follow move
-no byte on disk or on the wire. The pause on Macha's own development
-stands; extraction proceeds on the laptop (Tom, 2026-11-03), with fi-1 as
-the deploy gate when convenient. Nothing below this section is changed by
-it.
+## Rulings, 2026-11-05 (the operator, asked one by one; "via Dagda" = reported by it)
 
-State (2026-11-03): the laptop is on MacPorts (`build-macports`; the
-configure line is in `../dannan/TODO/COMPLETED.md`), and the 0.91.2
-laptop gate is 661 + 19 + 21. `feature/dannan-transport-proofs`
-(uncommitted) adds 21 transport cases to `tests/test_rpc_cluster.cpp`,
-gate 682 + 19 + 21. Found there and waiting on Tom: a burst of more than
-256 replies on one connection drops the excess unanswered
-(`RpcServer::execute`, `net.cpp:4384`); and
-`availability/test_a_disk_coming_back_is_surveyed_without_a_namespace_change`
-is flaky on macOS at the baseline (1 in 5).
+- **The ready gate**: "When we have done another independent review and are satisfied that
+  Macha can migrate to use Dannan and Dagda with no loss of functionality, performance,
+  reliabiliy, or data." Run by fresh agents from the code and the nodes only, no notes or
+  plans, once old-code removal, 0.92.6, the baselines and the libraries' work are done.
+- **Old code**: "This should be done right now, before anything else."
+- **0.92.6, one release, freeze exceptions**: `survey_by_diff` rethrows the stop; deletion marks a
+  multiset; `not_held`'s `others` loop pauses; the inventory walk gets a stop check; a read
+  failing on I/O keeps the object, only a record that reads and fails to open is removed
+  (`storage_pool.cpp:603` and kin); no storage online reads ready but degraded, so a node does not
+  crash-loop on its startup timeout (via Dagda); the `followed` path table fix; `query()`
+  and its predicates retired as dead code (via Dagda). Dagda matches these shapes.
+- **Design defects** (torrent merge associativity, no fence under a torrent claim, the local barrier's
+  deadline, the sweep's mixed ages, the policy loop, O(state) per delta, wire-sized allocations, reload
+  and `write_copies`, I/O and free-space reserves): left. "leave them, we need to get on with this."
+  He had understood they were in 0.92.6; they are not, and are not fixed.
+- **Staging**: stages, as many stops as needed, no flag-day worry ("its availability isn't critical",
+  via Dagda). No soak between cutovers ("None"); a stage moves on when its tests pass. inverbeg comes
+  back first. Disk does not wait for heads. Stage one: store, reachability provider, lease template,
+  Macha's loop running. Later: heads, metadata migrated on disk at 8c, Dagda's loop.
+- **Heads** build against the frozen code as it runs, and keep "an unchanged mutation commits" and the
+  no-dot policy commit as Macha's for now (via Dagda).
+- **Maintenance loop**: Macha's until 8c, then Dagda's.
+- **Keys**: Dagda may hold a copy of the cluster key for tests, out of any repo. Custody from a systemd
+  credential; one state directory, Macha's `state_path` (via Dagda).
+- **Dannan**: A every call names its deadline; B the Status byte change accepted, its loops take Macha's
+  names; C a per-pool thread CPU reporter; D per-account limits stay Macha's, and every Macha budget in
+  its layer must be representable in Dannan (its step 8). Generic class admission in `dannan::sched`
+  is **required first**, before stage one, gated by every existing case on both sides.
+- **Real migration on a copy, there and back, and the inverbeg rehearsal: dropped for now**: "No drop
+  that, I'll decide later." (This overrides what Dagda reported.)
+- **Baselines**: Macha's, after old-code removal and 0.92.6. **macnessa's drive**: no extended test.
+- **Older items**: parked in `BACKLOG.md`. Unused branches deleted.
 
-## 1. Next, then failing tests and defects
+**Removal plan.** The condition the operator set is met: both nodes' heads are tree-backed (Cluster state), checked
+   with Macha's own decoder, and the only inline records anywhere are genesis
+   (generation 1, in every cluster) and the `*.pre-migration.*` archives. In
+   order, each a release with its tests rewritten: (a) found a namespace as a tree
+   at its first commit and require the namespace store (b080c38's 623c202), after
+   which no new cluster is ever inline; (b) remove `mutate()`, the migration tool,
+   `install_migrated_head` and `plan_namespace_migration` (5f6101c, 8fc5a68), and
+   delete the archives on the nodes; (c) make genesis a fixed tree-backed or
+   constant record so no founder decodes an inline snapshot (not in the branch),
+   then remove `encode_snapshot`, the SM5 to SM13, SM15 and SM18 decoders, the
+   mixed branch of `read_group` (`metadata_manager.cpp:1214`), `metadata_delta`'s
+   map diff and the inline-tombstone path of `maintain_tombstone_batches`; (d)
+   remove legacy authority: `required == 0` certificates, `migrate_legacy_head_locked`'s
+   legacy branch, `acceptance_matches_record_policy_locked`'s legacy clause,
+   `accept_pristine_genesis_authority_` and the `current.meta`/`committed.meta`
+   layout reader (`metadata.cpp:2412`), none of which has a live instance (both
+   certificates are `required=1`; no protocol-20 node exists). The legacy clock
+   (SM17, DLT10) is a live feature, not old code. Dagda counts 45 of the 69
+   `test_storage_metadata` cases as using a legacy form: that is the cost of (c)
+   and (d).
 
-A failing test is P0: reproduce it before deciding whose it is.
+## Open work, in order
 
-- **gbni-1 compromised (2026-10-13)**: out of the cluster since 11:28Z; its
-  sshd now offers only passwords. Operator's to handle: its VPN identity,
-  Macha account passwords (it held every hash), whether it rejoins. No
-  blocking on fi-1 (operator: unreachable is unavailable).
-- **`rpc_cluster/test_two_node_mutual_bootstrap_metadata_write_floor`**:
-  failed in full runs on 2026-10-05 and 2026-10-07; 24 of 24 under
-  `--repeat`. A first write while two nodes form a set is refused
-  (`waiting for bootstrap checkpoint survey`) when the peer's answer is late,
-  and the test treats the refusal as fatal. Needs the operator's call
-  (section 8).
-- **`availability/test_two_nodes_survey_what_neither_holds`** exceeds its
-  20 s wait under heavy laptop load (3.4 s alone). The survey it tests is
-  retired at section 2's stage 5; fix only if it fails on fi-1.
-- **gbni-1's memory through a multi-file import** on 0.90.34's bounded owed
-  queue: now measurable by part (the `memory_*` gauges, 0.90.69).
-- **gbni-1 heap corruption**, three times. An ASan 0.84.0 build and
-  `/root/claude-missing-extent-driver.py` are staged on fi-1, not run.
-  *Carried.*
-- **Test failures**, each P0 when it recurs: *carried*
-  `filesystem_fuse/test_fuse_recovery_thousand_operations_have_bounded_publications`,
-  `storage_v18/test_has_is_a_cheap_presence_check_not_a_decrypt`,
-  `filesystem_fuse/test_coalesced_delete_burst_wakes_at_exact_garbage_grace`,
-  `rpc_cluster/test_metadata_history_checkpoint_concurrent_proposers_converge`,
-  `users/test_a_node_that_was_down_learns_a_deletion_not_a_resurrection`,
-  `rpc_cluster/test_rpc_slow_control_does_not_abort_data`,
-  `test_write_data_work_context_preserves_loader_provenance`,
-  `rpc_cluster/test_inbound_incapable_node_is_reached_only_over_its_own_sessions`,
-  the pacing check in
-  `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
-  under debug logging, `users/test_accounts_converge_across_nodes` (a
-  sign-in over 2 s under a loaded laptop; a busy slot now answers
-  `try_later`), and
-  `rpc_cluster/test_rpc_metadata_executor_cancellation_disconnect_and_shutdown`
-  (laptop, 2026-10-12, `exit=1` with no assertion printed, in a three-test
-  group; passed alone and in the group after).
-- **The macOS torrent segfaults are the laptop's libraries, not Macha**
-  (2026-10-12): the test executable's MacPorts boost.asio (1.91) exports a
-  weak `service_registry::create<kqueue_reactor>` that dyld binds into
-  Homebrew's libtorrent (2.1.1). Fix: one Boost and libtorrent from one
-  package manager on the laptop (the operator's machine; not changed).
-  Operator 2026-10-12: ignore these on the MacBook only; anywhere else P0.
-- **fi-1's speculative DATA waits abandoned** (2026-10-12 14:04Z to 14:07Z,
-  after the power cut; `lower_active=2/2`, during the cold rescan): not
-  reproduced on 0.90.91 by an unclean stop with the page cache dropped (a
-  7.3 min cold rescan, sampled every 10 s: slots never both held). The
-  likeliest holder was 0.90.86's pull putting through the rescan, which no
-  longer happens. Reopen on the next `credit wait abandoned`.
-- **Watched**: the merge rule and reconciler (the only standing conflicts
-  are the seven from before 0.89.0; a `metadata merge recorded a conflict`
-  WARN reopens it with the key); `RPC stalled (control)` (last 2026-10-11,
-  on fi-1's link to gbni-1; none since).
-- **fi-1, 2026-09-29**: a playback `PATCH` 503 after 19.9 s under software
-  transcode, and a `FUSE mount disappeared` ERROR during a restart. *Carried.*
+00. **macnessa's diskB left the USB bus 2026-11-05 10:16:26Z**, under undervoltage;
+   macha stopped cleanly. Back and serving from about 11:56Z after a physical knock;
+   ext4 journal replayed on mount. Operator: cease the investigation. SMART at that
+   point: no reallocated, pending or uncorrectable sectors, no logged errors. Short
+   self-test unfinished when dropped, extended never run; the drive has no shock
+   attribute, so this says little about the knock. Reports about 41,000 spindle hours
+   against 13,426 power-on hours. `smartmontools` and `smartd` now on macnessa.
+   **Open defect, read not reproduced:** `storage_pool.cpp:603` deletes an object on any
+   read exception, so a read failing on I/O deletes a good object. It fired once at the
+   failure (`0ec5f3a8...`). In 0.92.6.
+0. **P0: macnessa SIGSEGV, 2026-11-05 02:05:25Z, on 0.92.4, cause unknown.** 25 min
+   after the deploy; the first SIGSEGV of this boot (up since 11-03 23:27, every
+   earlier exit a stop or SIGKILL). No core (soft limit 0, pattern `core`), no kernel
+   line, no warning in the journal; ingest and a catalogue scan were running, and the
+   rail was in an undervoltage interval, as it often is. Restarted by systemd, writable
+   in 35 s, 6 FUSE operations recovered. Core capture is on, both nodes, since 02:22Z:
+   cores in `/mnt/diskB/crash` (mode 700; they hold keys and plaintext), set by
+   `/etc/sysctl.d/90-macha-core.conf` and `macha.service.d/core-dumps.conf`; proven
+   with a throwaway process. Read one against the tarball of the version that crashed, in `/root`.
+1. **P0: the stop.** Fixed in 0.92.4 for the survey: macnessa on 0.92.3 hung at
+   01:38:29Z, killed at 60 s, in `fill_path_table`; on 0.92.4 a stop 20 s after writable
+   took 6 s. One stop, not shown to have landed in a walk; no test of its own. The FUSE mount's
+   minute after start is recovery, not a defect (data ready +17 s, metadata +35
+   to +40 s at generation 100k, FUSE +42 s).
+2. **`feature/tree-native-namespace`** (b080c38, 4 WIP commits on 5a06d3c, unmerged,
+   the first part of the old-code removal). From its diff: founds a new namespace as a
+   tree at its first commit (develop founds inline, and only `macha-namespace-migrate`
+   makes a tree); removes `mutate()`, the migration tool, `install_migrated_head` and
+   `plan_namespace_migration`; requires the namespace store; skips re-accepting a head
+   whose certificate adds nothing; fixes the stale tombstone (taken as 0.92.5) and the
+   `followed` path table keeping a lost file complete (`availability_service.cpp:531`, on
+   develop by reading, not taken). It does **not** make genesis a constant
+   (`metadata.cpp:2294`), remove legacy authority or remove the inline decoders; earlier
+   notes said it did. It is the first part of the removal plan above.
+3. **Books**, as the web client reported at 0.92.2 (49 books): the Discworld series
+   holds 3 of 49; three books send a timestamp `published` (A Hat Full of Sky, Soul
+   Music, I Shall Wear Midnight); **possible regression, unexamined:** 11 books
+   send `published` and `language` null (Eric, Hogfather, Jingo, Maskerade, Mort,
+   Pyramids, Snuff, Sourcery, Thud!, Where's My Cow?, Wintersmith), and Thud! lost
+   its publisher too. "The Light Fantastic (Discworld)" keeps its clutter. "Le
+   Guin, Ursula K." splits into two authors. Conversion is MOBI and AZW3 to EPUB
+   only; per-user media state (stage 3) waits on the freeze. Catalogue checks go
+   through the client session.
+4. **Failing tests, each P0 when it recurs** (*carried, not re-checked on the two
+   current nodes; every name checked to exist at cac5998 on 2026-11-05*):
+   `availability/test_a_disk_coming_back_is_surveyed_without_a_namespace_change`
+   and `availability/test_two_nodes_survey_what_neither_holds` (laptop, load);
+   `rpc_cluster/test_two_node_mutual_bootstrap_metadata_write_floor` (section 8);
+   `filesystem_fuse/test_coalesced_delete_burst_wakes_at_exact_garbage_grace`,
+   `rpc_cluster/test_rpc_slow_control_does_not_abort_data`,
+   `rpc_cluster/test_inbound_incapable_node_is_reached_only_over_its_own_sessions`,
+   `users/test_accounts_converge_across_nodes`,
+   `rpc_cluster/test_rpc_metadata_executor_cancellation_disconnect_and_shutdown`.
+   macOS torrent segfaults are the laptop's libraries: ignore there only.
 
-## 2. Replication by diff (the next large piece)
+**Reopen on sight:** `credit wait abandoned`; `metadata merge recorded a conflict`
+(seven standing from before 0.89.0); `RPC stalled (control)`; heap corruption
+(three times on the old gbni-1; never on the current nodes).
 
-Proposal: [`2026-10-09-replication-by-diff.md`](2026-10-09-replication-by-diff.md),
-written and approved 2026-10-09. Its rule: a node's holdings have one
-identity, the `held` tries' root hashes, and it is the only signal that
-they changed; nothing keys a holdings memo on proxies. One subtree-hash
-diff between two nodes' `held` tries, joined locally with `referenced`,
-replaces the availability survey and its roll-up, repair's walks and
-probes, and the inventory's `outside_namespace`. Each stage ships alone;
-the walks stay as the fallback until every node runs stage 3.
+## Replication by diff
 
-0. **The holdings identity: built, 0.90.71.** `held_view()` on every
-   store; the survey keyed on (head, identity) only; `indexed()`,
-   `held_indexed()`, the loss counts, the cold wait and the kept roll-up
-   deleted. Closed `StoragePool::indexed()` and the missing re-roll when a
-   disk comes back. Found on the way: packed objects were never in the held
-   ledger; they are now, and each node's first start lists its packed
-   objects (watch gbni-1's start time).
-1. **The trie's diff surface: built, 0.90.72.**
-2. **`trie_diff` over the wire: built, 0.90.72.** The survey diffs held
-   tries when every peer runs 0.90.72; else the tree. A node with several
-   DATA disks diffs as the union of their tries (0.90.95).
-   Closes, once deployed and read on the cluster: **extents held by no node
-   online** (about 203,000 of 940,000; five of 25 sampled movies EIO on
-   both nodes, which is correct) as `unavailable`; the memo going stale
-   when a peer's holdings grow (the diff has no memo); **per-file
-   readability**'s answer. Deployed; fi-1 surveys by diff (201,372
-   unavailable), gbni-1 often falls back to the tree (section 1).
-3. **Repair on the diff: the push list built, 0.90.76.** Measured first (0.90.75, 2026-10-11, gbni-1
-   pushing to fi-1): a local read is 40 ms an extent; a two-extent batch
-   waits 3.95 s for its answers; repair's bandwidth estimate is 1.25 to
-   1.34 MB/s and it moves about 0.74 MB/s idle, one extent a minute with a
-   viewer. **The path is the limit, not repair:** a raw TCP stream gbni-1 to
-   fi-1 (fi-1 dialling, as Macha does) runs at 1.39 MB/s, and four parallel
-   streams total 1.3 MB/s: fi-1's downlink is the cap (its link type is
-   unverified; gbni-1 is on 1 Gbps fibre). So the pipelined window would not speed repair between these
-   nodes; what stage 3 still buys is the push list from the diff instead of
-   walking every local object, and no probes (already true when the lacks
-   come from a diff, since they carry the inventory's generation). fi-1
-   lacks about 570,000 extents gbni-1 holds (about 2 TB): about 18 days at
-   the path's full rate, about 30 at repair's idle rate.
-4. **Catalogue DATA: first part built, 0.90.77.** The inventory's referenced
-   set already held the catalogue's objects, so diff-based lacks (0.90.72)
-   and the push list (0.90.76) cover them; the survey now counts a catalogue
-   object no node holds as `unavailable` (442 on fi-1's first 0.90.77
-   survey, 2026-10-11), so repair stops asking for it. Left: the artwork
-   route still asks peers for a poster nobody holds (1 to 2 s each showing;
-   operator's call, section 8); re-fetching lost artwork from its provider
-   is the catalogue's.
-   Previously planned as: **Catalogue DATA as a `referenced` source** (the catalogue plan's stage
-   10). Closes: **artwork held by no online node** (60 of 296 posters,
-   2026-09-27) found and pulled, or reported `lost`; the 1 to 2 s remote
-   probe per missing poster; `GET catalogue/status` asking the store for
-   every artwork (`catalogue.cpp:896`, from the backlog). Catalogue
-   mutations already compute released DATA per touched shard (0.90.33);
-   whether stage 4 needs the plan's per-family shards (section 4) is for
-   its design.
-5. **Retire.** The survey half is built (0.90.96): diff only; what this
-   node lacks is the inventory's referenced set joined against its held
-   trie; a peer that cannot finish its diff leaves its share `unknown` and
-   the last `unavailable` stands; `tree_holdings` answers 501;
-   `outside_namespace` gone. Nodes with several disks keep the diff
-   (0.90.95, operator 2026-10-13: Macha is multi-backend by design).
-   Left: repair's store walk, push cursor, `repair_position` file and
-   `have_*` probes (push and pull from the survey's lists only, a peer that
-   could not answer is not sent to). About 75 test call sites drive repair
-   through `repair_once` without lists and need them; and repair cannot be
-   exercised on the cluster while fi-1 is alone.
+[`2026-10-09-replication-by-diff.md`](2026-10-09-replication-by-diff.md). Stages 0 to
+4 built (0.90.71 to 0.90.77), the survey half of 5 built (0.90.96). Left: repair's
+store walk, push cursor, `repair_position` and `have_*` probes, about 75 test call
+sites. Dagda dropped these by decision, so this work may fall to the second cutover
+rather than Macha. Measure again on the current pair: repair was last measured over
+a 1.39 MB/s path that no longer exists.
 
-The proposal's open questions (for the review): whether `claimed` is diffed
-(decide from the claim walk's probe counts after stage 3); a count bound on
-the pipelined window beside bytes; whether the counts (lacking here, per
-peer, below target, lost) become API resources now that they are cheap.
-
-Still separate, in this area:
-- **Bringing es-1 back** (operator's question, 2026-10-07): install the
-  current release before its first start; its 0.57-era config will be
-  refused (`dht.min_write_replicas` and others renamed in 0.88.0, keys
-  removed in 0.90.17); back up its state directory first; files deleted
-  elsewhere since 2026-09-24 may reappear from it (0.89.0). Its first start
-  on the current release seeds its held ledger, migrates its claims and
-  counts its namespace; under the proposal it joins the diff once seeded,
-  and answers "cannot say" until then. A rehearsal on a test cluster from
-  0.57.0 is offered, not done.
-- A torrent can land on a node away from where it is watched.
-- Per-peer down state in the transport; `fsync` without a deadline.
-- Seven namespace conflicts standing from before 0.89.0.
-- Say why a node counts itself busy (the pacer's active classes in status).
+Also here: a torrent can land on a node away from where it is watched; per-peer down
+state in the transport; `fsync` without a deadline; say why a node counts itself busy.
 
 ## 3. Memory
 
@@ -308,102 +268,54 @@ on control threads no longer grow with deletes. Left:
 - **Placement API asks**: the target `node_id` and a viewer-facing detail on
   `placement_failed`; the peer's own refusal text on a forwarded add; an
   optional node `name` (operator's call).
-- **Movie sets** and **ebooks**: later; each needs a proposal first.
+- **Movie sets**: later; needs a proposal first.
+- **Ebooks**: stages 1 and 2 of `TODO/2026-11-04-ebooks-design.md` are
+  merged. Stage 3, the per-user media state, waits on the freeze; OPDS is not
+  started.
+  **Audiobooks** (operator, 2026-11-04): a separate media class of their
+  own, designed after ebooks; they share the per-user media state.
 - Measured small, not now: ingest and data publications commit one
   operation at a time (about 100 ms each); the hint store rewrites its file
   per change (266 KB with 409 hints); the head record's largest part is now
   its 72 torrent requests (only if they grow).
 
-## 8. Waiting on the operator
-
-- The replication-by-diff proposal's three open questions.
-- **Lost posters on the viewer's path**: the artwork route could answer 404
-  at once for an object the last survey found no node holding (442 catalogue
-  objects today), saving 1 to 2 s per showing; the cost is that a poster a
-  peer gained since that survey is refused until the next one. Or the
-  catalogue re-fetches lost artwork from its provider and nothing changes on
-  the read path.
-- The bootstrap test (section 1): the first write waits for the bootstrap
-  checkpoint survey (not the availability survey), or the test retries the
-  refusal.
-- The memory limit to set on each node (section 3).
-- CPU priority for background work: `nice` or `SCHED_IDLE` for repair,
-  scrub, transcode and libtorrent threads, a cap on encoder threads, or a
-  systemd `CPUWeight`.
-- The size of a viewer rate reserve on a node's uplink: a fixed figure or a
-  share of the measured link (repair yields time, not rate).
-- [Cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md): a
-  proposal with six questions. Its memory section is partly overtaken by
-  0.90.69/70 (one limit, every part reported).
-- Metadata editor B: the choice of fields.
-- Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
-- A `CONTRIBUTING.md` line: "A new gate may pace lower-class work; it may
-  never stop it."
-- The replica's applier lifetime; fi-1's USB power (it lost power on
-  2026-10-12, and twice on 2026-10-14: 14:20Z, and mid-build at 15:39Z, up
-  16:15Z; 24 undervoltage warnings in its first 8 minutes up; it recovered by
-  itself each time).
-- Operator question: a configured DATA disk not yet online reads every
-  extent it holds `unavailable` (fi-1 after a reboot: 1,005,990 for two to
-  nine minutes until the USB disk mounts); Core's web queue drops
-  unavailable titles. Should it read `unknown` until the disk comes up?
-- From the backlog: anonymous access; whether a client should know a
-  playback generation existed anywhere in the cluster.
-
 ## Cluster state
 
-- **fi-1** (10.35.1.10) runs **0.91.0**, cluster protocol 23, alone.
-  **gbni-1** (10.44.1.50, `macnessa.macha.network`) is out since
-  2026-10-13 (compromised; last ran 0.90.93; section 1). es-1 is offline
-  indefinitely. Deploys go to fi-1 only (`build/deploy.sh`'s fi-1 lines).
-- `dht.write_copies` and `dht.metadata_write_copies`
-  are copies sought, not floors: a node alone still accepts writes.
-- Both nodes' config: `maintenance.foreground_weight: 80`,
-  `repair_weight: 20` (the code default is 95:5); `garbage_grace_ms` 30 days;
-  `catalogue.api.max_connections: 128`;
-  `dht.metadata_materialization_cache_bytes: 512M`;
-  `streaming.segment_memory_bytes: 64M`; no `runtime.memory_bytes` (no
-  limit). Neither sets `control_workers` or `max_concurrent_password_checks`
-  (defaults 4 and 2). fi-1 sets `hosts_extents: true` and
-  `inbound_capable: false`; gbni-1 resolves both automatically (true).
-- On the state device (`/etc/macha/state`): `ledger/` holds each store's
-  held ledger (with `verify-next`, the daily check's position) and
-  `ledger/referenced/` the namespace's reference counts; `retention/` holds
-  the claims tries (`ledger-data`, `ledger-control`) and `claims.log`.
-  The head names 64 tombstone batches (control objects) since the 0.90.67
-  migration; the head record is 87,546 bytes.
-- Rollback: `/root/pre-<version>/` on each node holds the binaries and config
-  in place before that version was installed (`pre-0.90.93` back to
-  `pre-0.89.0`, about 90 on each node; prune when convenient). A node cannot go back before 0.90.55 (claims) or 0.90.67
-  (tombstone batches) without losing state; see the CHANGELOG.
-- gbni-1 also runs Plex Media Server, which reads `/mnt/diskA` (the exFAT
-  ingest source, bound at `/media/Movies` and `/media/TV`); Macha never
-  touches that disk except to ingest from it.
-- fi-1's `/root/macha/build-asan` and `build-coverage` hold some macOS
-  objects; the trees need a clean rebuild before reuse. fi-1's
-  `/root/macha-bisect` is 0.90.46's tree; it can go.
-- Both nodes log at DEBUG. gbni-1 keeps its heap-check drop-in
-  (`/root/heap-check.conf.keep`).
-- Observation windows: `/etc/macha/state/observation/observations.jsonl` on
-  both: control's commit times (`metadata.*_sync_us`, `fuse.journal_sync_us`,
-  `durability.barrier_us.<dir>`), the ledger check (`ledger.verify.*`), the
-  `memory_*` gauges, `rss_bytes`, viewer presence by bytes on the wire.
-- Helpers: `build/deploy.sh VERSION` (stages from fi-1's build, installs
-  fi-1 then gbni-1, rolls back a node that does not come up). Run it in the
-  foreground and check both nodes' versions after: on 2026-10-09 a slow
-  copy outran its 90 s fi-1 check and it stopped before installing gbni-1
-  (`build/install-<version>.sh` then installs one node by hand).
-  On fi-1 `/root/mapi.sh`, `/root/claude-slot-holder.sh` (samples the DATA
-  arbiter, gdb stacks when both background slots are held),
-  `/root/claude-cold-kill.sh` (unclean stop with the page cache dropped),
-  `/root/apitime.sh`, `/root/burst-delete.sh`,
-  `/root/ryw-test.sh`, `/root/.macha-cold-read.py`,
-  `/root/.macha-writebehind-probe.py`; on gbni-1 `/root/warm-io.sh`,
-  `/root/match-trace.sh`, `/root/remove-empty-dirs.py`;
-  `macha-metadata-dump <key> <history.log> <heads.meta> --stats --objects
-  /etc/macha/metadata-objects` reads a node's head.
-- Code lookups go through basemind (load its tools first; rescan after edits
-  and moves).
+- **macnessa** (root@10.44.1.50, hostname corvus-gbni-1, Pi 5, 8 GB, domain
+  site-a): `/var/lib/macha`, DATA on `/mnt/diskB/data` (4.0 TB, about 1.03M loose
+  objects, 17 packs on 2026-11-04), API on 10.44.1.50:7438. The build node.
+- **inverbeg** (root@inverbeg.macha.network, Pi 5, 16 GB, domain site-b, inbound
+  capable, dialled at inverbeg.macha.network:7437, checked 2026-11-05): DATA on `/mnt/diskB/data` (about 670 GB and filling), API on
+  192.168.1.50:7438.
+- **Metadata, both nodes** (2026-11-05, `macha-metadata-dump --tree` and
+  `build/macha-fixtures/gen/frame_forms.cpp` over the live histories): one
+  tree-backed head, root `2fdd09bd...`, SM19 (`DHTMETB9`, 41,044 bytes) with the
+  legacy clock set, 23 torrent requests, 347 tombstone batches, 11,112 tombstones,
+  10 authors seen; tree 266 nodes, 8,713 entries, 1,251,866 extents, 63.6 MB;
+  generation about 129,500, rising about 20 a minute on 0.92.4 (Resume here, step 3). Re-rooted by
+  `macha-namespace-migrate` on 2026-11-03 16:04Z from an inline SM18 head of 2,567
+  entries (21 MB); the `*.pre-migration.*` archives are still in
+  `/var/lib/macha/metadata/` on both. Certificates `required=1`: nothing is on
+  legacy authority. A cluster founded at cac5998 founds inline and stays inline
+  until migrated (`build/macha-fixtures/state-scratch/` is such a state).
+- Both on Debian 13, aarch64, Boost 1.83. Neither API answers on loopback;
+  anonymous sessions are off. macnessa's genesis root password is in
+  `/var/lib/macha/initial-root-password` (root only), used read-only for Status
+  on 2026-11-05; inverbeg's not checked. `books.enabled` and
+  `books.conversion.enabled` are on; `libmobi-tools` installed.
+- **Deploy:** build on macnessa with the log and `$?` written to a file (a pipe
+  hides a failed build); `DESTDIR=/root/stage-V cmake --install build --prefix
+  /usr/local` (not `/usr`); `tar czf /root/macha-V.tgz -C /root/stage-V usr`; on
+  each node, one at a time, `/root/stop-with-stacks.sh`, then `build/install-V.sh`
+  (from `build/install-0.92.3.sh`, untracked) over ssh with `TARBALL=` and
+  `HEALTH=http://<api address>:7438/api/v1/health`. A wrong prefix or health URL
+  makes it roll a healthy node back. `build/deploy.sh` is stale; do not use it.
+- Rollback: `/root/pre-<version>/` on each node holds the previous binaries and
+  config, restored by the install script when a node does not come up.
+- A hung stop's stacks and journal land in `/root/macha-stop-<time>.*`; the
+  2026-11-05 one is copied to `build/macnessa-stop/`.
+- Laptop: `build-nobooks` and `build-notorrent`, `-j8`; plain `build` is stale. It
+  is an Intel Mac. Scratch files go in `build/`. Code lookups through basemind.
 
 ## Standing rules
 
@@ -428,7 +340,7 @@ on control threads no longer grow with deletes. Left:
   experience; no nit-picking that does not improve it (operator,
   2026-10-09).
 - **Testing**: design it properly, test it well once (the touched tests on
-  the laptop, then all three suites on fi-1, which are the gate), deploy,
+  the laptop, then all three suites on macnessa, which are the gate), deploy,
   measure, iterate. No repeat runs, soak runs, sanitizer builds or mutation
   sweeps; never rerun a whole suite on an overloaded laptop. A laptop under
   heavy load (load average over about 50) gives no verdict on timing.
@@ -438,8 +350,8 @@ on control threads no longer grow with deletes. Left:
 - **Every response has a snake_case code; errors add a message; clients own
   sorting and presentation; every API change is announced to Core and every
   client before it ships.** Client sessions may ask; they do not decide.
-- **Deploying**: build once on fi-1, run all three suites there, ship the
-  `usr` tree; never compile on gbni-1; never both nodes down at once. When a
+- **Deploying**: build once on macnessa, run all three suites there, ship the
+  `usr` tree (below); never both nodes down at once. When a
   release adds a wire message or a record format, roll the peers first and
   expect the older node to refuse the newer one's messages until upgraded.
   After any rejected or interrupted command, check what actually ran.
