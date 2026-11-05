@@ -10,7 +10,8 @@
 namespace macha {
 
 enum class NodeEvent : uint8_t {
-    // What this node holds changed: an object stored or removed.
+    // What this node holds changed: an object stored or removed, a disk come
+    // back.
     storage,
     metadata,
     topology,

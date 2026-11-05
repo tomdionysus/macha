@@ -471,10 +471,15 @@ class FileSystem final : public PublicationTarget {
     // by tree diff after, across restarts.
     IoMutex maintenance_build_mutex_;
     // Brings the counts to `snapshot`'s namespace.
-    void census_count(const MetadataSnapshot&) MACHA_REQUIRES(maintenance_build_mutex_);
-    void census_walk(const MetadataSnapshot&) MACHA_REQUIRES(maintenance_build_mutex_);
+    // `pause` runs between entries, and may throw to leave the counts as they
+    // stood.
+    void census_count(const MetadataSnapshot&, const std::function<void()>& pause = {})
+        MACHA_REQUIRES(maintenance_build_mutex_);
+    void census_walk(const MetadataSnapshot&, const std::function<void()>& pause)
+        MACHA_REQUIRES(maintenance_build_mutex_);
     // False when the counts cannot be brought to `root` from where they stand.
-    bool census_follow(const ObjectId& root) MACHA_REQUIRES(maintenance_build_mutex_);
+    bool census_follow(const ObjectId& root, const std::function<void()>& pause)
+        MACHA_REQUIRES(maintenance_build_mutex_);
     MaintenanceObjects maintenance_objects_from(const MetadataSnapshotView&)
         MACHA_REQUIRES(maintenance_build_mutex_);
     Mutex maintenance_index_mutex_;
@@ -584,7 +589,9 @@ class FileSystem final : public PublicationTarget {
     Hash256 namespace_signature(uint64_t* metadata_generation = nullptr);
     std::optional<Hash256> available_namespace_signature(
         uint64_t* metadata_generation = nullptr) const;
-    std::shared_ptr<const MaintenanceObjects> maintenance_objects_cached();
+    // `pause` runs between the entries a build walks, and may throw to end it.
+    std::shared_ptr<const MaintenanceObjects>
+    maintenance_objects_cached(const std::function<void()>& pause = {});
     // What the converged namespace refers to, from a walk of all of it and
     // apart from the counts: the reference for checking them.
     NamespaceListing walk_namespace_references();

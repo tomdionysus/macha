@@ -117,6 +117,9 @@ void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
         Log::info("node data storage ready used=" + std::to_string(used) +
                   " capacity=" + std::to_string(capacity) +
                   (cfg.storage_backends.empty() ? " (hosts no extents)" : ""));
+        if (!cfg.storage_backends.empty() && data_->online_backends() == 0)
+            Log::warn("node data storage degraded: no disk online of " +
+                      std::to_string(cfg.storage_backends.size()) + "; running without one until it returns");
     } catch (const RecoveryCancelled&) {
         throw;
     } catch (const std::exception& error) {

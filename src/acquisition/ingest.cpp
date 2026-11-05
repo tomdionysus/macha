@@ -10,6 +10,7 @@
 #include "catalogue/media_information.hpp"
 #include "supervised.hpp"
 
+#include <regex>
 #include <algorithm>
 #include <cctype>
 #include <array>
@@ -151,6 +152,10 @@ Json file_json(const IngestFileProgress& file) {
     o["catalogue_candidate"] = file.catalogue_candidate;
     if (file.control == IngestFileControl::paused) o["control"] = std::string("paused");
     else if (file.control == IngestFileControl::cancelled) o["control"] = std::string("cancelled");
+    if (file.failed()) {
+        o["error_code"] = file.error_code;
+        o["error"] = file.error;
+    }
     return o;
 }
 
@@ -168,6 +173,7 @@ Json job_json(const IngestJob& job) {
     o["bytes_completed"] = job.bytes_completed;
     o["files_total"] = static_cast<uint64_t>(job.files_total);
     o["files_completed"] = static_cast<uint64_t>(job.files_completed);
+    o["files_failed"] = static_cast<uint64_t>(job.files_failed);
     o["catalogue_total"] = static_cast<uint64_t>(job.catalogue_total);
     o["catalogue_pending"] = static_cast<uint64_t>(job.catalogue_pending);
     o["catalogue_catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
@@ -223,6 +229,8 @@ IngestFileProgress parse_file(const Json& value) {
     const auto control = json_string(value, "control");
     if (control == "paused") file.control = IngestFileControl::paused;
     else if (control == "cancelled") file.control = IngestFileControl::cancelled;
+    file.error_code = json_string(value, "error_code");
+    file.error = json_string(value, "error");
     return file;
 }
 
@@ -241,6 +249,7 @@ IngestJob parse_job(const Json& value) {
     job.bytes_completed = json_u64(value, "bytes_completed");
     job.files_total = static_cast<size_t>(json_u64(value, "files_total"));
     job.files_completed = static_cast<size_t>(json_u64(value, "files_completed"));
+    job.files_failed = static_cast<size_t>(json_u64(value, "files_failed"));
     job.catalogue_total = static_cast<size_t>(json_u64(value, "catalogue_total"));
     job.catalogue_pending = static_cast<size_t>(json_u64(value, "catalogue_pending"));
     job.catalogue_catalogued = static_cast<size_t>(json_u64(value, "catalogue_catalogued"));
@@ -259,6 +268,50 @@ IngestJob parse_job(const Json& value) {
         for (const auto& file : files->asArray()) job.files.push_back(parse_file(file));
     }
     return job;
+}
+
+} // namespace
+
+namespace {
+
+// By folder of the job's source: the series of the episodes under it, counted.
+using SeriesBelow = std::map<std::filesystem::path, std::map<std::string, size_t>>;
+
+// A folder of extras, by the names libraries and releases give them.
+bool extras_folder(const std::string& name) {
+    static const std::regex word(R"((^|[^a-z0-9])(featurettes?|extras?|bonus)($|[^a-z0-9]))",
+                                 std::regex::icase);
+    static const std::regex whole(R"(behind the scenes|deleted scenes|interviews|trailers|shorts)",
+                                  std::regex::icase);
+    return std::regex_search(name, word) || std::regex_match(name, whole);
+}
+
+// Where a file goes if it is an extra of a series: below the series' folder,
+// keeping the folders it has below its title, which is the outermost folder
+// with episodes under it. The job's own folder is a title only when one series
+// is all it holds. Nothing if it has no title, or no extras folder below that.
+std::optional<std::string> series_extra_destination(const std::filesystem::path& root,
+                                                    const std::filesystem::path& source,
+                                                    const SeriesBelow& series_below) {
+    std::vector<std::string> folders;
+    for (const auto& part : source.parent_path().lexically_relative(root))
+        if (part != ".") folders.push_back(part.string());
+    auto at = root;
+    for (size_t first = 0; first <= folders.size(); ++first) {
+        const auto found = series_below.find(at);
+        if (found != series_below.end() && (first > 0 || found->second.size() == 1)) {
+            const auto most = std::max_element(found->second.begin(), found->second.end(),
+                                               [](const auto& a, const auto& b) { return a.second < b.second; });
+            if (std::none_of(folders.begin() + static_cast<std::ptrdiff_t>(first), folders.end(), extras_folder))
+                return {};
+            auto destination = most->first;
+            for (size_t i = first; i < folders.size(); ++i)
+                destination += "/" + safe_component(folders[i]);
+            return normalize_path(destination + "/" + safe_component(source.filename().string(), "media"));
+        }
+        if (first < folders.size()) at /= folders[first];
+    }
+    return {};
 }
 
 } // namespace
@@ -296,6 +349,7 @@ std::string ingest_file_state_name(const IngestJob& job, size_t index) {
     if (file.completed) return "completed";
     if (file.skipped) return "skipped";
     if (file.control == IngestFileControl::cancelled) return "cancelled";
+    if (file.failed()) return "failed";
     if (file.control == IngestFileControl::paused) return "paused";
     if (job.state == IngestJobState::importing && job.current_file == file.source_path) return "importing";
     return "queued";
@@ -356,6 +410,7 @@ Json ingest_job_json(const IngestJob& job, bool include_files,
     out["bytes_completed"] = job.bytes_completed;
     out["files_total"] = static_cast<uint64_t>(job.files_total);
     out["files_completed"] = static_cast<uint64_t>(job.files_completed);
+    out["files_failed"] = static_cast<uint64_t>(job.files_failed);
     out["rate_bytes_per_second"] = job.rate_bytes_per_second;
     out["eta_seconds"] = optional_u64(job.eta_seconds);
     out["progress"] = job.bytes_total
@@ -386,6 +441,8 @@ Json ingest_job_json(const IngestJob& job, bool include_files,
             item["completed"] = file.completed;
             item["skipped"] = file.skipped;
             item["catalogue_candidate"] = file.catalogue_candidate;
+            item["error_code"] = file.failed() ? Json(file.error_code) : Json(nullptr);
+            item["error"] = file.failed() ? Json(file.error) : Json(nullptr);
             files.emplace_back(std::move(item));
         }
         out["files"] = std::move(files);
@@ -1071,11 +1128,13 @@ IngestManager::FileActionResult IngestManager::file_action(std::string_view id, 
         result.exists = true;
         auto& job = it->second;
         auto& file = job.files[index];
+        // A failed job can be restarted, so what it will run can still change.
         const bool finished = job.state == IngestJobState::completed ||
                               job.state == IngestJobState::cancelled ||
-                              job.state == IngestJobState::failed ||
                               job.state == IngestJobState::cataloguing;
         if (finished || file.completed || file.skipped) return result;
+        // A failed file stays failed; all that can be done is to leave it out.
+        if (file.failed() && action != "cancel_file") return result;
         const auto previous = job;
         if (action == "pause_file") {
             if (file.control != IngestFileControl::active) return result;
@@ -1096,7 +1155,7 @@ IngestManager::FileActionResult IngestManager::file_action(std::string_view id, 
             // Held only for files now all cancelled: let the job finish.
             if (job.state == IngestJobState::paused && job.held_by_files &&
                 std::none_of(job.files.begin(), job.files.end(), [](const IngestFileProgress& f) {
-                    return !f.completed && f.control == IngestFileControl::paused;
+                    return !f.completed && !f.failed() && f.control == IngestFileControl::paused;
                 })) {
                 job.state = IngestJobState::queued;
                 job.held_by_files = false;
@@ -1382,6 +1441,7 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
                       " catalogue_pending=" + std::to_string(job.catalogue_pending));
         else
             Log::info("ingest completed id=" + id + " files=" + std::to_string(job.files_completed) +
+                      " failed=" + std::to_string(job.files_failed) +
                       " bytes=" + std::to_string(job.bytes_completed));
     } catch (const std::exception& e) {
         if (stop.stop_requested()) {
@@ -1538,13 +1598,42 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         return exists_ignoring_case(path);
     };
 
+    // Each file probed, and what series the episodes under each folder are, so
+    // a file's place can depend on the title it came with.
+    struct Probed {
+        std::filesystem::path source;
+        uint64_t size{};
+        std::string destination;
+        MediaProbeKind kind{};
+    };
+    std::vector<Probed> probed;
+    SeriesBelow series_below;
     for (const auto& source : host_files) {
         std::error_code size_error;
         const auto size = std::filesystem::file_size(source, size_error);
         if (size_error || !size) continue;
-        auto destination = choose_destination(source, size);
+        MediaProbeKind kind{};
+        auto destination = choose_destination(source, size, kind);
         if (destination.empty()) continue;
         destination = with_existing_case(destination);
+        if (kind == MediaProbeKind::episode) {
+            const auto series = std::filesystem::path(destination).parent_path().parent_path().generic_string();
+            for (auto folder = source.parent_path(); path_under(folder, job.source_path);
+                 folder = folder.parent_path()) {
+                ++series_below[folder][series];
+                if (folder == job.source_path) break;
+            }
+        }
+        probed.push_back({source, size, std::move(destination), kind});
+    }
+
+    for (auto& [source, size, chosen, kind] : probed) {
+        std::string destination = chosen;
+        // Probing as a film, it is an extra of the series it came with.
+        const auto extra = kind == MediaProbeKind::movie
+                               ? series_extra_destination(job.source_path, source, series_below)
+                               : std::nullopt;
+        if (extra) destination = with_existing_case(*extra);
 
         // Chosen once and persisted; resume never re-chooses.
         std::string candidate = destination;
@@ -1558,6 +1647,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         planned.temporary_path = candidate + ".macha-ingest-" + job.id.substr(0, 12) + ".part";
         planned.size = size;
         planned.source_mtime_ns = host_mtime(source);
+        planned.catalogue_candidate = !extra;
         media_by_parent[source.parent_path()].push_back(job.files.size());
         job.files.push_back(std::move(planned));
         job.bytes_total += size;
@@ -1619,10 +1709,12 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     return true;
 }
 
-std::string IngestManager::choose_destination(const std::filesystem::path& source, uint64_t size) {
+std::string IngestManager::choose_destination(const std::filesystem::path& source, uint64_t size,
+                                              MediaProbeKind& kind) {
     auto candidates = probe_host_media_candidates(source, size);
     if (candidates.empty()) return {};
     const auto& probe = candidates.front().probe;
+    kind = probe.kind;
     const auto& scanner = node_.config().catalogue.scanner;
     const auto filename = safe_component(source.filename().string(), "media");
 
@@ -1724,7 +1816,7 @@ void IngestManager::ensure_namespace_parents(std::string_view path) {
         try {
             auto existing = fs_.getattr(current);
             if (existing.type != EntryType::directory)
-                throw IngestError("destination_parent_not_directory", "ingest destination parent is not a directory: " + current);
+                throw IngestFileError("destination_parent_not_directory", "ingest destination parent is not a directory: " + current);
         } catch (const FsError& e) {
             if (e.code() != ENOENT) throw;
             const auto& policy = node_.config().filesystem;
@@ -1735,8 +1827,8 @@ void IngestManager::ensure_namespace_parents(std::string_view path) {
                 if (created.code() != EEXIST) throw;
                 const auto existing = fs_.getattr(current);
                 if (existing.type != EntryType::directory)
-                    throw IngestError("destination_parent_not_directory", "ingest destination parent is not a directory: " +
-                                             current);
+                    throw IngestFileError("destination_parent_not_directory", "ingest destination parent is not a directory: " +
+                                                 current);
             }
         }
     }
@@ -1764,7 +1856,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     ensure_namespace_parents(file.destination_path);
     try {
         auto partial = fs_.getattr(file.temporary_path);
-        if (partial.type != EntryType::file) throw IngestError("partial_not_file", "ingest partial is not a file");
+        if (partial.type != EntryType::file) throw IngestFileError("partial_not_file", "ingest partial is not a file");
         file.copied = std::min<uint64_t>(partial.size, file.size);
     } catch (const FsError& e) {
         if (e.code() != ENOENT) throw;
@@ -1784,7 +1876,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
                 refresh_progress(job);
                 return true;
             }
-            throw IngestError("destination_conflict", "ingest destination appeared with an unexpected type or size");
+            throw IngestFileError("destination_conflict", "ingest destination appeared with an unexpected type or size");
         } catch (const FsError& final_error) {
             if (final_error.code() != ENOENT) throw;
         }
@@ -1969,8 +2061,13 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
 
     output->commit();
     file.copied = output->size();
-    if (file.copied != file.size) throw IngestError("size_mismatch", "ingest committed size mismatch");
-    fs_.rename(file.temporary_path, file.destination_path, true);
+    if (file.copied != file.size) throw IngestFileError("size_mismatch", "ingest committed size mismatch");
+    try {
+        fs_.rename(file.temporary_path, file.destination_path, true);
+    } catch (const FsError& e) {
+        if (e.code() != EEXIST) throw;
+        throw IngestFileError("destination_conflict", "ingest destination appeared during the copy");
+    }
     file.completed = true;
     if (file.catalogue_candidate) {
         (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
@@ -2016,11 +2113,16 @@ std::optional<std::vector<ExtentRef>> IngestManager::published_extents(
 
 void IngestManager::refresh_progress(IngestJob& job, uint64_t sample_bytes,
                                      std::chrono::steady_clock::duration sample_time) {
-    // A cancelled file is out of the job: neither planned nor done.
+    // A cancelled file is out of the job: neither planned nor done. So is a
+    // failed one, which is counted apart.
     uint64_t total = 0, planned = 0;
-    size_t completed = 0, files = 0;
+    size_t completed = 0, files = 0, failed = 0;
     for (const auto& file : job.files) {
         if (file.control == IngestFileControl::cancelled && !file.completed) continue;
+        if (file.failed()) {
+            ++failed;
+            continue;
+        }
         ++files;
         planned += file.size;
         total += std::min(file.copied, file.size);
@@ -2030,6 +2132,7 @@ void IngestManager::refresh_progress(IngestJob& job, uint64_t sample_bytes,
     job.files_total = files;
     job.bytes_completed = total;
     job.files_completed = completed;
+    job.files_failed = failed;
     if (sample_bytes && sample_time > std::chrono::steady_clock::duration::zero()) {
         const auto seconds = std::chrono::duration<double>(sample_time).count();
         const auto instantaneous = static_cast<uint64_t>(sample_bytes / std::max(0.001, seconds));
@@ -2053,7 +2156,7 @@ void IngestManager::resolve_duplicate_destinations(IngestJob& job) {
     for (const auto& file : job.files)
         if (file.completed) used.insert(file.destination_path);
     for (auto& file : job.files) {
-        if (file.completed) continue;
+        if (file.completed || file.failed()) continue;
         if (!used.contains(file.destination_path)) {
             used.insert(file.destination_path);
             continue;
@@ -2100,7 +2203,7 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
     for (bool runnable = true; runnable;) {
         for (auto& file : job.files) {
             if (stop.stop_requested()) return false;
-            if (file.completed) continue;
+            if (file.completed || file.failed()) continue;
             {
                 Lock lock(mutex_);
                 auto it = jobs_.find(job.id);
@@ -2123,7 +2226,16 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
                 if (!record_progress(job)) return false;
                 continue;
             }
-            if (!copy_file(job, file, stop)) return false;
+            try {
+                if (!copy_file(job, file, stop)) return false;
+            } catch (const IngestFileError& e) {
+                file.error_code = e.code();
+                file.error = e.what();
+                Log::warn("ingest file failed id=" + job.id + " path=" + file.destination_path +
+                          " code=" + e.code() + ": " + e.what());
+                drop_partial(file);
+                refresh_progress(job);
+            }
             job.updated_unix_ms = now_ms();
             if (!record_progress(job)) return false;
         }
@@ -2134,12 +2246,13 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
             keep_file_controls(job, it->second);
         }
         runnable = std::any_of(job.files.begin(), job.files.end(), [](const IngestFileProgress& file) {
-            return !file.completed && !file.skipped && file.control == IngestFileControl::active;
+            return !file.completed && !file.skipped && !file.failed() &&
+                   file.control == IngestFileControl::active;
         });
     }
     // Only paused files are left: the job waits for one of them.
     if (std::any_of(job.files.begin(), job.files.end(), [](const IngestFileProgress& file) {
-            return !file.completed && file.control == IngestFileControl::paused;
+            return !file.completed && !file.failed() && file.control == IngestFileControl::paused;
         })) {
         job.state = IngestJobState::paused;
         job.held_by_files = true;

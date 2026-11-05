@@ -1002,6 +1002,67 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_o
     CHECK(bench.local.data().has(wanted));
 }
 
+// A settled pull is settled for the list it walked. A list that arrives after
+// an empty one, or after the last one was finished while the push still ran,
+// is walked by the step that first sees it.
+MACHA_FAST_TEST("rpc_cluster", test_the_repair_step_that_first_sees_a_new_pull_list_walks_it) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    peer.holds_everything = true;
+    const auto wanted_bytes = pattern(256 * 1024, 43);
+    const auto wanted = object_id(wanted_bytes);
+    peer.serves = wanted_bytes;
+
+    auto store = bench.store();
+    REQUIRE(store->should_own(wanted));
+    const auto budget = 64ULL * 1024 * 1024;
+    const std::vector<ObjectId> none;
+    const std::vector<ObjectId> named{wanted};
+    const auto step = [&](const std::vector<ObjectId>& pull, uint64_t version) {
+        return store->repair_step(budget, 16, std::nullopt, {}, 0, {}, std::span<const ObjectId>(pull), {},
+                                  std::span<const ObjectId>(none), version, 1);
+    };
+
+    bool settled = false;
+    for (int attempt = 0; attempt < 4 && !settled; ++attempt)
+        settled = step(none, 1).complete;
+    REQUIRE(settled);
+    const auto filled = step(named, 2);
+    CHECK(peer.fetches.load() == 1);
+    CHECK(bench.local.data().has(wanted));
+    CHECK(filled.pull_examined == 1);
+}
+
+MACHA_FAST_TEST("rpc_cluster", test_a_pull_list_new_while_the_push_runs_is_not_passed_over) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    peer.holds_everything = true;
+    const auto first_bytes = pattern(64 * 1024, 44);
+    const auto second_bytes = pattern(64 * 1024, 45);
+    const auto second = object_id(second_bytes);
+    peer.serves = second_bytes;
+    REQUIRE(bench.local.data().put(object_id(first_bytes), first_bytes));
+    // More to push than one step examines, so the first list's pull finishes
+    // while the pass is still open.
+    const auto pushing = local_objects(bench, 100, 4 * 1024, 60);
+
+    auto store = bench.store();
+    REQUIRE(store->should_own(second));
+    const auto budget = 64ULL * 1024 * 1024;
+    const std::vector<ObjectId> first_list{object_id(first_bytes)};
+    const std::vector<ObjectId> second_list{second};
+    const auto step = [&](const std::vector<ObjectId>& pull, uint64_t version) {
+        return store->repair_step(budget, 16, std::nullopt, {}, 0, {}, std::span<const ObjectId>(pull), {},
+                                  std::span<const ObjectId>(pushing), version, 1);
+    };
+
+    const auto opening = step(first_list, 1);
+    REQUIRE(!opening.complete);
+    (void)step(second_list, 2);
+    CHECK(peer.fetches.load() == 1);
+    CHECK(bench.local.data().has(second));
+}
+
 // The push cursor survives a new live-set generation and a restart (each
 // object passed again would cost a full read on the peer). With no
 // generation, a pass a different live set arrived part-way through is not

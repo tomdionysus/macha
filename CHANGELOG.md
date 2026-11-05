@@ -1,5 +1,35 @@
 # Current release
 
+## 0.93.4: one file's error stays that file's, and repair walks a new list
+
+Repair: a pull list arriving after an empty one, or after the last list was
+finished while the push still ran, was passed over and the pass reported settled,
+so repair parked until something else woke it. The step that first sees a list
+now walks it. A disk coming back now wakes maintenance, so the survey and repair see it with
+nothing else happening.
+
+Import: an error belonging to one file (`destination_conflict`,
+`destination_parent_not_directory`, `partial_not_file`, `size_mismatch`) fails that
+file alone, and the job goes on. The file's state is `failed`, with `error_code` and
+`error`, and the job carries `files_failed`; a job with failed files ends `completed`.
+A destination appearing during the copy is `destination_conflict` too. A failed file
+stays failed: `pause` and `resume` of it are refused, `cancel` leaves it out. To try
+again, submit its source path. Per-file actions now work on a `failed` job.
+
+A file that probes as a film, in an extras folder under a title that has episodes,
+is filed under that series, keeping its folders below the title, and is not sent to
+the catalogue. Files already in the namespace stay where they are.
+
+Storage: a read failing on the device keeps the object, warns and counts in
+`storage.read_failures`, in a reader and in the scrub; only a record that reads and
+does not open is removed. A node with disks configured and none online reports
+`startup.data_storage_degraded` in Status and warns at startup.
+
+Maintenance: a stop during the survey's diff ends the survey and no longer counts
+as failed peers; `not_held` pauses over the ids beside its view; the inventory walk
+checks the stop. Two deletes of one object each hold its mark. The predicate queries,
+which nothing called, are gone.
+
 ## 0.93.3: genesis and the inline formats are gone
 
 Genesis is a fixed constant holding no tree, and a founder builds the root

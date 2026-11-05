@@ -76,6 +76,7 @@ class StoragePool final : public ObjectStore {
     std::map<uint64_t, std::shared_ptr<DurabilityDomain>>
         domains_by_device_ MACHA_GUARDED_BY(domain_mutex_);
     // Each cursor is owned by the maintenance thread that runs its step.
+    LocalStoreFiles& files_;
     Cursor rebalance_cursor_;
     Cursor scrub_cursor_;
     Cursor gc_cursor_;
@@ -92,6 +93,8 @@ class StoragePool final : public ObjectStore {
     mutable std::shared_ptr<const TrieUnion> union_ MACHA_GUARDED_BY(union_mutex_);
 
     void observe_get(size_t, uint64_t) const;
+    // A read that did not finish says nothing about the object: it stays.
+    void note_read_failure(const ObjectId&, const std::filesystem::path&, const std::exception&) const;
 
     std::vector<std::shared_ptr<Backend>> snapshot() const MACHA_EXCLUDES(mutex_);
     std::filesystem::path identity_path(const std::filesystem::path&) const;
@@ -104,12 +107,13 @@ class StoragePool final : public ObjectStore {
 
   public:
     // Each backend keeps a held ledger under <state_path>/ledger/, the
-    // backends sharing `ledger_cache` bytes of page cache.
+    // backends sharing `ledger_cache` bytes of page cache. `files` is the device
+    // work of every backend's store, and outlives the pool.
     StoragePool(std::filesystem::path state_path, NodeId, std::vector<StorageBackendConfig>,
                 std::array<uint8_t, 32> key,
                 std::chrono::milliseconds durability_batch_window = std::chrono::milliseconds(500),
                 StoragePackingConfig packing = StoragePackingConfig{0, 0},
-                uint64_t ledger_cache = 0);
+                uint64_t ledger_cache = 0, LocalStoreFiles& files = posix_local_store_files());
     void reconfigure(const std::vector<StorageBackendConfig>&);
     void refresh();
 

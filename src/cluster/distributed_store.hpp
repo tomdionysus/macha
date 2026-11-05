@@ -3,7 +3,6 @@
 #include "cluster/cluster.hpp"
 #include "cluster/control_objects.hpp"
 #include "contract/id_lookup.hpp"
-#include "contract/predicates.hpp"
 #include "contract/thread_safety.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/replica_selector.hpp"
@@ -45,7 +44,7 @@ struct ControlOffer {
     uint64_t bytes_sent{};
 };
 
-class DistributedStore final : public Placement, public ControlObjectSource {
+class DistributedStore final : public ControlObjectSource {
   public:
     struct ObjectBuffer {
         Bytes bytes;
@@ -443,8 +442,6 @@ class DistributedStore final : public Placement, public ControlObjectSource {
                           std::atomic_bool* cancelled = nullptr);
     bool has_on(const NodeInfo&, const ObjectId&);
     bool should_own(const ObjectId&) const;
-    // Placement: whether this node is in the object's owner set.
-    bool owns(const ObjectId& id) const override { return should_own(id); }
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);
     // Offers CONTROL objects this node holds to every other node present:
     // each is asked what it lacks (one batched question) and sent only that.

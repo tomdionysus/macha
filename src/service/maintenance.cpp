@@ -2,6 +2,7 @@
 #include "service/maintenance.hpp"
 #include "service/claim_walk.hpp"
 #include "contract/gates.hpp"
+#include "contract/stopping.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "diagnostics.hpp"
 #include "fuse/fuse_frontend.hpp"
@@ -244,14 +245,6 @@ void Maintenance::maintain_tombstone_batches(const InventoryHorizon& inventory) 
         });
     });
 }
-
-namespace {
-// Thrown out of a long walk when the pass is asked to stop; caught by the
-// pass, which then sees the stop and ends.
-struct MaintenanceStopping final : std::runtime_error {
-    MaintenanceStopping() : std::runtime_error("maintenance stopping") {}
-};
-} // namespace
 
 double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds,
                             double wall_seconds, double cpu_target) {
@@ -627,7 +620,10 @@ void Maintenance::run(std::stop_token stop) {
                 // The horizons this pass reads: the ledger's, as published.
                 auto inventory = ledger_.inventory();
                 auto release = ledger_.release();
-                auto objects = builder_.namespace_objects();
+                auto objects = builder_.namespace_objects([&stop] {
+                    if (stop.stop_requested())
+                        throw MaintenanceStopping{};
+                });
                 bool rebuilt_inventory = false;
                 // Rebuilding is held back until metadata is ready, so the inventory
                 // is never read ahead of the metadata convergence it depends on; a

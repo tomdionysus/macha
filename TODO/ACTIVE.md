@@ -1,8 +1,8 @@
 # Active tasks
 
-Last updated: 2026-11-05 evening, on `develop`, checked against the code and the
-running nodes, not against earlier notes. **State a branch's content from its diff
-and a node's state from its files, never from a prior note** (operator, on this
+Last updated: 2026-11-05 night, on `feature/tree-native-namespace`, checked against the
+code and the running nodes, not against earlier notes. **State a branch's content from
+its diff and a node's state from its files, never from a prior note** (operator, on this
 file's drift: "We can't afford drift like this."). The version before the morning's
 rationalisation is `archive/2026-11-05-ACTIVE-before-rationalisation.md`.
 Alongside this file: `BACKLOG.md` (everything else, by area), `COMPLETED.md`,
@@ -14,19 +14,29 @@ Alongside this file: `BACKLOG.md` (everything else, by area), `COMPLETED.md`,
 (root@inverbeg.macha.network) run **0.92.5**, one cluster, under `/usr/local`, installed
 2026-11-05 14:52Z and 14:54Z. Develop, main and tag 0.92.5 (808fa0f) are pushed.
 
-**0.92.5 is proven on the nodes.** Before: every recent delta a 61-byte empty DLT5,
-about 20 commits a minute. After: generation 130,059 held still for 180 s on both, same
-head, whose last commit is one DLT11 with `batches+=1 batches-=2`, the fix doing its
-work once. Gate 747, 20 and 21. Not measured: whether the collectors now run. The 0.92.4
-stop took 3 s on macnessa, 4 s on inverbeg.
+**On `feature/tree-native-namespace`, not merged, not deployed, not pushed:**
+
+- **The old-code removal, done.** 076115f 0.93.0 a namespace is a tree from its first
+  commit; 18f0c4b 0.93.1 the legacy write API; ecce886 0.93.2 legacy authority; 766617e
+  0.93.3 genesis and the inline formats. What stayed: SM14, SM16, SM17, SM19 and DLT5 to
+  DLT11 as the record forms, with envelope and hash; the legacy clock (a live feature);
+  `MetadataSnapshot::entries`, `merge_metadata_heads` and `metadata_delta` as the working
+  form; the map branches of `apply_metadata_delta_in_place` and `namespace_entry`;
+  `garbage` and `metadata_voters` in SM14, which its hash covers; `required == 0` for
+  genesis on a founder only. **`load_journal` has no production writer left: a question
+  for the operator.** Genesis's hash changed, so new clusters only; replay of a copy of
+  macnessa's real state reproduces every frame, root 2fdd09bd.
+- **0.93.4, the operator's fix group** (the release first named 0.92.6): see CHANGELOG.
+  Its API changes are to be announced to Core and the clients before it ships.
+  Gate on macnessa: 751, 20, 21, trace repeat 84 of 84. The repair stall reproduced;
+  whether it is what stalled fi-1 a month ago is not shown.
 
 **Next, in the operator's order (2026-11-05):**
-1. **Remove the old code, "right now, before anything else"**: both nodes are confirmed on
-   Merkle. Plan at the end of the rulings below.
-2. **0.92.6**, all in one release (rulings below).
-3. **Pi baselines** on the result, with the version recorded.
-4. The libraries finish their work on that baseline.
-5. **The independent review**, which is the gate for lifting the freeze.
+1. Merge and deploy 0.93.0 to 0.93.4, on the operator's word, and tell Dannan and Dagda
+   the commit: they paused until the removal lands, and re-cut their goldens from it.
+2. **Pi baselines** on the result, with the version recorded.
+3. The libraries finish their work on that baseline.
+4. **The independent review**, which is the gate for lifting the freeze.
 
 ## The port to Dannan and Dagda
 
@@ -51,7 +61,7 @@ confirmed, Pi and real IGD work held.
   not a ruling (Open work 2).
 - **Macha's code is frozen until the review passes (operator, 2026-11-05):**
   "Macha has a working, tested codebase, this shouldn't be modified until they're
-  ready." Exceptions: 0.92.5 (deployed), the old-code removal and 0.92.6; each moves
+  ready." Exceptions: 0.92.5 (deployed), the old-code removal and 0.93.4; each moves
   the libraries' baseline, and they are told at each commit. Artefacts for their
   plans are fine, changing no tracked file, under `build/macha-fixtures/`, each with a
   README: `placement/`; `goldens/` (Status 381 of 494 keys by name, journal 31 of 83
@@ -65,18 +75,11 @@ confirmed, Pi and real IGD work held.
 - **The ready gate**: "When we have done another independent review and are satisfied that
   Macha can migrate to use Dannan and Dagda with no loss of functionality, performance,
   reliabiliy, or data." Run by fresh agents from the code and the nodes only, no notes or
-  plans, once old-code removal, 0.92.6, the baselines and the libraries' work are done.
-- **Old code**: "This should be done right now, before anything else."
-- **0.92.6, one release, freeze exceptions**: `survey_by_diff` rethrows the stop; deletion marks a
-  multiset; `not_held`'s `others` loop pauses; the inventory walk gets a stop check; a read
-  failing on I/O keeps the object, only a record that reads and fails to open is removed
-  (`storage_pool.cpp:603` and kin); no storage online reads ready but degraded, so a node does not
-  crash-loop on its startup timeout (via Dagda); the `followed` path table fix; `query()`
-  and its predicates retired as dead code (via Dagda). Dagda matches these shapes.
+  plans, once old-code removal, 0.93.4, the baselines and the libraries' work are done.
 - **Design defects** (torrent merge associativity, no fence under a torrent claim, the local barrier's
   deadline, the sweep's mixed ages, the policy loop, O(state) per delta, wire-sized allocations, reload
   and `write_copies`, I/O and free-space reserves): left. "leave them, we need to get on with this."
-  He had understood they were in 0.92.6; they are not, and are not fixed.
+  He had understood they were in the fix group; they are not, and are not fixed.
 - **Staging**: stages, as many stops as needed, no flag-day worry ("its availability isn't critical",
   via Dagda). No soak between cutovers ("None"); a stage moves on when its tests pass. inverbeg comes
   back first. Disk does not wait for heads. Stage one: store, reachability provider, lease template,
@@ -92,29 +95,8 @@ confirmed, Pi and real IGD work held.
   is **required first**, before stage one, gated by every existing case on both sides.
 - **Real migration on a copy, there and back, and the inverbeg rehearsal: dropped for now**: "No drop
   that, I'll decide later." (This overrides what Dagda reported.)
-- **Baselines**: Macha's, after old-code removal and 0.92.6. **macnessa's drive**: no extended test.
+- **Baselines**: Macha's, after old-code removal and 0.93.4. **macnessa's drive**: no extended test.
 - **Older items**: parked in `BACKLOG.md`. Unused branches deleted.
-
-**Removal plan.** The condition the operator set is met: both nodes' heads are tree-backed (Cluster state), checked
-   with Macha's own decoder, and the only inline records anywhere are genesis
-   (generation 1, in every cluster) and the `*.pre-migration.*` archives. In
-   order, each a release with its tests rewritten: (a) found a namespace as a tree
-   at its first commit and require the namespace store (b080c38's 623c202), after
-   which no new cluster is ever inline; (b) remove `mutate()`, the migration tool,
-   `install_migrated_head` and `plan_namespace_migration` (5f6101c, 8fc5a68), and
-   delete the archives on the nodes; (c) make genesis a fixed tree-backed or
-   constant record so no founder decodes an inline snapshot (not in the branch),
-   then remove `encode_snapshot`, the SM5 to SM13, SM15 and SM18 decoders, the
-   mixed branch of `read_group` (`metadata_manager.cpp:1214`), `metadata_delta`'s
-   map diff and the inline-tombstone path of `maintain_tombstone_batches`; (d)
-   remove legacy authority: `required == 0` certificates, `migrate_legacy_head_locked`'s
-   legacy branch, `acceptance_matches_record_policy_locked`'s legacy clause,
-   `accept_pristine_genesis_authority_` and the `current.meta`/`committed.meta`
-   layout reader (`metadata.cpp:2412`), none of which has a live instance (both
-   certificates are `required=1`; no protocol-20 node exists). The legacy clock
-   (SM17, DLT10) is a live feature, not old code. Dagda counts 45 of the 69
-   `test_storage_metadata` cases as using a legacy form: that is the cost of (c)
-   and (d).
 
 ## Open work, in order
 
@@ -125,9 +107,6 @@ confirmed, Pi and real IGD work held.
    self-test unfinished when dropped, extended never run; the drive has no shock
    attribute, so this says little about the knock. Reports about 41,000 spindle hours
    against 13,426 power-on hours. `smartmontools` and `smartd` now on macnessa.
-   **Open defect, read not reproduced:** `storage_pool.cpp:603` deletes an object on any
-   read exception, so a read failing on I/O deletes a good object. It fired once at the
-   failure (`0ec5f3a8...`). In 0.92.6.
 0. **P0: macnessa SIGSEGV, 2026-11-05 02:05:25Z, on 0.92.4, cause unknown.** 25 min
    after the deploy; the first SIGSEGV of this boot (up since 11-03 23:27, every
    earlier exit a stop or SIGKILL). No core (soft limit 0, pattern `core`), no kernel
@@ -137,21 +116,20 @@ confirmed, Pi and real IGD work held.
    cores in `/mnt/diskB/crash` (mode 700; they hold keys and plaintext), set by
    `/etc/sysctl.d/90-macha-core.conf` and `macha.service.d/core-dumps.conf`; proven
    with a throwaway process. Read one against the tarball of the version that crashed, in `/root`.
-1. **P0: the stop.** Fixed in 0.92.4 for the survey: macnessa on 0.92.3 hung at
-   01:38:29Z, killed at 60 s, in `fill_path_table`; on 0.92.4 a stop 20 s after writable
-   took 6 s. One stop, not shown to have landed in a walk; no test of its own. The FUSE mount's
-   minute after start is recovery, not a defect (data ready +17 s, metadata +35
-   to +40 s at generation 100k, FUSE +42 s).
-2. **`feature/tree-native-namespace`** (b080c38, 4 WIP commits on 5a06d3c, unmerged,
-   the first part of the old-code removal). From its diff: founds a new namespace as a
-   tree at its first commit (develop founds inline, and only `macha-namespace-migrate`
-   makes a tree); removes `mutate()`, the migration tool, `install_migrated_head` and
-   `plan_namespace_migration`; requires the namespace store; skips re-accepting a head
-   whose certificate adds nothing; fixes the stale tombstone (taken as 0.92.5) and the
-   `followed` path table keeping a lost file complete (`availability_service.cpp:531`, on
-   develop by reading, not taken). It does **not** make genesis a constant
-   (`metadata.cpp:2294`), remove legacy authority or remove the inline decoders; earlier
-   notes said it did. It is the first part of the removal plan above.
+1. **P0: the stop.** The survey's walks and the inventory walk check it, with tests
+   (0.93.4). Not yet seen on a node: one stop on 0.92.4 took 6 s, none shown to have
+   landed in a walk. The release horizon's census (`namespace_references`) and the tree
+   diff under `census_follow` do not check it; each is bounded by what changed, except
+   a release build's first walk. The FUSE mount's minute after start is recovery, not a
+   defect (data ready +17 s, metadata +35 to +40 s at generation 100k, FUSE +42 s).
+2. **From the TV import's plan (job b2bf6286, read 2026-11-05).** 1,516 of 7,571 files were
+   planned under `/Movies`. 0.93.4's extras rule would have filed about 750, read by
+   simulating it over the plan. The rest it leaves: about 340 in extras folders of titles
+   with no probed episodes (House MD, Man to Man with Dean Learner, The Sopranos), and
+   about 430 not extras at all, mostly **real episodes that probe as films**: `House MD
+   Season 6 Episode 06`, `S01 - E15`, `Jail E30`, `Hornblower 04`, Star Trek TNG. That
+   probe is the larger defect, unfixed, for the operator. 1,286 of those files were already
+   imported under `/Movies` and stay there.
 3. **Books**, as the web client reported at 0.92.2 (49 books): the Discworld series
    holds 3 of 49; three books send a timestamp `published` (A Hat Full of Sky, Soul
    Music, I Shall Wear Midnight); **possible regression, unexamined:** 11 books
@@ -292,7 +270,7 @@ on control threads no longer grow with deletes. Left:
   tree-backed head, root `2fdd09bd...`, SM19 (`DHTMETB9`, 41,044 bytes) with the
   legacy clock set, 23 torrent requests, 347 tombstone batches, 11,112 tombstones,
   10 authors seen; tree 266 nodes, 8,713 entries, 1,251,866 extents, 63.6 MB;
-  generation about 129,500, rising about 20 a minute on 0.92.4 (Resume here, step 3). Re-rooted by
+  generation about 129,500, rising about 20 a minute on 0.92.4. Re-rooted by
   `macha-namespace-migrate` on 2026-11-03 16:04Z from an inline SM18 head of 2,567
   entries (21 MB); the `*.pre-migration.*` archives are still in
   `/var/lib/macha/metadata/` on both. Certificates `required=1`: nothing is on

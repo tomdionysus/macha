@@ -52,6 +52,14 @@ struct LocalStoreOptions {
     size_t ledger_cache_bytes{8ULL * 1024 * 1024};
 };
 
+// A record that was read in full and does not open: the bytes on the disk are
+// not this object. Any other exception from a read says the read did not
+// finish, and nothing about the object.
+class ObjectCorrupt final : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 // The device work behind LocalStore's object reads, object writes and pack
 // compaction, which the store does with its index mutex released. Handed to
 // the store at construction and owned by whoever constructed it, which keeps
