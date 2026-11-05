@@ -11,35 +11,23 @@ Alongside this file: `BACKLOG.md` (everything else, by area), `COMPLETED.md`,
 ## Resume here
 
 **Live.** macnessa (root@10.44.1.50, builds in `/home/tom/macha`) and inverbeg
-(root@inverbeg.macha.network) run **0.92.4**, one cluster, under `/usr/local`.
-Origin's develop and main are at cac5998, tag 0.92.4 on 70cf4a4.
+(root@inverbeg.macha.network) run **0.92.5**, one cluster, under `/usr/local`, installed
+2026-11-05 14:52Z and 14:54Z. Develop, main and tag 0.92.5 (808fa0f) are pushed.
 
-**Committed, gated, not deployed, not pushed: 0.92.5** on local develop: the stale
-tombstone in a batch (operator: "Yes fix now"; CHANGELOG). Gate on macnessa 747, 20
-and 21, `SUITE_RC=0`; `test_a_stale_tombstone_in_a_batch_is_erased_once` fails without
-the fix (laptop). `/root/macha-0.92.5.tgz` (md5 `4d58ff59...`) is on both nodes,
-`build/install-0.92.5.sh` here. The harness's permission classifier refused the install
-as a production deploy and needs the operator's word "deploy".
+**0.92.5 is proven on the nodes.** Before: every recent delta a 61-byte empty DLT5,
+about 20 commits a minute. After: generation 130,059 held still for 180 s on both, same
+head, whose last commit is one DLT11 with `batches+=1 batches-=2`, the fix doing its
+work once. Gate 747, 20 and 21. Not measured: whether the collectors now run. The 0.92.4
+stop took 3 s on macnessa, 4 s on inverbeg.
 
-**Next, in order, on his word:**
-1. inverbeg: `/root/stop-with-stacks.sh`, then the install script with
-   `TARBALL=/root/macha-0.92.5.tgz HEALTH=http://192.168.1.50:7438/api/v1/health`.
-2. macnessa: `/root/stop-with-stacks.sh`; with macha stopped, `/root/state-copy.sh`
-   (Dagda's real state, the operator's "use macnessa"; writes `/root/macha-state-<time>`
-   with `ORIGIN.txt`, leaving out the key, password, sessions, users and tmp); then the
-   install script with `HEALTH=http://10.44.1.50:7438/api/v1/health`.
-3. **Measure the fix; it is unproven on a node.** Before: every recent delta a 61-byte
-   empty DLT5, generation 128,954 to 129,512 in the 30 minutes to 14:34Z. After:
-   `build/macha-fixtures/gen/frame_forms.cpp` over both histories and the generation's
-   rate; the tombstone count should fall from 11,112 only by what is stale. If empty
-   deltas continue, the mechanism was wrong: report, do not patch.
-4. Tag 0.92.5 and push develop, main and the tag, on his word to push.
-5. Dagda: send the copy's path, the commit, the dump output (`macha-metadata-dump` on
-   the copy), then its `dagda-migrate --dry-run` on macnessa against the copy: build as
-   it specified under `/home/tom/dagda-linux`, throwaway custody in a scratch node-state,
-   whole output, elapsed time and disk back to it. The key stays on the node until he
-   rules otherwise. Copying the key-free copy to the laptop names the library: under
-   `build/` only.
+**Next:**
+1. Dagda's `dagda-migrate --dry-run` on macnessa against the copy at
+   `/root/macha-state-20261105T145340Z` (`ORIGIN.txt` says how it was taken; the loose sample
+   was copied after restart, from objects older than the stop; `macha-metadata-dump.txt`
+   beside it replays cleanly). Build as Dagda specified under `/home/tom/dagda-linux`,
+   throwaway custody in a scratch node-state, whole output, elapsed time and disk back to it.
+   The key stays on the node until the operator rules otherwise. The copy names the library.
+2. Answer whatever the libraries raise; otherwise the questions below wait on him.
 
 ## The port to Dannan and Dagda
 
@@ -64,7 +52,8 @@ confirmed, Pi and real IGD work held.
   not a ruling (Open work 2).
 - **Macha's code is frozen until the libraries are ready (operator, 2026-11-05):**
   "Macha has a working, tested codebase, this shouldn't be modified until they're
-  ready." One exception so far, 0.92.5, by his "Yes fix now". Artefacts for their
+  ready." One exception so far, 0.92.5, by his "Yes fix now"; deployed, so the
+  libraries' baseline is 808fa0f, which touches only `maintenance.cpp` and a test. Artefacts for their
   plans are fine, changing no tracked file, under `build/macha-fixtures/`, each with a
   README: `placement/`; `goldens/` (Status 381 of 494 keys by name, journal 31 of 83
   lines, 46 config fields, routes read from source); `state-scratch/` (inline, **not the
@@ -103,7 +92,7 @@ confirmed, Pi and real IGD work held.
    the startup timeout, so perhaps "ready, degraded".
 5. `mutate_delta`'s no-op (`metadata_manager.cpp:1919`) is unreachable, so a mutation
    that changes nothing still commits its clock. Macha's behaviour stands until he rules;
-   0.92.5 removes the one known source of such commits, not the rule. A policy commit
+   0.92.5 removed the source of such commits on the nodes, not the rule. A policy commit
    carries no dot (`:1376`).
 6. `read-ahead` in `frame_timings` and `read_ahead` in `traffic.classes` are the
    same class; unifying them is an API change for Core and the clients.
