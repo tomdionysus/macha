@@ -140,8 +140,8 @@ struct PersistedNodeStatus {
 };
 
 struct MetadataSnapshot {
-    // Legacy voter list: not authority, cleared on the first policy
-    // transition; kept in the SM10/DLT4 encoding so old state stays readable.
+    // Not authority, and no commit fills it: an SM14 slot, which a head's hash
+    // covers.
     std::vector<NodeId> metadata_voters;
     uint32_t data_replication{};
     uint64_t extent_size{};
@@ -170,14 +170,13 @@ struct MetadataSnapshot {
     // the legacy clock; none on a root set before that.
     MetadataDot catalogue_dot;
     std::optional<ObjectId> catalogue_root;
-    // SM14: the namespace tree root, carried instead of `entries`, never
-    // alongside; both encoders refuse the mix. See namespace_tree.hpp.
+    // The namespace tree root. A record carries this and never `entries`, which
+    // is the in-memory form of a tree merge and of founding. See namespace_tree.hpp.
     std::optional<ObjectId> namespace_root;
     std::map<std::string, FsEntry> entries;
-    // Tombstones held inline: an inline namespace's, and a tree-backed head's
-    // from before batches (moved into batches by maintenance).
+    // An SM14 slot no commit fills: tombstones live in batches.
     std::vector<GarbageRef> garbage;
-    // SM19: a tree-backed head's tombstones, by batch, sorted by id.
+    // SM19: the head's tombstones, by batch, sorted by id.
     std::vector<TombstoneBatch> tombstone_batches;
     // One coalesced last-known record per node; not a metrics history.
     std::map<NodeId, PersistedNodeStatus> node_status;
@@ -190,7 +189,7 @@ struct MetadataSnapshot {
     // Each conflict keeps its alternatives while the one its merge installed
     // stays in place; resolution is a later mutation.
     std::map<std::string, MetadataConflict, std::less<>> conflicts;
-    // Torrents requested for download, by request id (SM15/SM16).
+    // Torrents requested for download, by request id (SM16).
     std::map<std::string, TorrentRequest, std::less<>> torrent_requests;
 };
 // Immutable bytes with value semantics and shared storage, so copying a record
@@ -350,8 +349,8 @@ struct MetadataDelta {
     // DLT11: tombstone batches named and dropped, sorted by id.
     std::vector<TombstoneBatch> add_tombstone_batches;
     std::vector<ObjectId> drop_tombstone_batches;
-    // Never encoded: the tombstones a mutation makes in a tree-backed head,
-    // each group one batch at its time. The commit writes each batch object
+    // Never encoded: the tombstones a mutation makes, each group one batch at
+    // its time. The commit writes each batch object
     // and names it (add_tombstone_batches). See retire_objects().
     struct PendingTombstones {
         // Retired when the commit writes the batch, or at `retired_at_ns`.
@@ -378,19 +377,17 @@ void record_entry_change(MetadataDelta& delta, const std::string& path, const Fs
                          const FsEntry& after);
 
 // Strictly ordered by ObjectId, no duplicates.
-// Retires `ids` in the mutation `snapshot` and `delta` describe. In a
-// tree-backed head they join the mutation's one pending batch (the commit
-// writes it and names it); in an inline namespace each gets an inline
-// tombstone, a held one re-stamped later than it was.
-void retire_objects(MetadataSnapshot&, MetadataDelta&, std::vector<ObjectId> ids);
-// Every tombstone `snapshot` holds, inline and in its batches (each read by
-// `read_batch`), the latest retirement per object, sorted by id. A batch that
+// Retires `ids` in the mutation `delta` describes: they join its one pending
+// batch, which the commit writes and names.
+void retire_objects(MetadataDelta&, std::vector<ObjectId> ids);
+// Every tombstone `snapshot` holds (each batch read by `read_batch`), the
+// latest retirement per object, sorted by id. A batch that
 // cannot be read is left out and counted in `unreadable`.
 std::vector<GarbageRef>
 tombstones_of(const MetadataSnapshot&,
               const std::function<std::optional<Bytes>(const ObjectId&)>& read_batch,
               size_t* unreadable = nullptr);
-// How many tombstones `snapshot` names, inline and in batches.
+// How many tombstones `snapshot` names.
 uint64_t tombstone_count(const MetadataSnapshot&) noexcept;
 bool garbage_is_canonical(const std::vector<GarbageRef>&);
 // Stable sort into canonical order.
@@ -410,7 +407,6 @@ const FsEntry& later_entry(const FsEntry&, const FsEntry&);
 // `lookup` reads the snapshot's namespace when it is not held as a map.
 using NamespaceLookup = std::function<std::optional<FsEntry>(const std::string& path)>;
 size_t prune_superseded_conflicts(MetadataSnapshot&, const NamespaceLookup& lookup = {});
-Bytes encode_snapshot(const MetadataSnapshot&);
 MetadataSnapshot decode_snapshot(std::span<const uint8_t>);
 // SM14: the non-entry fields plus `namespace_root`, so the payload size is
 // independent of the library. Requires `namespace_root` set and `entries`

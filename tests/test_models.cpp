@@ -41,7 +41,7 @@ void check_snapshot_equal(const MetadataSnapshot& actual, const MetadataSnapshot
 }
 
 MACHA_FAST_TEST("models", test_metadata_delta_state_model) {
-    auto state = decode_snapshot(genesis_metadata().payload);
+    auto state = founded_snapshot();
     const auto mutator = model_node(1);
     const auto retire_node = model_node(2);
 
@@ -95,7 +95,7 @@ MACHA_FAST_TEST("models", test_metadata_delta_state_model) {
         check_snapshot_equal(applied, expected);
 
         // Snapshot serialisation must agree with the delta path at every state.
-        check_snapshot_equal(decode_snapshot(encode_snapshot(applied)), expected);
+        check_snapshot_equal(map_snapshot(tree_payload(applied)), expected);
         state = std::move(expected);
     }
 

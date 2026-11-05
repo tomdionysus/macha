@@ -495,8 +495,7 @@ class FileSystem final : public PublicationTarget {
                       std::optional<int64_t> mtime_override = {});
     static void require_parent(const NamespaceWorkingSet&, const std::string&);
     static std::optional<FsEntry> apply_namespace_mutation(
-        NamespaceWorkingSet&, MetadataSnapshot&, MetadataDelta&,
-        const FilesystemNamespaceMutation&);
+        NamespaceWorkingSet&, MetadataDelta&, const FilesystemNamespaceMutation&);
 
   public:
     // Removes the write staging files `node` left in `state_path/tmp` when it

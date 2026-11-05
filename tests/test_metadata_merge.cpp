@@ -27,7 +27,7 @@ struct Author {
 
     explicit Author(uint8_t tag, bool stamping = true) : stamps(stamping) {
         id.bytes[0] = tag;
-        head = decode_snapshot(genesis_metadata().payload);
+        head = founded_snapshot();
     }
 
     MetadataDot next() {
@@ -85,14 +85,14 @@ struct Author {
 };
 
 Hash256 head_of(const MetadataSnapshot& snapshot) {
-    return sha256(encode_snapshot(snapshot));
+    return sha256(tree_payload(snapshot));
 }
 
 // The merge, checked to be the same whichever head is named first.
 MetadataMergeResult merge(const MetadataSnapshot& a, const MetadataSnapshot& b) {
     auto forward = merge_metadata_heads(a, b, head_of(a), head_of(b));
     const auto backward = merge_metadata_heads(b, a, head_of(b), head_of(a));
-    CHECK(encode_snapshot(forward.snapshot) == encode_snapshot(backward.snapshot));
+    CHECK(tree_payload(forward.snapshot) == tree_payload(backward.snapshot));
     CHECK(forward.conflicts_created == backward.conflicts_created);
     return forward;
 }

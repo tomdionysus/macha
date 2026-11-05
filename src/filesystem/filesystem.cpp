@@ -1642,7 +1642,7 @@ void FileSystem::mkdir(const std::string& p, uint32_t mode, uint32_t uid, uint32
 }
 
 std::optional<FsEntry> FileSystem::apply_namespace_mutation(
-    NamespaceWorkingSet& working, MetadataSnapshot& s, MetadataDelta& delta,
+    NamespaceWorkingSet& working, MetadataDelta& delta,
     const FilesystemNamespaceMutation& op) {
     const auto& q = op.from;
     switch (op.kind) {
@@ -1701,7 +1701,7 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
         for (const auto& extent : entry->extents)
             if (!extent.hole)
                 retiring.push_back(extent.id);
-        retire_objects(s, delta, std::move(retiring));
+        retire_objects(delta, std::move(retiring));
         working.erase(q);
         return {};
     }
@@ -1735,7 +1735,7 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
                 for (const auto& extent : dst->extents)
                     if (!extent.hole)
                         retiring.push_back(extent.id);
-                retire_objects(s, delta, std::move(retiring));
+                retire_objects(delta, std::move(retiring));
             }
             working.erase(y);
         }
@@ -1796,7 +1796,7 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
 // Applies one batch's operations through the working set, as the largest
 // valid prefix unless `atomic`. Throws FsError when nothing of it can apply.
 void FileSystem::apply_namespace_batch_to(QueuedNamespaceBatch& batch, NamespaceWorkingSet& working,
-                                          MetadataSnapshot& snapshot, MetadataDelta& delta) {
+                                          MetadataSnapshot&, MetadataDelta& delta) {
     auto& result = batch.result;
     result.entries.assign(batch.operations.size(), std::nullopt);
     result.applied = 0;
@@ -1805,7 +1805,7 @@ void FileSystem::apply_namespace_batch_to(QueuedNamespaceBatch& batch, Namespace
     for (size_t i = 0; i < batch.operations.size(); ++i) {
         try {
             result.entries[i] =
-                apply_namespace_mutation(working, snapshot, delta, batch.operations[i]);
+                apply_namespace_mutation(working, delta, batch.operations[i]);
             ++result.applied;
         } catch (const FsError& error) {
             // No valid prefix, or all-or-nothing: throw. Otherwise commit
@@ -2396,7 +2396,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
             if (!extent.hole && !retained.contains(extent.id))
                 retiring.push_back(extent.id);
         }
-        retire_objects(s, delta, std::move(retiring));
+        retire_objects(delta, std::move(retiring));
 
         const FsEntry previous = current;
         current.size = z;

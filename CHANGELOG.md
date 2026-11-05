@@ -1,5 +1,15 @@
 # Current release
 
+## 0.93.3: genesis and the inline formats are gone
+
+Genesis is a fixed constant holding no tree, and a founder builds the root
+directory itself; a node still at genesis reads an empty root directory. The snapshot readers SM5 to SM13, SM15 and SM18 and the delta
+readers DLT1 to DLT4 are gone, with the map encoders; a record is SM14, SM16,
+SM17 or SM19 and a delta DLT5 to DLT11, byte for byte as before. Reconciliation
+refuses a head with no tree. Mutations retire objects only into tombstone
+batches, and maintenance no longer stamps, erases or moves inline tombstones.
+The `tombstones` maintenance trace line loses `stamp=`.
+
 ## 0.93.2: legacy authority is gone
 
 A record with no write floor is accepted only as genesis on a founder; any other
