@@ -79,6 +79,20 @@ Json catalogue_item_json(const CatalogueItem& item) {
     Json::Array artwork;
     for (const auto& art : item.artwork) artwork.push_back(artwork_json(art));
     out["artwork"] = std::move(artwork);
+    Json::Array authors;
+    for (const auto& id : item.author_ids) authors.emplace_back(id);
+    out["author_ids"] = std::move(authors);
+    Json::Array series;
+    for (const auto& ref : item.series) {
+        Json::Object value;
+        value["series_id"] = ref.series_id;
+        value["index"] = ref.index ? Json(*ref.index) : Json(nullptr);
+        series.push_back(Json(std::move(value)));
+    }
+    out["series"] = std::move(series);
+    out["language"] = item.language ? Json(*item.language) : Json(nullptr);
+    out["publisher"] = item.publisher ? Json(*item.publisher) : Json(nullptr);
+    out["published"] = item.published ? Json(*item.published) : Json(nullptr);
     out["revision"] = item.revision;
     out["updated_ns"] = item.updated_ns;
     return Json(std::move(out));
@@ -166,7 +180,8 @@ Json probe_json(const MediaProbeCandidate& candidate) {
     Json::Object out;
     const auto& probe = candidate.probe;
     out["kind"] = probe.kind == MediaProbeKind::movie ? "movie" :
-                  probe.kind == MediaProbeKind::episode ? "episode" : "track";
+                  probe.kind == MediaProbeKind::episode ? "episode" :
+                  probe.kind == MediaProbeKind::book ? "book" : "track";
     out["score"] = static_cast<int64_t>(candidate.score);
     out["generator"] = candidate.generator;
     out["title"] = probe.title;
@@ -178,6 +193,18 @@ Json probe_json(const MediaProbeCandidate& candidate) {
     out["album"] = probe.album;
     out["disc_number"] = probe.disc ? Json(static_cast<int64_t>(*probe.disc)) : Json(nullptr);
     out["track_number"] = probe.track ? Json(static_cast<int64_t>(*probe.track)) : Json(nullptr);
+    // A book's: its authors in credited order, the first for display, and
+    // its first series.
+    Json::Array authors;
+    for (const auto& author : probe.authors) authors.emplace_back(author);
+    out["authors"] = std::move(authors);
+    out["author"] = probe.authors.empty() ? std::string{} : probe.authors.front();
+    out["series_name"] = probe.book_series.empty() ? std::string{} : probe.book_series.front().name;
+    out["series_index"] = !probe.book_series.empty() && probe.book_series.front().index
+                              ? Json(*probe.book_series.front().index)
+                              : Json(nullptr);
+    out["isbn"] = probe.isbn ? Json(*probe.isbn) : Json(nullptr);
+    out["language"] = probe.language ? Json(*probe.language) : Json(nullptr);
     Json::Array evidence;
     for (const auto& value : candidate.evidence) evidence.emplace_back(value);
     out["evidence"] = std::move(evidence);
@@ -200,11 +227,13 @@ std::optional<CatalogueKind> leaf_kind(const std::vector<MediaProbeCandidate>& p
         case MediaProbeKind::movie: return CatalogueKind::movie;
         case MediaProbeKind::episode: return CatalogueKind::episode;
         case MediaProbeKind::track: return CatalogueKind::track;
+        case MediaProbeKind::book: return CatalogueKind::book;
         }
     }
     if (provider == "movies") return CatalogueKind::movie;
     if (provider == "tv") return CatalogueKind::episode;
     if (provider == "music") return CatalogueKind::track;
+    if (provider == "books") return CatalogueKind::book;
     return {};
 }
 
@@ -469,7 +498,63 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
         return out;
     }
 
-    throw std::runtime_error("kind must be movie, episode or track");
+    if (kind == "book") {
+        const auto title = required_string(root, "title");
+        const auto year = optional_i32(root, "year");
+        // Authors by name, or one existing author by id; a series by name
+        // with its index, or an existing series by id.
+        std::vector<std::string> author_names;
+        if (const auto* authors = root.find("authors"); authors && authors->isArray())
+            for (const auto& name : authors->asArray())
+                if (name.isString() && !name.asString().empty())
+                    author_names.push_back(name.asString());
+        if (const auto single = string_value(root, "author"); !single.empty())
+            author_names.insert(author_names.begin(), single);
+        const auto author_id = string_value(root, "author_id");
+        const auto series_title = string_value(root, "series");
+        const auto series_id = string_value(root, "series_id");
+        std::optional<double> series_index;
+        if (const auto* index = root.find("series_index"); index && index->isNumber())
+            series_index = index->asNumber();
+        if (author_names.empty() && author_id.empty())
+            throw std::runtime_error("a book needs authors or author_id");
+
+        std::vector<CatalogueItem> written;
+        CatalogueItem book = manual_base(CatalogueKind::book,
+                                         manual_id("book", title + "|" +
+                                                               (year ? std::to_string(*year) : "")),
+                                         title, synopsis);
+        book.year = year;
+        if (!author_id.empty()) {
+            book.author_ids.push_back(require_parent(catalogue, author_id, CatalogueKind::author).id);
+        }
+        for (const auto& name : author_names) {
+            auto author = manual_base(CatalogueKind::author, manual_id("author", name), name);
+            preserve_existing(catalogue, author);
+            if (std::find(book.author_ids.begin(), book.author_ids.end(), author.id) ==
+                book.author_ids.end())
+                book.author_ids.push_back(author.id);
+            written.push_back(std::move(author));
+        }
+        if (!series_id.empty()) {
+            book.series.push_back({require_parent(catalogue, series_id, CatalogueKind::series).id,
+                                   series_index});
+        } else if (!series_title.empty()) {
+            auto series = manual_base(CatalogueKind::series, manual_id("series", series_title),
+                                      series_title);
+            preserve_existing(catalogue, series);
+            book.series.push_back({series.id, series_index});
+            written.push_back(std::move(series));
+        }
+        book.media_ids.emplace_back(media_id);
+        preserve_existing(catalogue, book);
+        out.leaf_id = book.id;
+        written.push_back(std::move(book));
+        out.items = std::move(written);
+        return out;
+    }
+
+    throw std::runtime_error("kind must be movie, episode, track or book");
 }
 
 std::optional<CatalogueHint> actionable_hint(CatalogueHintQueue& hints, std::string_view id) {
@@ -931,8 +1016,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             const auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/manage/unmatched", local_waits));
             for (const auto& [_, item] : snapshot->items()) {
-                if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
-                    item.kind != CatalogueKind::track)
+                if (!catalogue_leaf_kind(item.kind))
                     continue;
                 for (const auto& media : item.media_ids) bound[media].push_back(&item);
             }
@@ -1008,6 +1092,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 item["year"] = result.year ? Json(static_cast<int64_t>(*result.year)) : Json(nullptr);
                 item["overview"] = result.overview;
                 if (result.kind == "album") item["artist"] = result.artist;
+                if (result.kind == "book") item["author"] = result.artist;
                 if (!result.catalogue_id.empty()) item["catalogue_item_id"] = result.catalogue_id;
                 results.push_back(Json(std::move(item)));
             }
@@ -1157,9 +1242,9 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 const auto item_id = required_string(root, "catalogue_item_id");
                 auto item = catalogue_.get(item_id);
                 if (!item) return http_error(404, "catalogue_item_not_found", "catalogue item not found");
-                if (item->kind != CatalogueKind::movie && item->kind != CatalogueKind::episode &&
-                    item->kind != CatalogueKind::track)
-                    return http_error(400, "not_playable_item", "files may be matched only to movies, episodes or tracks");
+                if (!catalogue_leaf_kind(item->kind))
+                    return http_error(400, "not_playable_item",
+                                      "files may be matched only to movies, episodes, tracks or books");
                 if (std::find(item->media_ids.begin(), item->media_ids.end(), current->second) == item->media_ids.end())
                     item->media_ids.push_back(current->second);
                 auto saved = catalogue_.upsert(*item, item->revision, frame_for(request.work));

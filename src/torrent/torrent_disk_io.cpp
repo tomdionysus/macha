@@ -2,6 +2,7 @@
 #include "torrent/torrent_disk_io.hpp"
 
 #include "log.hpp"
+#include "supervised.hpp"
 #include "torrent/torrent_extent_journal.hpp"
 
 #include <libtorrent/add_torrent_params.hpp>
@@ -143,9 +144,13 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         const auto threads = std::max<size_t>(1, hooks_.threads);
         workers_.reserve(threads);
         for (size_t i = 0; i < threads; ++i)
-            workers_.emplace_back([this] { worker(); });
+            workers_.emplace_back([this] {
+                run_supervised_once("torrent-disk-worker", [this] { worker(); });
+            });
         if (publishing()) {
-            publisher_ = std::thread([this] { publisher(); });
+            publisher_ = std::thread([this] {
+                run_supervised_once("torrent-disk-publisher", [this] { publisher(); });
+            });
             hooks_.verifications->attach(
                 [this](const std::string& save_path, int piece) { piece_verified(save_path, piece); },
                 [this](const std::string& save_path) { return publication(save_path); });
@@ -681,7 +686,15 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             auto job = std::move(storage->jobs.front());
             storage->jobs.pop_front();
             lock.unlock();
-            job();
+            // A job's failure is its own (each posts its error to libtorrent);
+            // one that escapes must not end the worker, or the queue stalls.
+            try {
+                job();
+            } catch (const std::exception& error) {
+                Log::warn(std::string("torrent disk job failed: ") + error.what());
+            } catch (...) {
+                Log::warn("torrent disk job failed: unknown exception");
+            }
             job = nullptr;
             lock.lock();
             if (storage->jobs.empty()) {

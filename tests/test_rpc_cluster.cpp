@@ -2194,15 +2194,21 @@ MACHA_TEST("rpc_cluster", test_rpc_call_fails_after_no_progress_deadline) {
     CHECK(waited >= 250ms);
     CHECK(waited < 2s);
 
-    // Slow-but-answering: finishes inside the deadline, no error.
+    // Slow-but-answering: finishes inside the deadline, no error. The gate's
+    // answer is checked after the join: a REQUIRE on another thread would
+    // end the process, not the case.
+    std::atomic_bool entered{false};
     std::thread releaser([&] {
-        REQUIRE(stuck_gate.wait_for_entries(2, 5s));
-        std::this_thread::sleep_for(150ms);
-        stuck_gate.open();
+        entered = stuck_gate.wait_for_entries(2, 5s);
+        if (entered) {
+            std::this_thread::sleep_for(150ms);
+            stuck_gate.open();
+        }
     });
     auto reply = client.call(endpoint, MessageType::have_object, Bytes{2}, 50ms, 2s);
-    CHECK(reply.message.type == MessageType::bool_reply);
     releaser.join();
+    REQUIRE(entered);
+    CHECK(reply.message.type == MessageType::bool_reply);
 
     // Zero deadline: healthy replies still come back straight away.
     auto pong = client.call(endpoint, MessageType::ping, {}, 50ms, 0ms);

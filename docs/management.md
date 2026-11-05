@@ -10,8 +10,8 @@ For one unmatched record:
 
 - `GET /api/v1/manage/unmatched/{id}` returns the failure plus local filename/tag probe hypotheses;
 - `GET /api/v1/manage/unmatched/{id}/matches?q=...&limit=...` searches existing catalogue leaf items as prospective manual bindings and answers `{query, matches}`; `limit` is 0..50 (default 12, otherwise `400 bad_limit`);
-- `POST /api/v1/manage/unmatched/{id}/match` with `{catalogue_item_id}` binds the immutable media identity to an existing movie, episode or track and answers `{"status": "ok", "item"}` (`400 not_playable_item` for any other kind, `404 catalogue_item_not_found` for an unknown item); with `{ref}` it matches to a provider record instead (see below);
-- `POST /api/v1/manage/unmatched/{id}/manual` creates normal manual catalogue metadata (including show/season or artist/album hierarchy as required), binds the file and answers `201` with `{leaf_item_id, items}` (see below);
+- `POST /api/v1/manage/unmatched/{id}/match` with `{catalogue_item_id}` binds the immutable media identity to an existing movie, episode, track or book and answers `{"status": "ok", "item"}` (`400 not_playable_item` for any other kind, `404 catalogue_item_not_found` for an unknown item); with `{ref}` it matches to a provider record instead (see below);
+- `POST /api/v1/manage/unmatched/{id}/manual` creates normal manual catalogue metadata (including show/season or artist/album hierarchy, or a book's authors and series, as required), binds the file and answers `201` with `{leaf_item_id, items}` (see below);
 - `POST /api/v1/manage/unmatched/{id}/retry` reopens normal scanner work at manual-rescan priority (`202`);
 - `DELETE /api/v1/manage/unmatched/{id}` deletes the media file through MachaDFS and clears the exception record.
 
@@ -21,13 +21,16 @@ A match by provider reference fetches the record, builds its hierarchy (reusing 
 
 - `tmdb:movie:<id>`;
 - `tmdb:tv:<id>` with `season_number` and `episode_number`;
-- `musicbrainz:release:<mbid>` with `track_number` and optionally `disc_number`.
+- `musicbrainz:release:<mbid>` with `track_number` and optionally `disc_number`;
+- `openlibrary:edition:<olid>` or `openlibrary:work:<olid>`, which need no numbers.
 
-It answers `200` with `status: matched`, `leaf_item_id` and the `items` written. Refusals leave the file unmatched: `400 bad_ref` (not one of the forms above), `400 not_playable_ref` (a show or release without its numbers), `400 provider_not_configured` (no TMDB token, or MusicBrainz disabled), `404 provider_not_found` (no such record, or no episode or track with those numbers), `503 provider_unavailable` (the provider could not be reached or failed). Editor requests use their own provider connections, outside the scanner's per-batch request budget; MusicBrainz requests from the editor and the scanner share one pacing of one a second.
+It answers `200` with `status: matched`, `leaf_item_id` and the `items` written. Refusals leave the file unmatched: `400 bad_ref` (not one of the forms above), `400 not_playable_ref` (a show or release without its numbers), `400 provider_not_configured` (no TMDB token, or MusicBrainz or Open Library disabled), `404 provider_not_found` (no such record, or no episode or track with those numbers), `503 provider_unavailable` (the provider could not be reached or failed). Editor requests use their own provider connections, outside the scanner's per-batch request budget; MusicBrainz requests from the editor and the scanner share one pacing of one a second, and Open Library requests another.
+
+An unmatched book's probes (`GET /api/v1/manage/unmatched/{id}`) carry `kind: "book"`, `authors` (credited order), `author` (the first), `series_name`, `series_index`, `isbn` and `language`, from the EPUB's own record or the path.
 
 ## Provider search
 
-`GET /api/v1/manage/providers/search?q=...&kind=movie|show|album&year=&artist=&limit=` searches the metadata provider for a kind: TMDB for `movie` and `show`, MusicBrainz releases for `album` (`artist` narrows to releases credited to that artist). `limit` is 1..50, default 10. It answers:
+`GET /api/v1/manage/providers/search?q=...&kind=movie|show|album|book&year=&artist=&limit=` searches the metadata provider for a kind: TMDB for `movie` and `show`, MusicBrainz releases for `album` (`artist` narrows to releases credited to that artist), Open Library works for `book` (`artist` is the author). `limit` is 1..50, default 10. It answers:
 
 ```json
 {"status": "ok", "results": [
@@ -37,7 +40,7 @@ It answers `200` with `status: matched`, `leaf_item_id` and the `items` written.
 ]}
 ```
 
-`ref` is what a match by provider reference takes. `year` is `null` when the provider gives none; an album result adds `artist`. `catalogue_item_id` is present when the catalogue already holds the item a match would write. Codes: `400 bad_query` (no `q`), `400 bad_kind`, `400 bad_year`, `400 bad_limit`, `400 provider_not_configured`, `503 provider_unavailable`.
+`ref` is what a match by provider reference takes. `year` is `null` when the provider gives none; an album result adds `artist`, a book result `author`. `catalogue_item_id` is present when the catalogue already holds the item a match would write. Codes: `400 bad_query` (no `q`), `400 bad_kind`, `400 bad_year`, `400 bad_limit`, `400 provider_not_configured`, `503 provider_unavailable`.
 
 ## Provider artwork
 
@@ -46,11 +49,12 @@ It answers `200` with `status: matched`, `leaf_item_id` and the `items` written.
 - `tmdb:movie:<id>` and `tmdb:tv:<id>`: `poster`, `backdrop`;
 - `tmdb:tv:<id>` with `season_number`: `poster` (the season's);
 - `tmdb:tv:<id>` with `season_number` and `episode_number`: `still`;
-- `musicbrainz:release:<mbid>`: `cover` (the Cover Art Archive's front images).
+- `musicbrainz:release:<mbid>`: `cover` (the Cover Art Archive's front images);
+- `openlibrary:edition:<olid>` and `openlibrary:work:<olid>`: `cover` (the record's covers).
 
 It answers `{"status": "ok", "options": [{option_id, role, width, height, language, preview_url}]}`. `width`, `height` and `language` are `null` when the provider does not say; `preview_url` is the provider's own small image, for the client to show directly.
 
-`POST /api/v1/manage/providers/artwork/choose` with `{item_id, role, option_id}` fetches that option at full size, stores it as catalogue artwork and makes it the item's only artwork for the role. The reference is the item's own: a TMDB movie or show is its own record, a season or episode is its show's with its own numbers, an album is its MusicBrainz release. An item with none (a manual item) names one with `ref` (and `season_number`, `episode_number`). The choice locks the item against the scanner unless the body says `"lock": false`. It answers `{"status": "chosen", "item": ...}`.
+`POST /api/v1/manage/providers/artwork/choose` with `{item_id, role, option_id}` fetches that option at full size, stores it as catalogue artwork and makes it the item's only artwork for the role. The reference is the item's own: a TMDB movie or show is its own record, a season or episode is its show's with its own numbers, an album is its MusicBrainz release, a book its Open Library edition or work. An item with none (a manual item) names one with `ref` (and `season_number`, `episode_number`). The choice locks the item against the scanner unless the body says `"lock": false`. It answers `{"status": "chosen", "item": ...}`.
 
 Codes, for both: `400 bad_ref`, `400 bad_role` (not a role that reference offers), `400 bad_number`, `400 provider_not_configured`, `404 provider_not_found`, `503 provider_unavailable`; for a choice also `404 not_found` (no such item), `400 no_provider_ref`, `404 option_not_found` (not an option the provider lists for that role now).
 
@@ -76,7 +80,8 @@ Provider search, artwork and release tracks need the manager role even to read, 
 Manual entry names its parents either by title or by id. By id, the item joins an existing hierarchy, such as a show the scanner matched, instead of creating a `manual:` one beside it:
 
 - an episode takes `season_id` (the episode takes that season's number), or `series_id` plus `season_number`, which reuses that show's season with the number or creates one under the show; otherwise `series`, `series_year`, `season_number` as titles;
-- a track takes `album_id`, or `artist_id` plus `album`, which reuses that artist's album with the title (and `year`, when given) or creates one under the artist; otherwise `artist`, `album` as titles.
+- a track takes `album_id`, or `artist_id` plus `album`, which reuses that artist's album with the title (and `year`, when given) or creates one under the artist; otherwise `artist`, `album` as titles;
+- a book (`kind: "book"`) takes `title`, its authors as `authors` (names, in credited order) or `author` (one name), or an existing author as `author_id`; optionally `year`, and a series as `series` (a name) with `series_index`, or an existing series as `series_id`. Authors and series named by title are created, or joined when an item of that name exists.
 
 Existing parents are referenced, never rewritten. A named id that does not exist is `404 parent_not_found`; one of the wrong kind is `400 bad_parent_kind`. Both state `error.parent_id`; `bad_parent_kind` adds `error.expected_kind` and `error.parent_kind`. The unmatched record is left in place when a request is refused.
 
