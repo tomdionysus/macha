@@ -21,12 +21,10 @@ work once. Gate 747, 20 and 21. Not measured: whether the collectors now run. Th
 stop took 3 s on macnessa, 4 s on inverbeg.
 
 **Next:**
-1. Dagda's `dagda-migrate --dry-run` on macnessa against the copy at
-   `/root/macha-state-20261105T145340Z` (`ORIGIN.txt` says how it was taken; the loose sample
-   was copied after restart, from objects older than the stop; `macha-metadata-dump.txt`
-   beside it replays cleanly). Build as Dagda specified under `/home/tom/dagda-linux`,
-   throwaway custody in a scratch node-state, whole output, elapsed time and disk back to it.
-   The key stays on the node until the operator rules otherwise. The copy names the library.
+1. Dagda's `dagda-migrate --dry-run` is done (`build/macha-fixtures/migrate-dryrun/`): on a
+   scratch copy of `/root/macha-state-20261105T145340Z`, exit 0, 12 s, 3.15 GB read, 0
+   written, no refusal. A sample and NVMe, so no figure for 4 TB on the USB disk. A real
+   run on a second copy, the there-and-back and the rehearsal are not done or asked for.
 2. Answer whatever the libraries raise; otherwise the questions below wait on him.
 
 ## The port to Dannan and Dagda
