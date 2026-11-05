@@ -122,6 +122,14 @@ class NodeRuntime : public ClusterNode {
     std::map<NodeId, Clock::time_point> dial_back_last_ MACHA_GUARDED_BY(dial_back_mutex_);
 
     std::atomic_uint64_t remote_metadata_generation_{};
+    // Raises it to `generation` if higher, never lowers it: two readers that
+    // each loaded, took their maximum and stored could put an older value back.
+    void raise_remote_metadata_generation(uint64_t generation) noexcept {
+        auto current = remote_metadata_generation_.load(std::memory_order_relaxed);
+        while (current < generation &&
+               !remote_metadata_generation_.compare_exchange_weak(current, generation)) {
+        }
+    }
     // Owned by the loop thread.
     std::optional<Clock::time_point> remote_generation_unbacked_since_;
     std::atomic_uint64_t remote_metadata_epoch_{};

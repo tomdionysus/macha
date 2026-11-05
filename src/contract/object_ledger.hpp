@@ -57,11 +57,12 @@ class ObjectLedger {
     static constexpr Waits retained_waits = ClaimStore::read_waits;
     static constexpr ThreadSafety retained_safety = ThreadSafety::thread_safe;
     virtual bool retained(RetentionClass, const ObjectId&) const = 0;
-    // The ClaimStore's guard: held across a "not claimed" check and the
-    // delete it justifies. A ledger with no claim store guards nothing.
-    static constexpr Waits claim_guard_waits = ClaimStore::guard_waits;
-    static constexpr ThreadSafety claim_guard_safety = ClaimStore::guard_safety;
-    virtual ClaimGuard claim_guard(const ObjectId&) const { return {}; }
+    // The ClaimStore's leave for a delete: no claim stands and the id is
+    // marked while the delete goes, or `claimed`. A ledger with no claim
+    // store refuses nothing and marks nothing.
+    static constexpr Waits claim_deletion_waits = ClaimStore::deletion_waits;
+    static constexpr ThreadSafety claim_deletion_safety = ClaimStore::deletion_safety;
+    virtual ClaimDeletion claim_deletion(RetentionClass, const ObjectId&) const { return {}; }
     // Releases claims `release` no longer refers to and whose writes its
     // clock has observed. Bounded. Single owner (the maintenance pass).
     static constexpr Waits release_waits = ClaimStore::release_waits;
