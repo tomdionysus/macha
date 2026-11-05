@@ -25,6 +25,9 @@ stop took 3 s on macnessa, 4 s on inverbeg.
    scratch copy of `/root/macha-state-20261105T145340Z`, exit 0, 12 s, 3.15 GB read, 0
    written, no refusal. A sample and NVMe, so no figure for 4 TB on the USB disk. A real
    run on a second copy, the there-and-back and the rehearsal are not done or asked for.
+   Dagda's reading of the copy's control packs: 313,783 puts and 1,883,019 touches over
+   311,000 ids (top id 28,104), about 235 MB, 9% of those packs. Callers not traced; whether
+   0.92.5 reduced them not measured. Open, not urgent: compare a pack's touch rate.
 2. Answer whatever the libraries raise; otherwise the questions below wait on him.
 
 ## The port to Dannan and Dagda
