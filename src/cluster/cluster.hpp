@@ -51,6 +51,9 @@ struct InboundResolution {
 struct NodeReadiness {
     bool control_plane_online{};
     bool data_storage_ready{};
+    // Ready, with disks configured and none of them online: the node runs, and
+    // holds no extents until one comes back.
+    bool data_storage_degraded{};
     bool control_storage_ready{};
     bool cache_ready{};
     bool retention_ready{};
