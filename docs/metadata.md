@@ -124,7 +124,9 @@ rounding error. Three rules keep it that way:
   alive like the tree's nodes. Maintenance reads every tombstone from the
   batches (the latest retirement per object wins), and drops a batch whole
   once `maintenance.garbage_grace_ms` has passed since its retirement, as its
-  tombstones retire together. An inline namespace keeps its tombstones in
+  tombstones retire together. A tombstone made stale by its content being
+  written again drops its batch at once, and the rest of the batch is written
+  again at its own retirement time. An inline namespace keeps its tombstones in
   the snapshot (`garbage`, in canonical ObjectId order, DLT7), erased after
   the same grace; a tree-backed head migrated from one has its inline
   tombstones moved into batches by maintenance, an hour of retirements to a

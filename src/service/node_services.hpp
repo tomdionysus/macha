@@ -9,6 +9,9 @@
 #include "catalogue/catalogue.hpp"
 #include "catalogue/catalogue_installer.hpp"
 #include "catalogue/catalogue_hints.hpp"
+#if MACHA_HAVE_BOOKS
+#include "catalogue/book_conversion.hpp"
+#endif
 #include "catalogue/cluster_unmatched.hpp"
 #include "catalogue/media_catalogue.hpp"
 #include "catalogue/media_information.hpp"
@@ -163,6 +166,10 @@ class NodeServices {
     ClusterUnmatchedView cluster_unmatched_;
     TorrentCoordinator torrent_coordinator_;
     AcquisitionApi acquisition_api_;
+#if MACHA_HAVE_BOOKS
+    // Present when books.conversion is enabled.
+    std::unique_ptr<BookConversions> book_conversions_;
+#endif
     CatalogueApi catalogue_api_;
     ManageApi manage_api_;
     PlaybackManager streaming_;

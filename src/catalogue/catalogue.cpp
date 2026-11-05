@@ -16,8 +16,11 @@
 namespace macha {
 namespace {
 constexpr std::array<uint8_t, 8> legacy_magic{'M', 'C', 'A', 'T', '0', '0', '1', '8'};
-// 0022 adds media indexes after the profiles; 0021 shards are still read.
-constexpr std::array<uint8_t, 8> magic{'M', 'C', 'A', 'T', '0', '0', '2', '2'};
+// 0023 adds a book's authors, series, language, publisher and date to each
+// item; 0022 added media indexes after the profiles. Older shards are still
+// read; every write is 0023.
+constexpr std::array<uint8_t, 8> magic{'M', 'C', 'A', 'T', '0', '0', '2', '3'};
+constexpr std::array<uint8_t, 8> magic_0022{'M', 'C', 'A', 'T', '0', '0', '2', '2'};
 constexpr std::array<uint8_t, 8> magic_0021{'M', 'C', 'A', 'T', '0', '0', '2', '1'};
 constexpr std::array<uint8_t, 8> manifest_magic{'M', 'C', 'R', 'O', 'O', 'T', '1', '8'};
 
@@ -204,7 +207,35 @@ Map rebuild_slot(const Map* before, const Map& after,
 
 bool valid_kind(uint8_t value) {
     return value >= static_cast<uint8_t>(CatalogueKind::movie) &&
-           value <= static_cast<uint8_t>(CatalogueKind::track);
+           value <= static_cast<uint8_t>(CatalogueKind::series);
+}
+
+void optional_string(Writer& w, const std::optional<std::string>& value) {
+    w.u8(value.has_value());
+    if (value)
+        w.string(*value);
+}
+
+std::optional<std::string> optional_string(Reader& r) {
+    if (!r.u8())
+        return {};
+    return r.string(1024 * 1024);
+}
+
+// A double as its bit pattern; the series index is the only one stored.
+void optional_f64(Writer& w, const std::optional<double>& value) {
+    w.u8(value.has_value());
+    if (value)
+        w.u64(std::bit_cast<uint64_t>(*value));
+}
+
+std::optional<double> optional_f64(Reader& r) {
+    if (!r.u8())
+        return {};
+    const auto value = std::bit_cast<double>(r.u64());
+    if (!std::isfinite(value))
+        throw DecodeError("bad catalogue series index");
+    return value;
 }
 
 bool valid_stream_type(uint8_t value) {
@@ -531,6 +562,15 @@ Bytes encode_catalogue(const CatalogueSnapshot& snapshot) {
         }
         w.u64(item.revision);
         w.i64(item.updated_ns);
+        string_vector(w, item.author_ids);
+        w.u32(item.series.size());
+        for (const auto& ref : item.series) {
+            w.string(ref.series_id);
+            optional_f64(w, ref.index);
+        }
+        optional_string(w, item.language);
+        optional_string(w, item.publisher);
+        optional_string(w, item.published);
     }
     w.u32(snapshot.media_profiles.size());
     for (const auto& [media_id, profile] : snapshot.media_profiles) {
@@ -552,7 +592,9 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
     auto m = r.raw(magic.size());
     const bool legacy = std::equal(m.begin(), m.end(), legacy_magic.begin());
     const bool v0021 = std::equal(m.begin(), m.end(), magic_0021.begin());
-    if (!legacy && !v0021 && !std::equal(m.begin(), m.end(), magic.begin()))
+    const bool v0022 = std::equal(m.begin(), m.end(), magic_0022.begin());
+    const bool current = std::equal(m.begin(), m.end(), magic.begin());
+    if (!legacy && !v0021 && !v0022 && !current)
         throw DecodeError("bad catalogue snapshot");
     auto count = r.u32();
     if (count > 1000000)
@@ -598,6 +640,22 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
         }
         item.revision = r.u64();
         item.updated_ns = r.i64();
+        if (current) {
+            item.author_ids = string_vector(r, 100000);
+            const auto series_count = r.u32();
+            if (series_count > 100000)
+                throw DecodeError("too many catalogue series references");
+            item.series.reserve(series_count);
+            for (uint32_t j = 0; j < series_count; ++j) {
+                CatalogueSeriesRef ref;
+                ref.series_id = r.string(1024 * 1024);
+                ref.index = optional_f64(r);
+                item.series.push_back(std::move(ref));
+            }
+            item.language = optional_string(r);
+            item.publisher = optional_string(r);
+            item.published = optional_string(r);
+        }
         if (item.id.empty() || !item.revision || !snapshot.items.emplace(item.id, item).second)
             throw DecodeError("invalid or duplicate catalogue item");
     }
@@ -695,10 +753,18 @@ std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
     }
 
     // A parent deletion on one branch with a child change on the other is not
-    // merged; the root conflict stays durable.
-    for (const auto& [_, item] : merged.items)
+    // merged; the root conflict stays durable. A book's authors and series
+    // are held the same way.
+    for (const auto& [_, item] : merged.items) {
         if (item.parent_id && !merged.items.contains(*item.parent_id))
             return {};
+        for (const auto& author : item.author_ids)
+            if (!merged.items.contains(author))
+                return {};
+        for (const auto& ref : item.series)
+            if (!merged.items.contains(ref.series_id))
+                return {};
+    }
     return merged;
 }
 
@@ -729,6 +795,15 @@ uint64_t catalogue_resident_bytes(const CatalogueSnapshot& snapshot) {
             resident::string(total, art.role);
             resident::string(total, art.mime_type);
         }
+        resident::vector(total, item.author_ids);
+        for (const auto& author : item.author_ids)
+            resident::string(total, author);
+        resident::vector(total, item.series);
+        for (const auto& ref : item.series)
+            resident::string(total, ref.series_id);
+        for (const auto* text : {&item.language, &item.publisher, &item.published})
+            if (*text)
+                resident::string(total, **text);
     }
     resident::map_nodes(total, snapshot.media_profiles);
     for (const auto& [media_id, profile] : snapshot.media_profiles) {
@@ -765,8 +840,35 @@ std::string catalogue_kind_name(CatalogueKind kind) {
     case CatalogueKind::artist: return "artist";
     case CatalogueKind::album: return "album";
     case CatalogueKind::track: return "track";
+    case CatalogueKind::book: return "book";
+    case CatalogueKind::author: return "author";
+    case CatalogueKind::series: return "series";
     }
     return "unknown";
+}
+
+bool catalogue_leaf_kind(CatalogueKind kind) noexcept {
+    return kind == CatalogueKind::movie || kind == CatalogueKind::episode ||
+           kind == CatalogueKind::track || kind == CatalogueKind::book;
+}
+
+bool catalogue_referenced_kind(CatalogueKind kind) noexcept {
+    return kind == CatalogueKind::author || kind == CatalogueKind::series;
+}
+
+bool catalogue_item_locked(const CatalogueItem& item) noexcept {
+    const auto lock = item.external_ids.find("macha_metadata_locked");
+    return lock != item.external_ids.end() && lock->second == "1";
+}
+
+bool CatalogueItem::refers_to(std::string_view id) const noexcept {
+    for (const auto& author : author_ids)
+        if (author == id)
+            return true;
+    for (const auto& ref : series)
+        if (ref.series_id == id)
+            return true;
+    return false;
 }
 
 std::optional<CatalogueKind> parse_catalogue_kind(std::string_view value) {
@@ -777,6 +879,9 @@ std::optional<CatalogueKind> parse_catalogue_kind(std::string_view value) {
     if (value == "artist") return CatalogueKind::artist;
     if (value == "album") return CatalogueKind::album;
     if (value == "track") return CatalogueKind::track;
+    if (value == "book") return CatalogueKind::book;
+    if (value == "author") return CatalogueKind::author;
+    if (value == "series") return CatalogueKind::series;
     return {};
 }
 
@@ -792,6 +897,38 @@ std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueView& c
         if (!parent || parent->kind != CatalogueKind::album)
             return {};
         return parent->artwork;
+    }
+
+    // An author or series without artwork of its own shows a book's: the
+    // first in the series, else the first by sort title.
+    if (catalogue_referenced_kind(item.kind)) {
+        const CatalogueItem* chosen = nullptr;
+        std::optional<double> chosen_index;
+        for (const auto& [_, candidate] : catalogue.items()) {
+            if (candidate.kind != CatalogueKind::book || candidate.artwork.empty() ||
+                !candidate.refers_to(item.id))
+                continue;
+            std::optional<double> index;
+            for (const auto& ref : candidate.series)
+                if (ref.series_id == item.id)
+                    index = ref.index;
+            const auto candidate_sort =
+                candidate.sort_title.empty() ? candidate.title : candidate.sort_title;
+            const auto chosen_sort =
+                !chosen ? std::string{}
+                        : (chosen->sort_title.empty() ? chosen->title : chosen->sort_title);
+            const bool earlier =
+                !chosen || (index.has_value() != chosen_index.has_value() ? index.has_value()
+                            : index && chosen_index && *index != *chosen_index
+                                ? *index < *chosen_index
+                                : std::tie(candidate_sort, candidate.id) <
+                                      std::tie(chosen_sort, chosen->id));
+            if (earlier) {
+                chosen = &candidate;
+                chosen_index = index;
+            }
+        }
+        return chosen ? chosen->artwork : std::vector<CatalogueArtwork>{};
     }
 
     if (item.kind != CatalogueKind::artist)
@@ -1405,13 +1542,16 @@ size_t CatalogueManager::prune_media_profiles(
 }
 
 std::vector<CatalogueItem> CatalogueManager::list(std::optional<CatalogueKind> kind,
-                                                  std::optional<std::string_view> parent) {
+                                                  std::optional<std::string_view> parent,
+                                                  std::optional<std::string_view> refers_to) {
     auto snapshot = current_snapshot();
     std::vector<CatalogueItem> out;
     for (const auto& [_, item] : snapshot->items()) {
         if (kind && item.kind != *kind)
             continue;
         if (parent && (!item.parent_id || *item.parent_id != *parent))
+            continue;
+        if (refers_to && !item.refers_to(*refers_to))
             continue;
         out.push_back(item);
     }
@@ -1814,20 +1954,47 @@ CatalogueClearResult CatalogueManager::clear_metadata_with_media(
     if (expected_revision && root->revision != *expected_revision)
         revision_changed(root->id, *expected_revision, root->revision);
 
-    // Removes the entity and its descendants, returning their media ids so the
-    // caller can re-enrich only those files.
+    // Removes the entity and its descendants (an author's or series' books
+    // among them), returning their media ids so the caller can re-enrich
+    // only those files.
     std::set<std::string> removed_ids{root->id};
     bool grew = true;
     while (grew) {
         grew = false;
         current.for_each_item([&](const std::string& candidate_id, const CatalogueItem& candidate) {
-            if (removed_ids.contains(candidate_id) || !candidate.parent_id)
+            if (removed_ids.contains(candidate_id))
                 return;
-            if (removed_ids.contains(*candidate.parent_id)) {
+            const bool beneath =
+                (candidate.parent_id && removed_ids.contains(*candidate.parent_id)) ||
+                std::any_of(removed_ids.begin(), removed_ids.end(),
+                            [&](const std::string& id) { return candidate.refers_to(id); });
+            if (beneath) {
                 removed_ids.insert(candidate_id);
                 grew = true;
             }
         });
+    }
+    // An author or series the removed books alone referred to goes with them.
+    for (;;) {
+        std::vector<std::string> orphaned;
+        current.for_each_item([&](const std::string& id, const CatalogueItem& item) {
+            if (removed_ids.contains(id) || !catalogue_referenced_kind(item.kind) ||
+                catalogue_item_locked(item))
+                return;
+            bool referenced = false;
+            current.for_each_item([&](const std::string& other_id, const CatalogueItem& other) {
+                referenced = referenced || (!removed_ids.contains(other_id) && other.refers_to(id));
+            });
+            bool referenced_by_removed = false;
+            for (const auto& removed : removed_ids)
+                if (const auto* gone = current.item(removed))
+                    referenced_by_removed = referenced_by_removed || gone->refers_to(id);
+            if (!referenced && referenced_by_removed)
+                orphaned.push_back(id);
+        });
+        if (orphaned.empty())
+            break;
+        removed_ids.insert(orphaned.begin(), orphaned.end());
     }
 
     std::set<std::string> media_ids;
@@ -1885,13 +2052,11 @@ CatalogueUnbindResult CatalogueManager::unbind_media(std::optional<std::string_v
         std::erase(item.media_ids, std::string(media_id));
         ++item.revision;
         item.updated_ns = now;
-        const bool leaf = item.kind == CatalogueKind::movie ||
-                          item.kind == CatalogueKind::episode ||
-                          item.kind == CatalogueKind::track;
-        if (leaf && item.media_ids.empty())
+        if (catalogue_leaf_kind(item.kind) && item.media_ids.empty())
             emptied.push_back(id);
     }
-    // Each removal may leave its parent with no children: walk up from it.
+    // Each removal may leave its parent with no children, or an author or
+    // series with no book: walk up from it.
     while (!emptied.empty()) {
         const auto id = emptied.back();
         emptied.pop_back();
@@ -1899,17 +2064,29 @@ CatalogueUnbindResult CatalogueManager::unbind_media(std::optional<std::string_v
         if (!found)
             continue;
         const auto parent = found->parent_id;
+        auto referenced = found->author_ids;
+        for (const auto& ref : found->series)
+            referenced.push_back(ref.series_id);
         current.erase(id);
         result.removed_ids.push_back(id);
-        if (!parent)
-            continue;
-        bool has_child = false;
-        current.for_each_item([&](const std::string&, const CatalogueItem& candidate) {
-            has_child = has_child || (candidate.parent_id && *candidate.parent_id == *parent);
-        });
-        const auto* above = current.item(*parent);
-        if (!has_child && above && above->media_ids.empty())
-            emptied.push_back(*parent);
+        if (parent) {
+            bool has_child = false;
+            current.for_each_item([&](const std::string&, const CatalogueItem& candidate) {
+                has_child = has_child || (candidate.parent_id && *candidate.parent_id == *parent);
+            });
+            const auto* above = current.item(*parent);
+            if (!has_child && above && above->media_ids.empty())
+                emptied.push_back(*parent);
+        }
+        for (const auto& reference : referenced) {
+            bool has_book = false;
+            current.for_each_item([&](const std::string&, const CatalogueItem& candidate) {
+                has_book = has_book || candidate.refers_to(reference);
+            });
+            const auto* item = current.item(reference);
+            if (!has_book && item && !catalogue_item_locked(*item))
+                emptied.push_back(reference);
+        }
     }
     if (item_id)
         if (const auto* kept = current.item(*item_id))
@@ -1959,7 +2136,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                                          std::optional<Hash256> expected_namespace,
                                          const std::map<std::string, MediaProbeResult, std::less<>>& profiles,
                                          const std::set<std::string>& vanished_media,
-                                         FrameType frame) {
+                                         FrameType frame,
+                                         const std::map<std::string, std::set<std::string>>& superseded) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
     auto [expected_root, view] = installed();
@@ -1982,7 +2160,10 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                a.season_number == b.season_number && a.episode_number == b.episode_number &&
                a.disc_number == b.disc_number && a.track_number == b.track_number &&
                a.aliases == b.aliases && a.external_ids == b.external_ids &&
-               a.media_ids == b.media_ids && a.artwork == b.artwork;
+               a.media_ids == b.media_ids && a.artwork == b.artwork &&
+               a.author_ids == b.author_ids && a.series == b.series &&
+               a.language == b.language && a.publisher == b.publisher &&
+               a.published == b.published;
     };
 
     for (auto item : discovered) {
@@ -2039,15 +2220,55 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
         changed = true;
     }
 
+    // A replaced scanner item gives up the files its replacement took, and
+    // goes when it has none left; an author or series it alone named goes
+    // with it.
+    if (!superseded.empty()) {
+        std::set<std::string> discovered_ids;
+        for (const auto& item : discovered) discovered_ids.insert(item.id);
+        for (const auto& [id, files] : superseded) {
+            if (discovered_ids.contains(id)) continue;
+            const auto* found = current.item(id);
+            if (!found || catalogue_item_locked(*found)) continue;
+            auto item = *found;
+            std::erase_if(item.media_ids, [&](const std::string& media) { return files.contains(media); });
+            if (item.media_ids.empty()) {
+                current.erase(id);
+            } else {
+                ++item.revision;
+                item.updated_ns = wall_time_ns();
+                current.put(std::move(item));
+            }
+            changed = true;
+        }
+        for (bool removed = true; removed;) {
+            removed = false;
+            std::set<std::string> referenced;
+            current.for_each_item([&](const std::string&, const CatalogueItem& item) {
+                referenced.insert(item.author_ids.begin(), item.author_ids.end());
+                for (const auto& ref : item.series) referenced.insert(ref.series_id);
+            });
+            std::vector<std::string> orphans;
+            current.for_each_item([&](const std::string& id, const CatalogueItem& item) {
+                const auto marker = item.external_ids.find("macha_scanner");
+                const bool scanner = marker != item.external_ids.end() && marker->second == "1";
+                if (scanner && catalogue_referenced_kind(item.kind) && !catalogue_item_locked(item) &&
+                    !referenced.contains(id))
+                    orphans.push_back(id);
+            });
+            for (const auto& id : orphans) {
+                current.erase(id);
+                removed = true;
+            }
+        }
+    }
+
     if (prune_missing) {
         const auto scanner_made = [](const CatalogueItem& item) {
             const auto marker = item.external_ids.find("macha_scanner");
             return marker != item.external_ids.end() && marker->second == "1";
         };
-        const auto leaf = [](const CatalogueItem& item) {
-            return item.kind == CatalogueKind::movie || item.kind == CatalogueKind::episode ||
-                   item.kind == CatalogueKind::track;
-        };
+        const auto leaf = [](const CatalogueItem& item) { return catalogue_leaf_kind(item.kind); };
         // Only scanner-owned leaf bindings are reconciled; a manual item may
         // bind a file outside the catalogue roots, so it loses only files gone
         // from the namespace altogether.
@@ -2087,7 +2308,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
             changed = true;
         }
 
-        // Bottom-up removal of empty scanner-created hierarchy nodes.
+        // Bottom-up removal of empty scanner-created hierarchy nodes, and of
+        // scanner-created authors and series no book names any more.
         const auto parent_kind = [](const CatalogueItem& item) {
             return item.kind == CatalogueKind::show || item.kind == CatalogueKind::season ||
                    item.kind == CatalogueKind::artist || item.kind == CatalogueKind::album;
@@ -2096,13 +2318,20 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
         while (removed) {
             removed = false;
             std::set<std::string> parents;
+            std::set<std::string> referenced;
             current.for_each_item([&](const std::string&, const CatalogueItem& item) {
                 if (item.parent_id)
                     parents.insert(*item.parent_id);
+                referenced.insert(item.author_ids.begin(), item.author_ids.end());
+                for (const auto& ref : item.series)
+                    referenced.insert(ref.series_id);
             });
             std::vector<std::string> childless;
             current.for_each_item([&](const std::string& id, const CatalogueItem& item) {
-                if (scanner_made(item) && parent_kind(item) && !parents.contains(id))
+                if (!scanner_made(item))
+                    return;
+                if ((parent_kind(item) && !parents.contains(id)) ||
+                    (catalogue_referenced_kind(item.kind) && !referenced.contains(id)))
                     childless.push_back(id);
             });
             for (const auto& id : childless) {
@@ -2414,8 +2643,12 @@ size_t CatalogueManager::control_gc_step(const IdLookup& live,
                 continue;
 
             // cache() takes this mutex to publish a new root, so GC never races
-            // a root transition and deletes its staging.
-            if (!waited || ledger_.retained(RetentionClass::control, *id))
+            // a root transition and deletes its staging. The claim deletion
+            // keeps a claim from landing between its check and the delete.
+            if (!waited)
+                continue;
+            const auto deletion = ledger_.claim_deletion(RetentionClass::control, *id);
+            if (deletion.claimed())
                 continue;
             if (local_.control().remove_if_older_than(*id, grace)) {
                 control_gc_unreferenced_epoch_.erase(seen);

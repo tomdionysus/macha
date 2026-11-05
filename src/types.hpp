@@ -58,9 +58,9 @@ struct NodeInfo {
     uint64_t used{};
     uint64_t seen_unix_ms{};
     uint64_t metadata_generation{};
-    // Metadata safety floor. Every metadata-capable node must advertise the same
-    // value; mismatches fail closed so a weaker node cannot mint an acceptance
-    // certificate.
+    // The metadata write floor this node seeks. Every node is expected to
+    // advertise the same value; a mismatch counts as a membership change and
+    // shows in Status, and the nodes still share one namespace.
     uint32_t metadata_write_replicas_required{};
     // node_flag_* bits. `inbound_capable` clear means peers must never dial
     // this node's advertised endpoint: it reaches them, they answer over the

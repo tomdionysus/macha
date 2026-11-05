@@ -108,8 +108,9 @@ ItemAvailabilityTable item_availability(const CatalogueView& catalogue,
         entry.status = best;
         with_files.push_back(&item);
     }
-    // Each is a member of every set above it. A parent chain longer than the
-    // catalogue has a cycle in it and is abandoned.
+    // Each is a member of every set above it, and a book of every author and
+    // series it names. A parent chain longer than the catalogue has a cycle
+    // in it and is abandoned.
     for (const auto* item : with_files) {
         const auto own = table.at(item->id).status;
         const CatalogueItem* at = item;
@@ -120,6 +121,12 @@ ItemAvailabilityTable item_availability(const CatalogueView& catalogue,
             count(table[parent->id], own);
             at = parent;
         }
+        for (const auto& author : item->author_ids)
+            if (catalogue.item(author))
+                count(table[author], own);
+        for (const auto& ref : item->series)
+            if (catalogue.item(ref.series_id))
+                count(table[ref.series_id], own);
     }
     for (auto& [id, entry] : table)
         if (entry.members)
