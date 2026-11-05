@@ -134,3 +134,36 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
 - A dead citation in `archive/2026-09-03-playback-resilience-and-av-sync-plan.md:83`;
   unticked boxes in the namespace-publication archive doc; COMPLETED's note
   that 0.24.1 to 0.35.0 is not ledgered.
+
+## Parked for after the refactor (operator, 2026-11-05)
+
+- The replication-by-diff proposal's three open questions.
+- **Lost posters on the viewer's path**: the artwork route could answer 404
+  at once for an object the last survey found no node holding (442 catalogue
+  objects today), saving 1 to 2 s per showing; the cost is that a poster a
+  peer gained since that survey is refused until the next one. Or the
+  catalogue re-fetches lost artwork from its provider and nothing changes on
+  the read path.
+- The bootstrap test (`test_two_node_mutual_bootstrap_metadata_write_floor`): the first write waits for the bootstrap
+  checkpoint survey (not the availability survey), or the test retries the
+  refusal.
+- The memory limit to set on each node (section 3, Memory).
+- CPU priority for background work: `nice` or `SCHED_IDLE` for repair,
+  scrub, transcode and libtorrent threads, a cap on encoder threads, or a
+  systemd `CPUWeight`.
+- The size of a viewer rate reserve on a node's uplink: a fixed figure or a
+  share of the measured link (repair yields time, not rate).
+- [Cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md): a
+  proposal with six questions. Its memory section is partly overtaken by
+  0.90.69/70 (one limit, every part reported).
+- Metadata editor B: the choice of fields.
+- Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
+- A `CONTRIBUTING.md` line: "A new gate may pace lower-class work; it may
+  never stop it."
+- The replica's applier lifetime.
+- Operator question: a configured DATA disk not yet online reads every
+  extent it holds `unavailable` (seen on fi-1 after a reboot, about 1M for two
+  to nine minutes until the USB disk mounted); Core's web queue drops
+  unavailable titles. Should it read `unknown` until the disk comes up?
+- From the backlog: anonymous access; whether a client should know a
+  playback generation existed anywhere in the cluster.

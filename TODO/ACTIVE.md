@@ -20,15 +20,13 @@ head, whose last commit is one DLT11 with `batches+=1 batches-=2`, the fix doing
 work once. Gate 747, 20 and 21. Not measured: whether the collectors now run. The 0.92.4
 stop took 3 s on macnessa, 4 s on inverbeg.
 
-**Next:**
-1. Dagda's `dagda-migrate --dry-run` is done (`build/macha-fixtures/migrate-dryrun/`): on a
-   scratch copy of `/root/macha-state-20261105T145340Z`, exit 0, 12 s, 3.15 GB read, 0
-   written, no refusal. A sample and NVMe, so no figure for 4 TB on the USB disk. A real
-   run on a second copy, the there-and-back and the rehearsal are not done or asked for.
-   Dagda's reading of the copy's control packs: 313,783 puts and 1,883,019 touches over
-   311,000 ids (top id 28,104), about 235 MB, 9% of those packs. Callers not traced; whether
-   0.92.5 reduced them not measured. Open, not urgent: compare a pack's touch rate.
-2. Answer whatever the libraries raise; otherwise the questions below wait on him.
+**Next, in the operator's order (2026-11-05):**
+1. **Remove the old code, "right now, before anything else"**: both nodes are confirmed on
+   Merkle. Plan at the end of the rulings below.
+2. **0.92.6**, all in one release (rulings below).
+3. **Pi baselines** on the result, with the version recorded.
+4. The libraries finish their work on that baseline.
+5. **The independent review**, which is the gate for lifting the freeze.
 
 ## The port to Dannan and Dagda
 
@@ -51,10 +49,10 @@ confirmed, Pi and real IGD work held.
   three differences of its own (question 1). Told to build heads against cac5998, not
   to wait on `feature/tree-native-namespace`: that is Macha's finding under the freeze,
   not a ruling (Open work 2).
-- **Macha's code is frozen until the libraries are ready (operator, 2026-11-05):**
+- **Macha's code is frozen until the review passes (operator, 2026-11-05):**
   "Macha has a working, tested codebase, this shouldn't be modified until they're
-  ready." One exception so far, 0.92.5, by his "Yes fix now"; deployed, so the
-  libraries' baseline is 808fa0f, which touches only `maintenance.cpp` and a test. Artefacts for their
+  ready." Exceptions: 0.92.5 (deployed), the old-code removal and 0.92.6; each moves
+  the libraries' baseline, and they are told at each commit. Artefacts for their
   plans are fine, changing no tracked file, under `build/macha-fixtures/`, each with a
   README: `placement/`; `goldens/` (Status 381 of 494 keys by name, journal 31 of 83
   lines, 46 config fields, routes read from source); `state-scratch/` (inline, **not the
@@ -62,52 +60,42 @@ confirmed, Pi and real IGD work held.
   off the running node, approved through Dannan). `gen/` holds the generators.
 - **Pi baselines**: Macha's, later, at his word, with the deployed version.
 
-## Questions for the operator
+## Rulings, 2026-11-05 (the operator, asked one by one; "via Dagda" = reported by it)
 
-1. Dagda's three findings, fix in Macha? Read here, not reproduced. `survey_by_diff`
-   (`availability.cpp:94`) takes `MaintenanceStopping` for a peer failure: the stop stays
-   prompt, but on the `kept` and `followed` table paths a stopping survey runs on, and
-   `followed` writes that table durably; recommended a rethrow. `ClaimLocks::deleting_` is a
-   set, so of two deletes of one id the first to finish clears the mark; recommended a
-   multiset; whether two can coincide is not traced. `ReferencedSets::not_held`'s `others`
-   loop (`horizon.cpp:107`) has no pause. Also the inventory walk's stop check (`namespace_objects`,
-   `maintenance_objects_cached`), and `storage_pool.cpp:603` (Open work 00), which Dagda has too.
-2. **Maintenance loop.** Macha's session proposed that Macha's pass stays the one
-   loop on a Macha node, which reopens his 2026-11-04 decision that maintenance
-   moves into the node. Dagda's recommendation: Macha's loop until heads move at
-   step 8c, Dagda's for a Dagda-only node, `MaintenanceOptions::automatic = false`
-   between. Dagda has this and is holding the dependent mapping rows.
-3. Dannan's rulings A to D: **ruled by the operator to Dannan, 2026-11-05.** A:
-   every call names its deadline, no default; Macha's call sites adapt in the
-   port (not the 24 h constant both recommended). B: the byte change accepted,
-   rows with no thread go, Dannan's three loops take Macha's names. C: Dannan
-   adds a per-pool thread CPU reporter. D, as replaced later the same day: the
-   session and transcode limits per account stay Macha's (`reserve_session_slot`,
-   `playback.cpp:1766`); Dannan builds no per-principal bound. His rule: bounds
-   exist for fair usage and preventing problems, and every Macha budget in
-   Dannan's layer (transfer, network, memory reserves, queues, reassembly) must
-   be representable in Dannan; Dannan's step 8 tables them, asking Macha where a
-   row needs it.
-4. Zero storage: `data_storage` reads ready with no backend online. Dagda leaves
-   it unready. A node whose only disk is offline at start must not crash-loop on
-   the startup timeout, so perhaps "ready, degraded".
-5. `mutate_delta`'s no-op (`metadata_manager.cpp:1919`) is unreachable, so a mutation
-   that changes nothing still commits its clock. Macha's behaviour stands until he rules;
-   0.92.5 removed the source of such commits on the nodes, not the rule. A policy commit
-   carries no dot (`:1376`).
-6. `read-ahead` in `frame_timings` and `read_ahead` in `traffic.classes` are the
-   same class; unifying them is an API change for Core and the clients.
-7. `query()` and its predicates have no production caller: retire as dead code?
-8. Design defects left from Dagda's list: the three-concurrent-adds torrent merge
-   is not associative; no epoch fence on actions under a torrent claim; the local
-   `durability_barrier` has no deadline; the catalogue sweep mixes wall and steady
-   ages; the policy disagreement loop; O(state) work per delta; wire-sized
-   allocations; reload silently ignoring `write_copies`; no disk I/O control
-   reserve and no control store free-space reserve.
-9. Delete `feature/ebooks`, `experiment/dagda-backend` (never used), local and
-   origin? `feature/loop-2` and `feature/dagda-found-defects` are merged, local only.
-10. **Removing the pre-tree code**, once the freeze lifts. The condition the
-   operator set is met: both nodes' heads are tree-backed (Cluster state), checked
+- **The ready gate**: "When we have done another independent review and are satisfied that
+  Macha can migrate to use Dannan and Dagda with no loss of functionality, performance,
+  reliabiliy, or data." Run by fresh agents from the code and the nodes only, no notes or
+  plans, once old-code removal, 0.92.6, the baselines and the libraries' work are done.
+- **Old code**: "This should be done right now, before anything else."
+- **0.92.6, one release, freeze exceptions**: `survey_by_diff` rethrows the stop; deletion marks a
+  multiset; `not_held`'s `others` loop pauses; the inventory walk gets a stop check; a read
+  failing on I/O keeps the object, only a record that reads and fails to open is removed
+  (`storage_pool.cpp:603` and kin); no storage online reads ready but degraded, so a node does not
+  crash-loop on its startup timeout (via Dagda); the `followed` path table fix; `query()`
+  and its predicates retired as dead code (via Dagda). Dagda matches these shapes.
+- **Design defects** (torrent merge associativity, no fence under a torrent claim, the local barrier's
+  deadline, the sweep's mixed ages, the policy loop, O(state) per delta, wire-sized allocations, reload
+  and `write_copies`, I/O and free-space reserves): left. "leave them, we need to get on with this."
+  He had understood they were in 0.92.6; they are not, and are not fixed.
+- **Staging**: stages, as many stops as needed, no flag-day worry ("its availability isn't critical",
+  via Dagda). No soak between cutovers ("None"); a stage moves on when its tests pass. inverbeg comes
+  back first. Disk does not wait for heads. Stage one: store, reachability provider, lease template,
+  Macha's loop running. Later: heads, metadata migrated on disk at 8c, Dagda's loop.
+- **Heads** build against the frozen code as it runs, and keep "an unchanged mutation commits" and the
+  no-dot policy commit as Macha's for now (via Dagda).
+- **Maintenance loop**: Macha's until 8c, then Dagda's.
+- **Keys**: Dagda may hold a copy of the cluster key for tests, out of any repo. Custody from a systemd
+  credential; one state directory, Macha's `state_path` (via Dagda).
+- **Dannan**: A every call names its deadline; B the Status byte change accepted, its loops take Macha's
+  names; C a per-pool thread CPU reporter; D per-account limits stay Macha's, and every Macha budget in
+  its layer must be representable in Dannan (its step 8). Generic class admission in `dannan::sched`
+  is **required first**, before stage one, gated by every existing case on both sides.
+- **Real migration on a copy, there and back, and the inverbeg rehearsal: dropped for now**: "No drop
+  that, I'll decide later." (This overrides what Dagda reported.)
+- **Baselines**: Macha's, after old-code removal and 0.92.6. **macnessa's drive**: no extended test.
+- **Older items**: parked in `BACKLOG.md`. Unused branches deleted.
+
+**Removal plan.** The condition the operator set is met: both nodes' heads are tree-backed (Cluster state), checked
    with Macha's own decoder, and the only inline records anywhere are genesis
    (generation 1, in every cluster) and the `*.pre-migration.*` archives. In
    order, each a release with its tests rewritten: (a) found a namespace as a tree
@@ -139,7 +127,7 @@ confirmed, Pi and real IGD work held.
    against 13,426 power-on hours. `smartmontools` and `smartd` now on macnessa.
    **Open defect, read not reproduced:** `storage_pool.cpp:603` deletes an object on any
    read exception, so a read failing on I/O deletes a good object. It fired once at the
-   failure (`0ec5f3a8...`). Held by the freeze, with the operator.
+   failure (`0ec5f3a8...`). In 0.92.6.
 0. **P0: macnessa SIGSEGV, 2026-11-05 02:05:25Z, on 0.92.4, cause unknown.** 25 min
    after the deploy; the first SIGSEGV of this boot (up since 11-03 23:27, every
    earlier exit a stop or SIGKILL). No core (soft limit 0, pattern `core`), no kernel
@@ -155,7 +143,7 @@ confirmed, Pi and real IGD work held.
    minute after start is recovery, not a defect (data ready +17 s, metadata +35
    to +40 s at generation 100k, FUSE +42 s).
 2. **`feature/tree-native-namespace`** (b080c38, 4 WIP commits on 5a06d3c, unmerged,
-   held by the freeze, not a port prerequisite). From its diff: founds a new namespace as a
+   the first part of the old-code removal). From its diff: founds a new namespace as a
    tree at its first commit (develop founds inline, and only `macha-namespace-migrate`
    makes a tree); removes `mutate()`, the migration tool, `install_migrated_head` and
    `plan_namespace_migration`; requires the namespace store; skips re-accepting a head
@@ -163,7 +151,7 @@ confirmed, Pi and real IGD work held.
    `followed` path table keeping a lost file complete (`availability_service.cpp:531`, on
    develop by reading, not taken). It does **not** make genesis a constant
    (`metadata.cpp:2294`), remove legacy authority or remove the inline decoders; earlier
-   notes said it did. Question 10 has the removal order.
+   notes said it did. It is the first part of the removal plan above.
 3. **Books**, as the web client reported at 0.92.2 (49 books): the Discworld series
    holds 3 of 49; three books send a timestamp `published` (A Hat Full of Sky, Soul
    Music, I Shall Wear Midnight); **possible regression, unexamined:** 11 books
@@ -291,46 +279,13 @@ on control threads no longer grow with deletes. Left:
   per change (266 KB with 409 hints); the head record's largest part is now
   its 72 torrent requests (only if they grow).
 
-## 8. Waiting on the operator
-
-- The replication-by-diff proposal's three open questions.
-- **Lost posters on the viewer's path**: the artwork route could answer 404
-  at once for an object the last survey found no node holding (442 catalogue
-  objects today), saving 1 to 2 s per showing; the cost is that a poster a
-  peer gained since that survey is refused until the next one. Or the
-  catalogue re-fetches lost artwork from its provider and nothing changes on
-  the read path.
-- The bootstrap test (`test_two_node_mutual_bootstrap_metadata_write_floor`): the first write waits for the bootstrap
-  checkpoint survey (not the availability survey), or the test retries the
-  refusal.
-- The memory limit to set on each node (section 3, Memory).
-- CPU priority for background work: `nice` or `SCHED_IDLE` for repair,
-  scrub, transcode and libtorrent threads, a cap on encoder threads, or a
-  systemd `CPUWeight`.
-- The size of a viewer rate reserve on a node's uplink: a fixed figure or a
-  share of the measured link (repair yields time, not rate).
-- [Cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md): a
-  proposal with six questions. Its memory section is partly overtaken by
-  0.90.69/70 (one limit, every part reported).
-- Metadata editor B: the choice of fields.
-- Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
-- A `CONTRIBUTING.md` line: "A new gate may pace lower-class work; it may
-  never stop it."
-- The replica's applier lifetime.
-- Operator question: a configured DATA disk not yet online reads every
-  extent it holds `unavailable` (seen on fi-1 after a reboot, about 1M for two
-  to nine minutes until the USB disk mounted); Core's web queue drops
-  unavailable titles. Should it read `unknown` until the disk comes up?
-- From the backlog: anonymous access; whether a client should know a
-  playback generation existed anywhere in the cluster.
-
 ## Cluster state
 
 - **macnessa** (root@10.44.1.50, hostname corvus-gbni-1, Pi 5, 8 GB, domain
   site-a): `/var/lib/macha`, DATA on `/mnt/diskB/data` (4.0 TB, about 1.03M loose
   objects, 17 packs on 2026-11-04), API on 10.44.1.50:7438. The build node.
-- **inverbeg** (root@inverbeg.macha.network, Pi 5, 16 GB, domain site-b, outbound
-  only): DATA on `/mnt/diskB/data` (about 670 GB and filling), API on
+- **inverbeg** (root@inverbeg.macha.network, Pi 5, 16 GB, domain site-b, inbound
+  capable, dialled at inverbeg.macha.network:7437, checked 2026-11-05): DATA on `/mnt/diskB/data` (about 670 GB and filling), API on
   192.168.1.50:7438.
 - **Metadata, both nodes** (2026-11-05, `macha-metadata-dump --tree` and
   `build/macha-fixtures/gen/frame_forms.cpp` over the live histories): one
