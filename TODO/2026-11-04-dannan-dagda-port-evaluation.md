@@ -85,10 +85,13 @@ Macha's blast radius (section 3 of the Macha audit): 785 test cases, of
 which between 225 and 287 touch the network layer and between 238 and 282
 the store (the two counts depend on whether fixture accessors are
 counted); `tests/test_support.hpp` is included by 42 of the 45 case files
-and builds `BareNode` on `NodeRuntime`'s constructor; there are 498
+and builds `BareNode` on `NodeRuntime`'s constructor; there are about 500
 reach-through hits where cases call `node().membership()`,
 `.local_state()`, `.metadata_server()`, `.ledger()`, `.local_store()` and
-the like; `test_rpc_cluster.cpp` has 114 cases, 100 of them on the
+the like (the Macha audit counted 498 by a pattern it did not record; the
+Dannan session's recount of those five nouns on any receiver is 555, and
+its per-noun table is in `../dannan/TODO/2026-11-05-macha-test-mapping.md`);
+`test_rpc_cluster.cpp` has 114 cases, 100 of them on the
 transport, and more than 30 construct `RpcClient` and `RpcServer`
 directly on `NetworkLinks`. Outside the layers, `FsEntry` has 136
 references in 22 files, `MetadataSnapshot` 70 in 15 (the FS, the torrent
@@ -206,9 +209,18 @@ does not; "unproven" means nothing asserts it.
    storage, cache, generation, backends-online, api_endpoint, playback
    budget or transcode rate fields; `peer_viewers_active` pacing works
    only through traffic class; `refresh_public_connectivity` (the API's
-   forced UPnP and self-probe refresh) has no Context operation;
-   readiness planes are name and bool, so `RecoveryProgress`'s per-plane
-   progress has no slot. Every field of `GET /api/v1/status`,
+   forced UPnP and self-probe refresh) has no Context operation. (Withdrawn
+   2026-11-05 on the Dannan session's check: `RecoveryProgress`,
+   `local_state.hpp:36-90`, is plane flags, complete, failed, the first
+   error, the ready time and a wait, all of which `status::Readiness`
+   carries by plane name; the ticking counter is `startup_progress()`,
+   which is `supervise::StartupProgress`. Two real differences remain,
+   found by the Dannan session the same night and taken by Dannan: Macha
+   marks complete explicitly after recovery returns
+   (`service/service.cpp:522`) where Dannan reads "every declared plane
+   ready", so a Dannan node would read ready earlier and peers would trust
+   its zero capacity; and Macha keeps the first failure
+   (`local_state.hpp:49-57`) where Dannan keeps the last.) Every field of `GET /api/v1/status`,
    `/status/nodes` and `/status/diagnostics` that section 6 of the Macha
    audit lists must be reproduced by Macha's facade from Dannan's
    `Diagnostics` and `Telemetry` and Dagda's `dagda.*` Status keys; nothing
@@ -314,6 +326,11 @@ right, and they must stay.
 
 ### 4.5 Where the planning documents are stale or wrong
 
+- `build/deploy.sh` is untracked (it lives under the ignored `build/`) and
+  still names fi-1 and `/usr`; the live install is `/usr/local`. Tonight's
+  procedure is in the `TODO/ACTIVE.md` handover. The port runbook must not
+  rest on that script.
+
 - `../dannan/TODO/ACTIVE.md` describes the sources at 0.91.x with fi-1
   live and names Macha releases 0.92.0, 0.93.0 and 0.94.0 for the port
   steps; 0.92.x is taken by books and the two nodes are macnessa and
@@ -397,8 +414,11 @@ takes are in 5.3 for acknowledgement, not reversal.
    the startup no-progress exit into the node; expose `dial_hook` from
    `NodeConfig` and add send and admit fault seams, or Macha's
    `test_rpc_cluster` cannot be carried.
-4. `refresh_public_connectivity` on the Context; per-plane progress in
-   readiness.
+4. `refresh_public_connectivity` on the Context. (Per-plane progress
+   withdrawn 2026-11-05: Macha has none beyond what `Readiness` holds.
+   Kept instead: readiness complete only on an explicit mark after
+   recovery returns, as Macha's, and the first failure kept, not the
+   last.)
 5. Injected time in the health loop and the watchdog.
 6. A measured gate: a 32 MiB DATA transfer with CONTROL ping round trips
    sampled during it, throughput and RSS recorded, in the test binary and
@@ -490,7 +510,11 @@ behind a facade; Macha's sink keeps the journal format. Gate: every
 mapped test green; the config and Status goldens byte-identical; the
 baselines equal or better on the Pis; a soak of several days on both
 nodes with viewers, ingest and a deliberate partition. Rollback: the
-0.92.x tarball, since nothing on disk changed.
+0.92.x tarball plus the Macha state files the importer replaced
+(`membership/known-nodes.bin`, `connectivity/inbound.bin`,
+`telemetry/last-known.bin`), which 0.92.x refuses in Dannan's formats
+(corrected 2026-11-05 on the Dannan session's finding F6; the runbook
+keeps copies before the import).
 
 **Phase 3, Macha's store on Dagda** (requirements section 6, "before
 8a", then 8a and 8b): rehearse the migration on inverbeg first (583 GB,
