@@ -2920,7 +2920,9 @@ struct PlaybackManager::Impl {
                     ++start_workers;
                 }
                 try {
-                    std::thread([this, session, start, trace] { run_start(session, start, trace); }).detach();
+                    std::thread([this, session, start, trace] {
+                        run_supervised_once("playback-start", [&] { run_start(session, start, trace); });
+                    }).detach();
                 } catch (...) {
                     Lock lock(mutex);
                     sessions.erase(session->id);
@@ -3236,7 +3238,10 @@ struct PlaybackManager::Impl {
                 ++start_workers;
             }
             try {
-                std::thread([this, old, pending, trace] { run_replacement(old, pending, trace); }).detach();
+                std::thread([this, old, pending, trace] {
+                    run_supervised_once("playback-replacement",
+                                        [&] { run_replacement(old, pending, trace); });
+                }).detach();
             } catch (...) {
                 {
                     Lock lock(mutex);

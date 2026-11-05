@@ -1266,8 +1266,10 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_restores_durable_over
 MACHA_TEST("foundations", test_every_subsystem_thread_is_run_supervised) {
     // An exception escaping a thread body calls std::terminate(); run_supervised
     // (src/supervised.hpp) guards that boundary. Every thread construction site
-    // under src/ must name run_supervised within the next two lines.
-    const std::regex site_pattern(R"(std::jthread\(\[|emplace_back\([^)]*stop_token)");
+    // under src/ must name run_supervised within the next two lines: a jthread
+    // or thread built on a lambda, and a thread pool's emplace_back of one.
+    const std::regex site_pattern(
+        R"(std::jthread\(\[|std::thread\(\[|emplace_back\([^)]*stop_token|(workers|threads)_?\.emplace_back\(\[)");
     const std::filesystem::path src_dir = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "src";
     std::vector<std::string> unguarded;
 
