@@ -178,9 +178,12 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
   though its comment expects one write per discovery pass. Seen on macnessa at 0.93.4, job
   b2bf6286: 7565 files, 5 MB `hints.json`, one thread at 100% from 13:13Z; hints change only in
   `updated_unix_ms`. Meanwhile the job shows `importing`, 100%, a stale `current_file` and rate,
-  and logs nothing. Establish why the end pass exists (a resumed job's earlier files is a guess),
-  then drop it or batch it. The per-file rewrite during the copy has the same cost; check
-  `media_information_->request_path` too. Announce any API change.
+  and logs nothing. **Operator 2026-11-06: remove the second pass.** Read for this: all three
+  places that set `file.completed` submit the hint straight after, so a normal run and a resume
+  lose nothing. One gap: they set `completed` before the submit, so a submit that throws can leave
+  a file recorded complete with no hint, which only the second pass now covers. Submit first, then
+  set `completed`, in the same change. Keep the `refresh_catalogue_jobs` call (`:1230`): it refills
+  a cataloguing job with no hints. The per-file rewrite during the copy stays a cost of its own.
 
 - Whether an owned source should survive `clear` and `remove_after_ms` while a job has failed
   files: clearing it removes a failed file's bytes, per the docs and a review of the code, so
