@@ -170,6 +170,17 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
 
 ## Import (operator 2026-11-06: not part of the port)
 
+- **Fix: the end of a large import rewrites the whole hint queue once per file.** After the last
+  copy, `IngestManager::enqueue_catalogue_hints` (`src/acquisition/ingest.cpp:1270`) calls
+  `hints_.submit` for each file, and every `submit_many` ends in
+  `persist_dirty_state_locked(true)` (`src/catalogue/catalogue_hints.cpp:359`), a durable rewrite
+  of all hints. Its comment expects one write per discovery pass. Seen on macnessa at 0.93.4, job
+  b2bf6286: 7565 files, 5 MB `hints.json`, 100% of a core and about one rewrite per submission,
+  hours in all, read from four gdb samples and the file itself. Meanwhile the job shows
+  `importing`, 100%, a stale `current_file` and a stale `rate_bytes_per_second`, and nothing is
+  logged. Submit the whole job as one batch, check `media_information_->request_path` in the same
+  loop, and let a client see the step: an API change to announce if it adds a state or field.
+
 - Whether an owned source should survive `clear` and `remove_after_ms` while a job has failed
   files: clearing it removes a failed file's bytes, per the docs and a review of the code, so
   the file cannot be retried. Not traced by hand. Core has been told to warn.
