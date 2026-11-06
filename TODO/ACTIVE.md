@@ -37,14 +37,14 @@ with a wake when a disk comes back; whether it stalled fi-1 a month ago is not s
 1. **Pi baselines** on 0.93.4, with the version recorded, once the TV import has finished so
    that the load is the measured work and not the import (operator cleared 2026-11-06).
 2. The libraries finish their work on that baseline. Goldens at 0.93.4 are cut:
-   `build/macha-fixtures/goldens-0.93.4/`. Dannan's arm64 run is on inverbeg (cleared
+   `build/macha-fixtures/goldens-0.93.4/`, and tree-backed scratch state: `state-scratch-0.93.4/`. Dannan's arm64 run is on inverbeg (cleared
    2026-11-06), `/root/dannan-arm64-415c6c4`, scratch only.
 3. **The independent review**, which is the gate for lifting the freeze.
 
 **Waiting on the operator:** the media-kind import hint and what to do with the running TV job,
 which still has files bound for `/Movies`; truncated pack records, which stay counted read
 failures and report held, with repair unchecked; source files gone for good, which still block
-the job; the replica journal reader, with no production writer left; the `*.pre-migration.*` archives,
+the job; the replica journal reader, with no production writer left; movie folder names such as `Blade Runner ( (1982)`, 62 of 1891 in `/Movies` on 2026-11-06 (`title_for_movie_year`, `src/catalogue/media_catalogue.cpp:587`, cuts at the year and keeps the ` (`), not fixed, under the freeze; the `*.pre-migration.*` archives,
 not found directly under `/var/lib/macha` or `/mnt/diskB/data` on 2026-11-06, location unchecked. Torrent
 moves out, not a P0: `2026-11-06-ingest-plugins-torrent-removal-plan.md`.
 
