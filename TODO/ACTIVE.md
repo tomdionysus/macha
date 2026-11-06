@@ -14,8 +14,8 @@ Alongside this file: `BACKLOG.md` (everything else, by area), `COMPLETED.md`,
 (root@inverbeg.macha.network) run **0.93.4**, one cluster, under `/usr/local`, installed
 2026-11-06 02:34Z and 02:36Z. Develop, main and tag 0.93.4 (merge 9a08846) are pushed.
 Gate on macnessa 751, 20, 21, trace repeat 84 of 84. Both nodes writable and connected;
-the TV import (b2bf6286) resumed by itself. The metadata history holds no empty delta: 18
-catalogue, 17 appends, 4 namespace changes of 39 read after the restart.
+the TV import (b2bf6286) resumed by itself. Of 39 metadata deltas read after the restart, none
+was empty: 18 catalogue, 17 appends, 4 namespace changes.
 
 **The old-code removal has landed.** 0.93.0 a namespace is a tree from its first commit;
 0.93.1 the legacy write API; 0.93.2 legacy authority; 0.93.3 genesis and the inline formats.
@@ -34,8 +34,10 @@ on one log line.
 with a wake when a disk comes back; whether it stalled fi-1 a month ago is not shown.
 
 **Next, in the operator's order:**
-1. Re-cut the goldens on 0.93.4 for the libraries, once they are told it has landed.
-2. **Pi baselines** on 0.93.4, with the version recorded and arm64 run for Dannan.
+1. Re-cut the goldens on 0.93.4 for the libraries, who have been told it has landed.
+2. **Pi baselines** on 0.93.4, with the version recorded. Dannan's arm64 run (its request of
+   2026-11-06: build and tests from its develop, scratch directory only, separate from the
+   baselines) waits for the operator's word.
 3. The libraries finish their work on that baseline.
 4. **The independent review**, which is the gate for lifting the freeze.
 
@@ -43,17 +45,18 @@ with a wake when a disk comes back; whether it stalled fi-1 a month ago is not s
 which still has files bound for `/Movies`; truncated pack records, which stay counted read
 failures and report held, with repair unchecked; source files gone for good, which still block
 the job; whether an owned source should survive `clear` and `remove_after_ms` while a job has
-failed files; the replica journal reader, with no production writer left; stale
-`macha-namespace-migrate` binaries and the `*.pre-migration.*` archives on both nodes. Torrent
+failed files; the replica journal reader, with no production writer left; the stale
+`/usr/local/bin/macha-namespace-migrate` on both nodes, and the `*.pre-migration.*` archives,
+not found directly under `/var/lib/macha` or `/mnt/diskB/data` on 2026-11-06, location unchecked. Torrent
 moves out, not a P0: `2026-11-06-ingest-plugins-torrent-removal-plan.md`.
 
 ## The port to Dannan and Dagda
 
 Evaluation: [`2026-11-04-dannan-dagda-port-evaluation.md`](2026-11-04-dannan-dagda-port-evaluation.md),
 kept current. Rulings so far (memory `project-port-rulings`): two cutovers,
-transport first then the disk, with a soak between; a Macha case may be retired
+transport first then the disk, no soak, inverbeg first; a Macha case may be retired
 against a named library case, recorded case by case; reverse migration built
-but not a gate; torrent bytes stay pinned in Macha's tests; Dannan's respec
+but not a gate; torrent bytes stay pinned in Macha's tests until torrent moves out; Dannan's respec
 confirmed, Pi and real IGD work held.
 
 - **Dannan** planned on cac5998, told 9a08846 has landed: `../dannan/TODO/ACTIVE.md` "The first cutover",
