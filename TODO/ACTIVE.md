@@ -34,19 +34,17 @@ on one log line.
 with a wake when a disk comes back; whether it stalled fi-1 a month ago is not shown.
 
 **Next, in the operator's order:**
-1. Re-cut the goldens on 0.93.4 for the libraries, who have been told it has landed.
-2. **Pi baselines** on 0.93.4, with the version recorded. Dannan's arm64 run (its request of
-   2026-11-06: build and tests from its develop, scratch directory only, separate from the
-   baselines) waits for the operator's word.
-3. The libraries finish their work on that baseline.
-4. **The independent review**, which is the gate for lifting the freeze.
+1. **Pi baselines** on 0.93.4, with the version recorded, once the TV import has finished so
+   that the load is the measured work and not the import (operator cleared 2026-11-06).
+2. The libraries finish their work on that baseline. Goldens at 0.93.4 are cut:
+   `build/macha-fixtures/goldens-0.93.4/`. Dannan's arm64 run is on inverbeg (cleared
+   2026-11-06), `/root/dannan-arm64-415c6c4`, scratch only.
+3. **The independent review**, which is the gate for lifting the freeze.
 
 **Waiting on the operator:** the media-kind import hint and what to do with the running TV job,
 which still has files bound for `/Movies`; truncated pack records, which stay counted read
 failures and report held, with repair unchecked; source files gone for good, which still block
-the job; whether an owned source should survive `clear` and `remove_after_ms` while a job has
-failed files; the replica journal reader, with no production writer left; the stale
-`/usr/local/bin/macha-namespace-migrate` on both nodes, and the `*.pre-migration.*` archives,
+the job; the replica journal reader, with no production writer left; the `*.pre-migration.*` archives,
 not found directly under `/var/lib/macha` or `/mnt/diskB/data` on 2026-11-06, location unchecked. Torrent
 moves out, not a P0: `2026-11-06-ingest-plugins-torrent-removal-plan.md`.
 
