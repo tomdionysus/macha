@@ -167,3 +167,9 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
   unavailable titles. Should it read `unknown` until the disk comes up?
 - From the backlog: anonymous access; whether a client should know a
   playback generation existed anywhere in the cluster.
+
+## Import (operator 2026-11-06: not part of the port)
+
+- Whether an owned source should survive `clear` and `remove_after_ms` while a job has failed
+  files: clearing it removes a failed file's bytes, per the docs and a review of the code, so
+  the file cannot be retried. Not traced by hand. Core has been told to warn.
