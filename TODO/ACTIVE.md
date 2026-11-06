@@ -44,7 +44,8 @@ with a wake when a disk comes back; whether it stalled fi-1 a month ago is not s
 **Waiting on the operator:** the media-kind import hint and what to do with the running TV job,
 which still has files bound for `/Movies`; truncated pack records, which stay counted read
 failures and report held, with repair unchecked; source files gone for good, which still block
-the job; the replica journal reader, with no production writer left; movie folder names such as `Blade Runner ( (1982)`, 62 of 1891 in `/Movies` on 2026-11-06 (`title_for_movie_year`, `src/catalogue/media_catalogue.cpp:587`, cuts at the year and keeps the ` (`), not fixed, under the freeze; the `*.pre-migration.*` archives,
+the job; macnessa's reboot of 2026-11-06 12:16Z to 12:18Z, see memory `project-core-capture`: SIGBUS in a page read of `libmacha_core.so` after a failed state write, PID 1 faulting 22 s later, about 100 undervoltage events an hour, the NVMe reporting critical warning 0x02 at 0 C; root disk loss is inferred, not logged; the two cores are on `/mnt/diskB/crash`;
+the replica journal reader, with no production writer left; movie folder names such as `Blade Runner ( (1982)`, 62 of 1891 in `/Movies` on 2026-11-06 (`title_for_movie_year`, `src/catalogue/media_catalogue.cpp:587`, cuts at the year and keeps the ` (`), not fixed, under the freeze; the `*.pre-migration.*` archives,
 not found directly under `/var/lib/macha` or `/mnt/diskB/data` on 2026-11-06, location unchecked. Torrent
 moves out, not a P0: `2026-11-06-ingest-plugins-torrent-removal-plan.md`.
 
