@@ -101,7 +101,18 @@ writer that damaged it is not found. inverbeg ran the same workload without a cr
 `CatalogueHintQueue::save_state_locked`, core `core.macha-catalogue.12003.1793988660`, in a process that
 never ran the small-file phase. So that phase is not the only way to it. Four crashes in 53 minutes
 after none from 12:18Z to 17:18Z. Three of the four stacks are building the large job or hint JSON,
-macnessa's alone. **Left until after the port (operator, 2026-11-06).** `ls /mnt/machamedia` also timed out
+macnessa's alone. **Left until after the port (operator, 2026-11-06), who attributes it to undervoltage.**
+Kernel log from 12:18Z, read that evening: macnessa 918 undervoltage events, inverbeg 104 from 12:00Z, about
+nine times the rate. Fits; does not prove it: macnessa's events came about every 26 s in the crash hour, so
+10 to 12 s before three crashes is chance, and its worst hours (13Z 286, 14Z 179) had no crash, against 137
+in 17Z. No software writer has been ruled out.
+**Lined up with the baseline's timestamps, recursive delete from the mount is the better lead:** 17:18:05Z, 3 s
+after a run of 200 small files was recorded and its `rmtree` began; 17:34:28Z, during the cleanup `rmtree`, in a
+process 3 minutes old that had done nothing else on the mount; 17:45:47Z, 9 s after the same record and `rmtree`.
+18:11:09Z is the odd one: its process deleted through the mount from 18:02Z to about 18:05Z, then crashed 6
+minutes later. This replaces "the small-file phase" above. It matches the operator's `rm` TODO below. inverbeg ran
+the same deletes with no crash, 16:34Z to 17:05Z, which remains unexplained. Timing only: no reproduction aimed at
+it, no writer found. `ls /mnt/machamedia` also timed out
 twice, about 20 and 3 minutes after a restart, then answered in ms: not looked into.
 **TODO (operator, 2026-11-06): `rm` in the FUSE mount with a filter can crash macha.** Not yet
 reproduced by this session; the 17:34 crash came during a recursive delete from the mount, which may
