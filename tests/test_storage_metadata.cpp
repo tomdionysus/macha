@@ -2633,6 +2633,154 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_history_payloads_are_disk_back
     CHECK(after.history_resident_payload_bytes == 0);
 }
 
+// A frame's length word is outside the AEAD, so damage to it looks like a torn
+// tail. Whatever it says, every intact frame after it stays, a node opens, and
+// a commit made afterwards survives the next open. Only bytes nothing can read
+// are ever cut.
+MACHA_FAST_TEST("storage_metadata", test_a_damaged_history_frame_loses_only_that_frame) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+
+    struct Damage {
+        const char* name;
+        std::function<void(std::fstream&, uint64_t offset, uint32_t length)> apply;
+    };
+    const auto put_length = [](std::fstream& file, uint64_t offset, uint32_t value) {
+        const std::array<char, 4> bytes{static_cast<char>(value >> 24), static_cast<char>(value >> 16),
+                                        static_cast<char>(value >> 8), static_cast<char>(value)};
+        file.seekp(static_cast<std::streamoff>(offset));
+        file.write(bytes.data(), bytes.size());
+    };
+    const std::vector<Damage> damages{
+        {"length past the end of the file",
+         [&](auto& file, uint64_t offset, uint32_t) { put_length(file, offset, 0x10000000); }},
+        {"length over any record", [&](auto& file, uint64_t offset, uint32_t) { put_length(file, offset, 0xFFFFFFFF); }},
+        {"length short, inside the file",
+         [&](auto& file, uint64_t offset, uint32_t length) { put_length(file, offset, length / 2); }},
+        {"length long, inside the file",
+         [&](auto& file, uint64_t offset, uint32_t length) { put_length(file, offset, length + 9); }},
+        {"length zero", [&](auto& file, uint64_t offset, uint32_t) { put_length(file, offset, 0); }},
+        {"a body byte", [](auto& file, uint64_t offset, uint32_t length) {
+             file.seekp(static_cast<std::streamoff>(offset + 4 + length / 2));
+             file.put('\x5a');
+         }},
+    };
+
+    size_t index = 0;
+    for (const auto& damage : damages) {
+        const auto path = t.path() / ("damaged-" + std::to_string(index++));
+        const auto history = path / "metadata" / "history.log";
+        auto snapshot = founded_snapshot();
+        snapshot.metadata_voters.clear();
+        snapshot.metadata_write_replicas_required = 1;
+
+        std::vector<MetadataRecord> chain;
+        std::vector<uint64_t> offsets;
+        MetadataRecord head = genesis_metadata();
+        const auto next_record = [&](uint64_t generation) {
+            snapshot.mutation_sequences[NodeId{{1}}] = generation;
+            MetadataRecord next;
+            next.generation = generation;
+            next.previous = head.hash;
+            next.payload = tree_payload(snapshot);
+            next.hash = metadata_hash(next.generation, next.previous, next.payload);
+            return next;
+        };
+        {
+            TestReplica writer(path, keys.storage);
+            for (uint64_t generation = 2; generation <= 9; ++generation) {
+                offsets.push_back(std::filesystem::file_size(history));
+                auto next = next_record(generation);
+                REQUIRE(writer.store_commit(next));
+                chain.push_back(next);
+                head = next;
+            }
+        }
+        const auto size_before = std::filesystem::file_size(history);
+
+        // The fourth of eight, with intact frames on both sides of it.
+        constexpr size_t damaged = 3;
+        const auto length = static_cast<uint32_t>(offsets[damaged + 1] - offsets[damaged] - 4);
+        {
+            std::fstream file(history, std::ios::binary | std::ios::in | std::ios::out);
+            damage.apply(file, offsets[damaged], length);
+        }
+
+        const auto check_survivors = [&](TestReplica& replica) {
+            for (size_t i = 0; i < chain.size(); ++i) {
+                if (i == damaged)
+                    continue;
+                const auto entry = replica.history_entry(chain[i].hash);
+                if (!entry)
+                    std::cerr << "lost frame " << i << " after: " << damage.name << "\n";
+                REQUIRE(entry.has_value());
+                CHECK(entry->payload == chain[i].payload);
+            }
+        };
+        auto after = next_record(10);
+        {
+            TestReplica reopened(path, keys.storage);
+            check_survivors(reopened);
+            CHECK(!reopened.history_entry(chain[damaged].hash).has_value());
+            CHECK(std::filesystem::file_size(history) == size_before);
+            REQUIRE(reopened.store_commit(after));
+        }
+        // What was appended past the damage is found again, and the damage has not spread.
+        TestReplica again(path, keys.storage);
+        check_survivors(again);
+        CHECK(again.history_entry(after.hash).has_value());
+    }
+}
+
+// A frame cut short by a crash has nothing readable after it: it is cut, kept
+// aside, and everything before it stays. A byte that is not a frame at all goes
+// the same way.
+MACHA_FAST_TEST("storage_metadata", test_a_torn_history_tail_is_still_cut) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "torn";
+    const auto history = path / "metadata" / "history.log";
+
+    auto snapshot = founded_snapshot();
+    snapshot.metadata_voters.clear();
+    snapshot.metadata_write_replicas_required = 1;
+    std::vector<MetadataRecord> chain;
+    uint64_t last_frame = 0;
+    MetadataRecord head = genesis_metadata();
+    {
+        TestReplica writer(path, keys.storage);
+        for (uint64_t generation = 2; generation <= 5; ++generation) {
+            snapshot.mutation_sequences[NodeId{{1}}] = generation;
+            MetadataRecord next;
+            next.generation = generation;
+            next.previous = head.hash;
+            next.payload = tree_payload(snapshot);
+            next.hash = metadata_hash(next.generation, next.previous, next.payload);
+            last_frame = std::filesystem::file_size(history);
+            REQUIRE(writer.store_commit(next));
+            chain.push_back(next);
+            head = next;
+        }
+    }
+    std::filesystem::resize_file(history, std::filesystem::file_size(history) - 7);
+    {
+        TestReplica reopened(path, keys.storage);
+        for (size_t i = 0; i + 1 < chain.size(); ++i)
+            CHECK(reopened.history_entry(chain[i].hash).has_value());
+        CHECK(!reopened.history_entry(chain.back().hash).has_value());
+        CHECK(std::filesystem::file_size(history) == last_frame);
+    }
+    size_t kept_aside = 0;
+    for (const auto& item : std::filesystem::directory_iterator(path / "metadata"))
+        kept_aside += item.path().filename().string().find("history.log") == 0 &&
+                      item.path().filename() != "history.log";
+    CHECK(kept_aside == 1);
+}
+
 MACHA_FAST_TEST("storage_metadata",
                 test_cold_accepted_head_validation_caches_only_owned_results) {
     TempDir t;
