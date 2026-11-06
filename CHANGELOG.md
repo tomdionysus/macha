@@ -1,5 +1,14 @@
 # Current release
 
+## 0.93.5: a damaged history frame loses only that frame
+
+Metadata history: a frame's length word is outside the AEAD, and damage to it read as
+a torn tail, so opening a node cut every later frame from `history.log`, and a length
+over 2 GiB refused the file and sent the node to seed recovery. A frame that does not
+authenticate now means looking for the next one that does: everything from there on
+stays, and the damaged bytes stay in the file until history is next truncated. Only
+when nothing later authenticates is the rest cut, as a torn tail always was.
+
 ## 0.93.4: one file's error stays that file's, and repair walks a new list
 
 Repair: a pull list arriving after an empty one, or after the last list was

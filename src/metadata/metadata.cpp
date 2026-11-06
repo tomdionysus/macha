@@ -2546,6 +2546,58 @@ void MetadataReplica::load_history() {
     size_t skipped = 0;
     std::string first_skipped;
 
+    const auto open_frame = [&](std::span<const uint8_t> frame) -> std::optional<Bytes> {
+        try {
+            Reader envelope(frame);
+            auto nonce = envelope.fixed<12>();
+            auto tag = envelope.fixed<16>();
+            auto ciphertext = envelope.bytes();
+            envelope.finish();
+            return aes_gcm_open(key_, nonce, tag, ciphertext, MH);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    };
+
+    // The next offset at or after `from` holding a frame that authenticates. The
+    // two length fields rule out nearly every position before any AES work.
+    const auto next_frame_from = [&](uint64_t from) -> std::optional<uint64_t> {
+        constexpr uint64_t envelope_bytes = 12 + 16 + 4;
+        constexpr uint64_t header_bytes = 4 + envelope_bytes;
+        constexpr uint64_t window = 1024 * 1024;
+        std::ifstream scan(history_p_, std::ios::binary);
+        Bytes buffer(window);
+        uint64_t at = from;
+        while (at + header_bytes <= file_size) {
+            const auto wanted = std::min(window, file_size - at);
+            scan.clear();
+            scan.seekg(static_cast<std::streamoff>(at), std::ios::beg);
+            if (!scan.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(wanted)))
+                return std::nullopt;
+            const std::span<const uint8_t> bytes(buffer.data(), wanted);
+            const auto u32_at = [&](uint64_t position) {
+                Reader reader(bytes.subspan(position, 4));
+                return static_cast<uint64_t>(reader.u32());
+            };
+            const auto positions = wanted - header_bytes + 1;
+            for (uint64_t i = 0; i < positions; ++i) {
+                const auto length = u32_at(i);
+                if (length < envelope_bytes || length > max_record ||
+                    at + i + 4 + length > file_size ||
+                    u32_at(i + 4 + 12 + 16) != length - envelope_bytes)
+                    continue;
+                Bytes frame(static_cast<size_t>(length));
+                scan.clear();
+                scan.seekg(static_cast<std::streamoff>(at + i + 4), std::ios::beg);
+                if (scan.read(reinterpret_cast<char*>(frame.data()), static_cast<std::streamsize>(length)) &&
+                    open_frame(frame))
+                    return at + i;
+            }
+            at += positions;
+        }
+        return std::nullopt;
+    };
+
     // Streaming: startup RSS is bounded by one frame, not history.log's size.
     while (offset + 4 <= file_size) {
         std::array<uint8_t, 4> header_bytes{};
@@ -2556,30 +2608,41 @@ void MetadataReplica::load_history() {
         Reader header(header_bytes);
         const auto length = static_cast<uint64_t>(header.u32());
         header.finish();
-        if (length > max_record)
-            throw std::runtime_error("metadata history " + history_p_.string() +
-                                     " offset=" + std::to_string(offset) + ": record too large");
-        if (offset > std::numeric_limits<uint64_t>::max() - 4 - length ||
-            offset + 4 + length > file_size) {
-            trailing_problem = "incomplete trailing frame";
-            break;
+
+        std::optional<Bytes> opened;
+        const bool in_file = length <= max_record && offset + 4 + length <= file_size;
+        if (in_file) {
+            Bytes frame(static_cast<size_t>(length));
+            if (length && !stream.read(reinterpret_cast<char*>(frame.data()),
+                                       static_cast<std::streamsize>(length))) {
+                trailing_problem = "incomplete trailing frame";
+                break;
+            }
+            opened = open_frame(frame);
+        }
+        if (!opened) {
+            // The length word is outside the AEAD, so a frame that does not open
+            // says nothing about where the next one starts. A later frame that
+            // opens means this is damage and everything from there on is good;
+            // none means a torn tail.
+            const auto next = next_frame_from(offset + 1);
+            if (!next) {
+                trailing_problem = in_file ? "last frame failed AES-GCM authentication"
+                                           : "incomplete trailing frame";
+                break;
+            }
+            ++skipped;
+            if (skipped == 1)
+                first_skipped = "offset=" + std::to_string(offset) + ": frame does not authenticate";
+            offset = *next;
+            valid = offset;
+            stream.clear();
+            stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+            continue;
         }
 
-        Bytes frame(static_cast<size_t>(length));
-        if (length && !stream.read(reinterpret_cast<char*>(frame.data()),
-                                   static_cast<std::streamsize>(length))) {
-            trailing_problem = "incomplete trailing frame";
-            break;
-        }
-        const bool final_frame = offset + 4 + length == file_size;
         try {
-            Reader envelope(frame);
-            auto nonce = envelope.fixed<12>();
-            auto tag = envelope.fixed<16>();
-            auto ciphertext = envelope.bytes();
-            envelope.finish();
-            auto plaintext = aes_gcm_open(key_, nonce, tag, ciphertext, MH);
-            auto entry_value = decode_metadata_history_entry(plaintext);
+            auto entry_value = decode_metadata_history_entry(*opened);
 
             // Linear in history bytes: validate each frame locally; full
             // reconstruction is deferred to heads that can become authority.
@@ -2624,13 +2687,9 @@ void MetadataReplica::load_history() {
                 history_.emplace(entry_value.hash, std::move(index));
             }
         } catch (const std::exception& error) {
-            if (final_frame && std::string_view(error.what()) == "AES-GCM authentication failed") {
-                trailing_problem = "final frame failed AES-GCM authentication";
-                break;
-            }
-            // Entries are independent and hash-indexed: skip a bad one (its
-            // dependants fail their predecessor check too); heads needing it
-            // are repaired live from peers.
+            // Authenticated, so its length is good. Entries are independent and
+            // hash-indexed: skip a bad one (its dependants fail their predecessor
+            // check too); heads needing it are repaired live from peers.
             ++skipped;
             if (skipped == 1)
                 first_skipped = "offset=" + std::to_string(offset) + ": " + error.what();
