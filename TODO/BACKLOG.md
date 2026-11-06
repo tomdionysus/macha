@@ -170,16 +170,17 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
 
 ## Import (operator 2026-11-06: not part of the port)
 
-- **Fix: the end of a large import rewrites the whole hint queue once per file.** After the last
-  copy, `IngestManager::enqueue_catalogue_hints` (`src/acquisition/ingest.cpp:1270`) calls
-  `hints_.submit` for each file, and every `submit_many` ends in
-  `persist_dirty_state_locked(true)` (`src/catalogue/catalogue_hints.cpp:359`), a durable rewrite
-  of all hints. Its comment expects one write per discovery pass. Seen on macnessa at 0.93.4, job
-  b2bf6286: 7565 files, 5 MB `hints.json`, 100% of a core and about one rewrite per submission,
-  hours in all, read from four gdb samples and the file itself. Meanwhile the job shows
-  `importing`, 100%, a stale `current_file` and a stale `rate_bytes_per_second`, and nothing is
-  logged. Submit the whole job as one batch, check `media_information_->request_path` in the same
-  loop, and let a client see the step: an API change to announce if it adds a state or field.
+- **Fix: a large import submits every file's catalogue hint twice, the second time as a slow
+  no-op pass.** Each file's hint goes in when that file lands (`src/acquisition/ingest.cpp:1872`,
+  `:1904`, `:2073`), and the catalogue matches as the job runs. After the last copy, `process_job`
+  (`:1421`) calls `enqueue_catalogue_hints` (`:1270`), which submits them all again. Every
+  `submit_many` forces a durable rewrite of all hints (`src/catalogue/catalogue_hints.cpp:359`),
+  though its comment expects one write per discovery pass. Seen on macnessa at 0.93.4, job
+  b2bf6286: 7565 files, 5 MB `hints.json`, one thread at 100% from 13:13Z; hints change only in
+  `updated_unix_ms`. Meanwhile the job shows `importing`, 100%, a stale `current_file` and rate,
+  and logs nothing. Establish why the end pass exists (a resumed job's earlier files is a guess),
+  then drop it or batch it. The per-file rewrite during the copy has the same cost; check
+  `media_information_->request_path` too. Announce any API change.
 
 - Whether an owned source should survive `clear` and `remove_after_ms` while a job has failed
   files: clearing it removes a failed file's bytes, per the docs and a review of the code, so
