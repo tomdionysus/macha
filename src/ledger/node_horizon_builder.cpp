@@ -87,8 +87,9 @@ NodeHorizonBuilder::NodeHorizonBuilder(FileSystem& filesystem, CatalogueManager&
                                        LocalStore& control, DistributedStore& store) noexcept
     : filesystem_(filesystem), catalogue_(catalogue), control_(control), store_(store) {}
 
-std::shared_ptr<const MaintenanceObjects> NodeHorizonBuilder::namespace_objects() {
-    return filesystem_.maintenance_objects_cached();
+std::shared_ptr<const MaintenanceObjects>
+NodeHorizonBuilder::namespace_objects(const std::function<void()>& pause) {
+    return filesystem_.maintenance_objects_cached(pause);
 }
 
 std::shared_ptr<const InventoryHorizon>

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "filesystem/filesystem.hpp"
+#include "contract/stopping.hpp"
 
 #include "ledger/reference_counts.hpp"
 #include "metadata/namespace_control_store.hpp"
@@ -1642,7 +1643,7 @@ void FileSystem::mkdir(const std::string& p, uint32_t mode, uint32_t uid, uint32
 }
 
 std::optional<FsEntry> FileSystem::apply_namespace_mutation(
-    NamespaceWorkingSet& working, MetadataSnapshot& s, MetadataDelta& delta,
+    NamespaceWorkingSet& working, MetadataDelta& delta,
     const FilesystemNamespaceMutation& op) {
     const auto& q = op.from;
     switch (op.kind) {
@@ -1701,7 +1702,7 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
         for (const auto& extent : entry->extents)
             if (!extent.hole)
                 retiring.push_back(extent.id);
-        retire_objects(s, delta, std::move(retiring));
+        retire_objects(delta, std::move(retiring));
         working.erase(q);
         return {};
     }
@@ -1735,7 +1736,7 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
                 for (const auto& extent : dst->extents)
                     if (!extent.hole)
                         retiring.push_back(extent.id);
-                retire_objects(s, delta, std::move(retiring));
+                retire_objects(delta, std::move(retiring));
             }
             working.erase(y);
         }
@@ -1796,7 +1797,7 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
 // Applies one batch's operations through the working set, as the largest
 // valid prefix unless `atomic`. Throws FsError when nothing of it can apply.
 void FileSystem::apply_namespace_batch_to(QueuedNamespaceBatch& batch, NamespaceWorkingSet& working,
-                                          MetadataSnapshot& snapshot, MetadataDelta& delta) {
+                                          MetadataSnapshot&, MetadataDelta& delta) {
     auto& result = batch.result;
     result.entries.assign(batch.operations.size(), std::nullopt);
     result.applied = 0;
@@ -1805,7 +1806,7 @@ void FileSystem::apply_namespace_batch_to(QueuedNamespaceBatch& batch, Namespace
     for (size_t i = 0; i < batch.operations.size(); ++i) {
         try {
             result.entries[i] =
-                apply_namespace_mutation(working, snapshot, delta, batch.operations[i]);
+                apply_namespace_mutation(working, delta, batch.operations[i]);
             ++result.applied;
         } catch (const FsError& error) {
             // No valid prefix, or all-or-nothing: throw. Otherwise commit
@@ -2396,7 +2397,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
             if (!extent.hole && !retained.contains(extent.id))
                 retiring.push_back(extent.id);
         }
-        retire_objects(s, delta, std::move(retiring));
+        retire_objects(delta, std::move(retiring));
 
         const FsEntry previous = current;
         current.size = z;
@@ -2494,7 +2495,7 @@ std::optional<Hash256> FileSystem::available_namespace_signature(
     return metadata_namespace_signature(*view->snapshot);
 }
 
-void FileSystem::census_walk(const MetadataSnapshot& snapshot) {
+void FileSystem::census_walk(const MetadataSnapshot& snapshot, const std::function<void()>& pause) {
     // The reachability walk GC trusts. for_each_namespace_entry walks a
     // tree-backed namespace; an empty live set would make every extent look
     // unreachable. The same walk names the tree's nodes, the namespace's own
@@ -2506,6 +2507,8 @@ void FileSystem::census_walk(const MetadataSnapshot& snapshot) {
     for_each_namespace_entry(
         snapshot, &nodes,
         [&](const std::string&, const FsEntry& entry) {
+            if (pause)
+                pause();
             ++totals.entries;
             totals.extent_count += entry.extents.size();
             for (const auto& extent : entry.extents)
@@ -2517,13 +2520,15 @@ void FileSystem::census_walk(const MetadataSnapshot& snapshot) {
                               totals);
 }
 
-bool FileSystem::census_follow(const ObjectId& root) {
+bool FileSystem::census_follow(const ObjectId& root, const std::function<void()>& pause) {
     auto& counts = local_.references();
     auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     std::vector<ObjectId> extents_in, extents_out, nodes_in, nodes_out;
     diff_namespace_tree_nodes(*counts.root(), root, nodes, nodes_in, nodes_out);
     auto totals = counts.totals();
     for (const auto& [path, difference] : diff_namespace_trees(*counts.root(), root, nodes)) {
+        if (pause)
+            pause();
         if (difference.before) {
             --totals.entries;
             totals.extent_count -= difference.before->extents.size();
@@ -2547,7 +2552,7 @@ bool FileSystem::census_follow(const ObjectId& root) {
                          std::move(nodes_out), totals);
 }
 
-void FileSystem::census_count(const MetadataSnapshot& snapshot) {
+void FileSystem::census_count(const MetadataSnapshot& snapshot, const std::function<void()>& pause) {
     // The counts follow the tree: what the new tree holds that the last one
     // did not goes in, what it no longer holds comes out. The whole tree is
     // walked the first time, for a namespace that is not a tree, and if the
@@ -2558,15 +2563,17 @@ void FileSystem::census_count(const MetadataSnapshot& snapshot) {
         if (*counted == *snapshot.namespace_root)
             return;
         try {
-            if (census_follow(*snapshot.namespace_root))
+            if (census_follow(*snapshot.namespace_root, pause))
                 return;
             Log::warn("maintenance census did not match the namespace tree; walking it again");
+        } catch (const MaintenanceStopping&) {
+            throw;
         } catch (const std::exception& error) {
             Log::warn("maintenance census cannot follow the namespace tree; walking it again: " +
                       std::string(error.what()));
         }
     }
-    census_walk(snapshot);
+    census_walk(snapshot, pause);
 }
 
 MaintenanceObjects FileSystem::maintenance_objects_from(const MetadataSnapshotView& view) {
@@ -2609,7 +2616,8 @@ MaintenanceObjects FileSystem::maintenance_objects_from(const MetadataSnapshotVi
     return built;
 }
 
-std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached() {
+std::shared_ptr<const MaintenanceObjects>
+FileSystem::maintenance_objects_cached(const std::function<void()>& pause) {
     const auto known_generation = metadata_server_.known_generation();
     {
         Lock lock(maintenance_index_mutex_);
@@ -2625,7 +2633,7 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
             return maintenance_index_;
     }
     auto view = m_.converged();
-    census_count(*view.snapshot);
+    census_count(*view.snapshot, pause);
     auto built = std::make_shared<MaintenanceObjects>(maintenance_objects_from(view));
     Lock lock(maintenance_index_mutex_);
     if (!maintenance_index_ || view.generation >= maintenance_index_generation_) {

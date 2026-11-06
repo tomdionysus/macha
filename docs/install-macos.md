@@ -103,7 +103,7 @@ sudo cmake --install build-homebrew
 
 This installs the executable at `/usr/local/bin/macha`, the administration
 tools (`macha-users`, `macha-recover`, `macha-metadata-dump`,
-`macha-metadata-repair`, `macha-namespace-migrate`) beside it,
+`macha-metadata-repair`) beside it,
 `libmacha_core.dylib` under `/usr/local/lib/macha`, the FUSE and BitTorrent
 plugins that were built under `/usr/local/lib/macha/plugins`, and the
 configuration at `/usr/local/etc/macha/macha.yaml`. The library and plugin

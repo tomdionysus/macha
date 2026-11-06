@@ -2485,8 +2485,12 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     const std::optional<uint64_t> pull_identity =
         pull_list ? std::optional<uint64_t>(identity_of(*pull_list, pull ? pull_version : 0))
                   : std::nullopt;
-    if (pull_identity != repair_pull_identity_ && repair_pull_after_)
-        repair_pass_spans_change_ = true;
+    if (pull_identity != repair_pull_identity_) {
+        if (repair_pull_after_)
+            repair_pass_spans_change_ = true;
+        // A settled pull covered the list it walked, not this one.
+        repair_pull_complete_ = false;
+    }
     repair_pull_identity_ = pull_identity;
     if (!pull_list || pull_list->empty())
         repair_pull_complete_ = true;

@@ -2,6 +2,7 @@
 #include "service/maintenance.hpp"
 #include "service/claim_walk.hpp"
 #include "contract/gates.hpp"
+#include "contract/stopping.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "diagnostics.hpp"
 #include "fuse/fuse_frontend.hpp"
@@ -170,48 +171,19 @@ std::vector<GarbageRef> Maintenance::collect_garbage(const std::vector<GarbageRe
     return matured;
 }
 
-void Maintenance::maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
-                                        const std::vector<GarbageRef>& stamp) {
-    if (erase.empty() && stamp.empty())
+void Maintenance::maintain_garbage_metadata(const std::vector<GarbageRef>& erase) {
+    if (erase.empty())
         return;
 
     std::map<ObjectId, GarbageRef> erase_expected;
-    std::map<ObjectId, GarbageRef> stamp_expected;
     for (const auto& candidate : erase)
         erase_expected[candidate.id] = candidate;
-    for (const auto& candidate : stamp)
-        stamp_expected[candidate.id] = candidate;
 
     metadata_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-        std::erase_if(snapshot.garbage, [&](const GarbageRef& current) {
-            auto expected = erase_expected.find(current.id);
-            const bool remove = expected != erase_expected.end() && expected->second == current;
-            if (remove)
-                delta.erase_garbage.push_back(current.id);
-            return remove;
-        });
-
-        const auto retired = clock_->wall_ns();
-        for (auto& current : snapshot.garbage) {
-            auto expected = stamp_expected.find(current.id);
-            if (expected == stamp_expected.end() || expected->second != current)
-                continue;
-            // Legacy tombstones have no retirement time or ABA token; stamping them
-            // keeps old storage safe while letting them leave metadata after grace.
-            current.retired_at_ns = retired;
-            current.retirement_id = random_node_id();
-            delta.upsert_garbage.push_back(current);
-        }
-        std::sort(delta.erase_garbage.begin(), delta.erase_garbage.end());
-        delta.erase_garbage.erase(
-            std::unique(delta.erase_garbage.begin(), delta.erase_garbage.end()),
-            delta.erase_garbage.end());
-
-        // A tree-backed head keeps its tombstones in immutable batches: a batch
-        // holding one to erase is dropped, and the rest of it written again at
-        // its own time. A later retirement of the same object is another batch
-        // and is kept.
-        if (erase_expected.empty() || snapshot.tombstone_batches.empty())
+        // A head keeps its tombstones in immutable batches: a batch holding one
+        // to erase is dropped, and the rest of it written again at its own time.
+        // A later retirement of the same object is another batch and is kept.
+        if (snapshot.tombstone_batches.empty())
             return;
         const auto reader = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
         std::vector<TombstoneBatch> kept;
@@ -260,11 +232,8 @@ void Maintenance::maintain_tombstone_batches(const InventoryHorizon& inventory) 
         return std::none_of(named.begin(), named.end(),
                             [&](const TombstoneBatch& batch) { return batch.id == id; });
     });
-    const bool inline_tombstones =
-        view.snapshot->namespace_root && !view.snapshot->garbage.empty();
-    if (matured.empty() && !inline_tombstones)
+    if (matured.empty())
         return;
-    constexpr int64_t hour_ns = 3600LL * 1000 * 1000 * 1000;
     metadata_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
         // A batch is immutable, so dropping it by id cannot drop a later
         // retirement of the same objects: that is another batch.
@@ -274,41 +243,8 @@ void Maintenance::maintain_tombstone_batches(const InventoryHorizon& inventory) 
                 delta.drop_tombstone_batches.push_back(batch.id);
             return drop;
         });
-        if (!snapshot.namespace_root || snapshot.garbage.empty())
-            return;
-        // Inline tombstones into batches, an hour of retirements to a batch at
-        // the hour's latest: a collection waits at most an hour more. One
-        // never stamped is stamped now, a full grace from here.
-        const auto now = clock_->wall_ns();
-        std::map<int64_t, MetadataDelta::PendingTombstones> hours;
-        for (const auto& garbage : snapshot.garbage) {
-            const auto at = garbage.retired_at_ns > 0 ? garbage.retired_at_ns : now;
-            auto& hour = hours[at / hour_ns];
-            hour.at_commit = false;
-            hour.retired_at_ns = std::max(hour.retired_at_ns, at);
-            hour.ids.push_back(garbage.id);
-            delta.erase_garbage.push_back(garbage.id);
-        }
-        snapshot.garbage.clear();
-        std::sort(delta.erase_garbage.begin(), delta.erase_garbage.end());
-        delta.erase_garbage.erase(
-            std::unique(delta.erase_garbage.begin(), delta.erase_garbage.end()),
-            delta.erase_garbage.end());
-        for (auto& [_, hour] : hours)
-            delta.pending_tombstones.push_back(std::move(hour));
-        Log::info("metadata tombstones moved into batches tombstones=" +
-                  std::to_string(delta.erase_garbage.size()) +
-                  " batches=" + std::to_string(hours.size()));
     });
 }
-
-namespace {
-// Thrown out of a long walk when the pass is asked to stop; caught by the
-// pass, which then sees the stop and ends.
-struct MaintenanceStopping final : std::runtime_error {
-    MaintenanceStopping() : std::runtime_error("maintenance stopping") {}
-};
-} // namespace
 
 double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds,
                             double wall_seconds, double cpu_target) {
@@ -684,7 +620,10 @@ void Maintenance::run(std::stop_token stop) {
                 // The horizons this pass reads: the ledger's, as published.
                 auto inventory = ledger_.inventory();
                 auto release = ledger_.release();
-                auto objects = builder_.namespace_objects();
+                auto objects = builder_.namespace_objects([&stop] {
+                    if (stop.stop_requested())
+                        throw MaintenanceStopping{};
+                });
                 bool rebuilt_inventory = false;
                 // Rebuilding is held back until metadata is ready, so the inventory
                 // is never read ahead of the metadata convergence it depends on; a
@@ -941,16 +880,11 @@ void Maintenance::run(std::stop_token stop) {
                 trace_gate("gate.tombstones", tombstones.permitted, tombstones.conditions);
                 if (tombstones.permitted) {
                     auto matured = collect_garbage(garbage);
-                    std::vector<GarbageRef> legacy;
-                    for (const auto& candidate : garbage) {
-                        if (candidate.retired_at_ns == 0)
-                            legacy.push_back(candidate);
-                    }
 
                     auto erase = inventory ? inventory->stale_garbage() : no_garbage;
                     erase.insert(erase.end(), matured.begin(), matured.end());
                     observations().add("maintenance.tombstones.collected", matured.size());
-                    if (!erase.empty() || !legacy.empty()) {
+                    if (!erase.empty()) {
                         const auto ids = [](const std::vector<GarbageRef>& refs) {
                             std::vector<std::string> hex;
                             for (const auto& ref : refs)
@@ -961,9 +895,8 @@ void Maintenance::run(std::stop_token stop) {
                                 joined += (joined.empty() ? "" : ",") + id;
                             return joined;
                         };
-                        trace_action("tombstones", "erase=[" + ids(erase) + "] stamp=[" +
-                                                       ids(legacy) + "]");
-                        maintain_garbage_metadata(erase, legacy);
+                        trace_action("tombstones", "erase=[" + ids(erase) + "]");
+                        maintain_garbage_metadata(erase);
                     }
                     if (inventory)
                         maintain_tombstone_batches(*inventory);

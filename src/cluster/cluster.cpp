@@ -311,6 +311,8 @@ NodeReadiness NodeRuntime::readiness() const {
     NodeReadiness out;
     out.control_plane_online = control_plane_online_.load(std::memory_order_acquire);
     out.data_storage_ready = progress_.has(RecoveryProgress::data_storage);
+    out.data_storage_degraded = out.data_storage_ready && !cfg_.storage_backends.empty() &&
+                                advertised_backends_online_.load(std::memory_order_relaxed) == 0;
     out.control_storage_ready = progress_.has(RecoveryProgress::control_storage);
     out.cache_ready = progress_.has(RecoveryProgress::cache);
     out.retention_ready = progress_.has(RecoveryProgress::retention);

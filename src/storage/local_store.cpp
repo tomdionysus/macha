@@ -903,9 +903,13 @@ std::optional<Bytes> LocalStore::get_packed_locked(const ObjectId& id, Lock& loc
                                       static_cast<size_t>(entry.payload_size));
         if (!payload)
             throw std::runtime_error("short packed object read");
-        plain = aes_gcm_open(key_, entry.nonce, entry.tag, *payload, id.bytes);
-        if (plain.size() != entry.plain_size || object_id(plain) != id)
-            throw std::runtime_error("packed object integrity failure");
+        try {
+            plain = aes_gcm_open(key_, entry.nonce, entry.tag, *payload, id.bytes);
+            if (plain.size() != entry.plain_size || object_id(plain) != id)
+                throw std::runtime_error("packed object integrity failure");
+        } catch (const std::runtime_error& error) {
+            throw ObjectCorrupt(error.what());
+        }
     } catch (...) {
         release_reader();
         throw;
@@ -1322,17 +1326,22 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
     if (!std::filesystem::exists(p)) return {};
     auto encoded = files_.read(p);
     if (encoded.empty() && prune_empty_loose(id, p)) return {};
-    Reader r(encoded);
-    auto magic = r.raw(M.size());
-    if (!std::equal(magic.begin(), magic.end(), M.begin()))
-        throw std::runtime_error("bad object header");
-    auto size = r.u64();
-    auto nonce = r.fixed<12>();
-    auto tag = r.fixed<16>();
-    auto cipher = r.raw(r.remaining());
-    auto plain = aes_gcm_open(key_, nonce, tag, cipher, id.bytes);
-    if (plain.size() != size || object_id(plain) != id)
-        throw std::runtime_error("object integrity failure");
+    Bytes plain;
+    try {
+        Reader r(encoded);
+        auto magic = r.raw(M.size());
+        if (!std::equal(magic.begin(), magic.end(), M.begin()))
+            throw std::runtime_error("bad object header");
+        auto size = r.u64();
+        auto nonce = r.fixed<12>();
+        auto tag = r.fixed<16>();
+        auto cipher = r.raw(r.remaining());
+        plain = aes_gcm_open(key_, nonce, tag, cipher, id.bytes);
+        if (plain.size() != size || object_id(plain) != id)
+            throw std::runtime_error("object integrity failure");
+    } catch (const std::runtime_error& error) {
+        throw ObjectCorrupt(error.what());
+    }
     const auto stamp = loose_stamp(p);
     if (stamp) {
         lock.lock();

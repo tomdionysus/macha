@@ -446,6 +446,7 @@ std::string Service::describe_readiness_stall() const {
     return std::string("readiness: control_plane=") +
           (readiness.control_plane_online ? "ready" : "starting") +
           " data_storage=" + phase(readiness.data_storage_ready) +
+          (readiness.data_storage_degraded ? " data_storage_degraded=true" : "") +
           " control_storage=" + phase(readiness.control_storage_ready) +
           " cache=" + phase(readiness.cache_ready) +
           " retention=" + phase(readiness.retention_ready) +

@@ -18,53 +18,6 @@ using namespace macha::test_support;
 
 namespace {
 
-// What macha-namespace-migrate does to one stopped node, through the same
-// plan_namespace_migration the tool uses.
-struct MigrationResult {
-    MetadataRecord record;
-    Hash256 hash{};
-    ObjectId root{};
-    size_t entries{};
-    uint64_t payload_before{};
-    uint64_t payload_after{};
-};
-
-MigrationResult migrate_state(const Config& config, const ClusterKeys& keys,
-                              const std::vector<NodeId>& witnesses, bool install = true) {
-    MetadataReplica replica(config.state_path, keys.storage);
-    const auto head = replica.committed();
-    REQUIRE(valid_metadata_record(head));
-
-    // An empty metadata_store.path means <state_path>/metadata-objects, as
-    // normalize_config resolves it.
-    const auto object_path = config.metadata_store.path.empty()
-                                 ? config.state_path / "metadata-objects"
-                                 : config.metadata_store.path;
-    LocalStore objects(object_path,
-                       LocalStoreOptions{config.metadata_store.limit, 0,
-                                         config.metadata_store.packing.threshold,
-                                         config.metadata_store.packing.target_size},
-                       keys.storage);
-    LocalNamespaceNodeStore nodes(objects);
-    const auto migration = plan_namespace_migration(head, nodes);
-    if (install)
-        REQUIRE(replica.install_migrated_head(migration.record, witnesses, "test migration"));
-    return {migration.record, migration.record.hash, migration.root, migration.entries,
-            migration.previous_payload_bytes, migration.record.payload.size()};
-}
-
-// Two stopped nodes re-rooted onto one record, as the tool's --adopt does:
-// each builds the tree into its own store, and the second installs the
-// first's record once its own namespace yields the same root.
-void migrate_pair(const Config& first, const Config& second, const ClusterKeys& keys,
-                  const std::vector<NodeId>& witnesses) {
-    const auto leader = migrate_state(first, keys, witnesses);
-    const auto follower = migrate_state(second, keys, witnesses, false);
-    REQUIRE(follower.root == leader.root);
-    MetadataReplica replica(second.state_path, keys.storage);
-    REQUIRE(replica.install_migrated_head(leader.record, witnesses, "test migration"));
-}
-
 // Every tree node the service's head reaches, read through its own store.
 std::vector<ObjectId> reachable_tree_nodes(Service& service) {
     const auto snapshot = service.metadata_manager().snapshot();
@@ -153,11 +106,11 @@ std::vector<uint8_t> read_file(Service& service, const std::string& path, size_t
     return out;
 }
 
-// Every write says where it came from, on a namespace held as a map and on
-// one held as a tree: a new file gets an identity and its two dots, a change
+// Every write says where it came from, before and after a restart: a new
+// file gets an identity and its two dots, a change
 // moves the content dot, a rename keeps the identity and moves the name dot,
 // and an append travels as a delta that carries its dot.
-MACHA_TEST("namespace_migration", test_every_write_records_where_it_came_from) {
+MACHA_TEST("namespace_service", test_every_write_records_where_it_came_from) {
     TestCluster cluster;
     auto config = cluster.node_config("provenance");
     make_solo(config);
@@ -206,14 +159,6 @@ MACHA_TEST("namespace_migration", test_every_write_records_where_it_came_from) {
         CHECK(grown.provenance.name == moved.provenance.name);
         CHECK(grown.provenance.content.sequence > moved.provenance.content.sequence);
         CHECK(newest(service, grown.provenance.content));
-        // A map-form record is far larger than the append, so it travels as
-        // a delta; a tree-form record is already smaller than one.
-        if (!service.metadata_manager().snapshot().namespace_root) {
-            const auto head = service.local_state().replica().accepted_heads().front();
-            const auto entry = service.local_state().replica().history_entry(head.hash);
-            REQUIRE(entry.has_value());
-            CHECK(entry->body == MetadataHistoryEntry::Body::delta);
-        }
 
         // A directory rename carries every identity under it.
         fs.rename(dir, dir + "-moved", false);
@@ -228,36 +173,34 @@ MACHA_TEST("namespace_migration", test_every_write_records_where_it_came_from) {
         service.start();
         node_id = service.node().node_id();
         REQUIRE(wait_metadata_writable(service));
-        check_lifecycle(service, "/map");
+        check_lifecycle(service, "/first");
         const auto snapshot = service.metadata_manager().snapshot();
-        REQUIRE(!snapshot.namespace_root.has_value());
+        REQUIRE(snapshot.namespace_root.has_value());
         REQUIRE(snapshot.legacy_clock.has_value());
-        // The root was there before provenance and nothing has changed it.
+        // The root was founded before any provenance and nothing has changed it.
         CHECK(service.filesystem().getattr("/").provenance.empty());
         service.stop();
     }
-    (void)migrate_state(config, cluster.keys(), {node_id});
     Service service(config, cluster.keys(), test_durability_window);
     service.start();
     REQUIRE(wait_metadata_writable(service));
-    REQUIRE(service.metadata_manager().snapshot().namespace_root.has_value());
-    // What was written before the tree is still there, provenance and all.
-    CHECK(service.filesystem().getattr("/map-moved/b.bin").provenance.file_id != NodeId{});
-    check_lifecycle(service, "/tree");
+    // What was written before the restart is still there, provenance and all.
+    CHECK(service.filesystem().getattr("/first-moved/b.bin").provenance.file_id != NodeId{});
+    check_lifecycle(service, "/second");
     service.stop();
 }
 
 // The maintenance inventory is, at every step, what a walk of the whole
 // namespace finds: files with inline and with external extent lists, the
-// same content at two paths, renames, overwrites and removals. On a tree it
-// gets there by following the tree from one head to the next, and a lookup
-// by media id follows the same changes.
-MACHA_TEST("namespace_migration", test_the_inventory_and_the_media_index_follow_the_tree) {
+// same content at two paths, renames, overwrites and removals, before and
+// after a restart. It gets there by following the tree from one head to the
+// next, and a lookup by media id follows the same changes.
+MACHA_TEST("namespace_service", test_the_inventory_and_the_media_index_follow_the_tree) {
     TestCluster cluster;
     auto config = cluster.node_config("census");
     make_solo(config);
     NodeId node_id{};
-    const auto check = [&](Service& service, const std::string& root, bool tree) {
+    const auto check = [&](Service& service, const std::string& root) {
     auto& fs = service.filesystem();
     const auto extent = config.extent_size;
     const auto agrees = [&] {
@@ -269,11 +212,9 @@ MACHA_TEST("namespace_migration", test_the_inventory_and_the_media_index_follow_
         CHECK(nodes == walked.nodes);
         // What the release horizon is given in place of its own walk.
         const auto counted = fs.namespace_references(service.metadata_manager().snapshot());
-        CHECK(counted.has_value() == tree);
-        if (counted) {
-            CHECK(counted->extents.ids() == walked.extents);
-            CHECK(counted->nodes.ids() == walked.nodes);
-        }
+        REQUIRE(counted.has_value());
+        CHECK(counted->extents.ids() == walked.extents);
+        CHECK(counted->nodes.ids() == walked.nodes);
         return extents == walked.extents && nodes == walked.nodes;
     };
     const auto write = [&](const std::string& path, const Bytes& bytes) {
@@ -378,24 +319,21 @@ MACHA_TEST("namespace_migration", test_the_inventory_and_the_media_index_follow_
         service.start();
         node_id = service.node().node_id();
         REQUIRE(wait_metadata_writable(service));
-        REQUIRE(!service.metadata_manager().snapshot().namespace_root.has_value());
-        check(service, "/map", false);
+        REQUIRE(service.metadata_manager().snapshot().namespace_root.has_value());
+        check(service, "/first");
         service.stop();
     }
-    (void)migrate_state(config, cluster.keys(), {node_id});
     Service service(config, cluster.keys(), test_durability_window);
     service.start();
     REQUIRE(wait_metadata_writable(service));
-    REQUIRE(service.metadata_manager().snapshot().namespace_root.has_value());
-    check(service, "/tree", true);
+    check(service, "/second");
     service.stop();
 }
 
-// Tombstones live in batches in a tree-backed head: maintenance moves a
-// migrated head's inline tombstones into batches, a delete writes its
-// extents' batch (a control object), maintenance reads every tombstone from
-// the batches, and drops each batch once its grace has run.
-MACHA_TEST("namespace_migration", test_tombstones_live_in_batches_in_a_tree_backed_head) {
+// Tombstones live in batches in the head: a delete writes its extents' batch
+// (a control object), the batches survive a restart, maintenance reads every
+// tombstone from them, and drops each batch once its grace has run.
+MACHA_TEST("namespace_service", test_tombstones_live_in_batches_in_a_tree_backed_head) {
     TestCluster cluster;
     auto config = cluster.node_config("tombstone-batches");
     make_solo(config);
@@ -418,12 +356,12 @@ MACHA_TEST("namespace_migration", test_tombstones_live_in_batches_in_a_tree_back
         for (const auto& x : fs.getattr("/before.bin").extents)
             map_extents.push_back(x.id);
         fs.unlink("/before.bin");
-        REQUIRE(!service.metadata_manager().snapshot().garbage.empty());
+        const auto head = service.metadata_manager().snapshot();
+        REQUIRE(head.garbage.empty());
+        REQUIRE(!head.tombstone_batches.empty());
         service.stop();
     }
-    (void)migrate_state(config, cluster.keys(), {node_id});
-    // Longer than the first passes take: a tombstone already past its grace
-    // when the gate first opens is collected outright, not moved into a batch.
+    // Longer than the first passes take, so the batches are still there to see.
     config.maintenance.garbage_grace = 20s;
     Service service(config, cluster.keys(), test_durability_window);
     service.start();
@@ -431,12 +369,7 @@ MACHA_TEST("namespace_migration", test_tombstones_live_in_batches_in_a_tree_back
     auto& fs = service.filesystem();
     auto& metadata = service.metadata_manager();
     REQUIRE(metadata.snapshot().namespace_root.has_value());
-
-    // The migrated head's inline tombstones move into batches.
-    REQUIRE(wait_until([&] {
-        const auto head = metadata.snapshot();
-        return head.garbage.empty() && !head.tombstone_batches.empty();
-    }, 30s));
+    REQUIRE(!metadata.snapshot().tombstone_batches.empty());
 
     // A delete in the tree writes one batch naming its extents.
     write(fs, "/after.bin", pattern(extent * 4, 22));
@@ -484,9 +417,8 @@ MACHA_TEST("namespace_migration", test_tombstones_live_in_batches_in_a_tree_back
 // A tombstone made stale by its content being written again lives in a batch
 // on a tree-backed head. Maintenance drops the batch, writes the rest of it
 // again at its own retirement time, and then has nothing to commit: the
-// generation holds still. Before 0.92.5 the erase reached only the inline
-// list, so the batch stayed and every pass committed an empty mutation.
-MACHA_TEST("namespace_migration", test_a_stale_tombstone_in_a_batch_is_erased_once) {
+// generation holds still.
+MACHA_TEST("namespace_service", test_a_stale_tombstone_in_a_batch_is_erased_once) {
     TestCluster cluster;
     auto config = cluster.node_config("stale-batch");
     make_solo(config);
@@ -497,16 +429,6 @@ MACHA_TEST("namespace_migration", test_a_stale_tombstone_in_a_batch_is_erased_on
         REQUIRE(writer->write(0, bytes) == bytes.size());
         writer->commit();
     };
-    NodeId node_id{};
-    {
-        Service service(config, cluster.keys(), test_durability_window);
-        service.start();
-        node_id = service.node().node_id();
-        REQUIRE(wait_metadata_writable(service));
-        write(service.filesystem(), "/seed.bin", pattern(extent, 20));
-        service.stop();
-    }
-    (void)migrate_state(config, cluster.keys(), {node_id});
     // Nothing matures: only staleness erases a tombstone here.
     config.maintenance.garbage_grace = 1h;
     Service service(config, cluster.keys(), test_durability_window);
@@ -570,9 +492,9 @@ MACHA_TEST("namespace_migration", test_a_stale_tombstone_in_a_batch_is_erased_on
 }
 
 // Namespace operations that arrive while a commit is in flight are committed
-// together by the next one, on a map-held and on a tree-held namespace. One
-// that cannot apply fails alone and leaves the rest of its commit intact.
-MACHA_TEST("namespace_migration", test_operations_waiting_on_a_commit_share_the_next_one) {
+// together by the next one, before and after a restart. One that cannot apply
+// fails alone and leaves the rest of its commit intact.
+MACHA_TEST("namespace_service", test_operations_waiting_on_a_commit_share_the_next_one) {
     TestCluster cluster;
     auto config = cluster.node_config("group-commit");
     make_solo(config);
@@ -630,272 +552,20 @@ MACHA_TEST("namespace_migration", test_operations_waiting_on_a_commit_share_the_
         service.start();
         node_id = service.node().node_id();
         REQUIRE(wait_metadata_writable(service));
-        check_group(service, "/map");
+        check_group(service, "/first");
         service.stop();
     }
-    (void)migrate_state(config, cluster.keys(), {node_id});
     Service service(config, cluster.keys(), test_durability_window);
     service.start();
     REQUIRE(wait_metadata_writable(service));
-    REQUIRE(service.metadata_manager().snapshot().namespace_root.has_value());
-    check_group(service, "/tree");
+    check_group(service, "/second");
     service.stop();
 }
 
-MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_library) {
-    // End to end on one node: write a library, stop, re-root onto the tree,
-    // restart. Every read must match and the filesystem must stay writable.
-    TestCluster cluster;
-    auto config = cluster.node_config("migrate-serves");
-    make_solo(config);
-    const auto payload_a = pattern(3 * 1024 * 1024, 11);
-    const auto payload_b = pattern(512 * 1024, 200);
-
-    NodeId node_id{};
-    {
-        // Destroyed, not merely stopped: a stopped Service still holds the
-        // storage lock the migration needs.
-        Service service(config, cluster.keys(), test_durability_window);
-        service.start();
-        node_id = service.node().node_id();
-        service.filesystem().mkdir("/TV", 0755, getuid(), getgid());
-        service.filesystem().mkdir("/TV/Show", 0755, getuid(), getgid());
-        write_file(service, "/TV/Show/one.mkv", payload_a);
-        write_file(service, "/TV/Show/two.mkv", payload_b);
-        service.filesystem().mkdir("/Music", 0755, getuid(), getgid());
-        CHECK(read_file(service, "/TV/Show/one.mkv", payload_a.size()) == payload_a);
-        service.stop();
-    }
-
-    // The sole witness is this node, the whole cluster here.
-    const auto migration = migrate_state(config, cluster.keys(), {node_id});
-    CHECK(migration.entries == 6); // /, /TV, /TV/Show, two files, /Music
-    // The record no longer carries the entry map.
-    CHECK(migration.payload_after < migration.payload_before);
-
-    // The head is tree-backed, with no entry map.
-    {
-        MetadataReplica replica(config.state_path, cluster.keys().storage);
-        const auto head = replica.committed();
-        CHECK(head.hash == migration.hash);
-        const auto snapshot = decode_snapshot(head.payload);
-        REQUIRE(snapshot.namespace_root.has_value());
-        CHECK(*snapshot.namespace_root == migration.root);
-        CHECK(snapshot.entries.empty());
-    }
-
-    // A new Service over the same state directory: the node restarting.
-    Service service(config, cluster.keys(), test_durability_window);
-    service.start();
-    (void)service.filesystem();
-
-    CHECK(service.filesystem().getattr("/TV/Show/one.mkv").size == payload_a.size());
-    CHECK(service.filesystem().getattr("/TV/Show").type == EntryType::directory);
-    auto listing = service.filesystem().readdir("/TV/Show");
-    CHECK(listing.size() == 2);
-    CHECK(read_file(service, "/TV/Show/one.mkv", payload_a.size()) == payload_a);
-    CHECK(read_file(service, "/TV/Show/two.mkv", payload_b.size()) == payload_b);
-
-    // Writes prove the commit path against a tree: mkdir, create, overwrite,
-    // rename and unlink, each read back.
-    service.filesystem().mkdir("/TV/Show/Season 2", 0755, getuid(), getgid());
-    const auto payload_c = pattern(256 * 1024, 42);
-    write_file(service, "/TV/Show/Season 2/three.mkv", payload_c);
-    CHECK(read_file(service, "/TV/Show/Season 2/three.mkv", payload_c.size()) == payload_c);
-
-    const auto payload_d = pattern(1024 * 1024, 99);
-    {
-        auto writer = service.filesystem().open_write("/TV/Show/two.mkv", true);
-        REQUIRE(writer->write(0, payload_d) == payload_d.size());
-        writer->commit();
-    }
-    CHECK(read_file(service, "/TV/Show/two.mkv", payload_d.size()) == payload_d);
-
-    service.filesystem().rename("/TV/Show/one.mkv", "/TV/Show/renamed.mkv", false);
-    CHECK(read_file(service, "/TV/Show/renamed.mkv", payload_a.size()) == payload_a);
-    bool gone = false;
-    try {
-        (void)service.filesystem().getattr("/TV/Show/one.mkv");
-    } catch (const FsError&) {
-        gone = true;
-    }
-    CHECK(gone);
-
-    service.filesystem().unlink("/TV/Show/Season 2/three.mkv");
-    service.filesystem().rmdir("/TV/Show/Season 2");
-    service.filesystem().rmdir("/Music");
-
-    auto final_listing = service.filesystem().readdir("/TV/Show");
-    CHECK(final_listing.size() == 2);
-    service.stop();
-}
-
-MACHA_TEST("namespace_migration", test_every_node_computes_the_same_record_from_the_same_head) {
-    // The record is a pure function of the head, so nodes migrate without a
-    // coordinator; --expect-hash relies on this. Two independent object stores
-    // stand in for two stopped nodes.
-    TestCluster cluster;
-    auto config = cluster.node_config("migrate-agree");
-    make_solo(config);
-    {
-        Service service(config, cluster.keys(), test_durability_window);
-        service.start();
-        service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
-        write_file(service, "/Films/a.mkv", pattern(128 * 1024, 5));
-        write_file(service, "/Films/b.mkv", pattern(64 * 1024, 9));
-        service.stop();
-    }
-
-    MetadataRecord head;
-    {
-        MetadataReplica replica(config.state_path, cluster.keys().storage);
-        head = replica.committed();
-    }
-    REQUIRE(valid_metadata_record(head));
-
-    TempDir left_dir, right_dir;
-    LocalStore left_store(left_dir.path() / "objects",
-                          LocalStoreOptions{1ULL << 30, 0, 0, 0}, cluster.keys().storage);
-    LocalStore right_store(right_dir.path() / "objects",
-                           LocalStoreOptions{1ULL << 30, 0, 0, 0}, cluster.keys().storage);
-    LocalNamespaceNodeStore left_nodes(left_store);
-    LocalNamespaceNodeStore right_nodes(right_store);
-
-    const auto left = plan_namespace_migration(head, left_nodes);
-    const auto right = plan_namespace_migration(head, right_nodes);
-
-    CHECK(left.root == right.root);
-    CHECK(left.record.hash == right.record.hash);
-    CHECK(left.record.payload == right.record.payload);
-    // The same tree nodes were written, not merely the same root.
-    CHECK(left_nodes.written().size() == right_nodes.written().size());
-    CHECK(left_nodes.bytes_written() == right_nodes.bytes_written());
-}
-
-MACHA_TEST("namespace_migration", test_a_migration_refuses_what_it_cannot_re_root_safely) {
-    TestCluster cluster;
-    auto config = cluster.node_config("migrate-refuses");
-    make_solo(config);
-    NodeId node_id{};
-    {
-        Service service(config, cluster.keys(), test_durability_window);
-        service.start();
-        node_id = service.node().node_id();
-        service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
-        write_file(service, "/Films/a.mkv", pattern(32 * 1024, 3));
-        service.stop();
-    }
-
-    MetadataReplica replica(config.state_path, cluster.keys().storage);
-    const auto head = replica.committed();
-    LocalStore objects(config.state_path / "metadata-objects",
-                       LocalStoreOptions{config.metadata_store.limit, 0, 0, 0},
-                       cluster.keys().storage);
-    LocalNamespaceNodeStore nodes(objects);
-
-    // An already-migrated namespace is refused.
-    const auto migration = plan_namespace_migration(head, nodes);
-    REQUIRE(replica.install_migrated_head(migration.record, {node_id}, "test"));
-    const auto migrated_head = replica.committed();
-    bool refused = false;
-    try {
-        (void)plan_namespace_migration(migrated_head, nodes);
-    } catch (const std::exception&) {
-        refused = true;
-    }
-    CHECK(refused);
-
-    // Fewer witnesses than the write floor is refused.
-    {
-        TestCluster floor_cluster;
-        auto floor_config = floor_cluster.node_config("migrate-floor");
-        floor_config.replication = 1;
-        floor_config.write_copies = 1;
-        floor_config.metadata_write_copies = 1;
-        NodeId floor_node{};
-        {
-            Service service(floor_config, floor_cluster.keys(), test_durability_window);
-            service.start();
-            floor_node = service.node().node_id();
-            service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
-            service.stop();
-        }
-        MetadataReplica floor_replica(floor_config.state_path, floor_cluster.keys().storage);
-        LocalStore floor_objects(floor_config.state_path / "metadata-objects",
-                                 LocalStoreOptions{1ULL << 30, 0, 0, 0},
-                                 floor_cluster.keys().storage);
-        LocalNamespaceNodeStore floor_nodes(floor_objects);
-        const auto plan = plan_namespace_migration(floor_replica.committed(), floor_nodes);
-        CHECK(!floor_replica.install_migrated_head(plan.record, {}, "no witnesses"));
-        // With the one witness the floor asks for, it installs: the refusal
-        // above is about the count alone.
-        CHECK(floor_replica.install_migrated_head(plan.record, {floor_node}, "one witness"));
-    }
-
-    // A record that fails valid_metadata_record is refused.
-    auto tampered = head;
-    REQUIRE(!tampered.payload.empty());
-    Bytes altered(tampered.payload.begin(), tampered.payload.end());
-    altered[altered.size() / 2] ^= 0x20;
-    tampered.payload = std::move(altered);
-    refused = false;
-    try {
-        (void)plan_namespace_migration(tampered, nodes);
-    } catch (const std::exception&) {
-        refused = true;
-    }
-    CHECK(refused);
-}
-
-MACHA_TEST("namespace_migration", test_the_pre_migration_state_is_kept_not_deleted) {
-    // The re-root discards ancestry by renaming the files, not removing them,
-    // so a node can recover from its own disk.
-    TestCluster cluster;
-    auto config = cluster.node_config("migrate-keeps-state");
-    make_solo(config);
-    NodeId node_id{};
-    {
-        Service service(config, cluster.keys(), test_durability_window);
-        service.start();
-        node_id = service.node().node_id();
-        service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
-        write_file(service, "/Films/a.mkv", pattern(16 * 1024, 7));
-        service.stop();
-    }
-
-    const auto state = config.state_path / "metadata";
-    std::set<std::string> before;
-    for (const auto& item : std::filesystem::directory_iterator(state))
-        if (item.is_regular_file())
-            before.insert(item.path().filename().string());
-    REQUIRE(before.contains("checkpoint.meta"));
-    REQUIRE(before.contains("history.log"));
-
-    (void)migrate_state(config, cluster.keys(), {node_id});
-
-    // Ancestry files survive under a .pre-migration. name; the live ones are
-    // written fresh.
-    std::set<std::string> preserved;
-    for (const auto& item : std::filesystem::directory_iterator(state)) {
-        const auto name = item.path().filename().string();
-        const auto marker = name.find(".pre-migration.");
-        if (marker != std::string::npos)
-            preserved.insert(name.substr(0, marker));
-    }
-    // Only ancestry is quarantined; other files, such as the mutation sequence
-    // clock, carry across untouched.
-    for (const auto& name : {"checkpoint.meta", "history.log", "current.meta", "committed.meta"})
-        if (before.contains(name))
-            CHECK(preserved.contains(name));
-    CHECK(std::filesystem::exists(state / "checkpoint.meta"));
-    CHECK(std::filesystem::exists(state / "heads.meta"));
-}
-
-MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keeps_the_namespace) {
-    // The merge of materialised heads reads entry maps, which are empty in
-    // tree-backed snapshots. A branch still held as a map makes the manager
-    // materialise both, merge, and re-root; this exercises that sequence
-    // without a cluster.
+MACHA_TEST("namespace_service", test_reconciling_two_tree_backed_branches_keeps_the_namespace) {
+    // Two branches from one head, each another author's file: the tree merge
+    // reads what differs between the trees and lands on the namespace both
+    // branches imply, the root a build of that namespace from scratch gives.
     MemoryNamespaceNodeStore store;
 
     std::map<std::string, FsEntry> base_entries;
@@ -904,6 +574,7 @@ MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keep
     base_entries["/Films/shared.mkv"] = make_file(10, 3);
     const auto base = populated_snapshot(base_entries);
 
+    auto expected = base_entries;
     // Each branch is another author's one mutation, stamped as a commit
     // stamps what it writes: a file the other has not seen.
     const auto make_branch = [&](uint8_t author, const std::string& path, const FsEntry& file) {
@@ -916,54 +587,29 @@ MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keep
         auto entry = file;
         stamp_entry_provenance(entry, path, nullptr, dot);
         branch.entries[path] = entry;
-        return branch;
+        expected[path] = entry;
+        return detach_namespace(branch, store);
     };
-    const auto left = make_branch(1, "/Films/left.mkv", make_file(20, 4));
-    const auto right = make_branch(2, "/Films/right.mkv", make_file(30, 5));
+    const auto left_tree = make_branch(1, "/Films/left.mkv", make_file(20, 4));
+    const auto right_tree = make_branch(2, "/Films/right.mkv", make_file(30, 5));
 
     Hash256 left_head{}, right_head{};
     left_head.bytes[0] = 1;
     right_head.bytes[0] = 2;
 
-    const auto expected = merge_metadata_heads(left, right, left_head, right_head);
-    CHECK(expected.snapshot.entries.size() == 5);
-    CHECK(expected.snapshot.entries.contains("/Films/shared.mkv"));
-    CHECK(expected.conflicts_created == 0);
-
-    // Merging the tree-backed forms directly is refused, not an empty result.
-    const auto left_tree = detach_namespace(left, store);
-    const auto right_tree = detach_namespace(right, store);
-    bool refused = false;
-    try {
-        (void)merge_metadata_heads(left_tree, right_tree, left_head, right_head);
-    } catch (const std::logic_error&) {
-        refused = true;
-    }
-    CHECK(refused);
-
-    // Materialised, merged, re-rooted: the root equals one built from scratch.
-    auto merged = merge_metadata_heads(attach_namespace(left_tree, store),
-                                       attach_namespace(right_tree, store), left_head,
-                                       right_head);
-    CHECK(merged.snapshot.entries == expected.snapshot.entries);
-    const auto merged_tree = detach_namespace(merged.snapshot, store);
-    REQUIRE(merged_tree.namespace_root.has_value());
-
-    MemoryNamespaceNodeStore fresh;
-    CHECK(*merged_tree.namespace_root == build_namespace_tree(expected.snapshot.entries, fresh));
-    CHECK(read_namespace_tree(*merged_tree.namespace_root, store) == expected.snapshot.entries);
-
-    // Two trees merge by what differs between them, to the same root.
     const auto tree_merge =
         merge_tree_backed_heads(left_tree, right_tree, left_head, right_head, store);
-    CHECK(update_namespace_tree(tree_merge.onto, store, tree_merge.changes) ==
-          *merged_tree.namespace_root);
     CHECK(tree_merge.merged.snapshot.conflicts.empty());
+    const auto merged_root = update_namespace_tree(tree_merge.onto, store, tree_merge.changes);
+    CHECK(read_namespace_tree(merged_root, store) == expected);
+    MemoryNamespaceNodeStore fresh;
+    CHECK(merged_root == build_namespace_tree(expected, fresh));
 }
 
-MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_only_if_it_agrees) {
-    // Nodes stopped at different generations compute different records; one
-    // may adopt another's record only if its own namespace yields the same root.
+MACHA_TEST("namespace_service", test_a_namespace_tree_is_a_function_of_its_entries) {
+    // The tree depends on the entries alone: nodes that agree on the namespace
+    // build the same root whatever else differs, which is what lets founders
+    // agree without a coordinator; a different namespace builds another.
     MemoryNamespaceNodeStore leader_store, follower_store, diverged_store;
 
     std::map<std::string, FsEntry> entries;
@@ -985,7 +631,7 @@ MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_
 
     CHECK(*leader_root == *follower_root);
 
-    // A diverged namespace computes a different root, so adoption is refused.
+    // A different namespace builds a different root.
     auto diverged_entries = entries;
     diverged_entries["/Films/b.mkv"] = make_file(11, 2);
     auto diverged = populated_snapshot(diverged_entries);
@@ -994,9 +640,9 @@ MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_
     CHECK(*diverged_root != *leader_root);
 }
 
-MACHA_TEST("namespace_migration", test_a_namespace_change_is_visible_as_a_change) {
-    // Change detection must compare namespace roots, since tree-backed (SM14)
-    // snapshots have empty entry maps.
+MACHA_TEST("namespace_service", test_a_namespace_change_is_visible_as_a_change) {
+    // Change detection compares namespace roots: a snapshot carries no entry
+    // map.
     MemoryNamespaceNodeStore store;
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
@@ -1007,12 +653,6 @@ MACHA_TEST("namespace_migration", test_a_namespace_change_is_visible_as_a_change
     changed_entries["/Films/new.mkv"] = make_file(5, 2);
     const auto after = populated_snapshot(changed_entries);
 
-    // Map-backed form.
-    CHECK(namespace_differs(before, after));
-    CHECK(!namespace_differs(before, before));
-    CHECK(metadata_namespace_signature(before) != metadata_namespace_signature(after));
-
-    // Tree-backed form.
     const auto before_tree = detach_namespace(before, store);
     const auto after_tree = detach_namespace(after, store);
     CHECK(namespace_differs(before_tree, after_tree));
@@ -1025,13 +665,9 @@ MACHA_TEST("namespace_migration", test_a_namespace_change_is_visible_as_a_change
     CHECK(!namespace_differs(before_tree, same_elsewhere));
     CHECK(metadata_namespace_signature(before_tree) ==
           metadata_namespace_signature(same_elsewhere));
-
-    // Tree-backed and map-backed forms never sign alike, so a cutover is a
-    // change.
-    CHECK(metadata_namespace_signature(before) != metadata_namespace_signature(before_tree));
 }
 
-MACHA_TEST("namespace_migration", test_a_tree_backed_delta_reconstructs_its_record) {
+MACHA_TEST("namespace_service", test_a_tree_backed_delta_reconstructs_its_record) {
     // The replica keeps a delta body only if replaying it reproduces the record
     // byte for byte, so a tree-backed replay must re-encode successfully.
     MemoryNamespaceNodeStore store;
@@ -1052,17 +688,7 @@ MACHA_TEST("namespace_migration", test_a_tree_backed_delta_reconstructs_its_reco
     REQUIRE(successor.namespace_root.has_value());
     CHECK(*successor.namespace_root != *parent.namespace_root);
 
-    // The delta-versioned encoder is internal, so this asserts its premise: a
-    // tree-backed snapshot has an SM14 encoding and encode_snapshot (SM13)
-    // throws on it.
     CHECK(!encode_snapshot_v14(successor).empty());
-    bool sm13_refused = false;
-    try {
-        (void)encode_snapshot(successor);
-    } catch (const std::exception&) {
-        sm13_refused = true;
-    }
-    CHECK(sm13_refused);
 
     // A replay produces the payload a commit would.
     auto committed = parent;
@@ -1073,20 +699,20 @@ MACHA_TEST("namespace_migration", test_a_tree_backed_delta_reconstructs_its_reco
 
 // On a tree, a commit that changes only the catalogue leaves the tree as it
 // is and claims the catalogue it installs.
-MACHA_TEST("namespace_migration", test_a_catalogue_change_on_a_tree_leaves_the_tree_alone) {
+MACHA_TEST("namespace_service", test_a_catalogue_change_on_a_tree_leaves_the_tree_alone) {
     TestCluster cluster;
     auto config = cluster.node_config("tree-catalogue");
     make_solo(config);
-    NodeId node_id{};
+    std::optional<ObjectId> root;
     {
         Service service(config, cluster.keys(), test_durability_window);
         service.start();
-        node_id = service.node().node_id();
         service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
         write_file(service, "/Movies/film.mkv", pattern(256 * 1024, 71));
+        root = service.metadata_manager().snapshot().namespace_root;
         service.stop();
     }
-    const auto migration = migrate_state(config, cluster.keys(), {node_id});
+    REQUIRE(root.has_value());
 
     Service service(config, cluster.keys(), test_durability_window);
     service.start();
@@ -1100,7 +726,7 @@ MACHA_TEST("namespace_migration", test_a_catalogue_change_on_a_tree_leaves_the_t
 
     const auto after = service.metadata_manager().snapshot();
     REQUIRE(after.namespace_root.has_value());
-    CHECK(*after.namespace_root == migration.root);
+    CHECK(*after.namespace_root == *root);
     REQUIRE(after.catalogue_root.has_value());
     CHECK(service.local_state().retention().retained(RetentionClass::control,
                                                      *after.catalogue_root));
@@ -1111,7 +737,7 @@ MACHA_TEST("namespace_migration", test_a_catalogue_change_on_a_tree_leaves_the_t
 // Claims are not what keeps a namespace: with none on either node, a zero
 // grace and the catalogue root moving on, the control collector sweeps what
 // nothing reaches and leaves every node of the accepted tree on both nodes.
-MACHA_HEAVY_TEST("namespace_migration", test_the_control_collector_keeps_an_unclaimed_namespace) {
+MACHA_HEAVY_TEST("namespace_service", test_the_control_collector_keeps_an_unclaimed_namespace) {
     TestCluster cluster;
     const auto p1 = free_port();
     const auto p2 = free_port();
@@ -1139,14 +765,12 @@ MACHA_HEAVY_TEST("namespace_migration", test_the_control_collector_keeps_an_uncl
     };
 
     // A library big enough for a tree of several leaves under a branch.
-    std::vector<NodeId> witnesses;
     {
         Service s1(c1, cluster.keys(), test_durability_window);
         Service s2(c2, cluster.keys(), test_durability_window);
         s1.start();
         s2.start();
         REQUIRE(wait_metadata_writable(s1));
-        witnesses = {s1.node().node_id(), s2.node().node_id()};
         s1.filesystem().mkdir("/Shows", 0755, getuid(), getgid());
         for (int i = 0; i < 80; ++i)
             s1.filesystem().mkdir("/Shows/" + std::to_string(i), 0755, getuid(), getgid());
@@ -1155,10 +779,8 @@ MACHA_HEAVY_TEST("namespace_migration", test_the_control_collector_keeps_an_uncl
         s2.stop();
         s1.stop();
     }
-    migrate_pair(c1, c2, cluster.keys(), witnesses);
-
-    // Started once so whatever a migrated namespace is due is done, then every
-    // claim on both nodes is lost.
+    // Started again so whatever the namespace is due is done, then every claim
+    // on both nodes is lost.
     {
         Service s1(c1, cluster.keys(), test_durability_window);
         Service s2(c2, cluster.keys(), test_durability_window);
@@ -1227,7 +849,7 @@ MACHA_HEAVY_TEST("namespace_migration", test_the_control_collector_keeps_an_uncl
 // published: the tree nodes it adds to its primary parent and the extents of
 // the conflict alternatives it records, under a dot of its own that its
 // clock does not carry and a later head of this node's covers.
-MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
+MACHA_TEST("namespace_service", test_a_merge_claims_what_it_introduces) {
     TestCluster cluster;
     auto config = cluster.node_config("merge-claims");
     make_solo(config);
@@ -1251,9 +873,8 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
     }
     REQUIRE(!first.extents.empty());
     REQUIRE(!second.extents.empty());
-    (void)migrate_state(config, cluster.keys(), {node_id});
-    // Started once so whatever a migrated namespace is due is done, then
-    // every claim is lost.
+    // Started again so whatever the namespace is due is done, then every claim
+    // is lost.
     {
         Service service(config, cluster.keys(), test_durability_window);
         service.start();

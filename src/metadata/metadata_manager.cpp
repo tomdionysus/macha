@@ -21,12 +21,6 @@
 
 namespace macha {
 namespace {
-bool same_legacy_metadata_voters(std::vector<NodeId> a, std::vector<NodeId> b) {
-    std::sort(a.begin(), a.end());
-    std::sort(b.begin(), b.end());
-    return a == b;
-}
-
 bool newer_than(const MetadataRecord& a, const MetadataRecord& b) {
     return a.generation > b.generation ||
            (a.generation == b.generation && a.hash > b.hash);
@@ -57,7 +51,7 @@ bool bool_reply(const RpcReply& reply) {
 
 MetadataManager::MetadataManager(NodeRuntime& node, LocalState& local,
                                  MetadataServer& metadata_server,
-                                 DistributedStore* namespace_store,
+                                 DistributedStore& namespace_store,
                                  PublicationRetention publication_retention,
                                  const TimeSource& time)
     : node_(node), local_(local), metadata_server_(metadata_server), namespace_store_(namespace_store),
@@ -1195,40 +1189,17 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         if (!left_materialized || !right_materialized)
             throw MergeUnavailable("metadata merge head cannot be materialized");
         const auto materialise_ms = stage_ms();
-        // The merge reads the two heads and nothing else. Two trees merge by
-        // what differs between them; a branch still held as a map is
-        // materialised with the other, and the result re-rooted.
+        // The merge reads the two heads and nothing else: two trees merge by
+        // what differs between them.
         const auto& left_snapshot = *left_materialized->snapshot;
         const auto& right_snapshot = *right_materialized->snapshot;
-        const auto tree_backed =
-            left_snapshot.namespace_root.has_value() || right_snapshot.namespace_root.has_value();
-        if (tree_backed && !namespace_store_)
-            throw MetadataNotReady("no namespace node store is configured");
-        const bool all_trees = left_snapshot.namespace_root && right_snapshot.namespace_root;
-        MetadataMergeResult merged;
-        std::optional<NamespaceTreeMerge> tree_merge;
-        if (all_trees) {
-            const auto reading =
-                ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_);
-            tree_merge = merge_tree_backed_heads(left_snapshot, right_snapshot, left.hash,
-                                                 right.hash, reading);
-            merged = std::move(tree_merge->merged);
-        } else {
-            auto reading = namespace_store_
-                               ? std::optional<ControlNamespaceNodeStore>(
-                                     ControlNamespaceNodeStore::for_reading(local_.control(),
-                                                                            *namespace_store_))
-                               : std::nullopt;
-            const auto materialise = [&](const MetadataSnapshot& snapshot) {
-                if (!snapshot.namespace_root)
-                    return snapshot;
-                if (!reading)
-                    throw MetadataNotReady("no namespace node store is configured");
-                return attach_namespace(snapshot, *reading);
-            };
-            merged = merge_metadata_heads(materialise(left_snapshot),
-                                          materialise(right_snapshot), left.hash, right.hash);
-        }
+        if (!left_snapshot.namespace_root || !right_snapshot.namespace_root)
+            throw MergeUnavailable("a metadata head to merge holds no namespace tree");
+        const auto reading =
+            ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
+        auto tree_merge = merge_tree_backed_heads(left_snapshot, right_snapshot, left.hash,
+                                                  right.hash, reading);
+        auto merged = std::move(tree_merge.merged);
         if (merged.snapshot.extent_size &&
             merged.snapshot.extent_size != node_.config().extent_size)
             throw std::runtime_error("cluster extent size does not match local configuration");
@@ -1242,27 +1213,22 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         if (right.hash < left.hash) {
             std::swap(left, right);
         }
-        merged.snapshot.metadata_voters.clear();
         merged.snapshot.merge_parents = {right.hash};
 
         // The merged namespace's tree; its nodes are written and replicated
         // before the record naming the root is published.
-        if (tree_backed) {
+        {
             auto commit_nodes =
-                ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_);
-            if (tree_merge)
-                merged.snapshot.namespace_root =
-                    update_namespace_tree(tree_merge->onto, commit_nodes, tree_merge->changes);
-            else
-                merged.snapshot = detach_namespace(std::move(merged.snapshot), commit_nodes);
+                ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
+            merged.snapshot.namespace_root =
+                update_namespace_tree(tree_merge.onto, commit_nodes, tree_merge.changes);
         }
 
         const auto tree_ms = stage_ms();
         MetadataRecord reconciliation;
         reconciliation.generation = std::max(left.generation, right.generation) + 1;
         reconciliation.previous = left.hash;
-        reconciliation.payload = tree_backed ? encode_snapshot_v14(merged.snapshot)
-                                             : encode_snapshot(merged.snapshot);
+        reconciliation.payload = encode_snapshot_v14(merged.snapshot);
         reconciliation.hash = metadata_hash(reconciliation.generation,
                                             reconciliation.previous,
                                             reconciliation.payload);
@@ -1272,11 +1238,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             left_materialized->record.hash == reconciliation.previous ? *left_materialized
                                                                       : *right_materialized;
         // A tree merge knows its namespace changes against the primary parent.
-        // A merge of materialised trees does not, and is published whole.
-        const auto delta =
-            tree_merge ? tree_merge_delta(*primary.snapshot, merged.snapshot, tree_merge->changes)
-            : tree_backed ? std::nullopt
-                          : metadata_delta(*primary.snapshot, merged.snapshot);
+        const auto delta = tree_merge_delta(*primary.snapshot, merged.snapshot, tree_merge.changes);
         if (delta) {
             auto encoded = encode_metadata_delta(*delta);
             if (encoded.size() < reconciliation.payload.size())
@@ -1357,26 +1319,16 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
     if (snapshot.extent_size && snapshot.extent_size != node_.config().extent_size)
         throw std::runtime_error("cluster extent size does not match local configuration");
 
-    // Zero marks a legacy snapshot; any other value is only that marker.
-    const bool policy_transition = snapshot.metadata_write_replicas_required == 0;
-    const bool clear_legacy_metadata_voters = !snapshot.metadata_voters.empty();
-    const bool data_policy_change = snapshot.data_replication != node_.config().replication;
-
-    const auto active = node_.membership().active();
-
-    if (!policy_transition && !clear_legacy_metadata_voters && !data_policy_change)
+    if (snapshot.data_replication == node_.config().replication)
         return initial;
 
-    snapshot.metadata_voters.clear();
-    if (policy_transition)
-        snapshot.metadata_write_replicas_required = 1;
+    const auto active = node_.membership().active();
     snapshot.merge_parents.clear();
     snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
     MetadataRecord proposed;
     proposed.generation = initial.generation + 1;
     proposed.previous = initial.hash;
-    proposed.payload =
-        snapshot.namespace_root ? encode_snapshot_v14(snapshot) : encode_snapshot(snapshot);
+    proposed.payload = encode_snapshot_v14(snapshot);
     proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
     (void)publish_commit(active, proposed, {}, FrameType::control);
     Log::info("metadata policy transition committed generation=" +
@@ -1479,32 +1431,35 @@ MetadataRecord MetadataManager::discover_or_form() {
             return read_group(ids, FrameType::control);
     }
 
-    auto base = genesis_metadata();
-    auto snapshot = decode_snapshot(base.payload);
-    auto root = snapshot.entries.find("/");
-    if (root == snapshot.entries.end())
-        throw std::runtime_error("genesis metadata has no filesystem root");
-    root->second.uid = node_.config().filesystem.root_uid;
-    root->second.gid = node_.config().filesystem.root_gid;
-    root->second.mode = node_.config().filesystem.root_mode;
+    const auto base = genesis_metadata();
+    MetadataSnapshot snapshot;
+    FsEntry root;
+    root.type = EntryType::directory;
+    root.uid = node_.config().filesystem.root_uid;
+    root.gid = node_.config().filesystem.root_gid;
+    root.mode = node_.config().filesystem.root_mode;
 
     // Virgin founders build byte-identical generation 2 without a
     // coordinator, so root timestamps use a fixed non-zero sentinel.
-    root->second.ctime_ns = root->second.mtime_ns = 1;
-    snapshot.metadata_voters.clear();
+    root.ctime_ns = root.mtime_ns = 1;
+    snapshot.entries["/"] = root;
     snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
     snapshot.extent_size = node_.config().extent_size;
     snapshot.metadata_write_replicas_required = 1;
-    snapshot.metadata_participants.clear();
     // Genesis is the first branch point; background convergence advances the
     // horizon to generation 2 once every founder has durably accepted it.
-    snapshot.metadata_branch_floor = {};
     snapshot.retention_baseline_complete = true; // virgin namespace has no inherited objects
+
+    // A namespace is a tree from its first commit: the record carries only the
+    // root, so no record, replay or checkpoint grows with the library. The
+    // tree is a function of the entries alone, so founders still agree.
+    auto nodes = ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
+    snapshot = detach_namespace(std::move(snapshot), nodes);
 
     MetadataRecord formed;
     formed.generation = base.generation + 1;
     formed.previous = base.hash;
-    formed.payload = encode_snapshot(snapshot);
+    formed.payload = encode_snapshot_v14(snapshot);
     formed.hash = metadata_hash(formed.generation, formed.previous, formed.payload);
     (void)publish_commit(active, formed, {}, FrameType::control);
 
@@ -1678,9 +1633,9 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
     }
 }
 
-MetadataRecord MetadataManager::mutate_impl(
-    const std::function<void(MetadataSnapshot&, MetadataDelta*)>& mutate, bool exact_delta,
-    size_t retries, std::optional<MetadataMutationIdentity> identity) {
+MetadataRecord MetadataManager::mutate_delta(
+    const std::function<void(MetadataSnapshot&, MetadataDelta&)>& mutate, size_t retries,
+    std::optional<MetadataMutationIdentity> identity) {
     Lock lock(mutation_mutex_);
     // This mutation's dot, kept across retries so an attempt that was
     // accepted after all is recognised rather than made twice.
@@ -1741,12 +1696,10 @@ MetadataRecord MetadataManager::mutate_impl(
         const auto origin = dot->author;
         const std::optional<uint64_t> sequence = dot->sequence;
 
-        std::optional<MetadataSnapshot> before;
-        if (!exact_delta)
-            before.emplace(snapshot);
+        if (!snapshot.namespace_root)
+            throw std::logic_error("metadata head carries no namespace tree");
         snapshot.merge_parents.clear();
         MetadataDelta supplied_delta;
-        const auto legacy_metadata_voters = snapshot.metadata_voters;
         const auto data_replication = snapshot.data_replication;
         const auto extent_size = snapshot.extent_size;
         const auto metadata_write_replicas_required =
@@ -1754,12 +1707,9 @@ MetadataRecord MetadataManager::mutate_impl(
         const auto metadata_participants = snapshot.metadata_participants;
         const auto metadata_branch_floor = snapshot.metadata_branch_floor;
         const auto retention_baseline_complete = snapshot.retention_baseline_complete;
-        mutate(snapshot, exact_delta ? &supplied_delta : nullptr);
-        if (exact_delta && !snapshot.node_status.empty() && supplied_delta.upsert_node_status.empty())
+        mutate(snapshot, supplied_delta);
+        if (!snapshot.node_status.empty() && supplied_delta.upsert_node_status.empty())
             supplied_delta.upsert_node_status.emplace(*snapshot.node_status.begin());
-        if (!same_legacy_metadata_voters(snapshot.metadata_voters, legacy_metadata_voters))
-            throw std::runtime_error(
-                "filesystem mutation attempted to change legacy metadata replica state");
         if (snapshot.data_replication != data_replication || snapshot.extent_size != extent_size ||
             snapshot.metadata_write_replicas_required != metadata_write_replicas_required ||
             snapshot.metadata_participants != metadata_participants ||
@@ -1773,69 +1723,29 @@ MetadataRecord MetadataManager::mutate_impl(
             if (!snapshot.legacy_clock) {
                 // Still the parent's clock here.
                 snapshot.legacy_clock = snapshot.mutation_sequences;
-                if (exact_delta)
-                    supplied_delta.set_legacy_clock = snapshot.legacy_clock;
+                supplied_delta.set_legacy_clock = snapshot.legacy_clock;
             }
-            if (exact_delta ? supplied_delta.catalogue != CatalogueDelta::unchanged
-                            : before->catalogue_root != snapshot.catalogue_root) {
+            if (supplied_delta.catalogue != CatalogueDelta::unchanged) {
                 snapshot.catalogue_dot = mutation;
-                if (exact_delta)
-                    supplied_delta.set_catalogue_dot = mutation;
+                supplied_delta.set_catalogue_dot = mutation;
             }
-            if (!exact_delta) {
-                for (auto& [path, entry] : snapshot.entries) {
-                    const auto prior = before->entries.find(path);
-                    if (prior == before->entries.end())
-                        stamp_entry_provenance(entry, path, nullptr, mutation);
-                    else if (prior->second != entry)
-                        stamp_entry_provenance(entry, path, &prior->second, mutation);
-                }
-            } else if (!supplied_delta.upsert_entries.empty() ||
-                       !supplied_delta.append_entries.empty()) {
-                const bool tree = snapshot.namespace_root.has_value();
-                if (tree && !namespace_store_)
-                    throw MetadataNotReady("no namespace node store is configured");
-                // The parent's namespace: the tree is not yet rewritten; the
-                // map already is, so the parent is decoded again.
-                std::optional<ControlNamespaceNodeStore> reader;
-                std::optional<MetadataSnapshot> parent;
-                if (tree)
-                    reader.emplace(ControlNamespaceNodeStore::for_reading(local_.control(),
-                                                                          *namespace_store_));
-                else
-                    parent = decode_snapshot(current.payload);
-                const auto prior_of = [&](const std::string& path) -> std::optional<FsEntry> {
-                    if (tree)
-                        return namespace_entry(snapshot, &*reader, path);
-                    const auto found = parent->entries.find(path);
-                    if (found == parent->entries.end())
-                        return {};
-                    return found->second;
-                };
+            if (!supplied_delta.upsert_entries.empty() || !supplied_delta.append_entries.empty()) {
+                // The parent's namespace: the tree is not yet rewritten.
+                const auto reader =
+                    ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
                 for (auto& [path, entry] : supplied_delta.upsert_entries) {
-                    const auto prior = prior_of(path);
+                    const auto prior = namespace_entry(snapshot, &reader, path);
                     stamp_entry_provenance(entry, path, prior ? &*prior : nullptr, mutation);
-                    if (!tree)
-                        snapshot.entries[path] = entry;
                 }
-                for (auto& [path, append] : supplied_delta.append_entries) {
+                for (auto& [path, append] : supplied_delta.append_entries)
                     append.content = mutation;
-                    if (tree)
-                        continue;
-                    auto& entry = snapshot.entries.at(path);
-                    entry.provenance.content = mutation;
-                    if (entry.provenance.file_id == NodeId{})
-                        entry.provenance.file_id = legacy_file_id(path);
-                }
             }
         }
         snapshot.mutation_sequences[origin] = *sequence;
-        if (exact_delta)
-            supplied_delta.mutation_sequences[origin] = *sequence;
+        supplied_delta.mutation_sequences[origin] = *sequence;
         if (identity) {
             snapshot.mutation_sequences[identity->origin] = identity->sequence;
-            if (exact_delta)
-                supplied_delta.mutation_sequences[identity->origin] = identity->sequence;
+            supplied_delta.mutation_sequences[identity->origin] = identity->sequence;
         }
 
         // Discipline 4. Keep tombstones in canonical order so the next
@@ -1845,26 +1755,20 @@ MetadataRecord MetadataManager::mutate_impl(
         const bool resorted = !garbage_is_canonical(snapshot.garbage);
         if (resorted)
             canonicalise_garbage(snapshot.garbage);
-        if (exact_delta && (resorted || !supplied_delta.upsert_garbage.empty() ||
-                            !supplied_delta.erase_garbage.empty()))
+        if (resorted || !supplied_delta.upsert_garbage.empty() ||
+            !supplied_delta.erase_garbage.empty())
             supplied_delta.canonical_garbage = true;
 
-        // A tree-backed namespace commits by applying this mutation's change set
-        // to the tree.
-        if (snapshot.namespace_root) {
-            // Without an exact delta there is no change set, and diffing both
-            // namespaces is the cost the tree avoids.
-            if (!exact_delta)
-                throw MetadataNotReady("a tree-backed namespace requires an exact delta");
+        // The namespace commits by applying this mutation's change set to the
+        // tree.
+        {
             // A map write is a change the delta does not describe and would be
             // silently dropped; refuse it.
             if (!snapshot.entries.empty())
                 throw std::runtime_error(
                     "metadata mutation wrote the namespace map on a tree-backed snapshot");
-            if (!namespace_store_)
-                throw MetadataNotReady("no namespace node store is configured");
             auto nodes =
-                ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_);
+                ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
             snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root,
                                                                     nodes, supplied_delta);
             // The mutation's tombstones, each group one batch object written
@@ -1890,32 +1794,24 @@ MetadataRecord MetadataManager::mutate_impl(
             }
             supplied_delta.pending_tombstones.clear();
         }
-        if (!supplied_delta.pending_tombstones.empty())
-            throw std::logic_error("tombstone batches need a tree-backed namespace");
 
         const auto tree_ms = stage_ms();
         // Drop the conflicts this mutation decided by rewriting their subject,
         // read from the namespace as the mutation leaves it.
         if (!snapshot.conflicts.empty()) {
-            NamespaceLookup lookup;
-            std::optional<ControlNamespaceNodeStore> reader;
-            if (snapshot.namespace_root) {
-                reader.emplace(
-                    ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_));
-                lookup = [&](const std::string& path) {
-                    return namespace_entry(snapshot, &*reader, path);
-                };
-            }
+            const auto reader =
+                ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
+            const NamespaceLookup lookup = [&](const std::string& path) {
+                return namespace_entry(snapshot, &reader, path);
+            };
             if (const auto superseded = prune_superseded_conflicts(snapshot, lookup)) {
                 conflicts_superseded_.fetch_add(superseded, std::memory_order_relaxed);
-                if (exact_delta)
-                    supplied_delta.replace_conflicts = snapshot.conflicts;
+                supplied_delta.replace_conflicts = snapshot.conflicts;
             }
         }
 
         const auto conflicts_ms = stage_ms();
-        auto payload =
-            snapshot.namespace_root ? encode_snapshot_v14(snapshot) : encode_snapshot(snapshot);
+        auto payload = encode_snapshot_v14(snapshot);
         if (payload == current.payload)
             return cache_record(current,
                                 std::make_shared<MetadataSnapshot>(std::move(snapshot)));
@@ -1927,18 +1823,13 @@ MetadataRecord MetadataManager::mutate_impl(
         proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
 
         Bytes delta_payload;
-        std::optional<MetadataDelta> delta;
-        if (exact_delta) {
-            delta = std::move(supplied_delta);
-            // An exact caller describes only its own edit; inherited branch topology
-            // (merge_parents, cleared above) is settled here, so the write stays a
-            // delta.
-            if (clear_merge_parent_topology)
-                delta->replace_merge_parents = snapshot.merge_parents;
-        } else {
-            delta = metadata_delta(*before, snapshot);
-        }
-        if (delta) {
+        std::optional<MetadataDelta> delta = std::move(supplied_delta);
+        // The caller describes only its own edit; inherited branch topology
+        // (merge_parents, cleared above) is settled here, so the write stays a
+        // delta.
+        if (clear_merge_parent_topology)
+            delta->replace_merge_parents = snapshot.merge_parents;
+        {
             auto encoded = encode_metadata_delta(*delta);
             if (encoded.size() < proposed.payload.size())
                 delta_payload = std::move(encoded);
@@ -2011,20 +1902,6 @@ MetadataRecord MetadataManager::mutate_impl(
     throw MetadataNotReady("metadata mutation could not be accepted");
 }
 
-MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
-                                       size_t retries) {
-    return mutate_impl(
-        [&](MetadataSnapshot& snapshot, MetadataDelta*) { mutate(snapshot); }, false, retries, {});
-}
-
-MetadataRecord MetadataManager::mutate_delta(
-    const std::function<void(MetadataSnapshot&, MetadataDelta&)>& mutate, size_t retries,
-    std::optional<MetadataMutationIdentity> identity) {
-    return mutate_impl(
-        [&](MetadataSnapshot& snapshot, MetadataDelta* delta) { mutate(snapshot, *delta); }, true,
-        retries, identity);
-}
-
 bool MetadataManager::resolve_conflict(const std::string& id, std::string_view choice) {
     if (choice != "left" && choice != "right" && choice != "base")
         throw std::invalid_argument("conflict resolution choice must be left, right or base");
@@ -2041,10 +1918,8 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
                                                      : conflict.base_entry;
             // Through the working set: on a tree-backed snapshot a map write would
             // never be applied.
-            auto nodes = namespace_store_
-                             ? std::optional<ControlNamespaceNodeStore>(
-                                   ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_))
-                             : std::nullopt;
+            auto nodes = std::optional<ControlNamespaceNodeStore>(
+                ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_));
             NamespaceWorkingSet working(snapshot, delta, nodes ? &*nodes : nullptr);
             if (chosen) {
                 // A decision is a change even when it keeps the value in
@@ -2152,10 +2027,8 @@ void MetadataManager::repair_once() {
 Page<std::pair<std::string, FsEntry>, std::string>
 MetadataManager::entries(const MetadataSnapshotView& view, Cursor<std::string> from,
                          Budget& budget) {
-    if (!namespace_store_)
-        return namespace_entries(*view.snapshot, nullptr, std::move(from), budget);
     (void)WaitGuard::enter(budget.context(), entries_waits, "MetadataManager::entries");
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
     return namespace_entries(*view.snapshot, &nodes, std::move(from), budget);
 }
 

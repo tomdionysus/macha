@@ -396,13 +396,15 @@ MACHA_TEST("node_services", test_a_commit_is_published_only_once_its_objects_are
     phantom.extents.push_back({0, 4096, object_id(pattern(4096, 42)), false});
     std::string refusal;
     try {
-        services.metadata().mutate(
-            [&](MetadataSnapshot& snapshot) { snapshot.entries["/phantom.bin"] = phantom; });
+        services.metadata().mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) {
+            delta.upsert_entries["/phantom.bin"] = phantom;
+        });
     } catch (const MetadataNotReady& error) {
         refusal = error.what();
     }
     CHECK(refusal == "DATA object is held by no node present before metadata publication");
-    CHECK(!services.metadata().snapshot().entries.contains("/phantom.bin"));
+    const auto nodes = services.filesystem().namespace_nodes();
+    CHECK(!namespace_entry(services.metadata().snapshot(), &nodes, "/phantom.bin").has_value());
     CHECK(claims.claim_objects(RetentionClass::data) == 1);
     bool named = false;
     for (const auto& [level, line] : log->records())

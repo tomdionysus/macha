@@ -822,6 +822,7 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
     startup["control_plane"] = readiness.control_plane_online ? "ready" : "starting";
     startup["api"] = "ready";
     startup["data_storage"] = readiness.data_storage_ready ? "ready" : "recovering";
+    startup["data_storage_degraded"] = readiness.data_storage_degraded;
     startup["control_storage"] = readiness.control_storage_ready ? "ready" : "recovering";
     startup["cache"] = readiness.cache_ready ? "ready" : "recovering";
     startup["retention"] = readiness.retention_ready ? "ready" : "recovering";

@@ -103,12 +103,14 @@ class ClaimLocks {
     static constexpr size_t stripes = 64;
     std::array<IoMutex, stripes> stripes_;
     mutable Mutex deleting_mutex_;
-    std::set<ObjectId> deleting_ MACHA_GUARDED_BY(deleting_mutex_);
+    // One instance per delete under way: two may mark the same id.
+    std::multiset<ObjectId> deleting_ MACHA_GUARDED_BY(deleting_mutex_);
     friend class ClaimDeletion;
 
     void end_deleting(const ObjectId& id) noexcept {
         Lock lock(deleting_mutex_);
-        deleting_.erase(id);
+        if (const auto found = deleting_.find(id); found != deleting_.end())
+            deleting_.erase(found);
     }
 
   public:

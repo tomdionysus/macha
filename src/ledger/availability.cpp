@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ledger/availability.hpp"
+#include "contract/stopping.hpp"
 #include "log.hpp"
 
 #include <algorithm>
@@ -91,6 +92,8 @@ AvailabilitySurvey survey_by_diff(const std::shared_ptr<const TrieUnion>& mine,
                 pause);
             survey.rounds += cost.rounds;
             survey.nodes_asked += cost.prefixes;
+        } catch (const MaintenanceStopping&) {
+            throw;
         } catch (const std::exception& error) {
             ++survey.peers_failed;
             Log::debug(std::string("availability: a peer could not finish a trie diff: ") +

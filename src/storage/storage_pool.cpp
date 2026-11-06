@@ -76,10 +76,11 @@ StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
                          std::vector<StorageBackendConfig> configs,
                          std::array<uint8_t, 32> key,
                          std::chrono::milliseconds durability_batch_window,
-                         StoragePackingConfig packing, uint64_t ledger_cache)
+                         StoragePackingConfig packing, uint64_t ledger_cache,
+                         LocalStoreFiles& files)
     : state_path_(std::move(state_path)), node_id_(node_id), key_(key),
       durability_batch_window_(durability_batch_window), packing_(packing),
-      ledger_cache_(ledger_cache) {
+      ledger_cache_(ledger_cache), files_(files) {
     reconfigure(configs);
     refresh();
 }
@@ -249,8 +250,7 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
                 static_cast<size_t>(ledger_cache_ / std::max<size_t>(1, ledger_shares_.load()));
             store = std::make_shared<LocalStore>(cfg.path, options, key_,
                                                  LocalStoreMode::authoritative,
-                                                 durability_domain,
-                                                 posix_local_store_files());
+                                                 durability_domain, files_);
         } else {
             Lock lock(backend->mutex);
             durability_domain = backend->durability_domain;
@@ -566,6 +566,14 @@ void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {
                " max_ms=" + std::to_string(max_ms));
 }
 
+void StoragePool::note_read_failure(const ObjectId& id, const std::filesystem::path& path,
+                                    const std::exception& error) const {
+    static auto& failures = observations().counter("storage.read_failures");
+    failures.fetch_add(1, std::memory_order_relaxed);
+    Log::warn("cannot read local object " + to_string(id) + " on " + path.string() +
+              "; keeping it: " + error.what());
+}
+
 std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
     // Reads feed the same pressure signal: slow reads starve a viewer as slow
     // writes do.
@@ -600,14 +608,16 @@ std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
                        " ms=" + std::to_string(elapsed.count()));
             observe_get(data ? data->size() : 0, static_cast<uint64_t>(elapsed.count()));
             return data;
-        } catch (const std::exception& error) {
+        } catch (const ObjectCorrupt& error) {
             // Corrupt content is an object failure, not a backend failure.
-            Log::warn("discarding unreadable local object " + to_string(id) + " on " +
+            Log::warn("discarding corrupt local object " + to_string(id) + " on " +
                       path.string() + ": " + error.what());
             try {
                 (void)store->remove(id);
             } catch (...) {
             }
+        } catch (const std::exception& error) {
+            note_read_failure(id, path, error);
         }
     }
     return {};
@@ -992,13 +1002,15 @@ StoragePool::scrub_step(uint64_t budget_bytes, size_t operation_budget,
             }
             if (data)
                 result.bytes += data->size();
-        } catch (const std::exception& error) {
+        } catch (const ObjectCorrupt& error) {
             Log::warn("removing corrupt local object " + to_string(item->id) + " on " +
                       item->path.string() + ": " + error.what());
             try {
                 (void)item->store->remove(item->id);
             } catch (...) {
             }
+        } catch (const std::exception& error) {
+            note_read_failure(item->id, item->path, error);
         }
         if (budget_bytes && result.bytes >= budget_bytes)
             return result;

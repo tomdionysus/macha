@@ -40,9 +40,8 @@ struct FakeMetadataView final : MetadataView {
     }
     std::optional<MetadataSnapshotView> release_head() const override { return view; }
     MetadataClusterStatus status() const noexcept override { return {}; }
-    MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t) override {
-        throw std::runtime_error("read-only fake");
-    }
+    // What the commits have retired, which a real commit writes as batches.
+    std::vector<ObjectId> retired;
     // A commit applies to the head and makes the next generation.
     MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>& change,
                                 size_t, std::optional<MetadataMutationIdentity>) override {
@@ -51,6 +50,8 @@ struct FakeMetadataView final : MetadataView {
         auto next = std::make_shared<MetadataSnapshot>(*view->snapshot);
         MetadataDelta delta;
         change(*next, delta);
+        for (const auto& pending : delta.pending_tombstones)
+            retired.insert(retired.end(), pending.ids.begin(), pending.ids.end());
         view = MetadataSnapshotView{view->generation + 1, 0, Hash256{}, std::move(next)};
         if (after_commit)
             after_commit();
@@ -485,9 +486,8 @@ MACHA_TEST("catalogue_maintenance", test_data_is_released_only_when_nothing_refe
     metadata.view = empty_head(fixture.node->known_metadata_generation());
     CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), fixture.node->metadata_server(), *fixture.store, metadata, fixture.node->ledger());
     const auto released = [&](const ObjectId& id) {
-        const auto& garbage = metadata.view->snapshot->garbage;
-        return std::any_of(garbage.begin(), garbage.end(),
-                           [&](const GarbageRef& entry) { return entry.id == id; });
+        return std::find(metadata.retired.begin(), metadata.retired.end(), id) !=
+               metadata.retired.end();
     };
     // Two items in different shards sharing one poster.
     std::string a = "movie:a", b = "movie:b";

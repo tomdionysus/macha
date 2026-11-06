@@ -7,6 +7,7 @@
 #include "filesystem/filesystem.hpp"
 #include "metadata/metadata_manager.hpp"
 
+#include <functional>
 #include <memory>
 
 // The horizon builder (object ledger spec, B4): derives what a metadata head
@@ -25,10 +26,12 @@ class HorizonBuilder {
     // The namespace's objects, tree nodes and tombstones at the current
     // metadata generation: the filesystem's cached walk, cheap while the
     // generation holds; throws when a tree node is unreadable. The pass reads
-    // its generation to decide whether to build an inventory from it.
+    // its generation to decide whether to build an inventory from it. `pause`
+    // runs between the entries a build walks, and may throw to end it.
     static constexpr Waits namespace_objects_waits =
         Waits::state_device | Waits::network | Waits::locks;
-    virtual std::shared_ptr<const MaintenanceObjects> namespace_objects() = 0;
+    virtual std::shared_ptr<const MaintenanceObjects>
+    namespace_objects(const std::function<void()>& pause) = 0;
 
     // The inventory at that generation: the namespace's objects and tree
     // nodes and the catalogue's installed view, read against `head`.

@@ -4,8 +4,8 @@ step: started
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1
-  inventory = generation=2 live=0 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=0 control_live=0
+  inventory = generation=2 live=0 control_live=1 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=1
 step: three files written
   state: data_objects=3 data_claims=3 control_claims=0
   object lost-0: held=1 claimed=1
@@ -15,8 +15,8 @@ step: three files written
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1
-  inventory = generation=8 live=3 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=3 control_live=0
+  inventory = generation=8 live=3 control_live=1 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=3 control_live=1
 step: their objects lost
   state: data_objects=0 data_claims=3 control_claims=0
   object lost-0: held=0 claimed=1
@@ -25,8 +25,8 @@ step: their objects lost
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1
-  inventory = generation=8 live=3 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=3 control_live=0
+  inventory = generation=8 live=3 control_live=1 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=3 control_live=1
 step: an unrelated file written
   state: data_objects=1 data_claims=4 control_claims=0
   object lost-0: held=0 claimed=1
@@ -42,5 +42,5 @@ step: an unrelated file written
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1
-  inventory = generation=10 live=4 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=4 control_live=0
+  inventory = generation=10 live=4 control_live=1 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=4 control_live=1

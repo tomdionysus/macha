@@ -20,4 +20,4 @@ Finite media uses VOD semantics. A future genuinely live/event mode needs an exp
 
 ## Metadata scale
 
-The namespace can be a content-addressed Merkle tree that the metadata record points at (applied per node with `macha-namespace-migrate`), so an ordinary commit rewrites a leaf and the branches above it rather than the whole library. Checkpoint-rooted journal-range catch-up for a replica that has fallen far behind remains to be built. There are no voters; every node is a replica.
+The namespace is a content-addressed Merkle tree that the metadata record points at, so an ordinary commit rewrites a leaf and the branches above it rather than the whole library. Checkpoint-rooted journal-range catch-up for a replica that has fallen far behind remains to be built. There are no voters; every node is a replica.

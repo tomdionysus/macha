@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.92.5*
+*v0.93.4*
 
 *Macha - Old Irish /ˈmˠaxə/ - approximately “MAKH-uh”*
 
@@ -26,8 +26,7 @@ engine. The FUSE mount and BitTorrent acquisition are
 so a node without a plugin file simply lacks that capability. Alongside it sit
 offline tools: `macha-users` for accounts, `macha-recover` for the
 root-password reset procedure, `macha-metadata-dump` and
-`macha-metadata-repair` for forensics, and `macha-namespace-migrate` for
-re-rooting a namespace onto the tree. A cluster is
+`macha-metadata-repair` for forensics. A cluster is
 several nodes sharing a key.
 
 Players are separate projects and are not in this tree. They reach a node over

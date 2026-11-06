@@ -127,8 +127,6 @@ class MetadataView {
     // short of their floor.
     static constexpr Waits mutate_waits =
         Waits::state_device | Waits::data_device | Waits::network | Waits::locks;
-    virtual MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&,
-                                  size_t retries = 8) = 0;
     virtual MetadataRecord mutate_delta(
         const std::function<void(MetadataSnapshot&, MetadataDelta&)>&, size_t retries = 8,
         std::optional<MetadataMutationIdentity> identity = {}) = 0;
