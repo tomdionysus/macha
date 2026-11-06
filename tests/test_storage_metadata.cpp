@@ -2663,8 +2663,11 @@ MACHA_FAST_TEST("storage_metadata", test_a_damaged_history_frame_loses_only_that
          [&](auto& file, uint64_t offset, uint32_t length) { put_length(file, offset, length + 9); }},
         {"length zero", [&](auto& file, uint64_t offset, uint32_t) { put_length(file, offset, 0); }},
         {"a body byte", [](auto& file, uint64_t offset, uint32_t length) {
-             file.seekp(static_cast<std::streamoff>(offset + 4 + length / 2));
-             file.put('\x5a');
+             const auto at = static_cast<std::streamoff>(offset + 4 + length / 2);
+             file.seekg(at);
+             const auto byte = file.get();
+             file.seekp(at);
+             file.put(static_cast<char>(byte ^ 0xFF));
          }},
     };
 
@@ -2779,6 +2782,75 @@ MACHA_FAST_TEST("storage_metadata", test_a_torn_history_tail_is_still_cut) {
         kept_aside += item.path().filename().string().find("history.log") == 0 &&
                       item.path().filename() != "history.log";
     CHECK(kept_aside == 1);
+}
+
+// A disk that stops answering says nothing about what is on it, so the forward
+// scan reports that apart from finding nothing, and load_history cuts only on
+// the second.
+MACHA_FAST_TEST("storage_metadata", test_a_failed_read_in_the_history_scan_is_not_nothing_later) {
+    struct FailingBuffer final : std::streambuf {
+        Bytes bytes;
+        std::streamoff fails_from;
+        FailingBuffer(Bytes value, std::streamoff at) : bytes(std::move(value)), fails_from(at) {
+            setg(chars(), chars(), chars());
+        }
+        char* chars() {
+            return reinterpret_cast<char*>(bytes.data());
+        }
+        pos_type seekoff(off_type off, std::ios_base::seekdir, std::ios_base::openmode) override {
+            setg(chars(), chars() + off, chars() + std::min<off_type>(fails_from, static_cast<off_type>(bytes.size())));
+            return off;
+        }
+        pos_type seekpos(pos_type at, std::ios_base::openmode mode) override {
+            return seekoff(at, std::ios_base::beg, mode);
+        }
+    };
+    // A frame the opener accepts, after 100 bytes of nothing.
+    constexpr uint32_t inner = 64;
+    Writer writer;
+    writer.raw(Bytes(100, 0xEE));
+    writer.u32(inner + 32);
+    writer.raw(Bytes(28, 1));
+    writer.u32(inner);
+    writer.raw(Bytes(inner, 2));
+    const auto file = writer.take();
+    const auto open = [](std::span<const uint8_t>) -> std::optional<Bytes> { return Bytes{}; };
+    constexpr uint64_t max_frame = 1024 * 1024;
+
+    {
+        FailingBuffer buffer(file, static_cast<std::streamoff>(file.size()));
+        std::istream stream(&buffer);
+        bool read_failed = false;
+        const auto found = next_history_frame(stream, 1, file.size(), max_frame, open, read_failed);
+        CHECK(!read_failed);
+        REQUIRE(found.has_value());
+        CHECK(*found == 100);
+    }
+    {
+        // Nothing but bytes that are not a frame: nothing later, and no failure.
+        const Bytes noise(4096, 0xEE);
+        FailingBuffer buffer(noise, static_cast<std::streamoff>(noise.size()));
+        std::istream stream(&buffer);
+        bool read_failed = false;
+        CHECK(!next_history_frame(stream, 1, noise.size(), max_frame, open, read_failed).has_value());
+        CHECK(!read_failed);
+    }
+    {
+        // The disk fails before the frame: reported as a failure, not as nothing.
+        FailingBuffer buffer(file, 50);
+        std::istream stream(&buffer);
+        bool read_failed = false;
+        CHECK(!next_history_frame(stream, 1, file.size(), max_frame, open, read_failed).has_value());
+        CHECK(read_failed);
+    }
+    {
+        // The disk fails inside the candidate frame.
+        FailingBuffer buffer(file, 120);
+        std::istream stream(&buffer);
+        bool read_failed = false;
+        CHECK(!next_history_frame(stream, 100, 100 + 4 + inner + 32 - 1 + 1, max_frame, open, read_failed).has_value());
+        CHECK(read_failed);
+    }
 }
 
 MACHA_FAST_TEST("storage_metadata",
