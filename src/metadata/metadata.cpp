@@ -2524,6 +2524,49 @@ void MetadataReplica::write_history_frame(std::span<const uint8_t> bytes) const 
                                  strerror(errno));
 }
 
+std::optional<uint64_t>
+next_history_frame(std::istream& file, uint64_t from, uint64_t file_size, uint64_t max_frame,
+                   const std::function<std::optional<Bytes>(std::span<const uint8_t>)>& open,
+                   bool& read_failed) {
+    constexpr uint64_t envelope_bytes = 12 + 16 + 4;
+    constexpr uint64_t header_bytes = 4 + envelope_bytes;
+    constexpr uint64_t window = 1024 * 1024;
+    Bytes buffer(window);
+    uint64_t at = from;
+    while (at + header_bytes <= file_size) {
+        const auto wanted = std::min(window, file_size - at);
+        file.clear();
+        file.seekg(static_cast<std::streamoff>(at), std::ios::beg);
+        if (!file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(wanted))) {
+            read_failed = true;
+            return std::nullopt;
+        }
+        const std::span<const uint8_t> bytes(buffer.data(), wanted);
+        const auto u32_at = [&](uint64_t position) {
+            Reader reader(bytes.subspan(position, 4));
+            return static_cast<uint64_t>(reader.u32());
+        };
+        const auto positions = wanted - header_bytes + 1;
+        for (uint64_t i = 0; i < positions; ++i) {
+            const auto length = u32_at(i);
+            if (length < envelope_bytes || length > max_frame || at + i + 4 + length > file_size ||
+                u32_at(i + 4 + 12 + 16) != length - envelope_bytes)
+                continue;
+            Bytes frame(static_cast<size_t>(length));
+            file.clear();
+            file.seekg(static_cast<std::streamoff>(at + i + 4), std::ios::beg);
+            if (!file.read(reinterpret_cast<char*>(frame.data()), static_cast<std::streamsize>(length))) {
+                read_failed = true;
+                return std::nullopt;
+            }
+            if (open(frame))
+                return at + i;
+        }
+        at += positions;
+    }
+    return std::nullopt;
+}
+
 void MetadataReplica::load_history() {
     constexpr uint64_t max_record = 2ULL * 1024ULL * 1024ULL * 1024ULL;
     constexpr uint64_t max_quarantine_tail = 16ULL * 1024ULL * 1024ULL;
@@ -2559,50 +2602,14 @@ void MetadataReplica::load_history() {
         }
     };
 
-    // The next offset at or after `from` holding a frame that authenticates. The
-    // two length fields rule out nearly every position before any AES work.
-    const auto next_frame_from = [&](uint64_t from) -> std::optional<uint64_t> {
-        constexpr uint64_t envelope_bytes = 12 + 16 + 4;
-        constexpr uint64_t header_bytes = 4 + envelope_bytes;
-        constexpr uint64_t window = 1024 * 1024;
-        std::ifstream scan(history_p_, std::ios::binary);
-        Bytes buffer(window);
-        uint64_t at = from;
-        while (at + header_bytes <= file_size) {
-            const auto wanted = std::min(window, file_size - at);
-            scan.clear();
-            scan.seekg(static_cast<std::streamoff>(at), std::ios::beg);
-            if (!scan.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(wanted)))
-                return std::nullopt;
-            const std::span<const uint8_t> bytes(buffer.data(), wanted);
-            const auto u32_at = [&](uint64_t position) {
-                Reader reader(bytes.subspan(position, 4));
-                return static_cast<uint64_t>(reader.u32());
-            };
-            const auto positions = wanted - header_bytes + 1;
-            for (uint64_t i = 0; i < positions; ++i) {
-                const auto length = u32_at(i);
-                if (length < envelope_bytes || length > max_record ||
-                    at + i + 4 + length > file_size ||
-                    u32_at(i + 4 + 12 + 16) != length - envelope_bytes)
-                    continue;
-                Bytes frame(static_cast<size_t>(length));
-                scan.clear();
-                scan.seekg(static_cast<std::streamoff>(at + i + 4), std::ios::beg);
-                if (scan.read(reinterpret_cast<char*>(frame.data()), static_cast<std::streamsize>(length)) &&
-                    open_frame(frame))
-                    return at + i;
-            }
-            at += positions;
-        }
-        return std::nullopt;
-    };
+    std::ifstream scan(history_p_, std::ios::binary);
+    bool read_failed = false;
 
     // Streaming: startup RSS is bounded by one frame, not history.log's size.
     while (offset + 4 <= file_size) {
         std::array<uint8_t, 4> header_bytes{};
         if (!stream.read(reinterpret_cast<char*>(header_bytes.data()), header_bytes.size())) {
-            trailing_problem = "incomplete trailing frame header";
+            read_failed = true;
             break;
         }
         Reader header(header_bytes);
@@ -2615,7 +2622,7 @@ void MetadataReplica::load_history() {
             Bytes frame(static_cast<size_t>(length));
             if (length && !stream.read(reinterpret_cast<char*>(frame.data()),
                                        static_cast<std::streamsize>(length))) {
-                trailing_problem = "incomplete trailing frame";
+                read_failed = true;
                 break;
             }
             opened = open_frame(frame);
@@ -2625,7 +2632,9 @@ void MetadataReplica::load_history() {
             // says nothing about where the next one starts. A later frame that
             // opens means this is damage and everything from there on is good;
             // none means a torn tail.
-            const auto next = next_frame_from(offset + 1);
+            const auto next = next_history_frame(scan, offset + 1, file_size, max_record, open_frame, read_failed);
+            if (read_failed)
+                break;
             if (!next) {
                 trailing_problem = in_file ? "last frame failed AES-GCM authentication"
                                            : "incomplete trailing frame";
@@ -2706,6 +2715,17 @@ void MetadataReplica::load_history() {
         Log::warn("metadata history skipped frames that could not be replayed path=" +
                   history_p_.string() + " count=" + std::to_string(skipped) + " first=" +
                   first_skipped + "; dependent heads are repaired live from peers");
+
+    if (read_failed) {
+        // The disk did not answer, which says nothing about what is on it. Nothing
+        // is cut: what was not read is read at the next open, and heads needing it
+        // are repaired live from peers meanwhile.
+        Log::warn("metadata history read failed path=" + history_p_.string() + " offset=" +
+                  std::to_string(offset) + " unread_bytes=" + std::to_string(file_size - offset) +
+                  "; nothing cut");
+        history_bytes_ = file_size;
+        return;
+    }
 
     if (valid != file_size) {
         if (trailing_problem.empty())

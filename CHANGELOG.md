@@ -7,7 +7,8 @@ a torn tail, so opening a node cut every later frame from `history.log`, and a l
 over 2 GiB refused the file and sent the node to seed recovery. A frame that does not
 authenticate now means looking for the next one that does: everything from there on
 stays, and the damaged bytes stay in the file until history is next truncated. Only
-when nothing later authenticates is the rest cut, as a torn tail always was.
+when nothing later authenticates is the rest cut, as a torn tail always was. A read
+that fails cuts nothing: what was not read is read at the next open.
 
 ## 0.93.4: one file's error stays that file's, and repair walks a new list
 
