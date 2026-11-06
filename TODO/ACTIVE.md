@@ -83,7 +83,7 @@ confirmed, Pi and real IGD work held.
 
 - **The ready gate**: "When we have done another independent review and are satisfied that
   Macha can migrate to use Dannan and Dagda with no loss of functionality, performance,
-  reliabiliy, or data." Run by fresh agents from the code and the nodes only, no notes or
+  reliabiliy, or data." Run by the Dannan and Dagda sessions after a clear (operator, 2026-11-06: "by fresh agents I meant the library agents, after a clear"), from the code and the nodes only, no notes or
   plans, once old-code removal, 0.93.4, the baselines and the libraries' work are done.
 - **Design defects** (torrent merge associativity, no fence under a torrent claim, the local barrier's
   deadline, the sweep's mixed ages, the policy loop, O(state) per delta, wire-sized allocations, reload
