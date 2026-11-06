@@ -33,19 +33,27 @@ on one log line.
 **0.93.4, the fix group**, in the CHANGELOG. The repair stall reproduced in tests and is fixed,
 with a wake when a disk comes back; whether it stalled fi-1 a month ago is not shown.
 
-**Next, in the operator's order:**
-1. **Pi baselines** on 0.93.4, with the version recorded, once the TV import has finished so
-   that the load is the measured work and not the import (operator cleared 2026-11-06).
-2. The libraries finish their work on that baseline. Goldens at 0.93.4 are cut:
-   `build/macha-fixtures/goldens-0.93.4/`, and tree-backed scratch state: `state-scratch-0.93.4/`. Dannan's arm64 run is on inverbeg (cleared
-   2026-11-06), `/root/dannan-arm64-415c6c4`, scratch only.
-3. **The independent review**, which is the gate for lifting the freeze.
+**The port question is answered: not today.** All three sessions agree, and nobody found an actual
+loss: Macha has never run on either library. **Read
+[`2026-11-06-port-readiness.md`](2026-11-06-port-readiness.md) first**: the answer by requirement, the
+seams nobody owns (custody is a blocker), the proposed plan, and five decisions for the operator.
+
+**Next:**
+1. **The operator's five decisions** in that document. Nothing past the baselines is agreed until then.
+2. **Pi baselines** on 0.93.4, with the version recorded, once the TV import has finished (operator
+   cleared 2026-11-06; what to measure: evaluation section 6, item 4). Not started. Nothing is watching
+   for the job's end: check it first. At 14:17Z job b2bf6286 reported `importing`, 7565 of 7565, 0
+   failed: all copied, one thread re-submitting hints (`BACKLOG.md`, Import). Record
+   `throttled=0x50000` on both Pis with the figures.
+3. Artefacts for the libraries are cut at 0.93.4: `build/macha-fixtures/goldens-0.93.4/` and
+   `state-scratch-0.93.4/`. When heads S3 and S7 start, Dagda will ask by name for a head ending in a
+   delta, a merge and a tombstone batch. Dannan's arm64 results: `build/dannan-arm64-415c6c4/`.
 
 **Waiting on the operator:** the media-kind import hint and what to do with the running TV job,
 which still has files bound for `/Movies`; truncated pack records, which stay counted read
 failures and report held, with repair unchecked; source files gone for good, which still block
 the job; macnessa's reboot of 2026-11-06 12:16Z to 12:18Z, see memory `project-core-capture`: SIGBUS in a page read of `libmacha_core.so` after a failed state write, PID 1 faulting 22 s later, about 100 undervoltage events an hour, the NVMe reporting critical warning 0x02 at 0 C; root disk loss is inferred, not logged; the two cores are on `/mnt/diskB/crash`;
-the replica journal reader, with no production writer left; movie folder names such as `Blade Runner ( (1982)`, 62 of 1891 in `/Movies` on 2026-11-06 (`title_for_movie_year`, `src/catalogue/media_catalogue.cpp:587`, cuts at the year and keeps the ` (`), not fixed, under the freeze; the `*.pre-migration.*` archives,
+delete the two cores (2.8 GB, hold keys and plaintext; stacks already read), recommended; the replica journal reader, with no production writer left; movie folder names such as `Blade Runner ( (1982)`, 62 of 1891 in `/Movies` on 2026-11-06 (`title_for_movie_year`, `src/catalogue/media_catalogue.cpp:587`, cuts at the year and keeps the ` (`), not fixed, under the freeze; the `*.pre-migration.*` archives,
 not found directly under `/var/lib/macha` or `/mnt/diskB/data` on 2026-11-06, location unchecked. Torrent
 moves out, not a P0: `2026-11-06-ingest-plugins-torrent-removal-plan.md`.
 
@@ -58,26 +66,23 @@ against a named library case, recorded case by case; reverse migration built
 but not a gate; torrent bytes stay pinned in Macha's tests until torrent moves out; Dannan's respec
 confirmed, Pi and real IGD work held.
 
-- **Dannan** planned on cac5998, told 9a08846 has landed: `../dannan/TODO/ACTIVE.md` "The first cutover",
-  `2026-11-05-first-cutover.md`, `2026-11-05-macha-test-mapping.md`. Local
-  develop, unpushed, steps 1 and 2 of 11 done. Generic class admission comes first (ruling).
-  arm64 unproven. Proposing a generic class
-  admission in `dannan::sched`, ledger first, then Dagda; Macha's view sent (the
-  `io_pressure` group is the gate; Macha's own arbiter stays Macha's).
-- **Dagda** planned on cac5998, told 9a08846 has landed: `../dagda/TODO/ACTIVE.md`,
-  `2026-11-05-second-cutover.md`, `2026-11-05-test-mapping.md` (786 cases),
-  `2026-11-05-heads-plan.md`. It took 0.92.4's shapes; its differences from Macha are now fixed
-  in Macha at 0.93.4, for it to match. Heads next, on the forms that remain above.
+- **Dannan**, baseline `9a08846`, local develop `415c6c4`, unpushed: `../dannan/TODO/ACTIVE.md` "The first
+  cutover", `2026-11-05-first-cutover.md`, `2026-11-05-macha-test-mapping.md`. Steps 1 to 10 done but for
+  the gaps in the readiness document; step 11, the tag, at the operator's word. `sched::ClassWaits` built.
+- **Dagda**, baseline `9a08846`, local develop `c3c09d2`, unpushed: `../dagda/TODO/ACTIVE.md`,
+  `2026-11-05-second-cutover.md`, `2026-11-05-test-mapping.md` (786 cases), `2026-11-05-heads-plan.md`.
+  Has 0.93.4's shapes, 453 on the Mac. **Heads do not exist yet.** Class-waits branch unmerged, awaiting
+  Dannan's tag.
 - **Macha's code is frozen until the review passes (operator, 2026-11-05):**
   "Macha has a working, tested codebase, this shouldn't be modified until they're
   ready." Exceptions: 0.92.5 (deployed), the old-code removal and 0.93.4; each moves
   the libraries' baseline, and they are told at each commit. Artefacts for their
   plans are fine, changing no tracked file, under `build/macha-fixtures/`, each with a
-  README: `placement/`; `goldens/` (Status 381 of 494 keys by name, journal 31 of 83
-  lines, 46 config fields, routes read from source); `state-scratch/` (inline, **not the
+  README: `placement/`; `goldens-0.93.4/` (Status 381 of 494 keys by name, journal 31 of 83
+  lines, 46 config fields, routes read from source), with `goldens/` at cac5998 beside it;
+  `state-scratch-0.93.4/` (tree-backed), with `state-scratch/` at cac5998 (inline, **not the
   live form**); `membership-tombstone/`; `state-macnessa/` (three roster files, read-only
   off the running node, approved through Dannan). `gen/` holds the generators.
-- **Pi baselines**: Macha's, later, at his word, with the deployed version.
 
 ## Rulings, 2026-11-05 (the operator, asked one by one; "via Dagda" = reported by it)
 
