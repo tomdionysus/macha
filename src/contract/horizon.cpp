@@ -104,10 +104,14 @@ std::vector<ObjectId> ReferencedSets::not_held(RetentionClass type,
             *set.view, held,
             [&](const ObjectTrie::Record& record) { viewed.push_back(record.first); }, pause);
     std::vector<ObjectId> others;
-    for (const auto& id : set.others)
+    size_t seen = 0;
+    for (const auto& id : set.others) {
         if (std::none_of(held.begin(), held.end(),
                          [&](const ObjectTrie::Snapshot& part) { return part.get(id).has_value(); }))
             others.push_back(id);
+        if (pause && ++seen % 4096 == 0)
+            pause();
+    }
     std::vector<ObjectId> out;
     out.reserve(viewed.size() + others.size());
     std::set_union(viewed.begin(), viewed.end(), others.begin(), others.end(),

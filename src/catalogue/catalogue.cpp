@@ -1823,7 +1823,7 @@ void CatalogueManager::publish(
                 delta.catalogue_root = root;
                 // The delta carries the conflict set; a replay infers nothing.
                 delta.replace_conflicts = metadata.conflicts;
-                retire_objects(metadata, delta, {released.begin(), released.end()});
+                retire_objects(delta, {released.begin(), released.end()});
             });
         } else {
             metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
@@ -1835,7 +1835,7 @@ void CatalogueManager::publish(
                 metadata.catalogue_root = root;
                 delta.catalogue = CatalogueDelta::set;
                 delta.catalogue_root = root;
-                retire_objects(metadata, delta, {released.begin(), released.end()});
+                retire_objects(delta, {released.begin(), released.end()});
             });
         }
     } catch (const CatalogueConflict&) {

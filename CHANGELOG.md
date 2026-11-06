@@ -1,5 +1,83 @@
 # Current release
 
+## 0.93.4: one file's error stays that file's, and repair walks a new list
+
+Repair: a pull list arriving after an empty one, or after the last list was
+finished while the push still ran, was passed over and the pass reported settled,
+so repair parked until something else woke it. The step that first sees a list
+now walks it. A disk coming back now wakes maintenance, so the survey and repair see it with
+nothing else happening.
+
+Import: an error belonging to one file (`destination_conflict`,
+`destination_parent_not_directory`, `partial_not_file`, `size_mismatch`) fails that
+file alone, and the job goes on. The file's state is `failed`, with `error_code` and
+`error`, and the job carries `files_failed`; a job with failed files ends `completed`.
+A destination appearing during the copy is `destination_conflict` too. A failed file
+stays failed: `pause` and `resume` of it are refused, `cancel` leaves it out. To try
+again, submit its source path. Per-file actions now work on a `failed` job.
+
+A file that probes as a film, in an extras folder under a title that has episodes,
+is filed under that series, keeping its folders below the title, and is not sent to
+the catalogue. Files already in the namespace stay where they are.
+
+Storage: a read failing on the device keeps the object, warns and counts in
+`storage.read_failures`, in a reader and in the scrub; only a record that reads and
+does not open is removed. A node with disks configured and none online reports
+`startup.data_storage_degraded` in Status and warns at startup.
+
+Maintenance: a stop during the survey's diff ends the survey and no longer counts
+as failed peers; `not_held` pauses over the ids beside its view; the inventory walk
+checks the stop. Two deletes of one object each hold its mark. The predicate queries,
+which nothing called, are gone.
+
+## 0.93.3: genesis and the inline formats are gone
+
+Genesis is a fixed constant holding no tree, and a founder builds the root
+directory itself; a node still at genesis reads an empty root directory. The snapshot readers SM5 to SM13, SM15 and SM18 and the delta
+readers DLT1 to DLT4 are gone, with the map encoders; a record is SM14, SM16,
+SM17 or SM19 and a delta DLT5 to DLT11, byte for byte as before. Reconciliation
+refuses a head with no tree. Mutations retire objects only into tombstone
+batches, and maintenance no longer stamps, erases or moves inline tombstones.
+The `tombstones` maintenance trace line loses `stamp=`.
+
+## 0.93.2: legacy authority is gone
+
+A record with no write floor is accepted only as genesis on a founder; any other
+checkpoint without a certificate goes to peer recovery, as one with a floor
+always has. A policy commit changes only the data replication. The
+`current.meta`/`committed.meta` layout and `mutation-sequence.meta` are no longer
+read.
+
+## 0.93.1: the legacy write API is gone
+
+`MetadataReplica`'s `cas`, `cas_delta`, `install_committed_delta`, `seed`,
+`remember_committed` and `remember_current_committed` refused every state with
+a write floor, and no caller remained. A commit is stored and accepted. Nothing
+in the replica writes its journal now; what it reads from one is unchanged.
+
+## 0.93.0: a namespace is a tree from its first commit
+
+A new namespace is founded on the content-addressed Merkle tree: the
+founding record carries the root and no entry map. It was founded inline,
+with every file and extent in the record, and stayed inline until re-rooted
+by hand, so the record grew with the library. On a 1.6 TB library it was
+21 MB, and every head materialisation, replayed delta and checkpoint
+rewrote it: a node spent a core re-encoding it, imports slowed to under
+1 MiB/s, and stop and reload waited behind the replay.
+
+Accepting a head the replica already holds, under a certificate that adds
+nothing, is now a lookup rather than a materialisation of the head and its
+parents; parents are materialised only for a record without a write floor,
+whose policy check reads them.
+
+Every metadata mutation is an exact delta applied to the tree; the
+whole-snapshot mutation is gone, and so is `macha-namespace-migrate`, which
+re-rooted an inline namespace by hand.
+
+The availability path table followed the tree while what was out of reach
+changed, so a file whose only copy went out of reach kept reporting itself
+complete; it follows the tree now only when that answer is unchanged.
+
 ## 0.92.5: a stale tombstone in a batch is erased
 
 A tree-backed head keeps its tombstones in batches, immutable control

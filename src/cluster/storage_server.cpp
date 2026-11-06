@@ -50,7 +50,12 @@ void StorageServer::refresh() {
     if (refresh_ms >= 100 && Log::enabled(LogLevel::all))
         Log::trace("DIAG node-stage stage=storage-refresh elapsed_ms=" + std::to_string(refresh_ms));
     node_.advertise_storage(local_.used(), local_.limit());
-    node_.advertise_storage_backends(static_cast<uint32_t>(local_.online_backends()));
+    const auto online = static_cast<uint32_t>(local_.online_backends());
+    node_.advertise_storage_backends(online);
+    // A disk come back changes what this node holds, with nothing written.
+    if (online > online_backends_)
+        events_.notify(NodeEvent::storage);
+    online_backends_ = online;
     const auto stats = cache_.stats();
     node_.advertise_cache(cache_max_blocks_ * extent_size_,
                           static_cast<uint64_t>(cache_.blocks()) * extent_size_,

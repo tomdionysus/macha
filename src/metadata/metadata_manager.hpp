@@ -77,7 +77,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     NodeRuntime& node_;
     LocalState& local_;
     MetadataServer& metadata_server_;
-    DistributedStore* namespace_store_{};
+    DistributedStore& namespace_store_;
     const TimeSource& time_;
     // Guards no state: serialises mutations, repair and history truncation.
     // A mutation holds it across its local commit only; repair holds it
@@ -85,7 +85,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     IoMutex mutation_mutex_;
     // Guards no state: serialises the multi-head merge-and-publish branch of
     // read_group(), held across its history imports and commit fan-out.
-    // mutate_impl() holds mutation_mutex_ while calling read_group().
+    // mutate_delta() holds mutation_mutex_ while calling read_group().
     IoMutex reconciliation_mutex_ MACHA_ACQUIRED_AFTER(mutation_mutex_);
     // Retry cooldown for peer certificates this replica cannot accept (record
     // fails to materialise locally). read_group() runs on nearly every read;
@@ -196,10 +196,6 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     bool replicate_accepted_head(const NodeInfo&, const MetadataRecord&,
                                  const MetadataAcceptance&, FrameType);
 
-    MetadataRecord mutate_impl(
-        const std::function<void(MetadataSnapshot&, MetadataDelta*)>&, bool exact_delta,
-        size_t retries, std::optional<MetadataMutationIdentity> identity);
-
     // What commits accepted here owe the peers: each commit's claims on
     // them, in order, and the newest head, whose history carries the rest.
     // The replicator delivers these off every caller's path; what it cannot
@@ -228,9 +224,8 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     void publish_replica_state(bool validated, std::string_view reason = {});
 
   public:
-    // `namespace_store`: where tree namespace nodes live; construction installs
-    // tree-delta commit application through it (spec B2). Without it only
-    // map-backed namespaces are served. `publication_retention`: the claims
+    // `namespace_store`: where the namespace tree's nodes live; every commit is
+    // applied to the tree through it. `publication_retention`: the claims
     // barrier (every object a new head refers to is durably claimed first).
     // `local` runs before each commit is accepted here, makes this node's
     // claims, which must hold, and returns what they name; `peers` makes the
@@ -239,8 +234,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     using PublicationRetention = MetadataPublicationRetention;
     // `time`: what the decoded cache's lifetime (config metadata_cache) is
     // measured by.
-    MetadataManager(NodeRuntime&, LocalState&, MetadataServer&,
-                    DistributedStore* namespace_store = nullptr,
+    MetadataManager(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore& namespace_store,
                     PublicationRetention publication_retention = {},
                     const TimeSource& time = steady_time_source());
     ~MetadataManager();
@@ -322,10 +316,8 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     uint64_t current_namespace_revision() const noexcept override {
         return available_namespace_revision();
     }
-    MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&,
-                          size_t retries = 8) override;
-    // Caller supplies the exact delta; avoids a second deep copy of the
-    // namespace. `identity` is an idempotency key: applied only if
+    // The caller supplies the exact change set, applied to the tree.
+    // `identity` is an idempotency key: applied only if
     // mutation_sequences[identity.origin] < identity.sequence, which it then
     // stamps, so a caller can tell after a crash whether it took effect.
     MetadataRecord mutate_delta(

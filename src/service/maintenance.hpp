@@ -128,11 +128,9 @@ class Maintenance final {
     void note_retry_trigger(Clock::time_point now);
     std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
     void save_sightings(UnreferencedSince&, Clock::time_point& saved, bool complete = false);
-    void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
-                                   const std::vector<GarbageRef>& stamp);
+    void maintain_garbage_metadata(const std::vector<GarbageRef>& erase);
     // Drops the tombstone batches whose grace has run (each batch's
-    // tombstones retire together), and moves a tree-backed head's inline
-    // tombstones into batches, an hour of retirements to a batch.
+    // tombstones retire together).
     void maintain_tombstone_batches(const InventoryHorizon&);
 
     NodeRuntime& node_;

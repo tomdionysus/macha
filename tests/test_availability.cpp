@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "contract/stopping.hpp"
 #include "test_support.hpp"
 
 #include "api/item_availability.hpp"
@@ -447,6 +448,42 @@ MACHA_FAST_TEST("availability", test_the_survey_by_diff_finds_what_no_node_holds
     CHECK(diffs[0].answered);
     CHECK(diffs[0].lacks == lacking(first));
     CHECK(!diffs[1].answered);
+}
+
+// A stop during the diff ends the survey: it is not a peer that failed, whose
+// empty answer would stand as what is unknown.
+MACHA_FAST_TEST("availability", test_a_stop_during_the_diff_is_not_a_failed_peer) {
+    TempDir dir;
+    auto mine = held_trie(dir.path() / "mine", {numbered_id(1), numbered_id(2)});
+    auto theirs = held_trie(dir.path() / "theirs", {numbered_id(2), numbered_id(3)});
+    const auto here = std::make_shared<const TrieUnion>(std::vector{mine->snapshot()});
+    SnapshotSource source(theirs->snapshot());
+    std::vector<TrieSource*> peers{&source, &source};
+    const std::vector<ObjectId> missing{numbered_id(3)};
+    std::vector<ObjectId> referenced{numbered_id(1), numbered_id(2), numbered_id(3)};
+    std::sort(referenced.begin(), referenced.end());
+    std::vector<PeerDiff> diffs;
+    bool stopped = false;
+    try {
+        (void)survey_by_diff(here, missing, IdLookup(referenced), peers, diffs,
+                             [] { throw MaintenanceStopping{}; });
+    } catch (const MaintenanceStopping&) {
+        stopped = true;
+    }
+    CHECK(stopped);
+}
+
+// The ids beside the view are walked as the view is: pausing every 4096.
+MACHA_FAST_TEST("availability", test_what_is_not_held_pauses_over_the_ids_beside_the_view) {
+    std::vector<ObjectId> others;
+    for (uint32_t i = 0; i < 10000; ++i)
+        others.push_back(numbered_id(i));
+    const ReferencedSets sets(ReferencedSets::Views{}, others, {});
+    size_t pauses = 0;
+    const auto missing = sets.not_held(RetentionClass::data, std::span<const ObjectTrie::Snapshot>{},
+                                       [&] { ++pauses; });
+    CHECK(missing.size() == others.size());
+    CHECK(pauses == 2);
 }
 
 // What this node lacks: the referenced set, a trie and a list beside it, less

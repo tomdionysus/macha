@@ -536,8 +536,8 @@ node's or a quarantined (`*.corrupt.<timestamp>`) metadata directory. It never
 constructs a replica, so it cannot trigger recovery. It decodes every history
 frame, reports anomalies, and for each accepted head walks the delta chain with
 the production succession rule and states where materialization would fail.
-`--stats` prints what each reconstructible head is made of. A tree-backed head
-carries only its root; `--objects` names the control object store so the tree
+`--stats` prints what each reconstructible head is made of. A head carries only
+its root; `--objects` names the control object store so the tree
 can be walked, the delta chain actually replayed (naming the first frame that
 diverges), and a stat timed against it.
 
@@ -554,7 +554,7 @@ authoring as a new author`.
 A node also takes a new author id by itself, logged as `metadata author chain
 cannot be continued (...); authoring as a new author`, when the head it is
 about to extend lacks a mutation it had accepted or its head set was replaced
-by a recovery from the cache seed or by a re-root.
+by a recovery from the cache seed.
 
 ## Inspecting a replica's heads offline
 
@@ -569,26 +569,3 @@ arguments for the full usage.
 Nothing here is needed to bring heads together: a running node merges any
 two heads it holds from what the heads themselves record.
 
-## Re-rooting the namespace onto the tree
-
-A cluster founds with the namespace inlined in its metadata record.
-`macha-namespace-migrate STATE_PATH KEY_FILE` re-roots one stopped node's
-namespace onto the content-addressed Merkle tree in the control store, after
-which the record carries only the tree's root and a commit rewrites the
-changed leaf and the branches above it. Once re-rooted, a node stays
-tree-backed; nothing migrates by installing a release.
-
-It is offline and deliberate. Stop every node, let them converge on one head
-first, then run it on each node: the new record is a pure function of the
-converged namespace, so every node computes the same one independently.
-`--expect-hash` makes a node refuse any record other than the one the first
-node produced, `--witness NODE_ID` (once per node)
-names the nodes being re-rooted, `--adopt FILE` installs a record written by
-`--export-record` on the node migrated first (for a node that stopped a few
-commits behind it, after proving this node's namespace produces the same tree
-root), and `--dry-run` installs nothing. The previous checkpoint, journal, history and heads
-are kept beside the originals with a `.pre-migration.<ns>`
-suffix rather than deleted; no extent is touched.
-
-Once the nodes are started the namespace is served and written from the
-installed head.
