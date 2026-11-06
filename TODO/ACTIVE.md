@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-05 night, on `feature/tree-native-namespace`, checked against the
+Last updated: 2026-11-06, on `develop`, checked against the
 code and the running nodes, not against earlier notes. **State a branch's content from
 its diff and a node's state from its files, never from a prior note** (operator, on this
 file's drift: "We can't afford drift like this."). The version before the morning's
@@ -11,32 +11,41 @@ Alongside this file: `BACKLOG.md` (everything else, by area), `COMPLETED.md`,
 ## Resume here
 
 **Live.** macnessa (root@10.44.1.50, builds in `/home/tom/macha`) and inverbeg
-(root@inverbeg.macha.network) run **0.92.5**, one cluster, under `/usr/local`, installed
-2026-11-05 14:52Z and 14:54Z. Develop, main and tag 0.92.5 (808fa0f) are pushed.
+(root@inverbeg.macha.network) run **0.93.4**, one cluster, under `/usr/local`, installed
+2026-11-06 02:34Z and 02:36Z. Develop, main and tag 0.93.4 (merge 9a08846) are pushed.
+Gate on macnessa 751, 20, 21, trace repeat 84 of 84. Both nodes writable and connected;
+the TV import (b2bf6286) resumed by itself. The metadata history holds no empty delta: 18
+catalogue, 17 appends, 4 namespace changes of 39 read after the restart.
 
-**On `feature/tree-native-namespace`, not merged, not deployed, not pushed:**
+**The old-code removal has landed.** 0.93.0 a namespace is a tree from its first commit;
+0.93.1 the legacy write API; 0.93.2 legacy authority; 0.93.3 genesis and the inline formats.
+What stayed: SM14, SM16, SM17, SM19 and DLT5 to DLT11 with envelope and hash; the legacy clock
+(a live feature); `MetadataSnapshot::entries`, `merge_metadata_heads` and `metadata_delta` as
+the working form; the map branches of `apply_metadata_delta_in_place` and `namespace_entry`;
+`garbage` and `metadata_voters` in SM14, which its hash covers; `required == 0` for genesis on
+a founder only. Replay of a copy of macnessa's real state reproduced every frame, root
+2fdd09bd. **Test changes the review should read:**
+`test_publication_generation_barrier_precedes_metadata_commit` now counts only the data
+store's barrier, on an unproven explanation of the control one;
+`test_concurrent_reads_during_divergence_produce_one_reconciliation` retries its first write,
+on one log line.
 
-- **The old-code removal, done.** 076115f 0.93.0 a namespace is a tree from its first
-  commit; 18f0c4b 0.93.1 the legacy write API; ecce886 0.93.2 legacy authority; 766617e
-  0.93.3 genesis and the inline formats. What stayed: SM14, SM16, SM17, SM19 and DLT5 to
-  DLT11 as the record forms, with envelope and hash; the legacy clock (a live feature);
-  `MetadataSnapshot::entries`, `merge_metadata_heads` and `metadata_delta` as the working
-  form; the map branches of `apply_metadata_delta_in_place` and `namespace_entry`;
-  `garbage` and `metadata_voters` in SM14, which its hash covers; `required == 0` for
-  genesis on a founder only. **`load_journal` has no production writer left: a question
-  for the operator.** Genesis's hash changed, so new clusters only; replay of a copy of
-  macnessa's real state reproduces every frame, root 2fdd09bd.
-- **0.93.4, the operator's fix group** (the release first named 0.92.6): see CHANGELOG.
-  Its API changes are to be announced to Core and the clients before it ships.
-  Gate on macnessa: 751, 20, 21, trace repeat 84 of 84. The repair stall reproduced;
-  whether it is what stalled fi-1 a month ago is not shown.
+**0.93.4, the fix group**, in the CHANGELOG. The repair stall reproduced in tests and is fixed,
+with a wake when a disk comes back; whether it stalled fi-1 a month ago is not shown.
 
-**Next, in the operator's order (2026-11-05):**
-1. Merge and deploy 0.93.0 to 0.93.4, on the operator's word, and tell Dannan and Dagda
-   the commit: they paused until the removal lands, and re-cut their goldens from it.
-2. **Pi baselines** on the result, with the version recorded.
+**Next, in the operator's order:**
+1. Re-cut the goldens on 0.93.4 for the libraries, once they are told it has landed.
+2. **Pi baselines** on 0.93.4, with the version recorded and arm64 run for Dannan.
 3. The libraries finish their work on that baseline.
 4. **The independent review**, which is the gate for lifting the freeze.
+
+**Waiting on the operator:** the media-kind import hint and what to do with the running TV job,
+which still has files bound for `/Movies`; truncated pack records, which stay counted read
+failures and report held, with repair unchecked; source files gone for good, which still block
+the job; whether an owned source should survive `clear` and `remove_after_ms` while a job has
+failed files; the replica journal reader, with no production writer left; stale
+`macha-namespace-migrate` binaries and the `*.pre-migration.*` archives on both nodes. Torrent
+moves out, not a P0: `2026-11-06-ingest-plugins-torrent-removal-plan.md`.
 
 ## The port to Dannan and Dagda
 
@@ -47,18 +56,16 @@ against a named library case, recorded case by case; reverse migration built
 but not a gate; torrent bytes stay pinned in Macha's tests; Dannan's respec
 confirmed, Pi and real IGD work held.
 
-- **Dannan** planned on cac5998: `../dannan/TODO/ACTIVE.md` "The first cutover",
-  `2026-11-05-first-cutover.md`, `2026-11-05-macha-test-mapping.md`. Branch
-  `feature/macha-parity`, unpushed, steps 1 and 2 of 11 done, at step 3 when the
-  operator says continue. 0.92.5 touches nothing in its layer. Proposing a generic class
+- **Dannan** planned on cac5998, told 9a08846 has landed: `../dannan/TODO/ACTIVE.md` "The first cutover",
+  `2026-11-05-first-cutover.md`, `2026-11-05-macha-test-mapping.md`. Local
+  develop, unpushed, steps 1 and 2 of 11 done. Generic class admission comes first (ruling).
+  arm64 unproven. Proposing a generic class
   admission in `dannan::sched`, ledger first, then Dagda; Macha's view sent (the
   `io_pressure` group is the gate; Macha's own arbiter stays Macha's).
-- **Dagda** planned on cac5998: `../dagda/TODO/ACTIVE.md`,
+- **Dagda** planned on cac5998, told 9a08846 has landed: `../dagda/TODO/ACTIVE.md`,
   `2026-11-05-second-cutover.md`, `2026-11-05-test-mapping.md` (786 cases),
-  `2026-11-05-heads-plan.md`. Local on develop, unpushed. It took 0.92.4's shapes and
-  three differences of its own (question 1). Told to build heads against cac5998, not
-  to wait on `feature/tree-native-namespace`: that is Macha's finding under the freeze,
-  not a ruling (Open work 2).
+  `2026-11-05-heads-plan.md`. It took 0.92.4's shapes; its differences from Macha are now fixed
+  in Macha at 0.93.4, for it to match. Heads next, on the forms that remain above.
 - **Macha's code is frozen until the review passes (operator, 2026-11-05):**
   "Macha has a working, tested codebase, this shouldn't be modified until they're
   ready." Exceptions: 0.92.5 (deployed), the old-code removal and 0.93.4; each moves
