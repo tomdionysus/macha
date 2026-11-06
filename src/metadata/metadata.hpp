@@ -3,6 +3,7 @@
 #include "contract/thread_safety.hpp"
 #include "crypto.hpp"
 #include "torrent/torrent_request.hpp"
+#include <istream>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -419,6 +420,14 @@ Bytes encode_metadata_acceptance_set(const std::vector<MetadataAcceptance>&);
 std::vector<MetadataAcceptance> decode_metadata_acceptance_set(std::span<const uint8_t>);
 Bytes encode_metadata_history_entry(const MetadataHistoryEntry&);
 MetadataHistoryEntry decode_metadata_history_entry(std::span<const uint8_t>);
+// The next offset at or after `from` in a history file holding a frame that
+// `open` authenticates. The two length fields rule out nearly every position
+// before any AES work. None means nothing later opens, unless `read_failed` is
+// set: then the file could not be read, and nothing is known about the rest.
+std::optional<uint64_t>
+next_history_frame(std::istream& file, uint64_t from, uint64_t file_size, uint64_t max_frame,
+                   const std::function<std::optional<Bytes>(std::span<const uint8_t>)>& open,
+                   bool& read_failed);
 Bytes encode_metadata_delta(const MetadataDelta&);
 MetadataDelta decode_metadata_delta(std::span<const uint8_t>);
 std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot&, const MetadataSnapshot&);
