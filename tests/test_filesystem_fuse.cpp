@@ -753,7 +753,8 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         const auto advanced = fs.local_snapshot_view();
         CHECK(advanced.generation > first.generation);
         CHECK(advanced.snapshot != first.snapshot);
-        CHECK(advanced.snapshot->entries.contains("/local-view"));
+        const auto nodes = fs.namespace_nodes();
+        CHECK(namespace_entry(*advanced.snapshot, &nodes, "/local-view").has_value());
     }
 }
 
@@ -3909,11 +3910,14 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
     fs.unlink("/garbage-grace-2");
 
     const auto snapshot = service.metadata_manager().snapshot();
+    auto batches = fs.namespace_nodes();
+    const auto garbage =
+        tombstones_of(snapshot, [&](const ObjectId& id) { return batches.get(id); });
     int64_t latest_retirement{};
     for (const auto& id : retired_ids) {
-        const auto found = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
+        const auto found = std::find_if(garbage.begin(), garbage.end(),
                                         [&](const GarbageRef& garbage) { return garbage.id == id; });
-        REQUIRE(found != snapshot.garbage.end());
+        REQUIRE(found != garbage.end());
         latest_retirement = std::max(latest_retirement, found->retired_at_ns);
         CHECK(service.local_state().data().has(id));
     }

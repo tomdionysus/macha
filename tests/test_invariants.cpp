@@ -8,6 +8,7 @@
 #include "api/users_api.hpp"
 
 #if defined(__linux__)
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #endif
@@ -546,6 +547,8 @@ Config config_for(const std::filesystem::path& path, const std::filesystem::path
 std::atomic_bool track_fsync{false};
 std::atomic_uint64_t fsync_calls{0};
 std::atomic_uint64_t syncfs_calls{0};
+// When set, syncfs_calls counts only a barrier on this directory.
+std::atomic<ino_t> syncfs_only_inode{0};
 #endif
 
 
@@ -1533,7 +1536,8 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
     BareNode node(config, cluster.keys(), {}, clock.source());
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    auto metadata_store = macha::test_support::distributed_store_for(node);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
     REQUIRE(metadata.snapshot().metadata_voters.empty());
 
     ClusterStatusService status(node, node.accounts(), node.resources.activity,
@@ -2021,11 +2025,11 @@ MACHA_TEST("invariants", test_catalogue_keeps_what_the_namespace_holds) {
         file.size = 1234;
         file.ctime_ns = file.mtime_ns = wall_time_ns();
         file.extents.push_back({0, file.size, object_id(pattern(1234, 7)), false});
-        bench.metadata().mutate([&](MetadataSnapshot& snapshot) {
-            snapshot.entries["/Movies"] = dir;
-            snapshot.entries["/Movies/A"] = dir;
-            snapshot.entries["/Movies/B"] = dir;
-            snapshot.entries["/Movies/A/live.mkv"] = file;
+        bench.metadata().mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) {
+            delta.upsert_entries["/Movies"] = dir;
+            delta.upsert_entries["/Movies/A"] = dir;
+            delta.upsert_entries["/Movies/B"] = dir;
+            delta.upsert_entries["/Movies/A/live.mkv"] = file;
         });
         CatalogueItem item;
         item.id = "test:movie:mixed-generation";
@@ -2047,7 +2051,8 @@ MACHA_TEST("invariants", test_catalogue_keeps_what_the_namespace_holds) {
 
         fs.rename("/Movies/A/live.mkv", "/Movies/B/live.mkv");
         const auto moved = fs.local_snapshot_view();
-        REQUIRE(moved.snapshot->entries.contains("/Movies/B/live.mkv"));
+        auto moved_nodes = fs.namespace_nodes();
+        REQUIRE(namespace_entry(*moved.snapshot, &moved_nodes, "/Movies/B/live.mkv").has_value());
         CHECK(metadata_namespace_signature(*moved.snapshot) != scanned_signature);
         catalogue.reconcile_scanner({}, active, true, scanned_signature);
         CHECK(catalogue.get(item.id)->media_ids == std::vector<std::string>{file_media_id(file)});
@@ -2129,8 +2134,11 @@ MACHA_TEST("invariants", test_catalogue_keeps_what_the_namespace_holds) {
         catalogue.repair_once();
         const auto missing_root = object_id(pattern(32123, 11));
         REQUIRE(!node.local_store().has(missing_root));
-        bench.metadata().mutate(
-            [&](MetadataSnapshot& snapshot) { snapshot.catalogue_root = missing_root; });
+        bench.metadata().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+            snapshot.catalogue_root = missing_root;
+            delta.catalogue = CatalogueDelta::set;
+            delta.catalogue_root = missing_root;
+        });
         const auto maintenance = maintenance_inventory(catalogue);
         CHECK(maintenance.control_live.contains(missing_root));
         CHECK(!maintenance.complete);
@@ -2365,6 +2373,100 @@ MACHA_TEST("invariants", test_rebalance_never_deletes_last_valid_copy_for_corrup
         readable = false;
     }
     CHECK(readable);
+}
+
+namespace {
+// The device, failing every read of the objects named as a disk does: the file
+// is there and its size known, the bytes do not come.
+class FailingReads final : public LocalStoreFiles {
+    LocalStoreFiles& device_{posix_local_store_files()};
+    mutable std::mutex mutex_;
+    std::set<std::filesystem::path> failing_;
+
+    void check(const std::filesystem::path& path) const {
+        std::lock_guard lock(mutex_);
+        if (failing_.contains(path))
+            throw std::runtime_error("cannot read object: Input/output error");
+    }
+
+  public:
+    void fail(const std::filesystem::path& path) {
+        std::lock_guard lock(mutex_);
+        failing_.insert(path);
+    }
+    void install(const std::filesystem::path& path, std::span<const uint8_t> head,
+                 std::span<const uint8_t> body) override {
+        device_.install(path, head, body);
+    }
+    Bytes read(const std::filesystem::path& path) override {
+        check(path);
+        return device_.read(path);
+    }
+    std::optional<Bytes> read_at(const std::filesystem::path& path, uint64_t offset, size_t size) override {
+        check(path);
+        return device_.read_at(path, offset, size);
+    }
+    void append(const std::filesystem::path& path, std::span<const uint8_t> head,
+                std::span<const uint8_t> body) override {
+        device_.append(path, head, body);
+    }
+    bool truncate(const std::filesystem::path& path, uint64_t size) override {
+        return device_.truncate(path, size);
+    }
+    std::vector<std::pair<std::filesystem::path, uint64_t>> list(const std::filesystem::path& dir) override {
+        return device_.list(dir);
+    }
+};
+} // namespace
+
+// A read that fails on the device says nothing about the object: it stays and
+// is counted. A record that reads and does not open is removed. Both by a
+// reader and by the scrub.
+MACHA_TEST("invariants", test_a_failed_read_keeps_the_object_and_a_bad_record_is_removed) {
+    TempDir t;
+    const auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto disk = t.path() / "disk";
+    std::filesystem::create_directories(disk);
+    FailingReads device;
+    StoragePool pool(t.path() / "state", random_node_id(), {{disk, 64ULL * 1024 * 1024}}, keys.storage,
+                     std::chrono::milliseconds(500), StoragePackingConfig{0, 0}, 0, device);
+    REQUIRE(wait_until([&] { return pool.online_backends() == 1; }));
+    const auto put = [&](uint8_t seed) {
+        const auto bytes = pattern(64 * 1024, seed);
+        const auto id = object_id(bytes);
+        REQUIRE(pool.put(id, bytes));
+        return id;
+    };
+    const auto unreadable_for_reader = put(1);
+    const auto unreadable_for_scrub = put(2);
+    const auto corrupt_for_reader = put(3);
+    const auto corrupt_for_scrub = put(4);
+    device.fail(object_path(disk, unreadable_for_reader));
+    device.fail(object_path(disk, unreadable_for_scrub));
+    corrupt_object(disk, corrupt_for_reader);
+    corrupt_object(disk, corrupt_for_scrub);
+    auto& failures = observations().counter("storage.read_failures");
+    const auto before = failures.load();
+
+    CHECK(!pool.get(unreadable_for_reader).has_value());
+    CHECK(pool.has(unreadable_for_reader));
+    CHECK(std::filesystem::exists(object_path(disk, unreadable_for_reader)));
+    CHECK(failures.load() == before + 1);
+
+    CHECK(!pool.get(corrupt_for_reader).has_value());
+    CHECK(!pool.has(corrupt_for_reader));
+    CHECK(failures.load() == before + 1);
+
+    bool complete = false;
+    for (int slice = 0; slice < 16 && !complete; ++slice)
+        complete = pool.scrub_step(0, 8).complete;
+    REQUIRE(complete);
+    CHECK(pool.has(unreadable_for_scrub));
+    CHECK(std::filesystem::exists(object_path(disk, unreadable_for_scrub)));
+    CHECK(!pool.has(corrupt_for_scrub));
+    CHECK(failures.load() >= before + 2);
 }
 
 MACHA_TEST("invariants", test_rpc_pre_auth_admission_is_bounded) {
@@ -2988,11 +3090,17 @@ MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_c
         fs.open_write("/generation.bin", true, false, WriteDurability::publication_generation);
     fsync_calls = 0;
     syncfs_calls = 0;
+    // The data store's barrier: the commit's tree nodes have their own, in the
+    // control store.
+    struct stat data_root {};
+    REQUIRE(::stat((fixture.path() / "publication-generation").c_str(), &data_root) == 0);
+    syncfs_only_inode = data_root.st_ino;
     track_fsync = true;
     REQUIRE(writer->write(0, bytes) == bytes.size());
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
     writer->commit();
     track_fsync = false;
+    syncfs_only_inode = 0;
 
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
     auto reader = fs.open_read("/generation.bin");
@@ -3368,8 +3476,12 @@ extern "C" int fsync(int fd) {
 }
 
 extern "C" int syncfs(int fd) {
-    if (track_fsync.load(std::memory_order_relaxed))
-        syncfs_calls.fetch_add(1, std::memory_order_relaxed);
+    if (track_fsync.load(std::memory_order_relaxed)) {
+        const auto only = syncfs_only_inode.load(std::memory_order_relaxed);
+        struct stat target {};
+        if (!only || (::fstat(fd, &target) == 0 && target.st_ino == only))
+            syncfs_calls.fetch_add(1, std::memory_order_relaxed);
+    }
     return static_cast<int>(::syscall(SYS_syncfs, fd));
 }
 #endif

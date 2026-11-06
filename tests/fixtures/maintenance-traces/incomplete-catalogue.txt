@@ -4,8 +4,8 @@ step: started
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1
-  inventory = generation=2 live=0 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=0 control_live=0
+  inventory = generation=2 live=0 control_live=1 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=1
 step: catalogue item and a file added
   state: data_objects=1 data_claims=1 control_claims=2
   object claimed: held=1 claimed=1
@@ -13,24 +13,24 @@ step: catalogue item and a file added
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1
-  inventory = generation=5 live=1 control_live=2 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=1 control_live=2
+  inventory = generation=5 live=1 control_live=3 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=1 control_live=3
 step: catalogue root lost, file deleted
-  state: data_objects=1 data_claims=1 control_claims=2
+  state: data_objects=1 data_claims=1 control_claims=3
   object claimed: held=1 claimed=1
   claim-walk: control #1 not-restored
   control-gate-in-rebuilding-pass: shut
   gate.control = release_view=1 catalogue_complete=0 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=0 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=0; decided open when catalogue_complete=1
-  inventory = generation=6 live=0 control_live=1 garbage=1 stale_garbage=0 catalogue_complete=0
-  release-horizon = incomplete data_live=0 control_live=0
+  inventory = generation=6 live=0 control_live=3 garbage=1 stale_garbage=0 catalogue_complete=0
+  release-horizon = incomplete data_live=0 control_live=2
 step: past the grace
-  state: data_objects=1 data_claims=1 control_claims=2
+  state: data_objects=1 data_claims=1 control_claims=3
   object claimed: held=1 claimed=1
   control-gate-in-rebuilding-pass: shut
   gate.control = release_view=1 catalogue_complete=0 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=0 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=0; decided open when catalogue_complete=1
-  inventory = generation=6 live=0 control_live=1 garbage=1 stale_garbage=0 catalogue_complete=0
-  release-horizon = incomplete data_live=0 control_live=0
+  inventory = generation=6 live=0 control_live=3 garbage=1 stale_garbage=0 catalogue_complete=0
+  release-horizon = incomplete data_live=0 control_live=2

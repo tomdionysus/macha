@@ -201,6 +201,57 @@ MACHA_TEST("service_root", test_a_failed_startup_with_no_reason_still_says_it_fa
                    "server startup failed"});
 }
 
+// A node whose only disk is offline comes up and runs: its data plane is ready,
+// which is all recovery waits for, and says it is degraded. No stall, no restart.
+MACHA_TEST("service_root", test_a_node_whose_only_disk_is_offline_starts_and_says_so) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("no-disk");
+    const auto port = enable_api(config);
+    config.replication = 1;
+    config.metadata_write_copies = 1;
+    config.write_copies = 1;
+    config.storage_packing.threshold = 0;
+    config.storage_packing.target_size = 0;
+    config.metadata_store.path = cluster.path() / "no-disk.control";
+    // A directory no store will adopt: not empty, and no backend marker.
+    const auto disk = cluster.path() / "foreign-disk";
+    config.storage_backends = {{disk, 8ULL * 1024 * 1024, 0}};
+    std::filesystem::create_directories(disk / "objects");
+    std::ofstream(disk / "objects" / "foreign") << "not ours";
+    config.service_startup_no_progress = 5s;
+
+    std::atomic_bool stalled{};
+    Service service(config, cluster.keys(), test_durability_window, {}, {},
+                    [&](std::string_view) { stalled = true; });
+    service.start();
+    REQUIRE(wait_until([&] { return service.ready(); }, 60s));
+    CHECK(!stalled.load());
+    const auto readiness = service.node().readiness();
+    CHECK(readiness.data_storage_ready);
+    CHECK(!readiness.failed);
+    CHECK(wait_until([&] { return service.node().readiness().data_storage_degraded; }, 10s));
+    const auto status = http_request(port, "GET", "/api/v1/status", bearer_header(service));
+    CHECK(status.status == 200);
+    CHECK(status.has("data_storage_degraded"));
+    service.stop();
+}
+
+// With a disk online, or none configured, it is not degraded.
+MACHA_TEST("service_root", test_a_node_with_its_disk_online_is_not_degraded) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("with-disk");
+    config.replication = 1;
+    config.metadata_write_copies = 1;
+    config.write_copies = 1;
+    Service service(config, cluster.keys(), test_durability_window);
+    service.start();
+    REQUIRE(wait_until([&] { return service.ready(); }, 60s));
+    // Long enough for a refresh to have said how many are online.
+    std::this_thread::sleep_for(1500ms);
+    CHECK(!service.node().readiness().data_storage_degraded);
+    service.stop();
+}
+
 // A waiter that gives up before the control plane is online is told so.
 MACHA_TEST("service_root", test_a_stall_before_the_control_plane_names_it_starting) {
     TestCluster cluster(ConfigProfile::isolated);
@@ -548,9 +599,10 @@ MACHA_TEST("service_root", test_standing_conflicts_are_listed_and_resolved_over_
     catalogue.base_catalogue_root = current_root;
     catalogue.left_catalogue_root = earlier_root;
     const std::vector<MetadataConflict> standing{take_left, take_right, take_base, catalogue};
-    metadata.mutate([&](MetadataSnapshot& snapshot) {
+    metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
         for (const auto& conflict : standing)
             snapshot.conflicts.emplace(metadata_conflict_id(conflict), conflict);
+        delta.replace_conflicts = snapshot.conflicts;
     });
 
     // The list is a read.

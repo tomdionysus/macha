@@ -140,13 +140,12 @@ struct PersistedNodeStatus {
 };
 
 struct MetadataSnapshot {
-    // Legacy voter list: not authority, cleared on the first policy
-    // transition; kept in the SM10/DLT4 encoding so old state stays readable.
+    // Not authority, and no commit fills it: an SM14 slot, which a head's hash
+    // covers.
     std::vector<NodeId> metadata_voters;
     uint32_t data_replication{};
     uint64_t extent_size{};
-    // Durability floor under which this commit is valid. Zero means a legacy
-    // snapshot not yet transitioned.
+    // Durability floor under which this commit is valid. Zero only on genesis.
     uint32_t metadata_write_replicas_required{};
     // Roster used only while establishing retention claims for a legacy
     // namespace; never an authority list, cleared once the baseline completes.
@@ -171,14 +170,13 @@ struct MetadataSnapshot {
     // the legacy clock; none on a root set before that.
     MetadataDot catalogue_dot;
     std::optional<ObjectId> catalogue_root;
-    // SM14: the namespace tree root, carried instead of `entries`, never
-    // alongside; both encoders refuse the mix. See namespace_tree.hpp.
+    // The namespace tree root. A record carries this and never `entries`, which
+    // is the in-memory form of a tree merge and of founding. See namespace_tree.hpp.
     std::optional<ObjectId> namespace_root;
     std::map<std::string, FsEntry> entries;
-    // Tombstones held inline: an inline namespace's, and a tree-backed head's
-    // from before batches (moved into batches by maintenance).
+    // An SM14 slot no commit fills: tombstones live in batches.
     std::vector<GarbageRef> garbage;
-    // SM19: a tree-backed head's tombstones, by batch, sorted by id.
+    // SM19: the head's tombstones, by batch, sorted by id.
     std::vector<TombstoneBatch> tombstone_batches;
     // One coalesced last-known record per node; not a metrics history.
     std::map<NodeId, PersistedNodeStatus> node_status;
@@ -191,7 +189,7 @@ struct MetadataSnapshot {
     // Each conflict keeps its alternatives while the one its merge installed
     // stays in place; resolution is a later mutation.
     std::map<std::string, MetadataConflict, std::less<>> conflicts;
-    // Torrents requested for download, by request id (SM15/SM16).
+    // Torrents requested for download, by request id (SM16).
     std::map<std::string, TorrentRequest, std::less<>> torrent_requests;
 };
 // Immutable bytes with value semantics and shared storage, so copying a record
@@ -256,7 +254,7 @@ struct MetadataIdentity {
 };
 
 // Evidence a commit reached the write floor: `replicas` durably acknowledged
-// it. `required == 0` marks a migrated legacy checkpoint, authoritative itself.
+// it. `required == 0` is genesis on a founder, which names nobody.
 struct MetadataAcceptance {
     uint64_t generation{};
     Hash256 hash{};
@@ -351,8 +349,8 @@ struct MetadataDelta {
     // DLT11: tombstone batches named and dropped, sorted by id.
     std::vector<TombstoneBatch> add_tombstone_batches;
     std::vector<ObjectId> drop_tombstone_batches;
-    // Never encoded: the tombstones a mutation makes in a tree-backed head,
-    // each group one batch at its time. The commit writes each batch object
+    // Never encoded: the tombstones a mutation makes, each group one batch at
+    // its time. The commit writes each batch object
     // and names it (add_tombstone_batches). See retire_objects().
     struct PendingTombstones {
         // Retired when the commit writes the batch, or at `retired_at_ns`.
@@ -379,19 +377,17 @@ void record_entry_change(MetadataDelta& delta, const std::string& path, const Fs
                          const FsEntry& after);
 
 // Strictly ordered by ObjectId, no duplicates.
-// Retires `ids` in the mutation `snapshot` and `delta` describe. In a
-// tree-backed head they join the mutation's one pending batch (the commit
-// writes it and names it); in an inline namespace each gets an inline
-// tombstone, a held one re-stamped later than it was.
-void retire_objects(MetadataSnapshot&, MetadataDelta&, std::vector<ObjectId> ids);
-// Every tombstone `snapshot` holds, inline and in its batches (each read by
-// `read_batch`), the latest retirement per object, sorted by id. A batch that
+// Retires `ids` in the mutation `delta` describes: they join its one pending
+// batch, which the commit writes and names.
+void retire_objects(MetadataDelta&, std::vector<ObjectId> ids);
+// Every tombstone `snapshot` holds (each batch read by `read_batch`), the
+// latest retirement per object, sorted by id. A batch that
 // cannot be read is left out and counted in `unreadable`.
 std::vector<GarbageRef>
 tombstones_of(const MetadataSnapshot&,
               const std::function<std::optional<Bytes>(const ObjectId&)>& read_batch,
               size_t* unreadable = nullptr);
-// How many tombstones `snapshot` names, inline and in batches.
+// How many tombstones `snapshot` names.
 uint64_t tombstone_count(const MetadataSnapshot&) noexcept;
 bool garbage_is_canonical(const std::vector<GarbageRef>&);
 // Stable sort into canonical order.
@@ -411,7 +407,6 @@ const FsEntry& later_entry(const FsEntry&, const FsEntry&);
 // `lookup` reads the snapshot's namespace when it is not held as a map.
 using NamespaceLookup = std::function<std::optional<FsEntry>(const std::string& path)>;
 size_t prune_superseded_conflicts(MetadataSnapshot&, const NamespaceLookup& lookup = {});
-Bytes encode_snapshot(const MetadataSnapshot&);
 MetadataSnapshot decode_snapshot(std::span<const uint8_t>);
 // SM14: the non-entry fields plus `namespace_root`, so the payload size is
 // independent of the library. Requires `namespace_root` set and `entries`
@@ -521,13 +516,10 @@ class MetadataReplica {
         uint64_t bytes{};
     };
 
-    std::filesystem::path p_;
-    std::filesystem::path committed_p_;
     std::filesystem::path checkpoint_p_;
     std::filesystem::path journal_p_;
     std::filesystem::path history_p_;
     std::filesystem::path heads_p_;
-    std::filesystem::path mutation_sequence_p_;
     std::filesystem::path author_p_;
     // Present from the moment the head set is replaced until the next
     // mutation takes a new author id.
@@ -639,8 +631,6 @@ class MetadataReplica {
     std::optional<MetadataRecord> load(const std::filesystem::path&) const;
     // Construction calls the load_* functions and recover_from_seed() before the
     // replica is shared; the analysis does not check constructors.
-    void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {})
-        MACHA_REQUIRES(m_);
     void load_journal() MACHA_REQUIRES(m_);
     Bytes encode_history_frame(const MetadataHistoryEntry&) const;
     MetadataHistoryEntry read_history_entry(const HistoryIndexEntry&) const;
@@ -651,14 +641,12 @@ class MetadataReplica {
     void load_heads() MACHA_REQUIRES(m_);
     void persist_heads_locked() MACHA_REQUIRES(m_);
     void ensure_history_root(const MetadataRecord&) MACHA_REQUIRES(m_);
-    void migrate_legacy_head_locked() MACHA_REQUIRES(m_);
+    void adopt_committed_head_locked() MACHA_REQUIRES(m_);
     bool prune_accepted_heads_locked() MACHA_REQUIRES(m_);
     bool accepted_head_is_ancestor_locked(const Hash256&, const Hash256&) const MACHA_REQUIRES(m_);
     bool acceptance_matches_record_policy_locked(const MetadataAcceptance&,
                                                  const MetadataMaterialization&) const
         MACHA_REQUIRES(m_);
-    bool legacy_write_api_allowed_locked() const MACHA_REQUIRES(m_);
-    void set_legacy_committed_head_locked(const MetadataRecord&) MACHA_REQUIRES(m_);
     void refresh_materialized_head_locked() MACHA_REQUIRES(m_);
     // The head refreshed in memory; when the committed head moved, the journal
     // is emptied and the record returned for the caller to write as the
@@ -708,21 +696,6 @@ class MetadataReplica {
     // This node's author ids, the current one first.
     std::vector<NodeId> author_ids(const NodeId& node_id,
                                    const std::map<NodeId, uint64_t>& head_clock);
-    bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
-    bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
-    bool install_committed_delta(uint64_t, const Hash256&, std::span<const uint8_t>,
-                                 const MetadataRecord&);
-    // Installs `record` as the sole accepted committed head, quarantining the
-    // prior state as recover_from_seed does. Unlike a seed, this grants
-    // authority, which comes from the operator re-rooting every node onto the
-    // same converged record. Only correct offline, cluster stopped, on every
-    // node; `macha-namespace-migrate` is the only caller. `witnesses` becomes
-    // the certificate's replica list and must cover the write floor.
-    bool install_migrated_head(const MetadataRecord&, const std::vector<NodeId>& witnesses,
-                               const std::string& reason);
-    bool seed(const MetadataRecord&);
-    bool remember_committed(const MetadataRecord&);
-    bool remember_current_committed(uint64_t, const Hash256&);
     std::optional<MetadataHistoryEntry> history_entry(const Hash256&) const;
     std::optional<MetadataHistoryLinks> history_links(const Hash256&) const;
     // `hash` as a full-body entry, for a peer to re-anchor a head it cannot

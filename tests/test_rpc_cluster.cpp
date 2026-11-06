@@ -1002,6 +1002,67 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_o
     CHECK(bench.local.data().has(wanted));
 }
 
+// A settled pull is settled for the list it walked. A list that arrives after
+// an empty one, or after the last one was finished while the push still ran,
+// is walked by the step that first sees it.
+MACHA_FAST_TEST("rpc_cluster", test_the_repair_step_that_first_sees_a_new_pull_list_walks_it) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    peer.holds_everything = true;
+    const auto wanted_bytes = pattern(256 * 1024, 43);
+    const auto wanted = object_id(wanted_bytes);
+    peer.serves = wanted_bytes;
+
+    auto store = bench.store();
+    REQUIRE(store->should_own(wanted));
+    const auto budget = 64ULL * 1024 * 1024;
+    const std::vector<ObjectId> none;
+    const std::vector<ObjectId> named{wanted};
+    const auto step = [&](const std::vector<ObjectId>& pull, uint64_t version) {
+        return store->repair_step(budget, 16, std::nullopt, {}, 0, {}, std::span<const ObjectId>(pull), {},
+                                  std::span<const ObjectId>(none), version, 1);
+    };
+
+    bool settled = false;
+    for (int attempt = 0; attempt < 4 && !settled; ++attempt)
+        settled = step(none, 1).complete;
+    REQUIRE(settled);
+    const auto filled = step(named, 2);
+    CHECK(peer.fetches.load() == 1);
+    CHECK(bench.local.data().has(wanted));
+    CHECK(filled.pull_examined == 1);
+}
+
+MACHA_FAST_TEST("rpc_cluster", test_a_pull_list_new_while_the_push_runs_is_not_passed_over) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    peer.holds_everything = true;
+    const auto first_bytes = pattern(64 * 1024, 44);
+    const auto second_bytes = pattern(64 * 1024, 45);
+    const auto second = object_id(second_bytes);
+    peer.serves = second_bytes;
+    REQUIRE(bench.local.data().put(object_id(first_bytes), first_bytes));
+    // More to push than one step examines, so the first list's pull finishes
+    // while the pass is still open.
+    const auto pushing = local_objects(bench, 100, 4 * 1024, 60);
+
+    auto store = bench.store();
+    REQUIRE(store->should_own(second));
+    const auto budget = 64ULL * 1024 * 1024;
+    const std::vector<ObjectId> first_list{object_id(first_bytes)};
+    const std::vector<ObjectId> second_list{second};
+    const auto step = [&](const std::vector<ObjectId>& pull, uint64_t version) {
+        return store->repair_step(budget, 16, std::nullopt, {}, 0, {}, std::span<const ObjectId>(pull), {},
+                                  std::span<const ObjectId>(pushing), version, 1);
+    };
+
+    const auto opening = step(first_list, 1);
+    REQUIRE(!opening.complete);
+    (void)step(second_list, 2);
+    CHECK(peer.fetches.load() == 1);
+    CHECK(bench.local.data().has(second));
+}
+
 // The push cursor survives a new live-set generation and a restart (each
 // object passed again would cost a full read on the peer). With no
 // generation, a pass a different live set arrived part-way through is not
@@ -1266,9 +1327,6 @@ struct SurveyCountingView final : MetadataView {
     }
     std::optional<MetadataSnapshotView> release_head() const override { return view; }
     MetadataClusterStatus status() const noexcept override { return {}; }
-    MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t) override {
-        throw std::runtime_error("read-only view");
-    }
     MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>&,
                                 size_t, std::optional<MetadataMutationIdentity>) override {
         throw std::runtime_error("read-only view");
@@ -2981,7 +3039,8 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     node.membership().observe(phantom, true);
     REQUIRE(node.wait_local_state_ready(10s));
 
-    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    auto metadata_store = macha::test_support::distributed_store_for(node);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
     bool rejected = false;
     try {
         (void)metadata.snapshot_view();
@@ -3136,7 +3195,7 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
         }
     }));
 
-    MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server());
+    MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server(), s1.store());
     auto snapshot = m1.snapshot();
     CHECK(snapshot.metadata_voters.empty());
     CHECK(snapshot.data_replication == 2);
@@ -3558,19 +3617,21 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
 
     const auto base = s1.local_state().replica().committed();
     auto make_sibling = [&](Service& service, const std::string& path) {
-        auto snapshot = decode_snapshot(base.payload);
         FsEntry entry;
         entry.type = EntryType::directory;
         entry.mode = 0755;
         entry.uid = getuid();
         entry.gid = getgid();
-        snapshot.entries[path] = entry;
+        MetadataDelta delta;
+        delta.upsert_entries[path] = entry;
+        auto snapshot = macha::test_support::with_namespace_delta(
+            decode_snapshot(base.payload), service.local_state().control(), service.store(), delta);
         ++snapshot.mutation_sequences[service.node().node_id()];
 
         MetadataRecord sibling;
         sibling.generation = base.generation + 1;
         sibling.previous = base.hash;
-        sibling.payload = encode_snapshot(snapshot);
+        sibling.payload = encode_snapshot_v14(snapshot);
         sibling.hash = metadata_hash(sibling.generation, sibling.previous, sibling.payload);
         REQUIRE(service.local_state().replica().store_commit(sibling));
         MetadataAcceptance acceptance;
@@ -3648,7 +3709,9 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
         },
         10s));
 
-    // The first write after a reconciliation is a compact delta over the merge commit.
+    // The first write after a reconciliation extends the merge commit and does
+    // not carry its topology. Under a tree either body is compact; the store
+    // keeps the smaller.
     auto merge_heads = s1.local_state().replica().accepted_heads();
     REQUIRE(merge_heads.size() == 1);
     const auto merge_head = merge_heads.front();
@@ -3663,7 +3726,6 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     REQUIRE(after_entry.has_value());
     CHECK(after_entry->previous == merge_head.hash);
     CHECK(after_entry->merge_parents.empty());
-    CHECK(after_entry->body == MetadataHistoryEntry::Body::delta);
 
     s2.stop();
     s1.stop();
@@ -3681,7 +3743,8 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
 
-    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    auto metadata_store = macha::test_support::distributed_store_for(node);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
     const auto directory = [] {
         FsEntry entry;
         entry.type = EntryType::directory;
@@ -3690,25 +3753,27 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
         entry.gid = getgid();
         return entry;
     };
-    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/mine"] = directory(); });
+    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/mine"] = directory(); });
     const auto mine = node.metadata_replica().committed();
     REQUIRE(mine.generation > 1);
 
     // Another author's namespace, with nothing of this node's in its clock.
     const MetadataDot theirs{random_node_id(), 9};
-    auto foreign_snapshot = decode_snapshot(genesis_metadata().payload);
-    foreign_snapshot.metadata_write_replicas_required = 1;
-    foreign_snapshot.extent_size = decode_snapshot(mine.payload).extent_size;
-    foreign_snapshot.data_replication = decode_snapshot(mine.payload).data_replication;
-    foreign_snapshot.legacy_clock.emplace();
-    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
+    // Its namespace is this node's with "/mine" gone and "/theirs" added.
     auto made = directory();
     stamp_entry_provenance(made, "/theirs", nullptr, theirs);
-    foreign_snapshot.entries["/theirs"] = made;
+    MetadataDelta foreign_delta;
+    foreign_delta.erase_entries.push_back("/mine");
+    foreign_delta.upsert_entries["/theirs"] = made;
+    auto foreign_snapshot = macha::test_support::with_namespace_delta(
+        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store, foreign_delta);
+    foreign_snapshot.mutation_sequences.clear();
+    foreign_snapshot.legacy_clock.emplace();
+    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
     MetadataRecord foreign;
     foreign.generation = mine.generation + 7;
     foreign.previous = sha256(pattern(64, 201));
-    foreign.payload = encode_snapshot(foreign_snapshot);
+    foreign.payload = encode_snapshot_v14(foreign_snapshot);
     foreign.hash = metadata_hash(foreign.generation, foreign.previous, foreign.payload);
     REQUIRE(node.metadata_replica().store_commit(foreign));
     MetadataAcceptance acceptance;
@@ -3719,16 +3784,19 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     REQUIRE(node.metadata_server().accept_commit(acceptance));
     REQUIRE(node.metadata_replica().accepted_heads().size() == 2);
 
+    const auto holds = [&](const MetadataSnapshot& snapshot, std::string_view path) {
+        return macha::test_support::namespace_holds(snapshot, node.local_state().control(), *metadata_store, path);
+    };
     const auto merged = metadata.snapshot();
-    CHECK(merged.entries.contains("/mine"));
-    CHECK(merged.entries.contains("/theirs"));
+    CHECK(holds(merged, "/mine"));
+    CHECK(holds(merged, "/theirs"));
     CHECK(merged.mutation_sequences.at(theirs.author) == theirs.sequence);
     CHECK(node.metadata_replica().accepted_heads().size() == 1);
     CHECK(metadata.head_standing().set_aside == 0);
 
-    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/more"] = directory(); });
-    CHECK(metadata.snapshot().entries.contains("/theirs"));
-    CHECK(metadata.snapshot().entries.contains("/more"));
+    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/more"] = directory(); });
+    CHECK(holds(metadata.snapshot(), "/theirs"));
+    CHECK(holds(metadata.snapshot(), "/more"));
     node.stop();
 }
 
@@ -3821,34 +3889,39 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
         },
         10s));
 
-    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server());
+    auto metadata1_store = macha::test_support::distributed_store_for(n1);
+    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), *metadata1_store);
     // One mutation, so the siblings fork from a real post-genesis record.
-    metadata1.mutate([](MetadataSnapshot& snapshot) {
-        FsEntry entry;
-        entry.type = EntryType::directory;
-        entry.mode = 0755;
-        entry.uid = getuid();
-        entry.gid = getgid();
-        snapshot.entries["/base-concurrent"] = entry;
-    });
+    REQUIRE(macha::test_support::retry_while_not_ready([&] {
+        metadata1.mutate_delta([](MetadataSnapshot&, MetadataDelta& delta) {
+            FsEntry entry;
+            entry.type = EntryType::directory;
+            entry.mode = 0755;
+            entry.uid = getuid();
+            entry.gid = getgid();
+            delta.upsert_entries["/base-concurrent"] = entry;
+        });
+    }));
     REQUIRE(n1.metadata_replica().committed_generation() > 1);
 
     // A two-head divergence on node 1 alone, from a locally authored sibling.
     const auto base = n1.metadata_replica().committed();
     auto make_sibling = [&](BareNode& node, const std::string& path) {
-        auto snapshot = decode_snapshot(base.payload);
         FsEntry entry;
         entry.type = EntryType::directory;
         entry.mode = 0755;
         entry.uid = getuid();
         entry.gid = getgid();
-        snapshot.entries[path] = entry;
+        MetadataDelta delta;
+        delta.upsert_entries[path] = entry;
+        auto snapshot = macha::test_support::with_namespace_delta(
+            decode_snapshot(base.payload), node.local_state().control(), *metadata1_store, delta);
         ++snapshot.mutation_sequences[node.node_id()];
 
         MetadataRecord sibling;
         sibling.generation = base.generation + 1;
         sibling.previous = base.hash;
-        sibling.payload = encode_snapshot(snapshot);
+        sibling.payload = encode_snapshot_v14(snapshot);
         sibling.hash = metadata_hash(sibling.generation, sibling.previous, sibling.payload);
         REQUIRE(node.metadata_replica().store_commit(sibling));
         MetadataAcceptance acceptance;
@@ -4065,11 +4138,11 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     REQUIRE(heads.size() == 1);
     CHECK(heads.front().hash == final.hash);
     CHECK(s3->local_state().replica().history_contains(final.hash));
-    CHECK(s3->local_state().replica().history_is_ancestor(base.hash, final.hash));
 
+    // A tree-backed record names only its root, so the head stands alone: the
+    // replica takes it whole instead of replaying the burst.
     const auto transfer1 = s1.metadata_manager().history_transfer_diagnostics();
     const auto transfer2 = s2.metadata_manager().history_transfer_diagnostics();
-    CHECK(std::max(transfer1.peak_in_flight, transfer2.peak_in_flight) > 1);
     CHECK(std::max(transfer1.peak_in_flight, transfer2.peak_in_flight) <= 8);
 
     s3->stop();
@@ -4564,7 +4637,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
         // One accepted base everywhere before partitioning into two writable pairs.
         REQUIRE(retry_while_not_ready(
             [&] { s1.filesystem().mkdir("/base", 0755, getuid(), getgid()); }));
-        MetadataManager initial_repair(s1.node(), s1.local_state(), s1.metadata_server());
+        MetadataManager initial_repair(s1.node(), s1.local_state(), s1.metadata_server(), s1.store());
         // A round in which a reachable peer did not take the head says so and
         // is run again.
         REQUIRE(retry_while_not_ready([&] { initial_repair.repair_once(); }));
@@ -4644,7 +4717,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
             return active2.size() == 2 && active3.size() == 2;
         }));
 
-        MetadataManager reconcile(s2.node(), s2.local_state(), s2.metadata_server());
+        MetadataManager reconcile(s2.node(), s2.local_state(), s2.metadata_server(), s2.store());
         REQUIRE(wait_until(
             [&] {
                 try {
@@ -4738,7 +4811,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
 
         REQUIRE(wait_metadata_writable(s1));
         s1.filesystem().mkdir("/after-grow", 0755, getuid(), getgid());
-        MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server());
+        MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server(), s1.store());
         auto snapshot = m1.snapshot();
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 2);
@@ -4776,7 +4849,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
 
         REQUIRE(retry_while_not_ready(
             [&] { s2.filesystem().mkdir("/after-shrink", 0755, getuid(), getgid()); }));
-        MetadataManager m2(s2.node(), s2.local_state(), s2.metadata_server());
+        MetadataManager m2(s2.node(), s2.local_state(), s2.metadata_server(), s2.store());
         auto snapshot = m2.snapshot();
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 1);
@@ -4854,7 +4927,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     }));
 
     // One metadata pass makes node 2 a durable checkpoint witness first.
-    MetadataManager witness_repair(s2->node(), s2->local_state(), s2->metadata_server());
+    MetadataManager witness_repair(s2->node(), s2->local_state(), s2->metadata_server(), s2->store());
     witness_repair.repair_once();
     CHECK(s2->local_state().replica().committed().generation > 1);
 
@@ -6311,7 +6384,8 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
 
-    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    auto metadata_store = macha::test_support::distributed_store_for(node);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
     auto& replica = node.metadata_replica();
     const auto directory = [] {
         FsEntry entry;
@@ -6321,24 +6395,26 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
         entry.gid = getgid();
         return entry;
     };
-    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/mine"] = directory(); });
+    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/mine"] = directory(); });
     const auto mine = replica.committed();
 
     // Another author's head, which this node's clock does not cover.
     const MetadataDot theirs{random_node_id(), 9};
-    auto foreign_snapshot = decode_snapshot(genesis_metadata().payload);
-    foreign_snapshot.metadata_write_replicas_required = 1;
-    foreign_snapshot.extent_size = decode_snapshot(mine.payload).extent_size;
-    foreign_snapshot.data_replication = decode_snapshot(mine.payload).data_replication;
-    foreign_snapshot.legacy_clock.emplace();
-    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
+    // Its namespace is this node's with "/mine" gone and "/theirs" added.
     auto made = directory();
     stamp_entry_provenance(made, "/theirs", nullptr, theirs);
-    foreign_snapshot.entries["/theirs"] = made;
+    MetadataDelta foreign_delta;
+    foreign_delta.erase_entries.push_back("/mine");
+    foreign_delta.upsert_entries["/theirs"] = made;
+    auto foreign_snapshot = macha::test_support::with_namespace_delta(
+        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store, foreign_delta);
+    foreign_snapshot.mutation_sequences.clear();
+    foreign_snapshot.legacy_clock.emplace();
+    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
     MetadataRecord foreign;
     foreign.generation = mine.generation + 7;
     foreign.previous = sha256(pattern(64, 201));
-    foreign.payload = encode_snapshot(foreign_snapshot);
+    foreign.payload = encode_snapshot_v14(foreign_snapshot);
     foreign.hash = metadata_hash(foreign.generation, foreign.previous, foreign.payload);
     REQUIRE(replica.store_commit(foreign));
     MetadataAcceptance acceptance;
@@ -6355,14 +6431,17 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
     CHECK(replica.diagnostics().history_records == records);
     CHECK(replica.accepted_heads().size() == 2);
 
+    const auto holds = [&](const MetadataSnapshot& snapshot, std::string_view path) {
+        return macha::test_support::namespace_holds(snapshot, node.local_state().control(), *metadata_store, path);
+    };
     // Reading merges the two; the one head then becomes the root.
-    CHECK(metadata.snapshot().entries.contains("/theirs"));
+    CHECK(holds(metadata.snapshot(), "/theirs"));
     REQUIRE(replica.accepted_heads().size() == 1);
     metadata.truncate_history(1, 1);
     CHECK(replica.diagnostics().history_records == 1);
     const auto after = metadata.snapshot();
-    CHECK(after.entries.contains("/mine"));
-    CHECK(after.entries.contains("/theirs"));
+    CHECK(holds(after, "/mine"));
+    CHECK(holds(after, "/theirs"));
     node.stop();
 }
 

@@ -4,19 +4,19 @@ step: started
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1
-  inventory = generation=2 live=0 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=0 control_live=0
+  inventory = generation=2 live=0 control_live=1 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=1
 step: quiet window passed
   state: data_objects=0 data_claims=0 control_claims=0
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1
-  inventory = generation=2 live=0 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=0 control_live=0
+  inventory = generation=2 live=0 control_live=1 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=1
 step: back-off passed
   state: data_objects=0 data_claims=0 control_claims=0
   gate.control = release_view=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = release_view=1 catalogue_complete=1 live=1 generation_current=1; decided open when release_view=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = catalogue_complete=1; decided open when catalogue_complete=1
-  inventory = generation=2 live=0 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=0 control_live=0
+  inventory = generation=2 live=0 control_live=1 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=1

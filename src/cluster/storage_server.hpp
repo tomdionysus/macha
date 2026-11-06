@@ -61,6 +61,8 @@ class StorageServer {
     DataResourceArbiter& data_resources_;
     ActivityClocks& activity_;
     NodeEvents& events_;
+    // Touched by the constructor, then by the refresher alone.
+    uint32_t online_backends_{};
     MessageRoutes& routes_;
     const size_t extent_size_;
     const uint64_t cache_max_blocks_;

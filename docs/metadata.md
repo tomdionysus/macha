@@ -44,7 +44,7 @@ A node writes its mutations under an author id, which is its node id to begin wi
 A node keeps its author id, the sequences it has reserved and the highest it has had accepted in `<state_path>/metadata/author.meta`. It takes a new author id and starts again at 1 whenever it cannot show that its chain continues:
 
 - the head it is about to extend lacks a mutation it had accepted;
-- its head set was replaced by a recovery from the cache seed or by a re-root;
+- its head set was replaced by a recovery from the cache seed;
 - its author record is gone while a head shows that it authored before.
 
 Each head carries a clock, the highest sequence it has incorporated per author, and a legacy clock, the clock as it stood when the head's lineage first recorded provenance.
@@ -116,7 +116,7 @@ The overwhelming majority of a snapshot is the namespace entries themselves,
 and most of that is their extent tables; everything else is meant to be a
 rounding error. Three rules keep it that way:
 
-- **Tombstones** are held outside a tree-backed head: each mutation that
+- **Tombstones** are held outside the head: each mutation that
   retires objects writes one tombstone batch, an immutable control object
   holding every object it retired (sorted) at one retirement time, and the
   head names its batches (SM19: id, retirement time and count, 44 bytes a
@@ -126,11 +126,7 @@ rounding error. Three rules keep it that way:
   once `maintenance.garbage_grace_ms` has passed since its retirement, as its
   tombstones retire together. A tombstone made stale by its content being
   written again drops its batch at once, and the rest of the batch is written
-  again at its own retirement time. An inline namespace keeps its tombstones in
-  the snapshot (`garbage`, in canonical ObjectId order, DLT7), erased after
-  the same grace; a tree-backed head migrated from one has its inline
-  tombstones moved into batches by maintenance, an hour of retirements to a
-  batch at the hour's latest.
+  again at its own retirement time.
 - **Conflicts** leave the snapshot when decided: a later write to (or
   removal of) the conflicted path, or a later catalogue root, supersedes the
   record at the next commit and at every merge; an operator can also resolve
@@ -143,19 +139,14 @@ rounding error. Three rules keep it that way:
   is a few hundred bytes of history on each replica.
 
 `macha-metadata-dump <key> history.log heads.meta --stats` prints the
-composition of each accepted head (entries, extents, tombstones, conflicts,
-and the encoded bytes each accounts for). Read it before concluding that a
-snapshot is large for a reason other than the library being large. For a
-tree-backed head it reports the record and, given `--objects <path>`, the
+composition of each accepted head's record and, given `--objects <path>`, the
 tree's shape.
 
 ## The namespace tree
 
-A metadata record either inlines the namespace as an entry map or, once the
-node has been re-rooted with `macha-namespace-migrate` (see the operations
-guide), carries a 32-byte `namespace_root` addressing a content-addressed
-Merkle tree keyed by path, and never both. A cluster founds in the inline
-form; a tree-backed node stays tree-backed.
+A namespace is a content-addressed Merkle tree keyed by path from its first
+commit: the metadata record carries a 32-byte `namespace_root` and no entry
+map, so no record, replay or checkpoint grows with the library.
 
 - Tree nodes live in the control object store and follow the CONTROL rules:
   a commit may reference a new root once this node holds every tree node it
@@ -166,22 +157,22 @@ form; a tree-backed node stays tree-backed.
   branches above it. Large extent lists live in their own spine, so a stat
   reads at most the tree's depth and fetches no extent node.
 - "Has the namespace changed" is a root comparison.
-- History replay rebuilds a tree-backed head locally without asking a peer.
-- Reconciliation of two tree-backed heads merges what differs between the
-  two trees. When one head is still inline, both are materialised, merged
-  path by path and the result re-rooted.
+- History replay rebuilds a head locally without asking a peer.
+- Reconciliation merges what differs between the two trees.
 - An entry with provenance sets a bit in its type byte and is followed by
-  the provenance; an entry without provenance is encoded as it always was,
-  in a tree leaf and in an inline map alike.
+  the provenance.
+- Genesis is a fixed constant holding no tree, and reads as an empty root
+  directory until the first commit. A founder builds the root directory itself,
+  and the first commit carries the first root.
 
 ## Torrent requests
 
-A snapshot also carries `torrent_requests`: the torrents the cluster has been asked to download, one record per request, with who has claimed it, what the operator wants and how far it has got (see the acquisition guide). SM15 is the SM13 layout with every section present followed by the requests; SM16 is SM14 followed by the requests; DLT9 is DLT8 followed by the requests a mutation rewrote and the tombstones it erased. SM15, SM16 and DLT9 are written only by a head with torrent requests and no legacy clock; a head with a legacy clock writes SM17 or SM18, and DLT10 where a mutation carries a dot. A tree-backed head that names tombstone batches is written as SM19 whatever its clock, and its deltas as DLT11.
+A snapshot also carries `torrent_requests`: the torrents the cluster has been asked to download, one record per request, with who has claimed it, what the operator wants and how far it has got (see the acquisition guide). SM16 is SM14 followed by the requests; DLT9 is DLT8 followed by the requests a mutation rewrote and the tombstones it erased. SM16 and DLT9 are written only by a head with torrent requests and no legacy clock; a head with a legacy clock writes SM17, and DLT10 where a mutation carries a dot. A head that names tombstone batches is written as SM19 whatever its clock, and its deltas as DLT11.
 
 Reconciliation joins the collection per request instead of recording conflicts: every field has a deterministic merge (cancel is final; a later claim epoch wins; within one epoch a request never moves backwards; removal wins), so the merge is commutative, associative and idempotent and never needs an operator. Removed requests stay as tombstones for seven days so a branch that has not seen the removal cannot bring one back.
 
-SM17, SM18, SM19, DLT10 and DLT11 belong to cluster protocol 23, which every node in the cluster must run.
+SM17, SM19, DLT10 and DLT11 belong to cluster protocol 23, which every node in the cluster must run.
 
 ## Clocks and dots in the encodings
 
-SM17 is SM16 (tree-backed) and SM18 is SM15 (inline map), each followed by the legacy clock and the catalogue root's dot. DLT10 is DLT9 with the dot of each append, the legacy clock when a mutation first sets it, and the catalogue root's dot when a mutation moves the root. A head that carries a legacy clock is written as SM17 or SM18, with or without torrent requests, unless it names tombstone batches (SM19); a delta is written as DLT10 only when it carries one of those values. A conflict record notes which alternative is in place.
+SM17 is SM16 followed by the legacy clock and the catalogue root's dot. DLT10 is DLT9 with the dot of each append, the legacy clock when a mutation first sets it, and the catalogue root's dot when a mutation moves the root. A head that carries a legacy clock is written as SM17, with or without torrent requests, unless it names tombstone batches (SM19); a delta is written as DLT10 only when it carries one of those values. A conflict record notes which alternative is in place.

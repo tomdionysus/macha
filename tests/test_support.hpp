@@ -9,6 +9,8 @@
 #include "ledger/retention_ledger.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "metadata/metadata_manager.hpp"
+#include "metadata/namespace_control_store.hpp"
+#include "metadata/namespace_tree.hpp"
 #include "service/service.hpp"
 #include "supervised.hpp"
 #include "test_framework.hpp"
@@ -60,6 +62,78 @@ inline CatalogueMaintenance maintenance_inventory(CatalogueManager& catalogue) {
     } catch (...) {
     }
     return catalogue.maintenance_objects(head);
+}
+
+// One node store behind every record a test builds, so a record's root can be
+// read back. Locked: a test's replica may apply a delta on another thread.
+class TestNamespaceNodes final : public NamespaceNodeStore {
+  public:
+    ObjectId put(std::span<const uint8_t> node) override {
+        std::lock_guard lock(mutex_);
+        return nodes_.put(node);
+    }
+    std::optional<Bytes> get(const ObjectId& id) const override {
+        std::lock_guard lock(mutex_);
+        return nodes_.get(id);
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    MemoryNamespaceNodeStore nodes_;
+};
+
+inline TestNamespaceNodes& test_namespace_nodes() {
+    static TestNamespaceNodes nodes;
+    return nodes;
+}
+
+inline NamespaceDeltaApplier test_namespace_applier() {
+    return [](const ObjectId& root, const MetadataDelta& delta) {
+        return apply_delta_to_namespace_tree(root, test_namespace_nodes(), delta);
+    };
+}
+
+// A replica that replays delta bodies against the test store.
+class TestReplica : public MetadataReplica {
+  public:
+    TestReplica(std::filesystem::path path, std::array<uint8_t, 32> key,
+                std::optional<MetadataRecord> seed = {}, bool founder = true,
+                uint64_t cache_bytes = 128ULL * 1024 * 1024)
+        : MetadataReplica(std::move(path), key, std::move(seed), founder, cache_bytes,
+                          test_namespace_applier()) {}
+};
+
+// The working form of a freshly founded namespace.
+inline MetadataSnapshot founded_snapshot() {
+    MetadataSnapshot snapshot;
+    FsEntry root;
+    root.type = EntryType::directory;
+    root.mode = 0755;
+    root.ctime_ns = root.mtime_ns = 1;
+    snapshot.entries["/"] = root;
+    snapshot.metadata_write_replicas_required = 1;
+    return snapshot;
+}
+
+// A record's payload for a working snapshot: its namespace goes into the test
+// store. A snapshot with no write floor gets the lowest there is.
+inline Bytes tree_payload(MetadataSnapshot snapshot) {
+    if (!snapshot.metadata_write_replicas_required)
+        snapshot.metadata_write_replicas_required = 1;
+    if (!snapshot.namespace_root)
+        snapshot = detach_namespace(std::move(snapshot), test_namespace_nodes());
+    return encode_snapshot_v14(snapshot);
+}
+
+// A record's snapshot in working form, for a test to change and encode again.
+inline MetadataSnapshot map_snapshot(std::span<const uint8_t> payload) {
+    const auto& genesis = genesis_metadata().payload;
+    if (std::equal(payload.begin(), payload.end(), genesis.begin(), genesis.end()))
+        return founded_snapshot();
+    auto snapshot = decode_snapshot(payload);
+    if (snapshot.namespace_root && test_namespace_nodes().get(*snapshot.namespace_root))
+        return attach_namespace(std::move(snapshot), test_namespace_nodes());
+    return snapshot;
 }
 
 using namespace std::chrono_literals;
@@ -421,6 +495,31 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     std::unique_ptr<RetentionLedger> ledger_;
 };
 
+// A DistributedStore over a bare node's own parts, built as Service builds
+// one: what a MetadataManager the test constructs keeps its namespace tree in.
+inline std::unique_ptr<DistributedStore> distributed_store_for(BareNode& node) {
+    return std::make_unique<DistributedStore>(node, node.local_state(), node.resources.activity,
+                                              node.resources.data, node.resources.memory,
+                                              node.resources.events);
+}
+
+// `snapshot` with `delta` applied to its namespace tree, the new nodes written
+// to `control`: a head built outside any manager, such as a
+// sibling or another author's history.
+inline MetadataSnapshot with_namespace_delta(MetadataSnapshot snapshot, LocalStore& control,
+                                             DistributedStore& store, const MetadataDelta& delta) {
+    auto nodes = ControlNamespaceNodeStore::for_commit(control, store);
+    snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root, nodes, delta);
+    return snapshot;
+}
+
+// Whether `snapshot`'s namespace holds `path`, read through `control`.
+inline bool namespace_holds(const MetadataSnapshot& snapshot, LocalStore& control,
+                            DistributedStore& store, std::string_view path) {
+    const auto nodes = ControlNamespaceNodeStore::for_reading(control, store);
+    return namespace_entry(snapshot, &nodes, path).has_value();
+}
+
 class TestNode {
     TempDir temp_;
     std::filesystem::path keyfile_;
@@ -495,7 +594,7 @@ class TestNode {
                                                         node_->resources.data,
                                                         node_->resources.memory, node_->resources.events);
             metadata_ = std::make_unique<MetadataManager>(
-                *node_, node_->local_state(), node_->metadata_server(), nullptr,
+                *node_, node_->local_state(), node_->metadata_server(), *store_,
                 MetadataPublicationRetention{
                     [this](const MetadataPublicationContext& context) {
                         if (publication_guard_)

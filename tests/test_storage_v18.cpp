@@ -608,12 +608,82 @@ MACHA_TEST("storage_v18", test_unversioned_state_is_refused) {
         node.stop();
     }
 }
+// What a store throws says which it was: ObjectCorrupt for a record that read
+// and did not open, anything else for a read that did not finish.
+MACHA_TEST("storage_v18", test_a_store_tells_a_bad_record_from_a_failed_read) {
+    TempDir t;
+    const auto key = storage_key(t);
+    const auto throws_corrupt = [](LocalStore& store, const ObjectId& id) {
+        try {
+            (void)store.get(id);
+        } catch (const ObjectCorrupt&) {
+            return true;
+        } catch (const std::exception&) {
+        }
+        return false;
+    };
+    const auto fails_plainly = [](LocalStore& store, const ObjectId& id) {
+        try {
+            (void)store.get(id);
+        } catch (const ObjectCorrupt&) {
+            return false;
+        } catch (const std::exception&) {
+            return true;
+        }
+        return false;
+    };
+    {
+        LocalStore packed(t.path() / "packed", packed_options(64ULL * 1024 * 1024, 16ULL * 1024 * 1024), key);
+        const auto first = pattern(16 * 1024, 1);
+        const auto last = pattern(16 * 1024, 2);
+        REQUIRE(packed.put(object_id(first), first));
+        REQUIRE(packed.put(object_id(last), last));
+        REQUIRE(packed.is_packed(object_id(first)));
+        REQUIRE(packed.is_packed(object_id(last)));
+        const auto pack = only_pack(t.path() / "packed");
+        // The first record's payload starts past its header; flip a byte in
+        // the middle of it. The last record's tail is cut off.
+        {
+            std::fstream file(pack, std::ios::in | std::ios::out | std::ios::binary);
+            file.seekg(8 * 1024);
+            char byte{};
+            file.read(&byte, 1);
+            byte ^= 0x5a;
+            file.seekp(8 * 1024);
+            file.write(&byte, 1);
+            REQUIRE(file.good());
+        }
+        std::filesystem::resize_file(pack, std::filesystem::file_size(pack) - 1024);
+        CHECK(throws_corrupt(packed, object_id(first)));
+        CHECK(fails_plainly(packed, object_id(last)));
+    }
+    {
+        LocalStoreOptions options;
+        options.limit = 64ULL * 1024 * 1024;
+        LocalStore loose(t.path() / "loose", options, key);
+        const auto corrupt = pattern(16 * 1024, 3);
+        const auto torn = pattern(16 * 1024, 4);
+        const auto unreadable = pattern(16 * 1024, 5);
+        for (const auto* bytes : {&corrupt, &torn, &unreadable})
+            REQUIRE(loose.put(object_id(*bytes), *bytes));
+        corrupt_object(t.path() / "loose", object_id(corrupt));
+        std::filesystem::resize_file(object_path(t.path() / "loose", object_id(torn)), 8);
+        const auto path = object_path(t.path() / "loose", object_id(unreadable));
+        REQUIRE(std::filesystem::remove(path));
+        REQUIRE(std::filesystem::create_directory(path));
+        CHECK(throws_corrupt(loose, object_id(corrupt)));
+        CHECK(throws_corrupt(loose, object_id(torn)));
+        CHECK(fails_plainly(loose, object_id(unreadable)));
+    }
+}
+
 namespace {
 class StorageClusterNode {
     Config config_;
     const ClusterKeys& keys_;
     std::unique_ptr<BareNode> node_;
     std::unique_ptr<DistributedStore> store_;
+    std::unique_ptr<DistributedStore> metadata_store_;
     std::unique_ptr<MetadataManager> metadata_;
     std::unique_ptr<CatalogueManager> catalogue_;
     bool started_{};
@@ -642,7 +712,8 @@ class StorageClusterNode {
         REQUIRE(node_->wait_local_state_ready(10s));
         store_ = std::make_unique<DistributedStore>(*node_, node_->local_state(), node_->resources.activity,
                                                     node_->resources.data, node_->resources.memory, node_->resources.events);
-        metadata_ = std::make_unique<MetadataManager>(*node_, node_->local_state(), node_->metadata_server());
+        metadata_store_ = macha::test_support::distributed_store_for(*node_);
+        metadata_ = std::make_unique<MetadataManager>(*node_, node_->local_state(), node_->metadata_server(), *metadata_store_);
         catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->local_state(), node_->metadata_server(), *store_, *metadata_, node_->ledger());
     }
     // A process restart in miniature: a fresh NodeRuntime over the same
@@ -1349,7 +1420,18 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
             return false;
         }
     }, 10s));
+    // The namespace tree's nodes are CONTROL objects too, but namespace repair
+    // restores them, not the catalogue's.
+    std::vector<ObjectId> tree;
+    {
+        const auto reader = ControlNamespaceNodeStore::for_reading(a.node().control_store(), a.store());
+        for_each_namespace_entry(a.metadata().snapshot(), &reader,
+                                 [](const std::string&, const FsEntry&) {}, tree);
+    }
     auto referenced = a.node().control_store().list();
+    std::erase_if(referenced, [&](const ObjectId& id) {
+        return std::find(tree.begin(), tree.end(), id) != tree.end();
+    });
     REQUIRE(referenced.size() >= 2);
     REQUIRE(std::find(referenced.begin(), referenced.end(), root) != referenced.end());
 

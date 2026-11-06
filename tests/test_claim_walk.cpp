@@ -3,6 +3,7 @@
 // RetentionLedger is checked against the RetentionStore it pages; ClaimWalk is
 // checked step by step against a reference walk over fakes, for every held
 // pattern and every credit limit that reaches a different decision.
+#include "contract/claim_store.hpp"
 #include "crypto.hpp"
 #include "service/claim_walk.hpp"
 #include "ledger/retention_ledger.hpp"
@@ -34,6 +35,21 @@ struct FakeStore final : ObjectStore {
         return objects.contains(id);
     }
 };
+
+// Two deletes of one id: the mark lasts until the last of them lets go.
+MACHA_FAST_TEST("claim_walk", test_a_delete_mark_lasts_until_the_last_delete_of_the_id_ends) {
+    ClaimLocks locks;
+    const auto id = id_of(7);
+    CHECK(!locks.deleting(id));
+    std::optional<ClaimDeletion> first(locks.begin_deleting(id));
+    {
+        auto second = locks.begin_deleting(id);
+        CHECK(locks.deleting(id));
+    }
+    CHECK(locks.deleting(id));
+    first.reset();
+    CHECK(!locks.deleting(id));
+}
 
 // Claim counts 0..9 (every third released, so the ledger must skip entries) and
 // page bounds 1..10: each live claim comes once, in order, pages stay within
