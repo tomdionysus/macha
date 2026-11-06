@@ -37,17 +37,75 @@ with a wake when a disk comes back; whether it stalled fi-1 a month ago is not s
 loss: Macha has never run on either library. **Read
 [`2026-11-06-port-readiness.md`](2026-11-06-port-readiness.md) first**: the answer by requirement, the
 seams nobody owns (custody is a blocker), the proposed plan, and five decisions for the operator.
+**Afternoon ruling:** both libraries answered "yes with amendments" and a bounded claim; the operator
+rejected it: "development will continue on them with macha code frozen until they can answer Yes
+unconditionally, the entire reason for their existence is this." Their amendments are their own work
+lists now, recorded in that file; the cross points between them are settled there too.
 
 **Next:**
 1. **The operator's five decisions** in that document. Nothing past the baselines is agreed until then.
-2. **Pi baselines** on 0.93.4, with the version recorded, once the TV import has finished (operator
-   cleared 2026-11-06; what to measure: evaluation section 6, item 4). Not started. Nothing is watching
-   for the job's end: check it first. At 14:17Z job b2bf6286 reported `importing`, 7565 of 7565, 0
-   failed: all copied, one thread re-submitting hints (`BACKLOG.md`, Import). Record
+2. **Pi baselines** on 0.93.4, with the version recorded (operator cleared 2026-11-06; what to
+   measure: evaluation section 6, item 4, plus the two libraries' lists in the readiness file). Not
+   started, and no longer waiting: the TV import was killed at the operator's word at 15:47Z. Record
    `throttled=0x50000` on both Pis with the figures.
+   **The kill, for the record:** all 7565 files had copied, 0 failed. `cancel` set the job `cancelled`
+   on disk but did not stop its worker: `enqueue_catalogue_hints` (`ingest.cpp:1270`) checks neither
+   cancel nor stop, and kept rewriting the 5 MB `hints.json`. macnessa was restarted at 15:51Z, writable
+   in about 70 s, job still cancelled, no hint writes since. Stop's stacks:
+   `/root/macha-stop-20261106T155059Z.stacks` on the node. Files are in the namespace; hints not yet
+   submitted were not, so some may not be catalogued. A defect under the freeze, not fixed.
 3. Artefacts for the libraries are cut at 0.93.4: `build/macha-fixtures/goldens-0.93.4/` and
-   `state-scratch-0.93.4/`. When heads S3 and S7 start, Dagda will ask by name for a head ending in a
-   delta, a merge and a tombstone batch. Dannan's arm64 results: `build/dannan-arm64-415c6c4/`.
+   `state-scratch-0.93.4/`. Dannan's arm64 results: `build/dannan-arm64-415c6c4/`.
+   **Cut for Dagda's heads, 2026-11-06**, under `build/macha-fixtures/`, each with a README:
+   `tree-vectors-0.93.4/`; `state-scratch-0.93.4-branch/`, `-delete/`, `-markers/`, `-truncated/`,
+   `-seed/`, `-recovery/`, `-twoheads/`, from `gen/state_scenarios.py`, on the MacBook. `set-aside.meta`
+   is not reached. No `journal-frames`: 0.93.4 only ever
+   writes `journal.log` empty. `-torrent/` is owed when S7 starts: torrent stays through the port, and
+   the laptop has no torrent plugin, so it is cut on a node. `macha-metadata-dump`'s `tombstones=`
+   counts `garbage`, not `tombstone_batches`, so it reads 0 on heads with batches.
+   **Found by Dagda's S3 reading `metadata.cpp` at 9a08846, checked by the Macha session by reading,
+   nothing run, for the operator under the freeze:** (1) History tail cut: **fixed on the operator's
+   word as a freeze exception, 0.93.5, on develop, tests green on the laptop only** (70 of 70
+   `storage_metadata`). Not gated on macnessa, not tagged, not deployed: the nodes stay on 0.93.4.
+   Dagda has the new behaviour; Dannan's layer does not move. (2) `reanchor_history` (`:3523`) erases without subtracting
+   bytes, but `:3505` returns first when the entry is materialised, so no way to reach it was found.
+   (3) Journal PREPARE then COMMIT: unreachable, `journal.log` is 0 bytes on both nodes.
+   `macha-metadata-dump` aborts on a state with no `heads.meta`.
+   **Dagda's findings from reading 9a08846, for the operator under the freeze, not fixes:** nothing
+   writes `journal.log` now, so `compact()`'s thresholds and `pending_history_` act only on old
+   frames; `set-aside.meta` is plain, no magic or seal; a corrupt `author.meta` throws out of
+   `reserve_mutation_dot` and stops every write with no recovery path (against the self-heal rule);
+   replay compares exception text (`metadata.cpp:2302`, `:2627`; against "never match English
+   text"); a policy commit under the mutation lock may hold it through a peer's stall window,
+   `write_stall`'s bound untraced; comments differing from code at `metadata_manager.cpp:1151-1153`,
+   `:1449-1450`, `maintenance.cpp:158-159`, `metadata.hpp:78-79`, `docs/metadata.md:71` against
+   `metadata_manager.cpp:1255`; `test_metadata_seed_sibling_replays_after_restart` retired at
+   18f0c4b was the proof of the preferred-head rule, which now has no named Macha case (Dagda
+   writes one).
+
+**macnessa SIGSEGV, 2026-11-06 17:18:05Z, on 0.93.4, during the mount write baseline, cause not
+found:** thread `macha-rpc-data`, inside `malloc`, called from `file_json` in
+`IngestManager::handle_jobs_query` serving a peer's request. A fault inside `malloc` points to the heap
+being damaged earlier, so this stack is likely where it surfaced, not what did it; not shown. Heap
+corruption is on the reopen-on-sight list. Core: `/mnt/diskB/crash/core.macha-rpc-data.6139.1793985485`
+(holds keys and plaintext), read against `/root/macha-0.93.4.tgz`'s version. systemd restarted it.
+**Again at 17:34:28Z**, same libc instruction (`libc+0x939b4`, level 2 translation fault), thread
+`macha-maint`, inside `malloc`, from `ObjectTrie::decode` under `StoragePool::held_view`, 5 minutes
+into a process, while the baseline deleted its scratch files from the mount. Core
+`core.macha-maint.9769.1793986467`. Two unrelated callers at one instruction fits a damaged heap; the
+writer that damaged it is not found. inverbeg ran the same workload without a crash.
+**Again at 17:45:49Z**, SIGABRT, journal `corrupted double-linked list (not small)`, in `malloc` under
+`file_json` again, core `core.macha-rpc-data.10116.1793987140`. Both write passes died in the phase of
+200 fsynced 64 KiB files on the mount, after 1 and 2 of 5 runs.
+**Again at 18:11:09Z**, SIGABRT, same message, thread `macha-catalogue`, in `malloc` under `hint_json` in
+`CatalogueHintQueue::save_state_locked`, core `core.macha-catalogue.12003.1793988660`, in a process that
+never ran the small-file phase. So that phase is not the only way to it. Four crashes in 53 minutes
+after none from 12:18Z to 17:18Z. Three of the four stacks are building the large job or hint JSON,
+macnessa's alone. **Left until after the port (operator, 2026-11-06).** `ls /mnt/machamedia` also timed out
+twice, about 20 and 3 minutes after a restart, then answered in ms: not looked into.
+**TODO (operator, 2026-11-06): `rm` in the FUSE mount with a filter can crash macha.** Not yet
+reproduced by this session; the 17:34 crash came during a recursive delete from the mount, which may
+or may not be the same thing.
 
 **Waiting on the operator:** the media-kind import hint and what to do with the running TV job,
 which still has files bound for `/Movies`; truncated pack records, which stay counted read
@@ -86,10 +144,10 @@ confirmed, Pi and real IGD work held.
 
 ## Rulings, 2026-11-05 (the operator, asked one by one; "via Dagda" = reported by it)
 
-- **The ready gate**: "When we have done another independent review and are satisfied that
-  Macha can migrate to use Dannan and Dagda with no loss of functionality, performance,
-  reliabiliy, or data." Run by the Dannan and Dagda sessions after a clear (operator, 2026-11-06: "by fresh agents I meant the library agents, after a clear"), from the code and the nodes only, no notes or
-  plans, once old-code removal, 0.93.4, the baselines and the libraries' work are done.
+- **The ready gate** (replaced 2026-11-06, see "The port's order" in
+  `2026-11-06-port-readiness.md`): the Macha session is the review. Both libraries finish all tasks
+  and report their capabilities; when this session is satisfied Macha can be ported with no loss of
+  functionality, it builds the port with both libraries frozen.
 - **Design defects** (torrent merge associativity, no fence under a torrent claim, the local barrier's
   deadline, the sweep's mixed ages, the policy loop, O(state) per delta, wire-sized allocations, reload
   and `write_copies`, I/O and free-space reserves): left. "leave them, we need to get on with this."
