@@ -12,7 +12,7 @@ genuine Macha defect is fixed in Macha first and the libraries match the fix.
 | A damaged `history.log` length word read as a torn tail, so opening a node cut every later intact frame; a length over 2 GiB sent the node to seed recovery (found by Dagda's S3 reading) | 0.93.5: a frame that does not authenticate means scanning for the next one that does (`9153011`) | develop, pushed; laptop tests only (71 of 71 `storage_metadata`); not tagged, not on the nodes |
 | A failed read in that scan, or in the main loop, also cut good frames (found by Dagda mirroring the fix) | A failed read cuts nothing; unread frames are read at the next open (`98b816d`) | as above; the scan's failure has a case, the main loop's is by reading (Dagda tested it in its copy) |
 | macnessa's control store full (below) | `storage.metadata.limit` 4G to 8G on both nodes, operator, 2026-11-08 | live; config backups `/etc/macha/macha.yaml.pre-8g-*` |
-| Repair credit-limited to a tenth of the link (below) | `maintenance.idle_bandwidth_fraction` 0.10 to 0.5 on both nodes, operator, 2026-11-08 | live; backups `.pre-fraction-*`; the new rate not yet measured |
+| Repair credit-limited to a tenth of the link (below) | `maintenance.idle_bandwidth_fraction` 0.10 to 0.5 on both nodes, operator, 2026-11-08 | live; backups `.pre-fraction-*`; measured 13:20Z: 3.6 to 3.9 MB/s each way, against 0.44 (`build/baselines/repair3-*.txt`) |
 
 ## Macha, open, after the freeze
 
@@ -22,9 +22,8 @@ Ordered by what they cost a user.
    inside `malloc`: two SIGSEGV at one libc instruction, two SIGABRT with `corrupted double-linked list (not
    small)`. Three of four came seconds after a recursive delete through the FUSE mount; three of four stacks
    were building the large ingest-job or catalogue-hint JSON, which only macnessa holds. inverbeg ran the same
-   workload without a crash. macnessa had about nine times inverbeg's undervoltage events. Cores in
-   `/mnt/diskB/crash` (`core.macha-rpc-data.6139.*`, `core.macha-maint.9769.*`, `core.macha-rpc-data.10116.*`,
-   `core.macha-catalogue.12003.*`; they hold keys and plaintext). **Operator: left until after the port**, and
+   workload without a crash. macnessa had about nine times inverbeg's undervoltage events. The cores were deleted
+   on the operator's word, 2026-11-08; their stacks had been read; capture stays on. **Operator: left until after the port**, and
    attributed to undervoltage or to the FUSE crashes. The reproducer to try then: 200 small files written and
    deleted through macnessa's mount, repeated, under an ASan build.
 2. **`rm` in the FUSE mount with a filter can crash macha** (operator's report, 2026-11-06). Not reproduced
@@ -72,7 +71,12 @@ Ordered by what they cost a user.
     reads; rpc:3212 can flake to a third run; two weak cases in `test_namespace_tree.cpp` (lines 218, 746).
     `storage_v18/test_retain_data_batches_a_large_publication_within_bounded_time` exceeds its 120 s bound with
     its temporary directory on macnessa's USB disk.
-14. **Seen, not looked into:** `ls /mnt/machamedia` timed out twice shortly after a restart, then answered in ms;
+14. **A telemetry demand can be lost for one interval** (read, found through Dannan's `7b8b35f`):
+    `NodeRuntime::signal_telemetry_refresh` (`cluster.cpp:958`) notifies without `telemetry_wait_mutex_`, so a
+    demand made between the loop's predicate test and its wait (`cluster.cpp:999-1002`) waits for the next
+    `telemetry_interval`. Fix: take and release the wait mutex before notifying, as Dannan's `wake_loops`. The
+    connectivity loop has no such race. Macha's other ~180 notify sites are not audited.
+15. **Seen, not looked into:** `ls /mnt/machamedia` timed out twice shortly after a restart, then answered in ms;
     remux `playback_pipeline_start_failed` ("timed out waiting for first fragmented-MP4 segment") 3 of 13 attempts
     on inverbeg, 1 of 13 on macnessa, during the baselines.
 
@@ -81,9 +85,8 @@ Ordered by what they cost a user.
 - **Replication is slow by policy, not stalled.** Repair's credit is `bandwidth x idle_bandwidth_fraction x
   cpu_scale` (`maintenance.cpp:437`): measured 0.43 MB/s from macnessa and 0.64 MB/s from inverbeg against a
   link estimated at 8 to 9 MB/s, with macnessa's `cpu_scale` about halved by item 3's retry loop. inverbeg held
-  1.68 TB to macnessa's 6.3 TB on 2026-11-08. Raised to 0.5 that day; the new rate is to be measured
-  (`build/baselines/repair3-*.txt`, then `probe_repair.py` again). A viewer on either node still paces repair to
-  its 5% share.
+  1.68 TB to macnessa's 6.3 TB on 2026-11-08. Raised to 0.5 that day: 3.6 to 3.9 MB/s measured at 13:20Z,
+  nearly every pass gated by credit. A viewer on either node still paces repair to its 5% share.
 - **macnessa's NVMe** reports SMART `FAILED` on critical warning 0x02 (temperature) at 0 C, with no media errors
   and 3% used. Read as a broken sensor; not acted on.
 - **Undervoltage** on both Pis (`throttled=0x50000`), macnessa about nine times inverbeg. The operator has ruled
@@ -103,7 +106,12 @@ Ordered by what they cost a user.
    it answers. Both need a 0.5.1 tag, at the operator's word, not yet given.
 3. **The handshake timeout is open** (run): 2 of about 11 full macOS TSan runs, "timed out at the handshake":
    TCP connected, no answer, neither end closed. Not explained by 1 or 2.
-4. **Relay bulk transfers fail under Debian TSan**, not on Macha's path.
+4. **Relay bulk transfers fail under Debian TSan**, not on Macha's path. Fixed toward 0.5.1: numbered chunks
+   with pipelining (`7e35338`); a close that waited for ever on a chunk lost with a session (found in review),
+   bounded (`0463790`, `8b1c46e`, `34e8080`, each bound's test asserting its own counter); a lost wakeup in
+   `Node` that held a forced connectivity refresh for a heartbeat (`7b8b35f`); the `shut()` handler fault
+   (found in review, `35e9ed7`). All read and passed by this session. Tag waits on macOS and Debian TSan once
+   each on a quiet host (the last run was at load 46 on 12 cores) and the operator's go.
 5. **Exposures to carry into the port:** logging blocks on whichever thread logs, io threads included; the io
    thread count must be set deliberately, unmeasured; `free_port` can collide across processes in tests.
 
