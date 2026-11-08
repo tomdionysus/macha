@@ -30,16 +30,14 @@ repositories, `../dannan` and `../dagda`; `../macha` is read-only to them.
 
 ## Waiting on the operator
 
-1. **Dannan 0.5.1** (the acceptor and the roster write off the io threads), when its gates pass. Recommended yes.
-2. **The performance comparison rule** (spread alone, or spread or 5%). Best set once the port's first figures exist.
-3. **Window W1** and best-effort peer claims (found-issues, Macha item 5). Recommended left until after the port.
-4. **What filled the control store**: measure, read only, recommended before 8G fills too (found-issues, item 3).
-5. **The cores on macnessa**: six in `/mnt/diskB/crash`, about 2.3 to 2.8 GB each, holding keys and plaintext; the
-   stacks are read. Keep the four heap-corruption cores for after the port; delete the two from 2026-11-06 12:16Z
-   (`core.macha-catalogue.150998.*`, `core.systemd.170868.*`). Recommended.
-6. Carried: the media-kind import hint; truncated pack records, which stay counted read failures and report held,
-   with repair unchecked; the `*.pre-migration.*` archives, location unchecked; the replica journal reader, with no
-   writer left.
+Nothing open. Answered 2026-11-08:
+- **Dannan 0.5.1**: yes, once the `shut()` handler fault is fixed and its gates pass (8dd73d2, 91a8c83 and the fix).
+- **The performance comparison rule**: set on the port's first figures.
+- **Window W1** and best-effort peer claims (found-issues, Macha item 5): after the port.
+- **What filled the control store** (found-issues, item 3): after the port; the 8G limit stands meanwhile.
+- **The cores on macnessa**: all six deleted 2026-11-08 14:06Z; capture to `/mnt/diskB/crash` stays on.
+- Carried, unchecked, not now: the media-kind import hint; truncated pack records (counted read failures, report
+  held, repair unchecked); the `*.pre-migration.*` archives; the replica journal reader, with no writer left.
 
 ## Open, in order (Macha, all after the freeze unless the operator says otherwise)
 
