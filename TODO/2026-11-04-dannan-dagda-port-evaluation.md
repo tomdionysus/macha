@@ -1,5 +1,7 @@
 # Moving Macha's network layer and store onto Dannan and Dagda: evaluation
 
+> **Superseded for current state by [`2026-11-08-port.md`](2026-11-08-port.md)** (2026-11-08). Kept as the evaluation the libraries planned from.
+
 Status: evaluation, 2026-11-04, written for Tom before any plan is adopted.
 Nothing here is built or decided. The question asked: can Macha's network
 layer and storage backend move to Dannan and Dagda with no loss of

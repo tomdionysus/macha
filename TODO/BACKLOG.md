@@ -188,3 +188,110 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
 - Whether an owned source should survive `clear` and `remove_after_ms` while a job has failed
   files: clearing it removes a failed file's bytes, per the docs and a review of the code, so
   the file cannot be retried. Not traced by hand. Core has been told to warn.
+
+## Moved from ACTIVE, 2026-11-08
+
+These were ACTIVE's numbered sections; nothing in them is in progress while Macha is frozen for the port.
+The dated plans they name are still in `TODO/`.
+
+### Replication by diff
+
+[`2026-10-09-replication-by-diff.md`](2026-10-09-replication-by-diff.md). Stages 0 to
+4 built (0.90.71 to 0.90.77), the survey half of 5 built (0.90.96). Left: repair's
+store walk, push cursor, `repair_position` and `have_*` probes, about 75 test call
+sites. Dagda dropped these by decision, so this work may fall to the second cutover
+rather than Macha. Measure again on the current pair: repair was last measured over
+a 1.39 MB/s path that no longer exists.
+
+Also here: a torrent can land on a node away from where it is watched; per-peer down
+state in the transport; `fsync` without a deadline; say why a node counts itself busy.
+
+### Memory
+
+Every large part is reported once a minute (0.90.69: `memory_limit_bytes`,
+`memory_budget_bytes`, `memory_in_flight_*`, `memory_metadata_cache_bytes`,
+`memory_ledger_caches_bytes`, `memory_catalogue_bytes`, beside `rss_bytes`),
+and `runtime.memory_bytes` is a limit that shrinks the configured parts pro
+rata with a `MEMORY OVER LIMIT` WARN, 0 none (0.90.70; operator,
+2026-10-09: account for all memory, proportionately, no nit-picking).
+- **Set a limit per node** from a day of the gauges (both today: 768M in
+  flight, 512M metadata cache, 64M ledger caches; first readings RSS about
+  500 MiB, of which about 100 MiB is in the counted parts).
+- **A shrunk cache must not fall below its working set** (from the
+  backlog): the limit can now shrink the metadata cache, so a floor at its
+  unit (one materialised head) and a WARN when the limit forces it lower.
+- Resident memory against 0.90.54 and 0.90.62 (the ledger's stage 3 and 4
+  exits): read from the gauges after a few undisturbed hours on one version.
+- The uncounted rest of RSS (code, libraries, allocator, snapshots in use):
+  measure only if the gauges show it growing.
+
+### The catalogue plan, stages 6 to 9 and 11
+
+Plan: [`2026-10-06-catalogue-materialised-view.md`](2026-10-06-catalogue-materialised-view.md).
+Stages 1 to 5 are done (0.90.27 to 0.90.33). Next: stage 6, the conflict
+merge per shard; then derived indexes for list, search and the descendant
+scan; the manifest change (per-family shards, growable count); batched
+profile publication; measure again. Stage 10 (holdings for catalogue DATA)
+is the replication-by-diff plan's stage 4; if that needs per-family shards, stage 8 comes
+first. Its residency (about 16 MiB) is now a gauge.
+
+### Matching
+
+- **The first track of a match pays the provider again**: the editor's
+  search and artwork options were fetched, then the match looked the release
+  up and downloaded the cover again (4.1 s for the first track, 0 for the
+  second; gbni-1, 2026-10-06). 0.90.86: the cover listing is fetched once
+  for the options and the match. Left, each paid once and needed: the
+  release record when the editor did not list its tracks first (same seat,
+  so cached when it did), and the chosen cover image itself.
+- Provider caches are per editor seat and lost on restart.
+
+### Control: what is left, all small
+
+The control audits are done (lock audit 0.90.45 to 0.90.49 and 0.90.68;
+CPU and memory audit 2026-10-08; control lane fixes 0.90.61, 0.90.64 to
+0.90.66). The head record is 87,546 bytes (0.90.67), so whole-record copies
+on control threads no longer grow with deletes. Left:
+- DNS (`getaddrinfo`, net.cpp) has no timeout of its own. fi-1 dials
+  gbni-1 by name (`macnessa.macha.network`): 4 to 6 ms through its router,
+  and no `resolve failed` in its journal (2026-10-12). Build only on
+  evidence.
+- A dial's peer observer can wait on another thread's roster fsync
+  (`persist_m_`): `Membership::observe` writes the roster on the caller's
+  thread when it changes. The fix is a combining writer (a caller finding a
+  write in progress leaves its roster to the writer), but an identity reset
+  must stay durable before it answers. No stall traced to it yet.
+- gbni-1's DATA barrier (`syncfs` on `diskB`) is mean 484 ms, max 5.1 s
+  under 20 torrents: it flushes torrent staging and the FUSE spool on the
+  same disk, and libtorrent's writes keep no write-behind; viewer and loader
+  DATA writes wait on it. libtorrent's own sockets use cubic and can fill an
+  uplink. (Recorded; not control.)
+- Whether a commit's control objects should reach every node present with
+  the head (claims stop at `metadata_write_copies` holders).
+
+### Features, API and optimisation
+
+- **The API is RESTful, all of it**: audit every route; identity resets
+  become a resource (decided); `providers/artwork?ref=` and
+  `providers/artwork/choose` are among the routes to change.
+- **OpenAPI**: generated from a declarative route table that dispatch runs
+  from, served at `/api/v1/openapi.json`. Agreed, unstarted.
+- **Core's request**: `providers/artwork` taking `item_id`.
+- **Per-file readability**: designed; the operator chooses where it goes.
+  Two of its three uses are wire changes; its answer (held by nobody
+  reachable) comes from the replication-by-diff plan's stage 2, so it follows that.
+- **A media-type context on torrent add** (operator, 2026-09-25).
+- **People on catalogue items**: approved, with a backfill.
+- **Placement API asks**: the target `node_id` and a viewer-facing detail on
+  `placement_failed`; the peer's own refusal text on a forwarded add; an
+  optional node `name` (operator's call).
+- **Movie sets**: later; needs a proposal first.
+- **Ebooks**: stages 1 and 2 of `TODO/2026-11-04-ebooks-design.md` are
+  merged. Stage 3, the per-user media state, waits on the freeze; OPDS is not
+  started.
+  **Audiobooks** (operator, 2026-11-04): a separate media class of their
+  own, designed after ebooks; they share the per-user media state.
+- Measured small, not now: ingest and data publications commit one
+  operation at a time (about 100 ms each); the hint store rewrites its file
+  per change (266 KB with 409 hints); the head record's largest part is now
+  its 72 torrent requests (only if they grow).

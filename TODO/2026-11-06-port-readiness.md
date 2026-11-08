@@ -1,5 +1,7 @@
 # Can Macha move onto Dannan and Dagda with no loss? (2026-11-06)
 
+> **Superseded for current state by [`2026-11-08-port.md`](2026-11-08-port.md)** (2026-11-08). Kept as the record of how the rulings came about; the libraries cite it.
+
 **Answer: not today. All three sessions agree.** Nobody found an actual loss. Macha has never run
 on either library, so most of the question has not been tested.
 
@@ -151,10 +153,46 @@ Macha session so far: inventory rows, none partial; 268 cited cases, all exist (
 The timeout stays open: 1 in 10 full macOS TSan runs at this code, not reproduced in 10,635 runs of the
 case under 10 parallel copies, not called environmental. Dannan's failure text gains the stage and source
 port, on the Macha session's word, so its head moves past `93d6689` by that line.
+
+**Dannan 0.5.0, on `df839fe`, pushed, on the operator's word: the head to review.** Two items open, by
+Dannan's report. (1) On Macha's path until shown otherwise: the handshake timeout recurred, 2 of about 11 full
+macOS TSan runs, "timed out at the handshake from local port 50040": TCP connected, then no answer, neither
+end closed; not explained. (2) Not on Macha's path: relay bulk transfers fail under Debian TSan, one session
+dying after about 30 s with no sign of movement. Last TSan runs: macOS 622 passed, 1 failed; Debian 623 passed,
+2 failed, no warnings. Its other gates ran once, some before the last test-only commit, per the operator's "test
+once". arm64 and gateway results pending. By Dannan's reading, a stalled handshake on a dial is a bounded delay
+(`connect_timeout`, then backoff to 4 s, failing to the caller), and bounds match Macha's for pre-auth 8,
+handshake 5 s and backoff. Not bounded by reading: an acceptor that stops re-arming. Put to Dannan by the Macha
+session: a throw from `admit` before the re-arm (`server.cpp:135-139`), and whether anything can hold the shared io
+threads, since Macha's accept and handshakes have their own. **Both real, by Dannan's reading at 0.5.0, not run:**
+`admit` can throw, which skips the re-arm and `end_operation`: the process dies, or under a supervised `run()`
+survives with no acceptor and `stop()` hangs. And `Node::observe_direct` on io threads can reach
+`SequencedFile::write`'s fsync. Dannan is fixing both, on the Macha session's word, the write moving to a worker with an
+identity reset still durable before it answers; 0.5.1 needs the operator's word. Neither explains the open timeout.
+For the port: set the io thread count deliberately; logging blocks on whichever thread logs. For Macha after
+the freeze: `accept_loop` spins on EMFILE (`net.cpp:4168-4176`).
 The review proper waits for Dagda's report.
 
 **Operator's decisions, that evening:** macnessa's heap corruption is left until after the port. 0.93.5 is
 committed and pushed to develop. Dannan's arm64 rerun, tag and push, and real IGD run are all approved.
+
+**For the port, from Dagda's S5:** set `ordered` on the three mutation types; from the later stage the facade passes
+Macha's numbers as `NodeOptions::exchange.numbers` and sets `SpaceSpec::unaddressed`; `SpaceSpec::generation_advert`
+and `write_copies_advert` are Macha's to name. After a failed history read, `ensure_history_root` may append the
+committed head again, a duplicate frame the next open indexes. **Rollback:** Macha's binary comes back only after
+`--reverse` has finished; its reader cuts a Dagda-sealed or half-migrated `history.log` as one torn tail.
+
+**Found by Dagda's S5, by reading, for after the freeze:** `MetadataManager::replication_loop` claims on peers are best
+effort, not owed: dropped at stop (`:131`), on a failed call (`:136`, logged "deferred"), and over the byte cap (`:101`),
+and in memory only, and `retain_on` swallows peer failures, discarded at `node_services.cpp:549`. **Nothing restores a
+lost claim** (Dagda's trace, citations read by the Macha session): `ClaimWalk::step` reads only claims this node has;
+one returns only through a later commit covering the object. The bytes are protected by the peer's own head and the two
+30-day gates. **Window W1, by reading, not run:** a peer's unclaimed object past its grace is re-referenced by the sender
+with no touch on the peer, and swept before the peer learns the generation. Cost one replica until repair, not the data.
+Kept as Macha's behaviour; recommended left until after the port, the operator's call. Comments at
+`metadata_manager.hpp:201-202`, `:242-243` and `claim_walk.hpp:32` are stale. For the port: `known_generation` from
+`Exchange::known_generation`; no `Objects::remove` on Macha's paths; the facade sets `write_copies` 1. Tests: the phantom-id hunt at
+`test_rpc_cluster:2999` seeks a placement `discover_or_form` no longer reads; rpc:3212 can flake to a third run.
 
 **Torrent (operator, later that afternoon):** moved after all of the port work, shelved until he asks
 again. Decision 5 is answered no: torrent and its 23 requests stay through 8c, so the SM19 section, the
