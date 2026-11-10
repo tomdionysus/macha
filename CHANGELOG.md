@@ -1,5 +1,14 @@
 # Current release
 
+## 0.93.6: repair comes back after yielding to a viewer
+
+Repair: a step that yielded to a viewer or loader set no wake for the next one. The
+busy wake and the share's next turn both read whether a higher class was active when
+the pass began, so a viewer arriving during the step left neither set, and once the
+credit passed an extent the credit deadline was not set either: maintenance slept
+until an unrelated event, for 31 hours on both nodes at `idle_bandwidth_fraction` 0.5.
+A yielded step now looks again after an interval, where the share paces it.
+
 ## 0.93.5: a damaged history frame loses only that frame
 
 Metadata history: a frame's length word is outside the AEAD, and damage to it read as
