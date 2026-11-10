@@ -151,6 +151,7 @@ class TracedNode {
     std::shared_ptr<ManualMaintenanceClock> clock_ = std::make_shared<ManualMaintenanceClock>();
     TraceLog trace_;
     std::unique_ptr<Service> service_;
+    Service::MaintenanceStageHook stage_hook_;
     std::vector<std::pair<std::string, ObjectId>> watched_;
 
     // Whether a CONTROL object is a namespace tree node. A node carries its
@@ -228,6 +229,13 @@ class TracedNode {
     Config& config() {
         return config_;
     }
+    // Called at each maintenance stage that names one; set before start().
+    void stage_hook(Service::MaintenanceStageHook hook) {
+        stage_hook_ = std::move(hook);
+    }
+    ManualMaintenanceClock& clock() {
+        return *clock_;
+    }
     Service& start() {
         // How many claims a pass releases counts superseded tree nodes too
         // (see namespace_node); what is left claimed is in the state.
@@ -238,8 +246,7 @@ class TracedNode {
             trace_.add(kind, detail);
         };
         service_ = std::make_unique<Service>(config_, keys_, test_durability_window,
-                                             NodeRuntime::StartupStageHook{},
-                                             Service::MaintenanceStageHook{},
+                                             NodeRuntime::StartupStageHook{}, stage_hook_,
                                              Service::StartupStallHandler{}, instruments);
         service_->start();
         (void)service_->filesystem();
@@ -289,6 +296,13 @@ class TracedNode {
         clock_->advance(follow_up);
         settle();
         clock_->advance(follow_up);
+        settle();
+    }
+
+    // Moves the clock by `by` alone, with no quiet window or follow-up around it.
+    void advance_exactly(Clock::duration by) {
+        settle();
+        clock_->advance(by);
         settle();
     }
 
@@ -635,6 +649,59 @@ MACHA_TEST("maintenance_trace", test_trace_peer_unreachable_and_back) {
     node.step("the pass after the peer returned");
     peer->stop();
     check_against_fixture("peer-unreachable", node.trace());
+}
+
+// A viewer arriving while a repair step runs makes the step yield. The pass
+// began with no viewer, so neither its busy wake nor the share's next turn is
+// set, and the credit is past an extent: repair must still come back within an
+// interval, not sleep until an unrelated event.
+MACHA_TEST("maintenance_trace", test_repair_resumes_after_yielding_to_a_viewer_that_arrived_mid_step) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto port_a = free_port();
+    const auto port_b = free_port();
+    auto config_b = cluster.node_config("yield-b", port_b, {{"127.0.0.1", port_a}});
+    TracedNode::apply_trace_settings(config_b);
+    config_b.replication = 2;
+    // B never pulls: only A's push can deliver the copy.
+    config_b.maintenance.idle_bandwidth_fraction = 0.0;
+    TracedNode node(cluster.node_config("yield-a", port_a), cluster.keys());
+    node.config().replication = 2;
+    std::atomic<bool> viewer_arrives{false};
+    std::atomic<Service*> a{nullptr};
+    node.stage_hook([&](std::string_view stage) {
+        if (stage == "network-repair-begin" && viewer_arrives.load())
+            if (auto* service = a.load()) {
+                // Past repair's 25 ms slice, so the step yields to the viewer
+                // whether or not one was present when the pass began.
+                node.clock().advance(30ms);
+                service->filesystem().note_foreground_activity(64 * 1024);
+            }
+    });
+    auto& service = node.start();
+    a.store(&service);
+    // Written while A is alone, so no prompt copy is owed to B.
+    write_file(service.filesystem(), "/yield.bin", pattern(64 * 1024, 7));
+    const auto id = service.filesystem().getattr("/yield.bin").extents.front().id;
+    node.advance(100ms);
+
+    viewer_arrives = true;
+    auto peer = std::make_unique<Service>(config_b, cluster.keys(), test_durability_window);
+    peer->start();
+    REQUIRE(wait_until([&] { return service.node().membership().all_known_reachable() &&
+                                    service.node().membership().active().size() == 2; },
+                       10s));
+    node.advance(100ms);
+    REQUIRE(!peer->local_state().data().has(id));
+    // A pass that begins with no viewer present and meets one in its step.
+    node.advance_exactly(node.config().maintenance.foreground_quiet * 4);
+    REQUIRE(!peer->local_state().data().has(id));
+
+    // The viewer has gone. Nothing else is due, so only repair's own wake can
+    // deliver the copy.
+    viewer_arrives = false;
+    node.advance_exactly(node.config().maintenance.interval * 3);
+    REQUIRE(wait_until([&] { return peer->local_state().data().has(id); }, 5s));
+    peer->stop();
 }
 
 // The catalogue's manifest is lost from the only node that held it: the
