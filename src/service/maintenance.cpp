@@ -784,6 +784,8 @@ void Maintenance::run(std::stop_token stop) {
                         return !std::binary_search(found->second->begin(), found->second->end(), id);
                     };
                     enter_stage("network-repair");
+                    if (maintenance_stage_hook_)
+                        maintenance_stage_hook_("network-repair-begin");
                     const auto repair_stage = Clock::now();
                     auto repair = store_.repair_step(
                         byte_budget, operation_budget,
@@ -838,6 +840,10 @@ void Maintenance::run(std::stop_token stop) {
                         store_.note_repair_gate(DistributedStore::RepairGate::credit,
                                                  network_credit);
                     } else if (repair.yielded) {
+                        // Work is left. The higher class may have arrived after the pass
+                        // began, so neither the busy wake nor the share's next turn may
+                        // be set: look again after an interval, when the share decides.
+                        repair_continue = true;
                         Log::trace("maintenance: repair yielded to foreground I/O");
                     } else if (!repair.complete || retained_repairs || repair.bytes_transferred ||
                                retained_walk_unfinished) {
