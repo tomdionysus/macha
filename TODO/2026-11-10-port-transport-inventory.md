@@ -34,6 +34,28 @@ ambiguous hits read; calls through receivers not named `node_`, `node`, `n_`, `n
   F17). Rollback restores the three `*.macha` files.
 - Open on Dannan's side: the macOS TSan handshake timeout (on Macha's path until shown otherwise).
 
+## The facade's design (decided 2026-11-10, before code)
+
+- **`DannanHost`** (new, `src/cluster/dannan_host.{hpp,cpp}`): owns the `boost::asio::io_context`, its threads (a
+  deliberate count, 2 to start, measured on the Pis), and the `dannan::Node`. Builds `NodeConfig` from Macha's
+  `Config` (first-cutover section 3); registers every Macha type with its `Registration` (section 7.2) and retires
+  549, 550, 560, 636 before `Node::start`; one hosted handler per type forwards to `MessageRoutes::dispatch`, so the 43
+  bind sites stay as they are.
+- **`NodeRuntime`** keeps its public interface and delegates. Calls gain a deadline parameter (ruling A); each call
+  site names one from purpose-named constants (control, metadata, object transfer), never one blanket default.
+  Synchronous calls run Macha's own no-progress loop over `CallHandle::idle_for` (F1); `AsyncRpc` wraps a promise and
+  the `CallHandle` (cancel, abort, promote, idle_for).
+- **`Membership` is a view, not a cache**: Macha's `Membership` expires nodes on its own `dead_after`, and the
+  roster watch reports changes, not heartbeats, so a fed cache would expire live peers. With a Dannan source set,
+  `all`, `active`, `snapshot`, `directly_reachable`, `all_known_reachable` ask `dannan::Nodes` and convert each
+  `NodeRecord` to `NodeInfo` (capacity, used, metadata generation, replicas, flags from adverts); without one (test
+  fakes) it keeps its local behaviour. Adverts: `macha/capacity`, `macha/used`, `macha/metadata-generation`,
+  `macha/hosts-extents`, the replicas advert.
+- **Events** from `Nodes::watch` (F7), **telemetry** through hosted fields 1024 to 1045 (first-cutover section 6), and
+  `TelemetryStore` as a view decoding them.
+- The old `RpcClient`, `RpcServer`, `SecureChannel`, `MessageAssembler`, Macha's `membership` merge,
+  `public_connectivity` and the three loops go when the facade is in and the 52 internal tests are retired.
+
 ## What the facade keeps (its interface), and what retires
 
 Kept, with Dannan behind them: `MessageType` (enumerators by name; values change to 512+n, the transport's own types
