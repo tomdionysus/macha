@@ -21,9 +21,9 @@ operator's rulings in his words, the order, where each library is, and everythin
    nodes, inverbeg first.
 
 **Macha's code is frozen** until the port starts. Exceptions so far: 0.92.5, the old-code removal, 0.93.4 (all
-deployed), and 0.93.5 (`9153011`, `98b816d`: a damaged or unreadable `history.log` frame loses only itself), on
-develop, pushed, laptop-tested only, **not tagged and not on the nodes**. It needs all three suites on macnessa
-before it can go live.
+deployed), 0.93.5 (`9153011`, `98b816d`: a damaged or unreadable `history.log` frame loses only itself) and 0.93.6
+(a repair step that yielded to a viewer now wakes the loop again; it had slept up to 31 h). 0.93.6 carries both:
+macnessa gate 755 + 20 + 21, live on both nodes since 2026-11-10 20:18Z, not tagged.
 
 **Peers:** the Dannan and Dagda sessions, by `SendMessage` (`ListAgents` shows them). They work on their own
 repositories, `../dannan` and `../dagda`; `../macha` is read-only to them.
@@ -69,12 +69,14 @@ corruption (now seen on macnessa, 2026-11-06).
 
 ## Cluster state (2026-11-08)
 
-- **macnessa** (root@10.44.1.50, reached locally; hostname corvus-gbni-1; Pi 5, 8 GB; domain site-a): 0.93.4 under
+- **Both on 0.93.6** since 2026-11-10 20:16Z (inverbeg) and 20:18Z (macnessa): 0.93.5's history fixes and the repair
+  wake after a yield. Rollback: `/root/pre-0.93.6/`.
+- **macnessa** (root@10.44.1.50, reached locally; hostname corvus-gbni-1; Pi 5, 8 GB; domain site-a): 0.93.6 under
   `/usr/local`; `/var/lib/macha`; DATA on `/mnt/diskB/data`, 6.3 TB used; control store
   `/var/lib/macha/metadata-objects`, limit 8G (was 4G, full from 2026-11-06 21:16Z to 2026-11-08 12:52Z); API on
   10.44.1.50:7438. The build node, sources in `/home/tom/macha`. NVMe SMART `FAILED` on its temperature flag only.
 - **inverbeg** (root@inverbeg.macha.network, Pi 5, 16 GB, domain site-b, inbound capable, dialled at
-  inverbeg.macha.network:7437): 0.93.4; DATA on `/mnt/diskB/data`, 1.68 TB used and filling; control store about
+  inverbeg.macha.network:7437): 0.93.6; DATA on `/mnt/diskB/data`, 1.68 TB used and filling; control store about
   4.0 GB, limit 8G; API on 192.168.1.50:7438.
 - **Both:** `maintenance.idle_bandwidth_fraction` 0.5 (was 0.10); config backups beside `/etc/macha/macha.yaml`
   (`.pre-8g-*`, `.pre-fraction-*`). Debian 13, aarch64, Boost 1.83. Core capture to `/mnt/diskB/crash`. Torrent on,

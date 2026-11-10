@@ -11,8 +11,9 @@ genuine Macha defect is fixed in Macha first and the libraries match the fix.
 |---|---|---|
 | A damaged `history.log` length word read as a torn tail, so opening a node cut every later intact frame; a length over 2 GiB sent the node to seed recovery (found by Dagda's S3 reading) | 0.93.5: a frame that does not authenticate means scanning for the next one that does (`9153011`) | develop, pushed; laptop tests only (71 of 71 `storage_metadata`); not tagged, not on the nodes |
 | A failed read in that scan, or in the main loop, also cut good frames (found by Dagda mirroring the fix) | A failed read cuts nothing; unread frames are read at the next open (`98b816d`) | as above; the scan's failure has a case, the main loop's is by reading (Dagda tested it in its copy) |
+| Repair slept for hours with work left (found 2026-11-10 from the observations: maintenance wakeups 0 for up to 31 h on both nodes, each sleep starting as a viewer arrived) | 0.93.6: a repair step that yielded looks again after an interval; the busy wake and the share's turn read the pass's stale start state, and a credit past an extent set no deadline, so nothing else woke it. Test `maintenance_trace/test_repair_resumes_after_yielding_to_a_viewer_that_arrived_mid_step` fails before and passes after | laptop: the case, maintenance_trace 11/11, storage_metadata 71/71; macnessa gate 755 + 20 + 21; deployed 2026-11-10, inverbeg 20:16Z, macnessa 20:18Z |
 | macnessa's control store full (below) | `storage.metadata.limit` 4G to 8G on both nodes, operator, 2026-11-08 | live; config backups `/etc/macha/macha.yaml.pre-8g-*` |
-| Repair credit-limited to a tenth of the link (below) | `maintenance.idle_bandwidth_fraction` 0.10 to 0.5 on both nodes, operator, 2026-11-08 | live; backups `.pre-fraction-*`; measured 13:20Z: 3.6 to 3.9 MB/s each way, against 0.44 (`build/baselines/repair3-*.txt`) |
+| Repair credit-limited to a tenth of the link (below) | `maintenance.idle_bandwidth_fraction` 0.10 to 0.5 on both nodes, operator, 2026-11-08 | live; backups `.pre-fraction-*`. 3.6 to 3.9 MB/s at 13:20Z was one burst: averaged over the next 53 h inverbeg gained 0.8 MB/s, because of the sleep above |
 
 ## Macha, open, after the freeze
 
@@ -71,12 +72,57 @@ Ordered by what they cost a user.
     reads; rpc:3212 can flake to a third run; two weak cases in `test_namespace_tree.cpp` (lines 218, 746).
     `storage_v18/test_retain_data_batches_a_large_publication_within_bounded_time` exceeds its 120 s bound with
     its temporary directory on macnessa's USB disk.
-14. **A telemetry demand can be lost for one interval** (read, found through Dannan's `7b8b35f`):
-    `NodeRuntime::signal_telemetry_refresh` (`cluster.cpp:958`) notifies without `telemetry_wait_mutex_`, so a
-    demand made between the loop's predicate test and its wait (`cluster.cpp:999-1002`) waits for the next
-    `telemetry_interval`. Fix: take and release the wait mutex before notifying, as Dannan's `wake_loops`. The
-    connectivity loop has no such race. Macha's other ~180 notify sites are not audited.
-15. **Seen, not looked into:** `ls /mnt/machamedia` timed out twice shortly after a restart, then answered in ms;
+14. **Lost wakeups** (read: every notify site in `src/` audited 2026-11-08, after Dannan's `7b8b35f` found one in
+    its `Node`; each notifier and waiter below read by this session unless marked *agent*). The defect: a waiter
+    tests its predicate under mutex M and blocks; the notifier changes what the predicate reads without M and does
+    not take M between the change and the notify, so a change landing between test and block is missed. The fix
+    everywhere is one rule: change the state under M, or take and release M before notifying (Dannan's
+    `wake_loops`); wait for a stop through the `stop_token` overload; a predicate must read what its notifier
+    changes; a time-based predicate needs a timed wait.
+    - **Stop can hang until systemd's kill** (plain wait whose predicate reads the jthread stop token; `request_stop`
+      and notify outside M): `~DistributedStore` local writer (`distributed_store.cpp:1185-1187` vs `:3159`);
+      `RpcServer::stop`'s four worker pools (`net.cpp:4140-4148` vs `:4498`, `:4518`, `:4539`, `:4628`);
+      `~DurabilityDomain` (`durability_domain.cpp:75` vs `:218`); the FUSE durability worker
+      (`fuse_frontend.cpp:5310` vs `:2355`); FUSE spool admission (`stopping` set at `:5279`, notify `:5283`, vs the
+      untimed wait `:1272`; a broker write parked there holds `stop()` at the broker join, `interrupt_waits` does not
+      reach it); the RPC session reaper on a double miss (`net.cpp:4401`, `:4695` vs `:3455`), narrow.
+    - **Work stalls until an unrelated wake:** torrent alerts (`torrent_manager.cpp:159-161` vs `:1274`; libtorrent
+      fires its notify only on an empty queue turning non-empty, so a miss is not repeated); the torrent resume
+      listener (`:155`, called from `ingest.cpp:937`; the predicate's ingest read *agent*); FUSE deferred-retry due
+      times (`fuse_frontend.cpp:2910` vs `:3923`); an fsync on a parked inode the operator abandons (`:3467` vs
+      `:2262`; at stop `waits_interrupted` rescues it), and `backend_error` set with no notify at all (`:2316`,
+      `:2992`, *agent*); hydrator wakes (`hydration.cpp:720-722` vs `:842`); prompt-replication retries, a
+      time-based predicate on an untimed wait (`distributed_store.cpp:1237`); a `PeerConnection` writer after its
+      reader fails lingers until `close()` (`net.cpp:1714` vs `:1539`); an extent submitter misses cancellation
+      until the next pop (`filesystem.hpp:615` vs `filesystem.cpp:1472`, *agent*).
+    - **The notify can never satisfy the predicate** (not a race, every time): media-information requests on an
+      idle service (`media_information.cpp:177`, `:193` vs `:508`; the predicate never reads the hint queue, so a
+      request waits for the next metadata generation, `maintenance.cpp:1401`, which masks it on a busy cluster);
+      `TorrentCoordinator` API wakes (`torrent_coordinator.cpp:180`, predicate constant false: every request waits
+      for the 2 s pass); hydration fetch completion (`hydration.cpp:611`, noticed at `config_.interval`, *agent*).
+    - **Bounded:** telemetry demand, one `telemetry_interval` (`cluster.cpp:958` vs `:999-1002`); a dial request,
+      one heartbeat, during which the requester's reverse dial may time out (`net.cpp:2733-2735` vs `:2830`); FUSE
+      write and metadata admission against stop and a new durable prefix, 200 ms (`fuse_frontend.cpp:5284`,
+      `:5285`, `:2347`, *agent*); startup readiness, at most 1 s (`service.cpp:542-553` vs `:471`).
+    - **Unsettled:** the plain `namespace_cv` wait in `replay_data_quantum` (`fuse_frontend.cpp:3514-3523`) against
+      stop, if `namespace_loop` can exit without its final notify; the DATA arbiter seeing `local_copy_cancelled_`
+      with no notify (`data_work.hpp`, bounded by the no-progress window if non-zero); cancels into
+      `retained_memory.hpp:263`; `finish_loader_admission`/`wait_for_loader_admission`, possibly dead code.
+    - Clean: about 150 sites. The connectivity loop is clean. These may bear on past slow stops; not shown.
+15. **Found by Dagda in Macha's code, 2026-11-08 and 09** (Dagda's reading and tests, cited lines not re-read here;
+    the operator ruled fixed in Dagda now, in Macha after the freeze):
+    - **A pack compaction can lose an object** (Dagda pinned it with a test that failed first). A packed put's record is in the
+      active pack but not yet indexed; compaction counts it dead, can take the active pack as its victim and unlink it,
+      and the object is gone while the held ledger says held. On a remove, the same gap brings a deleted object back.
+      Macha `local_store.cpp:821-867`, `:1694`, `:1700-1714`, `:1842`. Dagda's fix: compaction waits, under the pack lock,
+      for every written record to be indexed.
+    - **`StoragePool::get` stops at the first backend's empty answer** (`storage_pool.cpp:591-610`), so a copy on a
+      second backend is not read. Open in Dagda too.
+    - **A sweep pass forgets deferrals from its earlier slices**: `gc_step` reports `deferred` for its own slice only
+      (`storage_pool.cpp:1030-1083`), and the loop reads it from the slice that completes the pass
+      (`maintenance.cpp:1079-1087`), so the pass ends "complete; waiting for an event" with immature garbage still on
+      disk until the next event. Garbage is late, never wrongly deleted.
+16. **Seen, not looked into:** `ls /mnt/machamedia` timed out twice shortly after a restart, then answered in ms;
     remux `playback_pipeline_start_failed` ("timed out waiting for first fragmented-MP4 segment") 3 of 13 attempts
     on inverbeg, 1 of 13 on macnessa, during the baselines.
 
