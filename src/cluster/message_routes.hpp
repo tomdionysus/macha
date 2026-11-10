@@ -7,8 +7,8 @@
 #include "codec.hpp"
 #include "contract/thread_safety.hpp"
 
-#include <array>
 #include <functional>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -27,43 +27,32 @@ class MessageRoutes {
 
     void bind(MessageType type, Handler handler) {
         WriteLock lock(mutex_);
-        handlers_[index(type)] = std::move(handler);
+        handlers_[type] = std::move(handler);
     }
     // Waits for calls in flight on any route.
     void unbind(MessageType type) {
         WriteLock lock(mutex_);
-        handlers_[index(type)] = {};
+        handlers_.erase(type);
     }
     RpcMessage dispatch(const NodeInfo& peer, FrameType frame_type,
                         const RpcMessage& request) const {
-        if (static_cast<size_t>(request.type) >= route_count)
-            return error_reply(501, "not_implemented", "unsupported request");
         ReadLock lock(mutex_);
-        const auto& handler = handlers_[index(request.type)];
-        if (!handler)
+        const auto found = handlers_.find(request.type);
+        if (found == handlers_.end() || !found->second)
             return error_reply(501, "not_implemented",
                                std::string(message_type_name(request.type)) +
                                    " is not available on this node");
         try {
-            return handler(peer, frame_type, request);
+            return found->second(peer, frame_type, request);
         } catch (const std::exception& failure) {
             return error_reply(500, "internal_error", failure.what());
         }
     }
 
   private:
-    // Every message type is numbered below this.
-    static constexpr size_t route_count = 128;
-    static size_t index(MessageType type) {
-        const auto value = static_cast<size_t>(type);
-        if (value >= route_count)
-            throw std::out_of_range("message type beyond the route table");
-        return value;
-    }
-
     // Held shared across each handler call, which may do any I/O.
     mutable IoSharedMutex mutex_;
-    std::array<Handler, route_count> handlers_ MACHA_GUARDED_BY(mutex_);
+    std::map<MessageType, Handler> handlers_ MACHA_GUARDED_BY(mutex_);
 };
 
 } // namespace macha
