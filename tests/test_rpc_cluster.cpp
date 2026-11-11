@@ -2802,7 +2802,7 @@ MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_bef
         try {
             Bytes object_id(32, 0x7b);
             (void)service.node().call(endpoint, MessageType::get_object, object_id,
-                                      FrameType::speculative);
+                                      FrameType::speculative, call_deadline::object_transfer);
             return false;
         } catch (...) {
             return true;
@@ -2824,7 +2824,7 @@ MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_bef
     const auto retry_started = Clock::now();
     bool retry_rejected = false;
     try {
-        (void)service.node().call(endpoint, MessageType::ping, {});
+        (void)service.node().call(endpoint, MessageType::ping, {}, call_deadline::presence_probe);
     } catch (const std::exception&) {
         retry_rejected = true;
     }
@@ -6511,7 +6511,7 @@ MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_
     request.fixed(head.bytes);
     auto reply = s2->node().call(s1.node().membership().self(),
                                  MessageType::get_metadata_history_record, request.take(),
-                                 FrameType::control);
+                                 FrameType::control, call_deadline::metadata);
     REQUIRE(reply.message.type == MessageType::metadata_history_entry_reply);
     auto served = decode_metadata_history_entry(reply.message.payload);
     CHECK(served.hash == head);
@@ -7756,7 +7756,7 @@ MACHA_TEST("rpc_cluster", test_no_progress_deadline_follows_the_lane_configured)
         const auto started = Clock::now();
         std::string error;
         try {
-            (void)node.call(endpoint, stuck, Bytes{1}, stuck_frame);
+            (void)node.call(endpoint, stuck, Bytes{1}, stuck_frame, call_deadline::control);
         } catch (const std::exception& e) {
             error = e.what();
         }
@@ -7773,7 +7773,7 @@ MACHA_TEST("rpc_cluster", test_no_progress_deadline_follows_the_lane_configured)
         bool slow_ok = false;
         try {
             slow_ok =
-                node.call(endpoint, slow, Bytes{2}, slow_frame).message.type != MessageType::error;
+                node.call(endpoint, slow, Bytes{2}, slow_frame, call_deadline::control).message.type != MessageType::error;
         } catch (const std::exception&) {
         }
         releaser.join();

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "metadata/metadata_manager.hpp"
+#include "cluster/call_deadline.hpp"
 
 #include "observation.hpp"
 #include "diagnostics.hpp"
@@ -454,7 +455,7 @@ bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash
                 Writer request;
                 request.fixed(task.hash.bytes);
                 auto reply = node_.call(owner, MessageType::get_metadata_history_entry,
-                                        request.take(), frame_type);
+                                        request.take(), frame_type, call_deadline::metadata);
                 if (reply.message.type != MessageType::metadata_history_entry_reply)
                     throw std::runtime_error("metadata history entry unavailable");
                 task.entry = decode_metadata_history_entry(reply.message.payload);
@@ -530,7 +531,7 @@ size_t MetadataManager::repair_unreconstructable_heads(FrameType frame_type) {
                 Writer request;
                 request.fixed(hash.bytes);
                 auto reply = node_.call(owner, MessageType::get_metadata_history_record,
-                                        request.take(), frame_type);
+                                        request.take(), frame_type, call_deadline::metadata);
                 if (reply.message.type != MessageType::metadata_history_entry_reply) {
                     Log::debug("metadata head repair: " + owner.host + " cannot serve hash=" +
                                hex(hash.bytes));
@@ -579,7 +580,7 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
             Writer request;
             request.fixed(hash.bytes);
             auto reply = node_.call(owner, MessageType::has_metadata_history_entry,
-                                    request.take(), frame_type);
+                                    request.take(), frame_type, call_deadline::metadata);
             present = bool_reply(reply);
         } catch (...) {
         }
@@ -685,7 +686,7 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
             auto encoded = encode_metadata_history_entry(entry);
             pending.push_back({required,
                 node_.call_async(owner, MessageType::put_metadata_history_entry,
-                                 encoded, frame_type)});
+                                 encoded, frame_type, call_deadline::metadata)});
             history_entries_submitted_.fetch_add(1, std::memory_order_relaxed);
             note_depth();
         } catch (...) {
@@ -736,7 +737,7 @@ RpcReply MetadataManager::commit_call(const NodeInfo& owner, MessageType type,
                                       std::span<const uint8_t> payload, FrameType frame_type) {
     if (stalled(owner.id))
         throw std::runtime_error("peer stalled on an earlier commit call");
-    auto rpc = node_.call_async(owner, type, payload, frame_type);
+    auto rpc = node_.call_async(owner, type, payload, frame_type, call_deadline::metadata);
     const auto stall = node_.config().write_stall;
     const auto started = Clock::now();
     while (rpc.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
@@ -922,7 +923,7 @@ std::vector<std::pair<NodeInfo, MetadataAcceptance>> MetadataManager::discover_a
             if (owner.id == node_.node_id()) {
                 heads = metadata_server_.heads();
             } else {
-                auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type);
+                auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type, call_deadline::metadata);
                 if (reply.message.type != MessageType::metadata_heads_reply)
                     continue;
                 heads = decode_metadata_acceptance_set(reply.message.payload);
@@ -1359,7 +1360,7 @@ MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoi
             PendingRead item;
             item.owner = owner;
             item.rpc.emplace(node_.call_async(owner, MessageType::get_committed_metadata,
-                                              {}, FrameType::control));
+                                              {}, FrameType::control, call_deadline::metadata));
             pending.push_back(std::move(item));
         } catch (...) {
             ++completed;

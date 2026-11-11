@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/distributed_store.hpp"
+#include "cluster/call_deadline.hpp"
 #include "diagnostics.hpp"
 #include "codec.hpp"
 #include "durable_file.hpp"
@@ -336,7 +337,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             item.owner = owner;
             item.started = Clock::now();
             const auto type = batch ? MessageType::put_object_deferred : MessageType::put_object;
-            item.rpc.emplace(n_.call_async(owner, type, payload, frame_type));
+            item.rpc.emplace(n_.call_async(owner, type, payload, frame_type, call_deadline::object_transfer));
             pending.push_back(std::move(item));
         } catch (...) {
             ++replacement_needed;
@@ -558,7 +559,7 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
             PendingBarrier item;
             item.replica = replica;
             item.rpc.emplace(n_.call_async(found->second, MessageType::object_durability_barrier,
-                                           payload.data(), frame_type));
+                                           payload.data(), frame_type, call_deadline::object_transfer));
             pending.push_back(std::move(item));
         } catch (const std::exception& error) {
             // Still transient (an unsent request is "ask again"), but the
@@ -685,7 +686,7 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
                     for (size_t i = offset; i < end; ++i)
                         payload.fixed(ids[i].bytes);
                     auto reply = n_.call(found->second, MessageType::object_durability_barrier,
-                                         payload.data(), frame_type);
+                                         payload.data(), frame_type, call_deadline::object_transfer);
                     if (reply.message.type != MessageType::ok) {
                         probe_outcome = "probe-refused: " + reply_error_text(reply);
                         break;
@@ -783,7 +784,7 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
 RpcReply DistributedStore::bounded_control_call(const NodeInfo& target, MessageType type,
                                                 std::span<const uint8_t> payload,
                                                 FrameType frame_type) {
-    auto request = n_.call_async(target, type, payload, frame_type);
+    auto request = n_.call_async(target, type, payload, frame_type, call_deadline::control);
     const auto deadline = std::max(n_.config().dead_after, n_.config().connect_timeout);
     if (request.wait_for(deadline) != std::future_status::ready) {
         // Fast health probes can succeed while a control worker is wedged.
@@ -1339,7 +1340,7 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
     writer.fixed(id.bytes);
     writer.bytes(data);
     auto started = Clock::now();
-    bool ok = n_.call(target, MessageType::put_object, writer.data(), frame_type).message.type ==
+    bool ok = n_.call(target, MessageType::put_object, writer.data(), frame_type, call_deadline::object_transfer).message.type ==
               MessageType::ok;
     if (ok)
         note_network(data.size(), Clock::now() - started);
@@ -1387,7 +1388,7 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
         Writer writer;
         writer.fixed(id.bytes);
         auto started = Clock::now();
-        auto rpc = n_.call_async(target, MessageType::get_object, writer.data(), frame_type);
+        auto rpc = n_.call_async(target, MessageType::get_object, writer.data(), frame_type, call_deadline::object_transfer);
         if (shared) {
             FrameType effective;
             {
@@ -1872,7 +1873,7 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_object
             writer.fixed(id.bytes);
         try {
             auto rpc = n_.call_async(found->second, MessageType::have_objects, writer.data(),
-                                     frame_type);
+                                     frame_type, call_deadline::presence_probe);
             in_flight.push_back({chunk.node, std::move(chunk.ids), std::move(rpc)});
         } catch (const std::exception& error) {
             Log::debug("retention presence batch peer=" + found->second.host +
@@ -1946,7 +1947,7 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
                 writer.fixed(id.bytes);
             try {
                 request.rpc = n_.call_async(found->second, MessageType::have_valid_objects,
-                                            writer.data(), FrameType::speculative);
+                                            writer.data(), FrameType::speculative, call_deadline::presence_probe);
             } catch (const std::exception& error) {
                 Log::debug("repair presence batch peer=" + found->second.host +
                            " error=" + error.what());
@@ -1960,7 +1961,7 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
         writer.fixed(id.bytes);
         try {
             auto reply =
-                n_.call_async(node, MessageType::have_object, writer.data(), FrameType::speculative)
+                n_.call_async(node, MessageType::have_object, writer.data(), FrameType::speculative, call_deadline::presence_probe)
                     .get();
             if (reply.message.type != MessageType::bool_reply)
                 return std::nullopt;
@@ -2185,7 +2186,7 @@ bool DistributedStore::offer_control_on(const NodeInfo& target, const std::vecto
         writer.bytes(*bytes);
         try {
             in_flight.emplace_back(
-                n_.call_async(target, MessageType::put_control_object, writer.data(), frame),
+                n_.call_async(target, MessageType::put_control_object, writer.data(), frame, call_deadline::metadata),
                 bytes->size());
         } catch (const std::exception& error) {
             Log::debug("CONTROL object store peer=" + target.host + " error=" + error.what());
@@ -2313,7 +2314,7 @@ void DistributedStore::erase_all(const ObjectId& id) {
                 (void)local_.cache().remove(id);
             } else {
                 (void)n_.call(target, MessageType::delete_object, writer.data(),
-                              FrameType::speculative);
+                              FrameType::speculative, call_deadline::control);
             }
         } catch (const std::exception& e) {
             Log::debug("object delete " + target.host + ": " + e.what());
@@ -2869,7 +2870,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 writer.bytes(*send.data);
                 try {
                     send.rpc = n_.call_async(send.peer, MessageType::put_object, writer.data(),
-                                             FrameType::speculative);
+                                             FrameType::speculative, call_deadline::object_transfer);
                 } catch (const std::exception& error) {
                     Log::debug("repair push peer=" + send.peer.host + " error=" + error.what());
                 }

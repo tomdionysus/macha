@@ -49,29 +49,6 @@ bool object_transfer(MessageType type) {
            type == MessageType::object_durability_barrier;
 }
 
-bool metadata_call(MessageType type) {
-    switch (type) {
-    case MessageType::get_metadata:
-    case MessageType::cas_metadata:
-    case MessageType::seed_metadata:
-    case MessageType::get_committed_metadata:
-    case MessageType::checkpoint_metadata:
-    case MessageType::commit_metadata:
-    case MessageType::cas_metadata_delta:
-    case MessageType::get_metadata_identity:
-    case MessageType::get_metadata_history_entry:
-    case MessageType::has_metadata_history_entry:
-    case MessageType::put_metadata_history_entry:
-    case MessageType::get_metadata_heads:
-    case MessageType::put_metadata_commit:
-    case MessageType::accept_metadata_commit:
-    case MessageType::get_metadata_history_record:
-        return true;
-    default:
-        return false;
-    }
-}
-
 std::string peer_label(const NodeInfo& node) {
     return to_string(node.id).substr(0, 12);
 }
@@ -344,62 +321,59 @@ std::chrono::milliseconds NodeRuntime::no_progress_deadline_for(MessageType type
                                  : cfg_.control_no_progress_deadline;
 }
 
-std::chrono::milliseconds NodeRuntime::deadline_for(MessageType type) const {
-    if (object_transfer(type))
-        return call_deadline::object_transfer;
-    if (metadata_call(type))
-        return call_deadline::metadata;
-    return call_deadline::control;
-}
-
 RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type,
-                           std::span<const uint8_t> payload) {
-    return call(node, type, payload, default_frame_type(type));
+                           std::span<const uint8_t> payload, std::chrono::milliseconds deadline) {
+    return call(node, type, payload, default_frame_type(type), deadline);
 }
 
 RpcReply NodeRuntime::call(const Endpoint& endpoint, MessageType type,
-                           std::span<const uint8_t> payload) {
-    return call(endpoint, type, payload, default_frame_type(type));
+                           std::span<const uint8_t> payload, std::chrono::milliseconds deadline) {
+    return call(endpoint, type, payload, default_frame_type(type), deadline);
 }
 
 RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type, std::span<const uint8_t> payload,
-                           FrameType frame_type) {
+                           FrameType frame_type, std::chrono::milliseconds deadline) {
     refuse_when_stopping();
     const auto started = Clock::now();
-    auto async = host_.call_async(node, type, payload, frame_type, deadline_for(type));
+    auto async = host_.call_async(node, type, payload, frame_type, deadline);
     return wait_for_reply(async, peer_label(node), type, frame_type, started,
                           stall_notice_for(type), no_progress_deadline_for(type));
 }
 
 RpcReply NodeRuntime::call(const Endpoint& endpoint, MessageType type,
-                           std::span<const uint8_t> payload, FrameType frame_type) {
+                           std::span<const uint8_t> payload, FrameType frame_type,
+                           std::chrono::milliseconds deadline) {
     refuse_when_stopping();
     const auto started = Clock::now();
-    auto async = host_.call_async(endpoint, type, payload, frame_type, deadline_for(type));
+    auto async = host_.call_async(endpoint, type, payload, frame_type, deadline);
     return wait_for_reply(async, peer_label(endpoint), type, frame_type, started,
                           stall_notice_for(type), no_progress_deadline_for(type));
 }
 
 AsyncRpc NodeRuntime::call_async(const NodeInfo& node, MessageType type,
-                                 std::span<const uint8_t> payload) {
-    return call_async(node, type, payload, default_frame_type(type));
+                                 std::span<const uint8_t> payload,
+                                 std::chrono::milliseconds deadline) {
+    return call_async(node, type, payload, default_frame_type(type), deadline);
 }
 
 AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
-                                 std::span<const uint8_t> payload) {
-    return call_async(endpoint, type, payload, default_frame_type(type));
+                                 std::span<const uint8_t> payload,
+                                 std::chrono::milliseconds deadline) {
+    return call_async(endpoint, type, payload, default_frame_type(type), deadline);
 }
 
 AsyncRpc NodeRuntime::call_async(const NodeInfo& node, MessageType type,
-                                 std::span<const uint8_t> payload, FrameType frame_type) {
+                                 std::span<const uint8_t> payload, FrameType frame_type,
+                                 std::chrono::milliseconds deadline) {
     refuse_when_stopping();
-    return host_.call_async(node, type, payload, frame_type, deadline_for(type));
+    return host_.call_async(node, type, payload, frame_type, deadline);
 }
 
 AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
-                                 std::span<const uint8_t> payload, FrameType frame_type) {
+                                 std::span<const uint8_t> payload, FrameType frame_type,
+                                 std::chrono::milliseconds deadline) {
     refuse_when_stopping();
-    return host_.call_async(endpoint, type, payload, frame_type, deadline_for(type));
+    return host_.call_async(endpoint, type, payload, frame_type, deadline);
 }
 
 size_t NodeRuntime::broadcast_best_effort(const RpcMessage& message, FrameType frame_type) {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/control_objects.hpp"
+#include "cluster/call_deadline.hpp"
 
 #include "cluster/cluster.hpp"
 #include "codec.hpp"
@@ -29,7 +30,7 @@ bool ControlObjectFetch::pull(const ObjectId& id, const Observer& observe) {
         try {
             auto started = Clock::now();
             auto reply = node_.call(target, MessageType::get_control_object, payload,
-                                    FrameType::speculative);
+                                    FrameType::speculative, call_deadline::metadata);
             if (reply.message.type != MessageType::control_object_reply) {
                 last_failure = target.host + ": " + message_type_name(reply.message.type);
                 continue;
