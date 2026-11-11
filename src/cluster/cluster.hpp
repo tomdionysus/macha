@@ -5,7 +5,9 @@
 #include "contract/thread_safety.hpp"
 #include "cluster/activity_clocks.hpp"
 #include "cluster/cluster_node.hpp"
+#include "cluster/dannan_host.hpp"
 #include "cluster/data_work.hpp"
+#include "cluster/inbound_resolution.hpp"
 #include "cluster/message_routes.hpp"
 #include "cluster/node_events.hpp"
 #include "cluster/local_state.hpp"
@@ -24,29 +26,17 @@
 #include "cluster/telemetry.hpp"
 #include "cluster/transcode_rates.hpp"
 
+#include <boost/asio/strand.hpp>
+
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <map>
+#include <optional>
 #include <string_view>
 
 namespace macha {
-// How this node answers "can peers connect to me?" and "do I host extents?",
-// with the configured modes beside the resolved values. `source` decided the
-// inbound answer: "configured", "persisted", "default" (auto, no evidence yet,
-// behaving as capable) or "probe:<peer>".
-struct InboundResolution {
-    Tristate inbound_capable_mode{Tristate::automatic};
-    Tristate hosts_extents_mode{Tristate::automatic};
-    bool inbound_capable{true};
-    bool hosts_extents{true};
-    std::string source{"default"};
-    uint64_t decided_unix_ms{};
-    uint64_t last_probe_unix_ms{};
-    std::string last_probe_peer;
-    std::string last_probe_error;
-    unsigned consecutive_probe_failures{};
-};
 
 struct NodeReadiness {
     bool control_plane_online{};
@@ -85,44 +75,21 @@ class NodeRuntime : public ClusterNode {
     const NodeIdentity& identity_;
     // Owned by the root; the node reads it for readiness and telemetry.
     RecoveryProgress& progress_;
-    // Owned by the root (NodeResources), which stops them before this node.
-    RetainedMemoryLedger& retained_memory_;
     // Playback records, telemetry publishes.
     TranscodeRateBook& transcode_rates_;
-    // Inbound requests are dispatched here; this node binds the types it
-    // answers and records them for unbinding.
-    MessageRoutes& routes_;
-    std::vector<MessageType> bound_routes_;
     // Storage, metadata and topology changes are counted here for whoever
     // watches; the node never calls a consumer.
     NodeEvents& events_;
-    // Declared before members_ so the roster is built with the right flags.
-    // Held by a resolution being applied until its file is written, so
-    // writes land in order.
-    mutable IoMutex inbound_persist_mutex_ MACHA_ACQUIRED_BEFORE(inbound_mutex_);
-    // Held only to read or change the resolution in memory.
-    mutable Mutex inbound_mutex_;
-    InboundResolution inbound_ MACHA_GUARDED_BY(inbound_mutex_);
-
-    // The control plane is constructed before storage and metadata, so the
-    // node is reachable while its durable state recovers.
-    Membership members_;
-    PublicConnectivity public_connectivity_;
-    TelemetryStore telemetry_;
-    RpcClient client_;
-    RpcServer server_;
 
     StartupStageHook startup_stage_hook_;
     std::atomic_bool control_plane_online_{};
     uint64_t startup_unix_ms_{};
-    std::jthread connectivity_worker_;
-    // Guards no state: the connectivity worker's wait lock.
-    Mutex connectivity_wait_mutex_;
-    std::condition_variable_any connectivity_wait_cv_;
-    // One dial-back probe in flight per requesting peer, and one per 10 s: a
-    // peer cannot use the probe to make this node hammer an address.
-    Mutex dial_back_mutex_;
-    std::map<NodeId, Clock::time_point> dial_back_last_ MACHA_GUARDED_BY(dial_back_mutex_);
+
+    // The roster as the watch last told it, read only on the watch's strand.
+    std::map<NodeId, NodeInfo> roster_told_;
+    std::optional<uint64_t> roster_watch_;
+    // The inbound answer the topology was last moved for; the runtime thread's.
+    std::optional<bool> inbound_applied_;
 
     std::atomic_uint64_t remote_metadata_generation_{};
     // Raises it to `generation` if higher, never lowers it: two readers that
@@ -148,50 +115,53 @@ class NodeRuntime : public ClusterNode {
     std::atomic_uint64_t advertised_cache_hits_{};
     std::atomic_uint64_t advertised_cache_misses_{};
     std::atomic_uint64_t advertised_cache_evictions_{};
-    std::atomic_uint32_t telemetry_peers_known_{1};
-    std::atomic_uint32_t telemetry_peers_active_{1};
-    std::atomic_uint64_t telemetry_demand_{1};
-    std::jthread maintenance_;
-    std::jthread telemetry_worker_;
-    // Guards no state: the telemetry worker's wait lock.
-    Mutex telemetry_wait_mutex_;
-    std::condition_variable_any telemetry_wait_cv_;
-    // Guards no state: the maintenance thread's wait lock.
-    Mutex maintenance_wait_mutex_;
-    std::condition_variable_any maintenance_wait_cv_;
+    std::jthread runtime_;
+    // Guards no state: the runtime thread's wait lock.
+    Mutex runtime_wait_mutex_;
+    std::condition_variable_any runtime_wait_cv_;
+    std::atomic_uint64_t runtime_demand_{};
     std::atomic_bool started_{};
     std::atomic_bool outbound_calls_stopped_{};
 
+    // Dannan's node: the transport, the roster, telemetry, public connectivity and
+    // the inbound answer. Built before storage and metadata, so the node is
+    // reachable while its durable state recovers; built after everything its
+    // callbacks read, and destroyed before it. Requests reach `routes`.
+    DannanHost host_;
+    // Views over the node's roster and telemetry; this node's own figures are
+    // Membership's.
+    Membership members_;
+    TelemetryStore telemetry_;
 
     bool all_local_state_ready() const noexcept;
 
-    void bind_control_routes();
-    void route(MessageType, MessageRoutes::Handler);
-    void unbind_routes();
-    void loop(std::stop_token);
+    // Builds the node's configuration: Macha's, with what only this node gives it
+    // (version, planes, telemetry fields, the inbound journal fields).
+    dannan::NodeConfig node_config();
+    // The hosted telemetry fields of this node's next record.
+    void write_telemetry(dannan::status::Telemetry&) const;
+    // A peer's metadata notice, on its session: must not wait.
+    void on_metadata_notice(const RpcMessage& notice);
+    // A change to the active roster, on the watch's strand: topology on a place,
+    // capability or Macha advert change, metadata on a higher generation.
+    void on_roster_change(const dannan::RosterChange&);
+    // Each heartbeat or wake: the readiness planes, the advertised endpoint, the
+    // inbound answer, and the generation heard of.
+    void runtime_loop(std::stop_token);
+    void mirror_readiness();
+    void follow_self();
+    void follow_inbound();
     void settle_remote_generation();
-    // Public-endpoint discovery, then (for `inbound_capable: auto`) the
-    // dial-back resolution state machine, for the node's life.
-    void connectivity_loop(std::stop_token);
-    bool resolve_hosts_extents_for(bool inbound_capable) const;
-    void apply_inbound_resolution(bool inbound_capable, std::string source);
-    void persist_inbound_resolution(const InboundResolution&) const
-        MACHA_REQUIRES(inbound_persist_mutex_);
-    void refuse_impossible_cluster() const;
-    void exchange(const Endpoint&);
-    void exchange(const NodeInfo&);
-    void merge(std::span<const uint8_t>);
-    void refresh_telemetry();
-    void telemetry_loop(std::stop_token);
+    void wake_runtime();
     std::chrono::milliseconds stall_notice_for(MessageType) const;
     std::chrono::milliseconds no_progress_deadline_for(MessageType) const;
+    std::chrono::milliseconds deadline_for(MessageType) const;
+    void refuse_when_stopping() const;
 
   public:
     // The caller holds state_path's StorageLock for this node's life.
-    // `telemetry_now` is the steady time telemetry ages are measured by.
-    NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, RetainedMemoryLedger&,
-                TranscodeRateBook&, MessageRoutes&, NodeEvents&, RpcLinks&,
-                StartupStageHook startup_stage_hook, TelemetryStore::Now telemetry_now);
+    NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, TranscodeRateBook&,
+                MessageRoutes&, NodeEvents&, StartupStageHook startup_stage_hook);
     ~NodeRuntime() override;
     void start();
     void request_stop();
@@ -240,13 +210,9 @@ class NodeRuntime : public ClusterNode {
     }
     // A no-dial notification on established routes; never blocks. Returns
     // how many peers it was queued for.
-    size_t broadcast_best_effort(const RpcMessage& message, FrameType frame_type) {
-        return client_.broadcast_best_effort(message, frame_type);
-    }
+    size_t broadcast_best_effort(const RpcMessage& message, FrameType frame_type);
     // The same, never skipped because the route table was momentarily in use.
-    size_t broadcast_notify(const RpcMessage& message, FrameType frame_type) {
-        return client_.broadcast_notify(message, frame_type);
-    }
+    size_t broadcast_notify(const RpcMessage& message, FrameType frame_type);
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType) override;
@@ -277,10 +243,9 @@ class NodeRuntime : public ClusterNode {
     }
     bool apply_identity_reset(const IdentityAssociationReset&);
     void propagate_identity_reset(const IdentityAssociationReset&);
-    std::vector<IdentityAssociationReset> identity_resets() const {
-        return members_.identity_resets();
-    }
+    std::vector<IdentityAssociationReset> identity_resets() const;
     PublicConnectivityStatus public_connectivity_status() const;
+    // Waits for the node's refresh, within the connectivity timeouts.
     PublicConnectivityStatus refresh_public_connectivity(bool probe, bool force_probe = false);
     InboundResolution inbound_resolution() const;
     bool inbound_capable() const {
@@ -289,17 +254,16 @@ class NodeRuntime : public ClusterNode {
     bool hosts_extents() const {
         return inbound_resolution().hosts_extents;
     }
-    RpcStats rpc_stats() const {
-        return client_.stats();
+    RpcStats rpc_stats() const;
+    std::optional<std::chrono::milliseconds> peer_latency(const NodeId& peer) const override;
+    std::map<NodeId, std::chrono::milliseconds> peer_latencies() const;
+    RpcServerWorkStats rpc_server_work_stats() const;
+    // The node beneath, for Status and the parts that will speak to it directly.
+    dannan::Node& node() noexcept {
+        return host_.node();
     }
-    std::optional<std::chrono::milliseconds> peer_latency(const NodeId& peer) const override {
-        return client_.peer_latency(peer);
-    }
-    std::map<NodeId, std::chrono::milliseconds> peer_latencies() const {
-        return client_.peer_latencies();
-    }
-    RpcServerWorkStats rpc_server_work_stats() const {
-        return server_.work_stats();
+    const dannan::Node& node() const noexcept {
+        return host_.node();
     }
 };
 } // namespace macha
