@@ -209,7 +209,33 @@ bool Membership::set_flags(bool inbound_capable, bool hosts_extents) {
     self_.seen_unix_ms = unix_ms();
     return true;
 }
+void Membership::follow(std::shared_ptr<const MembershipView> view) {
+    Lock g(m_);
+    view_ = std::move(view);
+}
+
+std::shared_ptr<const MembershipView> Membership::view() const {
+    Lock g(m_);
+    return view_;
+}
+
+namespace {
+const NodeInfo* find_peer(const std::vector<NodeInfo>& nodes, const NodeId& id) {
+    for (const auto& node : nodes)
+        if (node.id == id)
+            return &node;
+    return nullptr;
+}
+} // namespace
+
 bool Membership::inbound_capable(const NodeId& id) const {
+    if (const auto followed = view()) {
+        if (id == self().id)
+            return node_inbound_capable(self());
+        const auto peers = followed->peers();
+        const auto* found = find_peer(peers.all, id);
+        return !found || node_inbound_capable(*found);
+    }
     Lock g(m_);
     if (id == self_.id)
         return node_inbound_capable(self_);
@@ -217,6 +243,13 @@ bool Membership::inbound_capable(const NodeId& id) const {
     return found == nodes_.end() || node_inbound_capable(found->second.info);
 }
 bool Membership::hosts_extents(const NodeId& id) const {
+    if (const auto followed = view()) {
+        if (id == self().id)
+            return node_hosts_extents(self());
+        const auto peers = followed->peers();
+        const auto* found = find_peer(peers.all, id);
+        return !found || node_hosts_extents(*found);
+    }
     Lock g(m_);
     if (id == self_.id)
         return node_hosts_extents(self_);
@@ -227,6 +260,8 @@ void Membership::observe(NodeInfo n, bool direct) {
     if (n.host.empty() || !n.port)
         return;
     Lock g(m_);
+    if (view_)
+        return;
     if (n.id == self_.id)
         return;
     for (const auto& [_, reset] : identity_resets_) {
@@ -315,6 +350,21 @@ std::vector<IdentityAssociationReset> Membership::identity_resets() const {
     return out;
 }
 MembershipSnapshot Membership::snapshot() const {
+    if (const auto followed = view()) {
+        auto peers = followed->peers();
+        auto self_now = self();
+        self_now.seen_unix_ms = unix_ms();
+        MembershipSnapshot out;
+        out.all.reserve(peers.all.size() + 1);
+        out.active.reserve(peers.active.size() + 1);
+        out.all.push_back(self_now);
+        out.active.push_back(std::move(self_now));
+        for (auto& node : peers.all)
+            out.all.push_back(std::move(node));
+        for (auto& node : peers.active)
+            out.active.push_back(std::move(node));
+        return out;
+    }
     Lock g(m_);
     const auto now = Clock::now();
     const auto seen = unix_ms();
@@ -334,6 +384,8 @@ MembershipSnapshot Membership::snapshot() const {
 }
 
 std::vector<NodeInfo> Membership::all() const {
+    if (view())
+        return snapshot().all;
     Lock g(m_);
     std::vector<NodeInfo> out{self_};
     out[0].seen_unix_ms = unix_ms();
@@ -344,6 +396,8 @@ std::vector<NodeInfo> Membership::all() const {
 }
 
 std::vector<NodeInfo> Membership::active() const {
+    if (view())
+        return snapshot().active;
     Lock g(m_);
     const auto now = Clock::now();
     std::vector<NodeInfo> out{self_};
@@ -356,6 +410,8 @@ std::vector<NodeInfo> Membership::active() const {
 }
 
 bool Membership::directly_reachable(const NodeId& id) const {
+    if (const auto followed = view())
+        return id == self().id || followed->directly_reachable(id);
     Lock g(m_);
     if (id == self_.id)
         return true;
@@ -366,6 +422,8 @@ bool Membership::directly_reachable(const NodeId& id) const {
 
 size_t Membership::forget_unseen() {
     Lock g(m_);
+    if (view_)
+        return 0;
     const auto horizon = forget_after_;
     const auto now = Clock::now();
     const auto wall = unix_ms();
@@ -383,6 +441,8 @@ size_t Membership::forget_unseen() {
 }
 
 bool Membership::all_known_reachable() const {
+    if (const auto followed = view())
+        return followed->all_known_reachable();
     Lock g(m_);
     const auto now = Clock::now();
     const bool self_capable = node_inbound_capable(self_);

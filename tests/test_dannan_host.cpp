@@ -100,6 +100,51 @@ MACHA_TEST("dannan_host", test_a_call_reaches_the_peers_route_and_answers) {
     a.stop();
 }
 
+// Membership following Dannan's roster: the peer that bootstrapped is active and directly
+// reachable, this node's own entry is Membership's with its figures, and gossip handed to
+// observe() changes nothing, the roster being the node's.
+MACHA_TEST("dannan_host", test_membership_follows_the_nodes_roster) {
+    TempDir dir;
+    const auto key = dir.path() / "cluster.key";
+    write_key(key);
+    const auto port_a = free_port();
+    const auto port_b = free_port();
+    MessageRoutes routes_a, routes_b;
+    DannanHost a(host_config(dir.path() / "a", key, port_a), routes_a, 2, {});
+    DannanHost b(host_config(dir.path() / "b", key, port_b, {{"127.0.0.1", port_a}}), routes_b, 2,
+                 {});
+    a.start();
+    b.start();
+
+    auto self = node_info_from(a.node().nodes().self());
+    self.capacity = 1000;
+    Membership members(self, 30s);
+    members.follow(std::make_shared<DannanMembership>(a.node().nodes(), a.node().nodes().self().id));
+    const auto peer_b = macha_id(b.node().nodes().self().id);
+    REQUIRE(wait_until([&] {
+        const auto active = members.active();
+        return active.size() == 2 && active[1].id == peer_b;
+    }, 10s));
+    REQUIRE(members.active().front().id == self.id);
+    REQUIRE(members.active().front().capacity == 1000);
+    REQUIRE(members.all().size() == 2);
+    REQUIRE(wait_until([&] { return members.directly_reachable(peer_b); }, 10s));
+    REQUIRE(members.directly_reachable(self.id));
+    REQUIRE(wait_until([&] { return members.all_known_reachable(); }, 10s));
+
+    NodeInfo stranger;
+    stranger.id.bytes.fill(9);
+    stranger.host = "198.51.100.1";
+    stranger.port = 7437;
+    stranger.seen_unix_ms = unix_ms();
+    members.observe(stranger, true);
+    REQUIRE(members.all().size() == 2);
+    REQUIRE(members.forget_unseen() == 0);
+
+    b.stop();
+    a.stop();
+}
+
 // A call whose deadline passes fails with the reason, and the host stops with calls
 // still pending.
 MACHA_TEST("dannan_host", test_a_call_past_its_deadline_fails_and_stop_does_not_wait) {

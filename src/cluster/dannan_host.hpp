@@ -6,6 +6,7 @@
 // each caller names. Requests reach Macha's MessageRoutes, so every part binds and
 // unbinds its handlers as before.
 
+#include "cluster/membership.hpp"
 #include "cluster/message_routes.hpp"
 #include "cluster/net.hpp"
 #include "types.hpp"
@@ -24,6 +25,20 @@
 #include <vector>
 
 namespace macha {
+
+// Dannan's roster as Macha's Membership reads it: each record as NodeInfo, this node
+// left to Membership itself. Lives no longer than the node.
+class DannanMembership final : public MembershipView {
+    const dannan::Nodes& nodes_;
+    const dannan::identity::NodeId self_;
+
+  public:
+    DannanMembership(const dannan::Nodes& nodes, dannan::identity::NodeId self)
+        : nodes_(nodes), self_(self) {}
+    MembershipSnapshot peers() const override;
+    bool directly_reachable(const NodeId& id) const override;
+    bool all_known_reachable() const override;
+};
 
 class DannanHost {
   public:
