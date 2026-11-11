@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "acquisition/cluster_jobs.hpp"
+#include "cluster/call_deadline.hpp"
 
 #include "cluster/cluster.hpp"
 #include "cluster/rpc_refusal.hpp"
@@ -98,7 +99,7 @@ void ClusterJobView::poll(const NodeInfo& info) {
     fresh.host = info.host;
     bool reached = false;
     try {
-        auto reply = node_.call(info, MessageType::get_torrent_jobs, {}, FrameType::loader);
+        auto reply = node_.call(info, MessageType::get_torrent_jobs, {}, FrameType::loader, call_deadline::control);
         reached = true;
         if (reply.message.type == MessageType::torrent_jobs_reply) {
             auto parsed = parse_payload(reply);
@@ -125,7 +126,7 @@ void ClusterJobView::poll(const NodeInfo& info) {
         Log::debug("cluster job view: torrent query to " + info.host + ": " + error.what());
     }
     try {
-        auto reply = node_.call(info, MessageType::get_ingest_jobs, {}, FrameType::loader);
+        auto reply = node_.call(info, MessageType::get_ingest_jobs, {}, FrameType::loader, call_deadline::control);
         reached = true;
         if (reply.message.type == MessageType::ingest_jobs_reply) {
             auto parsed = parse_payload(reply);
@@ -221,7 +222,7 @@ TorrentActionResult ClusterJobView::torrent_action(std::string_view id, std::str
     try {
         // Called by the torrent coordinator's retries: loader work.
         auto reply = node_.call(*peer, MessageType::torrent_job_action, json_bytes(Json(std::move(request))),
-                                FrameType::loader);
+                                FrameType::loader, call_deadline::control);
         if (reply.message.type != MessageType::torrent_job_action_reply) {
             result.unreachable = true;
             return result;
@@ -326,7 +327,7 @@ std::optional<Json> ClusterJobView::ingest_job_detail(std::string_view id) {
         try {
             // A user's read through the API: viewer work.
             auto reply = node_.call(*peer, MessageType::get_ingest_jobs,
-                                    json_bytes(Json(std::move(request))), FrameType::foreground);
+                                    json_bytes(Json(std::move(request))), FrameType::foreground, call_deadline::control);
             if (reply.message.type == MessageType::ingest_jobs_reply) {
                 auto parsed = parse_payload(reply);
                 if (const auto* detail = parsed.find("job_api"); detail && detail->isObject()) {
@@ -378,7 +379,7 @@ IngestActionResult ClusterJobView::ingest_action(std::string_view id, std::strin
     try {
         // A user's action through the API: viewer work.
         auto reply = node_.call(*peer, MessageType::ingest_job_action, json_bytes(Json(std::move(request))),
-                                FrameType::foreground);
+                                FrameType::foreground, call_deadline::control);
         if (reply.message.type != MessageType::ingest_job_action_reply) {
             result.unreachable = true;
             return result;
@@ -433,7 +434,7 @@ ClusterJobView::IngestSubmitResult ClusterJobView::submit_ingest(const NodeId& n
     try {
         // A user's submission through the API: viewer work.
         const auto reply = node_.call(*peer, MessageType::submit_ingest_job,
-                                      json_bytes(Json(std::move(request))), FrameType::foreground);
+                                      json_bytes(Json(std::move(request))), FrameType::foreground, call_deadline::control);
         if (reply.message.type == MessageType::ingest_submit_reply) {
             const auto parsed = parse_payload(reply);
             if (const auto* id = parsed.find("id"); id && id->isString() && !id->asString().empty()) {

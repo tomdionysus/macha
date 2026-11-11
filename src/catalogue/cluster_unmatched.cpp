@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "catalogue/cluster_unmatched.hpp"
+#include "cluster/call_deadline.hpp"
 
 #include "cluster/cluster.hpp"
 #include "json.hpp"
@@ -114,7 +115,7 @@ void ClusterUnmatchedView::poll(const NodeInfo& info) {
     try {
         // Background upkeep of a list the user reads later: loader work.
         const auto reply = node_.call(info, MessageType::get_unmatched_hints,
-                                      json_bytes(Json(std::move(request))), FrameType::loader);
+                                      json_bytes(Json(std::move(request))), FrameType::loader, call_deadline::control);
         if (reply.message.type != MessageType::unmatched_hints_reply) return;
         const auto parsed = Json::parse(std::string_view(
             reinterpret_cast<const char*>(reply.message.payload.data()), reply.message.payload.size()));

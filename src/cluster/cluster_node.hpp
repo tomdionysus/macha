@@ -43,19 +43,23 @@ class ClusterNode {
     virtual Membership& membership() = 0;
     virtual const Membership& membership() const = 0;
 
-    // One call to `peer`, returning its reply. Throws when the call cannot be
-    // placed, fails, or makes no progress within the node's deadline for it.
+    // One call to `peer`, returning its reply, ending at the latest when `deadline`
+    // passes (call_deadline.hpp names them). Throws when the call cannot be placed,
+    // fails, passes its deadline, or makes no progress for the node's no-progress
+    // budget.
     static constexpr Waits call_waits = Waits::network | Waits::locks;
     static constexpr ThreadSafety call_safety = ThreadSafety::thread_safe;
     virtual RpcReply call(const NodeInfo& peer, MessageType, std::span<const uint8_t> payload,
-                          FrameType) = 0;
+                          FrameType, std::chrono::milliseconds deadline) = 0;
 
     // Places one call to `peer` and returns without its reply; may dial a
-    // lane first. Throws when the call cannot be placed.
+    // lane first. The reply, or why none came, by `deadline` at the latest.
+    // Throws when the call cannot be placed.
     static constexpr Waits call_async_waits = Waits::network | Waits::locks;
     static constexpr ThreadSafety call_async_safety = ThreadSafety::thread_safe;
     virtual AsyncRpc call_async(const NodeInfo& peer, MessageType,
-                                std::span<const uint8_t> payload, FrameType) = 0;
+                                std::span<const uint8_t> payload, FrameType,
+                                std::chrono::milliseconds deadline) = 0;
 
     // The smoothed round trip to `peer`, once one has been measured.
     static constexpr Waits peer_latency_waits = Waits::none;

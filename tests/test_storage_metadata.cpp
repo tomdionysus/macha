@@ -4421,7 +4421,8 @@ MACHA_TEST("storage_metadata", test_metadata_identity_rpc) {
     auto found = std::find_if(peers.begin(), peers.end(),
                               [&](const NodeInfo& peer) { return peer.id == n2.node_id(); });
     REQUIRE(found != peers.end());
-    auto reply = n1.call(*found, MessageType::get_metadata_identity, {}, FrameType::speculative);
+    auto reply = n1.call(*found, MessageType::get_metadata_identity, {}, FrameType::speculative,
+                         call_deadline::metadata);
     REQUIRE(reply.message.type == MessageType::metadata_identity_reply);
     CHECK(reply.message.payload.size() == sizeof(uint64_t) + 32);
     Reader reader(reply.message.payload);

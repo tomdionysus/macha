@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "cluster/call_deadline.hpp"
 #include "catalogue/catalogue.hpp"
 #include "config.hpp"
 #include "crypto.hpp"

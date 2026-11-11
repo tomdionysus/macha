@@ -1361,8 +1361,8 @@ MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recov
     REQUIRE(peer.wait_local_state_ready(10s));
 
     const Endpoint recovering_endpoint{"127.0.0.1", recovering_config.port};
-    CHECK(peer.call(recovering_endpoint, MessageType::ping).message.type == MessageType::ok);
-    CHECK(peer.call(recovering_endpoint, MessageType::members).message.type ==
+    CHECK(peer.call(recovering_endpoint, MessageType::ping, {}, call_deadline::presence_probe).message.type == MessageType::ok);
+    CHECK(peer.call(recovering_endpoint, MessageType::members, {}, call_deadline::control).message.type ==
           MessageType::members_reply);
     REQUIRE(wait_until([&] {
         const auto all = recovering.membership().all();
@@ -3196,7 +3196,7 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     request.bytes(bytes);
     const Endpoint endpoint{"127.0.0.1", server_config.port};
     auto placed = client.call(endpoint, MessageType::put_object_deferred, request.data(),
-                              FrameType::read_ahead);
+                              FrameType::read_ahead, call_deadline::object_transfer);
     REQUIRE(placed.message.type == MessageType::ok);
     Reader placed_reply(placed.message.payload);
     NodeId acknowledged_epoch{placed_reply.fixed<16>()};
@@ -3220,12 +3220,13 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
         wrong_epoch = random_node_id();
     auto stale = barrier_payload(wrong_epoch);
     auto rejected =
-        client.call(endpoint, MessageType::object_durability_barrier, stale, FrameType::read_ahead);
+        client.call(endpoint, MessageType::object_durability_barrier, stale, FrameType::read_ahead,
+                    call_deadline::object_transfer);
     CHECK(rejected.message.type == MessageType::error);
 
     auto current = barrier_payload(acknowledged_epoch);
     auto durable = client.call(endpoint, MessageType::object_durability_barrier, current,
-                               FrameType::read_ahead);
+                               FrameType::read_ahead, call_deadline::object_transfer);
     CHECK(durable.message.type == MessageType::ok);
     client.stop();
     server.stop();

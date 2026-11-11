@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "api/status_api.hpp"
+#include "cluster/call_deadline.hpp"
 #include "service/maintenance.hpp"
 #include "subsystem/subsystem_registry.hpp"
 
@@ -1463,7 +1464,7 @@ HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId
         std::string error;
         if (!reachable) {
             try {
-                reachable = node_.call(member, MessageType::ping).message.type == MessageType::ok;
+                reachable = node_.call(member, MessageType::ping, {}, call_deadline::presence_probe).message.type == MessageType::ok;
             } catch (const std::exception& e) {
                 error = e.what();
             }
