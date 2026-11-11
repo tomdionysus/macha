@@ -381,13 +381,20 @@ class TestService {
     }
 };
 
+// `count` nodes active, each with its storage capacity known: a peer's figures reach
+// this node in the exchange after it joins, and placement weighs by them.
+inline bool capacities_known(const std::vector<NodeInfo>& active, size_t count) {
+    return active.size() == count &&
+           std::all_of(active.begin(), active.end(),
+                       [](const NodeInfo& node) { return node.capacity > 0; });
+}
+
 // The root parts a NodeRuntime takes, built before it (a base is built first).
 struct BareNodeResources {
     NodeResources resources;
     NodeIdentity identity;
     RecoveryProgress progress;
     MessageRoutes routes;
-    NetworkLinks links;
     LocalState::StageHook stage_hook;
     BareNodeResources(const Config& config, ClusterKeys keys, LocalState::StageHook hook)
         : resources(config), identity(config.state_path, std::move(keys)),
@@ -402,12 +409,10 @@ struct BareNodeResources {
 class BareNode : public BareNodeResources, public NodeRuntime {
   public:
     BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {},
-             TelemetryStore::Now telemetry_now = {},
              std::chrono::milliseconds durability_batch_window = test_durability_window)
         : BareNodeResources(config, keys, hook),
-          NodeRuntime(std::move(config), identity, progress, resources.memory,
-                      resources.transcode_rates, routes,
-                      resources.events, links, std::move(hook), std::move(telemetry_now)),
+          NodeRuntime(std::move(config), identity, progress, resources.transcode_rates, routes,
+                      resources.events, std::move(hook)),
           durability_batch_window_(durability_batch_window) {}
     ~BareNode() { stop(); }
     BareNode(const BareNode&) = delete;

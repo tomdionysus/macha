@@ -131,6 +131,12 @@ DannanHost::DannanHost(dannan::NodeConfig config, MessageRoutes& routes, size_t 
 
 DannanHost::~DannanHost() {
     stop();
+    // The node goes first, whole, while the io threads still run: its client's
+    // teardown waits for work only they can finish.
+    node_.reset();
+    work_.reset();
+    io_.stop();
+    io_threads_.clear();
 }
 
 void DannanHost::start() {
@@ -152,14 +158,8 @@ void DannanHost::cancel_outbound_calls() {
 void DannanHost::stop() {
     if (stopped_.exchange(true))
         return;
-    // The node goes first, whole, while the io threads still run: its client's stop
-    // waits for work only they can finish.
     if (node_)
         node_->stop();
-    node_.reset();
-    work_.reset();
-    io_.stop();
-    io_threads_.clear();
 }
 
 dannan::membership::NodeRecord DannanHost::record_for(const NodeInfo& peer) const {
@@ -181,10 +181,19 @@ dannan::membership::NodeRecord DannanHost::record_for(const NodeInfo& peer) cons
 AsyncRpc DannanHost::wrap(std::shared_ptr<std::promise<RpcReply>> promise,
                           std::shared_ptr<dannan::net::CallHandle> handle) {
     auto future = promise->get_future();
+    // Dannan reads max() while the call is not yet placed (its dial runs); Macha's
+    // callers read idleness from when the call was made, so a dial counts against
+    // their stall budgets as long as it lasts, no longer.
+    const auto made = Clock::now();
     return AsyncRpc(
         std::move(future), [handle] { handle->cancel(); }, [handle] { handle->abort(); },
         [handle](FrameType frame) { handle->promote(dannan_frame(frame)); },
-        [handle] { return handle->idle_for(); });
+        [handle, made] {
+            const auto idle = handle->idle_for();
+            if (idle != std::chrono::milliseconds::max())
+                return idle;
+            return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - made);
+        });
 }
 
 namespace {

@@ -64,7 +64,6 @@ class Service {
     Clock::time_point constructed_{Clock::now()};
     // Before node_, which is constructed after them.
     std::shared_ptr<MaintenanceClock> clock_;
-    std::shared_ptr<RpcLinks> links_;
     MaintenanceTraceHook maintenance_trace_;
     LifecycleHook lifecycle_;
     void note_lifecycle(std::string_view event) {
