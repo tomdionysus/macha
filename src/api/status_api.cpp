@@ -868,7 +868,7 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
     // Every supervised thread by name; on a fault each is restarted, escalated or
     // ended according to its kind (supervised.hpp).
     Json::Array threads;
-    for (const auto& status : supervised_thread_statuses()) {
+    for (const auto& status : node_.thread_statuses()) {
         Json::Object entry;
         entry["name"] = status.name;
         entry["running"] = static_cast<uint64_t>(status.running);

@@ -24,6 +24,7 @@
 #include "auth/users.hpp"
 #include "storage/storage_pool.hpp"
 #include "cluster/telemetry.hpp"
+#include "supervised.hpp"
 #include "cluster/transcode_rates.hpp"
 
 #include <boost/asio/strand.hpp>
@@ -156,6 +157,7 @@ class NodeRuntime : public ClusterNode {
     std::chrono::milliseconds stall_notice_for(MessageType) const;
     std::chrono::milliseconds no_progress_deadline_for(MessageType) const;
     void refuse_when_stopping() const;
+    dannan::Node& readable_node() const;
 
   public:
     // The caller holds state_path's StorageLock for this node's life.
@@ -265,6 +267,8 @@ class NodeRuntime : public ClusterNode {
     std::optional<std::chrono::milliseconds> peer_latency(const NodeId& peer) const override;
     std::map<NodeId, std::chrono::milliseconds> peer_latencies() const;
     RpcServerWorkStats rpc_server_work_stats() const;
+    // Every supervised thread Status lists: Macha's, and the node's that share Macha's names.
+    std::vector<SupervisedThreadStatus> thread_statuses() const;
     // The node beneath, for Status and the parts that will speak to it directly.
     dannan::Node& node() noexcept {
         return host_.node();
