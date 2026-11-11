@@ -1114,7 +1114,7 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
 }
 
 MACHA_FAST_TEST("foundations", test_retained_memory_ledger_preserves_priority_headroom) {
-    RetainedMemoryLedger ledger(100, 10, 30, 10);
+    RetainedMemoryLedger ledger(100, 10, 30, 10, 5);
     auto speculative = ledger.try_acquire(WorkClass::speculative, MemoryOwner::cache, 50);
     REQUIRE(speculative.has_value());
     CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::cache, 1).has_value());
@@ -1143,7 +1143,7 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_never_starves_rpc_rea
     // Publication holds its bytes until a peer confirms the write, and the
     // confirmation must be reassembled into this same ledger. A full
     // durable-lower budget must therefore never block reassembly.
-    RetainedMemoryLedger ledger(100, 10, 30, 10);
+    RetainedMemoryLedger ledger(100, 10, 30, 10, 5);
 
     auto publication = ledger.try_acquire(WorkClass::loader, MemoryOwner::publication, 60);
     REQUIRE(publication.has_value());
@@ -1228,7 +1228,7 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
 }
 
 MACHA_FAST_TEST("foundations", test_retained_memory_ledger_sheds_borrowed_cache_for_viewer) {
-    RetainedMemoryLedger ledger(100, 10, 30, 10);
+    RetainedMemoryLedger ledger(100, 10, 30, 10, 5);
     std::optional<RetainedMemoryLedger::Lease> borrowed;
     borrowed = ledger.try_acquire(WorkClass::loader, MemoryOwner::cache, 90, true,
                                   [&] { borrowed.reset(); });
@@ -1248,7 +1248,7 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_sheds_borrowed_cache_
 }
 
 MACHA_FAST_TEST("foundations", test_retained_memory_ledger_restores_durable_overcommit) {
-    RetainedMemoryLedger ledger(100, 10, 30, 10);
+    RetainedMemoryLedger ledger(100, 10, 30, 10, 5);
     auto restored = ledger.restore(WorkClass::loader, MemoryOwner::fuse_operation, 120);
     const auto overcommitted = ledger.stats();
     CHECK(overcommitted.used_bytes == 120);
