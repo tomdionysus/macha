@@ -177,6 +177,18 @@ NodeTelemetry decode_node_telemetry(std::span<const uint8_t>);
 Bytes encode_telemetry_set(const std::vector<NodeTelemetry>&);
 std::vector<NodeTelemetry> decode_telemetry_set(std::span<const uint8_t>);
 
+// Every node's telemetry as the node beneath Macha holds it. While a TelemetryStore
+// follows one, its records are the source's.
+class TelemetrySource {
+  public:
+    virtual ~TelemetrySource() = default;
+    virtual std::optional<NodeTelemetry> local() const = 0;
+    virtual std::vector<NodeTelemetry> all() const = 0;
+    virtual std::vector<NodeTelemetry> persisted() const = 0;
+    virtual void persist() = 0;
+    virtual std::vector<TelemetryView> views(std::chrono::milliseconds fresh_for) const = 0;
+};
+
 class TelemetryStore {
   public:
     // The steady time a record's age is measured by; empty reads Clock::now().
@@ -205,8 +217,13 @@ class TelemetryStore {
     std::string node_name_ MACHA_GUARDED_BY(mutex_);
     std::optional<TrafficTotals> previous_traffic_ MACHA_GUARDED_BY(mutex_);
     Clock::time_point previous_traffic_at_ MACHA_GUARDED_BY(mutex_){};
+    std::shared_ptr<TelemetrySource> source_ MACHA_GUARDED_BY(mutex_);
+
+    std::shared_ptr<TelemetrySource> source() const;
 
   public:
+    // From here every record is the source's. Set before the node starts.
+    void follow(std::shared_ptr<TelemetrySource>);
     // Takes effect from the next sample.
     void set_node_name(std::string name) {
         Lock lock(mutex_);
