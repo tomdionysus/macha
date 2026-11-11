@@ -328,6 +328,7 @@ set(MACHA_CORE_SOURCES
     src/cluster/dannan_bridge.cpp
     src/cluster/rpc_wait.cpp
     src/cluster/dannan_host.cpp
+    src/cluster/telemetry_bridge.cpp
     src/cluster/cluster.cpp
     src/cluster/distributed_store.cpp
     src/cluster/replica_selector.cpp
