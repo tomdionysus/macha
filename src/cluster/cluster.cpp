@@ -141,6 +141,7 @@ dannan::NodeConfig NodeRuntime::node_config() {
         config.gateway = std::make_shared<dannan::reach::UpnpGateway>();
     // Service's recorder is the one writer of the observation log.
     config.observation_interval = std::chrono::milliseconds(0);
+    config.log = macha_log_sink();
     return config;
 }
 
@@ -533,8 +534,10 @@ void NodeRuntime::follow_inbound() {
     const bool first = !inbound_applied_;
     inbound_applied_ = capable;
     const bool hosts = resolve_hosts_extents(cfg_, capable);
-    host_.node().nodes().advertise(advert::hosts_extents,
-                                   dannan::membership::u64_advert(hosts ? 1 : 0));
+    if (hosts)
+        host_.node().nodes().advertise(advert::hosts_extents, dannan::net::Bytes{1});
+    else
+        host_.node().nodes().withdraw(advert::hosts_extents);
     if (members_.set_flags(capable, hosts) && !first)
         events_.notify(NodeEvent::topology);
 }

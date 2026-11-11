@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/dannan_bridge.hpp"
 
+#include "log.hpp"
+
 #include <algorithm>
 
 #include <unistd.h>
@@ -205,6 +207,33 @@ InboundResolution macha_inbound(const Config& config, const dannan::reach::Inbou
     return out;
 }
 
+namespace {
+// The two enums have equal values, all to error.
+LogLevel macha_level(dannan::status::LogLevel level) noexcept {
+    return static_cast<LogLevel>(static_cast<unsigned char>(level));
+}
+
+class MachaLogSink final : public dannan::status::LogSink {
+  public:
+    bool enabled(dannan::status::LogLevel level) const noexcept override {
+        return Log::enabled(macha_level(level));
+    }
+    void write(dannan::status::LogLevel level, std::string_view scope,
+               std::string_view message) override {
+        std::string line;
+        line.reserve(scope.size() + 2 + message.size());
+        if (!scope.empty())
+            line.append(scope).append(": ");
+        line.append(message);
+        Log::emit(macha_level(level), line);
+    }
+};
+} // namespace
+
+std::shared_ptr<dannan::status::LogSink> macha_log_sink() {
+    return std::make_shared<MachaLogSink>();
+}
+
 dannan::net::Message dannan_message(const RpcMessage& message) {
     dannan::net::Message out;
     out.type = dannan_type(message.type);
@@ -229,7 +258,7 @@ NodeInfo node_info_from(const dannan::membership::NodeRecord& record) {
     node.metadata_write_replicas_required =
         static_cast<uint32_t>(record.advert_u64(advert::metadata_write_replicas).value_or(0));
     node.flags = node_flags_for(record.inbound_capable(),
-                                record.advert_u64(advert::hosts_extents).value_or(0) != 0);
+                                record.advert(advert::hosts_extents).has_value());
     return node;
 }
 
