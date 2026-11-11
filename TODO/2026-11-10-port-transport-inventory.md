@@ -21,8 +21,9 @@ ambiguous hits read; calls through receivers not named `node_`, `node`, `n_`, `n
   `node.stop()`. `Node::request_stop` exists.
 - **Readiness** (F5): a sixth plane, `local_services`, marked where `service.cpp` marks recovery complete
   (`Readiness::hold_until_marked`, `mark_complete`); Status reads the five planes by name.
-- **metadata_notice** registered notification and fast control, through `Registration::on_session`; its handler
-  never waits (F10).
+- **metadata_notice** registered as a plain notification handled on the session (`Registration::on_session`), read
+  as it arrives ahead of every queue; its handler never waits (F10). Not also fast control: Dannan refuses that
+  combination, and the session path already passes every queue.
 - **Version**: `NodeConfig::version = kServerVersion` (F11). `SupervisorOptions::system_name = "macha"`.
   `inbound_journal_fields` adds ` hosts_extents=`. UPnP: `NodeConfig::gateway = make_shared<reach::UpnpGateway>()` (F4).
 - **Memory** (F18): keep Macha's `validate` as the one fit, pass its results, `memory_limit_bytes` 0.

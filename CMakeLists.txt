@@ -325,6 +325,7 @@ set(MACHA_CORE_SOURCES
     src/cluster/placement.cpp
     src/cluster/membership.cpp
     src/cluster/net.cpp
+    src/cluster/dannan_bridge.cpp
     src/cluster/cluster.cpp
     src/cluster/distributed_store.cpp
     src/cluster/replica_selector.cpp
@@ -631,6 +632,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_observation.cpp
         tests/test_baselines.cpp
         tests/test_maintenance_trace.cpp
+        tests/test_dannan_bridge.cpp
         tests/test_presence.cpp
         tests/test_contract.cpp
         tests/test_absent_nodes.cpp
