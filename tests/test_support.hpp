@@ -563,6 +563,7 @@ class TestNode {
     TestNode& operator=(const TestNode&) = delete;
 
     const std::filesystem::path& path() const noexcept { return temp_.path(); }
+    const std::filesystem::path& keyfile() const noexcept { return keyfile_; }
     const ClusterKeys& keys() const noexcept { return keys_; }
     Config& config() noexcept { return config_; }
     const Config& config() const noexcept { return config_; }
