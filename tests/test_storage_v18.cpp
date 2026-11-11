@@ -1006,7 +1006,7 @@ MACHA_TEST("storage_v18", test_a_busy_peer_still_says_what_it_does_not_hold) {
         writer.fixed(held.bytes);
         writer.fixed(absent.bytes);
         const auto reply = a.node().call(peer, MessageType::have_valid_objects, writer.data(),
-                                         FrameType::speculative);
+                                         FrameType::speculative, call_deadline::presence_probe);
         REQUIRE(reply.message.type == MessageType::have_valid_objects_reply);
         Reader reader(reply.message.payload);
         REQUIRE(reader.u32() == 2);

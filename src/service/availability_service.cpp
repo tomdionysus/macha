@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/availability_service.hpp"
+#include "cluster/call_deadline.hpp"
 
 #include "cluster/cluster.hpp"
 #include "cluster/distributed_store.hpp"
@@ -85,7 +86,7 @@ class RemoteTrie final : public TrieSource {
     Bytes ask(const TrieQuestion& question) {
         const auto started = Clock::now();
         const auto reply = node_.call(peer_, MessageType::trie_diff,
-                                      encode_trie_question(question), FrameType::speculative);
+                                      encode_trie_question(question), FrameType::speculative, call_deadline::presence_probe);
         ++spent_.questions;
         spent_.bytes += reply.message.payload.size();
         spent_.waited += Clock::now() - started;

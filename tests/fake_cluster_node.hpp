@@ -87,13 +87,13 @@ class FakeClusterNode final : public ClusterNode {
     }
 
     RpcReply call(const NodeInfo& peer, MessageType type, std::span<const uint8_t> payload,
-                  FrameType frame_type) override {
+                  FrameType frame_type, std::chrono::milliseconds) override {
         auto handler = place(peer, type, payload, frame_type);
         return {peer, answer(handler, type, Bytes(payload.begin(), payload.end()), frame_type)};
     }
 
     AsyncRpc call_async(const NodeInfo& peer, MessageType type, std::span<const uint8_t> payload,
-                        FrameType frame_type) override {
+                        FrameType frame_type, std::chrono::milliseconds) override {
         auto handler = place(peer, type, payload, frame_type);
         auto promise = std::make_shared<std::promise<RpcReply>>();
         auto future = promise->get_future();

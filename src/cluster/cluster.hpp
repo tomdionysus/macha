@@ -155,7 +155,6 @@ class NodeRuntime : public ClusterNode {
     void wake_runtime();
     std::chrono::milliseconds stall_notice_for(MessageType) const;
     std::chrono::milliseconds no_progress_deadline_for(MessageType) const;
-    std::chrono::milliseconds deadline_for(MessageType) const;
     void refuse_when_stopping() const;
 
   public:
@@ -213,15 +212,23 @@ class NodeRuntime : public ClusterNode {
     size_t broadcast_best_effort(const RpcMessage& message, FrameType frame_type);
     // The same, never skipped because the route table was momentarily in use.
     size_t broadcast_notify(const RpcMessage& message, FrameType frame_type);
-    RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
-    RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
-    RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType) override;
-    RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
-    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
-    AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
-    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>,
-                        FrameType) override;
-    AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
+    // Each call names its deadline (call_deadline.hpp); without a frame, the type's.
+    RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload,
+                  std::chrono::milliseconds deadline);
+    RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload,
+                  std::chrono::milliseconds deadline);
+    RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType,
+                  std::chrono::milliseconds deadline) override;
+    RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType,
+                  std::chrono::milliseconds deadline);
+    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload,
+                        std::chrono::milliseconds deadline);
+    AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload,
+                        std::chrono::milliseconds deadline);
+    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType,
+                        std::chrono::milliseconds deadline) override;
+    AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType,
+                        std::chrono::milliseconds deadline);
     // Tells peers this node's accepted metadata changed: advances the
     // announcement epoch, advertises the generation and broadcasts a notice.
     void announce_metadata_generation(uint64_t);
