@@ -63,6 +63,9 @@ Nothing open. Answered 2026-11-08:
    `rpc_cluster/test_rpc_metadata_executor_cancellation_disconnect_and_shutdown`. macOS torrent segfaults are the
    laptop's libraries: ignore there only.
 8. The rest of found-issues, items 5 to 14.
+9. **Status thread names, after the port** (operator, 2026-11-11): the port maps Dannan's threads to Macha's names in
+   Status `threads[]`. Change every client (Core and each client session) to Dannan's real names, announced first,
+   then drop the mapping.
 
 **Reopen on sight:** `credit wait abandoned`; `metadata merge recorded a conflict`; `RPC stalled (control)`; heap
 corruption (now seen on macnessa, 2026-11-06).

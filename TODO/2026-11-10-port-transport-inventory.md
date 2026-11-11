@@ -56,6 +56,17 @@ ambiguous hits read; calls through receivers not named `node_`, `node`, `n_`, `n
 - The old `RpcClient`, `RpcServer`, `SecureChannel`, `MessageAssembler`, Macha's `membership` merge,
   `public_connectivity` and the three loops go when the facade is in and the 52 internal tests are retired.
 
+## Operator's decisions, 2026-11-11
+
+- **Deadlines**: a purpose-named set, each call site naming one: control 2 min, metadata 5 min, object transfer
+  30 min, presence probe 2 min. The no-progress watch still ends a stalled call sooner.
+- **Flag day**: back to back. Install inverbeg, check it starts cleanly alone, then macnessa within minutes;
+  rollback to 0.93.6 on both.
+- **Status thread names**: the facade maps Dannan's threads to Macha's names in `threads[]` (`cluster-telemetry`,
+  `cluster-maintenance`, `cluster-connectivity`; rows with no counterpart dropped). Changing the names in every
+  client to Dannan's is a TODO (`ACTIVE.md`).
+- **Push**: `port/dannan-dagda` is pushed after each tested step.
+
 ## What the facade keeps (its interface), and what retires
 
 Kept, with Dannan behind them: `MessageType` (enumerators by name; values change to 512+n, the transport's own types
