@@ -187,7 +187,9 @@ MACHA_FAST_TEST("root_parts", test_node_resources_yield_the_loader_to_a_recent_v
     config.maintenance.foreground_quiet = 2s;
     config.maintenance.background_concurrency = 8;
     SteppedTime time;
-    NodeResources resources(config, [&] { return time.now(); });
+    NodeBooks books(config);
+    const auto memory = standalone_memory(config);
+    NodeResources resources(config, books, *memory, [&] { return time.now(); });
 
     DiskServiceMonitor monitor(DiskServiceMonitor::Thresholds{25ms, 120ms, 300, 150, 1000});
     monitor.note(2000ms, 4096);

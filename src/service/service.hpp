@@ -70,9 +70,8 @@ class Service {
         if (lifecycle_)
             lifecycle_(event);
     }
-    // Built, and stopped, before the node that waits on them.
-    NodeResources resources_;
-    // After resources_, whose lock it reads the state path under.
+    // Held first: no state file is read before this process owns state_path.
+    StorageLock state_lock_;
     NodeIdentity identity_;
     RecoveryProgress progress_;
     // Inbound requests by message type; each part binds what it answers.
@@ -80,7 +79,10 @@ class Service {
     // Local recovery's stages, reported as the node's are.
     LocalState::StageHook recovery_stage_hook_;
     std::chrono::milliseconds durability_batch_window_;
+    NodeBooks books_;
     NodeRuntime node_;
+    // After the node, whose ledger they charge; stopped before it.
+    NodeResources resources_;
     // After the node, whose transport carries its gossip; started after the
     // node and stopped before it.
     Accounts accounts_;

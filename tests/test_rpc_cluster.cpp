@@ -114,7 +114,7 @@ MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_has_count_byte_and_message_bo
 }
 
 MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_is_process_memory_charged_until_consumed) {
-    RetainedMemoryLedger memory(4096, 512, 1024, 512);
+    RetainedMemoryLedger memory(4096, 512, 1024, 512, 512);
     MessageAssembler assembler(4, 2048, 2048, &memory);
     auto fragment = [](uint64_t request, bool first, bool last, size_t bytes,
                        FrameType frame_type = FrameType::loader) {
@@ -2075,7 +2075,7 @@ MACHA_TEST("rpc_cluster", test_rpc_request_payload_is_charged_until_handler_comp
     server_info.port = port;
     server_info.failure_domain = "server-site";
 
-    RetainedMemoryLedger memory(1024 * 1024, 64 * 1024, 256 * 1024, 64 * 1024);
+    RetainedMemoryLedger memory(1024 * 1024, 64 * 1024, 256 * 1024, 64 * 1024, 64 * 1024);
     TestGate handler_gate;
     RpcServer server(
         "127.0.0.1", port, keys, server_info,
