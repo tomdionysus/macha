@@ -163,6 +163,10 @@ void NodeRuntime::write_telemetry(dannan::status::Telemetry& record) const {
     hosted.cache.misses = advertised_cache_misses_.load(std::memory_order_relaxed);
     hosted.cache.evictions = advertised_cache_evictions_.load(std::memory_order_relaxed);
     write_hosted_telemetry(record, hosted);
+    // A core field the node leaves unwritten: the routes usable now.
+    if (const auto stats = readable_node().client_stats())
+        record.set_u64(dannan::status::field::connections_canonical,
+                       stats->canonical_connections);
 }
 
 bool NodeRuntime::all_local_state_ready() const noexcept {
@@ -304,7 +308,9 @@ void NodeRuntime::stop() {
         host_.node().nodes().unwatch(*roster_watch_);
         roster_watch_.reset();
     }
+    Log::debug("shutdown: node transport stop calling");
     host_.stop();
+    Log::debug("shutdown: node transport stop returned");
     Log::debug("shutdown: NodeRuntime::stop complete");
 }
 
@@ -628,10 +634,36 @@ PublicConnectivityStatus NodeRuntime::refresh_public_connectivity(bool probe, bo
     return public_connectivity_status();
 }
 
+dannan::Node& NodeRuntime::readable_node() const {
+    // A read that Dannan's Node offers without a const overload (inbound(),
+    // threads()); what is read through it is const.
+    return const_cast<DannanHost&>(host_).node();
+}
+
 InboundResolution NodeRuntime::inbound_resolution() const {
-    // Node::inbound() has no const overload; the resolver's state() is const.
-    auto& node = const_cast<DannanHost&>(host_).node();
-    return macha_inbound(cfg_, node.inbound().state());
+    return macha_inbound(cfg_, readable_node().inbound().state());
+}
+
+std::vector<SupervisedThreadStatus> NodeRuntime::thread_statuses() const {
+    // Macha's threads, then the node's under the names they share with Macha;
+    // the node's others have no counterpart in Status and are left out.
+    static constexpr std::array<std::string_view, 3> shared{
+        "cluster-telemetry", "cluster-maintenance", "cluster-connectivity"};
+    auto out = supervised_thread_statuses();
+    for (const auto& status : readable_node().threads().statuses()) {
+        if (std::find(shared.begin(), shared.end(), status.name) == shared.end())
+            continue;
+        SupervisedThreadStatus entry;
+        entry.name = status.name;
+        entry.running = status.running;
+        entry.restarting = status.restarting;
+        entry.faults = status.faults;
+        entry.last_fault_code = status.last_fault_code;
+        entry.last_fault = status.last_fault;
+        entry.last_fault_unix_ms = status.last_fault_unix_ms;
+        out.push_back(std::move(entry));
+    }
+    return out;
 }
 
 RpcStats NodeRuntime::rpc_stats() const {

@@ -228,3 +228,33 @@ MACHA_TEST("dannan_host", test_a_call_past_its_deadline_fails_and_stop_does_not_
     b.stop();
     a.stop();
 }
+
+// What Status reads of the node: its threads under Macha's names, those with no Macha
+// counterpart left out; and the routes usable now in the local telemetry record, a core
+// field the node leaves unwritten.
+MACHA_TEST("dannan_host", test_status_reads_the_nodes_threads_and_canonical_routes) {
+    TestCluster cluster;
+    const auto port_a = free_port();
+    const auto port_b = free_port();
+    auto config_a = config_for(cluster.path() / "a", cluster.keyfile(), port_a);
+    auto config_b = config_for(cluster.path() / "b", cluster.keyfile(), port_b, {{"127.0.0.1", port_a}});
+    config_a.telemetry_interval = 250ms;
+    BareNode a(config_a, cluster.keys());
+    BareNode b(config_b, cluster.keys());
+    a.start();
+    b.start();
+
+    const auto named = [&](std::string_view name) {
+        const auto threads = a.thread_statuses();
+        return std::any_of(threads.begin(), threads.end(),
+                           [&](const SupervisedThreadStatus& t) { return t.name == name; });
+    };
+    REQUIRE(wait_until([&] { return named("cluster-telemetry") && named("cluster-maintenance"); }, 10s));
+    REQUIRE(named("cluster-runtime"));
+    REQUIRE(!named("cluster-roster"));
+
+    REQUIRE(wait_until([&] {
+        const auto local = a.telemetry().local();
+        return local && local->rpc_connections_canonical > 0;
+    }, 15s));
+}
