@@ -5,8 +5,11 @@
 // Macha registers for each of its message types. Pure: no node, no I/O.
 
 #include "cluster/frame_type.hpp"
+#include "cluster/inbound_resolution.hpp"
 #include "cluster/net.hpp"
+#include "cluster/public_connectivity.hpp"
 #include "config.hpp"
+#include "crypto.hpp"
 #include "types.hpp"
 
 #include <dannan/identity/cluster_key.h>
@@ -83,6 +86,23 @@ const std::vector<dannan::net::MessageType>& macha_retired_types();
 // network.failure_domain, else that host.
 std::string advertised_host(const Config& config);
 std::string advertised_failure_domain(const Config& config, const std::string& host);
+
+// The cluster key as Dannan derives it from the same file: the master is the file's
+// SHA-256 for both, so Dannan's auth and cluster id follow from Macha's master.
+dannan::identity::ClusterKey dannan_cluster_key(const ClusterKeys& keys);
+
+dannan::membership::IdentityReset dannan_identity_reset(const IdentityAssociationReset& reset);
+IdentityAssociationReset macha_identity_reset(const dannan::membership::IdentityReset& reset);
+
+PublicConnectivityStatus macha_connectivity(const dannan::reach::PublicConnectivityStatus& status);
+RpcStats macha_rpc_stats(const dannan::net::ClientStats& stats);
+RpcServerWorkStats macha_work_stats(const dannan::net::WorkStats& stats);
+
+// The node's inbound answer with Macha's configured modes beside it, and hosts_extents
+// resolved from it: `auto` is "yes if there is somewhere to put them and peers can
+// fetch them".
+bool resolve_hosts_extents(const Config& config, bool inbound_capable);
+InboundResolution macha_inbound(const Config& config, const dannan::reach::InboundState& state);
 
 // The node's configuration from Macha's (first cutover, section 3). Every shared default
 // agrees; what Macha computes first is computed here: the advertised host and failure

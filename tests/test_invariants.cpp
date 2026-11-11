@@ -1533,7 +1533,7 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
     // The peer stays membership-online past the telemetry freshness floor.
     config.dead_after = 60s;
     SteppedTime clock;
-    BareNode node(config, cluster.keys(), {}, clock.source());
+    BareNode node(config, cluster.keys());
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     auto metadata_store = macha::test_support::distributed_store_for(node);

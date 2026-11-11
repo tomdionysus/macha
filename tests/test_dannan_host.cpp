@@ -215,6 +215,8 @@ MACHA_TEST("dannan_host", test_a_call_past_its_deadline_fails_and_stop_does_not_
     b.start();
     const auto peer_b = node_info_from(b.node().nodes().self());
     auto slow = a.call_async(peer_b, MessageType::get_ingest_jobs, {}, FrameType::control, 300ms);
+    // Idle from when the call was made, placed or not: never the "not placed" maximum.
+    REQUIRE(slow.idle_for() < 300ms);
     bool failed = false;
     try {
         (void)slow.get();

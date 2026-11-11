@@ -1047,10 +1047,11 @@ MACHA_TEST("storage_v18", test_durability_barrier_across_peer_restarts) {
                          cluster.keys());
     a.start();
     b.start();
+    // Active, and each node's capacity known to the other: placement weighs by it.
     const auto both_active = [&] {
         return wait_until([&] {
-            return a.node().membership().active().size() == 2 &&
-                   b.node().membership().active().size() == 2;
+            return capacities_known(a.node().membership().active(), 2) &&
+                   capacities_known(b.node().membership().active(), 2);
         }, 10s);
     };
     REQUIRE(both_active());
@@ -1120,9 +1121,9 @@ MACHA_TEST("storage_v18", test_min_write_two_uses_fallback_when_preferred_replic
     StorageClusterNode c(std::move(c_config), cluster.keys());
     a.start(); b.start(); c.start();
     REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 3 &&
-               b.node().membership().active().size() == 3 &&
-               c.node().membership().active().size() == 3;
+        return capacities_known(a.node().membership().active(), 3) &&
+               capacities_known(b.node().membership().active(), 3) &&
+               capacities_known(c.node().membership().active(), 3);
     }, 5s));
 
     fill_data_store(a.local_state().data());

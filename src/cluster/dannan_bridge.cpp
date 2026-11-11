@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/dannan_bridge.hpp"
 
+#include <algorithm>
+
 #include <unistd.h>
 
 namespace macha {
@@ -71,6 +73,135 @@ dannan::NodeConfig dannan_node_config(const Config& config, dannan::identity::Cl
     out.loader_reserve_bytes = config.runtime.loader_memory_reserve_bytes;
     out.reassembly_reserve_bytes = config.runtime.reassembly_memory_reserve_bytes;
     out.memory_limit_bytes = 0;
+    return out;
+}
+
+dannan::identity::ClusterKey dannan_cluster_key(const ClusterKeys& keys) {
+    dannan::identity::ClusterKey out;
+    out.master = keys.master;
+    out.auth = out.derive("dannan/auth/1");
+    const auto id = out.derive("dannan/cluster-id/1");
+    std::copy_n(id.begin(), out.cluster_id.size(), out.cluster_id.begin());
+    return out;
+}
+
+dannan::membership::IdentityReset dannan_identity_reset(const IdentityAssociationReset& reset) {
+    dannan::membership::IdentityReset out;
+    out.host = reset.host;
+    out.port = reset.port;
+    out.stale_node_id = dannan_id(reset.stale_node_id);
+    out.epoch = reset.epoch;
+    out.reset_unix_ms = reset.reset_unix_ms;
+    out.reset_by = dannan_id(reset.reset_by);
+    out.reason = reset.reason;
+    return out;
+}
+
+IdentityAssociationReset macha_identity_reset(const dannan::membership::IdentityReset& reset) {
+    IdentityAssociationReset out;
+    out.host = reset.host;
+    out.port = reset.port;
+    out.stale_node_id = macha_id(reset.stale_node_id);
+    out.epoch = reset.epoch;
+    out.reset_unix_ms = reset.reset_unix_ms;
+    out.reset_by = macha_id(reset.reset_by);
+    out.reason = reset.reason;
+    return out;
+}
+
+PublicConnectivityStatus macha_connectivity(const dannan::reach::PublicConnectivityStatus& status) {
+    PublicConnectivityStatus out;
+    out.configured = Endpoint{status.configured.host, status.configured.port};
+    out.advertised = Endpoint{status.advertised.host, status.advertised.port};
+    out.advertised_source = status.advertised_source;
+    out.upnp.enabled = status.upnp.enabled;
+    out.upnp.support_built = status.upnp.support_built;
+    out.upnp.gateway_found = status.upnp.gateway_found;
+    out.upnp.mapping_active = status.upnp.mapping_active;
+    out.upnp.mapping_created = status.upnp.mapping_created;
+    out.upnp.mapping_owned = status.upnp.mapping_owned;
+    out.upnp.private_wan = status.upnp.private_wan;
+    out.upnp.lan_address = status.upnp.lan_address;
+    out.upnp.external_address = status.upnp.external_address;
+    out.upnp.internal_port = status.upnp.internal_port;
+    out.upnp.external_port = status.upnp.external_port;
+    out.upnp.lease_seconds = status.upnp.lease_seconds;
+    out.upnp.igd_status = status.upnp.igd_status;
+    out.upnp.error_code = status.upnp.error_code;
+    out.upnp.error = status.upnp.error;
+    out.external_ip.enabled = status.external_ip.enabled;
+    out.external_ip.attempted = status.external_ip.attempted;
+    out.external_ip.address = status.external_ip.address;
+    out.external_ip.error_code = status.external_ip.error_code;
+    out.external_ip.error = status.external_ip.error;
+    out.check_enabled = status.check_enabled;
+    out.self_probe = status.self_probe;
+    out.self_probe_error = status.self_probe_error;
+    out.checked_unix_ms = status.checked_unix_ms;
+    return out;
+}
+
+RpcStats macha_rpc_stats(const dannan::net::ClientStats& stats) {
+    RpcStats out;
+    out.connections_created = stats.connections_created;
+    out.connections_reused = stats.reused;
+    out.canonical_connections = stats.canonical_connections;
+    return out;
+}
+
+namespace {
+RpcServerWorkStats::Timing macha_timing(const dannan::net::Timing& timing) {
+    RpcServerWorkStats::Timing out;
+    out.requests = timing.requests;
+    out.queue_wait_us_total = timing.queue_wait_us_total;
+    out.queue_wait_us_max = timing.queue_wait_us_max;
+    out.handler_us_total = timing.handler_us_total;
+    out.handler_us_max = timing.handler_us_max;
+    return out;
+}
+} // namespace
+
+RpcServerWorkStats macha_work_stats(const dannan::net::WorkStats& stats) {
+    RpcServerWorkStats out;
+    out.metadata_pending_jobs = stats.ordered_pending_jobs;
+    out.metadata_pending_bytes = stats.ordered_pending_bytes;
+    out.metadata_active_jobs = stats.ordered_active_jobs;
+    out.metadata_rejected_jobs = stats.ordered_rejected;
+    out.fast_control_pending_bytes = stats.fast_control_pending_bytes;
+    out.control_pending_bytes = stats.control_pending_bytes;
+    out.data_pending_bytes = stats.data_pending_bytes;
+    out.rejected_jobs = stats.rejected;
+    for (const auto& [frame, timing] : stats.frame_timings)
+        out.frame_timings[macha_frame(frame)] = macha_timing(timing);
+    for (const auto& [type, timing] : stats.message_timings)
+        out.message_timings[macha_type(type)] = macha_timing(timing);
+    return out;
+}
+
+bool resolve_hosts_extents(const Config& config, bool inbound_capable) {
+    switch (config.hosts_extents) {
+    case Tristate::yes:
+        return true;
+    case Tristate::no:
+        return false;
+    case Tristate::automatic:
+        break;
+    }
+    return !config.storage_backends.empty() && inbound_capable;
+}
+
+InboundResolution macha_inbound(const Config& config, const dannan::reach::InboundState& state) {
+    InboundResolution out;
+    out.inbound_capable_mode = config.inbound_capable;
+    out.hosts_extents_mode = config.hosts_extents;
+    out.inbound_capable = state.capable;
+    out.hosts_extents = resolve_hosts_extents(config, state.capable);
+    out.source = state.source;
+    out.decided_unix_ms = state.decided_unix_ms;
+    out.last_probe_unix_ms = state.last_probe_unix_ms;
+    out.last_probe_peer = state.last_probe_peer;
+    out.last_probe_error = state.last_probe_error;
+    out.consecutive_probe_failures = state.consecutive_failures;
     return out;
 }
 

@@ -74,8 +74,9 @@ class DannanHost {
     void request_stop();
     // Fails every outbound call now and admits no more; the node runs on.
     void cancel_outbound_calls();
-    // The node stopped and destroyed, then the io threads joined. Idempotent. Nothing
-    // may use node() after.
+    // The node's loops, server and client stopped; pending calls fail at once.
+    // Idempotent. The node stays readable until the host is destroyed, which
+    // destroys it and then joins the io threads.
     void stop();
 
     dannan::Node& node() noexcept { return *node_; }
