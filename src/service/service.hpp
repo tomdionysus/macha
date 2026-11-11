@@ -43,10 +43,10 @@ namespace macha {
 
 
 // What a test injects into a Service. Production passes none of it: the
-// system clock, the network's links, no trace and no lifecycle record.
+// system clock, every call placed, no trace and no lifecycle record.
 struct ServiceInstruments {
     std::shared_ptr<MaintenanceClock> clock;
-    std::shared_ptr<RpcLinks> links;
+    NodeRuntime::CallFault call_fault;
     MaintenanceTraceHook trace;
     LifecycleHook lifecycle;
 };

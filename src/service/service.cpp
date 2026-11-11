@@ -47,6 +47,8 @@ Service::Service(Config config, ClusterKeys keys,
       web_(node_.config().web, node_.config().catalogue.api.compression),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)),
       startup_stall_handler_(std::move(startup_stall_handler)) {
+    if (instruments.call_fault)
+        node_.set_call_fault(std::move(instruments.call_fault));
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,

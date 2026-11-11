@@ -86,6 +86,16 @@ class StandInPeer {
         host_->node().nodes().advertise(key, dannan::membership::u64_advert(value));
     }
 
+    // Calls from the stand-in, as any node places them.
+    AsyncRpc call_async(const Endpoint& endpoint, MessageType type, std::span<const uint8_t> payload,
+                        FrameType frame, std::chrono::milliseconds deadline) {
+        return host_->call_async(endpoint, type, payload, frame, deadline);
+    }
+    RpcReply call(const Endpoint& endpoint, MessageType type, std::span<const uint8_t> payload,
+                  FrameType frame, std::chrono::milliseconds deadline) {
+        return call_async(endpoint, type, payload, frame, deadline).get();
+    }
+
     NodeId id() const { return macha_id(host_->node().nodes().self().id); }
     NodeInfo info() const { return node_info_from(host_->node().nodes().self()); }
     Endpoint endpoint() const { return {"127.0.0.1", port_}; }

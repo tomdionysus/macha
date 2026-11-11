@@ -69,6 +69,9 @@ PlaybackBudgets enforced_playback_budgets(const StreamingConfig&);
 class NodeRuntime : public ClusterNode {
   public:
     using StartupStageHook = std::function<void(std::string_view)>;
+    // At the transport's edge, for a test: for a call about to be placed on `peer`, a
+    // result to stand for it (a call never answered, say), or none to place it.
+    using CallFault = std::function<std::optional<AsyncRpc>(const NodeInfo& peer, MessageType)>;
 
   private:
     Config cfg_;
@@ -123,6 +126,8 @@ class NodeRuntime : public ClusterNode {
     std::atomic_uint64_t runtime_demand_{};
     std::atomic_bool started_{};
     std::atomic_bool outbound_calls_stopped_{};
+    // Set before start, read by every caller after.
+    CallFault call_fault_;
 
     // Dannan's node: the transport, the roster, telemetry, public connectivity and
     // the inbound answer. Built before storage and metadata, so the node is
@@ -157,6 +162,8 @@ class NodeRuntime : public ClusterNode {
     std::chrono::milliseconds stall_notice_for(MessageType) const;
     std::chrono::milliseconds no_progress_deadline_for(MessageType) const;
     void refuse_when_stopping() const;
+    AsyncRpc place(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType,
+                   std::chrono::milliseconds deadline);
     dannan::Node& readable_node() const;
 
   public:
@@ -164,6 +171,10 @@ class NodeRuntime : public ClusterNode {
     NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, TranscodeRateBook&,
                 MessageRoutes&, NodeEvents&, StartupStageHook startup_stage_hook);
     ~NodeRuntime() override;
+    // Before start().
+    void set_call_fault(CallFault fault) {
+        call_fault_ = std::move(fault);
+    }
     void start();
     void request_stop();
     // Closes client routes and fails every pending synchronous call now, so

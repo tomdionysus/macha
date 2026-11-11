@@ -338,11 +338,20 @@ RpcReply NodeRuntime::call(const Endpoint& endpoint, MessageType type,
     return call(endpoint, type, payload, default_frame_type(type), deadline);
 }
 
+AsyncRpc NodeRuntime::place(const NodeInfo& node, MessageType type,
+                            std::span<const uint8_t> payload, FrameType frame_type,
+                            std::chrono::milliseconds deadline) {
+    if (call_fault_)
+        if (auto faulted = call_fault_(node, type))
+            return std::move(*faulted);
+    return host_.call_async(node, type, payload, frame_type, deadline);
+}
+
 RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type, std::span<const uint8_t> payload,
                            FrameType frame_type, std::chrono::milliseconds deadline) {
     refuse_when_stopping();
     const auto started = Clock::now();
-    auto async = host_.call_async(node, type, payload, frame_type, deadline);
+    auto async = place(node, type, payload, frame_type, deadline);
     return wait_for_reply(async, peer_label(node), type, frame_type, started,
                           stall_notice_for(type), no_progress_deadline_for(type));
 }
@@ -373,7 +382,7 @@ AsyncRpc NodeRuntime::call_async(const NodeInfo& node, MessageType type,
                                  std::span<const uint8_t> payload, FrameType frame_type,
                                  std::chrono::milliseconds deadline) {
     refuse_when_stopping();
-    return host_.call_async(node, type, payload, frame_type, deadline);
+    return place(node, type, payload, frame_type, deadline);
 }
 
 AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
