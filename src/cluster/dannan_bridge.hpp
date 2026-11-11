@@ -18,7 +18,9 @@
 #include <dannan/net/message.h>
 #include <dannan/net/routes.h>
 #include <dannan/sched/work.h>
+#include <dannan/status/log.h>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -31,7 +33,9 @@ inline const std::string capacity = "macha/capacity";
 inline const std::string used = "macha/used";
 inline const std::string metadata_generation = "macha/metadata-generation";
 inline const std::string metadata_write_replicas = "macha/metadata-write-replicas";
-inline const std::string hosts_extents = "macha/hosts-extents";
+// Present while the node hosts extents, whatever its value: Dagda's name, which the
+// state importer writes too.
+inline const std::string hosts_extents = "dagda/extents";
 } // namespace advert
 
 // A Macha type's wire number, which is also Dannan's.
@@ -67,7 +71,7 @@ RpcMessage macha_message(dannan::net::Message message);
 // A node record as Macha's NodeInfo: place and identity from the record, the storage
 // figures, metadata generation and write floor from Macha's adverts (zero when
 // absent), inbound capability from the record's capability bit, hosts_extents from
-// its advert.
+// the extents advert's presence.
 NodeInfo node_info_from(const dannan::membership::NodeRecord& record);
 
 // Macha's types with their wire rules (first cutover, section 7.2), registered before
@@ -103,6 +107,11 @@ RpcServerWorkStats macha_work_stats(const dannan::net::WorkStats& stats);
 // fetch them".
 bool resolve_hosts_extents(const Config& config, bool inbound_capable);
 InboundResolution macha_inbound(const Config& config, const dannan::reach::InboundState& state);
+
+// The node's log, written through Macha's: one level (Macha's log_level), one
+// format and one destination for every line the process writes. Dannan's scope
+// leads the message, as "scope: message".
+std::shared_ptr<dannan::status::LogSink> macha_log_sink();
 
 // The node's configuration from Macha's (first cutover, section 3). Every shared default
 // agrees; what Macha computes first is computed here: the advertised host and failure

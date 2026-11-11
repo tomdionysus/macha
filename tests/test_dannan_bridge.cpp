@@ -5,12 +5,17 @@
 #include "cluster/dannan_bridge.hpp"
 #include "cluster/telemetry_bridge.hpp"
 #include "test_framework.hpp"
+#include "test_support.hpp"
 
+#include <dannan/identity/cluster_key.h>
+#include <dannan/membership/node_record.h>
 #include <dannan/net/routes.h>
 
+#include <mutex>
 #include <set>
 
 using namespace macha;
+using namespace macha::test_support;
 
 namespace {
 
@@ -374,4 +379,65 @@ MACHA_TEST("dannan_bridge", test_frames_ids_and_messages_convert_both_ways) {
     REQUIRE(back.type == MessageType::trie_diff);
     REQUIRE(back.payload == message.payload);
     REQUIRE(static_cast<uint16_t>(dannan_message(message).type) == 561);
+}
+
+namespace {
+class LinesLogger final : public Logger {
+    LogLevel level_;
+
+  public:
+    std::mutex mutex;
+    std::vector<std::pair<LogLevel, std::string>> lines;
+    explicit LinesLogger(LogLevel level) : level_(level) {}
+    bool enabled(LogLevel level) const noexcept override {
+        return static_cast<unsigned char>(level) >= static_cast<unsigned char>(level_);
+    }
+    void log(LogLevel level, const std::string& message) override {
+        std::lock_guard lock(mutex);
+        lines.emplace_back(level, message);
+    }
+};
+} // namespace
+
+// The node's lines go through Macha's log, filtered at Macha's level, each led by its
+// scope.
+MACHA_TEST("dannan_bridge", test_the_nodes_log_is_machas) {
+    auto logger = std::make_shared<LinesLogger>(LogLevel::info);
+    Log::set_logger(logger);
+    const dannan::status::ScopedLogger net(macha_log_sink(), "net.client");
+    REQUIRE(!net.enabled(dannan::status::LogLevel::debug));
+    REQUIRE(net.enabled(dannan::status::LogLevel::warn));
+    net.debug("dial request sent");
+    net.warn("peer 10.44.1.50:7437 liveness failure: no answer");
+    REQUIRE(logger->lines.size() == 1);
+    REQUIRE(logger->lines.front().first == LogLevel::warn);
+    REQUIRE(logger->lines.front().second ==
+            "net.client: peer 10.44.1.50:7437 liveness failure: no answer");
+}
+
+// The node's cluster key, derived from Macha's master, is the one Dannan reads from the
+// same file.
+MACHA_TEST("dannan_bridge", test_the_cluster_key_is_dannans_from_the_same_file) {
+    TempDir dir;
+    const auto file = dir.path() / "cluster.key";
+    write_key(file);
+    const auto ours = dannan_cluster_key(load_cluster_keys(file));
+    const auto theirs = dannan::identity::load_cluster_key(file);
+    REQUIRE(ours.master == theirs.master);
+    REQUIRE(ours.auth == theirs.auth);
+    REQUIRE(ours.cluster_id == theirs.cluster_id);
+}
+
+// A node hosts extents while the extents advert is present, whatever its value, as the
+// state importer writes it.
+MACHA_TEST("dannan_bridge", test_hosts_extents_is_the_adverts_presence) {
+    dannan::membership::NodeRecord record;
+    record.id.bytes.fill(3);
+    record.host = "inverbeg.macha.network";
+    record.port = 7437;
+    REQUIRE(!node_hosts_extents(node_info_from(record)));
+    record.adverts[advert::hosts_extents] = dannan::net::Bytes{1};
+    REQUIRE(node_hosts_extents(node_info_from(record)));
+    record.adverts[advert::hosts_extents] = dannan::net::Bytes{};
+    REQUIRE(node_hosts_extents(node_info_from(record)));
 }
