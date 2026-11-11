@@ -3,6 +3,7 @@
 // The conversions between Macha's cluster vocabulary and Dannan's, and the wire rules
 // Macha registers: pure functions, tested over everything they cover.
 #include "cluster/dannan_bridge.hpp"
+#include "cluster/telemetry_bridge.hpp"
 #include "test_framework.hpp"
 
 #include <dannan/net/routes.h>
@@ -266,6 +267,94 @@ MACHA_TEST("dannan_bridge", test_the_node_config_is_macha_config_key_by_key) {
     // Any other listen address advertises the machine's name, never an empty host.
     bare.listen_host = "0.0.0.0";
     REQUIRE(!advertised_host(bare).empty());
+}
+
+// Macha's telemetry goes into Dannan's record and comes back whole: core fields as Dannan
+// writes them, hosted fields 1024 to 1045 in their order, nothing written for a zero, at
+// most 256 transcode rates, and one unreadable field drops that record alone.
+MACHA_TEST("dannan_bridge", test_telemetry_goes_into_the_record_and_back) {
+    REQUIRE(hosted_telemetry_layout().size() == 22);
+    REQUIRE(hosted_telemetry_layout().front() == 1024);
+    REQUIRE(hosted_telemetry_layout().back() == 1045);
+
+    dannan::status::Telemetry record;
+    dannan::identity::NodeId id;
+    id.bytes.fill(3);
+    record.set_bytes(dannan::status::field::node_id, id.bytes);
+    record.set_u64(dannan::status::field::sequence, 7);
+    record.set_text(dannan::status::field::version, "0.94.0");
+    record.set_text(dannan::status::field::host, "macnessa.macha.network");
+    record.set_u16(dannan::status::field::port, 7437);
+    record.set_u32(dannan::status::field::peers_active, 2);
+    record.set_phase(dannan::status::Phase::recovering);
+    record.set_traffic(1000, {{2, 10, 20, 30, 40}});
+
+    HostedTelemetry hosted;
+    hosted.storage_capacity = 10995116277760ULL;
+    hosted.storage_used = 6364071813037ULL;
+    hosted.cache_capacity = 1ULL << 30;
+    hosted.metadata_generation = 168518;
+    hosted.storage_backends_online = 1;
+    hosted.api_endpoint = "http://10.44.1.50:7438";
+    hosted.playback.startup_timeout_ms = 30000;
+    hosted.playback.max_transcodes_per_account = 2;
+    hosted.playback.start_failed_retention_ms = 60000;
+    hosted.cache.hits = 5;
+    hosted.cache.evictions = 9;
+    for (uint32_t i = 0; i < 300; ++i)
+        hosted.playback.transcode_rates.push_back(TranscodeRate{"video", "hevc", 10, 2160, i, 1, 1});
+    write_hosted_telemetry(record, hosted);
+    // Zero values are not written: cache_used, cache_misses and the rest.
+    REQUIRE(!record.get(hosted_field::cache_used).has_value());
+    REQUIRE(!record.get(hosted_field::cache_misses).has_value());
+
+    const auto back = node_telemetry_from(record);
+    REQUIRE(back.has_value());
+    REQUIRE(back->node_id.bytes == id.bytes);
+    REQUIRE(back->sequence == 7);
+    REQUIRE(back->version == "0.94.0");
+    REQUIRE(back->host == "macnessa.macha.network");
+    REQUIRE(back->port == 7437);
+    REQUIRE(back->peers_active == 2);
+    REQUIRE(back->phase == NodePhase::recovering);
+    REQUIRE(back->traffic_window_ms == 1000);
+    REQUIRE(back->traffic.size() == 1);
+    REQUIRE(back->traffic[0].frame_class == 2);
+    REQUIRE(back->traffic[0].out_bytes_per_s == 40);
+    REQUIRE(back->storage_capacity == hosted.storage_capacity);
+    REQUIRE(back->storage_used == hosted.storage_used);
+    REQUIRE(back->cache_capacity == hosted.cache_capacity);
+    REQUIRE(back->cache_used == 0);
+    REQUIRE(back->metadata_generation == 168518);
+    REQUIRE(back->storage_backends_online == 1);
+    REQUIRE(back->api_endpoint == "http://10.44.1.50:7438");
+    REQUIRE(back->playback_startup_timeout_ms == 30000);
+    REQUIRE(back->playback_max_transcodes_per_account == 2);
+    REQUIRE(back->playback_start_failed_retention_ms == 60000);
+    REQUIRE(back->cache_hits == 5);
+    REQUIRE(back->cache_evictions == 9);
+    REQUIRE(back->playback_transcode_rates.size() == 256);
+    REQUIRE(back->playback_transcode_rates.back().rate_milli == 255);
+
+    // Clearing a figure removes its field.
+    hosted.playback.transcode_rates.clear();
+    hosted.storage_used = 0;
+    write_hosted_telemetry(record, hosted);
+    REQUIRE(!record.get(hosted_field::playback_transcode_rates).has_value());
+    REQUIRE(!record.get(hosted_field::storage_used).has_value());
+
+    // An empty rates field, as a peer whose set_bytes kept one would send, reads as none.
+    auto empty_rates = record;
+    empty_rates.set_bytes(hosted_field::playback_transcode_rates, {});
+    const auto read = node_telemetry_from(empty_rates);
+    REQUIRE(read.has_value());
+    REQUIRE(read->playback_transcode_rates.empty());
+
+    // A hosted field of the wrong width drops the record, and only it.
+    auto bad = record;
+    bad.set_bytes(hosted_field::storage_capacity, std::vector<uint8_t>{1, 2, 3});
+    REQUIRE(!node_telemetry_from(bad).has_value());
+    REQUIRE(node_telemetry_from(record).has_value());
 }
 
 // Every frame class, id and message survives the trip both ways.
