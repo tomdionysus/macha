@@ -3,6 +3,7 @@
 
 #include "cluster/dannan_bridge.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 
 #include <future>
 #include <stdexcept>
@@ -27,13 +28,37 @@ dannan::net::RequestHandler dispatch_to(MessageRoutes& routes) {
 
 } // namespace
 
+MembershipSnapshot DannanMembership::peers() const {
+    const auto roster = nodes_.snapshot();
+    MembershipSnapshot out;
+    for (const auto& record : roster.all)
+        if (record.id != self_)
+            out.all.push_back(node_info_from(record));
+    for (const auto& record : roster.active)
+        if (record.id != self_)
+            out.active.push_back(node_info_from(record));
+    return out;
+}
+
+bool DannanMembership::directly_reachable(const NodeId& id) const {
+    return nodes_.directly_reachable(dannan_id(id));
+}
+
+bool DannanMembership::all_known_reachable() const {
+    return nodes_.all_known_reachable();
+}
+
 DannanHost::DannanHost(dannan::NodeConfig config, MessageRoutes& routes, size_t io_threads,
                        MetadataNotice metadata_notice)
     : work_(boost::asio::make_work_guard(io_)) {
     if (!io_threads)
         throw std::invalid_argument("the cluster transport needs at least one io thread");
+    // A handler that throws unwinds run(); the fault is recorded and run() resumes after
+    // the backoff. Once the context is stopped run() returns and the thread ends.
     for (size_t i = 0; i < io_threads; ++i)
-        io_threads_.emplace_back([this] { io_.run(); });
+        io_threads_.emplace_back([this](std::stop_token stop) {
+            run_supervised_loop("cluster-io", stop, [this] { io_.run(); });
+        });
     try {
         node_ = std::make_unique<dannan::Node>(io_, std::move(config));
         auto& node_routes = node_->routes();

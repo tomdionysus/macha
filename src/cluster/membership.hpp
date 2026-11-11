@@ -4,6 +4,7 @@
 #include "contract/thread_safety.hpp"
 #include "types.hpp"
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -12,6 +13,18 @@ namespace macha {
 struct MembershipSnapshot {
     std::vector<NodeInfo> all;
     std::vector<NodeInfo> active;
+};
+
+// The roster as the node beneath Macha holds it. While Membership follows one, its peers,
+// their liveness and reachability are the view's, and only this node's own entry is kept
+// here.
+class MembershipView {
+  public:
+    virtual ~MembershipView() = default;
+    // Every known peer and those active, this node excluded.
+    virtual MembershipSnapshot peers() const = 0;
+    virtual bool directly_reachable(const NodeId&) const = 0;
+    virtual bool all_known_reachable() const = 0;
 };
 
 class Membership {
@@ -39,6 +52,9 @@ class Membership {
     const std::filesystem::path known_path_;
     std::unordered_map<NodeId, R, NodeIdHash> nodes_ MACHA_GUARDED_BY(m_);
     std::unordered_map<std::string, IdentityAssociationReset> identity_resets_ MACHA_GUARDED_BY(m_);
+    std::shared_ptr<const MembershipView> view_ MACHA_GUARDED_BY(m_);
+
+    std::shared_ptr<const MembershipView> view() const;
 
     void load_known() MACHA_REQUIRES(m_);
     struct EncodedRoster {
@@ -52,6 +68,9 @@ class Membership {
     Membership(NodeInfo, std::chrono::milliseconds dead_after,
                std::filesystem::path known_path = {},
                std::chrono::milliseconds forget_after = std::chrono::milliseconds::max());
+    // From here the peers are the view's: observe and forget_unseen do nothing, and the
+    // roster is not written here. Set before the node starts.
+    void follow(std::shared_ptr<const MembershipView>);
     NodeInfo self() const;
     void usage(uint64_t);
     void storage(uint64_t used, uint64_t capacity);
