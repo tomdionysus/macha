@@ -2,6 +2,7 @@
 #include "cluster/dannan_host.hpp"
 
 #include "cluster/dannan_bridge.hpp"
+#include "cluster/telemetry_bridge.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
 
@@ -46,6 +47,43 @@ bool DannanMembership::directly_reachable(const NodeId& id) const {
 
 bool DannanMembership::all_known_reachable() const {
     return nodes_.all_known_reachable();
+}
+
+namespace {
+std::vector<NodeTelemetry> readable(const std::vector<dannan::status::Telemetry>& records) {
+    std::vector<NodeTelemetry> out;
+    out.reserve(records.size());
+    for (const auto& record : records)
+        if (auto telemetry = node_telemetry_from(record))
+            out.push_back(std::move(*telemetry));
+    return out;
+}
+} // namespace
+
+std::optional<NodeTelemetry> DannanTelemetry::local() const {
+    if (const auto record = telemetry_.local())
+        return node_telemetry_from(*record);
+    return std::nullopt;
+}
+
+std::vector<NodeTelemetry> DannanTelemetry::all() const {
+    return readable(telemetry_.all());
+}
+
+std::vector<NodeTelemetry> DannanTelemetry::persisted() const {
+    return readable(telemetry_.persisted());
+}
+
+void DannanTelemetry::persist() {
+    telemetry_.persist();
+}
+
+std::vector<TelemetryView> DannanTelemetry::views(std::chrono::milliseconds fresh_for) const {
+    std::vector<TelemetryView> out;
+    for (const auto& view : telemetry_.views(fresh_for))
+        if (auto telemetry = node_telemetry_from(view.telemetry))
+            out.push_back(TelemetryView{std::move(*telemetry), view.age, view.fresh});
+    return out;
 }
 
 DannanHost::DannanHost(dannan::NodeConfig config, MessageRoutes& routes, size_t io_threads,

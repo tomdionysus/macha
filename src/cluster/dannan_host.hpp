@@ -9,6 +9,7 @@
 #include "cluster/membership.hpp"
 #include "cluster/message_routes.hpp"
 #include "cluster/net.hpp"
+#include "cluster/telemetry.hpp"
 #include "types.hpp"
 
 #include <dannan/node.h>
@@ -38,6 +39,20 @@ class DannanMembership final : public MembershipView {
     MembershipSnapshot peers() const override;
     bool directly_reachable(const NodeId& id) const override;
     bool all_known_reachable() const override;
+};
+
+// Dannan's telemetry as Macha's TelemetryStore reads it: each record as NodeTelemetry, one
+// that cannot be read left out. Lives no longer than the node.
+class DannanTelemetry final : public TelemetrySource {
+    dannan::Telemetry& telemetry_;
+
+  public:
+    explicit DannanTelemetry(dannan::Telemetry& telemetry) : telemetry_(telemetry) {}
+    std::optional<NodeTelemetry> local() const override;
+    std::vector<NodeTelemetry> all() const override;
+    std::vector<NodeTelemetry> persisted() const override;
+    void persist() override;
+    std::vector<TelemetryView> views(std::chrono::milliseconds fresh_for) const override;
 };
 
 class DannanHost {

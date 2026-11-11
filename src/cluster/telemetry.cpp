@@ -681,7 +681,19 @@ void TelemetryStore::apply_identity_reset(const IdentityAssociationReset& reset)
     });
 }
 
+void TelemetryStore::follow(std::shared_ptr<TelemetrySource> source) {
+    Lock lock(mutex_);
+    source_ = std::move(source);
+}
+
+std::shared_ptr<TelemetrySource> TelemetryStore::source() const {
+    Lock lock(mutex_);
+    return source_;
+}
+
 std::optional<NodeTelemetry> TelemetryStore::local() const {
+    if (const auto followed = source())
+        return followed->local();
     Lock lock(mutex_);
     auto found = records_.find(self_);
     if (found == records_.end())
@@ -690,6 +702,8 @@ std::optional<NodeTelemetry> TelemetryStore::local() const {
 }
 
 std::vector<NodeTelemetry> TelemetryStore::all() const {
+    if (const auto followed = source())
+        return followed->all();
     Lock lock(mutex_);
     std::vector<NodeTelemetry> out;
     out.reserve(records_.size());
@@ -717,6 +731,8 @@ std::vector<NodeTelemetry> TelemetryStore::recent(std::chrono::milliseconds max_
 }
 
 std::vector<NodeTelemetry> TelemetryStore::persisted() const {
+    if (const auto followed = source())
+        return followed->persisted();
     Lock lock(mutex_);
     std::vector<NodeTelemetry> out;
     out.reserve(persisted_.size());
@@ -726,6 +742,8 @@ std::vector<NodeTelemetry> TelemetryStore::persisted() const {
 }
 
 void TelemetryStore::persist() {
+    if (const auto followed = source())
+        return followed->persist();
     if (persisted_path_.empty())
         return;
     std::map<NodeId, NodeTelemetry> merged;
@@ -764,6 +782,8 @@ void TelemetryStore::persist() {
 }
 
 std::vector<TelemetryView> TelemetryStore::views(std::chrono::milliseconds fresh_for) const {
+    if (const auto followed = source())
+        return followed->views(fresh_for);
     Lock lock(mutex_);
     const auto now = now_();
     std::vector<TelemetryView> out;

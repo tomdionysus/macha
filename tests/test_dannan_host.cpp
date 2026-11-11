@@ -6,6 +6,7 @@
 #include "cluster/dannan_bridge.hpp"
 #include "cluster/dannan_host.hpp"
 #include "cluster/rpc_refusal.hpp"
+#include "cluster/telemetry_bridge.hpp"
 #include "test_framework.hpp"
 #include "test_support.hpp"
 
@@ -140,6 +141,55 @@ MACHA_TEST("dannan_host", test_membership_follows_the_nodes_roster) {
     members.observe(stranger, true);
     REQUIRE(members.all().size() == 2);
     REQUIRE(members.forget_unseen() == 0);
+
+    b.stop();
+    a.stop();
+}
+
+// TelemetryStore following Dannan's records: the peer's hosted fields, written by its
+// telemetry_fields, arrive and read back as Macha's NodeTelemetry.
+MACHA_TEST("dannan_host", test_telemetry_follows_the_nodes_records) {
+    TempDir dir;
+    const auto key = dir.path() / "cluster.key";
+    write_key(key);
+    const auto port_a = free_port();
+    const auto port_b = free_port();
+    MessageRoutes routes_a, routes_b;
+    auto config_a = host_config(dir.path() / "a", key, port_a);
+    config_a.telemetry_interval = 250ms;
+    auto config_b = host_config(dir.path() / "b", key, port_b, {{"127.0.0.1", port_a}});
+    config_b.telemetry_interval = 250ms;
+    config_b.telemetry_layout = hosted_telemetry_layout();
+    config_b.telemetry_fields = [](dannan::status::Telemetry& record) {
+        HostedTelemetry hosted;
+        hosted.storage_capacity = 9895604649984ULL;
+        hosted.storage_used = 1835376108947ULL;
+        hosted.api_endpoint = "http://192.168.1.50:7438";
+        write_hosted_telemetry(record, hosted);
+    };
+    DannanHost a(std::move(config_a), routes_a, 2, {});
+    DannanHost b(std::move(config_b), routes_b, 2, {});
+    a.start();
+    b.start();
+
+    TelemetryStore store(macha_id(a.node().nodes().self().id));
+    store.follow(std::make_shared<DannanTelemetry>(a.node().telemetry()));
+    const auto peer_b = macha_id(b.node().nodes().self().id);
+    std::optional<NodeTelemetry> seen;
+    REQUIRE(wait_until([&] {
+        for (const auto& view : store.views(10s))
+            if (view.telemetry.node_id == peer_b && view.telemetry.storage_capacity) {
+                seen = view.telemetry;
+                return true;
+            }
+        return false;
+    }, 15s));
+    REQUIRE(seen->storage_capacity == 9895604649984ULL);
+    REQUIRE(seen->storage_used == 1835376108947ULL);
+    REQUIRE(seen->api_endpoint == "http://192.168.1.50:7438");
+    REQUIRE(seen->version == "test");
+    REQUIRE(store.local().has_value());
+    REQUIRE(store.local()->node_id == macha_id(a.node().nodes().self().id));
 
     b.stop();
     a.stop();
