@@ -316,6 +316,7 @@ set(MACHA_CORE_SOURCES
     src/cluster/transcode_rates.cpp
     src/cluster/activity_clocks.cpp
     src/cluster/node_resources.cpp
+    src/retained_memory.cpp
     src/cluster/node_identity.cpp
     src/cluster/storage_server.cpp
     src/cluster/control_objects.cpp

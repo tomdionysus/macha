@@ -392,28 +392,33 @@ inline bool capacities_known(const std::vector<NodeInfo>& active, size_t count) 
 
 // The root parts a NodeRuntime takes, built before it (a base is built first).
 struct BareNodeResources {
-    NodeResources resources;
+    StorageLock state_lock;
     NodeIdentity identity;
     RecoveryProgress progress;
     MessageRoutes routes;
     LocalState::StageHook stage_hook;
+    NodeBooks books;
     BareNodeResources(const Config& config, ClusterKeys keys, LocalState::StageHook hook)
-        : resources(config), identity(config.state_path, std::move(keys)),
-          stage_hook(std::move(hook)) {}
+        : state_lock(config.state_path), identity(config.state_path, std::move(keys)),
+          stage_hook(std::move(hook)), books(config) {}
 };
 
-// A NodeRuntime with the root parts it takes, owned as Service owns them:
-// resources first, then the node; start() brings the control plane online
-// and recovers local state on its own thread; stop() stops the resources,
-// the node and that recovery, in that order. The store accessors are the
-// tests' convenience; each waits, bounded, for local state to recover.
+// A NodeRuntime with the root parts it takes, owned as Service owns them: the
+// lock, identity and books first, then the node, then the resources that charge
+// its ledger; start() brings the control plane online and recovers local state
+// on its own thread; stop() stops the resources, the node and that recovery, in
+// that order. The store accessors are the tests' convenience; each waits,
+// bounded, for local state to recover.
 class BareNode : public BareNodeResources, public NodeRuntime {
   public:
+    NodeResources resources;
+
     BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {},
              std::chrono::milliseconds durability_batch_window = test_durability_window)
         : BareNodeResources(config, keys, hook),
-          NodeRuntime(std::move(config), identity, progress, resources.transcode_rates, routes,
-                      resources.events, std::move(hook)),
+          NodeRuntime(std::move(config), identity, progress, books.transcode_rates, routes,
+                      books.events, std::move(hook)),
+          resources(NodeRuntime::config(), books, node().memory()),
           durability_batch_window_(durability_batch_window) {}
     ~BareNode() { stop(); }
     BareNode(const BareNode&) = delete;

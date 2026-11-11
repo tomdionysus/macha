@@ -606,7 +606,7 @@ MACHA_TEST("media_playback", test_segment_store_holds_requests_until_published_s
     // request and then parks; older fragments spill so residency stays bounded,
     // and the store's memory is leased from the ledger.
     {
-        RetainedMemoryLedger retained(8 * 1024, 1024, 4 * 1024, 1024);
+        RetainedMemoryLedger retained(8 * 1024, 1024, 4 * 1024, 1024, 1024);
         auto store = std::make_shared<MediaSegmentStore>(2, 2 * 1024, t.path() / "spill", 4000ms,
                                                          std::vector<double>{4.0, 4.0, 4.0, 4.0});
         REQUIRE(store->attach_memory_ledger(retained));
