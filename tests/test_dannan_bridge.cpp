@@ -174,6 +174,100 @@ MACHA_TEST("dannan_bridge", test_a_node_record_reads_as_node_info) {
     REQUIRE(node_info_from(record).capacity == 0);
 }
 
+// Every key section 3 names reaches its NodeConfig field; the advertised host and failure
+// domain fall back as Macha's do; no node-wide watch is applied to calls; the memory
+// figures are Macha's own fit, with no limit for the node to fit again.
+MACHA_TEST("dannan_bridge", test_the_node_config_is_macha_config_key_by_key) {
+    Config config;
+    config.state_path = "/var/lib/macha";
+    config.node_name = "inverbeg";
+    config.listen_host = "0.0.0.0";
+    config.advertise_host = "inverbeg.macha.network";
+    config.failure_domain = "site-b";
+    config.port = 7437;
+    config.bootstrap = {Endpoint{"macnessa.macha.network", 7437}};
+    config.inbound_capable = Tristate::yes;
+    config.heartbeat = std::chrono::milliseconds(6000);
+    config.dead_after = std::chrono::milliseconds(31000);
+    config.maintenance.garbage_grace = std::chrono::hours(24 * 31);
+    config.telemetry_interval = std::chrono::milliseconds(11000);
+    config.connect_timeout = std::chrono::milliseconds(2600);
+    config.max_frame_size = 512 * 1024;
+    config.control_no_progress_deadline = std::chrono::milliseconds(30000);
+    config.control_stall_notice = std::chrono::milliseconds(5000);
+    config.data_stall_notice = std::chrono::milliseconds(120000);
+    config.dial_back_probe_min_interval = std::chrono::milliseconds(11000);
+    config.inbound_reprobe_while_capable = std::chrono::minutes(61);
+    config.inbound_reprobe_while_incapable = std::chrono::minutes(11);
+    config.upnp.enabled = true;
+    config.upnp.external_port = 17437;
+    config.upnp.discovery_timeout = std::chrono::milliseconds(2100);
+    config.upnp.lease_seconds = 3600;
+    config.external_ip.enabled = true;
+    config.external_ip.timeout = std::chrono::milliseconds(3100);
+    config.connectivity_check.enabled = true;
+    config.connectivity_check.timeout = std::chrono::milliseconds(3200);
+    config.runtime.memory_bytes = 4ULL << 30;
+    config.runtime.retained_memory_bytes = 700ULL << 20;
+    config.runtime.control_memory_reserve_bytes = 65ULL << 20;
+    config.runtime.viewer_memory_reserve_bytes = 193ULL << 20;
+    config.runtime.loader_memory_reserve_bytes = 66ULL << 20;
+    config.runtime.reassembly_memory_reserve_bytes = 33ULL << 20;
+
+    const auto node = dannan_node_config(config, dannan::identity::ClusterKey{});
+    REQUIRE(node.state_path == config.state_path);
+    REQUIRE(node.node_name == "inverbeg");
+    REQUIRE(node.listen_host == "0.0.0.0");
+    REQUIRE(node.advertise_host == "inverbeg.macha.network");
+    REQUIRE(node.failure_domain == "site-b");
+    REQUIRE(node.port == 7437);
+    REQUIRE(node.bootstrap.size() == 1);
+    REQUIRE(node.bootstrap[0].host == "macnessa.macha.network");
+    REQUIRE(node.bootstrap[0].port == 7437);
+    REQUIRE(node.inbound == dannan::reach::Inbound::yes);
+    REQUIRE(node.heartbeat == std::chrono::milliseconds(6000));
+    REQUIRE(node.dead_after == std::chrono::milliseconds(31000));
+    REQUIRE(node.forget_after == std::chrono::hours(24 * 31));
+    REQUIRE(node.telemetry_interval == std::chrono::milliseconds(11000));
+    REQUIRE(node.connect_timeout == std::chrono::milliseconds(2600));
+    REQUIRE(node.max_frame == 512 * 1024);
+    REQUIRE(node.control_no_progress.count() == 0);
+    REQUIRE(node.data_no_progress.count() == 0);
+    REQUIRE(node.control_stall_notice.count() == 0);
+    REQUIRE(node.data_stall_notice.count() == 0);
+    REQUIRE(node.dial_back_min_interval == std::chrono::milliseconds(11000));
+    REQUIRE(node.reprobe_while_capable == std::chrono::minutes(61));
+    REQUIRE(node.reprobe_while_incapable == std::chrono::minutes(11));
+    REQUIRE(node.connectivity.upnp.enabled);
+    REQUIRE(node.connectivity.upnp.external_port == 17437);
+    REQUIRE(node.connectivity.upnp.discovery_timeout == std::chrono::milliseconds(2100));
+    REQUIRE(node.connectivity.upnp.lease_seconds == 3600);
+    REQUIRE(node.connectivity.external_ip.enabled);
+    REQUIRE(node.connectivity.external_ip.timeout == std::chrono::milliseconds(3100));
+    REQUIRE(node.connectivity.check.enabled);
+    REQUIRE(node.connectivity.check.timeout == std::chrono::milliseconds(3200));
+    REQUIRE(node.memory_bytes == (700ULL << 20));
+    REQUIRE(node.control_reserve_bytes == (65ULL << 20));
+    REQUIRE(node.foreground_reserve_bytes == (193ULL << 20));
+    REQUIRE(node.loader_reserve_bytes == (66ULL << 20));
+    REQUIRE(node.reassembly_reserve_bytes == (33ULL << 20));
+    REQUIRE(node.memory_limit_bytes == 0);
+
+    // The fallbacks: loopback listen is advertised as itself, the domain is the host.
+    Config bare;
+    bare.listen_host = "127.0.0.1";
+    const auto fallback = dannan_node_config(bare, dannan::identity::ClusterKey{});
+    REQUIRE(fallback.advertise_host == "127.0.0.1");
+    REQUIRE(fallback.failure_domain == "127.0.0.1");
+    bare.inbound_capable = Tristate::no;
+    REQUIRE(dannan_node_config(bare, {}).inbound == dannan::reach::Inbound::no);
+    bare.inbound_capable = Tristate::automatic;
+    REQUIRE(dannan_node_config(bare, {}).inbound == dannan::reach::Inbound::automatic);
+    // Any other listen address advertises the machine's name, never an empty host.
+    bare.listen_host = "0.0.0.0";
+    REQUIRE(!advertised_host(bare).empty());
+}
+
 // Every frame class, id and message survives the trip both ways.
 MACHA_TEST("dannan_bridge", test_frames_ids_and_messages_convert_both_ways) {
     for (const auto frame : {FrameType::control, FrameType::foreground, FrameType::read_ahead,

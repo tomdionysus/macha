@@ -122,7 +122,11 @@ Ordered by what they cost a user.
       (`storage_pool.cpp:1030-1083`), and the loop reads it from the slice that completes the pass
       (`maintenance.cpp:1079-1087`), so the pass ends "complete; waiting for an event" with immature garbage still on
       disk until the next event. Garbage is late, never wrongly deleted.
-16. **Seen, not looked into:** `ls /mnt/machamedia` timed out twice shortly after a restart, then answered in ms;
+16. **`namespace_service/test_a_stale_tombstone_in_a_batch_is_erased_once` ran past its 30 s wait once**, in a full
+    laptop run of the port branch at load 5 (2026-11-11, `build-port`); alone it passed in 7.3 s, and it passed in two
+    earlier full runs of the same code and in macnessa's 0.93.6 gate. A laptop under load gives no timing verdict;
+    reopen as P0 if it fails again, above all on macnessa.
+17. **Seen, not looked into:** `ls /mnt/machamedia` timed out twice shortly after a restart, then answered in ms;
     remux `playback_pipeline_start_failed` ("timed out waiting for first fragmented-MP4 segment") 3 of 13 attempts
     on inverbeg, 1 of 13 on macnessa, during the baselines.
 

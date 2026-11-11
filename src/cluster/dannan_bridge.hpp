@@ -6,9 +6,12 @@
 
 #include "cluster/frame_type.hpp"
 #include "cluster/net.hpp"
+#include "config.hpp"
 #include "types.hpp"
 
+#include <dannan/identity/cluster_key.h>
 #include <dannan/membership/node_record.h>
+#include <dannan/node.h>
 #include <dannan/net/message.h>
 #include <dannan/net/routes.h>
 #include <dannan/sched/work.h>
@@ -74,5 +77,18 @@ const std::vector<MachaRegistration>& macha_registrations();
 
 // Numbers once used and never to be reused: 549, 550, 560, 636.
 const std::vector<dannan::net::MessageType>& macha_retired_types();
+
+// The host this node advertises: network.advertise; else the listen address when it is
+// loopback; else the machine's name; else 127.0.0.1. And its failure domain:
+// network.failure_domain, else that host.
+std::string advertised_host(const Config& config);
+std::string advertised_failure_domain(const Config& config, const std::string& host);
+
+// The node's configuration from Macha's (first cutover, section 3). Every shared default
+// agrees; what Macha computes first is computed here: the advertised host and failure
+// domain, and no node-wide watch on calls (each call names its own; F1). What only the
+// host can give (the gateway, version, planes, telemetry, log sink, gauges, clocks) is
+// left for it to set.
+dannan::NodeConfig dannan_node_config(const Config& config, dannan::identity::ClusterKey key);
 
 } // namespace macha

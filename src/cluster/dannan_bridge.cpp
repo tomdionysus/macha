@@ -1,7 +1,78 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/dannan_bridge.hpp"
 
+#include <unistd.h>
+
 namespace macha {
+
+std::string advertised_host(const Config& config) {
+    if (!config.advertise_host.empty())
+        return config.advertise_host;
+    if (config.listen_host == "127.0.0.1" || config.listen_host == "::1")
+        return config.listen_host;
+    char hostname[256]{};
+    if (!gethostname(hostname, 255) && hostname[0])
+        return hostname;
+    return "127.0.0.1";
+}
+
+std::string advertised_failure_domain(const Config& config, const std::string& host) {
+    return config.failure_domain.empty() ? host : config.failure_domain;
+}
+
+dannan::NodeConfig dannan_node_config(const Config& config, dannan::identity::ClusterKey key) {
+    dannan::NodeConfig out;
+    out.state_path = config.state_path;
+    out.key = std::move(key);
+    out.node_name = config.node_name;
+    out.listen_host = config.listen_host;
+    out.advertise_host = advertised_host(config);
+    out.failure_domain = advertised_failure_domain(config, out.advertise_host);
+    out.port = config.port;
+    for (const auto& endpoint : config.bootstrap)
+        out.bootstrap.push_back(dannan::net::Endpoint{endpoint.host, endpoint.port});
+    switch (config.inbound_capable) {
+    case Tristate::yes:
+        out.inbound = dannan::reach::Inbound::yes;
+        break;
+    case Tristate::no:
+        out.inbound = dannan::reach::Inbound::no;
+        break;
+    case Tristate::automatic:
+        out.inbound = dannan::reach::Inbound::automatic;
+        break;
+    }
+    out.heartbeat = config.heartbeat;
+    out.dead_after = config.dead_after;
+    out.forget_after = config.maintenance.garbage_grace;
+    out.telemetry_interval = config.telemetry_interval;
+    out.connect_timeout = config.connect_timeout;
+    out.max_frame = config.max_frame_size;
+    // Each call names its own deadline and watch; none is applied node-wide.
+    out.control_no_progress = std::chrono::milliseconds(0);
+    out.data_no_progress = std::chrono::milliseconds(0);
+    out.control_stall_notice = std::chrono::milliseconds(0);
+    out.data_stall_notice = std::chrono::milliseconds(0);
+    out.dial_back_min_interval = config.dial_back_probe_min_interval;
+    out.reprobe_while_capable = config.inbound_reprobe_while_capable;
+    out.reprobe_while_incapable = config.inbound_reprobe_while_incapable;
+    out.connectivity.upnp.enabled = config.upnp.enabled;
+    out.connectivity.upnp.external_port = config.upnp.external_port;
+    out.connectivity.upnp.discovery_timeout = config.upnp.discovery_timeout;
+    out.connectivity.upnp.lease_seconds = config.upnp.lease_seconds;
+    out.connectivity.external_ip.enabled = config.external_ip.enabled;
+    out.connectivity.external_ip.timeout = config.external_ip.timeout;
+    out.connectivity.check.enabled = config.connectivity_check.enabled;
+    out.connectivity.check.timeout = config.connectivity_check.timeout;
+    // Macha's own validate is the one fit; the node is given its results and no limit.
+    out.memory_bytes = config.runtime.retained_memory_bytes;
+    out.control_reserve_bytes = config.runtime.control_memory_reserve_bytes;
+    out.foreground_reserve_bytes = config.runtime.viewer_memory_reserve_bytes;
+    out.loader_reserve_bytes = config.runtime.loader_memory_reserve_bytes;
+    out.reassembly_reserve_bytes = config.runtime.reassembly_memory_reserve_bytes;
+    out.memory_limit_bytes = 0;
+    return out;
+}
 
 dannan::net::Message dannan_message(const RpcMessage& message) {
     dannan::net::Message out;

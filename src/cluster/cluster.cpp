@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/cluster.hpp"
+#include "cluster/dannan_bridge.hpp"
 #include "diagnostics.hpp"
 #include "durable_file.hpp"
 
@@ -23,19 +24,8 @@ NodeInfo self_info(const Config& config, const NodeId& id, uint64_t used, uint64
     NodeInfo node;
     node.id = id;
     node.flags = flags;
-    node.host = config.advertise_host;
-    if (node.host.empty()) {
-        if (config.listen_host == "127.0.0.1" || config.listen_host == "::1") {
-            node.host = config.listen_host;
-        } else {
-            char hostname[256]{};
-            if (!gethostname(hostname, 255))
-                node.host = hostname;
-            if (node.host.empty())
-                node.host = "127.0.0.1";
-        }
-    }
-    node.failure_domain = config.failure_domain.empty() ? node.host : config.failure_domain;
+    node.host = advertised_host(config);
+    node.failure_domain = advertised_failure_domain(config, node.host);
     node.port = config.port;
     node.capacity = capacity;
     node.used = used;
