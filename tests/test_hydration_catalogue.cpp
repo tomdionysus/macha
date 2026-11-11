@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "stand_in_peer.hpp"
 #include "contract/stopping.hpp"
 #include "torrent/torrent_extent_journal.hpp"
 #include "stepped_time.hpp"
@@ -2603,12 +2604,10 @@ MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_an
 
         // A pin holds while the node it names is known, and no longer once
         // that node is forgotten: then any node may take the request.
-        NodeInfo known_peer;
-        known_peer.id = random_node_id();
-        known_peer.host = "127.0.0.9";
-        known_peer.port = 57499;
-        known_peer.seen_unix_ms = unix_ms();
-        fixture.node().membership().observe(known_peer, true);
+        StandInPeer known_peer(fixture.path(), fixture.keyfile(), "known-peer",
+                               {.bootstrap = {{"127.0.0.1", fixture.config().port}}});
+        known_peer.start();
+        REQUIRE(wait_until([&] { return active_on(fixture.node(), known_peer.id()); }, 15s));
         const auto pinned_to = [&](char tag, const NodeId& node) {
             TorrentRequest pinned;
             pinned.id = std::string(32, tag);
@@ -2623,7 +2622,7 @@ MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_an
             });
             return pinned.id;
         };
-        const auto held = pinned_to('b', known_peer.id);
+        const auto held = pinned_to('b', known_peer.id());
         const auto freed = pinned_to('c', gone);
         impatient.pass_now();
         impatient.pass_now();

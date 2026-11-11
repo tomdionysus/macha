@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "stand_in_peer.hpp"
 #include "observation.hpp"
 #include "json.hpp"
 #include "api/manage_api.hpp"
@@ -67,6 +68,7 @@ class CatalogueBench {
         hints_.emplace(node.config().state_path);
     }
     const std::filesystem::path& path() const { return node_.path(); }
+    const std::filesystem::path& keyfile() const { return node_.keyfile(); }
     BareNode& node() { return node_.node(); }
     MetadataManager& metadata() { return node_.metadata(); }
     DistributedStore& store() { return node_.store(); }
@@ -1037,25 +1039,30 @@ MACHA_TEST("invariants", test_provider_release_tracks) {
     }
 }
 
-// Resetting an identity association: the stale NodeId leaves membership at
-// once and pre-reset gossip cannot bring it back, while a different NodeId
-// may own the endpoint; a reset by IP covers every port. The reset is
-// admitted on the local tombstone alone: it does not wait for writable
-// metadata or a metadata mutation in progress, and the audit record follows.
+// Resetting an identity association through the manage API: the stale NodeId leaves
+// membership at once, and the reset is admitted on the local tombstone alone: it does
+// not wait for writable metadata or a metadata mutation in progress, and the audit
+// record follows. What the roster does with a reset afterwards is Dannan's, each rule a
+// named case at 0.5.3: Membership.IdentityResetsDropTheStaleMemberAndPersist,
+// ANewerResetClearsAFreshAssociation (pre-reset gossip cannot bring it back, a newer
+// association can), AnAddressWideResetDropsEveryNodeThereAndOnlyThem,
+// DeferredObservationsCombineAndAnIdentityResetDoesNotWait; and
+// TelemetryStore.AResetDropsTheStaleRecordAndOldGossipStaysOut.
 MACHA_TEST("invariants", test_identity_association_reset) {
     const auto members_without = [](BareNode& node, const NodeId& id) {
         const auto all = node.membership().all();
         return std::none_of(all.begin(), all.end(),
                             [&](const NodeInfo& member) { return member.id == id; });
     };
-    const auto stale_peer = [](std::string host, uint16_t port) {
-        NodeInfo stale;
-        stale.id = random_node_id();
-        stale.host = std::move(host);
-        stale.port = port;
-        stale.failure_domain = "test";
-        stale.seen_unix_ms = unix_ms();
-        return stale;
+    // A peer the node met and that has since gone quiet: known, no longer active.
+    const auto met_then_gone = [](BareNode& node, const std::filesystem::path& root,
+                                  const std::filesystem::path& keyfile, const std::string& name) {
+        auto peer = std::make_unique<StandInPeer>(
+            root, keyfile, name, StandInPeer::Options{.bootstrap = {{"127.0.0.1", node.config().port}}});
+        peer->start();
+        REQUIRE(wait_until([&] { return active_on(node, peer->id()); }, 15s));
+        peer->stop();
+        return peer;
     };
 
     {
@@ -1077,8 +1084,8 @@ MACHA_TEST("invariants", test_identity_association_reset) {
         CHECK(root_json.find("actions")->find("identity_association_reset") != nullptr);
         CHECK(root_json.find("actions")->find("node_identity_association_reset") != nullptr);
 
-        auto stale = stale_peer("10.44.1.50", 57401);
-        node.membership().observe(stale, true);
+        const auto stale_peer = met_then_gone(node, bench.path(), bench.keyfile(), "stale");
+        const auto stale = stale_peer->info();
         PersistedNodeStatus durable;
         durable.observed_unix_ms = unix_ms();
         durable.host = stale.host;
@@ -1097,30 +1104,23 @@ MACHA_TEST("invariants", test_identity_association_reset) {
         });
         REQUIRE(mutation_gate.wait_for_entries(1));
         const auto began = Clock::now();
+        const auto scope = "[" + stale.host + "]:" + std::to_string(stale.port);
         auto reset = manage.handle(request_for(
             "POST", "/api/v1/manage/nodes/" + to_string(stale.id) + "/identity-association/reset",
-            R"({"host":"10.44.1.50","port":57401,"reason":"test endpoint reassignment"})"));
+            R"({"host":")" + stale.host + R"(","port":)" + std::to_string(stale.port) +
+                R"(,"reason":"test endpoint reassignment"})"));
         CHECK(Clock::now() - began < 500ms);
         REQUIRE(reset.status == 202);
         const auto reset_json = body_json(reset);
         const auto& reset_value = *reset_json.find("reset");
         CHECK(reset_value.find("stale_node_id")->asString() == to_string(stale.id));
         CHECK(reset_value.find("epoch")->asUInt64() == 1);
-        CHECK(reset_value.find("scope")->asString() == "[10.44.1.50]:57401");
+        CHECK(reset_value.find("scope")->asString() == scope);
         CHECK(reset_json.find("audit_state")->asString() == "queued");
         CHECK(!reset_json.find("metadata_persisted")->asBool());
         CHECK(members_without(node, stale.id));
         mutation_gate.open();
         blocker.join();
-
-        // Re-gossiping the pre-reset association cannot resurrect it; a
-        // different authenticated NodeId may own the same endpoint at once.
-        node.membership().observe(stale, false);
-        CHECK(members_without(node, stale.id));
-        auto replacement = stale;
-        replacement.id = random_node_id();
-        node.membership().observe(replacement, true);
-        CHECK(!members_without(node, replacement.id));
 
         const auto key = identity_reset_key(stale.host, stale.port);
         REQUIRE(wait_until([&] { return metadata.snapshot().identity_resets.contains(key); }));
@@ -1130,40 +1130,19 @@ MACHA_TEST("invariants", test_identity_association_reset) {
         CHECK(audited.identity_resets.at(key).reason == "test endpoint reassignment");
 
         // By IP alone: no NodeId, every port on the host.
-        auto second_port = replacement;
-        second_port.id = random_node_id();
-        second_port.port = 57402;
-        node.membership().observe(second_port, true);
-        auto unrelated = replacement;
-        unrelated.id = random_node_id();
-        unrelated.host = "10.44.1.51";
-        node.membership().observe(unrelated, true);
-        auto reset_ip = manage.handle(request_for("POST", "/api/v1/manage/identity-associations/reset",
-                                                  R"({"host":"10.44.1.50","reason":"clear by ip"})"));
+        const auto other = met_then_gone(node, bench.path(), bench.keyfile(), "other-port");
+        auto reset_ip = manage.handle(request_for(
+            "POST", "/api/v1/manage/identity-associations/reset",
+            R"({"host":")" + stale.host + R"(","reason":"clear by ip"})"));
         REQUIRE(reset_ip.status == 202);
         const auto reset_ip_json = body_json(reset_ip);
         const auto& reset_ip_value = *reset_ip_json.find("reset");
-        CHECK(reset_ip_value.find("scope")->asString() == "[10.44.1.50]:*");
+        CHECK(reset_ip_value.find("scope")->asString() == "[" + stale.host + "]:*");
         CHECK(reset_ip_value.find("port")->isNull());
         CHECK(reset_ip_value.find("stale_node_id")->isNull());
-        const auto reset_ip_at = reset_ip_value.find("reset_at_unix_ms")->asUInt64();
-        const auto after_ip = node.membership().all();
-        CHECK(std::none_of(after_ip.begin(), after_ip.end(),
-                           [&](const NodeInfo& member) { return member.host == "10.44.1.50"; }));
-        CHECK(!members_without(node, unrelated.id));
+        CHECK(members_without(node, other->id()));
 
-        // Pre-reset gossip cannot recreate an association for that IP, but
-        // post-reset authentication can establish a replacement identity.
-        replacement.seen_unix_ms = reset_ip_at ? reset_ip_at - 1 : 0;
-        node.membership().observe(replacement, false);
-        CHECK(members_without(node, replacement.id));
-        auto fresh = replacement;
-        fresh.id = random_node_id();
-        fresh.seen_unix_ms = reset_ip_at + 1;
-        node.membership().observe(fresh, true);
-        CHECK(!members_without(node, fresh.id));
-
-        const auto ip_key = identity_reset_key("10.44.1.50", 0);
+        const auto ip_key = identity_reset_key(stale.host, 0);
         REQUIRE(wait_until([&] { return metadata.snapshot().identity_resets.contains(ip_key); }));
         const auto ip_audited = metadata.snapshot();
         CHECK(ip_audited.identity_resets.at(ip_key).stale_node_id == NodeId{});
@@ -1179,8 +1158,8 @@ MACHA_TEST("invariants", test_identity_association_reset) {
         auto scanner = bench.scanner();
         ManageApi manage(node, bench.metadata(), bench.fs(), bench.catalogue(), bench.hints(),
                          *scanner);
-        const auto stale = stale_peer("10.44.1.50", 7437);
-        node.membership().observe(stale, true);
+        const auto stale_peer = met_then_gone(node, bench.path(), bench.keyfile(), "stale");
+        const auto stale = stale_peer->info();
         REQUIRE(node.membership().all().size() == 2);
 
         auto response = manage.handle(request_for(
@@ -1532,7 +1511,6 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
     config.catalogue.scanner.enabled = false;
     // The peer stays membership-online past the telemetry freshness floor.
     config.dead_after = 60s;
-    SteppedTime clock;
     BareNode node(config, cluster.keys());
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
@@ -1587,17 +1565,32 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(detail.find("identity_association_reset")->find("epoch")->asUInt64() == 1);
     }
 
-    NodeInfo peer;
-    peer.id = random_node_id();
-    peer.host = "10.44.1.200";
-    peer.port = 7437;
-    peer.failure_domain = "test-lab";
-    peer.capacity = 4ULL * 1024 * 1024 * 1024;
-    peer.used = 1024ULL * 1024 * 1024;
-    // Unknown to membership; telemetry knows it.
-    peer.metadata_generation = 0;
-    peer.seen_unix_ms = unix_ms();
-    node.membership().observe(peer, true);
+    // A peer met over the transport: its storage figures in its adverts, its telemetry
+    // held back until asked for.
+    constexpr uint64_t peer_capacity = 4ULL * 1024 * 1024 * 1024;
+    StandInPeer stand_in(cluster, "status-peer",
+                         {.bootstrap = {{"127.0.0.1", config.port}},
+                          .failure_domain = "test-lab",
+                          .node_name = "Corvus Test Peer",
+                          .telemetry = [](dannan::status::Telemetry& record) {
+                              HostedTelemetry hosted;
+                              hosted.storage_capacity = peer_capacity;
+                              // A measured zero differs from a missing observation.
+                              hosted.storage_used = 0;
+                              hosted.cache_capacity = 1024;
+                              hosted.metadata_generation = 25723;
+                              hosted.storage_backends_online = 1;
+                              hosted.api_endpoint = "http://10.44.1.51:7438";
+                              hosted.playback.startup_timeout_ms = 9000;
+                              hosted.playback.segment_timeout_ms = 3000;
+                              write_hosted_telemetry(record, hosted);
+                              record.set_traffic(10000, {{2, 5000, 100, 2500, 50}});
+                          },
+                          .telemetry_interval = std::chrono::hours(1)});
+    stand_in.advertise_storage(peer_capacity, 1024ULL * 1024 * 1024);
+    stand_in.start();
+    REQUIRE(wait_until([&] { return active_on(node, stand_in.id()); }, 15s));
+    const auto peer = stand_in.info();
     // A pending replica-set validation does not demote write capability while
     // the durability floor is reachable.
     metadata.note_replica_validation(false, "test metadata reconciliation pending");
@@ -1678,30 +1671,14 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(!diagnostics->find("filesystem")->find("available")->asBool());
     }
 
-    NodeTelemetry telemetry;
-    telemetry.node_id = peer.id;
-    telemetry.boot_id = random_node_id();
-    telemetry.sequence = 1;
-    telemetry.observed_unix_ms = unix_ms();
-    telemetry.host = peer.host;
-    telemetry.failure_domain = peer.failure_domain;
-    telemetry.port = peer.port;
-    telemetry.storage_capacity = peer.capacity;
-    // A measured zero differs from a missing observation.
-    telemetry.storage_used = 0;
-    telemetry.cache_capacity = 1024;
-    telemetry.cache_used = 0;
-    telemetry.metadata_generation = 25723;
-    telemetry.storage_backends_online = 1;
-    telemetry.uptime_ms = 60000;
-    telemetry.rss_bytes = 123456;
-    telemetry.api_endpoint = "http://10.44.1.51:7438";
-    telemetry.node_name = "Corvus Test Peer";
-    telemetry.playback_startup_timeout_ms = 9000;
-    telemetry.playback_segment_timeout_ms = 3000;
-    telemetry.traffic = {TrafficClass{2, 5000, 100, 2500, 50}};
-    telemetry.traffic_window_ms = 10000;
-    node.telemetry().observe(telemetry, true);
+    stand_in.node().telemetry().refresh();
+    REQUIRE(wait_until([&] {
+        const auto root = get("/api/v1/status");
+        const auto* entry = node_entry(root, peer.id);
+        return entry && entry->find("telemetry_freshness")->asString() == "live";
+    }, 15s));
+    // What the peer measured of itself, as it sent it.
+    const auto sent = *stand_in.node().telemetry().local();
 
     {
         // Fresh telemetry.
@@ -1720,7 +1697,7 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(entry->find("playback")->find("segment_timeout_ms")->asInt64() == 3000);
         const auto* traffic = entry->find("traffic");
         REQUIRE(traffic != nullptr);
-        CHECK(traffic->find("as_of_unix_ms")->asUInt64() == telemetry.observed_unix_ms);
+        CHECK(traffic->find("as_of_unix_ms")->asUInt64() == sent.observed_unix_ms());
         CHECK(traffic->find("window_ms")->asUInt64() == 10000);
         const auto& classes = traffic->find("classes")->asArray();
         REQUIRE(classes.size() == 1);
@@ -1731,21 +1708,23 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(classes.front().find("out_bytes_per_s")->asUInt64() == 50);
         const auto* storage = entry->find("storage");
         CHECK(storage->find("available")->asBool());
-        CHECK(storage->find("capacity_bytes")->asUInt64() == peer.capacity);
+        CHECK(storage->find("capacity_bytes")->asUInt64() == peer_capacity);
         CHECK(storage->find("used_bytes")->asUInt64() == 0);
-        CHECK(storage->find("free_bytes")->asUInt64() == peer.capacity);
+        CHECK(storage->find("free_bytes")->asUInt64() == peer_capacity);
         CHECK(entry->find("storage_backends_online")->asUInt64() == 1);
         const auto* cache = entry->find("cache");
         CHECK(cache->find("available")->asBool());
         CHECK(cache->find("capacity_bytes")->asUInt64() == 1024);
         CHECK(cache->find("used_bytes")->asUInt64() == 0);
         CHECK(cache->find("free_bytes")->asUInt64() == 1024);
-        CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() == telemetry.rss_bytes);
+        CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() ==
+              sent.u64(dannan::status::field::rss_bytes));
     }
 
     {
-        // Past the fixed 5 s freshness floor.
-        clock.advance(5200ms);
+        // Past the fixed 5 s freshness floor: the peer gone quiet, still a member.
+        stand_in.stop();
+        std::this_thread::sleep_for(5200ms);
         const auto root = get("/api/v1/status");
         const auto* entry = node_entry(root, peer.id);
         REQUIRE(entry != nullptr);
@@ -1757,8 +1736,10 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(!root.find("cluster")->find("storage_online")->find("available")->asBool());
         // Runtime figures survive: nothing aggregates them and the entry
         // states their age.
-        CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() == telemetry.rss_bytes);
-        CHECK(entry->find("runtime")->find("uptime_ms")->asUInt64() == telemetry.uptime_ms);
+        CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() ==
+              sent.u64(dannan::status::field::rss_bytes));
+        CHECK(entry->find("runtime")->find("uptime_ms")->asUInt64() ==
+              sent.u64(dannan::status::field::uptime_ms));
         CHECK(entry->find("live_age_ms")->asUInt64() >= 5000);
     }
 
@@ -3240,7 +3221,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
     server_config.replication = client_config.replication = 1;
     server_config.metadata_write_copies = client_config.metadata_write_copies = 1;
     // A window the three barriers below, 75 ms apart, all fall inside.
-    BareNode server(server_config, cluster.keys(), {}, {}, 500ms);
+    BareNode server(server_config, cluster.keys(), {}, 500ms);
     BareNode client(client_config, cluster.keys());
     server.start();
     client.start();
@@ -3260,7 +3241,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
         request.fixed(object_id(bytes).bytes);
         request.bytes(bytes);
         auto reply = client.call(endpoint, MessageType::put_object_deferred, request.data(),
-                                 FrameType::read_ahead);
+                                 FrameType::read_ahead, call_deadline::object_transfer);
         REQUIRE(reply.message.type == MessageType::ok);
         Reader reader(reply.message.payload);
         RemoteToken token;
@@ -3278,7 +3259,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
         request.u64(token.generation);
         request.u64(token.backend_instance);
         return client.call(endpoint, MessageType::object_durability_barrier, request.data(),
-                           FrameType::read_ahead);
+                           FrameType::read_ahead, call_deadline::object_transfer);
     };
 
     const auto a = defer(53);
@@ -3318,7 +3299,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
     auto client_config = cluster.node_config("durability-generation-rpc-client");
     server_config.replication = client_config.replication = 1;
     server_config.metadata_write_copies = client_config.metadata_write_copies = 1;
-    BareNode server(server_config, cluster.keys(), {}, {}, 500ms);
+    BareNode server(server_config, cluster.keys(), {}, 500ms);
     BareNode client(client_config, cluster.keys());
     server.start();
     client.start();
@@ -3338,7 +3319,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
         request.fixed(object_id(bytes).bytes);
         request.bytes(bytes);
         auto reply = client.call(endpoint, MessageType::put_object_deferred, request.data(),
-                                 FrameType::read_ahead);
+                                 FrameType::read_ahead, call_deadline::object_transfer);
         REQUIRE(reply.message.type == MessageType::ok);
         Reader reader(reply.message.payload);
         RemoteToken token;
@@ -3356,7 +3337,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
         request.u64(token.generation);
         request.u64(token.backend_instance);
         return client.call(endpoint, MessageType::object_durability_barrier, request.data(),
-                           FrameType::read_ahead);
+                           FrameType::read_ahead, call_deadline::object_transfer);
     };
 
     const auto a = defer(56);

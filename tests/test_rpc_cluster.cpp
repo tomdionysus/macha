@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "stand_in_peer.hpp"
 #include "test_backend_support.hpp"
 #include "fake_cluster_node.hpp"
 #include "acquisition/cluster_jobs.hpp"
@@ -1427,23 +1428,15 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
     // Another node, as s2's telemetry sees it, playing throughout.
     {
         std::atomic_bool watching{true};
-        std::thread viewer([&] {
-            const auto peer = random_node_id();
-            const auto boot = random_node_id();
-            for (uint64_t sequence = 1; watching.load(); ++sequence) {
-                NodeTelemetry telemetry;
-                telemetry.node_id = peer;
-                telemetry.boot_id = boot;
-                telemetry.sequence = sequence;
-                telemetry.observed_unix_ms = unix_ms();
-                telemetry.host = "127.0.0.9";
-                telemetry.port = 9;
-                telemetry.traffic = {TrafficClass{static_cast<uint8_t>(FrameType::foreground), 0,
-                                                  0, 1'300'000, 0}};
-                s2.node().telemetry().observe(telemetry, true);
-                std::this_thread::sleep_for(50ms);
-            }
-        });
+        StandInPeer viewer(cluster, "viewer",
+                           {.bootstrap = {{"127.0.0.1", p2}},
+                            .telemetry = [&](dannan::status::Telemetry& record) {
+                                if (watching.load())
+                                    record.set_traffic(250, {{static_cast<uint8_t>(FrameType::foreground),
+                                                              0, 0, 1'300'000, 0}});
+                            },
+                            .hosts_extents = false});
+        viewer.start();
         REQUIRE(wait_until([&] { return s2.node().peer_viewers_active(3000ms); }));
         const auto share_before = s2.repair_diagnostics().gate_share;
         const auto [id, bytes] = lose_a_copy(1);
@@ -1452,7 +1445,6 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
         // The passes that restored it ran with the peer's viewer active.
         const auto paced_by = s2.repair_diagnostics().paced_by;
         watching = false;
-        viewer.join();
         REQUIRE(restored);
         CHECK(*s2.local_state().data().get(id) == bytes);
         CHECK(share_after > share_before);
@@ -3036,7 +3028,15 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
         selected_self = !ranked.empty() && ranked.front().id == self.id;
     }
     REQUIRE(selected_self);
-    node.membership().observe(phantom, true);
+    // The phantom meets the joiner and answers nothing it is asked about metadata.
+    StandInPeer stand_in(cluster, "phantom",
+                         {.bootstrap = {{"127.0.0.1", config.port}},
+                          .id = phantom.id,
+                          .failure_domain = phantom.failure_domain});
+    stand_in.advertise_storage(phantom.capacity, 0);
+    stand_in.advertise(advert::metadata_write_replicas, phantom.metadata_write_replicas_required);
+    stand_in.start();
+    REQUIRE(wait_until([&] { return active_on(node, phantom.id); }, 15s));
     REQUIRE(node.wait_local_state_ready(10s));
 
     auto metadata_store = macha::test_support::distributed_store_for(node);
