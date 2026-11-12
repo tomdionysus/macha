@@ -196,37 +196,12 @@ if(APPLE)
             message(STATUS "Using Homebrew libtorrent from ${MACHA_LIBTORRENT_PREFIX}")
         endif()
 
-        execute_process(
-            COMMAND ${MACHA_BREW_EXECUTABLE} --prefix miniupnpc
-            RESULT_VARIABLE MACHA_BREW_MINIUPNPC_RESULT
-            OUTPUT_VARIABLE MACHA_MINIUPNPC_PREFIX
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET)
-        if(MACHA_BREW_MINIUPNPC_RESULT EQUAL 0)
-            list(PREPEND CMAKE_PREFIX_PATH "${MACHA_MINIUPNPC_PREFIX}")
-            set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH TRUE)
-            message(STATUS "Using Homebrew miniupnpc from ${MACHA_MINIUPNPC_PREFIX}")
-        endif()
     endif()
 endif()
 
 # The in-process media engine uses public APIs present in FFmpeg 6 and later.
 pkg_check_modules(LIBAV QUIET IMPORTED_TARGET
     libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7 libswresample>=4)
-
-# UPnP IGD discovery/port mapping is optional at build time. Prefer the
-# library's native CMake package when available (including Homebrew), with
-# pkg-config as a fallback for distributions that only ship miniupnpc.pc.
-set(MACHA_MINIUPNPC_TARGET "")
-find_package(miniupnpc CONFIG QUIET)
-if(TARGET miniupnpc::miniupnpc)
-    set(MACHA_MINIUPNPC_TARGET miniupnpc::miniupnpc)
-else()
-    pkg_check_modules(MINIUPNPC QUIET IMPORTED_TARGET miniupnpc)
-    if(TARGET PkgConfig::MINIUPNPC)
-        set(MACHA_MINIUPNPC_TARGET PkgConfig::MINIUPNPC)
-    endif()
-endif()
 
 # BitTorrent acquisition is optional at build time. Prefer libtorrent's native
 # CMake package: it carries the exact compile definitions and transitive Boost,
@@ -322,10 +297,9 @@ set(MACHA_CORE_SOURCES
     src/cluster/control_objects.cpp
     src/cluster/local_state.cpp
     src/cluster/local_services.cpp
-    src/cluster/public_connectivity.cpp
     src/cluster/placement.cpp
     src/cluster/membership.cpp
-    src/cluster/net.cpp
+    src/cluster/message.cpp
     src/cluster/dannan_bridge.cpp
     src/cluster/rpc_wait.cpp
     src/cluster/dannan_host.cpp
@@ -411,13 +385,6 @@ target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
     dannan::dannan OpenSSL::Crypto Threads::Threads ${MACHA_CURL_TARGET} ZLIB::ZLIB ${CMAKE_DL_LIBS})
-if(MACHA_MINIUPNPC_TARGET)
-    target_link_libraries(macha_core PUBLIC ${MACHA_MINIUPNPC_TARGET})
-    target_compile_definitions(macha_core PUBLIC MACHA_HAVE_MINIUPNPC=1)
-    message(STATUS "UPnP port mapping enabled (${MACHA_MINIUPNPC_TARGET})")
-else()
-    message(STATUS "miniupnpc not found; UPnP port mapping unavailable at runtime")
-endif()
 if(APPLE)
     find_library(MACHA_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
     target_link_libraries(macha_core PUBLIC ${MACHA_COREFOUNDATION_FRAMEWORK})

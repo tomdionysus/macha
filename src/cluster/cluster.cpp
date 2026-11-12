@@ -104,7 +104,7 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryPr
                          node_flags_for(host_.node().inbound().capable(),
                                         resolve_hosts_extents(cfg_, host_.node().inbound().capable()))),
                cfg_.dead_after),
-      telemetry_(identity_.id) {
+      telemetry_(std::make_shared<DannanTelemetry>(host_.node().telemetry())) {
     // One identity file, read by both: a mismatch is a state path in two minds.
     if (host_.node().identity().id() != dannan_id(identity_.id))
         throw std::logic_error("the node's id is not Macha's: " +
@@ -112,7 +112,6 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryPr
                                to_string(identity_.id));
     auto& node = host_.node();
     members_.follow(std::make_shared<DannanMembership>(node.nodes(), node.nodes().self().id));
-    telemetry_.follow(std::make_shared<DannanTelemetry>(node.telemetry()));
     // Ready once the planes are and recovery has built what runs on them.
     node.readiness().hold_until_marked();
     node.nodes().advertise(advert::metadata_write_replicas,

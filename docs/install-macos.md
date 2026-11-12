@@ -13,10 +13,12 @@ xcode-select --install
 ```
 
 Macha requires CMake 3.20 or later, a C++20 compiler, OpenSSL, libcurl,
-zlib, yaml-cpp and FFmpeg 6 or later development libraries. zlib comes with
-the macOS SDK. macFUSE supplies the mounted filesystem. miniupnpc enables UPnP
-port mapping, and libtorrent-rasterbar 2.0 or later enables BitTorrent
-acquisition.
+zlib, yaml-cpp, Boost 1.83 or later (Asio) and FFmpeg 6 or later development
+libraries, and [Dannan](https://github.com/tomdionysus/dannan) 0.5.3, the
+cluster transport, built and installed first. zlib comes with the macOS SDK.
+macFUSE supplies the mounted filesystem, and libtorrent-rasterbar 2.0 or later
+enables BitTorrent acquisition. UPnP port mapping is Dannan's and needs
+nothing extra.
 
 The BitTorrent plugin must be built against the same Boost headers that
 libtorrent-rasterbar was built with: Homebrew's `boost` for Homebrew's
@@ -35,7 +37,7 @@ runtime dependencies:
 ```bash
 brew update
 brew install cmake pkgconf openssl@3 curl yaml-cpp \
-  ffmpeg@7 libtorrent-rasterbar miniupnpc
+  boost ffmpeg@7 libtorrent-rasterbar
 brew install --cask macfuse
 ```
 
@@ -43,9 +45,15 @@ brew install --cask macfuse
 prefix on both `/usr/local` Intel installations and `/opt/homebrew` Apple
 Silicon installations; it does not need to be force-linked.
 
-Configure and build as your normal user:
+Build and install Dannan 0.5.3 from its tag, then configure and build Macha
+as your normal user, naming Dannan's prefix:
 
 ```bash
+git clone --branch 0.5.3 https://github.com/tomdionysus/dannan.git
+cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release
+cmake --build dannan/build --parallel
+sudo cmake --install dannan/build --prefix /usr/local
+
 cmake -S . -B build-homebrew \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -54,9 +62,9 @@ cmake --build build-homebrew --parallel
 ctest --test-dir build-homebrew --output-on-failure
 ```
 
-Review the configure output. A full build reports the Homebrew FFmpeg,
-libtorrent and miniupnpc prefixes, followed by `FUSE mount plugin enabled`,
-`UPnP port mapping enabled` and `BitTorrent acquisition plugin enabled`.
+Review the configure output. A full build reports the Homebrew FFmpeg and
+libtorrent prefixes, followed by `FUSE mount plugin enabled` and `BitTorrent
+acquisition plugin enabled`.
 
 ## MacPorts dependencies
 
@@ -66,7 +74,7 @@ package for the installed macOS release, update the ports tree, then install:
 ```bash
 sudo port selfupdate
 sudo port install cmake pkgconfig openssl3 curl yaml-cpp \
-  ffmpeg7 libtorrent-rasterbar miniupnpc
+  boost ffmpeg7 libtorrent-rasterbar
 sudo port install macfuse +fs_link
 ```
 
@@ -75,11 +83,17 @@ system location. MacPorts installs FFmpeg 7's pkg-config files below its
 versioned `libexec` directory, so expose that directory while configuring:
 
 ```bash
+git clone --branch 0.5.3 https://github.com/tomdionysus/dannan.git
+cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="/opt/local/libexec/boost/1.88;/opt/local"
+cmake --build dannan/build --parallel
+sudo cmake --install dannan/build --prefix /opt/local
+
 export PKG_CONFIG_PATH="/opt/local/libexec/ffmpeg7/lib/pkgconfig:/opt/local/lib/pkgconfig:/opt/local/share/pkgconfig"
 cmake -S . -B build-macports \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=/opt/local \
-  -DCMAKE_PREFIX_PATH=/opt/local \
+  -DCMAKE_PREFIX_PATH="/opt/local/libexec/boost/1.88;/opt/local" \
   -DMACHA_INSTALL_SYSTEMD=OFF
 cmake --build build-macports --parallel
 ctest --test-dir build-macports --output-on-failure
@@ -206,9 +220,7 @@ state, cache, spool, mounts and media data are intentionally retained.
 
 - [Homebrew ffmpeg@7](https://formulae.brew.sh/formula/ffmpeg@7)
 - [Homebrew libtorrent-rasterbar](https://formulae.brew.sh/formula/libtorrent-rasterbar)
-- [Homebrew miniupnpc](https://formulae.brew.sh/formula/miniupnpc)
 - [Homebrew macFUSE](https://formulae.brew.sh/cask/macfuse)
 - [MacPorts ffmpeg7](https://ports.macports.org/port/ffmpeg7/)
 - [MacPorts libtorrent-rasterbar](https://ports.macports.org/port/libtorrent-rasterbar/)
-- [MacPorts miniupnpc](https://ports.macports.org/port/miniupnpc/)
 - [MacPorts macFUSE](https://ports.macports.org/port/macfuse/)
