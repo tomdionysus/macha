@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "contract/thread_safety.hpp"
-
-#include "config.hpp"
 #include "types.hpp"
 
-#include <mutex>
 #include <string>
 
 namespace macha {
 
+// What the node reports of its public reachability, as Status shows it.
 struct UpnpStatus {
     bool enabled{};
     bool support_built{};
@@ -50,39 +47,6 @@ struct PublicConnectivityStatus {
     std::string self_probe{"not_run"};
     std::string self_probe_error;
     uint64_t checked_unix_ms{};
-};
-
-class PublicConnectivity {
-    UpnpConfig upnp_config_;
-    ExternalIpConfig external_ip_config_;
-    ConnectivityCheckConfig check_config_;
-    Endpoint configured_;
-    NodeId node_id_;
-    // Held across UPnP discovery, mapping and the reachability probe: one
-    // check at a time, on a copy of the status.
-    mutable IoMutex work_mutex_ MACHA_ACQUIRED_BEFORE(mutex_);
-    // Held only to read or publish the status, so /status never waits on a
-    // probe.
-    mutable Mutex mutex_;
-    PublicConnectivityStatus status_ MACHA_GUARDED_BY(mutex_);
-#ifdef MACHA_HAVE_MINIUPNPC
-    bool mapping_owned_ MACHA_GUARDED_BY(work_mutex_){};
-    uint16_t owned_external_port_ MACHA_GUARDED_BY(work_mutex_){};
-#endif
-
-    void refresh_locked(PublicConnectivityStatus&) MACHA_REQUIRES(work_mutex_);
-    void probe_locked(PublicConnectivityStatus&, bool force) MACHA_REQUIRES(work_mutex_);
-    void remove_owned_mapping_locked() noexcept MACHA_REQUIRES(work_mutex_);
-
-  public:
-    PublicConnectivity(const Config&, NodeId, Endpoint configured);
-    ~PublicConnectivity();
-    PublicConnectivity(const PublicConnectivity&) = delete;
-    PublicConnectivity& operator=(const PublicConnectivity&) = delete;
-
-    PublicConnectivityStatus refresh(bool probe, bool force_probe = false);
-    PublicConnectivityStatus probe(bool force = false);
-    PublicConnectivityStatus status() const;
 };
 
 } // namespace macha

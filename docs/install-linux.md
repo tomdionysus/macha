@@ -1,7 +1,7 @@
 # Installing Macha on Linux
 
-This guide builds the Macha server, FUSE filesystem, media support, UPnP
-support and BitTorrent acquisition from source, then installs the supplied
+This guide builds the Macha server, FUSE filesystem, media support and
+BitTorrent acquisition from source, then installs the supplied
 systemd service.
 
 ## Requirements
@@ -13,11 +13,14 @@ Macha requires:
 - FFmpeg 6 or later development libraries (`libavformat` and `libavcodec`
   60, `libavutil` 58, `libswscale` 7 and `libswresample` 4, or later)
 - pkg-config and POSIX threads
+- Boost 1.83 or later (Asio) development headers
+- [Dannan](https://github.com/tomdionysus/dannan) 0.5.3, the cluster transport,
+  built and installed first (below)
 
-FUSE 3 is required for the mounted filesystem. `miniupnpc` and
-libtorrent-rasterbar 2.0 or later are optional at build time, but are needed
-for UPnP port mapping and BitTorrent acquisition respectively. CMake reports
-clearly when any optional feature is unavailable.
+FUSE 3 is required for the mounted filesystem. libtorrent-rasterbar 2.0 or
+later is optional at build time, but is needed for BitTorrent acquisition.
+UPnP port mapping is Dannan's and needs nothing extra. CMake reports clearly
+when any optional feature is unavailable.
 
 Book support (EPUB and MOBI metadata, Open Library, MOBI to EPUB conversion)
 is built unless `-DMACHA_ENABLE_BOOKS=OFF` is given; it needs nothing extra
@@ -40,7 +43,7 @@ sudo apt install build-essential cmake pkg-config \
   fuse3 libfuse3-dev \
   libavformat-dev libavcodec-dev libavutil-dev \
   libswscale-dev libswresample-dev \
-  libtorrent-rasterbar-dev libminiupnpc-dev
+  libboost-dev libtorrent-rasterbar-dev
 ```
 
 Debian 12's standard repository contains FFmpeg 5, which is too old for
@@ -59,7 +62,7 @@ sudo apt install build-essential cmake pkg-config \
   fuse3 libfuse3-dev \
   libavformat-dev libavcodec-dev libavutil-dev \
   libswscale-dev libswresample-dev \
-  libtorrent-rasterbar-dev libminiupnpc-dev
+  libboost-dev libtorrent-rasterbar-dev
 ```
 
 Ubuntu 22.04's standard FFmpeg 4.4 packages do not meet Macha's requirement.
@@ -70,7 +73,7 @@ Ubuntu 22.04's standard FFmpeg 4.4 packages do not meet Macha's requirement.
 sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
   openssl-devel libcurl-devel yaml-cpp-devel zlib-devel \
   fuse3 fuse3-devel ffmpeg-free-devel \
-  rb_libtorrent-devel miniupnpc-devel
+  boost-devel rb_libtorrent-devel
 ```
 
 The similarly named `libtorrent` package is not libtorrent-rasterbar. Macha
@@ -83,7 +86,7 @@ Arch packages include their development files:
 ```bash
 sudo pacman -Syu --needed base-devel cmake pkgconf \
   openssl curl zlib yaml-cpp fuse3 ffmpeg \
-  libtorrent-rasterbar miniupnpc
+  boost libtorrent-rasterbar
 ```
 
 Package names and available versions can change between distribution
@@ -95,10 +98,26 @@ pkg-config --exists 'libavformat >= 60' 'libavcodec >= 60' 'libavutil >= 58' \
   'libswscale >= 7' 'libswresample >= 4' && echo "FFmpeg API is suitable"
 ```
 
+## Build Dannan
+
+Macha builds against Dannan 0.5.3, from its tag:
+
+```bash
+git clone --branch 0.5.3 https://github.com/tomdionysus/dannan.git
+cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release
+cmake --build dannan/build --parallel
+sudo cmake --install dannan/build --prefix /usr/local
+sudo ldconfig
+```
+
+`dannan/build/dannan-import-macha` converts an existing node's state at the
+upgrade to 0.94 (see the CHANGELOG); install it beside Macha on such a node.
+
 ## Build and test
 
 Run configure and compilation as your normal user. Do not use `sudo` for
-either step:
+either step. Where Dannan is not under a default prefix, add
+`-DCMAKE_PREFIX_PATH=<its prefix>`:
 
 ```bash
 cmake -S . -B build \

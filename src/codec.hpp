@@ -78,6 +78,4 @@ class Reader {
     void finish() const;
 };
 
-void encode_node_info(Writer&, const NodeInfo&);
-NodeInfo decode_node_info(Reader&);
 } // namespace macha
