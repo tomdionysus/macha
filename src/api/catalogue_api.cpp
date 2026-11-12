@@ -884,8 +884,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 // A PUT replaces descriptive fields, but files and artwork change only when
                 // named: leaving media_ids out must not unbind every file.
                 CatalogueItem item;
-                if (request.method == "PATCH") {
-                    item = existing.value();
+                if (request.method == "PATCH" && existing) {
+                    item = *existing;
                 } else {
                     item.id = id;
                     if (existing) {

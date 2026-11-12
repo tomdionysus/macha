@@ -1477,7 +1477,8 @@ FileSystem::ResolvedPath FileSystem::resolve_in(const MetadataSnapshot& snapshot
         begin = end + 1;
         if (component.empty())
             continue;
-        const auto exact = resolved == "/" ? "/" + component : resolved + "/" + component;
+        auto exact = resolved == "/" ? std::string() : resolved;
+        exact.append("/").append(component);
         if (namespace_contains(snapshot, &nodes, exact)) {
             resolved = exact;
             continue;
@@ -1912,7 +1913,10 @@ FsEntry FileSystem::create_file(const std::string& p, uint32_t mode, uint32_t ui
     const FilesystemNamespaceMutation op{
         FilesystemNamespaceMutation::Kind::create, q, {}, false, mode, uid, gid};
     auto result = apply_namespace_batch({&op, 1});
-    return result.entries.front().value();
+    auto& created = result.entries.front();
+    if (!created)
+        throw std::logic_error("file creation returned no entry");
+    return std::move(*created);
 }
 
 void FileSystem::unlink(const std::string& p) {
@@ -2502,8 +2506,7 @@ bool FileSystem::census_follow(const ObjectId& root, const std::function<void()>
             nodes_in.insert(nodes_in.end(), spine.begin(), spine.end());
         }
     }
-    return counts.change(root, std::move(extents_in), std::move(extents_out), std::move(nodes_in),
-                         std::move(nodes_out), totals);
+    return counts.change(root, extents_in, extents_out, nodes_in, nodes_out, totals);
 }
 
 void FileSystem::census_count(const MetadataSnapshot& snapshot,

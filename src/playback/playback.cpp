@@ -742,6 +742,13 @@ Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
     return Json(std::move(out));
 }
 
+// Configuration loading settles the streaming temp path before playback starts.
+const std::filesystem::path& streaming_temp_path(const StreamingConfig& config) {
+    if (!config.temp_path)
+        throw std::invalid_argument("streaming.temp_path is not set");
+    return *config.temp_path;
+}
+
 } // namespace
 
 struct PlaybackManager::Impl {
@@ -1758,8 +1765,10 @@ struct PlaybackManager::Impl {
                       lease.media_id + " wait_ms=" + std::to_string(elapsed));
             if (flight->error)
                 std::rethrow_exception(flight->error);
-            // Every flight completed without an error carries a result.
-            return flight->result.value();
+            auto result = flight->result;
+            if (!result)
+                throw std::logic_error("concurrent media inspection completed without a result");
+            return std::move(*result);
         }
 
         auto complete_flight = [&](std::optional<MediaProbeResult> result,
@@ -2328,7 +2337,7 @@ struct PlaybackManager::Impl {
         session.stream_touched = time.now();
         ++session.generation;
         session.generation_dir =
-            settings.temp_path.value() / session.id / std::to_string(session.generation);
+            streaming_temp_path(settings) / session.id / std::to_string(session.generation);
         std::error_code ec;
         std::filesystem::remove_all(session.generation_dir, ec);
         session.subtitle_cache = std::make_shared<Session::SubtitleCache>();
@@ -3713,7 +3722,7 @@ struct PlaybackManager::Impl {
         cancel_pending(*removed);
         stop_pipeline(*removed);
         std::error_code ec;
-        std::filesystem::remove_all(current_config().temp_path.value() / removed->id, ec);
+        std::filesystem::remove_all(streaming_temp_path(current_config()) / removed->id, ec);
         return true;
     }
 
@@ -4118,11 +4127,11 @@ struct PlaybackManager::Impl {
 
 PlaybackManager::PlaybackManager(
     FileSystem& fs, TranscodeRateBook& transcode_rates, RetainedMemoryLedger& retained_memory,
-    CatalogueManager& catalogue, CatalogueApiConfig api, StreamingConfig streaming,
+    CatalogueManager& catalogue, const CatalogueApiConfig& api, StreamingConfig streaming,
     std::shared_ptr<MediaEngine> engine,
     std::function<size_t(const std::vector<std::string>&)> request_profiles,
     MediaInformationService* media_information, MediaFacts media_facts, const TimeSource& time)
-    : impl_(std::make_unique<Impl>(fs, transcode_rates, retained_memory, catalogue, std::move(api),
+    : impl_(std::make_unique<Impl>(fs, transcode_rates, retained_memory, catalogue, api,
                                    std::move(streaming), std::move(engine),
                                    std::move(request_profiles), media_information, time)) {
     impl_->extra_media_facts = std::move(media_facts);
@@ -4136,7 +4145,7 @@ void PlaybackManager::start() {
     const auto config = impl_->current_config();
     if (impl_->started || !config.enabled)
         return;
-    std::filesystem::create_directories(config.temp_path.value());
+    std::filesystem::create_directories(streaming_temp_path(config));
     if (!impl_->engine)
         throw std::runtime_error("streaming media engine is unavailable");
     auto status = impl_->engine->status();

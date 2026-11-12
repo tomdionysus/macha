@@ -265,7 +265,7 @@ void DurabilityDomain::loop(std::stop_token stop) {
         }
 
         try {
-            perform_barrier(cut, std::move(portable));
+            perform_barrier(cut, portable);
         } catch (...) {
             Lock lock(mutex_);
             failure_ = std::current_exception();

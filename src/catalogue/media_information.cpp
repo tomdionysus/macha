@@ -332,10 +332,11 @@ MediaProbeResult MediaInformationService::resolve(const std::string& media_id,
     }
 }
 
-MediaProbeResult MediaInformationService::resolve_playback(std::string media_id, std::string path,
-                                                           FsEntry entry,
+MediaProbeResult MediaInformationService::resolve_playback(const std::string& media_id,
+                                                           const std::string& path,
+                                                           const FsEntry& entry,
                                                            Clock::time_point deadline) {
-    return resolve(std::move(media_id), std::move(path), std::move(entry), true, deadline);
+    return resolve(media_id, path, entry, true, deadline);
 }
 
 void MediaInformationService::process_hint(const CatalogueHint& hint, const std::stop_token& stop) {
