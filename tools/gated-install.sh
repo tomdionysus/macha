@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: sh gated-install.sh <version> <previous>. Installs only when no
 # playback session can be live.
 V=$1; PREV=$2

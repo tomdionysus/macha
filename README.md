@@ -4,6 +4,10 @@
 
 *v0.94.0*
 
+[![CI](https://github.com/tomdionysus/macha/actions/workflows/ci.yml/badge.svg)](https://github.com/tomdionysus/macha/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/tomdionysus/macha/graph/badge.svg)](https://codecov.io/gh/tomdionysus/macha)
+[![CodeQL](https://github.com/tomdionysus/macha/actions/workflows/codeql.yml/badge.svg)](https://github.com/tomdionysus/macha/actions/workflows/codeql.yml)
+
 *Macha - Old Irish /ˈmˠaxə/ - approximately “MAKH-uh”*
 
 Macha is a C++20 distributed filesystem (MachaDFS) and media server for large,

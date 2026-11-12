@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.20)
 
 # CMake 3.30 removed the legacy FindBoost module. libtorrent 2.1's exported
@@ -758,6 +759,27 @@ if(MACHA_BUILD_TESTS)
             endif()
         endif()
         add_test(NAME macha-tests-torrent COMMAND macha-tests-torrent)
+    endif()
+    # The coverage report: every test binary run once, then lcov's record of the
+    # sources under src/, written to coverage/coverage.info (GCC builds).
+    if(MACHA_TEST_COVERAGE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        find_program(MACHA_LCOV lcov)
+        if(MACHA_LCOV)
+            add_custom_target(coverage
+                COMMAND ${CMAKE_COMMAND} -E make_directory coverage
+                COMMAND ${MACHA_LCOV} --quiet --zerocounters --directory .
+                COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/run-tests.sh ${CMAKE_BINARY_DIR}
+                COMMAND ${MACHA_LCOV} --quiet --capture --directory . --output-file coverage/all.info
+                    --ignore-errors mismatch,negative,unused
+                COMMAND ${MACHA_LCOV} --quiet --extract coverage/all.info
+                    "${CMAKE_CURRENT_SOURCE_DIR}/src/*" --output-file coverage/coverage.info
+                COMMAND ${MACHA_LCOV} --summary coverage/coverage.info
+                WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+                DEPENDS macha-tests
+                USES_TERMINAL)
+        else()
+            message(STATUS "lcov not found; the coverage target is not available")
+        endif()
     endif()
 endif()
 
