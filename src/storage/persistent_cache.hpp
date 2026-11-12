@@ -2,14 +2,14 @@
 #pragma once
 
 #include "config.hpp"
-#include "storage/local_store.hpp"
 #include "metadata/metadata.hpp"
+#include "storage/local_store.hpp"
 
+#include "contract/thread_safety.hpp"
 #include <atomic>
 #include <list>
 #include <map>
 #include <memory>
-#include "contract/thread_safety.hpp"
 
 namespace macha {
 

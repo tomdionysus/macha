@@ -46,7 +46,8 @@ MACHA_FAST_TEST("contract", test_only_control_is_refused_and_only_device_or_netw
         for (unsigned mask = 0; mask < 16; ++mask) {
             const bool data_or_network = (mask & (2U | 4U)) != 0;
             const bool expected = frame_type != FrameType::control || !data_or_network;
-            CHECK(may_enter(WorkContext(frame_type).allowed(), static_cast<Waits>(mask)) == expected);
+            CHECK(may_enter(WorkContext(frame_type).allowed(), static_cast<Waits>(mask)) ==
+                  expected);
         }
 }
 
@@ -206,8 +207,8 @@ MACHA_FAST_TEST("contract", test_budget_stop_precedence_over_every_combination) 
         const bool context_deadline = bits & 4U;
         const bool yielding = bits & 8U;
         std::atomic_bool cancelled{cancelled_now};
-        const WorkContext context(FrameType::speculative,
-                                  context_deadline ? now - 1ms : now + 1h, &cancelled);
+        const WorkContext context(FrameType::speculative, context_deadline ? now - 1ms : now + 1h,
+                                  &cancelled);
         FixedYield yield;
         yield.answer = yielding;
         Budget budget(context);
@@ -405,10 +406,12 @@ MACHA_TEST("contract", test_the_wait_guard_on_a_cold_catalogue) {
     test_support::BareNode node(config, cluster.keys());
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
+    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data,
+                           node.resources.memory, node.resources.events);
     auto metadata_store = macha::test_support::distributed_store_for(node);
     MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata,
+                               node.ledger());
 
     WaitGuard::set_mode(WaitGuard::Mode::throw_on_violation);
     const WorkContext control(FrameType::control, {}, nullptr, "test control");

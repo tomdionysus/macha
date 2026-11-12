@@ -111,8 +111,10 @@ MACHA_FAST_TEST("models", test_metadata_delta_state_model) {
 MACHA_FAST_TEST("models", test_hydration_scheduler_state_model) {
     std::vector<ObjectId> foreground;
     std::vector<ObjectId> background;
-    for (uint32_t i = 0; i < 24; ++i) foreground.push_back(model_object(4000 + i));
-    for (uint32_t i = 0; i < 6; ++i) background.push_back(model_object(5000 + i));
+    for (uint32_t i = 0; i < 24; ++i)
+        foreground.push_back(model_object(4000 + i));
+    for (uint32_t i = 0; i < 6; ++i)
+        background.push_back(model_object(5000 + i));
 
     HydrationHint high{"foreground", foreground, 1000, "current", FrameType::read_ahead};
     HydrationHint low{"background", background, 100, "next", FrameType::speculative};
@@ -128,9 +130,8 @@ MACHA_FAST_TEST("models", test_hydration_scheduler_state_model) {
     std::optional<std::size_t> first_background_turn;
 
     for (std::size_t turn = 0; turn < foreground.size() + background.size(); ++turn) {
-        auto request = scheduler.next(
-            {high, low, reinforcement},
-            [&](const ObjectId& id) { return present.contains(id); });
+        auto request = scheduler.next({high, low, reinforcement},
+                                      [&](const ObjectId& id) { return present.contains(id); });
         REQUIRE(request.has_value());
 
         if (request->run_id == "foreground") {
@@ -146,7 +147,8 @@ MACHA_FAST_TEST("models", test_hydration_scheduler_state_model) {
             CHECK(request->sequence_index == background_next);
             CHECK(request->object == background[background_next]);
             CHECK(request->priority == 100);
-            if (!first_background_turn) first_background_turn = turn;
+            if (!first_background_turn)
+                first_background_turn = turn;
             ++background_next;
         }
         CHECK(!present.contains(request->object));
@@ -159,8 +161,9 @@ MACHA_FAST_TEST("models", test_hydration_scheduler_state_model) {
     // A 15:1 priority ratio may bias service heavily, but the lower-priority run
     // must be serviced before the high-priority run is exhausted.
     CHECK(*first_background_turn < foreground.size());
-    CHECK(!scheduler.next({high, low, reinforcement},
-                          [&](const ObjectId& id) { return present.contains(id); })
+    CHECK(!scheduler
+               .next({high, low, reinforcement},
+                     [&](const ObjectId& id) { return present.contains(id); })
                .has_value());
 
     // An unavailable prefix stalls only its own run, and is never jumped over.
@@ -168,14 +171,15 @@ MACHA_FAST_TEST("models", test_hydration_scheduler_state_model) {
     present.clear();
     const auto blocked_object = foreground.front();
     auto blocked = [&](const ObjectId& id) { return id == blocked_object; };
-    auto other = scheduler.next({high, low},
-                                [&](const ObjectId& id) { return present.contains(id); }, blocked);
+    auto other = scheduler.next(
+        {high, low}, [&](const ObjectId& id) { return present.contains(id); }, blocked);
     REQUIRE(other.has_value());
     CHECK(other->run_id == "background");
     CHECK(other->sequence_index == 0);
     present.insert(other->object);
 
-    CHECK(!scheduler.next({high}, [&](const ObjectId& id) { return present.contains(id); }, blocked)
+    CHECK(!scheduler.next(
+                        {high}, [&](const ObjectId& id) { return present.contains(id); }, blocked)
                .has_value());
 }
 
@@ -205,7 +209,8 @@ MACHA_FAST_TEST("models", test_capacity_placement_invariants_model) {
             std::set<std::string> preferred_domains;
             for (std::size_t i = 0; i < order.size(); ++i) {
                 CHECK(unique.insert(order[i].id).second);
-                if (i < replicas) preferred_domains.insert(order[i].failure_domain);
+                if (i < replicas)
+                    preferred_domains.insert(order[i].failure_domain);
             }
             CHECK(preferred_domains.size() == replicas);
         }

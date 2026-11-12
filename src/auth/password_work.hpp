@@ -22,7 +22,9 @@ class PasswordWork {
     // Held while hashing; released when it goes.
     class Slot {
       public:
-        Slot(Slot&& other) noexcept : work_(other.work_) { other.work_ = nullptr; }
+        Slot(Slot&& other) noexcept : work_(other.work_) {
+            other.work_ = nullptr;
+        }
         Slot& operator=(Slot&&) = delete;
         ~Slot() {
             if (work_)

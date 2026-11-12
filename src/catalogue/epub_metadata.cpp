@@ -255,7 +255,8 @@ void append_text(std::vector<XmlElement>& stack, std::string text) {
 
 // Parses the tag at `p` (just past '<'), pushing the element; returns the
 // position after the tag and whether it was self-closing.
-std::pair<size_t, bool> parse_open_tag(std::string_view s, size_t p, std::vector<XmlElement>& stack) {
+std::pair<size_t, bool> parse_open_tag(std::string_view s, size_t p,
+                                       std::vector<XmlElement>& stack) {
     const size_t n = s.size();
     size_t name_end = p;
     while (name_end < n && !is_space(s[name_end]) && s[name_end] != '>' && s[name_end] != '/')
@@ -667,7 +668,8 @@ std::string resolve_path(std::string_view base, std::string_view href) {
 
 std::string mime_from_extension(std::string_view path) {
     const auto dot = path.rfind('.');
-    const auto extension = dot == std::string_view::npos ? std::string{} : lowercase(path.substr(dot + 1));
+    const auto extension =
+        dot == std::string_view::npos ? std::string{} : lowercase(path.substr(dot + 1));
     if (extension == "jpg" || extension == "jpeg")
         return "image/jpeg";
     if (extension == "png")

@@ -51,7 +51,9 @@ class ObjectTrie {
         uint64_t count{};
         Hash256 hash{};
         NodePtr node;
-        bool empty() const noexcept { return count == 0; }
+        bool empty() const noexcept {
+            return count == 0;
+        }
     };
 
   public:
@@ -128,8 +130,12 @@ class ObjectTrie {
         Snapshot() = default;
         std::optional<Bytes> get(const ObjectId&) const;
         std::vector<Record> next(const std::optional<ObjectId>& after, size_t limit) const;
-        uint64_t size() const noexcept { return root_.count; }
-        Hash256 root_hash() const noexcept { return root_.hash; }
+        uint64_t size() const noexcept {
+            return root_.count;
+        }
+        Hash256 root_hash() const noexcept {
+            return root_.hash;
+        }
         // Every id, in order: linear, for tests and small sets.
         std::vector<ObjectId> ids() const;
         // For each prefix (shorter than an id), the 256 subtrees one byte

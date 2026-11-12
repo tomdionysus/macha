@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/service.hpp"
-#include "metadata/namespace_control_store.hpp"
 #include "diagnostics.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "fuse/fuse_subsystem.hpp"
 #include "json.hpp"
 #include "log.hpp"
 #include "macha_version.hpp"
+#include "metadata/namespace_control_store.hpp"
 #include "startup_progress.hpp"
 #include "supervised.hpp"
 #include <algorithm>
@@ -24,19 +24,16 @@
 
 namespace macha {
 
-
-Service::Service(Config config, ClusterKeys keys,
-                 std::chrono::milliseconds durability_batch_window,
+Service::Service(Config config, ClusterKeys keys, std::chrono::milliseconds durability_batch_window,
                  NodeRuntime::StartupStageHook startup_stage_hook,
                  MaintenanceStageHook maintenance_stage_hook,
                  StartupStallHandler startup_stall_handler, ServiceInstruments instruments)
     : clock_(instruments.clock ? std::move(instruments.clock)
                                : std::make_shared<SystemMaintenanceClock>()),
       maintenance_trace_(std::move(instruments.trace)),
-      lifecycle_(std::move(instruments.lifecycle)),
-      state_lock_(config.state_path), identity_(config.state_path, keys),
-      recovery_stage_hook_(startup_stage_hook), durability_batch_window_(durability_batch_window),
-      books_(config),
+      lifecycle_(std::move(instruments.lifecycle)), state_lock_(config.state_path),
+      identity_(config.state_path, keys), recovery_stage_hook_(startup_stage_hook),
+      durability_batch_window_(durability_batch_window), books_(config),
       node_(config, identity_, progress_, books_.transcode_rates, routes_, books_.events,
             std::move(startup_stage_hook)),
       resources_(node_.config(), books_, node_.node().memory(),
@@ -75,9 +72,8 @@ Service::Service(Config config, ClusterKeys keys,
             static constexpr std::array<std::string_view, 4> control{
                 "/api/v1/health", "/api/v1/status", "/api/v1/session", "/api/v1/users"};
             for (const auto prefix : control)
-                if (path == prefix ||
-                    (path.size() > prefix.size() && path.starts_with(prefix) &&
-                     path[prefix.size()] == '/'))
+                if (path == prefix || (path.size() > prefix.size() && path.starts_with(prefix) &&
+                                       path[prefix.size()] == '/'))
                     return WorkClass::control;
             return WorkClass::viewer;
         });
@@ -168,17 +164,16 @@ std::string_view Service::required_role(const HttpRequest& request) {
         return request.path == "/api/v1/users/me" ? role_media_viewer : role_manage_users;
 
     // Acquisition is importing: torrents and ingest jobs.
-    if (mutating && (request.path.starts_with("/api/v1/acquisition") ||
-                     request.path.starts_with("/api/v1/ingest") ||
-                     request.path.starts_with("/api/v1/torrent")))
+    if (mutating &&
+        (request.path.starts_with("/api/v1/acquisition") ||
+         request.path.starts_with("/api/v1/ingest") || request.path.starts_with("/api/v1/torrent")))
         return role_importer;
 
     // Everything else that changes state: catalogue matches, files, namespaces,
     // and cluster identity associations.
     if (mutating && (request.path.starts_with("/api/v1/manage") ||
                      request.path.starts_with("/api/v1/catalogue") ||
-                     request.path == "/api/v1/files" ||
-                     request.path.starts_with("/api/v1/files/")))
+                     request.path == "/api/v1/files" || request.path.starts_with("/api/v1/files/")))
         return role_manager;
 
     // Reads, playback and cluster status.
@@ -193,9 +188,9 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
     if (request.path == "/api/v1/health")
         return health_response();
 
-    if (const auto role = required_role(request); !role.empty() && request.session &&
-                                                  !std::count(request.session->roles.begin(),
-                                                              request.session->roles.end(), role))
+    if (const auto role = required_role(request);
+        !role.empty() && request.session &&
+        !std::count(request.session->roles.begin(), request.session->roles.end(), role))
         return http_error(403, "forbidden",
                           "this action requires the '" + std::string(role) + "' role");
 
@@ -241,8 +236,7 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
             return http_error(405, "method", "GET required");
         auto blocked = blocked_namespace_operation();
         if (!blocked)
-            return http_error(404, "not_found",
-                              "no namespace operation is currently blocked");
+            return http_error(404, "not_found", "no namespace operation is currently blocked");
         Json::Object out{{"sequence", blocked->sequence},
                          {"kind", blocked->kind},
                          {"path", blocked->path},
@@ -260,8 +254,8 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
         uint64_t sequence = 0;
         if (it == request.query.end() || it->second.empty())
             return http_error(400, "missing_sequence", "sequence query parameter is required");
-        auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(),
-                                         sequence);
+        auto [end, ec] =
+            std::from_chars(it->second.data(), it->second.data() + it->second.size(), sequence);
         if (ec != std::errc{} || end != it->second.data() + it->second.size())
             return http_error(400, "bad_sequence", "sequence must be a non-negative integer");
         // Operator confirms the exact sequence number from a prior GET so a
@@ -284,28 +278,27 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
         const auto describe = [](const std::optional<FsEntry>& entry) {
             if (!entry)
                 return Json(nullptr);
-            return Json(Json::Object{
-                {"type", entry->type == EntryType::directory ? "directory" : "file"},
-                {"size", entry->size},
-                {"mtime_ns", static_cast<uint64_t>(entry->mtime_ns)},
-                {"version", entry->version},
-                {"extents", static_cast<uint64_t>(entry->extents.size())}});
+            return Json(
+                Json::Object{{"type", entry->type == EntryType::directory ? "directory" : "file"},
+                             {"size", entry->size},
+                             {"mtime_ns", static_cast<uint64_t>(entry->mtime_ns)},
+                             {"version", entry->version},
+                             {"extents", static_cast<uint64_t>(entry->extents.size())}});
         };
         const auto describe_root = [](const std::optional<ObjectId>& root) {
             return root ? Json(to_string(*root)) : Json(nullptr);
         };
         Json::Array items;
         for (const auto& [id, conflict] : view->snapshot->conflicts) {
-            Json::Object item{
-                {"id", id},
-                {"kind", conflict.kind == MetadataConflictKind::namespace_entry
-                             ? "namespace_entry"
-                             : "catalogue_root"},
-                {"key", conflict.key},
-                // Which alternative is in place until someone decides.
-                {"installed", conflict.later_installed ? "left" : "base"},
-                {"left_head", hex(conflict.left_head.bytes)},
-                {"right_head", hex(conflict.right_head.bytes)}};
+            Json::Object item{{"id", id},
+                              {"kind", conflict.kind == MetadataConflictKind::namespace_entry
+                                           ? "namespace_entry"
+                                           : "catalogue_root"},
+                              {"key", conflict.key},
+                              // Which alternative is in place until someone decides.
+                              {"installed", conflict.later_installed ? "left" : "base"},
+                              {"left_head", hex(conflict.left_head.bytes)},
+                              {"right_head", hex(conflict.right_head.bytes)}};
             if (conflict.kind == MetadataConflictKind::namespace_entry) {
                 item["base"] = describe(conflict.base_entry);
                 item["left"] = describe(conflict.left_entry);
@@ -333,11 +326,13 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
         auto choice = request.query.find("choice");
         if (choice == request.query.end() ||
             (choice->second != "left" && choice->second != "right" && choice->second != "base"))
-            return http_error(400, "bad_choice", "choice query parameter must be left, right or base");
+            return http_error(400, "bad_choice",
+                              "choice query parameter must be left, right or base");
         try {
             if (!metadata_manager().resolve_conflict(id, choice->second))
-                return http_error(409, "not_standing",
-                                  "no conflict with this id is standing (superseded or already resolved)");
+                return http_error(
+                    409, "not_standing",
+                    "no conflict with this id is standing (superseded or already resolved)");
         } catch (const MetadataNotReady& e) {
             return http_error(503, "metadata_unavailable", e.what());
         }
@@ -349,15 +344,15 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
             return http_error(405, "method", "GET required");
         Json::Array items;
         for (const auto& parked : parked_publications()) {
-            items.push_back(Json(Json::Object{
-                {"inode", parked.inode},
-                {"path", parked.path},
-                {"error_code", parked.error_code},
-                {"error_message", parked.error_message},
-                {"attempts", static_cast<uint64_t>(parked.attempts)},
-                {"failing_for_ms", static_cast<uint64_t>(parked.failing_for.count())},
-                {"parked_for_ms", static_cast<uint64_t>(parked.parked_for.count())},
-                {"pending_bytes", parked.pending_bytes}}));
+            items.push_back(Json(
+                Json::Object{{"inode", parked.inode},
+                             {"path", parked.path},
+                             {"error_code", parked.error_code},
+                             {"error_message", parked.error_message},
+                             {"attempts", static_cast<uint64_t>(parked.attempts)},
+                             {"failing_for_ms", static_cast<uint64_t>(parked.failing_for.count())},
+                             {"parked_for_ms", static_cast<uint64_t>(parked.parked_for.count())},
+                             {"pending_bytes", parked.pending_bytes}}));
         }
         return http_json(200, Json(Json::Object{{"parked", std::move(items)}}).dump());
     }
@@ -368,7 +363,8 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
         const auto rest = request.path.substr(parked_path.size() + 1);
         const auto slash = rest.find('/');
         if (slash == std::string::npos)
-            return http_error(404, "not_found", "expected /parked-publications/{inode}/retry|abandon");
+            return http_error(404, "not_found",
+                              "expected /parked-publications/{inode}/retry|abandon");
         uint64_t inode = 0;
         const auto id = rest.substr(0, slash);
         auto [end, ec] = std::from_chars(id.data(), id.data() + id.size(), inode);
@@ -445,15 +441,15 @@ std::string Service::describe_readiness_stall() const {
     const auto readiness = node_.readiness();
     auto phase = [](bool ready) { return ready ? "ready" : "recovering"; };
     return std::string("readiness: control_plane=") +
-          (readiness.control_plane_online ? "ready" : "starting") +
-          " data_storage=" + phase(readiness.data_storage_ready) +
-          (readiness.data_storage_degraded ? " data_storage_degraded=true" : "") +
-          " control_storage=" + phase(readiness.control_storage_ready) +
-          " cache=" + phase(readiness.cache_ready) +
-          " retention=" + phase(readiness.retention_ready) +
-          " metadata=" + phase(readiness.metadata_ready) +
-          " local_state=" + phase(readiness.local_state_ready) +
-          " failed=" + (readiness.failed ? "true" : "false");
+           (readiness.control_plane_online ? "ready" : "starting") +
+           " data_storage=" + phase(readiness.data_storage_ready) +
+           (readiness.data_storage_degraded ? " data_storage_degraded=true" : "") +
+           " control_storage=" + phase(readiness.control_storage_ready) +
+           " cache=" + phase(readiness.cache_ready) +
+           " retention=" + phase(readiness.retention_ready) +
+           " metadata=" + phase(readiness.metadata_ready) +
+           " local_state=" + phase(readiness.local_state_ready) +
+           " failed=" + (readiness.failed ? "true" : "false");
 }
 
 void Service::wait_services_ready() {
@@ -494,11 +490,11 @@ void Service::wait_services_ready() {
         std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                            Clock::now() - gate.last_progress_at())
                            .count()) +
-        "ms (gate " + std::to_string(config.service_startup_no_progress.count()) +
-        "ms, ceiling " + std::to_string(config.service_startup_timeout.count()) + "ms, elapsed " +
-        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
-                                                                              gate.started())
-                           .count()) +
+        "ms (gate " + std::to_string(config.service_startup_no_progress.count()) + "ms, ceiling " +
+        std::to_string(config.service_startup_timeout.count()) + "ms, elapsed " +
+        std::to_string(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - gate.started())
+                .count()) +
         "ms); " + diagnostic + "; terminating for restart";
     Log::error(message);
     if (startup_stall_handler_) {
@@ -515,9 +511,8 @@ void Service::initialise_services(std::stop_token stop) {
     try {
         try {
             local_ = std::make_unique<LocalServices>(node_.config(), identity_, progress_,
-                                                     recovery_stage_hook_, stop, node_,
-                                                     resources_, routes_,
-                                                     durability_batch_window_);
+                                                     recovery_stage_hook_, stop, node_, resources_,
+                                                     routes_, durability_batch_window_);
         } catch (const RecoveryCancelled&) {
             return;
         }
@@ -659,6 +654,5 @@ std::map<std::string, uint64_t> Service::observation_gauges() {
         gauges.merge(services_->observation_gauges());
     return gauges;
 }
-
 
 } // namespace macha

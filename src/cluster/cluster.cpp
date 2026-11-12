@@ -100,16 +100,17 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryPr
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()),
       host_(node_config(), routes, 2,
             [this](const NodeInfo&, const RpcMessage& notice) { on_metadata_notice(notice); }),
-      members_(self_info(cfg_, identity_.id,
-                         node_flags_for(host_.node().inbound().capable(),
-                                        resolve_hosts_extents(cfg_, host_.node().inbound().capable()))),
-               cfg_.dead_after),
+      members_(
+          self_info(cfg_, identity_.id,
+                    node_flags_for(host_.node().inbound().capable(),
+                                   resolve_hosts_extents(cfg_, host_.node().inbound().capable()))),
+          cfg_.dead_after),
       telemetry_(std::make_shared<DannanTelemetry>(host_.node().telemetry())) {
     // One identity file, read by both: a mismatch is a state path in two minds.
     if (host_.node().identity().id() != dannan_id(identity_.id))
-        throw std::logic_error("the node's id is not Macha's: " +
-                               to_string(macha_id(host_.node().identity().id())) + " and " +
-                               to_string(identity_.id));
+        throw std::logic_error(
+            "the node's id is not Macha's: " + to_string(macha_id(host_.node().identity().id())) +
+            " and " + to_string(identity_.id));
     auto& node = host_.node();
     members_.follow(std::make_shared<DannanMembership>(node.nodes(), node.nodes().self().id));
     // Ready once the planes are and recovery has built what runs on them.
@@ -130,7 +131,9 @@ dannan::NodeConfig NodeRuntime::node_config() {
     for (const auto& [plane, name] : recovery_planes)
         config.planes.emplace_back(name);
     config.telemetry_layout = hosted_telemetry_layout();
-    config.telemetry_fields = [this](dannan::status::Telemetry& record) { write_telemetry(record); };
+    config.telemetry_fields = [this](dannan::status::Telemetry& record) {
+        write_telemetry(record);
+    };
     config.inbound_journal_fields = [this](bool capable) {
         wake_runtime();
         return std::string(" hosts_extents=") +
@@ -164,8 +167,7 @@ void NodeRuntime::write_telemetry(dannan::status::Telemetry& record) const {
     write_hosted_telemetry(record, hosted);
     // A core field the node leaves unwritten: the routes usable now.
     if (const auto stats = readable_node().client_stats())
-        record.set_u64(dannan::status::field::connections_canonical,
-                       stats->canonical_connections);
+        record.set_u64(dannan::status::field::connections_canonical, stats->canonical_connections);
 }
 
 bool NodeRuntime::all_local_state_ready() const noexcept {
@@ -192,8 +194,9 @@ NodeReadiness NodeRuntime::readiness() const {
 
 void NodeRuntime::publish_self() {
     auto& nodes = host_.node().nodes();
-    nodes.advertise(advert::capacity, dannan::membership::u64_advert(advertised_storage_capacity_.load(
-                                          std::memory_order_relaxed)));
+    nodes.advertise(advert::capacity,
+                    dannan::membership::u64_advert(
+                        advertised_storage_capacity_.load(std::memory_order_relaxed)));
     nodes.advertise(advert::used, dannan::membership::u64_advert(
                                       advertised_storage_used_.load(std::memory_order_relaxed)));
     nodes.advertise(advert::metadata_generation,
@@ -244,12 +247,11 @@ void NodeRuntime::start() {
         Log::warn("configuration: " + warning);
     {
         const auto resolution = inbound_resolution();
-        Log::info(std::string("node inbound_capable=") +
-                  (resolution.inbound_capable ? "true" : "false") + " (" +
-                  std::string(tristate_name(resolution.inbound_capable_mode)) + ", " +
-                  resolution.source + ") hosts_extents=" +
-                  (resolution.hosts_extents ? "true" : "false") + " (" +
-                  std::string(tristate_name(resolution.hosts_extents_mode)) + ")");
+        Log::info(
+            std::string("node inbound_capable=") + (resolution.inbound_capable ? "true" : "false") +
+            " (" + std::string(tristate_name(resolution.inbound_capable_mode)) + ", " +
+            resolution.source + ") hosts_extents=" + (resolution.hosts_extents ? "true" : "false") +
+            " (" + std::string(tristate_name(resolution.hosts_extents_mode)) + ")");
     }
 
     if (startup_stage_hook_)
@@ -258,9 +260,9 @@ void NodeRuntime::start() {
     auto& node = host_.node();
     // Every change from the first: a joined for each node active now, then each one.
     if (!roster_watch_)
-        roster_watch_ = node.nodes().watch(
-            boost::asio::make_strand(node.time().executor()),
-            [this](dannan::RosterChange change) { on_roster_change(change); });
+        roster_watch_ =
+            node.nodes().watch(boost::asio::make_strand(node.time().executor()),
+                               [this](dannan::RosterChange change) { on_roster_change(change); });
 
     // Control plane before any expensive backend recovery: peers can
     // authenticate this node at once and Status can tell reachability from
@@ -327,8 +329,8 @@ std::chrono::milliseconds NodeRuntime::no_progress_deadline_for(MessageType type
                                  : cfg_.control_no_progress_deadline;
 }
 
-RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type,
-                           std::span<const uint8_t> payload, std::chrono::milliseconds deadline) {
+RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type, std::span<const uint8_t> payload,
+                           std::chrono::milliseconds deadline) {
     return call(node, type, payload, default_frame_type(type), deadline);
 }
 
@@ -533,10 +535,10 @@ void NodeRuntime::follow_self() {
         return;
     members_.endpoint(record.host, record.port);
     const auto connectivity = host_.node().connectivity();
-    Log::info("node advertised endpoint changed from=" + before.host + ":" +
-              std::to_string(before.port) + " to=" + record.host + ":" +
-              std::to_string(record.port) + " source=" +
-              (connectivity ? connectivity->advertised_source : std::string("configured")));
+    Log::info(
+        "node advertised endpoint changed from=" + before.host + ":" + std::to_string(before.port) +
+        " to=" + record.host + ":" + std::to_string(record.port) +
+        " source=" + (connectivity ? connectivity->advertised_source : std::string("configured")));
 }
 
 // The node logs its inbound change, with hosts_extents beside it; here placement

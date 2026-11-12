@@ -2,11 +2,11 @@
 #include "metadata/metadata_manager.hpp"
 #include "cluster/call_deadline.hpp"
 
-#include "observation.hpp"
-#include "diagnostics.hpp"
 #include "cluster/placement.hpp"
+#include "diagnostics.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "metadata/namespace_tree.hpp"
+#include "observation.hpp"
 
 #include "codec.hpp"
 #include "log.hpp"
@@ -23,8 +23,7 @@
 namespace macha {
 namespace {
 bool newer_than(const MetadataRecord& a, const MetadataRecord& b) {
-    return a.generation > b.generation ||
-           (a.generation == b.generation && a.hash > b.hash);
+    return a.generation > b.generation || (a.generation == b.generation && a.hash > b.hash);
 }
 
 struct PendingRead {
@@ -51,12 +50,11 @@ bool bool_reply(const RpcReply& reply) {
 } // namespace
 
 MetadataManager::MetadataManager(NodeRuntime& node, LocalState& local,
-                                 MetadataServer& metadata_server,
-                                 DistributedStore& namespace_store,
-                                 PublicationRetention publication_retention,
-                                 const TimeSource& time)
-    : node_(node), local_(local), metadata_server_(metadata_server), namespace_store_(namespace_store),
-      time_(time), publication_retention_(std::move(publication_retention)),
+                                 MetadataServer& metadata_server, DistributedStore& namespace_store,
+                                 PublicationRetention publication_retention, const TimeSource& time)
+    : node_(node), local_(local), metadata_server_(metadata_server),
+      namespace_store_(namespace_store), time_(time),
+      publication_retention_(std::move(publication_retention)),
       replicator_([this](std::stop_token stop) { replication_loop(stop); }) {}
 
 MetadataManager::~MetadataManager() {
@@ -247,18 +245,16 @@ void MetadataManager::publish_replica_state(bool validated, std::string_view rea
 
     std::string message =
         "metadata availability changed state=" + std::string(metadata_availability_name(next)) +
-        " previous=" + metadata_availability_name(previous) +
-        " reason=\"" + transition_reason + "\"";
+        " previous=" + metadata_availability_name(previous) + " reason=\"" + transition_reason +
+        "\"";
     if (generation) {
         message += " generation=" + std::to_string(generation) +
-                   " replicas=" + std::to_string(online) + "/" +
-                   std::to_string(known) +
+                   " replicas=" + std::to_string(online) + "/" + std::to_string(known) +
                    " required=" + std::to_string(required);
     }
 
-    if (next == MetadataAvailability::writable ||
-        (previous == MetadataAvailability::unavailable &&
-         next == MetadataAvailability::read_only)) {
+    if (next == MetadataAvailability::writable || (previous == MetadataAvailability::unavailable &&
+                                                   next == MetadataAvailability::read_only)) {
         Log::info(message);
     } else {
         Log::warn(message);
@@ -283,8 +279,8 @@ std::vector<NodeInfo> MetadataManager::replica_nodes(const std::vector<NodeId>& 
     return out;
 }
 
-MetadataRecord MetadataManager::cache_record(
-    const MetadataRecord& record, std::shared_ptr<const MetadataSnapshot> decoded) {
+MetadataRecord MetadataManager::cache_record(const MetadataRecord& record,
+                                             std::shared_ptr<const MetadataSnapshot> decoded) {
     // Durable management tombstones are operational constraints once decoded.
     for (const auto& [_, reset] : decoded->identity_resets)
         node_.apply_identity_reset(reset);
@@ -297,7 +293,8 @@ MetadataRecord MetadataManager::cache_record(
     cache_ = record;
     cache_until_ = time_.now() + node_.config().metadata_cache;
     cache_remote_epoch_ = node_.remote_metadata_epoch();
-    if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
+    if (!decoded_cache_ || decoded_generation_ != record.generation ||
+        decoded_hash_ != record.hash) {
         // The change witness FUSE and the catalogue wake on. Tree-backed namespaces
         // compare roots: their entry maps are always empty.
         const bool namespace_changed =
@@ -321,7 +318,8 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
         cache_ = record;
         cache_until_ = time_.now() + node_.config().metadata_cache;
         cache_remote_epoch_ = node_.remote_metadata_epoch();
-        if (decoded_cache_ && decoded_generation_ == record.generation && decoded_hash_ == record.hash)
+        if (decoded_cache_ && decoded_generation_ == record.generation &&
+            decoded_hash_ == record.hash)
             return record;
     }
 
@@ -376,7 +374,7 @@ std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
         metadata_server_.remote_generation() > decoded_generation_)
         return {};
     return coherent(MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_,
-                                             decoded_hash_, decoded_cache_});
+                                         decoded_hash_, decoded_cache_});
 }
 
 bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash256& target,
@@ -476,8 +474,7 @@ bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash
             // ancestry, not transfer prerequisites, and following them would copy
             // unrelated retained history. A delta needs its primary predecessor, so
             // follow that chain to the nearest full checkpoint.
-            for (const auto& dependency :
-                 metadata_history_materialization_dependencies(task.entry))
+            for (const auto& dependency : metadata_history_materialization_dependencies(task.entry))
                 dependencies.emplace_back(dependency, true);
 
             bool pushed = false;
@@ -533,8 +530,8 @@ size_t MetadataManager::repair_unreconstructable_heads(FrameType frame_type) {
                 auto reply = node_.call(owner, MessageType::get_metadata_history_record,
                                         request.take(), frame_type, call_deadline::metadata);
                 if (reply.message.type != MessageType::metadata_history_entry_reply) {
-                    Log::debug("metadata head repair: " + owner.host + " cannot serve hash=" +
-                               hex(hash.bytes));
+                    Log::debug("metadata head repair: " + owner.host +
+                               " cannot serve hash=" + hex(hash.bytes));
                     continue;
                 }
                 auto entry = decode_metadata_history_entry(reply.message.payload);
@@ -548,9 +545,8 @@ size_t MetadataManager::repair_unreconstructable_heads(FrameType frame_type) {
                               " rejected locally hash=" + hex(hash.bytes));
                     continue;
                 }
-                Log::info("metadata accepted head repaired from peer " + owner.host +
-                          " hash=" + hex(hash.bytes) + " generation=" +
-                          std::to_string(entry.generation));
+                Log::info("metadata accepted head repaired from peer " + owner.host + " hash=" +
+                          hex(hash.bytes) + " generation=" + std::to_string(entry.generation));
                 done = true;
                 break;
             } catch (const std::exception& error) {
@@ -564,7 +560,7 @@ size_t MetadataManager::repair_unreconstructable_heads(FrameType frame_type) {
 }
 
 bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256& target,
-                                            FrameType frame_type) {
+                                           FrameType frame_type) {
     auto& local = local_.replica();
     if (owner.id == node_.node_id())
         return local.history_contains(target);
@@ -579,8 +575,8 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
         try {
             Writer request;
             request.fixed(hash.bytes);
-            auto reply = node_.call(owner, MessageType::has_metadata_history_entry,
-                                    request.take(), frame_type, call_deadline::metadata);
+            auto reply = node_.call(owner, MessageType::has_metadata_history_entry, request.take(),
+                                    frame_type, call_deadline::metadata);
             present = bool_reply(reply);
         } catch (...) {
         }
@@ -626,8 +622,7 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
             std::vector<std::pair<Hash256, bool>> dependencies;
             // As on the pull side: only a delta's primary predecessor is required;
             // following optional links would exchange entire retained histories.
-            for (const auto& dependency :
-                 metadata_history_materialization_dependencies(*entry))
+            for (const auto& dependency : metadata_history_materialization_dependencies(*entry))
                 dependencies.emplace_back(dependency, true);
 
             bool pushed = false;
@@ -675,18 +670,17 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
     };
     auto note_depth = [&] {
         auto peak = history_peak_in_flight_.load(std::memory_order_relaxed);
-        while (peak < pending.size() &&
-               !history_peak_in_flight_.compare_exchange_weak(
-                   peak, pending.size(), std::memory_order_relaxed)) {
+        while (peak < pending.size() && !history_peak_in_flight_.compare_exchange_weak(
+                                            peak, pending.size(), std::memory_order_relaxed)) {
         }
     };
 
     for (auto& [entry, required] : transfer) {
         try {
             auto encoded = encode_metadata_history_entry(entry);
-            pending.push_back({required,
-                node_.call_async(owner, MessageType::put_metadata_history_entry,
-                                 encoded, frame_type, call_deadline::metadata)});
+            pending.push_back(
+                {required, node_.call_async(owner, MessageType::put_metadata_history_entry, encoded,
+                                            frame_type, call_deadline::metadata)});
             history_entries_submitted_.fetch_add(1, std::memory_order_relaxed);
             note_depth();
         } catch (...) {
@@ -702,8 +696,8 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
     return true;
 }
 
-MetadataHistoryEntry MetadataManager::commit_history_entry(
-    const MetadataRecord& record, std::span<const uint8_t> delta) const {
+MetadataHistoryEntry MetadataManager::commit_history_entry(const MetadataRecord& record,
+                                                           std::span<const uint8_t> delta) const {
     if (!valid_metadata_record(record))
         throw std::runtime_error("cannot publish invalid metadata commit");
     MetadataHistoryEntry entry;
@@ -753,18 +747,16 @@ RpcReply MetadataManager::commit_call(const NodeInfo& owner, MessageType type,
             Lock lock(stalled_mutex_);
             stalled_until_[owner.id] = Clock::now() + node_.config().dead_after;
         }
-        Log::warn("metadata commit call stalled peer=" + owner.host + " no_progress_ms=" +
-                  std::to_string(stall.count()) + "; not asked again for " +
+        Log::warn("metadata commit call stalled peer=" + owner.host +
+                  " no_progress_ms=" + std::to_string(stall.count()) + "; not asked again for " +
                   std::to_string(node_.config().dead_after.count()) + " ms");
         throw std::runtime_error("peer made no progress on a commit call");
     }
     return rpc.get();
 }
 
-bool MetadataManager::store_commit_on(const NodeInfo& owner,
-                                      const MetadataHistoryEntry& compact,
-    const MetadataRecord& record,
-                                      FrameType frame_type) {
+bool MetadataManager::store_commit_on(const NodeInfo& owner, const MetadataHistoryEntry& compact,
+                                      const MetadataRecord& record, FrameType frame_type) {
     if (owner.id == node_.node_id()) {
         if (compact.body != MetadataHistoryEntry::Body::delta)
             return local_.replica().store_commit(record);
@@ -806,8 +798,7 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
     return false;
 }
 
-bool MetadataManager::accept_commit_on(const NodeInfo& owner,
-                                       const MetadataAcceptance& acceptance,
+bool MetadataManager::accept_commit_on(const NodeInfo& owner, const MetadataAcceptance& acceptance,
                                        FrameType frame_type) {
     // NodeRuntime detects and notifies accepted-head changes for the local
     // path; do not announce again after this returns.
@@ -823,9 +814,10 @@ bool MetadataManager::accept_commit_on(const NodeInfo& owner,
     }
 }
 
-MetadataManager::PublishedCommit MetadataManager::publish_commit(
-    const std::vector<NodeInfo>& nodes, const MetadataRecord& record,
-    std::span<const uint8_t> delta, FrameType frame_type) {
+MetadataManager::PublishedCommit MetadataManager::publish_commit(const std::vector<NodeInfo>& nodes,
+                                                                 const MetadataRecord& record,
+                                                                 std::span<const uint8_t> delta,
+                                                                 FrameType frame_type) {
     // A commit is accepted once this node holds it. Further copies are sought
     // from the nodes present and owed to the rest; repair_once() delivers them.
     const size_t sought = node_.config().metadata_write_copies;
@@ -834,9 +826,8 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
     PublishedCommit out;
     out.record = record;
 
-    auto ordered = order_commit_replicas(nodes, node_.node_id(), [&](const NodeId& peer) {
-        return node_.peer_latency(peer);
-    });
+    auto ordered = order_commit_replicas(
+        nodes, node_.node_id(), [&](const NodeId& peer) { return node_.peer_latency(peer); });
 
     // Store the commit on the nearest replicas until enough hold it or none is
     // left to ask. Receivers validate and append to the DAG without comparing
@@ -857,9 +848,8 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
         if (out.stored_on.size() >= sought)
             break;
     }
-    if (std::none_of(out.stored_on.begin(), out.stored_on.end(), [&](const NodeInfo& owner) {
-            return owner.id == node_.node_id();
-        }))
+    if (std::none_of(out.stored_on.begin(), out.stored_on.end(),
+                     [&](const NodeInfo& owner) { return owner.id == node_.node_id(); }))
         throw std::runtime_error("local metadata commit store failed");
 
     out.acceptance.generation = record.generation;
@@ -878,9 +868,8 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
     // reconstruct the branch later.
     const auto parents = metadata_record_parents(record);
     // Local first: a peer must never hold an accepted commit its author lacks.
-    std::stable_partition(out.stored_on.begin(), out.stored_on.end(), [&](const NodeInfo& owner) {
-        return owner.id == node_.node_id();
-    });
+    std::stable_partition(out.stored_on.begin(), out.stored_on.end(),
+                          [&](const NodeInfo& owner) { return owner.id == node_.node_id(); });
     bool local_accepted = false;
     for (const auto& owner : out.stored_on) {
         if (owner.id != node_.node_id() && !local_accepted)
@@ -903,9 +892,8 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
             const auto ms = elapsed_ms(accept_started);
             if (ms >= 250 || !accepted_here)
                 Log::debug("metadata commit accept replica=" + owner.host +
-                           " accepted=" + (accepted_here ? "yes" : "no") +
-                           " ancestry_ready=" + (ancestry_ready ? "yes" : "no") +
-                           " ms=" + std::to_string(ms) +
+                           " accepted=" + (accepted_here ? "yes" : "no") + " ancestry_ready=" +
+                           (ancestry_ready ? "yes" : "no") + " ms=" + std::to_string(ms) +
                            " generation=" + std::to_string(record.generation));
         }
     }
@@ -914,8 +902,8 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
     return out;
 }
 
-std::vector<std::pair<NodeInfo, MetadataAcceptance>> MetadataManager::discover_accepted_heads(
-    const std::vector<NodeInfo>& nodes, FrameType frame_type) {
+std::vector<std::pair<NodeInfo, MetadataAcceptance>>
+MetadataManager::discover_accepted_heads(const std::vector<NodeInfo>& nodes, FrameType frame_type) {
     std::vector<std::pair<NodeInfo, MetadataAcceptance>> out;
     for (const auto& owner : nodes) {
         try {
@@ -923,7 +911,8 @@ std::vector<std::pair<NodeInfo, MetadataAcceptance>> MetadataManager::discover_a
             if (owner.id == node_.node_id()) {
                 heads = metadata_server_.heads();
             } else {
-                auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type, call_deadline::metadata);
+                auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type,
+                                        call_deadline::metadata);
                 if (reply.message.type != MessageType::metadata_heads_reply)
                     continue;
                 heads = decode_metadata_acceptance_set(reply.message.payload);
@@ -937,8 +926,7 @@ std::vector<std::pair<NodeInfo, MetadataAcceptance>> MetadataManager::discover_a
     return out;
 }
 
-bool MetadataManager::replicate_accepted_head(const NodeInfo& owner,
-                                              const MetadataRecord& record,
+bool MetadataManager::replicate_accepted_head(const NodeInfo& owner, const MetadataRecord& record,
                                               const MetadataAcceptance& acceptance,
                                               FrameType frame_type) {
     if (owner.id == node_.node_id()) {
@@ -961,8 +949,8 @@ void MetadataManager::truncate_history(size_t record_threshold, uint64_t byte_th
     Lock mutation_lock(mutation_mutex_);
     if (local_.replica().recovery_required())
         return;
-    if (const auto dropped = local_.replica().expire_set_aside(
-            unix_ms(), node_.config().maintenance.garbage_grace))
+    if (const auto dropped =
+            local_.replica().expire_set_aside(unix_ms(), node_.config().maintenance.garbage_grace))
         Log::warn("metadata: dropped " + std::to_string(dropped) +
                   " head(s) set aside for the absence horizon; their content never arrived");
     // A node's history is its own: once it holds one head and the history
@@ -1013,13 +1001,11 @@ MetadataRecord MetadataManager::own_head(const std::vector<MetadataRecord>& head
         try {
             const auto snapshot = decode_snapshot(head.payload);
             if (!authors)
-                authors = local_.replica().author_ids(node_.node_id(),
-                                                      snapshot.mutation_sequences);
+                authors = local_.replica().author_ids(node_.node_id(), snapshot.mutation_sequences);
             std::vector<uint64_t> sequences;
             for (const auto& author : *authors) {
                 const auto found = snapshot.mutation_sequences.find(author);
-                sequences.push_back(found == snapshot.mutation_sequences.end() ? 0
-                                                                               : found->second);
+                sequences.push_back(found == snapshot.mutation_sequences.end() ? 0 : found->second);
             }
             ranked.emplace_back(std::move(sequences), &head);
         } catch (const std::exception&) {
@@ -1027,12 +1013,12 @@ MetadataRecord MetadataManager::own_head(const std::vector<MetadataRecord>& head
     }
     if (ranked.empty())
         return heads.front();
-    const auto best = std::max_element(ranked.begin(), ranked.end(),
-                                       [](const auto& a, const auto& b) {
-                                           if (a.first != b.first)
-                                               return a.first < b.first;
-                                           return a.second->hash > b.second->hash;
-                                       });
+    const auto best =
+        std::max_element(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+            if (a.first != b.first)
+                return a.first < b.first;
+            return a.second->hash > b.second->hash;
+        });
     return *best->second;
 }
 
@@ -1081,9 +1067,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         std::vector<NodeInfo> history_sources = head.owners;
         for (const auto& certificate : head.certificates) {
             for (const auto& witness : certificate.replicas) {
-                auto found = std::find_if(nodes.begin(), nodes.end(), [&](const NodeInfo& peer) {
-                    return peer.id == witness;
-                });
+                auto found = std::find_if(nodes.begin(), nodes.end(),
+                                          [&](const NodeInfo& peer) { return peer.id == witness; });
                 if (found != nodes.end() &&
                     std::none_of(history_sources.begin(), history_sources.end(),
                                  [&](const NodeInfo& peer) { return peer.id == found->id; }))
@@ -1134,8 +1119,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         auto heads = usable_heads();
         if (heads.empty())
             throw MetadataNotReady("metadata accepted-head set is empty");
-        std::sort(heads.begin(), heads.end(), [](const MetadataRecord& a,
-                                                 const MetadataRecord& b) {
+        std::sort(heads.begin(), heads.end(), [](const MetadataRecord& a, const MetadataRecord& b) {
             if (a.hash != b.hash)
                 return a.hash < b.hash;
             return a.generation < b.generation;
@@ -1183,129 +1167,127 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             set_aside(own.hash == heads[0].hash ? heads[1] : heads[0], reason);
         };
         try {
-        auto left = heads[0];
-        auto right = heads[1];
-        auto left_materialized = local_.replica().materialized(left.hash);
-        auto right_materialized = local_.replica().materialized(right.hash);
-        if (!left_materialized || !right_materialized)
-            throw MergeUnavailable("metadata merge head cannot be materialized");
-        const auto materialise_ms = stage_ms();
-        // The merge reads the two heads and nothing else: two trees merge by
-        // what differs between them.
-        const auto& left_snapshot = *left_materialized->snapshot;
-        const auto& right_snapshot = *right_materialized->snapshot;
-        if (!left_snapshot.namespace_root || !right_snapshot.namespace_root)
-            throw MergeUnavailable("a metadata head to merge holds no namespace tree");
-        const auto reading =
-            ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
-        auto tree_merge = merge_tree_backed_heads(left_snapshot, right_snapshot, left.hash,
-                                                  right.hash, reading);
-        auto merged = std::move(tree_merge.merged);
-        if (merged.snapshot.extent_size &&
-            merged.snapshot.extent_size != node_.config().extent_size)
-            throw std::runtime_error("cluster extent size does not match local configuration");
-        const auto merge_ms = stage_ms();
+            auto left = heads[0];
+            auto right = heads[1];
+            auto left_materialized = local_.replica().materialized(left.hash);
+            auto right_materialized = local_.replica().materialized(right.hash);
+            if (!left_materialized || !right_materialized)
+                throw MergeUnavailable("metadata merge head cannot be materialized");
+            const auto materialise_ms = stage_ms();
+            // The merge reads the two heads and nothing else: two trees merge by
+            // what differs between them.
+            const auto& left_snapshot = *left_materialized->snapshot;
+            const auto& right_snapshot = *right_materialized->snapshot;
+            if (!left_snapshot.namespace_root || !right_snapshot.namespace_root)
+                throw MergeUnavailable("a metadata head to merge holds no namespace tree");
+            const auto reading =
+                ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
+            auto tree_merge = merge_tree_backed_heads(left_snapshot, right_snapshot, left.hash,
+                                                      right.hash, reading);
+            auto merged = std::move(tree_merge.merged);
+            if (merged.snapshot.extent_size &&
+                merged.snapshot.extent_size != node_.config().extent_size)
+                throw std::runtime_error("cluster extent size does not match local configuration");
+            const auto merge_ms = stage_ms();
 
-        // The lower hash is the primary parent so every reconciler of the same
-        // head pair produces the same merge commit. A merge is a pure join, not a
-        // user mutation: the merged clock covers both parents. A fresh local
-        // origin/sequence here would make simultaneous reconcilers mint sibling
-        // merges forever.
-        if (right.hash < left.hash) {
-            std::swap(left, right);
-        }
-        merged.snapshot.merge_parents = {right.hash};
+            // The lower hash is the primary parent so every reconciler of the same
+            // head pair produces the same merge commit. A merge is a pure join, not a
+            // user mutation: the merged clock covers both parents. A fresh local
+            // origin/sequence here would make simultaneous reconcilers mint sibling
+            // merges forever.
+            if (right.hash < left.hash) {
+                std::swap(left, right);
+            }
+            merged.snapshot.merge_parents = {right.hash};
 
-        // The merged namespace's tree; its nodes are written and replicated
-        // before the record naming the root is published.
-        {
-            auto commit_nodes =
-                ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
-            merged.snapshot.namespace_root =
-                update_namespace_tree(tree_merge.onto, commit_nodes, tree_merge.changes);
-        }
+            // The merged namespace's tree; its nodes are written and replicated
+            // before the record naming the root is published.
+            {
+                auto commit_nodes =
+                    ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
+                merged.snapshot.namespace_root =
+                    update_namespace_tree(tree_merge.onto, commit_nodes, tree_merge.changes);
+            }
 
-        const auto tree_ms = stage_ms();
-        MetadataRecord reconciliation;
-        reconciliation.generation = std::max(left.generation, right.generation) + 1;
-        reconciliation.previous = left.hash;
-        reconciliation.payload = encode_snapshot_v14(merged.snapshot);
-        reconciliation.hash = metadata_hash(reconciliation.generation,
-                                            reconciliation.previous,
-                                            reconciliation.payload);
+            const auto tree_ms = stage_ms();
+            MetadataRecord reconciliation;
+            reconciliation.generation = std::max(left.generation, right.generation) + 1;
+            reconciliation.previous = left.hash;
+            reconciliation.payload = encode_snapshot_v14(merged.snapshot);
+            reconciliation.hash = metadata_hash(reconciliation.generation, reconciliation.previous,
+                                                reconciliation.payload);
 
-        Bytes reconciliation_delta;
-        const auto& primary =
-            left_materialized->record.hash == reconciliation.previous ? *left_materialized
-                                                                      : *right_materialized;
-        // A tree merge knows its namespace changes against the primary parent.
-        const auto delta = tree_merge_delta(*primary.snapshot, merged.snapshot, tree_merge.changes);
-        if (delta) {
-            auto encoded = encode_metadata_delta(*delta);
-            if (encoded.size() < reconciliation.payload.size())
-                reconciliation_delta = std::move(encoded);
-        }
-        const auto encode_ms = stage_ms();
+            Bytes reconciliation_delta;
+            const auto& primary = left_materialized->record.hash == reconciliation.previous
+                                      ? *left_materialized
+                                      : *right_materialized;
+            // A tree merge knows its namespace changes against the primary parent.
+            const auto delta =
+                tree_merge_delta(*primary.snapshot, merged.snapshot, tree_merge.changes);
+            if (delta) {
+                auto encoded = encode_metadata_delta(*delta);
+                if (encoded.size() < reconciliation.payload.size())
+                    reconciliation_delta = std::move(encoded);
+            }
+            const auto encode_ms = stage_ms();
 
-        // The merge claims what it introduces before it is published, as a
-        // mutation does. Its dot is a fresh local sequence the merged clock
-        // does not carry, so every reconciler still mints the same commit and
-        // no earlier release here can void the claim; the head that carries
-        // this node's next mutation covers it.
-        if (publication_retention_.local) {
-            const auto claim = local_.replica().reserve_mutation_dot(
-                node_.node_id(), merged.snapshot.mutation_sequences);
-            const auto claims = publication_retention_.local(MetadataPublicationContext{
-                claim.author, claim.sequence, primary.record, merged.snapshot,
-                delta ? &*delta : nullptr});
-            // A merge is made off every caller's path, so the peers' share
-            // is done here too, before the merge is offered to them.
-            if (publication_retention_.peers) {
-                try {
-                    publication_retention_.peers(claim.author, claim.sequence, claims);
-                } catch (const std::exception& error) {
-                    if (Log::enabled(LogLevel::debug))
-                        Log::debug("metadata merge claims on peers deferred: " +
-                                   std::string(error.what()));
+            // The merge claims what it introduces before it is published, as a
+            // mutation does. Its dot is a fresh local sequence the merged clock
+            // does not carry, so every reconciler still mints the same commit and
+            // no earlier release here can void the claim; the head that carries
+            // this node's next mutation covers it.
+            if (publication_retention_.local) {
+                const auto claim = local_.replica().reserve_mutation_dot(
+                    node_.node_id(), merged.snapshot.mutation_sequences);
+                const auto claims = publication_retention_.local(
+                    MetadataPublicationContext{claim.author, claim.sequence, primary.record,
+                                               merged.snapshot, delta ? &*delta : nullptr});
+                // A merge is made off every caller's path, so the peers' share
+                // is done here too, before the merge is offered to them.
+                if (publication_retention_.peers) {
+                    try {
+                        publication_retention_.peers(claim.author, claim.sequence, claims);
+                    } catch (const std::exception& error) {
+                        if (Log::enabled(LogLevel::debug))
+                            Log::debug("metadata merge claims on peers deferred: " +
+                                       std::string(error.what()));
+                    }
                 }
             }
-        }
-        const auto retention_ms = stage_ms();
-        (void)publish_commit(nodes, reconciliation, reconciliation_delta, frame_type);
-        const auto publish_ms = stage_ms();
-        if (merged.conflicts_superseded)
-            conflicts_superseded_.fetch_add(merged.conflicts_superseded, std::memory_order_relaxed);
-        const auto reconcile_us = elapsed_us(reconcile_started);
-        observations().record("metadata.reconcile_us", reconcile_us);
-        Log::info("metadata histories reconciled generation=" +
-                  std::to_string(reconciliation.generation) +
-                  " ms=" + std::to_string(reconcile_us / 1000) +
-                  " materialise_ms=" + std::to_string(materialise_ms) +
-                  " merge_ms=" + std::to_string(merge_ms) +
-                  " tree_ms=" + std::to_string(tree_ms) +
-                  " encode_ms=" + std::to_string(encode_ms) +
-                  " retention_ms=" + std::to_string(retention_ms) +
-                  " publish_ms=" + std::to_string(publish_ms) +
-                  " history_body=" +
-                  std::string(reconciliation_delta.empty() ? "full" : "delta") +
-                  " history_bytes=" +
-                  std::to_string(reconciliation_delta.empty()
-                                     ? reconciliation.payload.size()
-                                     : reconciliation_delta.size()) +
-                  " conflicts=" + std::to_string(merged.conflicts_created) +
-                  " superseded=" + std::to_string(merged.conflicts_superseded) +
-                  " standing=" + std::to_string(merged.snapshot.conflicts.size()) +
-                  " remaining_heads=" + std::to_string(heads.size() - 1));
-        for (const auto& key : merged.created_keys)
-            Log::warn("metadata merge recorded a conflict generation=" +
-                      std::to_string(reconciliation.generation) + " key=" + key +
-                      "; resolve it at /api/v1/manage/metadata/conflicts");
-        if (merged.conflicts_created > merged.created_keys.size())
-            Log::warn("metadata merge recorded " +
-                      std::to_string(merged.conflicts_created - merged.created_keys.size()) +
-                      " more conflicts generation=" + std::to_string(reconciliation.generation));
-        // accept_commit() drops accepted ancestors from the head set, so the loop
-        // folds any remaining heads into this commit.
+            const auto retention_ms = stage_ms();
+            (void)publish_commit(nodes, reconciliation, reconciliation_delta, frame_type);
+            const auto publish_ms = stage_ms();
+            if (merged.conflicts_superseded)
+                conflicts_superseded_.fetch_add(merged.conflicts_superseded,
+                                                std::memory_order_relaxed);
+            const auto reconcile_us = elapsed_us(reconcile_started);
+            observations().record("metadata.reconcile_us", reconcile_us);
+            Log::info(
+                "metadata histories reconciled generation=" +
+                std::to_string(reconciliation.generation) +
+                " ms=" + std::to_string(reconcile_us / 1000) + " materialise_ms=" +
+                std::to_string(materialise_ms) + " merge_ms=" + std::to_string(merge_ms) +
+                " tree_ms=" + std::to_string(tree_ms) + " encode_ms=" + std::to_string(encode_ms) +
+                " retention_ms=" + std::to_string(retention_ms) +
+                " publish_ms=" + std::to_string(publish_ms) + " history_body=" +
+                std::string(reconciliation_delta.empty() ? "full" : "delta") + " history_bytes=" +
+                std::to_string(reconciliation_delta.empty() ? reconciliation.payload.size()
+                                                            : reconciliation_delta.size()) +
+                " conflicts=" + std::to_string(merged.conflicts_created) +
+                " superseded=" + std::to_string(merged.conflicts_superseded) +
+                " standing=" + std::to_string(merged.snapshot.conflicts.size()) +
+                " remaining_heads=" + std::to_string(heads.size() - 1));
+            for (const auto& key : merged.created_keys)
+                Log::warn("metadata merge recorded a conflict generation=" +
+                          std::to_string(reconciliation.generation) + " key=" + key +
+                          "; resolve it at /api/v1/manage/metadata/conflicts");
+            if (merged.conflicts_created > merged.created_keys.size())
+                Log::warn(
+                    "metadata merge recorded " +
+                    std::to_string(merged.conflicts_created - merged.created_keys.size()) +
+                    " more conflicts generation=" + std::to_string(reconciliation.generation));
+            // accept_commit() drops accepted ancestors from the head set, so the loop
+            // folds any remaining heads into this commit.
         } catch (const MergeUnavailable& error) {
             aside(error.what());
         } catch (const DecodeError& error) {
@@ -1334,12 +1316,11 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
     (void)publish_commit(active, proposed, {}, FrameType::control);
     Log::info("metadata policy transition committed generation=" +
               std::to_string(proposed.generation));
-    return cache_record(proposed,
-                        std::make_shared<MetadataSnapshot>(std::move(snapshot)));
+    return cache_record(proposed, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 }
 
-MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoints(
-    const std::vector<NodeInfo>& active) {
+MetadataManager::RecoverySurvey
+MetadataManager::recover_from_committed_checkpoints(const std::vector<NodeInfo>& active) {
     RecoverySurvey survey;
     if (active.empty())
         return survey;
@@ -1352,15 +1333,14 @@ MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoi
     for (const auto& owner : active) {
         if (owner.id == node_.node_id()) {
             ++completed;
-            durable_history = durable_history ||
-                              local_.replica().committed().generation > 1;
+            durable_history = durable_history || local_.replica().committed().generation > 1;
             continue;
         }
         try {
             PendingRead item;
             item.owner = owner;
-            item.rpc.emplace(node_.call_async(owner, MessageType::get_committed_metadata,
-                                              {}, FrameType::control, call_deadline::metadata));
+            item.rpc.emplace(node_.call_async(owner, MessageType::get_committed_metadata, {},
+                                              FrameType::control, call_deadline::metadata));
             pending.push_back(std::move(item));
         } catch (...) {
             ++completed;
@@ -1384,8 +1364,8 @@ MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoi
                     ++failed;
                     continue;
                 }
-                durable_history = durable_history ||
-                                  decode_metadata_record(reply.message.payload).generation > 1;
+                durable_history =
+                    durable_history || decode_metadata_record(reply.message.payload).generation > 1;
             } catch (...) {
                 ++failed;
             }
@@ -1465,8 +1445,7 @@ MetadataRecord MetadataManager::discover_or_form() {
     (void)publish_commit(active, formed, {}, FrameType::control);
 
     Log::info("metadata replica set formed active=" + std::to_string(active.size()));
-    return cache_record(formed,
-                        std::make_shared<MetadataSnapshot>(std::move(snapshot)));
+    return cache_record(formed, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 }
 
 MetadataRecord MetadataManager::read_record_base() {
@@ -1530,9 +1509,8 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
         if (decoded_cache_ &&
             (decoded_generation_ > record.generation ||
              (decoded_generation_ == record.generation && decoded_hash_ >= record.hash))) {
-            return coherent(MetadataSnapshotView{decoded_generation_,
-                                                     decoded_namespace_revision_, decoded_hash_,
-                                                     decoded_cache_});
+            return coherent(MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_,
+                                                 decoded_hash_, decoded_cache_});
         }
     }
 
@@ -1560,8 +1538,7 @@ MetadataSnapshotView MetadataManager::local() {
     {
         // The head set moves far more often than the head this node reads.
         Lock lock(cache_mutex_);
-        if (identities.size() == 1 && local_view_ &&
-            local_view_->hash == identities.front().hash) {
+        if (identities.size() == 1 && local_view_ && local_view_->hash == identities.front().hash) {
             local_view_revision_ = revision;
             return *local_view_;
         }
@@ -1586,8 +1563,8 @@ MetadataSnapshotView MetadataManager::local() {
     (void)cache_record(head, decoded);
     Lock lock(cache_mutex_);
     auto view = coherent(MetadataSnapshotView{
-        head.generation,
-        decoded_hash_ == head.hash ? decoded_namespace_revision_ : 0, head.hash, decoded});
+        head.generation, decoded_hash_ == head.hash ? decoded_namespace_revision_ : 0, head.hash,
+        decoded});
     local_view_ = view;
     local_view_revision_ = revision;
     return view;
@@ -1600,7 +1577,7 @@ std::optional<MetadataSnapshotView> MetadataManager::available_snapshot_view() c
     if (!decoded_cache_)
         return {};
     return coherent(MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_,
-                                             decoded_hash_, decoded_cache_});
+                                         decoded_hash_, decoded_cache_});
 }
 
 MetadataSnapshot MetadataManager::snapshot() {
@@ -1628,15 +1605,15 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
         // A refusal becomes "no view" below, which stops retention release
         // rather than running it against an empty live set.
         return coherent(MetadataSnapshotView{heads.front().generation, 0, heads.front().hash,
-                                                 materialized->snapshot});
+                                             materialized->snapshot});
     } catch (...) {
         return {};
     }
 }
 
-MetadataRecord MetadataManager::mutate_delta(
-    const std::function<void(MetadataSnapshot&, MetadataDelta&)>& mutate, size_t retries,
-    std::optional<MetadataMutationIdentity> identity) {
+MetadataRecord
+MetadataManager::mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>& mutate,
+                              size_t retries, std::optional<MetadataMutationIdentity> identity) {
     Lock lock(mutation_mutex_);
     // This mutation's dot, kept across retries so an attempt that was
     // accepted after all is recognised rather than made twice.
@@ -1683,8 +1660,7 @@ MetadataRecord MetadataManager::mutate_delta(
         }
         if (identity) {
             auto clock = snapshot.mutation_sequences.find(identity->origin);
-            if (clock != snapshot.mutation_sequences.end() &&
-                clock->second >= identity->sequence) {
+            if (clock != snapshot.mutation_sequences.end() && clock->second >= identity->sequence) {
                 // Already accepted (before a crash, or merged by a peer).
                 owe(current, std::nullopt);
                 cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
@@ -1692,8 +1668,8 @@ MetadataRecord MetadataManager::mutate_delta(
             }
         }
         if (!dot)
-            dot = local_.replica().reserve_mutation_dot(node_.node_id(),
-                                                        snapshot.mutation_sequences);
+            dot =
+                local_.replica().reserve_mutation_dot(node_.node_id(), snapshot.mutation_sequences);
         const auto origin = dot->author;
         const std::optional<uint64_t> sequence = dot->sequence;
 
@@ -1703,8 +1679,7 @@ MetadataRecord MetadataManager::mutate_delta(
         MetadataDelta supplied_delta;
         const auto data_replication = snapshot.data_replication;
         const auto extent_size = snapshot.extent_size;
-        const auto metadata_write_replicas_required =
-            snapshot.metadata_write_replicas_required;
+        const auto metadata_write_replicas_required = snapshot.metadata_write_replicas_required;
         const auto metadata_participants = snapshot.metadata_participants;
         const auto metadata_branch_floor = snapshot.metadata_branch_floor;
         const auto retention_baseline_complete = snapshot.retention_baseline_complete;
@@ -1768,10 +1743,9 @@ MetadataRecord MetadataManager::mutate_delta(
             if (!snapshot.entries.empty())
                 throw std::runtime_error(
                     "metadata mutation wrote the namespace map on a tree-backed snapshot");
-            auto nodes =
-                ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
-            snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root,
-                                                                    nodes, supplied_delta);
+            auto nodes = ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
+            snapshot.namespace_root =
+                apply_delta_to_namespace_tree(*snapshot.namespace_root, nodes, supplied_delta);
             // The mutation's tombstones, each group one batch object written
             // here beside the tree's nodes and named by the head.
             for (auto& pending : supplied_delta.pending_tombstones) {
@@ -1781,8 +1755,8 @@ MetadataRecord MetadataManager::mutate_delta(
                 if (ids.empty())
                     continue;
                 const auto retired = pending.at_commit ? wall_time_ns() : pending.retired_at_ns;
-                const TombstoneBatch batch{nodes.put(encode_tombstone_batch(retired, ids)),
-                                           retired, static_cast<uint32_t>(ids.size())};
+                const TombstoneBatch batch{nodes.put(encode_tombstone_batch(retired, ids)), retired,
+                                           static_cast<uint32_t>(ids.size())};
                 const auto by_id = [](const TombstoneBatch& held, const ObjectId& id) {
                     return held.id < id;
                 };
@@ -1814,8 +1788,7 @@ MetadataRecord MetadataManager::mutate_delta(
         const auto conflicts_ms = stage_ms();
         auto payload = encode_snapshot_v14(snapshot);
         if (payload == current.payload)
-            return cache_record(current,
-                                std::make_shared<MetadataSnapshot>(std::move(snapshot)));
+            return cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 
         MetadataRecord proposed;
         proposed.generation = current.generation + 1;
@@ -1870,9 +1843,8 @@ MetadataRecord MetadataManager::mutate_delta(
             owe(proposed, OwedClaims{origin, *sequence, std::move(claims)});
             const auto total_ms = elapsed_ms(total_started);
             if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
-                Log::debug("metadata mutate total_ms=" + std::to_string(total_ms) +
-                           " head_ms=" + std::to_string(head_ms) +
-                           " decode_ms=" + std::to_string(decode_ms) +
+                Log::debug("metadata mutate total_ms=" + std::to_string(total_ms) + " head_ms=" +
+                           std::to_string(head_ms) + " decode_ms=" + std::to_string(decode_ms) +
                            " apply_ms=" + std::to_string(apply_ms) +
                            " tree_ms=" + std::to_string(tree_ms) +
                            " conflicts_ms=" + std::to_string(conflicts_ms) +
@@ -1891,9 +1863,8 @@ MetadataRecord MetadataManager::mutate_delta(
             // iteration recognises it rather than minting a second mutation.
             if (Log::enabled(LogLevel::debug))
                 Log::debug("metadata mutation publish failed sequence=" +
-                           std::to_string(*sequence) + " attempt=" +
-                           std::to_string(attempt + 1) + "/" + std::to_string(retries) +
-                           " error=" + error.what());
+                           std::to_string(*sequence) + " attempt=" + std::to_string(attempt + 1) +
+                           "/" + std::to_string(retries) + " error=" + error.what());
             if (attempt + 1 == retries)
                 throw;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));

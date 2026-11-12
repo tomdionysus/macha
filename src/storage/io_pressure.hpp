@@ -72,17 +72,16 @@ class DiskServiceMonitor {
 
     // Records one completed DATA read or write, whatever class of work issued it.
     void note(std::chrono::nanoseconds elapsed, uint64_t bytes) noexcept {
-        const auto micros =
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed)
-                                      .count());
+        const auto micros = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
         operations_.fetch_add(1, std::memory_order_relaxed);
         bytes_.fetch_add(bytes, std::memory_order_relaxed);
 
         // Deliberately racy EWMA: a lost update is noise; a lock would sit on
         // the hot completion path of every extent write.
         auto mean = mean_us_.load(std::memory_order_relaxed);
-        const auto next = mean ? (mean * (weight_denominator - 1) + micros) / weight_denominator
-                               : micros;
+        const auto next =
+            mean ? (mean * (weight_denominator - 1) + micros) / weight_denominator : micros;
         mean_us_.store(next, std::memory_order_relaxed);
 
         auto worst = worst_us_.load(std::memory_order_relaxed);
@@ -112,7 +111,8 @@ class DiskServiceMonitor {
             }
         } else if (next_slowdown < thresholds_.release_percent) {
             if (pressured_.exchange(false, std::memory_order_relaxed))
-                log_transition("DATA device pressure released", next_slowdown, ratio, micros, bytes);
+                log_transition("DATA device pressure released", next_slowdown, ratio, micros,
+                               bytes);
         }
     }
 
@@ -150,8 +150,8 @@ class DiskServiceMonitor {
                                uint64_t bytes) noexcept {
         try {
             Log::info(std::string(what) + " slowdown_percent=" + std::to_string(slowdown) +
-                      " last_percent=" + std::to_string(ratio) + " last_us=" + std::to_string(micros) +
-                      " last_bytes=" + std::to_string(bytes));
+                      " last_percent=" + std::to_string(ratio) + " last_us=" +
+                      std::to_string(micros) + " last_bytes=" + std::to_string(bytes));
         } catch (...) {
             // A log line must never fail the I/O it describes.
         }

@@ -44,8 +44,8 @@ class StandInPeer {
     StandInPeer(const std::filesystem::path& root, const std::filesystem::path& keyfile,
                 const std::string& name, Options options)
         : port_(free_port()) {
-        auto config = config_for(root / name, keyfile, port_, options.bootstrap,
-                                 ConfigProfile::isolated);
+        auto config =
+            config_for(root / name, keyfile, port_, options.bootstrap, ConfigProfile::isolated);
         if (!options.failure_domain.empty())
             config.failure_domain = options.failure_domain;
         config.node_name = options.node_name;
@@ -60,7 +60,8 @@ class StandInPeer {
         node.telemetry_layout = hosted_telemetry_layout();
         node.telemetry_fields = std::move(options.telemetry);
         node.log = macha_log_sink();
-        host_ = std::make_unique<DannanHost>(std::move(node), routes, 2, DannanHost::MetadataNotice{});
+        host_ =
+            std::make_unique<DannanHost>(std::move(node), routes, 2, DannanHost::MetadataNotice{});
         if (options.hosts_extents)
             host_->node().nodes().advertise(advert::hosts_extents, dannan::net::Bytes{1});
     }
@@ -72,8 +73,12 @@ class StandInPeer {
     StandInPeer(const StandInPeer&) = delete;
     StandInPeer& operator=(const StandInPeer&) = delete;
 
-    void start() { host_->start(); }
-    void stop() { host_->stop(); }
+    void start() {
+        host_->start();
+    }
+    void stop() {
+        host_->stop();
+    }
 
     // Its storage figures, as Macha's adverts carry them.
     void advertise_storage(uint64_t capacity, uint64_t used) {
@@ -87,8 +92,9 @@ class StandInPeer {
     }
 
     // Calls from the stand-in, as any node places them.
-    AsyncRpc call_async(const Endpoint& endpoint, MessageType type, std::span<const uint8_t> payload,
-                        FrameType frame, std::chrono::milliseconds deadline) {
+    AsyncRpc call_async(const Endpoint& endpoint, MessageType type,
+                        std::span<const uint8_t> payload, FrameType frame,
+                        std::chrono::milliseconds deadline) {
         return host_->call_async(endpoint, type, payload, frame, deadline);
     }
     RpcReply call(const Endpoint& endpoint, MessageType type, std::span<const uint8_t> payload,
@@ -96,10 +102,18 @@ class StandInPeer {
         return call_async(endpoint, type, payload, frame, deadline).get();
     }
 
-    NodeId id() const { return macha_id(host_->node().nodes().self().id); }
-    NodeInfo info() const { return node_info_from(host_->node().nodes().self()); }
-    Endpoint endpoint() const { return {"127.0.0.1", port_}; }
-    dannan::Node& node() { return host_->node(); }
+    NodeId id() const {
+        return macha_id(host_->node().nodes().self().id);
+    }
+    NodeInfo info() const {
+        return node_info_from(host_->node().nodes().self());
+    }
+    Endpoint endpoint() const {
+        return {"127.0.0.1", port_};
+    }
+    dannan::Node& node() {
+        return host_->node();
+    }
 
     // Answers for the types the test binds; any other is refused 501.
     MessageRoutes routes;

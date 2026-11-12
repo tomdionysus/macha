@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "stand_in_peer.hpp"
-#include "observation.hpp"
-#include "json.hpp"
 #include "api/manage_api.hpp"
 #include "api/status_api.hpp"
+#include "api/users_api.hpp"
+#include "json.hpp"
+#include "observation.hpp"
+#include "stand_in_peer.hpp"
 #include "supervised.hpp"
 #include "test_backend_support.hpp"
-#include "api/users_api.hpp"
 
 #if defined(__linux__)
 #include <sys/stat.h>
@@ -53,8 +53,7 @@ class CatalogueBench {
     std::optional<CatalogueHintQueue> hints_;
 
   public:
-    explicit CatalogueBench(std::string_view name, size_t metadata_write_copies = 1)
-        : node_(name) {
+    explicit CatalogueBench(std::string_view name, size_t metadata_write_copies = 1) : node_(name) {
         auto& config = node_.config();
         config.replication = 1;
         config.metadata_write_copies = metadata_write_copies;
@@ -67,16 +66,36 @@ class CatalogueBench {
                            node_.metadata(), node.ledger());
         hints_.emplace(node.config().state_path);
     }
-    const std::filesystem::path& path() const { return node_.path(); }
-    const std::filesystem::path& keyfile() const { return node_.keyfile(); }
-    BareNode& node() { return node_.node(); }
-    MetadataManager& metadata() { return node_.metadata(); }
-    DistributedStore& store() { return node_.store(); }
-    FileSystem& fs() { return node_.filesystem(); }
-    NodeResources& resources() { return node_.resources(); }
-    const Config& config() { return node_.config(); }
-    CatalogueManager& catalogue() { return *catalogue_; }
-    CatalogueHintQueue& hints() { return *hints_; }
+    const std::filesystem::path& path() const {
+        return node_.path();
+    }
+    const std::filesystem::path& keyfile() const {
+        return node_.keyfile();
+    }
+    BareNode& node() {
+        return node_.node();
+    }
+    MetadataManager& metadata() {
+        return node_.metadata();
+    }
+    DistributedStore& store() {
+        return node_.store();
+    }
+    FileSystem& fs() {
+        return node_.filesystem();
+    }
+    NodeResources& resources() {
+        return node_.resources();
+    }
+    const Config& config() {
+        return node_.config();
+    }
+    CatalogueManager& catalogue() {
+        return *catalogue_;
+    }
+    CatalogueHintQueue& hints() {
+        return *hints_;
+    }
 
     std::unique_ptr<CatalogueScanner> scanner(CatalogueScannerConfig config = {},
                                               std::unique_ptr<HttpClient> http = {}) {
@@ -176,9 +195,10 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         REQUIRE(listed.status == 200);
         CHECK(body_json(listed).find("count")->asUInt64() == 1);
 
-        REQUIRE(manage.handle(request_for(
-                                  "POST", "/api/v1/manage/filesystem/rename",
-                                  R"({"path":"/Movies/unknown.mkv","destination":"/Movies/renamed.mkv"})"))
+        REQUIRE(manage
+                    .handle(request_for(
+                        "POST", "/api/v1/manage/filesystem/rename",
+                        R"({"path":"/Movies/unknown.mkv","destination":"/Movies/renamed.mkv"})"))
                     .status == 200);
         CHECK(file_media_id(fs.getattr("/Movies/renamed.mkv")) == media_id);
         auto moved = hints.list();
@@ -213,8 +233,9 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
                                         CatalogueHintPriority::periodic_scan);
         REQUIRE(hints.claim_next().has_value());
         hints.mark_no_match(stale, "movies", media_id, "synthetic stale exception");
-        REQUIRE(manage.handle(request_for("DELETE", "/api/v1/manage/filesystem", {},
-                                          {{"path", "/Movies/renamed.mkv"}}))
+        REQUIRE(manage
+                    .handle(request_for("DELETE", "/api/v1/manage/filesystem", {},
+                                        {{"path", "/Movies/renamed.mkv"}}))
                     .status == 204);
         CHECK(hints.list().empty());
     }
@@ -234,17 +255,17 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         auto season_two =
             parent(CatalogueKind::season, "tmdb:tv:1:season:2", "Season 2", "tmdb:tv:1");
         season_two.season_number = 2;
-        catalogue.upsert_many({parent(CatalogueKind::show, "tmdb:tv:1", "Scanner Show"),
-                               season_two,
-                               parent(CatalogueKind::artist, "musicbrainz:artist:a",
-                                      "Scanner Artist")});
+        catalogue.upsert_many(
+            {parent(CatalogueKind::show, "tmdb:tv:1", "Scanner Show"), season_two,
+             parent(CatalogueKind::artist, "musicbrainz:artist:a", "Scanner Artist")});
         auto scanner = bench.scanner();
         ManageApi manage(bench.node(), bench.metadata(), fs, catalogue, hints, *scanner);
         int file = 0;
         auto unmatched = [&] {
             ++file;
-            return bench.unmatched("/TV/hand-" + std::to_string(file) + ".mkv",
-                                   static_cast<uint8_t>(100 + file))
+            return bench
+                .unmatched("/TV/hand-" + std::to_string(file) + ".mkv",
+                           static_cast<uint8_t>(100 + file))
                 .first;
         };
         auto post = [&](const std::string& hint_id, std::string_view body) {
@@ -257,7 +278,9 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         };
 
         // season_id: the episode joins the scanner's season, locked.
-        auto [status, body] = post(unmatched(), R"({"kind":"episode","season_id":"tmdb:tv:1:season:2","season_number":7,"episode_number":3})");
+        auto [status, body] = post(
+            unmatched(),
+            R"({"kind":"episode","season_id":"tmdb:tv:1:season:2","season_number":7,"episode_number":3})");
         REQUIRE(status == 201);
         auto episode = leaf(body);
         REQUIRE(episode.has_value());
@@ -267,7 +290,9 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         CHECK(catalogue.get("tmdb:tv:1:season:2")->title == "Season 2");
 
         // series_id plus an existing season number reuses that season.
-        std::tie(status, body) = post(unmatched(), R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":2,"episode_number":4,"lock":false})");
+        std::tie(status, body) = post(
+            unmatched(),
+            R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":2,"episode_number":4,"lock":false})");
         REQUIRE(status == 201);
         episode = leaf(body);
         CHECK(episode->parent_id == "tmdb:tv:1:season:2");
@@ -275,7 +300,9 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         CHECK(catalogue.list(CatalogueKind::season, std::string_view("tmdb:tv:1")).size() == 1);
 
         // A new season number creates one season under the existing show.
-        std::tie(status, body) = post(unmatched(), R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":5,"episode_number":1})");
+        std::tie(status, body) = post(
+            unmatched(),
+            R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":5,"episode_number":1})");
         REQUIRE(status == 201);
         const auto new_season = catalogue.get(*leaf(body)->parent_id);
         REQUIRE(new_season.has_value());
@@ -284,18 +311,24 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         CHECK(catalogue.list(CatalogueKind::show).size() == 1);
 
         // artist_id plus an album title: one album, reused by the second track.
-        std::tie(status, body) = post(unmatched(), R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"One","track_number":1})");
+        std::tie(status, body) = post(
+            unmatched(),
+            R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"One","track_number":1})");
         REQUIRE(status == 201);
         const auto album_id = leaf(body)->parent_id;
         CHECK(catalogue.get(*album_id)->parent_id == "musicbrainz:artist:a");
-        std::tie(status, body) = post(unmatched(), R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"Two","track_number":2})");
+        std::tie(status, body) = post(
+            unmatched(),
+            R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"Two","track_number":2})");
         REQUIRE(status == 201);
         CHECK(leaf(body)->parent_id == album_id);
         CHECK(catalogue.list(CatalogueKind::artist).size() == 1);
 
         // A book by hand: its authors and series by name are created or
         // joined, an existing author by id is referenced.
-        std::tie(status, body) = post(unmatched(), R"({"kind":"book","title":"Hand Book","authors":["Ann Author","Bob Writer"],"series":"Hand Series","series_index":2,"year":2020})");
+        std::tie(status, body) = post(
+            unmatched(),
+            R"({"kind":"book","title":"Hand Book","authors":["Ann Author","Bob Writer"],"series":"Hand Series","series_index":2,"year":2020})");
         REQUIRE(status == 201);
         auto book = leaf(body);
         REQUIRE(book.has_value());
@@ -313,23 +346,27 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         REQUIRE(catalogue.get(series_id).has_value());
         CHECK(catalogue.get(series_id)->kind == CatalogueKind::series);
         CHECK(catalogue.get(series_id)->title == "Hand Series");
-        std::tie(status, body) = post(unmatched(), "{\"kind\":\"book\",\"title\":\"Second Hand Book\",\"author_id\":\"" + ann_id +
-                                                       "\",\"series_id\":\"" + series_id + "\"}");
+        std::tie(status, body) =
+            post(unmatched(), "{\"kind\":\"book\",\"title\":\"Second Hand Book\",\"author_id\":\"" +
+                                  ann_id + "\",\"series_id\":\"" + series_id + "\"}");
         REQUIRE(status == 201);
         CHECK((leaf(body)->author_ids == std::vector<std::string>{ann_id}));
         CHECK(catalogue.list(CatalogueKind::author).size() == 2);
         CHECK(catalogue.list(CatalogueKind::book, {}, std::string_view(series_id)).size() == 2);
-        std::tie(status, body) = post(unmatched(), R"({"kind":"book","title":"Third","author_id":"musicbrainz:artist:a"})");
+        std::tie(status, body) = post(
+            unmatched(), R"({"kind":"book","title":"Third","author_id":"musicbrainz:artist:a"})");
         CHECK(status == 400);
         CHECK(error_code(body) == "bad_parent_kind");
 
         // A missing parent is 404 and a wrong kind is 400, both naming the parent.
         const auto refused = unmatched();
-        std::tie(status, body) = post(refused, R"({"kind":"episode","season_id":"tmdb:tv:missing","episode_number":1})");
+        std::tie(status, body) =
+            post(refused, R"({"kind":"episode","season_id":"tmdb:tv:missing","episode_number":1})");
         CHECK(status == 404);
         CHECK(error_code(body) == "parent_not_found");
         CHECK(body.find("error")->find("parent_id")->asString() == "tmdb:tv:missing");
-        std::tie(status, body) = post(refused, R"({"kind":"track","album_id":"musicbrainz:artist:a","title":"Three"})");
+        std::tie(status, body) =
+            post(refused, R"({"kind":"track","album_id":"musicbrainz:artist:a","title":"Three"})");
         CHECK(status == 400);
         CHECK(error_code(body) == "bad_parent_kind");
         CHECK(body.find("error")->find("expected_kind")->asString() == "album");
@@ -341,11 +378,13 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         // By provider reference, as a scan would match it.
         const std::string release = "0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41";
         auto http = std::make_unique<FakeHttpClient>();
-        http->add("/movie/335984", 200, "application/json",
-                  R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","poster_path":"/p.jpg"})");
+        http->add(
+            "/movie/335984", 200, "application/json",
+            R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","poster_path":"/p.jpg"})");
         http->add("/movie/77", 500, "text/plain", "down");
-        http->add("/tv/1399/season/1", 200, "application/json",
-                  R"({"id":3624,"name":"Season 1","episodes":[{"id":63057,"episode_number":2,"name":"The Kingsroad"}]})");
+        http->add(
+            "/tv/1399/season/1", 200, "application/json",
+            R"({"id":3624,"name":"Season 1","episodes":[{"id":63057,"episode_number":2,"name":"The Kingsroad"}]})");
         http->add("/tv/1399", 200, "application/json",
                   R"({"id":1399,"name":"Game of Thrones","first_air_date":"2011-04-17"})");
         // Before "/release/", which the cover lookup's URL also contains.
@@ -385,7 +424,8 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
 
         // A show by id with season and episode numbers builds show, season, episode.
         auto [episode_hint, episode_media] = bench.unmatched("/TV/ref-2.mkv", 2);
-        std::tie(status, body) = match(episode_hint, R"({"ref":"tmdb:tv:1399","season_number":1,"episode_number":2})");
+        std::tie(status, body) =
+            match(episode_hint, R"({"ref":"tmdb:tv:1399","season_number":1,"episode_number":2})");
         REQUIRE(status == 200);
         auto episode = catalogue.get(body.find("leaf_item_id")->asString());
         REQUIRE(episode.has_value());
@@ -406,7 +446,8 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
 
         // A release by MusicBrainz id with a track number.
         auto [track_hint, track_media] = bench.unmatched("/Music/ref-3.flac", 3);
-        std::tie(status, body) = match(track_hint, R"({"ref":"musicbrainz:release:)" + release + R"(","track_number":2})");
+        std::tie(status, body) = match(track_hint, R"({"ref":"musicbrainz:release:)" + release +
+                                                       R"(","track_number":2})");
         REQUIRE(status == 200);
         auto track = catalogue.get(body.find("leaf_item_id")->asString());
         REQUIRE(track.has_value());
@@ -421,7 +462,8 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         // Another track of the release: the cover this node already holds is
         // neither fetched nor stored again.
         auto [other_hint, other_media] = bench.unmatched("/Music/ref-3b.flac", 13);
-        std::tie(status, body) = match(other_hint, R"({"ref":"musicbrainz:release:)" + release + R"(","track_number":1})");
+        std::tie(status, body) = match(other_hint, R"({"ref":"musicbrainz:release:)" + release +
+                                                       R"(","track_number":1})");
         REQUIRE(status == 200);
         CHECK(catalogue.get(body.find("leaf_item_id")->asString())->title == "One");
         CHECK(http_ptr->requests_containing("covers.example") == 1);
@@ -553,7 +595,6 @@ std::atomic_uint64_t syncfs_calls{0};
 std::atomic<ino_t> syncfs_only_inode{0};
 #endif
 
-
 // ManageApi over provider records: search says which results are already
 // catalogued, artwork options are listed per role, and a choice fetches the
 // full image, replaces the role's artwork and locks the item.
@@ -583,7 +624,8 @@ MACHA_TEST("invariants", test_a_titles_files_are_unmatched_and_deleted_one_call_
         out.title = out.id;
         out.parent_id = std::move(parent);
         out.media_ids = std::move(media);
-        if (scanner) out.external_ids["macha_scanner"] = "1";
+        if (scanner)
+            out.external_ids["macha_scanner"] = "1";
         return out;
     };
     catalogue.upsert_many({item(CatalogueKind::artist, "artist", {}),
@@ -609,12 +651,14 @@ MACHA_TEST("invariants", test_a_titles_files_are_unmatched_and_deleted_one_call_
     };
     const auto ids = [](const Json& body) {
         std::vector<std::string> out;
-        for (const auto& id : body.find("removed_item_ids")->asArray()) out.push_back(id.asString());
+        for (const auto& id : body.find("removed_item_ids")->asArray())
+            out.push_back(id.asString());
         return out;
     };
     const auto unmatched_paths = [&] {
         std::set<std::string> out;
-        const auto listed = body_json(manage.handle(request_for("GET", "/api/v1/manage/unmatched")));
+        const auto listed =
+            body_json(manage.handle(request_for("GET", "/api/v1/manage/unmatched")));
         for (const auto& entry : listed.find("items")->asArray())
             out.insert(entry.find("path")->asString());
         return out;
@@ -626,11 +670,12 @@ MACHA_TEST("invariants", test_a_titles_files_are_unmatched_and_deleted_one_call_
         std::map<std::string, std::string, std::less<>> query{{"path", "/Music/A"}, {"limit", "1"}};
         for (int pages = 0;; ++pages) {
             REQUIRE(pages < 5);
-            const auto body = body_json(manage.handle(
-                request_for("GET", "/api/v1/manage/filesystem", {}, query)));
+            const auto body = body_json(
+                manage.handle(request_for("GET", "/api/v1/manage/filesystem", {}, query)));
             REQUIRE(body.find("entries")->asArray().size() == 1);
             names.push_back(body.find("entries")->asArray().front().find("name")->asString());
-            if (body.find("next_cursor")->isNull()) break;
+            if (body.find("next_cursor")->isNull())
+                break;
             query["cursor"] = body.find("next_cursor")->asString();
         }
         CHECK((names == std::vector<std::string>{"1.flac", "2.flac", "copy-of-2.flac"}));
@@ -700,7 +745,8 @@ MACHA_TEST("invariants", test_a_titles_files_are_unmatched_and_deleted_one_call_
     catalogue.upsert_many({item(CatalogueKind::album, "album-2", {}),
                            item(CatalogueKind::track, "track-9", "album-2", {clear_media}, true)});
     std::tie(status, body) = [&] {
-        auto response = manage.handle(request_for("DELETE", "/api/v1/catalogue/items/album-2/metadata"));
+        auto response =
+            manage.handle(request_for("DELETE", "/api/v1/catalogue/items/album-2/metadata"));
         return std::pair{response.status, Json(Json::Object{})};
     }();
     CHECK(status == 204);
@@ -734,13 +780,14 @@ MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {
     episode.episode_number = 2;
     auto album = item(CatalogueKind::album, "musicbrainz:album:g1");
     album.external_ids["musicbrainz_release"] = release;
-    catalogue.upsert_many({movie, item(CatalogueKind::show, "tmdb:tv:1399"), season, episode,
-                           album, item(CatalogueKind::movie, "manual:movie:x")});
+    catalogue.upsert_many({movie, item(CatalogueKind::show, "tmdb:tv:1399"), season, episode, album,
+                           item(CatalogueKind::movie, "manual:movie:x")});
 
     auto http = std::make_unique<FakeHttpClient>();
     auto* http_ptr = http.get();
-    http->add("/search/movie", 200, "application/json",
-              R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","overview":"K."},
+    http->add(
+        "/search/movie", 200, "application/json",
+        R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","overview":"K."},
                              {"id":78,"title":"Blade Runner","release_date":"1982-06-25"},
                              {"id":79,"title":"Blade Runner Black Out"}]})");
     http->add("/search/tv", 500, "text/plain", "down");
@@ -759,11 +806,15 @@ MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {
     http->add("-500.jpg", 200, "image/jpeg", "cover-image");
     http->add("coverartarchive.org/release/" + release, 200, "application/json",
               R"({"images":[{"id":36041390393,"front":true,"types":["Front"],
-                             "image":"https://coverartarchive.org/release/)" + release + R"(/36041390393.jpg",
-                             "thumbnails":{"250":"https://coverartarchive.org/release/)" + release + R"(/36041390393-250.jpg",
-                                           "500":"https://coverartarchive.org/release/)" + release + R"(/36041390393-500.jpg"}},
+                             "image":"https://coverartarchive.org/release/)" +
+                  release + R"(/36041390393.jpg",
+                             "thumbnails":{"250":"https://coverartarchive.org/release/)" +
+                  release + R"(/36041390393-250.jpg",
+                                           "500":"https://coverartarchive.org/release/)" +
+                  release + R"(/36041390393-500.jpg"}},
                             {"id":2,"front":false,"types":["Back"],"image":"https://coverartarchive.org/x/2.jpg"}]})");
-    auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
+    auto scanner =
+        bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
     ManageApi manage(bench.node(), bench.metadata(), bench.fs(), catalogue, bench.hints(),
                      *scanner);
     const auto get = [&](const char* path, std::map<std::string, std::string, std::less<>> query) {
@@ -793,7 +844,8 @@ MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {
         CHECK(results[1].find("catalogue_item_id") == nullptr);
         CHECK(http_ptr->requests_containing("primary_release_year=2017") == 1);
     }
-    std::tie(status, body) = get(search, {{"q", "Hand Album"}, {"kind", "album"}, {"artist", "Band"}});
+    std::tie(status, body) =
+        get(search, {{"q", "Hand Album"}, {"kind", "album"}, {"artist", "Band"}});
     REQUIRE(status == 200);
     {
         const auto& albums = body.find("results")->asArray();
@@ -812,16 +864,19 @@ MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {
         CHECK(posters[0].find("width")->asInt64() == 1000);
         CHECK(posters[0].find("language")->asString() == "en");
         CHECK(posters[1].find("language")->isNull());
-        CHECK(posters[0].find("preview_url")->asString() == "https://image.tmdb.org/t/p/w185/a.jpg");
+        CHECK(posters[0].find("preview_url")->asString() ==
+              "https://image.tmdb.org/t/p/w185/a.jpg");
         CHECK(posters[0].find("url") == nullptr);
     }
-    std::tie(status, body) = get(artwork, {{"ref", "musicbrainz:release:" + release}, {"role", "cover"}});
+    std::tie(status, body) =
+        get(artwork, {{"ref", "musicbrainz:release:" + release}, {"role", "cover"}});
     REQUIRE(status == 200);
     REQUIRE(body.find("options")->asArray().size() == 1);
     CHECK(body.find("options")->asArray()[0].find("option_id")->asString() == "36041390393");
 
     // Choosing fetches the full image, replaces the role and locks the item.
-    std::tie(status, body) = choose(R"({"item_id":"tmdb:movie:335984","role":"poster","option_id":"/b.jpg"})");
+    std::tie(status, body) =
+        choose(R"({"item_id":"tmdb:movie:335984","role":"poster","option_id":"/b.jpg"})");
     REQUIRE(status == 200);
     CHECK(body.find("status")->asString() == "chosen");
     auto chosen = catalogue.get("tmdb:movie:335984");
@@ -830,18 +885,21 @@ MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {
     CHECK(chosen->external_ids.at("macha_metadata_locked") == "1");
     CHECK(http_ptr->requests_containing("/b.jpg") == 1);
     // An episode's reference is its show's, with its own numbers.
-    std::tie(status, body) = choose(R"({"item_id":"tmdb:episode:63057","role":"still","option_id":"/s.jpg","lock":false})");
+    std::tie(status, body) = choose(
+        R"({"item_id":"tmdb:episode:63057","role":"still","option_id":"/s.jpg","lock":false})");
     REQUIRE(status == 200);
     auto chosen_episode = catalogue.get("tmdb:episode:63057");
     REQUIRE(chosen_episode->artwork.size() == 1);
     CHECK(!chosen_episode->external_ids.contains("macha_metadata_locked"));
     // An album's reference is its release.
-    std::tie(status, body) = choose(R"({"item_id":"musicbrainz:album:g1","role":"cover","option_id":"36041390393"})");
+    std::tie(status, body) =
+        choose(R"({"item_id":"musicbrainz:album:g1","role":"cover","option_id":"36041390393"})");
     REQUIRE(status == 200);
     CHECK(catalogue.get("musicbrainz:album:g1")->artwork.size() == 1);
     CHECK(http_ptr->requests_containing("36041390393-500.jpg") == 1);
     // A manual item needs a reference given with the choice.
-    std::tie(status, body) = choose(R"({"item_id":"manual:movie:x","role":"poster","option_id":"/a.jpg","ref":"tmdb:movie:335984"})");
+    std::tie(status, body) = choose(
+        R"({"item_id":"manual:movie:x","role":"poster","option_id":"/a.jpg","ref":"tmdb:movie:335984"})");
     CHECK(status == 200);
 
     struct Refusal {
@@ -857,15 +915,25 @@ MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {
         {search, {{"kind", "movie"}}, {}, 400, "bad_query"},
         {search, {{"q", "x"}, {"kind", "movie"}, {"limit", "0"}}, {}, 400, "bad_limit"},
         {artwork, {{"ref", "tmdb:movie:335984"}, {"role", "still"}}, {}, 400, "bad_role"},
-        {artwork, {{"ref", "tmdb:movie:404404"}, {"role", "poster"}}, {}, 404, "provider_not_found"},
-        {nullptr, {}, R"({"item_id":"tmdb:movie:335984","role":"poster","option_id":"/elsewhere.jpg"})",
-         404, "option_not_found"},
-        {nullptr, {}, R"({"item_id":"manual:movie:x","role":"poster","option_id":"/a.jpg"})", 400,
+        {artwork,
+         {{"ref", "tmdb:movie:404404"}, {"role", "poster"}},
+         {},
+         404,
+         "provider_not_found"},
+        {nullptr,
+         {},
+         R"({"item_id":"tmdb:movie:335984","role":"poster","option_id":"/elsewhere.jpg"})",
+         404,
+         "option_not_found"},
+        {nullptr,
+         {},
+         R"({"item_id":"manual:movie:x","role":"poster","option_id":"/a.jpg"})",
+         400,
          "no_provider_ref"},
     };
     for (const auto& refusal : refusals) {
-        std::tie(status, body) = refusal.method ? get(refusal.method, refusal.query)
-                                                : choose(refusal.body);
+        std::tie(status, body) =
+            refusal.method ? get(refusal.method, refusal.query) : choose(refusal.body);
         CHECK(status == refusal.status);
         CHECK(error_code(body) == refusal.code);
     }
@@ -902,8 +970,8 @@ MACHA_TEST("invariants", test_provider_release_tracks) {
                           {"position":1,"title":"Second Disc","length":90500,
                            "recording":{"id":"aaaaaaaa-0000-4000-8000-000000000003",
                                         "title":"Second Disc"}}]}]})JSON");
-        auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())),
-                                     std::move(http));
+        auto scanner =
+            bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
         ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
                          bench.hints(), *scanner);
 
@@ -964,8 +1032,8 @@ MACHA_TEST("invariants", test_provider_release_tracks) {
     {
         // MusicBrainz has no such release.
         auto http = std::make_unique<FakeHttpClient>();
-        auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())),
-                                     std::move(http));
+        auto scanner =
+            bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
         ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
                          bench.hints(), *scanner);
         auto [status, body] = get(manage, tracks_path(release));
@@ -982,8 +1050,8 @@ MACHA_TEST("invariants", test_provider_release_tracks) {
                   R"JSON({"id":")JSON" + release + R"JSON(","title":"Once","media":[
                       {"position":1,"tracks":[{"position":1,"title":"Only",
                        "recording":{"id":"aaaaaaaa-0000-4000-8000-000000000009","title":"Only"}}]}]})JSON");
-        auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())),
-                                     std::move(http));
+        auto scanner =
+            bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
         ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
                          bench.hints(), *scanner);
         const auto started = std::chrono::steady_clock::now();
@@ -1001,8 +1069,8 @@ MACHA_TEST("invariants", test_provider_release_tracks) {
         auto http = std::make_unique<FakeHttpClient>();
         auto* http_ptr = http.get();
         http->add("musicbrainz.org/ws/2/release/", 503, "text/plain", "down");
-        auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())),
-                                     std::move(http));
+        auto scanner =
+            bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
         ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
                          bench.hints(), *scanner);
         const auto refused = [&](const std::string& id) {
@@ -1058,7 +1126,8 @@ MACHA_TEST("invariants", test_identity_association_reset) {
     const auto met_then_gone = [](BareNode& node, const std::filesystem::path& root,
                                   const std::filesystem::path& keyfile, const std::string& name) {
         auto peer = std::make_unique<StandInPeer>(
-            root, keyfile, name, StandInPeer::Options{.bootstrap = {{"127.0.0.1", node.config().port}}});
+            root, keyfile, name,
+            StandInPeer::Options{.bootstrap = {{"127.0.0.1", node.config().port}}});
         peer->start();
         REQUIRE(wait_until([&] { return active_on(node, peer->id()); }, 15s));
         peer->stop();
@@ -1131,9 +1200,9 @@ MACHA_TEST("invariants", test_identity_association_reset) {
 
         // By IP alone: no NodeId, every port on the host.
         const auto other = met_then_gone(node, bench.path(), bench.keyfile(), "other-port");
-        auto reset_ip = manage.handle(request_for(
-            "POST", "/api/v1/manage/identity-associations/reset",
-            R"({"host":")" + stale.host + R"(","reason":"clear by ip"})"));
+        auto reset_ip = manage.handle(
+            request_for("POST", "/api/v1/manage/identity-associations/reset",
+                        R"({"host":")" + stale.host + R"(","reason":"clear by ip"})"));
         REQUIRE(reset_ip.status == 202);
         const auto reset_ip_json = body_json(reset_ip);
         const auto& reset_ip_value = *reset_ip_json.find("reset");
@@ -1257,7 +1326,8 @@ MACHA_TEST("invariants", test_service_answers_health_and_status_through_startup)
         CHECK(startup.find("control_storage")->asString() == "recovering");
         CHECK(!available(status_diagnostics_response(port, service), "data_store"));
         CHECK(!service.ready());
-        const auto ordinary = raw_http_get(port, "/api/v1/catalogue/status", bearer_header(service));
+        const auto ordinary =
+            raw_http_get(port, "/api/v1/catalogue/status", bearer_header(service));
         CHECK(ordinary.find("HTTP/1.1 503") != std::string::npos);
         CHECK(ordinary.find("service_recovering") != std::string::npos);
     }
@@ -1327,7 +1397,9 @@ MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recov
     });
     struct ReleaseGate {
         TestGate& gate;
-        ~ReleaseGate() { gate.open(); }
+        ~ReleaseGate() {
+            gate.open();
+        }
     } release{recovery_gate};
 
     recovering.start();
@@ -1340,9 +1412,10 @@ MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recov
     REQUIRE(peer.wait_local_state_ready(10s));
 
     const Endpoint recovering_endpoint{"127.0.0.1", recovering_config.port};
-    CHECK(peer.call(recovering_endpoint, MessageType::ping, {}, call_deadline::presence_probe).message.type == MessageType::ok);
-    CHECK(peer.call(recovering_endpoint, MessageType::members, {}, call_deadline::control).message.type ==
-          MessageType::members_reply);
+    CHECK(peer.call(recovering_endpoint, MessageType::ping, {}, call_deadline::presence_probe)
+              .message.type == MessageType::ok);
+    CHECK(peer.call(recovering_endpoint, MessageType::members, {}, call_deadline::control)
+              .message.type == MessageType::members_reply);
     REQUIRE(wait_until([&] {
         const auto all = recovering.membership().all();
         return std::any_of(all.begin(), all.end(),
@@ -1350,16 +1423,18 @@ MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recov
     }));
 
     // Fresh telemetry on the peer reporting the non-ready phase.
-    REQUIRE(wait_until([&] {
-        const auto views = peer.telemetry().views(std::chrono::milliseconds(60000));
-        return std::any_of(views.begin(), views.end(), [&](const TelemetryView& view) {
-            return view.telemetry.node_id == recovering.node_id() &&
-                   view.telemetry.phase != NodePhase::ready;
-        });
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto views = peer.telemetry().views(std::chrono::milliseconds(60000));
+            return std::any_of(views.begin(), views.end(), [&](const TelemetryView& view) {
+                return view.telemetry.node_id == recovering.node_id() &&
+                       view.telemetry.phase != NodePhase::ready;
+            });
+        },
+        10s));
 
-    ClusterStatusService status(peer, peer.accounts(), peer.resources.activity,
-                                peer.resources.data, peer.resources.memory);
+    ClusterStatusService status(peer, peer.accounts(), peer.resources.activity, peer.resources.data,
+                                peer.resources.memory);
     auto response = status.handle(request_for("GET", "/api/v1/status"));
     REQUIRE(response.status == 200);
     const auto root = body_json(response);
@@ -1394,7 +1469,8 @@ MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recov
 MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_own_route) {
     TestCluster cluster;
     BareNode node(cluster.node_config("status-split"), cluster.keys());
-    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
+    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data,
+                                node.resources.memory);
 
     const auto body_of = [](const HttpResponse& response) {
         return Json::parse(
@@ -1420,7 +1496,8 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
         const auto again = body_of(get("/api/v1/status"));
         const Json* listed = nullptr;
         for (const auto& entry : again.find("threads")->asArray())
-            if (entry.find("name")->asString() == "test-status-thread-fault") listed = &entry;
+            if (entry.find("name")->asString() == "test-status-thread-fault")
+                listed = &entry;
         REQUIRE(listed != nullptr);
         CHECK(listed->find("faults")->asUInt64() == 1);
         CHECK(listed->find("running")->asUInt64() == 0);
@@ -1439,7 +1516,8 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
         REQUIRE(listed != nullptr);
         bool found = false;
         for (const auto& entry : listed->asArray())
-            if (entry.find("id") && entry.find("id")->asString() == answering) found = true;
+            if (entry.find("id") && entry.find("id")->asString() == answering)
+                found = true;
         CHECK(found);
     }
     // The polled route carries no diagnostics tree; it names the route that does.
@@ -1451,10 +1529,10 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
     auto heavy_root = body_of(heavy);
     const auto* diagnostics = heavy_root.find("diagnostics");
     REQUIRE(diagnostics != nullptr);
-    constexpr std::array<const char*, 9> sections{"metadata",       "rpc_server", "rpc_transport",
-                                                  "data_resources", "retained_memory",
-                                                  "data_store",     "filesystem", "convergence",
-                                                  "auth"};
+    constexpr std::array<const char*, 9> sections{
+        "metadata",       "rpc_server",      "rpc_transport",
+        "data_resources", "retained_memory", "data_store",
+        "filesystem",     "convergence",     "auth"};
     for (const auto* section : sections)
         CHECK(diagnostics->find(section) != nullptr);
     CHECK(heavy_root.find("generated_at_unix_ms") != nullptr);
@@ -1464,10 +1542,10 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
     // "metadata_generation", which a bare "metadata" would match.
     const std::string light_text(reinterpret_cast<const char*>(light.body.data()),
                                  light.body.size());
-    for (const auto* owned : {"retained_memory", "rpc_server", "rpc_transport", "data_resources",
-                              "data_store", "convergence", "peer_latency_ms",
-                              "materialization_cache_hits", "user_table_hash",
-                              "data_publication_quanta"})
+    for (const auto* owned :
+         {"retained_memory", "rpc_server", "rpc_transport", "data_resources", "data_store",
+          "convergence", "peer_latency_ms", "materialization_cache_hits", "user_table_hash",
+          "data_publication_quanta"})
         CHECK(light_text.find(owned) == std::string::npos);
 
     // The per-node prefix still routes alongside the diagnostics route.
@@ -1475,17 +1553,20 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
     CHECK(get("/api/v1/status/nodes/not-a-node-id").status == 400);
 }
 
-
 // Steady time that stands still until the test moves it.
 class SteppedTime {
     std::atomic<Clock::rep> now_{Clock::now().time_since_epoch().count()};
 
   public:
-    Clock::time_point now() const { return Clock::time_point(Clock::duration(now_.load())); }
+    Clock::time_point now() const {
+        return Clock::time_point(Clock::duration(now_.load()));
+    }
     std::function<Clock::time_point()> source() const {
         return [this] { return now(); };
     }
-    void advance(Clock::duration by) { now_.fetch_add(by.count()); }
+    void advance(Clock::duration by) {
+        now_.fetch_add(by.count());
+    }
 };
 
 const Json* node_entry(const Json& root, const NodeId& id) {
@@ -1518,8 +1599,8 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
     MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
     REQUIRE(metadata.snapshot().metadata_voters.empty());
 
-    ClusterStatusService status(node, node.accounts(), node.resources.activity,
-                                node.resources.data, node.resources.memory);
+    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data,
+                                node.resources.memory);
     StatusSources sources;
     sources.local = &node.local_state();
     sources.metadata = &metadata;
@@ -1572,20 +1653,21 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
                          {.bootstrap = {{"127.0.0.1", config.port}},
                           .failure_domain = "test-lab",
                           .node_name = "Corvus Test Peer",
-                          .telemetry = [](dannan::status::Telemetry& record) {
-                              HostedTelemetry hosted;
-                              hosted.storage_capacity = peer_capacity;
-                              // A measured zero differs from a missing observation.
-                              hosted.storage_used = 0;
-                              hosted.cache_capacity = 1024;
-                              hosted.metadata_generation = 25723;
-                              hosted.storage_backends_online = 1;
-                              hosted.api_endpoint = "http://10.44.1.51:7438";
-                              hosted.playback.startup_timeout_ms = 9000;
-                              hosted.playback.segment_timeout_ms = 3000;
-                              write_hosted_telemetry(record, hosted);
-                              record.set_traffic(10000, {{2, 5000, 100, 2500, 50}});
-                          },
+                          .telemetry =
+                              [](dannan::status::Telemetry& record) {
+                                  HostedTelemetry hosted;
+                                  hosted.storage_capacity = peer_capacity;
+                                  // A measured zero differs from a missing observation.
+                                  hosted.storage_used = 0;
+                                  hosted.cache_capacity = 1024;
+                                  hosted.metadata_generation = 25723;
+                                  hosted.storage_backends_online = 1;
+                                  hosted.api_endpoint = "http://10.44.1.51:7438";
+                                  hosted.playback.startup_timeout_ms = 9000;
+                                  hosted.playback.segment_timeout_ms = 3000;
+                                  write_hosted_telemetry(record, hosted);
+                                  record.set_traffic(10000, {{2, 5000, 100, 2500, 50}});
+                              },
                           .telemetry_interval = std::chrono::hours(1)});
     stand_in.advertise_storage(peer_capacity, 1024ULL * 1024 * 1024);
     stand_in.start();
@@ -1672,11 +1754,13 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
     }
 
     stand_in.node().telemetry().refresh();
-    REQUIRE(wait_until([&] {
-        const auto root = get("/api/v1/status");
-        const auto* entry = node_entry(root, peer.id);
-        return entry && entry->find("telemetry_freshness")->asString() == "live";
-    }, 15s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto root = get("/api/v1/status");
+            const auto* entry = node_entry(root, peer.id);
+            return entry && entry->find("telemetry_freshness")->asString() == "live";
+        },
+        15s));
     // What the peer measured of itself, as it sent it.
     const auto sent = *stand_in.node().telemetry().local();
 
@@ -1815,13 +1899,15 @@ MACHA_TEST("invariants", test_status_follows_a_peer_through_telemetry_and_depart
     REQUIRE(wait_until([&] {
         return first.membership().active().size() == 2 && second.membership().active().size() == 2;
     }));
-    REQUIRE(wait_until([&] {
-        const auto values = first.telemetry().all();
-        return std::any_of(values.begin(), values.end(), [&](const NodeTelemetry& value) {
-            return value.node_id == second_id && value.storage_capacity > 0 &&
-                   value.storage_backends_online > 0;
-        });
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto values = first.telemetry().all();
+            return std::any_of(values.begin(), values.end(), [&](const NodeTelemetry& value) {
+                return value.node_id == second_id && value.storage_capacity > 0 &&
+                       value.storage_backends_online > 0;
+            });
+        },
+        10s));
 
     ClusterStatusService status(first, first.accounts(), first.resources.activity,
                                 first.resources.data, first.resources.memory);
@@ -1893,7 +1979,6 @@ MACHA_TEST("invariants", test_metadata_availability_logs_only_transitions) {
     CHECK(availability_logs == 1);
     CHECK(saw_initial_writable);
 }
-
 
 // An open FUSE inode keeps its identity when another node replaces or
 // unlinks its path: it reads the original, and a dirty one never publishes
@@ -2053,8 +2138,7 @@ MACHA_TEST("invariants", test_catalogue_keeps_what_the_namespace_holds) {
             conflicted = true;
         }
         CHECK(conflicted);
-        CHECK(catalogue.get(item.id)->media_ids ==
-              std::vector<std::string>{replacement_media_id});
+        CHECK(catalogue.get(item.id)->media_ids == std::vector<std::string>{replacement_media_id});
     }
 
     {
@@ -2247,7 +2331,8 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
     }));
 
-    DistributedStore distributed(n1, n1.local_state(), n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
+    DistributedStore distributed(n1, n1.local_state(), n1.resources.activity, n1.resources.data,
+                                 n1.resources.memory, n1.resources.events);
     const auto bytes = pattern(128 * 1024, 9);
     const auto id = object_id(bytes);
     REQUIRE(distributed.put(id, bytes));
@@ -2383,7 +2468,8 @@ class FailingReads final : public LocalStoreFiles {
         check(path);
         return device_.read(path);
     }
-    std::optional<Bytes> read_at(const std::filesystem::path& path, uint64_t offset, size_t size) override {
+    std::optional<Bytes> read_at(const std::filesystem::path& path, uint64_t offset,
+                                 size_t size) override {
         check(path);
         return device_.read_at(path, offset, size);
     }
@@ -2394,7 +2480,8 @@ class FailingReads final : public LocalStoreFiles {
     bool truncate(const std::filesystem::path& path, uint64_t size) override {
         return device_.truncate(path, size);
     }
-    std::vector<std::pair<std::filesystem::path, uint64_t>> list(const std::filesystem::path& dir) override {
+    std::vector<std::pair<std::filesystem::path, uint64_t>>
+    list(const std::filesystem::path& dir) override {
         return device_.list(dir);
     }
 };
@@ -2411,8 +2498,9 @@ MACHA_TEST("invariants", test_a_failed_read_keeps_the_object_and_a_bad_record_is
     const auto disk = t.path() / "disk";
     std::filesystem::create_directories(disk);
     FailingReads device;
-    StoragePool pool(t.path() / "state", random_node_id(), {{disk, 64ULL * 1024 * 1024}}, keys.storage,
-                     std::chrono::milliseconds(500), StoragePackingConfig{0, 0}, 0, device);
+    StoragePool pool(t.path() / "state", random_node_id(), {{disk, 64ULL * 1024 * 1024}},
+                     keys.storage, std::chrono::milliseconds(500), StoragePackingConfig{0, 0}, 0,
+                     device);
     REQUIRE(wait_until([&] { return pool.online_backends() == 1; }));
     const auto put = [&](uint8_t seed) {
         const auto bytes = pattern(64 * 1024, seed);
@@ -2515,7 +2603,6 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
     std::cout << "[ARCH-REGRESSION] syncfs generation check is Linux-only; skipped\n";
 #endif
 }
-
 
 MACHA_TEST("invariants", test_durability_batch_retains_exact_nondominated_frontier) {
     DistributedStore::DurabilityBatch batch;
@@ -2984,12 +3071,13 @@ MACHA_TEST("invariants", test_claims_owed_to_slow_peers_stay_within_their_bound)
         return claims;
     });
     TestGate peers;
-    fixture.set_peer_retention([&](const NodeId&, uint64_t, const MetadataPublicationClaims&) {
-        peers.enter_and_wait();
-    });
+    fixture.set_peer_retention(
+        [&](const NodeId&, uint64_t, const MetadataPublicationClaims&) { peers.enter_and_wait(); });
     struct Opener {
         TestGate& gate;
-        ~Opener() { gate.open(); }
+        ~Opener() {
+            gate.open();
+        }
     } open_on_exit{peers};
     fixture.start();
     auto& fs = fixture.filesystem();
@@ -3031,7 +3119,7 @@ MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_c
     syncfs_calls = 0;
     // The data store's barrier: the commit's tree nodes have their own, in the
     // control store.
-    struct stat data_root {};
+    struct stat data_root{};
     REQUIRE(::stat((fixture.path() / "publication-generation").c_str(), &data_root) == 0);
     syncfs_only_inode = data_root.st_ino;
     track_fsync = true;
@@ -3158,9 +3246,8 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     while (wrong_epoch == acknowledged_epoch)
         wrong_epoch = random_node_id();
     auto stale = barrier_payload(wrong_epoch);
-    auto rejected =
-        client.call(endpoint, MessageType::object_durability_barrier, stale, FrameType::read_ahead,
-                    call_deadline::object_transfer);
+    auto rejected = client.call(endpoint, MessageType::object_durability_barrier, stale,
+                                FrameType::read_ahead, call_deadline::object_transfer);
     CHECK(rejected.message.type == MessageType::error);
 
     auto current = barrier_payload(acknowledged_epoch);
@@ -3372,7 +3459,7 @@ extern "C" int fsync(int fd) {
 extern "C" int syncfs(int fd) {
     if (track_fsync.load(std::memory_order_relaxed)) {
         const auto only = syncfs_only_inode.load(std::memory_order_relaxed);
-        struct stat target {};
+        struct stat target{};
         if (!only || (::fstat(fd, &target) == 0 && target.st_ino == only))
             syncfs_calls.fetch_add(1, std::memory_order_relaxed);
     }

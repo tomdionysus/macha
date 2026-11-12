@@ -67,8 +67,8 @@ MACHA_TEST("dannan_host", test_a_call_reaches_the_peers_route_and_answers) {
 
     const auto peer_b = node_info_from(b.node().nodes().self());
     const Bytes payload{1, 2, 3, 4};
-    auto reply = a.call_async(peer_b, MessageType::get_ingest_jobs, payload, FrameType::control, 30s)
-                     .get();
+    auto reply =
+        a.call_async(peer_b, MessageType::get_ingest_jobs, payload, FrameType::control, 30s).get();
     REQUIRE(reply.message.type == MessageType::ingest_jobs_reply);
     Reader reader(reply.message.payload);
     REQUIRE(reader.fixed<16>() == a.node().nodes().self().id.bytes);
@@ -87,11 +87,14 @@ MACHA_TEST("dannan_host", test_a_call_reaches_the_peers_route_and_answers) {
     // The metadata notice reaches its own handler, ahead of every queue.
     Writer notice;
     notice.u64(168518);
-    a.node().channels().broadcast(dannan_message(RpcMessage(MessageType::metadata_notice, notice.take())));
-    REQUIRE(wait_until([&] {
-        std::lock_guard lock(notices_mutex);
-        return !notices.empty();
-    }, 10s));
+    a.node().channels().broadcast(
+        dannan_message(RpcMessage(MessageType::metadata_notice, notice.take())));
+    REQUIRE(wait_until(
+        [&] {
+            std::lock_guard lock(notices_mutex);
+            return !notices.empty();
+        },
+        10s));
     {
         std::lock_guard lock(notices_mutex);
         REQUIRE(notices.front() == 168518);
@@ -121,12 +124,15 @@ MACHA_TEST("dannan_host", test_membership_follows_the_nodes_roster) {
     auto self = node_info_from(a.node().nodes().self());
     self.capacity = 1000;
     Membership members(self, 30s);
-    members.follow(std::make_shared<DannanMembership>(a.node().nodes(), a.node().nodes().self().id));
+    members.follow(
+        std::make_shared<DannanMembership>(a.node().nodes(), a.node().nodes().self().id));
     const auto peer_b = macha_id(b.node().nodes().self().id);
-    REQUIRE(wait_until([&] {
-        const auto active = members.active();
-        return active.size() == 2 && active[1].id == peer_b;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto active = members.active();
+            return active.size() == 2 && active[1].id == peer_b;
+        },
+        10s));
     REQUIRE(members.active().front().id == self.id);
     REQUIRE(members.active().front().capacity == 1000);
     REQUIRE(members.all().size() == 2);
@@ -175,14 +181,16 @@ MACHA_TEST("dannan_host", test_telemetry_follows_the_nodes_records) {
     TelemetryStore store(std::make_shared<DannanTelemetry>(a.node().telemetry()));
     const auto peer_b = macha_id(b.node().nodes().self().id);
     std::optional<NodeTelemetry> seen;
-    REQUIRE(wait_until([&] {
-        for (const auto& view : store.views(10s))
-            if (view.telemetry.node_id == peer_b && view.telemetry.storage_capacity) {
-                seen = view.telemetry;
-                return true;
-            }
-        return false;
-    }, 15s));
+    REQUIRE(wait_until(
+        [&] {
+            for (const auto& view : store.views(10s))
+                if (view.telemetry.node_id == peer_b && view.telemetry.storage_capacity) {
+                    seen = view.telemetry;
+                    return true;
+                }
+            return false;
+        },
+        15s));
     REQUIRE(seen->storage_capacity == 9895604649984ULL);
     REQUIRE(seen->storage_used == 1835376108947ULL);
     REQUIRE(seen->api_endpoint == "http://192.168.1.50:7438");
@@ -236,7 +244,8 @@ MACHA_TEST("dannan_host", test_status_reads_the_nodes_threads_and_canonical_rout
     const auto port_a = free_port();
     const auto port_b = free_port();
     auto config_a = config_for(cluster.path() / "a", cluster.keyfile(), port_a);
-    auto config_b = config_for(cluster.path() / "b", cluster.keyfile(), port_b, {{"127.0.0.1", port_a}});
+    auto config_b =
+        config_for(cluster.path() / "b", cluster.keyfile(), port_b, {{"127.0.0.1", port_a}});
     config_a.telemetry_interval = 250ms;
     BareNode a(config_a, cluster.keys());
     BareNode b(config_b, cluster.keys());
@@ -248,14 +257,17 @@ MACHA_TEST("dannan_host", test_status_reads_the_nodes_threads_and_canonical_rout
         return std::any_of(threads.begin(), threads.end(),
                            [&](const SupervisedThreadStatus& t) { return t.name == name; });
     };
-    REQUIRE(wait_until([&] { return named("cluster-telemetry") && named("cluster-maintenance"); }, 10s));
+    REQUIRE(wait_until([&] { return named("cluster-telemetry") && named("cluster-maintenance"); },
+                       10s));
     REQUIRE(named("cluster-runtime"));
     REQUIRE(!named("cluster-roster"));
 
-    REQUIRE(wait_until([&] {
-        const auto local = a.telemetry().local();
-        return local && local->rpc_connections_canonical > 0;
-    }, 15s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto local = a.telemetry().local();
+            return local && local->rpc_connections_canonical > 0;
+        },
+        15s));
 }
 
 // Job traffic keeps its class from Macha's caller to the peer's handler: polls travel
@@ -269,20 +281,22 @@ MACHA_TEST("dannan_host", test_job_traffic_travels_as_its_own_class) {
         std::lock_guard lock(seen_mutex);
         seen.push_back(frame);
     };
-    peer.routes.bind(MessageType::get_torrent_jobs, [&](const NodeInfo&, FrameType frame, const RpcMessage&) {
-        record(frame);
-        return RpcMessage{MessageType::torrent_jobs_reply, {}};
-    });
-    peer.routes.bind(MessageType::ingest_job_action, [&](const NodeInfo&, FrameType frame, const RpcMessage&) {
-        record(frame);
-        return RpcMessage{MessageType::ingest_job_action_reply, {}};
-    });
+    peer.routes.bind(MessageType::get_torrent_jobs,
+                     [&](const NodeInfo&, FrameType frame, const RpcMessage&) {
+                         record(frame);
+                         return RpcMessage{MessageType::torrent_jobs_reply, {}};
+                     });
+    peer.routes.bind(MessageType::ingest_job_action,
+                     [&](const NodeInfo&, FrameType frame, const RpcMessage&) {
+                         record(frame);
+                         return RpcMessage{MessageType::ingest_job_action_reply, {}};
+                     });
     peer.start();
     BareNode node(cluster.node_config("jobs-caller"), cluster.keys());
     node.start();
 
-    const auto polled = node.call(peer.endpoint(), MessageType::get_torrent_jobs, {}, FrameType::loader,
-                                  call_deadline::control);
+    const auto polled = node.call(peer.endpoint(), MessageType::get_torrent_jobs, {},
+                                  FrameType::loader, call_deadline::control);
     REQUIRE(polled.message.type == MessageType::torrent_jobs_reply);
     const Bytes action{'{', '}'};
     const auto acted = node.call(peer.endpoint(), MessageType::ingest_job_action, action,

@@ -14,9 +14,8 @@ std::vector<NodeInfo> order_commit_replicas(
             return {1, measured->count()};
         return {2, 0};
     };
-    std::stable_sort(replicas.begin(), replicas.end(), [&](const NodeInfo& a, const NodeInfo& b) {
-        return rank(a) < rank(b);
-    });
+    std::stable_sort(replicas.begin(), replicas.end(),
+                     [&](const NodeInfo& a, const NodeInfo& b) { return rank(a) < rank(b); });
     return replicas;
 }
 
@@ -55,8 +54,7 @@ PlacementShard shard_for(std::span<const uint8_t> key) {
     }
     return (static_cast<PlacementShard>(bytes[0]) << 24U) |
            (static_cast<PlacementShard>(bytes[1]) << 16U) |
-           (static_cast<PlacementShard>(bytes[2]) << 8U) |
-           static_cast<PlacementShard>(bytes[3]);
+           (static_cast<PlacementShard>(bytes[2]) << 8U) | static_cast<PlacementShard>(bytes[3]);
 }
 
 std::array<uint8_t, 4> shard_key(std::span<const uint8_t> key) {
@@ -98,9 +96,8 @@ uint64_t max_logical_capacity(const std::vector<uint64_t>& capacities, size_t re
     if (!level.numerator)
         return 0;
     const __uint128_t value = level.numerator / level.denominator;
-    return value > std::numeric_limits<uint64_t>::max()
-               ? std::numeric_limits<uint64_t>::max()
-               : static_cast<uint64_t>(value);
+    return value > std::numeric_limits<uint64_t>::max() ? std::numeric_limits<uint64_t>::max()
+                                                        : static_cast<uint64_t>(value);
 }
 
 std::vector<uint64_t> shard_quotas(const std::vector<uint64_t>& capacities, size_t replicas) {
@@ -227,9 +224,8 @@ std::vector<CapacityEntity> failure_domains(const std::vector<NodeInfo>& nodes) 
             it->nodes.push_back(node);
         }
     }
-    std::sort(groups.begin(), groups.end(), [](const auto& a, const auto& b) {
-        return a.stable_id < b.stable_id;
-    });
+    std::sort(groups.begin(), groups.end(),
+              [](const auto& a, const auto& b) { return a.stable_id < b.stable_id; });
     for (auto& group : groups) {
         std::sort(group.nodes.begin(), group.nodes.end(),
                   [](const auto& a, const auto& b) { return a.id < b.id; });
@@ -306,8 +302,8 @@ std::vector<NodeInfo> rendezvous_nodes(std::span<const uint8_t> key,
     for (const auto& item : scored) {
         if (out.size() == count)
             break;
-        auto domain = item.node.failure_domain.empty() ? to_string(item.node.id)
-                                                       : item.node.failure_domain;
+        auto domain =
+            item.node.failure_domain.empty() ? to_string(item.node.id) : item.node.failure_domain;
         if (domains.insert(domain).second) {
             out.push_back(item.node);
             chosen.insert(item.node.id);
@@ -366,9 +362,8 @@ std::vector<NodeInfo> capacity_placement_nodes(std::span<const uint8_t> key,
             if (!chosen.contains(node.id))
                 remaining.push_back(node);
         }
-        std::sort(remaining.begin(), remaining.end(), [](const auto& a, const auto& b) {
-            return a.id < b.id;
-        });
+        std::sort(remaining.begin(), remaining.end(),
+                  [](const auto& a, const auto& b) { return a.id < b.id; });
         std::vector<uint64_t> capacities;
         for (const auto& node : remaining)
             capacities.push_back(node.capacity);

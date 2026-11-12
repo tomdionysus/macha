@@ -6,10 +6,10 @@
 #include "supervised.hpp"
 #include "types.hpp"
 
+#include "contract/thread_safety.hpp"
 #include <condition_variable>
 #include <deque>
 #include <dlfcn.h>
-#include "contract/thread_safety.hpp"
 #include <mutex>
 #include <system_error>
 #include <thread>
@@ -94,7 +94,8 @@ void SubsystemSupervisor::discover_plugins() {
     if (!std::filesystem::is_directory(plugin_dir_, discovery_error))
         return;
 
-    for (const auto& candidate : std::filesystem::directory_iterator(plugin_dir_, discovery_error)) {
+    for (const auto& candidate :
+         std::filesystem::directory_iterator(plugin_dir_, discovery_error)) {
         if (discovery_error) {
             Log::warn("subsystem plugin discovery failed dir=" + plugin_dir_.string() +
                       " error=" + discovery_error.message());
@@ -110,7 +111,7 @@ void SubsystemSupervisor::discover_plugins() {
         entry->handle = ::dlopen(candidate.path().c_str(), RTLD_NOW | RTLD_LOCAL);
         if (!entry->handle) {
             Log::error("subsystem plugin '" + entry->name +
-                      "' failed to load: " + std::string(::dlerror()));
+                       "' failed to load: " + std::string(::dlerror()));
             {
                 Lock lock(entry->mutex);
                 entry->state = SubsystemState::disabled;
@@ -126,10 +127,9 @@ void SubsystemSupervisor::discover_plugins() {
             // directory, which may hold unrelated .so files (/usr/bin/ld.so).
             // Log quietly and report nothing. Unloading is safe: none of its
             // code was called.
-            Log::debug("subsystem plugin candidate '" + entry->name +
-                      "' has no entry symbol '" + kSubsystemEntrySymbol +
-                      "', skipping as not a macha plugin: " +
-                      (symbol_error ? symbol_error : "symbol resolved to null"));
+            Log::debug("subsystem plugin candidate '" + entry->name + "' has no entry symbol '" +
+                       kSubsystemEntrySymbol + "', skipping as not a macha plugin: " +
+                       (symbol_error ? symbol_error : "symbol resolved to null"));
             ::dlclose(entry->handle);
             continue;
         }
@@ -146,11 +146,9 @@ void SubsystemSupervisor::discover_plugins() {
             continue;
         }
         if (entry->plugin->build_identity != kBuildIdentity) {
-            Log::error("subsystem plugin '" + entry->name +
-                      "' build identity mismatch: plugin=" +
-                      std::string(entry->plugin->build_identity) +
-                      " core=" + std::string(kBuildIdentity) +
-                      "; refusing to load (partial deploy?)");
+            Log::error("subsystem plugin '" + entry->name + "' build identity mismatch: plugin=" +
+                       std::string(entry->plugin->build_identity) + " core=" +
+                       std::string(kBuildIdentity) + "; refusing to load (partial deploy?)");
             {
                 Lock lock(entry->mutex);
                 entry->state = SubsystemState::disabled;
@@ -173,8 +171,8 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
         {
             Lock lock(entry.mutex);
             // Status tells a first start from a rebuild.
-            entry.state = entry.restart_count ? SubsystemState::restarting
-                                              : SubsystemState::starting;
+            entry.state =
+                entry.restart_count ? SubsystemState::restarting : SubsystemState::starting;
             entry.fault_requested = false;
             entry.pending_fault.clear();
         }
@@ -195,9 +193,8 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
                     if (entry.fault_requested)
                         return; // first reason wins
                     entry.fault_requested = true;
-                    entry.pending_fault =
-                        reason.empty() ? std::string("subsystem reported a fault")
-                                       : std::move(reason);
+                    entry.pending_fault = reason.empty() ? std::string("subsystem reported a fault")
+                                                         : std::move(reason);
                     entry.cv.notify_all();
                 });
                 instance->start();
@@ -213,17 +210,17 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
         if (declined) {
             // Configured off on this node (e.g. torrent.enabled false): not a
             // fault, so no retry and Status says `unavailable`.
-            Log::info("subsystem plugin '" + entry.name +
-                      "' loaded but its capability is not enabled on this node path=" +
-                      entry.origin());
+            Log::info(
+                "subsystem plugin '" + entry.name +
+                "' loaded but its capability is not enabled on this node path=" + entry.origin());
             Lock lock(entry.mutex);
             entry.state = SubsystemState::unavailable;
             return;
         }
 
         if (fault.empty()) {
-            Log::info("subsystem plugin '" + entry.name + "' loaded and running path=" +
-                      entry.origin());
+            Log::info("subsystem plugin '" + entry.name +
+                      "' loaded and running path=" + entry.origin());
             {
                 Lock lock(entry.mutex);
                 entry.state = SubsystemState::running;
@@ -278,8 +275,8 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
             Lock lock(entry.mutex);
             entry.state = SubsystemState::disabled;
             Log::error("subsystem '" + entry.name + "' disabled after " +
-                      std::to_string(retry.failures_in_window()) +
-                      " failed attempts; needs an operator");
+                       std::to_string(retry.failures_in_window()) +
+                       " failed attempts; needs an operator");
             return;
         }
 
@@ -311,8 +308,8 @@ std::vector<SubsystemStatus> SubsystemSupervisor::statuses() const {
     result.reserve(entries_.size());
     for (const auto& entry : entries_) {
         Lock lock(entry->mutex);
-        result.push_back(SubsystemStatus{entry->name, entry->state, entry->restart_count,
-                                         entry->last_fault});
+        result.push_back(
+            SubsystemStatus{entry->name, entry->state, entry->restart_count, entry->last_fault});
     }
     return result;
 }

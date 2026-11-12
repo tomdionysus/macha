@@ -57,9 +57,8 @@ class ClusterNode {
     // Throws when the call cannot be placed.
     static constexpr Waits call_async_waits = Waits::network | Waits::locks;
     static constexpr ThreadSafety call_async_safety = ThreadSafety::thread_safe;
-    virtual AsyncRpc call_async(const NodeInfo& peer, MessageType,
-                                std::span<const uint8_t> payload, FrameType,
-                                std::chrono::milliseconds deadline) = 0;
+    virtual AsyncRpc call_async(const NodeInfo& peer, MessageType, std::span<const uint8_t> payload,
+                                FrameType, std::chrono::milliseconds deadline) = 0;
 
     // The smoothed round trip to `peer`, once one has been measured.
     static constexpr Waits peer_latency_waits = Waits::none;

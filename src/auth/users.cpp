@@ -33,10 +33,10 @@ constexpr uint64_t scrypt_max_memory = 64ull * 1024 * 1024;
 constexpr std::string_view recovery_label = "macha/recovery/v1";
 
 std::array<uint8_t, 32> recovery_wrap_key(std::span<const uint8_t, 32> shared) {
-    return hkdf_sha256(shared, {},
-                       std::span<const uint8_t>(
-                           reinterpret_cast<const uint8_t*>(recovery_label.data()),
-                           recovery_label.size()));
+    return hkdf_sha256(
+        shared, {},
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(recovery_label.data()),
+                                 recovery_label.size()));
 }
 
 Hash256 scrypt_hash(std::string_view password, std::span<const uint8_t, 16> salt, uint32_t n,
@@ -111,17 +111,15 @@ bool incoming_wins(const UserRecord& existing, const UserRecord& incoming) {
         return incoming.version > existing.version;
     if (incoming.tombstone != existing.tombstone)
         return incoming.tombstone;
-    return std::lexicographical_compare(existing.updated_by.bytes.begin(),
-                                        existing.updated_by.bytes.end(),
-                                        incoming.updated_by.bytes.begin(),
-                                        incoming.updated_by.bytes.end());
+    return std::lexicographical_compare(
+        existing.updated_by.bytes.begin(), existing.updated_by.bytes.end(),
+        incoming.updated_by.bytes.begin(), incoming.updated_by.bytes.end());
 }
 } // namespace
 
 std::vector<std::string> all_roles() {
-    return {std::string(role_manage_users), std::string(role_manager),
-            std::string(role_importer), std::string(role_media_viewer),
-            std::string(role_view_status)};
+    return {std::string(role_manage_users), std::string(role_manager), std::string(role_importer),
+            std::string(role_media_viewer), std::string(role_view_status)};
 }
 
 bool known_role(std::string_view role) {
@@ -217,8 +215,8 @@ UserStore::UserStore(size_t max_users, std::filesystem::path persisted_path,
         if (!input)
             throw std::runtime_error("cannot open persisted users");
         Bytes sealed(static_cast<size_t>(size));
-        if (size && !input.read(reinterpret_cast<char*>(sealed.data()),
-                                static_cast<std::streamsize>(size)))
+        if (size &&
+            !input.read(reinterpret_cast<char*>(sealed.data()), static_cast<std::streamsize>(size)))
             throw std::runtime_error("cannot read persisted users");
 
         Reader reader(sealed);
@@ -246,8 +244,7 @@ UserStore::UserStore(size_t max_users, std::filesystem::path persisted_path,
     }
 }
 
-UserCredentialCheck UserStore::verify(std::string_view username,
-                                      std::string_view password) const {
+UserCredentialCheck UserStore::verify(std::string_view username, std::string_view password) const {
     const auto normalized = normalize_username(username);
     std::optional<UserRecord> user;
     // `anonymous` is never reachable by password, whatever its record holds,
@@ -337,16 +334,14 @@ bool UserStore::sole_user_manager(std::string_view user_id) const {
 
 size_t UserStore::size() const {
     ReadLock lock(mutex_);
-    return static_cast<size_t>(
-        std::count_if(by_id_.begin(), by_id_.end(),
-                      [](const auto& item) { return !item.second.tombstone; }));
+    return static_cast<size_t>(std::count_if(
+        by_id_.begin(), by_id_.end(), [](const auto& item) { return !item.second.tombstone; }));
 }
 
 size_t UserStore::tombstones() const {
     ReadLock lock(mutex_);
-    return static_cast<size_t>(
-        std::count_if(by_id_.begin(), by_id_.end(),
-                      [](const auto& item) { return item.second.tombstone; }));
+    return static_cast<size_t>(std::count_if(
+        by_id_.begin(), by_id_.end(), [](const auto& item) { return item.second.tombstone; }));
 }
 
 Hash256 UserStore::table_hash() const {
@@ -368,8 +363,9 @@ std::optional<UserRecord> UserStore::create(std::string_view username, std::stri
     return insert(username, password, roles, by);
 }
 
-std::optional<UserRecord> UserStore::create_without_password(
-    std::string_view username, const std::vector<std::string>& roles, const NodeId& by) {
+std::optional<UserRecord> UserStore::create_without_password(std::string_view username,
+                                                             const std::vector<std::string>& roles,
+                                                             const NodeId& by) {
     return insert(username, {}, roles, by);
 }
 
@@ -602,8 +598,7 @@ IssuedRecoveryKey issue_recovery_key(const ClusterKeys& keys) {
     const auto recipient = x25519_generate();
     // A fresh ephemeral pair per envelope, so no wrap key is ever reused.
     const auto ephemeral = x25519_generate();
-    const auto wrap = recovery_wrap_key(x25519_shared(ephemeral.private_key,
-                                                      recipient.public_key));
+    const auto wrap = recovery_wrap_key(x25519_shared(ephemeral.private_key, recipient.public_key));
     const auto sealed = aes_gcm_seal(wrap, keys.master, ephemeral.public_key);
     if (sealed.ciphertext.size() != 32)
         throw std::runtime_error("unexpected recovery envelope size");
@@ -633,8 +628,7 @@ bool recovery_key_matches(const RecoveryEnvelope& envelope, const ClusterKeys& k
                                         envelope.ephemeral_public);
         // Rejects an envelope sealed against a different cluster key, e.g.
         // one carried over from a rebuilt cluster.
-        return plain.size() == keys.master.size() &&
-               constant_time_equal(plain, keys.master);
+        return plain.size() == keys.master.size() && constant_time_equal(plain, keys.master);
     } catch (const std::exception&) {
         return false;
     }
@@ -657,10 +651,9 @@ std::string generate_password() {
     return out;
 }
 
-
 std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const ClusterKeys& keys,
-                                               const std::filesystem::path& state_path,
-                                               const NodeId& by) {
+                                                       const std::filesystem::path& state_path,
+                                                       const NodeId& by) {
     // all(), not list(): a tombstone counts, so deleting root never makes the
     // next restart mint a fresh one.
     if (!users.all().empty())
@@ -679,8 +672,8 @@ std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const C
     (void)keys;
     const std::string recovery_key;
     // No password: see anonymous_username.
-    auto anonymous = users.create_without_password(anonymous_username,
-                                                   {std::string(role_media_viewer)}, by);
+    auto anonymous =
+        users.create_without_password(anonymous_username, {std::string(role_media_viewer)}, by);
     if (!anonymous) {
         Log::warn("could not create the anonymous account");
         return std::nullopt;
@@ -704,10 +697,9 @@ std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const C
             std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
             if (!out)
                 throw std::runtime_error("cannot open " + temporary.string());
-            std::filesystem::permissions(temporary,
-                                         std::filesystem::perms::owner_read |
-                                             std::filesystem::perms::owner_write,
-                                         std::filesystem::perm_options::replace);
+            std::filesystem::permissions(
+                temporary, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                std::filesystem::perm_options::replace);
             out << contents;
             if (!out)
                 throw std::runtime_error("cannot write " + temporary.string());
@@ -723,7 +715,7 @@ std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const C
     }
 
     return InitialAccounts{std::move(*root), std::move(anonymous.value()), std::move(password),
-                       std::move(recovery_key), path};
+                           std::move(recovery_key), path};
 }
 
 void UserStore::persist() const {

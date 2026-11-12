@@ -70,8 +70,7 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
                                               const MetadataSnapshot& right,
                                               const NamespaceEntries& left_entries,
                                               const NamespaceEntries& right_entries,
-                                              const Hash256& left_head,
-                                              const Hash256& right_head) {
+                                              const Hash256& left_head, const Hash256& right_head) {
     if (left_head == right_head) {
         MetadataMergeResult same{left, 0};
         same.snapshot.namespace_root.reset();
@@ -92,8 +91,8 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
     // heads differ.
     out.data_replication = std::max(left.data_replication, right.data_replication);
     out.extent_size = std::max(left.extent_size, right.extent_size);
-    out.metadata_write_replicas_required = std::max(left.metadata_write_replicas_required,
-                                                    right.metadata_write_replicas_required);
+    out.metadata_write_replicas_required =
+        std::max(left.metadata_write_replicas_required, right.metadata_write_replicas_required);
     out.metadata_participants = left.metadata_participants;
     out.metadata_participants.insert(right.metadata_participants.begin(),
                                      right.metadata_participants.end());
@@ -180,10 +179,10 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
         const auto& present = a ? *a : *b;
         const auto& owner = a ? l : r;
         const auto& other = a ? r : l;
-        const bool removed = present.provenance.empty()
-                                 ? clock_covers_clock(other.clock, owner.legacy)
-                                 : name_seen(other, owner, present) &&
-                                       content_seen(other, owner, present);
+        const bool removed =
+            present.provenance.empty()
+                ? clock_covers_clock(other.clock, owner.legacy)
+                : name_seen(other, owner, present) && content_seen(other, owner, present);
         if (removed)
             continue;
         out.entries[path] = present;
@@ -289,8 +288,7 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
             conflict.right_head = right_head;
             conflict.installed_dot = take_left ? left.catalogue_dot : right.catalogue_dot;
             conflict.left_catalogue_root = take_left ? left.catalogue_root : right.catalogue_root;
-            conflict.right_catalogue_root =
-                take_left ? right.catalogue_root : left.catalogue_root;
+            conflict.right_catalogue_root = take_left ? right.catalogue_root : left.catalogue_root;
             const auto id = metadata_conflict_id(conflict);
             if (out.conflicts.emplace(id, std::move(conflict)).second) {
                 ++result.conflicts_created;
@@ -351,8 +349,8 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
         }
     }
     // A request on one side only is new there; one both hold joins.
-    out.torrent_requests = merge_torrent_requests({}, left.torrent_requests,
-                                                  right.torrent_requests);
+    out.torrent_requests =
+        merge_torrent_requests({}, left.torrent_requests, right.torrent_requests);
 
     result.conflicts_superseded = prune_superseded_conflicts(out);
     out.merge_parents.clear();

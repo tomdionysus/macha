@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include <memory>
 #include "contract/thread_safety.hpp"
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -17,7 +17,9 @@ template <class T> class Published {
     using Handle = std::shared_ptr<const T>;
 
     Published() = default;
-    explicit Published(Handle initial) { publish(std::move(initial)); }
+    explicit Published(Handle initial) {
+        publish(std::move(initial));
+    }
     Published(const Published&) = delete;
     Published& operator=(const Published&) = delete;
 
@@ -40,7 +42,9 @@ template <class T> class Published {
             current_.swap(next);
         }
     }
-    void publish(T value) { publish(std::make_shared<const T>(std::move(value))); }
+    void publish(T value) {
+        publish(std::make_shared<const T>(std::move(value)));
+    }
 
   private:
     mutable Mutex mutex_;

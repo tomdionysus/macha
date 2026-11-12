@@ -62,7 +62,9 @@ class ObjectLedger {
     // store refuses nothing and marks nothing.
     static constexpr Waits claim_deletion_waits = ClaimStore::deletion_waits;
     static constexpr ThreadSafety claim_deletion_safety = ClaimStore::deletion_safety;
-    virtual ClaimDeletion claim_deletion(RetentionClass, const ObjectId&) const { return {}; }
+    virtual ClaimDeletion claim_deletion(RetentionClass, const ObjectId&) const {
+        return {};
+    }
     // Releases claims `release` no longer refers to and whose writes its
     // clock has observed. Bounded. Single owner (the maintenance pass).
     static constexpr Waits release_waits = ClaimStore::release_waits;

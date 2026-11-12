@@ -84,7 +84,7 @@ Availability availability_of(const PathAvailability* facts) noexcept {
         return Availability::unknown;
     if (facts->extents_unavailable)
         return facts->extents_unavailable == facts->extents ? Availability::unavailable
-                                                             : Availability::partial;
+                                                            : Availability::partial;
     if (facts->extents_unknown)
         return Availability::unknown;
     return Availability::complete;

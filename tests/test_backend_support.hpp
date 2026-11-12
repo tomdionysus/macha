@@ -3,35 +3,35 @@
 
 #include "catalogue/catalogue.hpp"
 #include "catalogue/catalogue_hints.hpp"
+#include "catalogue/media_catalogue.hpp"
 #include "cluster/cluster.hpp"
 #include "cluster/distributed_store.hpp"
-#include "metadata/metadata_manager.hpp"
+#include "cluster/net.hpp"
+#include "cluster/placement.hpp"
+#include "cluster/replica_selector.hpp"
 #include "codec.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
 #include "diagnostics.hpp"
 #include "durable_file.hpp"
 #include "filesystem/filesystem.hpp"
+#include "filesystem/macos_unicode.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "http/http.hpp"
 #include "http/http_compression.hpp"
-#include "storage/local_store.hpp"
 #include "macha_version.hpp"
-#include "metadata/metadata.hpp"
-#include "catalogue/media_catalogue.hpp"
-#include "filesystem/macos_unicode.hpp"
 #include "media/media_timestamps.hpp"
 #include "media/media_vod.hpp"
-#include "cluster/net.hpp"
-#include "cluster/placement.hpp"
-#include "service/service.hpp"
-#include "storage/storage_pool.hpp"
 #include "media/subtitle_text.hpp"
+#include "metadata/metadata.hpp"
+#include "metadata/metadata_manager.hpp"
+#include "service/service.hpp"
+#include "storage/local_store.hpp"
 #include "storage/persistent_cache.hpp"
+#include "storage/storage_pool.hpp"
 #include "test_framework.hpp"
 #include "test_support.hpp"
 #include "torrent/torrent.hpp"
-#include "cluster/replica_selector.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
 #include <array>
@@ -72,7 +72,8 @@ class CapturingLogger final : public Logger {
     explicit CapturingLogger(LogLevel level) : level_(level) {}
 
     bool enabled(LogLevel level) const noexcept override {
-        return level_ == LogLevel::all || static_cast<unsigned char>(level) >= static_cast<unsigned char>(level_);
+        return level_ == LogLevel::all ||
+               static_cast<unsigned char>(level) >= static_cast<unsigned char>(level_);
     }
 
     void log(LogLevel level, const std::string& message) override {
@@ -107,15 +108,29 @@ class ConcurrentCapturingLogger final : public Logger {
 class FakeMediaEngineSession final : public MediaEngineSession {
     bool running_{true};
     std::shared_ptr<MediaSegmentStore> segments_;
+
   public:
     explicit FakeMediaEngineSession(std::shared_ptr<MediaSegmentStore> segments)
         : segments_(std::move(segments)) {}
-    bool running() const override { return running_; }
-    std::optional<int> exit_code() const override { return running_ ? std::optional<int>{} : std::optional<int>{0}; }
-    std::string diagnostics() const override { return {}; }
-    std::shared_ptr<MediaSegmentStore> segments() const override { return segments_; }
-    void note_segment_requested(uint64_t index) override { segments_->note_requested(index); }
-    void stop() override { running_ = false; segments_->cancel(); }
+    bool running() const override {
+        return running_;
+    }
+    std::optional<int> exit_code() const override {
+        return running_ ? std::optional<int>{} : std::optional<int>{0};
+    }
+    std::string diagnostics() const override {
+        return {};
+    }
+    std::shared_ptr<MediaSegmentStore> segments() const override {
+        return segments_;
+    }
+    void note_segment_requested(uint64_t index) override {
+        segments_->note_requested(index);
+    }
+    void stop() override {
+        running_ = false;
+        segments_->cancel();
+    }
 };
 
 class FakeMediaEngine : public MediaEngine {
@@ -124,23 +139,33 @@ class FakeMediaEngine : public MediaEngine {
     std::atomic_uint probes_{};
     std::atomic_uint vod_prepares_{};
     std::atomic_uint subtitle_segments_{};
+
   public:
-    MediaEngineStatus status() const override { return {true, "fake", "fake-media-engine", true, true}; }
+    MediaEngineStatus status() const override {
+        return {true, "fake", "fake-media-engine", true, true};
+    }
     MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
         ++probes_;
         MediaProbeResult result;
         result.format = "mov,mp4,m4a,3gp,3g2,mj2";
         result.duration_seconds = 60.0;
         result.bitrate = 4'000'000;
-        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false, 3'700'000, false, 0, ""});
-        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false, 192'000, false, 0, ""});
-        result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng", 0, 0, 0, 0, 0, false, false, 0, false, 0, ""});
-        result.streams.push_back(MediaStreamInfo{3, MediaStreamType::subtitle, "hdmv_pgs_subtitle", "", "eng", 0, 0, 0, 0, 0, false, false, 0, false, 0, ""});
+        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "",
+                                                 1920, 1080, 0, 0, 8, true, false, 3'700'000, false,
+                                                 0, ""});
+        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0,
+                                                 0, 2, 48000, 0, true, false, 192'000, false, 0,
+                                                 ""});
+        result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng",
+                                                 0, 0, 0, 0, 0, false, false, 0, false, 0, ""});
+        result.streams.push_back(MediaStreamInfo{3, MediaStreamType::subtitle, "hdmv_pgs_subtitle",
+                                                 "", "eng", 0, 0, 0, 0, 0, false, false, 0, false,
+                                                 0, ""});
         return result;
     }
-    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
-                               std::chrono::milliseconds segment_duration, bool,
-                               std::chrono::milliseconds = {}) override {
+    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan,
+                               double duration_seconds, std::chrono::milliseconds segment_duration,
+                               bool, std::chrono::milliseconds = {}) override {
         ++vod_prepares_;
         HlsVodPlan vod;
         vod.playback = plan;
@@ -149,22 +174,24 @@ class FakeMediaEngine : public MediaEngine {
         vod.seek_segment_seconds = segment;
         vod.reusable_seek = true;
         double left = duration_seconds - plan.seek.count() / 1000.0;
-        while (left > segment + 0.001) { vod.segment_durations.push_back(segment); left -= segment; }
+        while (left > segment + 0.001) {
+            vod.segment_durations.push_back(segment);
+            left -= segment;
+        }
         vod.segment_durations.push_back(std::max(0.001, left));
         return vod;
     }
-    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan& vod_plan,
-                                                  std::chrono::milliseconds segment_duration,
-                                                  size_t max_ahead_segments,
-                                                  uint64_t memory_limit,
-                                                  const std::filesystem::path& spill_directory) override {
+    std::unique_ptr<MediaEngineSession>
+    start_hls(const MediaSource&, const HlsVodPlan& vod_plan,
+              std::chrono::milliseconds segment_duration, size_t max_ahead_segments,
+              uint64_t memory_limit, const std::filesystem::path& spill_directory) override {
         {
             std::lock_guard lock(mutex_);
             started_plans_.push_back(vod_plan.playback);
         }
-        auto store = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
-                                                         spill_directory, segment_duration,
-                                                         vod_plan.segment_durations);
+        auto store =
+            std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit, spill_directory,
+                                                segment_duration, vod_plan.segment_durations);
         Bytes init{'i', 'n', 'i', 't'};
         Bytes segment{'s', 'e', 'g', 'm', 'e', 'n', 't'};
         REQUIRE(store->publish_init(std::move(init)));
@@ -189,19 +216,28 @@ class FakeMediaEngine : public MediaEngine {
         std::lock_guard lock(mutex_);
         return started_plans_;
     }
-    unsigned probes() const { return probes_.load(); }
-    unsigned vod_prepares() const { return vod_prepares_.load(); }
-    unsigned subtitle_segments() const { return subtitle_segments_.load(); }
+    unsigned probes() const {
+        return probes_.load();
+    }
+    unsigned vod_prepares() const {
+        return vod_prepares_.load();
+    }
+    unsigned subtitle_segments() const {
+        return subtitle_segments_.load();
+    }
 };
 
 class FailingProbeMediaEngine final : public MediaEngine {
   public:
-    MediaEngineStatus status() const override { return {true, "fake", "failing-probe", true, true}; }
+    MediaEngineStatus status() const override {
+        return {true, "fake", "failing-probe", true, true};
+    }
     MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds) override {
         throw std::runtime_error("synthetic probe failure");
     }
     HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan&, double,
-                               std::chrono::milliseconds, bool, std::chrono::milliseconds = {}) override {
+                               std::chrono::milliseconds, bool,
+                               std::chrono::milliseconds = {}) override {
         throw std::runtime_error("prepare_hls_vod must not be called after a failed probe");
     }
     std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan&,
@@ -210,15 +246,17 @@ class FailingProbeMediaEngine final : public MediaEngine {
         throw std::runtime_error("start_hls must not be called after a failed probe");
     }
     std::string extract_webvtt_segment(const MediaSource&, int, std::chrono::milliseconds,
-                                       std::chrono::milliseconds, std::chrono::milliseconds) override {
+                                       std::chrono::milliseconds,
+                                       std::chrono::milliseconds) override {
         throw std::runtime_error("extract_webvtt_segment must not be called after a failed probe");
     }
 };
 
-
 class AttachedPictureAudioEngine final : public MediaEngine {
   public:
-    MediaEngineStatus status() const override { return {true, "fake", "attached-picture-audio", true, true}; }
+    MediaEngineStatus status() const override {
+        return {true, "fake", "attached-picture-audio", true, true};
+    }
     MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
         MediaProbeResult result;
         result.format = "mp3";
@@ -226,7 +264,8 @@ class AttachedPictureAudioEngine final : public MediaEngine {
         result.bitrate = 192'000;
         MediaStreamInfo picture;
         picture.index = 0;
-        picture.type = MediaStreamType::video; // defensive path: disposition must still make this non-playable
+        picture.type =
+            MediaStreamType::video; // defensive path: disposition must still make this non-playable
         picture.codec = "png";
         picture.width = 600;
         picture.height = 600;
@@ -244,7 +283,8 @@ class AttachedPictureAudioEngine final : public MediaEngine {
         return result;
     }
     HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan&, double,
-                               std::chrono::milliseconds, bool, std::chrono::milliseconds = {}) override {
+                               std::chrono::milliseconds, bool,
+                               std::chrono::milliseconds = {}) override {
         throw std::runtime_error("attached-picture MP3 should direct-play without HLS planning");
     }
     std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan&,
@@ -253,7 +293,8 @@ class AttachedPictureAudioEngine final : public MediaEngine {
         throw std::runtime_error("attached-picture MP3 should direct-play without HLS startup");
     }
     std::string extract_webvtt_segment(const MediaSource&, int, std::chrono::milliseconds,
-                                       std::chrono::milliseconds, std::chrono::milliseconds) override {
+                                       std::chrono::milliseconds,
+                                       std::chrono::milliseconds) override {
         return {};
     }
 };
@@ -262,20 +303,25 @@ class BlockingMediaEngine final : public MediaEngine {
     mutable std::mutex mutex_;
     std::shared_ptr<MediaSegmentStore> pending_;
     std::atomic_uint starts_{};
+
   public:
-    MediaEngineStatus status() const override { return {true, "fake", "blocking", true, true}; }
+    MediaEngineStatus status() const override {
+        return {true, "fake", "blocking", true, true};
+    }
     MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
         MediaProbeResult result;
         result.format = "matroska,webm";
         result.duration_seconds = 60.0;
         result.bitrate = 4'000'000;
-        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false, 3'700'000});
-        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false, 192'000});
+        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "",
+                                                 1920, 1080, 0, 0, 8, true, false, 3'700'000});
+        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0,
+                                                 0, 2, 48000, 0, true, false, 192'000});
         return result;
     }
-    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
-                               std::chrono::milliseconds segment_duration, bool,
-                               std::chrono::milliseconds = {}) override {
+    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan,
+                               double duration_seconds, std::chrono::milliseconds segment_duration,
+                               bool, std::chrono::milliseconds = {}) override {
         HlsVodPlan vod;
         vod.playback = plan;
         const double segment = segment_duration.count() / 1000.0;
@@ -283,17 +329,20 @@ class BlockingMediaEngine final : public MediaEngine {
         vod.seek_segment_seconds = segment;
         vod.reusable_seek = true;
         double left = duration_seconds - plan.seek.count() / 1000.0;
-        while (left > segment + 0.001) { vod.segment_durations.push_back(segment); left -= segment; }
+        while (left > segment + 0.001) {
+            vod.segment_durations.push_back(segment);
+            left -= segment;
+        }
         vod.segment_durations.push_back(std::max(0.001, left));
         return vod;
     }
-    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan& vod_plan,
-                                                  std::chrono::milliseconds segment_duration,
-                                                  size_t max_ahead_segments, uint64_t memory_limit,
-                                                  const std::filesystem::path& spill_directory) override {
-        auto store = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
-                                                         spill_directory, segment_duration,
-                                                         vod_plan.segment_durations);
+    std::unique_ptr<MediaEngineSession>
+    start_hls(const MediaSource&, const HlsVodPlan& vod_plan,
+              std::chrono::milliseconds segment_duration, size_t max_ahead_segments,
+              uint64_t memory_limit, const std::filesystem::path& spill_directory) override {
+        auto store =
+            std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit, spill_directory,
+                                                segment_duration, vod_plan.segment_durations);
         {
             std::lock_guard lock(mutex_);
             pending_ = store;
@@ -302,8 +351,13 @@ class BlockingMediaEngine final : public MediaEngine {
         return std::make_unique<FakeMediaEngineSession>(std::move(store));
     }
     std::string extract_webvtt_segment(const MediaSource&, int, std::chrono::milliseconds,
-                                       std::chrono::milliseconds, std::chrono::milliseconds) override { return {}; }
-    unsigned starts() const { return starts_.load(); }
+                                       std::chrono::milliseconds,
+                                       std::chrono::milliseconds) override {
+        return {};
+    }
+    unsigned starts() const {
+        return starts_.load();
+    }
     void release() {
         std::shared_ptr<MediaSegmentStore> store;
         {
@@ -328,7 +382,9 @@ class FakeHttpClient final : public HttpClient {
     std::vector<std::string> urls_;
 
   public:
-    size_t requests() const noexcept { return requests_.load(); }
+    size_t requests() const noexcept {
+        return requests_.load();
+    }
     size_t requests_containing(std::string_view needle) const {
         std::lock_guard lock(urls_mutex_);
         return static_cast<size_t>(std::count_if(urls_.begin(), urls_.end(), [&](const auto& url) {
@@ -343,8 +399,9 @@ class FakeHttpClient final : public HttpClient {
         routes_.push_back({std::move(contains), std::move(response)});
     }
     void add_bytes(std::string contains, long status, std::string content_type, Bytes body) {
-        routes_.push_back({std::move(contains),
-                           RemoteHttpResponse{status, std::move(content_type), std::move(body), {}}});
+        routes_.push_back(
+            {std::move(contains),
+             RemoteHttpResponse{status, std::move(content_type), std::move(body), {}}});
     }
     // Answered once, before any route, by the first request containing
     // `contains`.
@@ -352,8 +409,8 @@ class FakeHttpClient final : public HttpClient {
                   std::optional<std::chrono::milliseconds> retry_after = {}) {
         std::lock_guard lock(urls_mutex_);
         once_.push_back({std::move(contains),
-                         RemoteHttpResponse{status, "text/plain",
-                                            Bytes(body.begin(), body.end()), retry_after}});
+                         RemoteHttpResponse{status, "text/plain", Bytes(body.begin(), body.end()),
+                                            retry_after}});
     }
     RemoteHttpResponse get(std::string_view url, const std::vector<std::string>&, size_t) override {
         requests_.fetch_add(1);
@@ -382,14 +439,22 @@ class BlockingHttpClient final : public HttpClient {
     std::atomic_bool stopped_{};
 
   public:
-    bool entered() const { return entered_.load(); }
-    bool stopped() const { return stopped_.load(); }
+    bool entered() const {
+        return entered_.load();
+    }
+    bool stopped() const {
+        return stopped_.load();
+    }
     void request_stop() noexcept override {
         stopped_.store(true);
         cv_.notify_all();
     }
-    void reset_stop() noexcept override { stopped_.store(false); }
-    bool stop_requested() const noexcept override { return stopped_.load(); }
+    void reset_stop() noexcept override {
+        stopped_.store(false);
+    }
+    bool stop_requested() const noexcept override {
+        return stopped_.load();
+    }
     RemoteHttpResponse get(std::string_view, const std::vector<std::string>&, size_t) override {
         entered_.store(true);
         cv_.notify_all();
@@ -404,12 +469,16 @@ class BlockingHttpBody final : public HttpBodySource {
     TestGate& gate_;
     uint64_t size_;
     std::atomic_bool first_read_{true};
+
   public:
     BlockingHttpBody(std::atomic_bool& entered, TestGate& gate, uint64_t size)
         : entered_(entered), gate_(gate), size_(size) {}
-    uint64_t size() const override { return size_; }
+    uint64_t size() const override {
+        return size_;
+    }
     size_t read(uint64_t offset, std::span<uint8_t> destination) override {
-        if (offset >= size_) return 0;
+        if (offset >= size_)
+            return 0;
         if (first_read_.exchange(false)) {
             entered_ = true;
             gate_.enter_and_wait();
@@ -423,7 +492,8 @@ class BlockingHttpBody final : public HttpBodySource {
 inline std::string raw_http_get(uint16_t port, std::string_view path,
                                 const std::map<std::string, std::string>& headers = {}) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) throw std::runtime_error("http test socket failed");
+    if (fd < 0)
+        throw std::runtime_error("http test socket failed");
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
@@ -439,16 +509,22 @@ inline std::string raw_http_get(uint16_t port, std::string_view path,
     size_t sent = 0;
     while (sent < request.size()) {
         auto n = send(fd, request.data() + sent, request.size() - sent, 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { close(fd); throw std::runtime_error("http test send failed"); }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            close(fd);
+            throw std::runtime_error("http test send failed");
+        }
         sent += static_cast<size_t>(n);
     }
     std::string response;
     std::array<char, 8192> buffer{};
     while (true) {
         auto n = recv(fd, buffer.data(), buffer.size(), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
         response.append(buffer.data(), static_cast<size_t>(n));
     }
     close(fd);
@@ -458,7 +534,8 @@ inline std::string raw_http_get(uint16_t port, std::string_view path,
 inline std::string raw_http_post(uint16_t port, std::string_view path, std::string_view body,
                                  const std::map<std::string, std::string>& headers = {}) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) throw std::runtime_error("http test socket failed");
+    if (fd < 0)
+        throw std::runtime_error("http test socket failed");
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
@@ -467,9 +544,9 @@ inline std::string raw_http_post(uint16_t port, std::string_view path, std::stri
         close(fd);
         throw std::runtime_error("http test connect failed");
     }
-    auto request = "POST " + std::string(path) + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
-                   "Content-Type: application/json\r\nContent-Length: " +
-                   std::to_string(body.size()) + "\r\n";
+    auto request =
+        "POST " + std::string(path) + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
+        "Content-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
     for (const auto& [key, value] : headers)
         request += key + ": " + value + "\r\n";
     request += "Connection: close\r\n\r\n";
@@ -477,16 +554,22 @@ inline std::string raw_http_post(uint16_t port, std::string_view path, std::stri
     size_t sent = 0;
     while (sent < request.size()) {
         auto n = send(fd, request.data() + sent, request.size() - sent, 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { close(fd); throw std::runtime_error("http test send failed"); }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            close(fd);
+            throw std::runtime_error("http test send failed");
+        }
         sent += static_cast<size_t>(n);
     }
     std::string response;
     std::array<char, 8192> buffer{};
     while (true) {
         auto n = recv(fd, buffer.data(), buffer.size(), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
         response.append(buffer.data(), static_cast<size_t>(n));
     }
     close(fd);
@@ -527,8 +610,10 @@ inline void raw_http_send(int fd, std::string_view request) {
     size_t sent = 0;
     while (sent < request.size()) {
         auto n = send(fd, request.data() + sent, request.size() - sent, 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) throw std::runtime_error("http test send failed");
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            throw std::runtime_error("http test send failed");
         sent += static_cast<size_t>(n);
     }
 }
@@ -543,8 +628,10 @@ inline RawHttpResponse raw_http_read_response(int fd) {
     while ((header_end = input.find("\r\n\r\n")) == std::string::npos) {
         char c{};
         auto n = recv(fd, &c, 1, 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) throw std::runtime_error("http test response truncated before headers");
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            throw std::runtime_error("http test response truncated before headers");
         input.push_back(c);
     }
 
@@ -559,13 +646,17 @@ inline RawHttpResponse raw_http_read_response(int fd) {
     }
     std::string line;
     while (std::getline(head, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
         auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
+        if (colon == std::string::npos)
+            continue;
         std::string key = line.substr(0, colon);
-        for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (auto& c : key)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         std::string value = line.substr(colon + 1);
-        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
+            value.erase(value.begin());
         response.headers[key] = value;
     }
 
@@ -574,9 +665,12 @@ inline RawHttpResponse raw_http_read_response(int fd) {
         content_length = static_cast<size_t>(std::stoull(found->second));
     response.body = input.substr(header_end + 4);
     while (response.body.size() < content_length) {
-        auto n = recv(fd, buffer.data(), std::min(buffer.size(), content_length - response.body.size()), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) throw std::runtime_error("http test response body truncated");
+        auto n = recv(fd, buffer.data(),
+                      std::min(buffer.size(), content_length - response.body.size()), 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            throw std::runtime_error("http test response body truncated");
         response.body.append(buffer.data(), static_cast<size_t>(n));
     }
     return response;
@@ -618,8 +712,12 @@ struct HttpReply {
     int status{};
     std::string body;
     std::map<std::string, std::string> headers; // lowercased keys
-    bool has(std::string_view text) const { return body.find(text) != std::string::npos; }
-    Json json() const { return Json::parse(body); }
+    bool has(std::string_view text) const {
+        return body.find(text) != std::string::npos;
+    }
+    Json json() const {
+        return Json::parse(body);
+    }
 };
 
 inline HttpReply http_request(uint16_t port, std::string_view method, std::string_view path,
@@ -663,16 +761,24 @@ class HeldLoaderAdmission final : public LoaderAdmission {
     }
 
   public:
-    void hold() { set(true); }
-    void release() { set(false); }
+    void hold() {
+        set(true);
+    }
+    void release() {
+        set(false);
+    }
 
-    bool can_start(TimePoint) override { return !held_.load(std::memory_order_acquire); }
+    bool can_start(TimePoint) override {
+        return !held_.load(std::memory_order_acquire);
+    }
     bool namespace_can_start(TimePoint) override {
         return !held_.load(std::memory_order_acquire);
     }
     void started(TimePoint, bool) override {}
     void service_started(TimePoint) override {}
-    bool should_yield(TimePoint) override { return held_.load(std::memory_order_acquire); }
+    bool should_yield(TimePoint) override {
+        return held_.load(std::memory_order_acquire);
+    }
     void finished(TimePoint) override {}
     std::optional<std::chrono::milliseconds> retry_after(TimePoint) override {
         if (held_.load(std::memory_order_acquire))
@@ -687,18 +793,16 @@ class HeldLoaderAdmission final : public LoaderAdmission {
 
 // A frontend admitting loader publication as production does, publishing
 // into `fs`.
-inline std::shared_ptr<FuseFrontend> make_fuse_frontend(FileSystem& fs,
-                                                        RetainedMemoryLedger& memory,
-                                                        const FuseConfig& config) {
+inline std::shared_ptr<FuseFrontend>
+make_fuse_frontend(FileSystem& fs, RetainedMemoryLedger& memory, const FuseConfig& config) {
     return std::make_shared<FuseFrontend>(
         fs, memory, config, std::make_unique<ViewerWeightedAdmission>(fs, config), fs);
 }
 
 // A frontend whose loader publication `admission` decides.
-inline std::shared_ptr<FuseFrontend> make_fuse_frontend(FileSystem& fs,
-                                                        RetainedMemoryLedger& memory,
-                                                        const FuseConfig& config,
-                                                        std::unique_ptr<LoaderAdmission> admission) {
+inline std::shared_ptr<FuseFrontend>
+make_fuse_frontend(FileSystem& fs, RetainedMemoryLedger& memory, const FuseConfig& config,
+                   std::unique_ptr<LoaderAdmission> admission) {
     return std::make_shared<FuseFrontend>(fs, memory, config, std::move(admission), fs);
 }
 

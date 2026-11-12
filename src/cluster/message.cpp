@@ -198,8 +198,7 @@ FrameType default_frame_type(MessageType type) noexcept {
     if (type == MessageType::get_control_object || type == MessageType::put_control_object ||
         type == MessageType::telemetry || type == MessageType::have_object ||
         type == MessageType::have_objects || type == MessageType::have_valid_objects ||
-        type == MessageType::trie_diff ||
-        type == MessageType::retain_objects ||
+        type == MessageType::trie_diff || type == MessageType::retain_objects ||
         type == MessageType::delete_object)
         return FrameType::speculative;
     return FrameType::control;

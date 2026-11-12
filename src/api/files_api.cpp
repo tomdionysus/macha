@@ -79,7 +79,8 @@ HttpResponse FilesApi::handle(const HttpRequest& request) {
         return http_error(405, "method_not_allowed", "the files resource is read with GET");
     const auto snapshot = availability_.snapshot();
     PageQuery page;
-    if (auto bad = read_page_query(request, page)) return *bad;
+    if (auto bad = read_page_query(request, page))
+        return *bad;
 
     if (const auto hash = request.query.find("hash"); hash != request.query.end()) {
         if (request.path != prefix && request.path != std::string(prefix) + "/")

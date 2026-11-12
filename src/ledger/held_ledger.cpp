@@ -93,10 +93,9 @@ void HeldLedger::install_queued() {
     if (changes.empty())
         return;
     // In order, a later change to an id winning.
-    std::stable_sort(changes.begin(), changes.end(),
-                     [](const ObjectTrie::Change& a, const ObjectTrie::Change& b) {
-                         return a.id < b.id;
-                     });
+    std::stable_sort(
+        changes.begin(), changes.end(),
+        [](const ObjectTrie::Change& a, const ObjectTrie::Change& b) { return a.id < b.id; });
     std::vector<ObjectTrie::Change> unique;
     unique.reserve(changes.size());
     for (const auto& change : changes) {
@@ -107,10 +106,9 @@ void HeldLedger::install_queued() {
     }
     // The journal's sync is the write; lookups go on meanwhile.
     write_journal(unique);
-    const auto removed = static_cast<uint64_t>(std::count_if(
-        unique.begin(), unique.end(), [](const ObjectTrie::Change& change) {
-            return !change.value;
-        }));
+    const auto removed = static_cast<uint64_t>(
+        std::count_if(unique.begin(), unique.end(),
+                      [](const ObjectTrie::Change& change) { return !change.value; }));
     Lock lock(trie_mutex_);
     trie_->install(unique);
     removals_.fetch_add(removed, std::memory_order_acq_rel);

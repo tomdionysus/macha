@@ -30,9 +30,9 @@ Accounts::Accounts(const Config& cfg, const NodeIdentity& identity, NodeRuntime&
       sessions_(cfg.session.anonymous_ttl, cfg.session.max_sessions,
                 cfg.state_path / "sessions" / "sessions.bin"),
       users_(cfg.session.max_users, cfg.state_path / "users" / "users.bin",
-             hkdf_sha256(identity.keys.master, {},
-                         std::span<const uint8_t>(
-                             reinterpret_cast<const uint8_t*>("macha/users/v1"), 14))),
+             hkdf_sha256(
+                 identity.keys.master, {},
+                 std::span<const uint8_t>(reinterpret_cast<const uint8_t*>("macha/users/v1"), 14))),
       password_work_(cfg.session.max_concurrent_password_checks),
       gossip_ttl_(std::max(cfg.dead_after * 2, std::chrono::milliseconds(60000))) {
     bind_routes();
@@ -54,7 +54,8 @@ void Accounts::start() {
         Log::warn("accounts: this node holds no user accounts, so nothing can sign in and "
                   "every API route will refuse with 403");
         Log::warn("accounts: if this cluster has just been upgraded, stop one node and run: "
-                  "macha-users " + cfg_.state_path.string() + " <cluster.key> init");
+                  "macha-users " +
+                  cfg_.state_path.string() + " <cluster.key> init");
         Log::warn("accounts: if it has not, this node has simply not received the user table "
                   "yet and will converge shortly");
     }
@@ -97,14 +98,13 @@ void Accounts::bind_routes() {
             (void)users_.apply_all(decode_users(request.payload));
         return RpcMessage{MessageType::user_sync_reply, encode_users(users_.all())};
     });
-    route(MessageType::session_sync,
-          [this](const NodeInfo&, FrameType, const RpcMessage& request) {
-              if (!request.payload.empty())
-                  for (const auto& session : decode_sessions(request.payload))
-                      apply_session(session);
-              return RpcMessage{MessageType::session_sync_reply,
-                                encode_sessions(sessions_.recent(gossip_ttl_, 64))};
-          });
+    route(MessageType::session_sync, [this](const NodeInfo&, FrameType, const RpcMessage& request) {
+        if (!request.payload.empty())
+            for (const auto& session : decode_sessions(request.payload))
+                apply_session(session);
+        return RpcMessage{MessageType::session_sync_reply,
+                          encode_sessions(sessions_.recent(gossip_ttl_, 64))};
+    });
 }
 
 bool Accounts::apply_session(const AuthSession& session) {
@@ -146,8 +146,8 @@ void Accounts::propagate_users() {
         auto values = users_.all();
         if (values.empty())
             return;
-        const auto reached = node_.broadcast_notify(
-            {MessageType::user_sync, encode_users(values)}, FrameType::control);
+        const auto reached = node_.broadcast_notify({MessageType::user_sync, encode_users(values)},
+                                                    FrameType::control);
         if (reached < active_peers().size())
             request_gossip();
     } catch (const std::exception& error) {
@@ -207,8 +207,8 @@ void Accounts::gossip_sessions() {
                          now - gossiped_sessions_at_ >= gossip_reannounce_interval;
         if (!due || now < gossip_sessions_retry_after_)
             return;
-        const auto reached = node_.broadcast_notify(
-            {MessageType::session_sync, std::move(payload)}, FrameType::control);
+        const auto reached = node_.broadcast_notify({MessageType::session_sync, std::move(payload)},
+                                                    FrameType::control);
         // Recorded only once it reached everyone: a best-effort notify queues
         // nothing for a busy or not-yet-usable peer (as when a peer rejoins),
         // and recording anyway would retire the retry before it ran.
@@ -244,8 +244,8 @@ void Accounts::gossip_users_if_changed() {
         auto values = users_.all();
         if (values.empty())
             return;
-        const auto reached = node_.broadcast_notify(
-            {MessageType::user_sync, encode_users(values)}, FrameType::control);
+        const auto reached = node_.broadcast_notify({MessageType::user_sync, encode_users(values)},
+                                                    FrameType::control);
         // Commit only when it reached everyone, so a not-yet-usable peer is
         // retried next tick rather than marked told.
         if (reached >= peers.size()) {

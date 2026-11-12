@@ -27,8 +27,12 @@ class ReferenceCounts {
     };
     // The root the counts are at; none before the first count, for a
     // namespace that is not a tree, and after an interrupted change.
-    std::optional<ObjectId> root() const noexcept { return root_; }
-    Totals totals() const noexcept { return totals_; }
+    std::optional<ObjectId> root() const noexcept {
+        return root_;
+    }
+    Totals totals() const noexcept {
+        return totals_;
+    }
 
     // Replaces every count: one item per reference, in any order.
     void reset(const std::optional<ObjectId>& root, std::vector<ObjectId> extents,

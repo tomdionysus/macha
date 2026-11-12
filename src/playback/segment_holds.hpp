@@ -32,8 +32,7 @@ class SegmentHoldArbiter {
         Hold() = default;
         Hold(const Hold&) = delete;
         Hold& operator=(const Hold&) = delete;
-        Hold(Hold&& other) noexcept
-            : owner_(other.owner_), session_(std::move(other.session_)) {
+        Hold(Hold&& other) noexcept : owner_(other.owner_), session_(std::move(other.session_)) {
             other.owner_ = nullptr;
         }
         Hold& operator=(Hold&& other) noexcept {
@@ -45,14 +44,19 @@ class SegmentHoldArbiter {
             }
             return *this;
         }
-        ~Hold() { reset(); }
+        ~Hold() {
+            reset();
+        }
 
         // Idempotent; also runs from the destructor, so an exception releases it.
         void reset() {
-            if (owner_) owner_->release(session_);
+            if (owner_)
+                owner_->release(session_);
             owner_ = nullptr;
         }
-        explicit operator bool() const noexcept { return owner_ != nullptr; }
+        explicit operator bool() const noexcept {
+            return owner_ != nullptr;
+        }
     };
 
     SegmentHoldArbiter(size_t max_session_holds, size_t max_concurrent_holds)
@@ -74,11 +78,13 @@ class SegmentHoldArbiter {
         // Per-session first, so a deeply prefetching player is refused for
         // exceeding its own share rather than reported as exhausting the node.
         if (max_session_ == 0 || held >= max_session_) {
-            if (why) *why = Refusal::session_limit;
+            if (why)
+                *why = Refusal::session_limit;
             return std::nullopt;
         }
         if (max_total_ == 0 || total_ >= max_total_) {
-            if (why) *why = Refusal::budget_exhausted;
+            if (why)
+                *why = Refusal::budget_exhausted;
             return std::nullopt;
         }
         per_session_[key] = held + 1;
@@ -103,7 +109,8 @@ class SegmentHoldArbiter {
         auto it = per_session_.find(session);
         if (it != per_session_.end() && it->second > 0 && --it->second == 0)
             per_session_.erase(it);
-        if (total_ > 0) --total_;
+        if (total_ > 0)
+            --total_;
     }
 
     mutable Mutex mutex_;

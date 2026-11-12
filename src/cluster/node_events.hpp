@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
 #include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include "contract/thread_safety.hpp"
 
 namespace macha {
 
@@ -56,7 +56,9 @@ class NodeEvents {
     std::condition_variable_any wait_cv;
 
   private:
-    static size_t index(NodeEvent kind) noexcept { return static_cast<size_t>(kind); }
+    static size_t index(NodeEvent kind) noexcept {
+        return static_cast<size_t>(kind);
+    }
     std::array<std::atomic_uint64_t, kinds> counts_{};
 };
 

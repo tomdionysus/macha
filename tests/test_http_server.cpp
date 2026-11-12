@@ -95,7 +95,9 @@ namespace {
 std::string body_of(const HttpResponse& response) {
     return std::string(response.body.begin(), response.body.end());
 }
-HttpResponse json_response(int status, std::string body) { return http_json(status, std::move(body)); }
+HttpResponse json_response(int status, std::string body) {
+    return http_json(status, std::move(body));
+}
 } // namespace
 
 MACHA_FAST_TEST("http_server", test_every_json_object_response_carries_a_snake_case_status) {
@@ -116,7 +118,8 @@ MACHA_FAST_TEST("http_server", test_every_json_object_response_carries_a_snake_c
     CHECK(body_of(pending) == R"({"status":"pending","media_id":"x"})");
 
     // "status" nested, or inside a string, is not the top-level key.
-    auto nested = json_response(200, R"({"node":{"status":"up"},"note":"\"status\": no","list":[{"status":1}]})");
+    auto nested = json_response(
+        200, R"({"node":{"status":"up"},"note":"\"status\": no","list":[{"status":1}]})");
     http_stamp_status(nested);
     CHECK(Json::parse(body_of(nested)).find("status")->asString() == "ok");
     CHECK(Json::parse(body_of(nested)).find("node")->find("status")->asString() == "up");
@@ -166,7 +169,8 @@ MACHA_TEST("http_server", test_a_repeated_query_parameter_keeps_every_value) {
     HttpServer server(config, [&](const HttpRequest& request) {
         std::string joined;
         if (auto all = request.query_all.find("kind"); all != request.query_all.end())
-            for (const auto& value : all->second) joined += value + ";";
+            for (const auto& value : all->second)
+                joined += value + ";";
         if (request.query_all.empty())
             return http_json(200, "{\"parameters\":0}");
         return http_json(200, "{\"kinds\":\"" + joined + "\",\"last\":\"" +
@@ -672,7 +676,8 @@ MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodie
     auto config = loopback_config();
     std::string catalogue = "{\"items\":[";
     for (int i = 0; i < 400; ++i) {
-        if (i) catalogue += ',';
+        if (i)
+            catalogue += ',';
         catalogue += "{\"id\":\"macha:" + std::to_string(i) + "\",\"title\":\"A Title\"}";
     }
     catalogue += "]}";
@@ -739,14 +744,12 @@ MACHA_TEST("http_server", test_compression_can_be_disabled_for_a_node_behind_a_p
     config.compression.enabled = false;
     std::string catalogue(8192, 'x');
 
-    HttpServer server(config,
-                      [&](const HttpRequest&) { return http_json(200, catalogue); });
+    HttpServer server(config, [&](const HttpRequest&) { return http_json(200, catalogue); });
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
 
-    const auto response =
-        raw_http_get(server.bound_port(), "/api/v1/catalogue",
-                     {{"Accept-Encoding", "gzip, deflate"}});
+    const auto response = raw_http_get(server.bound_port(), "/api/v1/catalogue",
+                                       {{"Accept-Encoding", "gzip, deflate"}});
     CHECK(response.find("HTTP/1.1 200") != std::string::npos);
     CHECK(response.find("Content-Encoding") == std::string::npos);
     // Nothing is negotiated, so nothing varies.

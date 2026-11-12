@@ -44,8 +44,10 @@ std::string encrypted_book() {
 
 MediaContentSource source_of(std::string text, std::string name = "book.mobi") {
     auto bytes = std::make_shared<std::string>(std::move(text));
-    return {bytes->size(), std::move(name), [bytes](uint64_t offset, std::span<uint8_t> into) -> size_t {
-                if (offset >= bytes->size()) return 0;
+    return {bytes->size(), std::move(name),
+            [bytes](uint64_t offset, std::span<uint8_t> into) -> size_t {
+                if (offset >= bytes->size())
+                    return 0;
                 const auto n = std::min<size_t>(into.size(), bytes->size() - offset);
                 std::copy_n(bytes->data() + offset, n, into.data());
                 return n;
@@ -56,9 +58,11 @@ std::string read_all(const MediaContentSource& source) {
     std::string out(source.size, '\0');
     size_t done = 0;
     while (done < out.size()) {
-        const auto n = source.read(done, std::span<uint8_t>(reinterpret_cast<uint8_t*>(out.data()) + done,
-                                                            out.size() - done));
-        if (!n) break;
+        const auto n =
+            source.read(done, std::span<uint8_t>(reinterpret_cast<uint8_t*>(out.data()) + done,
+                                                 out.size() - done));
+        if (!n)
+            break;
         done += n;
     }
     out.resize(done);
@@ -68,12 +72,15 @@ std::string read_all(const MediaContentSource& source) {
 ConversionState wait_settled(BookConversions& conversions, const std::string& media,
                              const std::string& format) {
     ConversionState last;
-    REQUIRE(wait_until([&] {
-        auto state = conversions.state(media, format);
-        if (!state) return false;
-        last = *state;
-        return state->phase != ConversionState::Phase::converting;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            auto state = conversions.state(media, format);
+            if (!state)
+                return false;
+            last = *state;
+            return state->phase != ConversionState::Phase::converting;
+        },
+        10s));
     return last;
 }
 
@@ -104,7 +111,8 @@ MACHA_TEST("book_conversion", test_conversions_run_report_fail_and_are_kept) {
         REQUIRE(content.has_value());
         CHECK(read_all(*content) == "converted:BOOK");
         // Asking again answers ready without converting again.
-        CHECK(conversions.request(media, "epub", source_of("OTHER")).phase == ConversionState::Phase::ready);
+        CHECK(conversions.request(media, "epub", source_of("OTHER")).phase ==
+              ConversionState::Phase::ready);
         CHECK(read_all(*conversions.content(media, "epub")) == "converted:BOOK");
         // An AZW3 converts the same way.
         conversions.request(id('e'), "epub", source_of("KF8", "book.AZW3"));
@@ -131,7 +139,8 @@ MACHA_TEST("book_conversion", test_conversions_run_report_fail_and_are_kept) {
         auto pdf = conversions.request(id('4'), "epub", source_of("BOOK", "book.pdf"));
         CHECK(pdf.phase == ConversionState::Phase::failed);
         CHECK(pdf.error_code == "unsupported_source");
-        CHECK(conversions.request(media, "azw3", source_of("BOOK")).phase == ConversionState::Phase::failed);
+        CHECK(conversions.request(media, "azw3", source_of("BOOK")).phase ==
+              ConversionState::Phase::failed);
 
         // Too large a source is refused before anything runs.
         config.max_source_bytes = 2;
@@ -141,12 +150,14 @@ MACHA_TEST("book_conversion", test_conversions_run_report_fail_and_are_kept) {
         CHECK(refused.error_code == "source_too_large");
 
         // An unreadable source fails as such.
-        MediaContentSource broken{100, "book.mobi",
-                                  [](uint64_t, std::span<uint8_t>) -> size_t { throw std::runtime_error("gone"); }};
+        MediaContentSource broken{100, "book.mobi", [](uint64_t, std::span<uint8_t>) -> size_t {
+                                      throw std::runtime_error("gone");
+                                  }};
         conversions.request(id('5'), "epub", broken);
         CHECK(wait_settled(conversions, id('5'), "epub").error_code == "source_unreadable");
         // A failed one is tried again when asked.
-        CHECK(conversions.request(id('5'), "epub", source_of("BOOK")).phase == ConversionState::Phase::converting);
+        CHECK(conversions.request(id('5'), "epub", source_of("BOOK")).phase ==
+              ConversionState::Phase::converting);
         CHECK(wait_settled(conversions, id('5'), "epub").phase == ConversionState::Phase::ready);
         conversions.stop();
     }

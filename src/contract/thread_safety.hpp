@@ -73,10 +73,18 @@ class MACHA_CAPABILITY("mutex") Mutex {
     std::mutex mutex_;
 
   public:
-    void lock() MACHA_ACQUIRE() { mutex_.lock(); }
-    void unlock() MACHA_RELEASE() { mutex_.unlock(); }
-    bool try_lock() MACHA_TRY_ACQUIRE(true) { return mutex_.try_lock(); }
-    std::mutex& native() noexcept { return mutex_; }
+    void lock() MACHA_ACQUIRE() {
+        mutex_.lock();
+    }
+    void unlock() MACHA_RELEASE() {
+        mutex_.unlock();
+    }
+    bool try_lock() MACHA_TRY_ACQUIRE(true) {
+        return mutex_.try_lock();
+    }
+    std::mutex& native() noexcept {
+        return mutex_;
+    }
 };
 
 // A mutex some holder keeps across device or network I/O, so taking it is
@@ -85,11 +93,19 @@ class MACHA_CAPABILITY("I/O mutex") IoMutex {
     std::mutex mutex_;
 
   public:
-    void lock() MACHA_ACQUIRE() MACHA_EXCLUDES(no_io) { mutex_.lock(); }
-    void unlock() MACHA_RELEASE() { mutex_.unlock(); }
+    void lock() MACHA_ACQUIRE() MACHA_EXCLUDES(no_io) {
+        mutex_.lock();
+    }
+    void unlock() MACHA_RELEASE() {
+        mutex_.unlock();
+    }
     // Never waits, so it is allowed anywhere.
-    bool try_lock() MACHA_TRY_ACQUIRE(true) { return mutex_.try_lock(); }
-    std::mutex& native() noexcept { return mutex_; }
+    bool try_lock() MACHA_TRY_ACQUIRE(true) {
+        return mutex_.try_lock();
+    }
+    std::mutex& native() noexcept {
+        return mutex_;
+    }
 };
 
 // A reader-writer mutex never held across I/O.
@@ -97,11 +113,21 @@ class MACHA_CAPABILITY("shared mutex") SharedMutex {
     std::shared_mutex mutex_;
 
   public:
-    void lock() MACHA_ACQUIRE() { mutex_.lock(); }
-    void unlock() MACHA_RELEASE() { mutex_.unlock(); }
-    void lock_shared() MACHA_ACQUIRE_SHARED() { mutex_.lock_shared(); }
-    void unlock_shared() MACHA_RELEASE_SHARED() { mutex_.unlock_shared(); }
-    std::shared_mutex& native() noexcept { return mutex_; }
+    void lock() MACHA_ACQUIRE() {
+        mutex_.lock();
+    }
+    void unlock() MACHA_RELEASE() {
+        mutex_.unlock();
+    }
+    void lock_shared() MACHA_ACQUIRE_SHARED() {
+        mutex_.lock_shared();
+    }
+    void unlock_shared() MACHA_RELEASE_SHARED() {
+        mutex_.unlock_shared();
+    }
+    std::shared_mutex& native() noexcept {
+        return mutex_;
+    }
 };
 
 // A reader-writer mutex some holder keeps across I/O.
@@ -109,11 +135,21 @@ class MACHA_CAPABILITY("I/O shared mutex") IoSharedMutex {
     std::shared_mutex mutex_;
 
   public:
-    void lock() MACHA_ACQUIRE() MACHA_EXCLUDES(no_io) { mutex_.lock(); }
-    void unlock() MACHA_RELEASE() { mutex_.unlock(); }
-    void lock_shared() MACHA_ACQUIRE_SHARED() MACHA_EXCLUDES(no_io) { mutex_.lock_shared(); }
-    void unlock_shared() MACHA_RELEASE_SHARED() { mutex_.unlock_shared(); }
-    std::shared_mutex& native() noexcept { return mutex_; }
+    void lock() MACHA_ACQUIRE() MACHA_EXCLUDES(no_io) {
+        mutex_.lock();
+    }
+    void unlock() MACHA_RELEASE() {
+        mutex_.unlock();
+    }
+    void lock_shared() MACHA_ACQUIRE_SHARED() MACHA_EXCLUDES(no_io) {
+        mutex_.lock_shared();
+    }
+    void unlock_shared() MACHA_RELEASE_SHARED() {
+        mutex_.unlock_shared();
+    }
+    std::shared_mutex& native() noexcept {
+        return mutex_;
+    }
 };
 
 // Holds a Mutex or IoMutex for its scope; may be released and retaken, and
@@ -124,8 +160,7 @@ class MACHA_SCOPED_CAPABILITY Lock {
 
   public:
     explicit Lock(Mutex& mutex) MACHA_ACQUIRE(mutex) : lock_(mutex.native()) {}
-    explicit Lock(IoMutex& mutex) MACHA_ACQUIRE(mutex)
-        : lock_(mutex.native()) {}
+    explicit Lock(IoMutex& mutex) MACHA_ACQUIRE(mutex) : lock_(mutex.native()) {}
     // Adopts a mutex the caller already holds, as after a successful try_lock().
     Lock(Mutex& mutex, std::adopt_lock_t) MACHA_REQUIRES(mutex)
         : lock_(mutex.native(), std::adopt_lock) {}
@@ -135,10 +170,18 @@ class MACHA_SCOPED_CAPABILITY Lock {
     Lock(const Lock&) = delete;
     Lock& operator=(const Lock&) = delete;
 
-    void lock() MACHA_ACQUIRE() { lock_.lock(); }
-    void unlock() MACHA_RELEASE() { lock_.unlock(); }
-    bool owns_lock() const noexcept { return lock_.owns_lock(); }
-    std::unique_lock<std::mutex>& native() noexcept { return lock_; }
+    void lock() MACHA_ACQUIRE() {
+        lock_.lock();
+    }
+    void unlock() MACHA_RELEASE() {
+        lock_.unlock();
+    }
+    bool owns_lock() const noexcept {
+        return lock_.owns_lock();
+    }
+    std::unique_lock<std::mutex>& native() noexcept {
+        return lock_;
+    }
 };
 
 // Holds a SharedMutex or IoSharedMutex exclusively for its scope.
@@ -147,8 +190,7 @@ class MACHA_SCOPED_CAPABILITY WriteLock {
 
   public:
     explicit WriteLock(SharedMutex& mutex) MACHA_ACQUIRE(mutex) : lock_(mutex.native()) {}
-    explicit WriteLock(IoSharedMutex& mutex) MACHA_ACQUIRE(mutex)
-        : lock_(mutex.native()) {}
+    explicit WriteLock(IoSharedMutex& mutex) MACHA_ACQUIRE(mutex) : lock_(mutex.native()) {}
     ~WriteLock() MACHA_RELEASE() {}
     WriteLock(const WriteLock&) = delete;
     WriteLock& operator=(const WriteLock&) = delete;
@@ -160,8 +202,7 @@ class MACHA_SCOPED_CAPABILITY ReadLock {
 
   public:
     explicit ReadLock(SharedMutex& mutex) MACHA_ACQUIRE_SHARED(mutex) : lock_(mutex.native()) {}
-    explicit ReadLock(IoSharedMutex& mutex) MACHA_ACQUIRE_SHARED(mutex)
-        : lock_(mutex.native()) {}
+    explicit ReadLock(IoSharedMutex& mutex) MACHA_ACQUIRE_SHARED(mutex) : lock_(mutex.native()) {}
     ~ReadLock() MACHA_RELEASE() {}
     ReadLock(const ReadLock&) = delete;
     ReadLock& operator=(const ReadLock&) = delete;

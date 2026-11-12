@@ -56,20 +56,31 @@ class WorkContext {
     // narrows what the work may wait on (a read that must answer from
     // memory allows no network wait); it never widens the class's default.
     explicit WorkContext(FrameType frame_type = FrameType::loader, Clock::time_point deadline = {},
-                         std::atomic_bool* cancelled = nullptr,
-                         const char* origin = "unnamed",
+                         std::atomic_bool* cancelled = nullptr, const char* origin = "unnamed",
                          std::optional<Waits> allowed = std::nullopt) noexcept
         : frame_type_(frame_type), deadline_(deadline), cancelled_(cancelled), origin_(origin),
           allowed_(static_cast<Waits>(
               static_cast<uint8_t>(default_waits(work_class(frame_type))) &
               static_cast<uint8_t>(allowed.value_or(default_waits(work_class(frame_type)))))) {}
 
-    FrameType frame_type() const noexcept { return frame_type_; }
-    WorkClass work() const noexcept { return work_class(frame_type_); }
-    Waits allowed() const noexcept { return allowed_; }
-    const char* origin() const noexcept { return origin_; }
-    Clock::time_point deadline() const noexcept { return deadline_; }
-    std::atomic_bool* cancellation() const noexcept { return cancelled_; }
+    FrameType frame_type() const noexcept {
+        return frame_type_;
+    }
+    WorkClass work() const noexcept {
+        return work_class(frame_type_);
+    }
+    Waits allowed() const noexcept {
+        return allowed_;
+    }
+    const char* origin() const noexcept {
+        return origin_;
+    }
+    Clock::time_point deadline() const noexcept {
+        return deadline_;
+    }
+    std::atomic_bool* cancellation() const noexcept {
+        return cancelled_;
+    }
     bool cancelled() const noexcept {
         return cancelled_ && cancelled_->load(std::memory_order_relaxed);
     }

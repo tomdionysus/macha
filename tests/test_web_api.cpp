@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "api/web_api.hpp"
 #include "json.hpp"
 #include "test_backend_support.hpp"
-#include "api/web_api.hpp"
 
 #include <fstream>
 
@@ -17,14 +17,16 @@ void write_file(const std::filesystem::path& path, std::string_view text) {
 }
 
 std::string body_of(const HttpResponse& response) {
-    if (!response.stream) return std::string(response.body.begin(), response.body.end());
+    if (!response.stream)
+        return std::string(response.body.begin(), response.body.end());
     std::string out(static_cast<size_t>(response.stream->size()), '\0');
     size_t filled = 0;
     while (filled < out.size()) {
-        auto n = response.stream->read(filled,
-                                       std::span<uint8_t>(reinterpret_cast<uint8_t*>(out.data()) + filled,
-                                                          out.size() - filled));
-        if (n == 0) break;
+        auto n = response.stream->read(
+            filled, std::span<uint8_t>(reinterpret_cast<uint8_t*>(out.data()) + filled,
+                                       out.size() - filled));
+        if (n == 0)
+            break;
         filled += n;
     }
     out.resize(filled);
@@ -62,7 +64,8 @@ std::string bundle(size_t repeats = 200) {
 std::string gzip_of(std::string_view text) {
     auto compressed = gzip_compress(
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()), 6);
-    if (!compressed) throw std::runtime_error("test fixture would not compress");
+    if (!compressed)
+        throw std::runtime_error("test fixture would not compress");
     return std::string(compressed->begin(), compressed->end());
 }
 

@@ -32,11 +32,13 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
 
 class NodeHorizonBuilder final : public HorizonBuilder {
   public:
-    NodeHorizonBuilder(FileSystem&, CatalogueManager&, LocalStore& control, DistributedStore&) noexcept;
+    NodeHorizonBuilder(FileSystem&, CatalogueManager&, LocalStore& control,
+                       DistributedStore&) noexcept;
 
-    std::shared_ptr<const MaintenanceObjects> namespace_objects(const std::function<void()>& pause) override;
-    std::shared_ptr<const InventoryHorizon> inventory(const MaintenanceObjects&,
-                                                      const CatalogueMaintenanceHead& head) override;
+    std::shared_ptr<const MaintenanceObjects>
+    namespace_objects(const std::function<void()>& pause) override;
+    std::shared_ptr<const InventoryHorizon>
+    inventory(const MaintenanceObjects&, const CatalogueMaintenanceHead& head) override;
     ReleaseBuild release(const MetadataSnapshotView& head) override;
 
   private:

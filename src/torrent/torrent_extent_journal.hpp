@@ -57,7 +57,6 @@ class TorrentExtentJournal {
     // keeps appended lines whole.
     IoMutex mutex_;
     int fd_{-1}; // opened at construction, fixed after
-
 };
 
 } // namespace macha

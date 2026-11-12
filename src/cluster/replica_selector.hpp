@@ -50,8 +50,8 @@ class ReplicaSelector {
   public:
     // All candidates, most suitable first. `stripe` rotates equal-scored
     // candidates deterministically.
-    std::vector<NodeInfo> order(const std::vector<NodeInfo>& candidates,
-                                size_t stripe, ReplicaWorkClass work) const;
+    std::vector<NodeInfo> order(const std::vector<NodeInfo>& candidates, size_t stripe,
+                                ReplicaWorkClass work) const;
 
     void started(const NodeInfo&, ReplicaWorkClass);
     void promoted(const NodeInfo&); // speculative transfer became foreground

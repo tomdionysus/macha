@@ -84,12 +84,12 @@ GateVerdict data_gate(const PassFacts& facts, const InventoryHorizon* inventory)
         verdict.reason = "inventory generation " + std::to_string(inventory->generation()) +
                          " behind known " + std::to_string(facts.known_generation);
     verdict.permitted = verdict.reason.empty();
-    verdict.conditions =
-        flag("due", facts.gc_due) + " " + flag("rebuilt", facts.rebuilt_inventory) + " " +
-        flag("release_view", facts.release_view) + " " +
-        flag("catalogue_complete", catalogue_complete(inventory)) + " " +
-        flag("live", inventory != nullptr) + " " +
-        flag("generation_current", generation_current(facts, inventory));
+    verdict.conditions = flag("due", facts.gc_due) + " " +
+                         flag("rebuilt", facts.rebuilt_inventory) + " " +
+                         flag("release_view", facts.release_view) + " " +
+                         flag("catalogue_complete", catalogue_complete(inventory)) + " " +
+                         flag("live", inventory != nullptr) + " " +
+                         flag("generation_current", generation_current(facts, inventory));
     return verdict;
 }
 

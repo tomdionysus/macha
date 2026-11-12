@@ -39,12 +39,16 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
                                          std::chrono::milliseconds requested_seek,
                                          std::string* declined_reason) {
     const auto decline = [&](const char* reason) {
-        if (declined_reason) *declined_reason = reason;
+        if (declined_reason)
+            *declined_reason = reason;
         return std::nullopt;
     };
-    if (!prepared.reusable_seek) return decline("plan-not-reusable");
-    if (!(prepared.source_duration_seconds > 0.001)) return decline("source-duration-unknown");
-    if (!(prepared.seek_segment_seconds > 0.001)) return decline("segment-length-unknown");
+    if (!prepared.reusable_seek)
+        return decline("plan-not-reusable");
+    if (!(prepared.source_duration_seconds > 0.001))
+        return decline("source-duration-unknown");
+    if (!(prepared.seek_segment_seconds > 0.001))
+        return decline("segment-length-unknown");
 
     HlsVodPlan result = prepared;
     const int64_t requested_ms =
@@ -57,44 +61,51 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
         // own GOP via fixed_vod_durations, so no keyframe or density check applies.
         result.playback.seek = std::chrono::milliseconds(requested_ms);
         result.playback.seek_offset = {};
-        result.segment_durations = fixed_vod_durations(prepared.source_duration_seconds,
-                                                       requested_seconds,
-                                                       prepared.seek_segment_seconds);
+        result.segment_durations = fixed_vod_durations(
+            prepared.source_duration_seconds, requested_seconds, prepared.seek_segment_seconds);
     } else if (!prepared.video_random_access_points.empty()) {
         auto indexed = media_vod::indexed_plan(prepared.video_random_access_points,
-                                               prepared.source_duration_seconds,
-                                               requested_ms,
+                                               prepared.source_duration_seconds, requested_ms,
                                                prepared.seek_segment_seconds);
         // The density bounds are whole-file, so a sparser GOP elsewhere can reject a
         // playable seek point; name that rather than decline silently.
-        if (!indexed) return decline("keyframe-density-bounds");
+        if (!indexed)
+            return decline("keyframe-density-bounds");
         result.playback.seek = std::chrono::milliseconds(indexed->seek_ms);
         result.playback.seek_offset = std::chrono::milliseconds(indexed->seek_offset_ms);
         result.segment_durations = std::move(indexed->segment_durations);
     } else {
         result.playback.seek = std::chrono::milliseconds(requested_ms);
         result.playback.seek_offset = {};
-        result.segment_durations = fixed_vod_durations(prepared.source_duration_seconds,
-                                                       requested_seconds,
-                                                       prepared.seek_segment_seconds);
+        result.segment_durations = fixed_vod_durations(
+            prepared.source_duration_seconds, requested_seconds, prepared.seek_segment_seconds);
     }
     return result;
 }
 
-std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stream, bool transcoded) {
+std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stream,
+                             bool transcoded) {
     if (transcoded) {
         // libx264 output: High profile; level 4.1 covers up to 1080p30/720p60.
-        if (codec == "h264") return "avc1.640029";
-        if (codec == "aac") return "mp4a.40.2";
+        if (codec == "h264")
+            return "avc1.640029";
+        if (codec == "aac")
+            return "mp4a.40.2";
     }
     if (codec == "h264") {
         // avc1.PPCCLL: profile_idc, constraint flags, level_idc, in hex.
         std::string profile = "64", constraints = "00";
         if (stream) {
-            if (stream->profile.find("Baseline") != std::string::npos) { profile = "42"; constraints = "C0"; }
-            else if (stream->profile.find("Main") != std::string::npos) { profile = "4D"; constraints = "40"; }
-            else if (stream->profile.find("High 10") != std::string::npos) profile = "6E";
-            else if (stream->profile.find("High 4:2:2") != std::string::npos) profile = "7A";
+            if (stream->profile.find("Baseline") != std::string::npos) {
+                profile = "42";
+                constraints = "C0";
+            } else if (stream->profile.find("Main") != std::string::npos) {
+                profile = "4D";
+                constraints = "40";
+            } else if (stream->profile.find("High 10") != std::string::npos)
+                profile = "6E";
+            else if (stream->profile.find("High 4:2:2") != std::string::npos)
+                profile = "7A";
         }
         const int level = std::clamp(stream && stream->level > 0 ? stream->level : 41, 0, 255);
         char buffer[16];
@@ -104,18 +115,26 @@ std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stre
     if (codec == "hevc") {
         // hvc1.P.C.Lxxx.B0: general_profile_idc, compatibility flags, tier + level.
         // Main = 1 (flags 6), Main 10 = 2 (flags 4).
-        const bool main10 = stream && (stream->bit_depth > 8 ||
-                                       stream->profile.find("10") != std::string::npos);
+        const bool main10 =
+            stream && (stream->bit_depth > 8 || stream->profile.find("10") != std::string::npos);
         const int level = stream && stream->level > 0 ? stream->level : 153;
-        return std::string("hvc1.") + (main10 ? "2.4" : "1.6") + ".L" + std::to_string(level) + ".B0";
+        return std::string("hvc1.") + (main10 ? "2.4" : "1.6") + ".L" + std::to_string(level) +
+               ".B0";
     }
-    if (codec == "av1") return "av01.0.08M.08";
-    if (codec == "aac") return "mp4a.40.2";
-    if (codec == "ac3") return "ac-3";
-    if (codec == "eac3") return "ec-3";
-    if (codec == "mp3") return "mp4a.40.34";
-    if (codec == "opus") return "opus";
-    if (codec == "flac") return "flac";
+    if (codec == "av1")
+        return "av01.0.08M.08";
+    if (codec == "aac")
+        return "mp4a.40.2";
+    if (codec == "ac3")
+        return "ac-3";
+    if (codec == "eac3")
+        return "ec-3";
+    if (codec == "mp3")
+        return "mp4a.40.34";
+    if (codec == "opus")
+        return "opus";
+    if (codec == "flac")
+        return "flac";
     return std::string(codec);
 }
 
@@ -125,26 +144,32 @@ std::string hls_variant_stream_inf(const PlaybackPlan& plan, const MediaStreamIn
     if (plan.video != MediaTransform::omit)
         codecs = hls_codec_string(plan.video_codec, video, plan.video == MediaTransform::transcode);
     if (plan.audio != MediaTransform::omit) {
-        if (!codecs.empty()) codecs += ',';
-        codecs += hls_codec_string(plan.audio_codec, audio, plan.audio == MediaTransform::transcode);
+        if (!codecs.empty())
+            codecs += ',';
+        codecs +=
+            hls_codec_string(plan.audio_codec, audio, plan.audio == MediaTransform::transcode);
     }
     int width = video ? video->width : 0;
     int height = video ? video->height : 0;
-    if (plan.video == MediaTransform::transcode && plan.target_height && video && video->height > 0 &&
-        *plan.target_height < video->height) {
+    if (plan.video == MediaTransform::transcode && plan.target_height && video &&
+        video->height > 0 && *plan.target_height < video->height) {
         height = *plan.target_height;
         width = std::max(2, static_cast<int>(std::llround(static_cast<double>(video->width) *
                                                           static_cast<double>(height) /
-                                                          static_cast<double>(video->height))) & ~1);
+                                                          static_cast<double>(video->height))) &
+                                ~1);
     }
     uint64_t bandwidth = source_bitrate;
     if (plan.video == MediaTransform::transcode) {
         bandwidth = plan.target_video_bitrate ? *plan.target_video_bitrate + 192000
-                                              : (height >= 1080 ? 8000000 : height >= 720 ? 5000000 : 2500000);
+                                              : (height >= 1080  ? 8000000
+                                                 : height >= 720 ? 5000000
+                                                                 : 2500000);
     }
-    if (!bandwidth) bandwidth = 8000000;
-    std::string out = "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(bandwidth) +
-                      ",CODECS=\"" + codecs + "\"";
+    if (!bandwidth)
+        bandwidth = 8000000;
+    std::string out =
+        "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(bandwidth) + ",CODECS=\"" + codecs + "\"";
     if (width > 0 && height > 0)
         out += ",RESOLUTION=" + std::to_string(width) + "x" + std::to_string(height);
     return out;
@@ -163,32 +188,46 @@ const char* media_container_name(MediaContainer container) noexcept {
 // carries them with the eighth silent.
 const char* aac_standard_channel_layout(int channels) noexcept {
     switch (channels) {
-    case 1: return "mono";
-    case 2: return "stereo";
-    case 3: return "3.0";
-    case 4: return "4.0";
-    case 5: return "5.0";
-    case 6: return "5.1";
-    case 7: return "7.1";
-    default: break;
+    case 1:
+        return "mono";
+    case 2:
+        return "stereo";
+    case 3:
+        return "3.0";
+    case 4:
+        return "4.0";
+    case 5:
+        return "5.0";
+    case 6:
+        return "5.1";
+    case 7:
+        return "7.1";
+    default:
+        break;
     }
     return channels >= 8 ? "7.1" : "stereo";
 }
 
 std::string playback_mode_name(PlaybackMode mode) {
     switch (mode) {
-    case PlaybackMode::direct: return "direct";
-    case PlaybackMode::remux: return "remux";
-    case PlaybackMode::transcode: return "transcode";
+    case PlaybackMode::direct:
+        return "direct";
+    case PlaybackMode::remux:
+        return "remux";
+    case PlaybackMode::transcode:
+        return "transcode";
     }
     return "unknown";
 }
 
 std::string_view media_failure_name(MediaFailure failure) noexcept {
     switch (failure) {
-    case MediaFailure::unreadable: return "source_unreadable";
-    case MediaFailure::unsupported: return "source_unsupported";
-    case MediaFailure::timed_out: return "source_read_timed_out";
+    case MediaFailure::unreadable:
+        return "source_unreadable";
+    case MediaFailure::unsupported:
+        return "source_unsupported";
+    case MediaFailure::timed_out:
+        return "source_read_timed_out";
     }
     return "source_unreadable";
 }
@@ -215,10 +254,14 @@ FailureAxes media_failure_axes(MediaFailure failure) noexcept {
 
 std::string media_stream_type_name(MediaStreamType type) {
     switch (type) {
-    case MediaStreamType::video: return "video";
-    case MediaStreamType::audio: return "audio";
-    case MediaStreamType::subtitle: return "subtitle";
-    case MediaStreamType::other: return "other";
+    case MediaStreamType::video:
+        return "video";
+    case MediaStreamType::audio:
+        return "audio";
+    case MediaStreamType::subtitle:
+        return "subtitle";
+    case MediaStreamType::other:
+        return "other";
     }
     return "other";
 }

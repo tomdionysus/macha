@@ -34,8 +34,7 @@ struct MediaTimestampRepairState {
 // can break. A repair carries forward as a timeline shift so later packets
 // keep their spacing. PTS before DTS is kept: version-1 CTTS allows signed
 // composition offsets.
-void normalize_media_timestamps(MediaTimestampRepairState& state,
-                                MediaPacketTimestamps& packet);
+void normalize_media_timestamps(MediaTimestampRepairState& state, MediaPacketTimestamps& packet);
 
 // Encoders need strictly increasing PTS, which rescaled best-effort timestamps
 // can violate around seeks in imperfect files. Keeps AV_NOPTS_VALUE; nudges

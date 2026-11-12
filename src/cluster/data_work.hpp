@@ -3,10 +3,10 @@
 
 #include "contract/thread_safety.hpp"
 
-#include "storage/io_pressure.hpp"
-#include "log.hpp"
 #include "cluster/net.hpp"
 #include "contract/work.hpp"
+#include "log.hpp"
+#include "storage/io_pressure.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -31,10 +31,8 @@ class DataWorkContext : public WorkContext {
     std::chrono::milliseconds no_progress_budget_{};
 
   public:
-    explicit DataWorkContext(FrameType frame_type = FrameType::loader,
-                             uint64_t quantum_bytes = 0,
-                             Clock::time_point deadline = {},
-                             std::atomic_bool* cancelled = nullptr,
+    explicit DataWorkContext(FrameType frame_type = FrameType::loader, uint64_t quantum_bytes = 0,
+                             Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr,
                              const std::atomic_uint64_t* progress = nullptr,
                              std::chrono::milliseconds no_progress_budget = {})
         : WorkContext(frame_type, deadline, cancelled), quantum_bytes_(quantum_bytes),
@@ -47,9 +45,13 @@ class DataWorkContext : public WorkContext {
     const std::atomic_uint64_t* progress() const noexcept {
         return no_progress_budget_.count() ? progress_ : nullptr;
     }
-    std::chrono::milliseconds no_progress_budget() const noexcept { return no_progress_budget_; }
+    std::chrono::milliseconds no_progress_budget() const noexcept {
+        return no_progress_budget_;
+    }
 
-    uint64_t quantum_bytes() const noexcept { return quantum_bytes_; }
+    uint64_t quantum_bytes() const noexcept {
+        return quantum_bytes_;
+    }
 };
 
 struct DataResourceStats {
@@ -120,10 +122,16 @@ class DataResourceArbiter {
             }
             return *this;
         }
-        ~Lease() { reset(); }
+        ~Lease() {
+            reset();
+        }
         void reset();
-        explicit operator bool() const noexcept { return owner_ != nullptr; }
-        uint64_t bytes() const noexcept { return bytes_; }
+        explicit operator bool() const noexcept {
+            return owner_ != nullptr;
+        }
+        uint64_t bytes() const noexcept {
+            return bytes_;
+        }
     };
 
   private:
@@ -176,11 +184,13 @@ class DataResourceArbiter {
     static bool loader(FrameType frame_type) noexcept {
         return work_class(frame_type) == WorkClass::loader;
     }
-    uint64_t charge(uint64_t bytes) const noexcept { return std::max<uint64_t>(1, bytes); }
+    uint64_t charge(uint64_t bytes) const noexcept {
+        return std::max<uint64_t>(1, bytes);
+    }
     // `refused_for_pressure` reports whether a false answer was the pressure
     // gate's doing. Callers count it once per waiter, not per wakeup.
-    bool available(FrameType frame_type, uint64_t bytes,
-                   bool* refused_for_pressure = nullptr) const MACHA_REQUIRES(mutex_);
+    bool available(FrameType frame_type, uint64_t bytes, bool* refused_for_pressure = nullptr) const
+        MACHA_REQUIRES(mutex_);
     void release(FrameType frame_type, uint64_t bytes);
 
   public:
@@ -189,8 +199,7 @@ class DataResourceArbiter {
                         std::chrono::milliseconds no_progress_deadline = {},
                         std::function<bool()> viewer_recently_active = {});
     // Set once when the node's DATA store recovers, before it admits work.
-    void observe_device(const DiskServiceMonitor* monitor,
-                        uint64_t min_background_under_pressure) {
+    void observe_device(const DiskServiceMonitor* monitor, uint64_t min_background_under_pressure) {
         Lock lock(mutex_);
         service_monitor_ = monitor;
         min_background_under_pressure_ = std::max<uint64_t>(1, min_background_under_pressure);
@@ -208,8 +217,7 @@ inline DataResourceArbiter::DataResourceArbiter(uint64_t capacity_bytes,
                                                 std::function<bool()> viewer_recently_active)
     : capacity_bytes_(capacity_bytes), viewer_reserve_bytes_(viewer_reserve_bytes),
       viewer_recently_active_(std::move(viewer_recently_active)),
-      background_concurrency_(background_concurrency),
-      no_progress_deadline_(no_progress_deadline) {
+      background_concurrency_(background_concurrency), no_progress_deadline_(no_progress_deadline) {
     if (!capacity_bytes_ || !viewer_reserve_bytes_ || viewer_reserve_bytes_ >= capacity_bytes_)
         throw std::invalid_argument("DATA resource capacity must exceed viewer reserve");
 }
@@ -256,9 +264,8 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
     if (work_class(frame_type) == WorkClass::control)
         throw std::invalid_argument("control cannot acquire DATA resource credit");
     const auto bytes = charge(requested_bytes);
-    const auto class_capacity = viewer(frame_type)
-                                    ? capacity_bytes_
-                                    : capacity_bytes_ - viewer_reserve_bytes_;
+    const auto class_capacity =
+        viewer(frame_type) ? capacity_bytes_ : capacity_bytes_ - viewer_reserve_bytes_;
     // Larger than the whole class budget: never admissible, fail now.
     if (bytes > class_capacity)
         return {};
@@ -294,23 +301,23 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
             // Wait in no-progress windows: any release anywhere re-arms the
             // window, so only a wholly stalled arbiter gives up.
             const auto seen = releases_;
-            if (!cv_.wait_for(lock.native(), no_progress_deadline_,
-                              [&]() MACHA_REQUIRES(mutex_) { return wait_predicate() || releases_ != seen; })) {
+            if (!cv_.wait_for(lock.native(), no_progress_deadline_, [&]() MACHA_REQUIRES(mutex_) {
+                    return wait_predicate() || releases_ != seen;
+                })) {
                 ++no_progress_failures_;
                 if (counted_wait)
                     --waiters;
                 cv_.notify_all();
-                Log::warn("DATA credit wait abandoned after " +
-                          std::to_string(no_progress_deadline_.count()) +
-                          " ms with no release anywhere: class=" +
-                          std::string(frame_type_name(frame_type)) +
-                          " bytes=" + std::to_string(bytes) +
-                          " used=" + std::to_string(used_bytes_) + "/" +
-                          std::to_string(capacity_bytes_) +
-                          " lower_active=" + std::to_string(lower_active_) + "/" +
-                          std::to_string(background_concurrency_) +
-                          " waiting_viewers=" + std::to_string(waiting_viewers_) +
-                          " waiting_loaders=" + std::to_string(waiting_loaders_));
+                Log::warn(
+                    "DATA credit wait abandoned after " +
+                    std::to_string(no_progress_deadline_.count()) +
+                    " ms with no release anywhere: class=" +
+                    std::string(frame_type_name(frame_type)) + " bytes=" + std::to_string(bytes) +
+                    " used=" + std::to_string(used_bytes_) + "/" + std::to_string(capacity_bytes_) +
+                    " lower_active=" + std::to_string(lower_active_) + "/" +
+                    std::to_string(background_concurrency_) +
+                    " waiting_viewers=" + std::to_string(waiting_viewers_) +
+                    " waiting_loaders=" + std::to_string(waiting_loaders_));
                 return {};
             }
         }
@@ -344,9 +351,8 @@ DataResourceArbiter::try_acquire(const DataWorkContext& context, uint64_t reques
     if (work_class(frame_type) == WorkClass::control)
         throw std::invalid_argument("control cannot acquire DATA resource credit");
     const auto bytes = charge(requested_bytes);
-    const auto class_capacity = viewer(frame_type)
-                                    ? capacity_bytes_
-                                    : capacity_bytes_ - viewer_reserve_bytes_;
+    const auto class_capacity =
+        viewer(frame_type) ? capacity_bytes_ : capacity_bytes_ - viewer_reserve_bytes_;
     if (bytes > class_capacity || context.cancelled() || context.expired())
         return {};
     Lock lock(mutex_);
@@ -378,7 +384,8 @@ inline void DataResourceArbiter::release(FrameType frame_type, uint64_t bytes) {
     used_bytes_ -= std::min(used_bytes_, bytes);
     if (!viewer(frame_type)) {
         lower_used_bytes_ -= std::min(lower_used_bytes_, bytes);
-        if (lower_active_) --lower_active_;
+        if (lower_active_)
+            --lower_active_;
     }
     cv_.notify_all();
 }
@@ -399,16 +406,26 @@ inline void DataResourceArbiter::stop() {
 
 inline DataResourceStats DataResourceArbiter::stats() const {
     Lock lock(mutex_);
-    const auto device = service_monitor_ ? service_monitor_->sample() : DiskServiceMonitor::Sample{};
-    return {capacity_bytes_,           viewer_reserve_bytes_,
-            used_bytes_,               peak_used_bytes_,
-            viewer_admissions_,        loader_admissions_,
-            speculative_admissions_,   viewer_waits_,
-            loader_waits_,             speculative_waits_,
-            cancelled_waits_,          background_concurrency_,
-            lower_active_,             peak_lower_active_,
-            device.pressured,          device.mean_us,
-            device.worst_us,           device.slowdown_percent,
+    const auto device =
+        service_monitor_ ? service_monitor_->sample() : DiskServiceMonitor::Sample{};
+    return {capacity_bytes_,
+            viewer_reserve_bytes_,
+            used_bytes_,
+            peak_used_bytes_,
+            viewer_admissions_,
+            loader_admissions_,
+            speculative_admissions_,
+            viewer_waits_,
+            loader_waits_,
+            speculative_waits_,
+            cancelled_waits_,
+            background_concurrency_,
+            lower_active_,
+            peak_lower_active_,
+            device.pressured,
+            device.mean_us,
+            device.worst_us,
+            device.slowdown_percent,
             service_monitor_ ? service_monitor_->pressure_onsets() : 0,
             pressure_refusals_};
 }

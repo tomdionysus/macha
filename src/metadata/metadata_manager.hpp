@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "metadata/metadata_server.hpp"
+#include "cluster/cluster.hpp"
 #include "contract/metadata_view.hpp"
 #include "contract/thread_safety.hpp"
 #include "contract/time_source.hpp"
 #include "contract/work.hpp"
-#include "cluster/cluster.hpp"
+#include "metadata/metadata_server.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -28,8 +28,6 @@ class MetadataNotReady final : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-
-
 // A snapshot carries its namespace as a tree root or an entry map, never both:
 // both would let the two disagree and every reader pick. The encoders refuse to
 // write that state; this refuses to hand it out. Throws MetadataNotReady.
@@ -37,9 +35,7 @@ void require_coherent_namespace(const MetadataSnapshot&);
 
 class DistributedStore;
 
-
 const char* metadata_availability_name(MetadataAvailability) noexcept;
-
 
 struct MetadataPublicationContext {
     NodeId origin{};
@@ -55,7 +51,9 @@ struct MetadataPublicationContext {
 struct MetadataPublicationClaims {
     std::vector<ObjectId> data;
     std::vector<ObjectId> control;
-    uint64_t bytes() const noexcept { return (data.size() + control.size()) * sizeof(ObjectId); }
+    uint64_t bytes() const noexcept {
+        return (data.size() + control.size()) * sizeof(ObjectId);
+    }
 };
 
 // The claims barrier around a commit; see MetadataManager's constructor.
@@ -64,8 +62,6 @@ struct MetadataPublicationRetention {
     std::function<void(const NodeId& origin, uint64_t sequence, const MetadataPublicationClaims&)>
         peers;
 };
-
-
 
 struct MetadataHistoryTransferDiagnostics {
     uint64_t transfers{};
@@ -176,7 +172,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
         std::vector<NodeInfo> stored_on;
     };
     MetadataHistoryEntry commit_history_entry(const MetadataRecord&,
-                                               std::span<const uint8_t> delta = {}) const;
+                                              std::span<const uint8_t> delta = {}) const;
     // A peer that made no progress on a commit call for write_stall is not
     // asked again until dead_after has passed: by then membership has either
     // dropped it or it is answering.
@@ -186,15 +182,15 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     // A call to a peer on the commit path, waited for only while it makes
     // progress. Throws when the peer is stalled or stalls.
     RpcReply commit_call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
-    bool store_commit_on(const NodeInfo&, const MetadataHistoryEntry&,
-                         const MetadataRecord&, FrameType);
+    bool store_commit_on(const NodeInfo&, const MetadataHistoryEntry&, const MetadataRecord&,
+                         FrameType);
     bool accept_commit_on(const NodeInfo&, const MetadataAcceptance&, FrameType);
     PublishedCommit publish_commit(const std::vector<NodeInfo>&, const MetadataRecord&,
                                    std::span<const uint8_t> delta, FrameType);
-    std::vector<std::pair<NodeInfo, MetadataAcceptance>> discover_accepted_heads(
-        const std::vector<NodeInfo>&, FrameType);
-    bool replicate_accepted_head(const NodeInfo&, const MetadataRecord&,
-                                 const MetadataAcceptance&, FrameType);
+    std::vector<std::pair<NodeInfo, MetadataAcceptance>>
+    discover_accepted_heads(const std::vector<NodeInfo>&, FrameType);
+    bool replicate_accepted_head(const NodeInfo&, const MetadataRecord&, const MetadataAcceptance&,
+                                 FrameType);
 
     // What commits accepted here owe the peers: each commit's claims on
     // them, in order, and the newest head, whose history carries the rest.
@@ -258,7 +254,9 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     bool wait_replicated(std::chrono::milliseconds timeout);
 
     MetadataRecord read_record();
-    MetadataRecord record() override { return read_record(); }
+    MetadataRecord record() override {
+        return read_record();
+    }
     MetadataSnapshot snapshot();
     MetadataSnapshotView snapshot_view();
     // May refresh a stale cache from the replicas: waits on the state device
@@ -320,9 +318,9 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     // `identity` is an idempotency key: applied only if
     // mutation_sequences[identity.origin] < identity.sequence, which it then
     // stamps, so a caller can tell after a crash whether it took effect.
-    MetadataRecord mutate_delta(
-        const std::function<void(MetadataSnapshot&, MetadataDelta&)>&, size_t retries = 8,
-        std::optional<MetadataMutationIdentity> identity = {}) override;
+    MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>&,
+                                size_t retries = 8,
+                                std::optional<MetadataMutationIdentity> identity = {}) override;
     // Snapshot at the last causal stability horizon; for retention release only.
     std::optional<MetadataSnapshotView> retention_release_view() const;
     void repair_once();
@@ -338,15 +336,21 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
         return available_snapshot_view();
     }
     MetadataSnapshotView local() override;
-    MetadataSnapshotView converged() override { return snapshot_view(); }
+    MetadataSnapshotView converged() override {
+        return snapshot_view();
+    }
     MetadataSnapshotView converged(const WorkContext& context) override {
         return snapshot_view(context);
     }
     std::optional<MetadataSnapshotView> release_head() const override {
         return retention_release_view();
     }
-    MetadataClusterStatus status() const noexcept override { return cluster_status(); }
-    void repair_step() override { repair_once(); }
+    MetadataClusterStatus status() const noexcept override {
+        return cluster_status();
+    }
+    void repair_step() override {
+        repair_once();
+    }
     Page<std::pair<std::string, FsEntry>, std::string>
     entries(const MetadataSnapshotView& view, Cursor<std::string> from, Budget& budget) override;
 

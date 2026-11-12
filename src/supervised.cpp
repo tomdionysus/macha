@@ -52,7 +52,8 @@ void left(std::string_view name) noexcept {
         auto& r = registry();
         Lock lock(r.mutex);
         auto& entry = r.entry_locked(name);
-        if (entry.running) --entry.running;
+        if (entry.running)
+            --entry.running;
     } catch (...) {
     }
 }
@@ -121,7 +122,8 @@ std::optional<Fault> run_body(std::string_view name, const std::function<void()>
 
 std::chrono::milliseconds supervised_restart_delay(size_t consecutive) noexcept {
     std::chrono::milliseconds delay = restart_initial;
-    for (size_t i = 1; i < consecutive && delay < restart_ceiling; ++i) delay *= 2;
+    for (size_t i = 1; i < consecutive && delay < restart_ceiling; ++i)
+        delay *= 2;
     return std::min<std::chrono::milliseconds>(delay, restart_ceiling);
 }
 
@@ -131,14 +133,16 @@ void run_supervised_loop(std::string_view name, std::stop_token stop,
     while (true) {
         const auto started = std::chrono::steady_clock::now();
         const auto fault = run_body(name, body);
-        if (!fault) return;
+        if (!fault)
+            return;
         if (stop.stop_requested()) {
             record(name, *fault, "stopping, not restarted");
             return;
         }
         // A run that outlived the ceiling was healthy until it faulted; it
         // starts the backoff over rather than inheriting an old streak.
-        if (std::chrono::steady_clock::now() - started > restart_ceiling) consecutive = 0;
+        if (std::chrono::steady_clock::now() - started > restart_ceiling)
+            consecutive = 0;
         const auto delay = supervised_restart_delay(++consecutive);
         record(name, *fault, "restarting in " + std::to_string(delay.count()) + " ms");
         set_restarting(name, true);
@@ -150,21 +154,25 @@ void run_supervised_loop(std::string_view name, std::stop_token stop,
         } catch (...) {
         }
         set_restarting(name, false);
-        if (stop.stop_requested()) return;
+        if (stop.stop_requested())
+            return;
     }
 }
 
 void run_supervised_once(std::string_view name, const std::function<void()>& body) noexcept {
-    if (const auto fault = run_body(name, body)) record(name, *fault, "thread ended");
+    if (const auto fault = run_body(name, body))
+        record(name, *fault, "thread ended");
 }
 
 void run_supervised_escalating(std::string_view name, const std::function<void()>& body,
                                const std::function<void(std::string)>& escalate) noexcept {
     const auto fault = run_body(name, body);
-    if (!fault) return;
+    if (!fault)
+        return;
     record(name, *fault, "escalated to its subsystem's supervisor");
     try {
-        if (escalate) escalate("thread '" + std::string(name) + "' faulted: " + fault->message);
+        if (escalate)
+            escalate("thread '" + std::string(name) + "' faulted: " + fault->message);
     } catch (...) {
     }
 }
@@ -174,7 +182,8 @@ std::vector<SupervisedThreadStatus> supervised_thread_statuses() {
     Lock lock(r.mutex);
     std::vector<SupervisedThreadStatus> out;
     out.reserve(r.threads.size());
-    for (const auto& [_, status] : r.threads) out.push_back(status);
+    for (const auto& [_, status] : r.threads)
+        out.push_back(status);
     return out;
 }
 

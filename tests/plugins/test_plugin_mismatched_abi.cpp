@@ -9,7 +9,9 @@ namespace {
 
 class MismatchedSubsystem final : public macha::Subsystem {
   public:
-    std::string_view name() const noexcept override { return "test-plugin-mismatched-abi"; }
+    std::string_view name() const noexcept override {
+        return "test-plugin-mismatched-abi";
+    }
     void start() override {}
     void stop() override {}
 };

@@ -6,14 +6,14 @@
 #include "catalogue/catalogue.hpp"
 #include "catalogue/catalogue_hints.hpp"
 #include "catalogue/cluster_unmatched.hpp"
+#include "catalogue/media_catalogue.hpp"
 #include "filesystem/filesystem.hpp"
 #include "http/http.hpp"
 #include "metadata/metadata_manager.hpp"
-#include "catalogue/media_catalogue.hpp"
 
-#include <mutex>
 #include <condition_variable>
 #include <map>
+#include <mutex>
 #include <thread>
 
 namespace macha {
@@ -32,8 +32,8 @@ class ManageApi {
     const ClusterUnmatchedView* peers_unmatched_;
     Mutex identity_audit_mutex_;
     std::condition_variable_any identity_audit_cv_;
-    std::map<std::string, IdentityAssociationReset, std::less<>> identity_audit_pending_
-        MACHA_GUARDED_BY(identity_audit_mutex_);
+    std::map<std::string, IdentityAssociationReset, std::less<>>
+        identity_audit_pending_ MACHA_GUARDED_BY(identity_audit_mutex_);
     std::jthread identity_audit_worker_;
 
     void queue_identity_reset_audit(IdentityAssociationReset);

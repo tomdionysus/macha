@@ -21,9 +21,9 @@
 #include "config.hpp"
 #include "crypto.hpp"
 #include "metadata/metadata.hpp"
-#include "storage/local_store.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "metadata/namespace_tree.hpp"
+#include "storage/local_store.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -80,9 +80,9 @@ void print(const Frame& frame, const std::string& note = {}) {
 void nodes_read_probe(const NamespaceNodeStore& nodes, const ObjectId& root) {
     const auto started = std::chrono::steady_clock::now();
     const auto entry = namespace_tree_lookup(root, "/", nodes, false);
-    const auto elapsed = std::chrono::duration<double, std::milli>(
-                             std::chrono::steady_clock::now() - started)
-                             .count();
+    const auto elapsed =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+            .count();
     std::cout << "  stat of \"/\": " << (entry ? "found" : "MISSING") << " in " << elapsed
               << "ms\n";
 }
@@ -148,8 +148,7 @@ int main(int argc, char** argv) {
         } else if (std::string(argv[i]) == "--tree") {
             // Implies --stats, which materialises the head.
             stats = true;
-        }
-        else
+        } else
             heads_path = argv[i];
     }
     const auto key = load_cluster_keys(argv[1]).storage;
@@ -184,7 +183,8 @@ int main(int argc, char** argv) {
             auto tag = envelope.fixed<16>();
             auto ciphertext = envelope.bytes();
             envelope.finish();
-            auto entry = decode_metadata_history_entry(aes_gcm_open(key, nonce, tag, ciphertext, MH));
+            auto entry =
+                decode_metadata_history_entry(aes_gcm_open(key, nonce, tag, ciphertext, MH));
             frame.generation = entry.generation;
             frame.previous = entry.previous;
             frame.hash = entry.hash;
@@ -207,8 +207,8 @@ int main(int argc, char** argv) {
                 note = "delta parent ABSENT from index";
             else if (!metadata_delta_succession_valid(parent->second.generation, frame.generation))
                 note = "delta parent generation not older: parent gen=" +
-                       std::to_string(parent->second.generation) + " child gen=" +
-                       std::to_string(frame.generation);
+                       std::to_string(parent->second.generation) +
+                       " child gen=" + std::to_string(frame.generation);
             else if (parent->second.generation + 1 != frame.generation)
                 ++gap_deltas; // Legitimate: a merge commit.
         } else {
@@ -226,8 +226,7 @@ int main(int argc, char** argv) {
     }
     std::cout << "history: frames=" << order.size() << " full=" << full_count
               << " delta=" << delta_count << " gap_deltas=" << gap_deltas
-              << " anomalies=" << anomalies << " bytes=" << offset
-              << "/" << file_size;
+              << " anomalies=" << anomalies << " bytes=" << offset << "/" << file_size;
     if (!order.empty())
         std::cout << " first_gen=" << order.front().generation
                   << " last_gen=" << order.back().generation;
@@ -303,8 +302,8 @@ int main(int argc, char** argv) {
                 before->namespace_root.reset();
                 merged.namespace_root.reset();
                 auto delta = metadata_delta(*before, merged);
-                std::cout << "merge gen=" << frame.generation << " full_bytes="
-                          << body.payload.size();
+                std::cout << "merge gen=" << frame.generation
+                          << " full_bytes=" << body.payload.size();
                 if (!delta) {
                     std::cout << " delta=inexpressible\n";
                     continue;
@@ -383,14 +382,16 @@ int main(int argc, char** argv) {
         bool broken = false;
         while (cursor.body == MetadataHistoryEntry::Body::delta) {
             if (!seen.insert(cursor.hash).second || !cursor.previous_known) {
-                std::cout << "  chain broken at "; print(cursor, "cycle or previous unknown");
+                std::cout << "  chain broken at ";
+                print(cursor, "cycle or previous unknown");
                 broken = true;
                 break;
             }
             chain.push_back(cursor);
             auto parent = index.find(cursor.previous);
             if (parent == index.end()) {
-                std::cout << "  chain broken at "; print(cursor, "parent absent");
+                std::cout << "  chain broken at ";
+                print(cursor, "parent absent");
                 broken = true;
                 break;
             }
@@ -398,15 +399,16 @@ int main(int argc, char** argv) {
         }
         if (broken)
             continue;
-        std::cout << "  anchor "; print(cursor);
+        std::cout << "  anchor ";
+        print(cursor);
         Frame working = cursor;
         bool ok = true;
         for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
             if (it->previous != working.hash ||
                 !metadata_delta_succession_valid(working.generation, it->generation)) {
                 std::cout << "  MATERIALIZATION WOULD FAIL at ";
-                print(*it, "parent gen=" + std::to_string(working.generation) + " child gen=" +
-                               std::to_string(it->generation));
+                print(*it, "parent gen=" + std::to_string(working.generation) +
+                               " child gen=" + std::to_string(it->generation));
                 ok = false;
                 break;
             }
@@ -424,7 +426,7 @@ int main(int argc, char** argv) {
                 ReplayNodeStore overlay(store);
                 LocalNamespaceNodeStore writing(store);
                 NamespaceDeltaApplier applier = [&](const ObjectId& root,
-                                                   const MetadataDelta& delta) {
+                                                    const MetadataDelta& delta) {
                     if (replay_write)
                         return apply_delta_to_namespace_tree(root, writing, delta);
                     return apply_delta_to_namespace_tree(root, overlay, delta);
@@ -443,8 +445,7 @@ int main(int argc, char** argv) {
                     apply_metadata_delta_in_place(snapshot, delta, applier);
                     // Mirrors the encoder the replica uses for a delta body's successor.
                     const auto payload = encode_snapshot_v14(snapshot);
-                    const auto reconstructed =
-                        metadata_hash(it->generation, it->previous, payload);
+                    const auto reconstructed = metadata_hash(it->generation, it->previous, payload);
                     if (reconstructed != it->hash) {
                         std::cout << "  REPLAY DIVERGES at frame " << frame_index << " of "
                                   << chain.size() << " gen=" << it->generation
@@ -455,8 +456,7 @@ int main(int argc, char** argv) {
                                   << " appends=" << delta.append_entries.size()
                                   << " garbage_upserts=" << delta.upsert_garbage.size()
                                   << " canonical_garbage=" << (delta.canonical_garbage ? 1 : 0)
-                                  << " replace_conflicts="
-                                  << (delta.replace_conflicts ? 1 : 0)
+                                  << " replace_conflicts=" << (delta.replace_conflicts ? 1 : 0)
                                   << " replace_merge_parents="
                                   << (delta.replace_merge_parents ? 1 : 0)
                                   << " catalogue=" << static_cast<int>(delta.catalogue) << '\n'
@@ -473,9 +473,9 @@ int main(int argc, char** argv) {
                         for (const auto& path : delta.erase_entries)
                             std::cout << "      erase " << path << '\n';
                         for (const auto& [path, append] : delta.append_entries)
-                            std::cout << "      append " << path << " base_extents="
-                                      << append.base_extents << " added="
-                                      << append.extents.size() << '\n';
+                            std::cout << "      append " << path
+                                      << " base_extents=" << append.base_extents
+                                      << " added=" << append.extents.size() << '\n';
                         break;
                     }
                 }
@@ -529,8 +529,7 @@ int main(int argc, char** argv) {
         // A head carries a root, not entries: describe the record. `--objects` walks it.
         if (snapshot.namespace_root) {
             std::cout << "  snapshot: tree-backed namespace_root="
-                      << to_string(*snapshot.namespace_root)
-                      << " last_body_bytes=" << record_bytes
+                      << to_string(*snapshot.namespace_root) << " last_body_bytes=" << record_bytes
                       << " tombstones=" << snapshot.garbage.size()
                       << " conflicts=" << snapshot.conflicts.size()
                       << " node_status=" << snapshot.node_status.size()

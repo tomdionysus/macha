@@ -25,10 +25,14 @@ constexpr std::string_view diagnostics_path = "/api/v1/status/diagnostics";
 
 std::string_view health_name(HealthSeverity severity) {
     switch (severity) {
-    case HealthSeverity::healthy: return "healthy";
-    case HealthSeverity::degraded: return "degraded";
-    case HealthSeverity::recovering: return "recovering";
-    case HealthSeverity::critical: return "critical";
+    case HealthSeverity::healthy:
+        return "healthy";
+    case HealthSeverity::degraded:
+        return "degraded";
+    case HealthSeverity::recovering:
+        return "recovering";
+    case HealthSeverity::critical:
+        return "critical";
     }
     return "unknown";
 }
@@ -115,7 +119,8 @@ Json public_connectivity_json(const PublicConnectivityStatus& status) {
     upnp["external_port"] = static_cast<uint64_t>(status.upnp.external_port);
     upnp["lease_seconds"] = static_cast<uint64_t>(status.upnp.lease_seconds);
     upnp["igd_status"] = static_cast<int64_t>(status.upnp.igd_status);
-    upnp["error_code"] = status.upnp.error_code.empty() ? Json(nullptr) : Json(status.upnp.error_code);
+    upnp["error_code"] =
+        status.upnp.error_code.empty() ? Json(nullptr) : Json(status.upnp.error_code);
     upnp["error"] = status.upnp.error.empty() ? Json(nullptr) : Json(status.upnp.error);
 
     Json::Object external_ip;
@@ -151,7 +156,8 @@ Json public_connectivity_json(const PublicConnectivityStatus& status) {
 // beside the configured modes and the dial-back evidence.
 void add_inbound_resolution(Json::Object& connectivity, const InboundResolution& resolution) {
     connectivity["inbound_capable"] = resolution.inbound_capable;
-    connectivity["inbound_capable_mode"] = std::string(tristate_name(resolution.inbound_capable_mode));
+    connectivity["inbound_capable_mode"] =
+        std::string(tristate_name(resolution.inbound_capable_mode));
     connectivity["inbound_capable_source"] = resolution.source;
     connectivity["inbound_capable_decided_at_unix_ms"] =
         resolution.decided_unix_ms ? Json(resolution.decided_unix_ms) : Json(nullptr);
@@ -308,7 +314,8 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         node["cache"] = Json(std::move(cache));
     }
     node["storage_backends_online"] =
-        telemetry_available ? Json(static_cast<uint64_t>(effective.storage_backends_online)) : Json(nullptr);
+        telemetry_available ? Json(static_cast<uint64_t>(effective.storage_backends_online))
+                            : Json(nullptr);
 
     Json::Array roles;
     if (storage_capacity_for_roles)
@@ -355,11 +362,21 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         for (const auto& entry : live->traffic) {
             const char* name = nullptr;
             switch (static_cast<FrameType>(entry.frame_class)) {
-            case FrameType::control: name = "control"; break;
-            case FrameType::foreground: name = "foreground"; break;
-            case FrameType::read_ahead: name = "read_ahead"; break;
-            case FrameType::speculative: name = "speculative"; break;
-            case FrameType::loader: name = "loader"; break;
+            case FrameType::control:
+                name = "control";
+                break;
+            case FrameType::foreground:
+                name = "foreground";
+                break;
+            case FrameType::read_ahead:
+                name = "read_ahead";
+                break;
+            case FrameType::speculative:
+                name = "speculative";
+                break;
+            case FrameType::loader:
+                name = "loader";
+                break;
             }
             if (!name)
                 continue;
@@ -372,11 +389,11 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
                 {"out_bytes_per_s",
                  rated ? Json(static_cast<uint64_t>(entry.out_bytes_per_s)) : Json(nullptr)}}));
         }
-        node["traffic"] = Json(Json::Object{
-            {"as_of_unix_ms", live->observed_unix_ms},
-            {"window_ms", rated ? Json(static_cast<uint64_t>(live->traffic_window_ms))
-                                : Json(nullptr)},
-            {"classes", Json(std::move(classes))}});
+        node["traffic"] = Json(
+            Json::Object{{"as_of_unix_ms", live->observed_unix_ms},
+                         {"window_ms", rated ? Json(static_cast<uint64_t>(live->traffic_window_ms))
+                                             : Json(nullptr)},
+                         {"classes", Json(std::move(classes))}});
     } else {
         node["traffic"] = nullptr;
     }
@@ -395,11 +412,9 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
             playback["segment_timeout_ms"] =
                 static_cast<uint64_t>(live->playback_segment_timeout_ms);
         if (live->playback_pipeline_idle_ms)
-            playback["pipeline_idle_ms"] =
-                static_cast<uint64_t>(live->playback_pipeline_idle_ms);
+            playback["pipeline_idle_ms"] = static_cast<uint64_t>(live->playback_pipeline_idle_ms);
         if (live->playback_session_idle_ms)
-            playback["session_idle_ms"] =
-                static_cast<uint64_t>(live->playback_session_idle_ms);
+            playback["session_idle_ms"] = static_cast<uint64_t>(live->playback_session_idle_ms);
         // The limit only: the current count is too perishable for a cached payload.
         // It appears where computed live: the creation payload, the collection
         // listing, and the refusal.
@@ -628,9 +643,9 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
 
         const auto& host = member ? member->host : (current ? current->host : durable.host);
         const auto port = member ? member->port : (current ? current->port : durable.port);
-        const auto observed_unix_ms = std::max(
-            {durable.observed_unix_ms, member ? member->seen_unix_ms : uint64_t{},
-             current ? current->observed_unix_ms : uint64_t{}});
+        const auto observed_unix_ms =
+            std::max({durable.observed_unix_ms, member ? member->seen_unix_ms : uint64_t{},
+                      current ? current->observed_unix_ms : uint64_t{}});
         const IdentityAssociationReset* identity_reset = nullptr;
         if (!host.empty() && port) {
             for (const auto& [_, reset] : identity_resets) {
@@ -643,8 +658,8 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
         }
         // A reset retires the pre-reset durable identity only as a freshness
         // boundary: a later directly authenticated sighting is an ordinary node.
-        const bool retired = !online && identity_reset &&
-                             observed_unix_ms <= identity_reset->reset_unix_ms;
+        const bool retired =
+            !online && identity_reset && observed_unix_ms <= identity_reset->reset_unix_ms;
         const InboundResolution* resolution_for_node =
             id == node_.node_id() ? &local_resolution : nullptr;
         if (retired) {
@@ -664,12 +679,13 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
         if (hosting)
             ++known_hosting_nodes;
 
-        const auto effective = effective_telemetry(current, stale, durable, telemetry_known.contains(id));
+        const auto effective =
+            effective_telemetry(current, stale, durable, telemetry_known.contains(id));
         const bool telemetry_available = effective.authoritative || telemetry_known.contains(id);
-        const auto storage_capacity =
-            !hosting ? 0
-                     : (telemetry_available ? effective.storage_capacity
-                                            : (member ? member->capacity : 0));
+        const auto storage_capacity = !hosting
+                                          ? 0
+                                          : (telemetry_available ? effective.storage_capacity
+                                                                 : (member ? member->capacity : 0));
         known_capacity += storage_capacity;
         known_storage_available = known_storage_available && (telemetry_available || !hosting);
         known_cache_available = known_cache_available && telemetry_available;
@@ -686,7 +702,8 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
             if (hosting && inbound_capable)
                 ++online_capable_hosting_nodes;
             online_capacity += storage_capacity;
-            online_storage_available = online_storage_available && (telemetry_available || !hosting);
+            online_storage_available =
+                online_storage_available && (telemetry_available || !hosting);
             online_cache_available = online_cache_available && telemetry_available;
             if (telemetry_available) {
                 if (hosting)
@@ -860,7 +877,8 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
             entry["name"] = status.name;
             entry["state"] = std::string(subsystem_state_name(status.state));
             entry["restart_count"] = static_cast<uint64_t>(status.restart_count);
-            entry["last_fault"] = status.last_fault.empty() ? Json(nullptr) : Json(status.last_fault);
+            entry["last_fault"] =
+                status.last_fault.empty() ? Json(nullptr) : Json(status.last_fault);
             subsystems.push_back(std::move(entry));
         }
     }
@@ -920,8 +938,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             values.materialization_cache_evictions;
         metadata_diagnostics["materialization_cache_entries"] =
             static_cast<uint64_t>(values.materialization_cache_entries);
-        metadata_diagnostics["materialization_cache_bytes"] =
-            values.materialization_cache_bytes;
+        metadata_diagnostics["materialization_cache_bytes"] = values.materialization_cache_bytes;
         metadata_diagnostics["materialization_cache_limit_bytes"] =
             values.materialization_cache_limit_bytes;
         metadata_diagnostics["history_records"] = values.history_records;
@@ -981,8 +998,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     rpc_diagnostics["metadata_rejected_jobs"] = rpc.metadata_rejected_jobs;
     rpc_diagnostics["fast_control_pending_bytes"] =
         static_cast<uint64_t>(rpc.fast_control_pending_bytes);
-    rpc_diagnostics["control_pending_bytes"] =
-        static_cast<uint64_t>(rpc.control_pending_bytes);
+    rpc_diagnostics["control_pending_bytes"] = static_cast<uint64_t>(rpc.control_pending_bytes);
     rpc_diagnostics["data_pending_bytes"] = static_cast<uint64_t>(rpc.data_pending_bytes);
     rpc_diagnostics["rejected_jobs"] = rpc.rejected_jobs;
     Json::Object frame_timings;
@@ -1016,8 +1032,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     data_resource_diagnostics["peak_used_bytes"] = data_resource.peak_used_bytes;
     data_resource_diagnostics["viewer_admissions"] = data_resource.viewer_admissions;
     data_resource_diagnostics["loader_admissions"] = data_resource.loader_admissions;
-    data_resource_diagnostics["speculative_admissions"] =
-        data_resource.speculative_admissions;
+    data_resource_diagnostics["speculative_admissions"] = data_resource.speculative_admissions;
     data_resource_diagnostics["viewer_waits"] = data_resource.viewer_waits;
     data_resource_diagnostics["loader_waits"] = data_resource.loader_waits;
     data_resource_diagnostics["speculative_waits"] = data_resource.speculative_waits;
@@ -1041,12 +1056,9 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     const auto retained_memory = retained_memory_.stats();
     Json::Object retained_memory_diagnostics;
     retained_memory_diagnostics["capacity_bytes"] = retained_memory.capacity_bytes;
-    retained_memory_diagnostics["control_reserve_bytes"] =
-        retained_memory.control_reserve_bytes;
-    retained_memory_diagnostics["viewer_reserve_bytes"] =
-        retained_memory.viewer_reserve_bytes;
-    retained_memory_diagnostics["loader_reserve_bytes"] =
-        retained_memory.loader_reserve_bytes;
+    retained_memory_diagnostics["control_reserve_bytes"] = retained_memory.control_reserve_bytes;
+    retained_memory_diagnostics["viewer_reserve_bytes"] = retained_memory.viewer_reserve_bytes;
+    retained_memory_diagnostics["loader_reserve_bytes"] = retained_memory.loader_reserve_bytes;
     // The slice only inbound frame reassembly may draw on: its exhaustion turns a
     // stuck publication into dropped peer channels.
     retained_memory_diagnostics["reassembly_reserve_bytes"] =
@@ -1063,8 +1075,8 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             : 0;
     Json::Object retained_admissions;
     Json::Object retained_waits;
-    constexpr std::array<std::string_view, 4> memory_class_names{
-        "control", "viewer", "loader", "speculative"};
+    constexpr std::array<std::string_view, 4> memory_class_names{"control", "viewer", "loader",
+                                                                 "speculative"};
     for (size_t i = 0; i < memory_class_names.size(); ++i) {
         retained_admissions[std::string(memory_class_names[i])] = retained_memory.admissions[i];
         retained_waits[std::string(memory_class_names[i])] = retained_memory.waits[i];
@@ -1073,8 +1085,9 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     retained_memory_diagnostics["waits"] = std::move(retained_waits);
     Json::Object retained_owners;
     constexpr std::array<std::string_view, static_cast<size_t>(MemoryOwner::count)> owner_names{
-        "fuse_request", "fuse_operation", "publication", "rpc_frame", "object_payload",
-        "durability", "metadata", "catalogue", "media_profile", "playback_segment", "cache"};
+        "fuse_request",   "fuse_operation",   "publication", "rpc_frame",
+        "object_payload", "durability",       "metadata",    "catalogue",
+        "media_profile",  "playback_segment", "cache"};
     for (size_t i = 0; i < owner_names.size(); ++i)
         retained_owners[std::string(owner_names[i])] = retained_memory.owner_bytes[i];
     retained_memory_diagnostics["owners"] = std::move(retained_owners);
@@ -1115,8 +1128,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             filesystem_diagnostics["available"] = true;
             filesystem_diagnostics["timed_out_requests"] = values.timed_out_requests;
             filesystem_diagnostics["merged_publications"] = values.merged_publications;
-            filesystem_diagnostics["data_publication_requests"] =
-                values.data_publication_requests;
+            filesystem_diagnostics["data_publication_requests"] = values.data_publication_requests;
             filesystem_diagnostics["data_publication_notifications_suppressed"] =
                 values.data_publication_notifications_suppressed;
             filesystem_diagnostics["spool_pressure_publication_sweeps"] =
@@ -1127,16 +1139,13 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
                 values.data_publication_coalesced_running;
             filesystem_diagnostics["data_publication_coalesced_unconfirmed"] =
                 values.data_publication_coalesced_unconfirmed;
-            filesystem_diagnostics["data_publications_started"] =
-                values.data_publications_started;
+            filesystem_diagnostics["data_publications_started"] = values.data_publications_started;
             filesystem_diagnostics["data_publications_completed"] =
                 values.data_publications_completed;
             filesystem_diagnostics["data_publication_peak_active"] =
                 values.data_publication_peak_active;
-            filesystem_diagnostics["data_publication_quanta"] =
-                values.data_publication_quanta;
-            filesystem_diagnostics["data_publication_yields"] =
-                values.data_publication_yields;
+            filesystem_diagnostics["data_publication_quanta"] = values.data_publication_quanta;
+            filesystem_diagnostics["data_publication_yields"] = values.data_publication_yields;
             filesystem_diagnostics["data_publication_peak_inflight_bytes"] =
                 values.data_publication_peak_inflight_bytes;
             filesystem_diagnostics["data_publication_pipeline_limit_bytes"] =
@@ -1148,8 +1157,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             filesystem_diagnostics["data_retirement_priority_selections"] =
                 values.data_retirement_priority_selections;
             filesystem_diagnostics["open_publications"] = values.open_publications;
-            filesystem_diagnostics["peak_open_publications"] =
-                values.peak_open_publications;
+            filesystem_diagnostics["peak_open_publications"] = values.peak_open_publications;
             filesystem_diagnostics["publication_max_open_writers"] =
                 values.publication_max_open_writers;
             filesystem_diagnostics["data_publication_selections_under_writer_cap"] =
@@ -1170,32 +1178,26 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
                 values.data_publication_completed_reused_extents;
             filesystem_diagnostics["data_publication_completed_put_extents"] =
                 values.data_publication_completed_put_extents;
-            filesystem_diagnostics["data_overlay_read_queries"] =
-                values.data_overlay_read_queries;
+            filesystem_diagnostics["data_overlay_read_queries"] = values.data_overlay_read_queries;
             filesystem_diagnostics["data_overlay_ranges_examined"] =
                 values.data_overlay_ranges_examined;
             filesystem_diagnostics["data_overlay_descriptors_copied"] =
                 values.data_overlay_descriptors_copied;
-            filesystem_diagnostics["retained_data_operations"] =
-                values.retained_data_operations;
+            filesystem_diagnostics["retained_data_operations"] = values.retained_data_operations;
             filesystem_diagnostics["retained_data_operation_bytes"] =
                 values.retained_data_operation_bytes;
-            filesystem_diagnostics["retained_overlay_ranges"] =
-                values.retained_overlay_ranges;
-            filesystem_diagnostics["retained_overlay_bytes"] =
-                values.retained_overlay_bytes;
+            filesystem_diagnostics["retained_overlay_ranges"] = values.retained_overlay_ranges;
+            filesystem_diagnostics["retained_overlay_bytes"] = values.retained_overlay_bytes;
             filesystem_diagnostics["retained_publication_operations"] =
                 values.retained_publication_operations;
             filesystem_diagnostics["retained_publication_operation_bytes"] =
                 values.retained_publication_operation_bytes;
-            filesystem_diagnostics["operation_metadata_bytes"] =
-                values.operation_metadata_bytes;
+            filesystem_diagnostics["operation_metadata_bytes"] = values.operation_metadata_bytes;
             filesystem_diagnostics["peak_operation_metadata_bytes"] =
                 values.peak_operation_metadata_bytes;
             filesystem_diagnostics["operation_metadata_limit_bytes"] =
                 values.operation_metadata_limit_bytes;
-            filesystem_diagnostics["operation_metadata_waits"] =
-                values.operation_metadata_waits;
+            filesystem_diagnostics["operation_metadata_waits"] = values.operation_metadata_waits;
             filesystem_diagnostics["retained_durability_tickets"] =
                 values.retained_durability_tickets;
             filesystem_diagnostics["data_publication_inflight_bytes"] =
@@ -1237,8 +1239,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
                 values.journal_recovery_quarantined_bytes;
             filesystem_diagnostics["recovery_dropped_operations"] =
                 values.recovery_dropped_operations;
-            filesystem_diagnostics["publications_abandoned"] =
-                values.publications_abandoned;
+            filesystem_diagnostics["publications_abandoned"] = values.publications_abandoned;
             // The host directory under the mount: entries found there at
             // startup are hidden by the mount, and whether the directory
             // is immutable while no mount covers it.
@@ -1247,8 +1248,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             filesystem_diagnostics["mountpoint_immutable"] =
                 fuse_mountpoint_preparation().immutable;
             filesystem_diagnostics["journal_append_batches"] = values.journal_append_batches;
-            filesystem_diagnostics["journal_records_appended"] =
-                values.journal_records_appended;
+            filesystem_diagnostics["journal_records_appended"] = values.journal_records_appended;
             filesystem_diagnostics["journal_durability_barriers"] =
                 values.journal_durability_barriers;
             filesystem_diagnostics["spool_bytes"] = values.spool_bytes;
@@ -1259,32 +1259,25 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
                 values.spool_publish_rate_window_bytes;
             filesystem_diagnostics["spool_publish_rate_window_ms"] =
                 values.spool_publish_rate_window_ms;
-            filesystem_diagnostics["spool_throttle_waits"] =
-                values.spool_throttle_waits;
-            filesystem_diagnostics["spool_throttle_wait_ms"] =
-                values.spool_throttle_wait_ms;
+            filesystem_diagnostics["spool_throttle_waits"] = values.spool_throttle_waits;
+            filesystem_diagnostics["spool_throttle_wait_ms"] = values.spool_throttle_wait_ms;
             filesystem_diagnostics["pending_write_request_bytes"] =
                 values.pending_write_request_bytes;
             filesystem_diagnostics["peak_pending_write_request_bytes"] =
                 values.peak_pending_write_request_bytes;
             filesystem_diagnostics["pending_write_request_limit_bytes"] =
                 values.pending_write_request_limit_bytes;
-            filesystem_diagnostics["extent_executor_workers"] =
-                values.extent_executor_workers;
-            filesystem_diagnostics["extent_executor_queued"] =
-                values.extent_executor_queued;
-            filesystem_diagnostics["extent_executor_active"] =
-                values.extent_executor_active;
+            filesystem_diagnostics["extent_executor_workers"] = values.extent_executor_workers;
+            filesystem_diagnostics["extent_executor_queued"] = values.extent_executor_queued;
+            filesystem_diagnostics["extent_executor_active"] = values.extent_executor_active;
             filesystem_diagnostics["extent_executor_peak_queued"] =
                 values.extent_executor_peak_queued;
             filesystem_diagnostics["extent_executor_peak_active"] =
                 values.extent_executor_peak_active;
-            filesystem_diagnostics["extent_executor_submitted"] =
-                values.extent_executor_submitted;
+            filesystem_diagnostics["extent_executor_submitted"] = values.extent_executor_submitted;
             filesystem_diagnostics["inode_count"] = values.inode_count;
             filesystem_diagnostics["peak_inode_count"] = values.peak_inode_count;
-            filesystem_diagnostics["reclaimed_inode_count"] =
-                values.reclaimed_inode_count;
+            filesystem_diagnostics["reclaimed_inode_count"] = values.reclaimed_inode_count;
         } catch (const std::exception& error) {
             Log::debug("status filesystem diagnostics unavailable: " + std::string(error.what()));
         }
@@ -1360,9 +1353,15 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             } else if (values.last_gate) {
                 switch (*values.last_gate) {
                 case DistributedStore::RepairGate::ran:
-                case DistributedStore::RepairGate::share: pace = "running"; break;
-                case DistributedStore::RepairGate::quiescent: pace = "settling"; break;
-                case DistributedStore::RepairGate::credit: pace = "awaiting_credit"; break;
+                case DistributedStore::RepairGate::share:
+                    pace = "running";
+                    break;
+                case DistributedStore::RepairGate::quiescent:
+                    pace = "settling";
+                    break;
+                case DistributedStore::RepairGate::credit:
+                    pace = "awaiting_credit";
+                    break;
                 }
             }
             repair_diagnostics["pace"] = pace;
@@ -1394,8 +1393,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             http_diagnostics["reactor_stalls"] = values.reactor_stalls;
             http_diagnostics["reactor_longest_pass_ms"] = values.reactor_longest_pass_ms;
             http_diagnostics["connections_open"] = values.connections_open;
-            http_diagnostics["connections_idle_keep_alive"] =
-                values.connections_idle_keep_alive;
+            http_diagnostics["connections_idle_keep_alive"] = values.connections_idle_keep_alive;
             http_diagnostics["connections_writing"] = values.connections_writing;
             http_diagnostics["connections_deferred"] = values.connections_deferred;
             http_diagnostics["connections_refused"] = values.connections_refused;
@@ -1464,7 +1462,8 @@ HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId
         std::string error;
         if (!reachable) {
             try {
-                reachable = node_.call(member, MessageType::ping, {}, call_deadline::presence_probe).message.type == MessageType::ok;
+                reachable = node_.call(member, MessageType::ping, {}, call_deadline::presence_probe)
+                                .message.type == MessageType::ok;
             } catch (const std::exception& e) {
                 error = e.what();
             }
@@ -1493,7 +1492,8 @@ HttpResponse ClusterStatusService::handle(const HttpRequest& request,
         return status_response(sources);
     if (request.method == "GET" && request.path == "/api/v1/status/nodes") {
         PageQuery page;
-        if (auto bad = read_page_query(request, page)) return *bad;
+        if (auto bad = read_page_query(request, page))
+            return *bad;
         return status_response(sources, {}, page);
     }
     if (request.method == "GET" && request.path == diagnostics_path)

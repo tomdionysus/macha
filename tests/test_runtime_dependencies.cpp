@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "test_backend_support.hpp"
 #include "process_allocator.hpp"
+#include "test_backend_support.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -54,8 +54,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_glibc_allocator_arena_limit_is_hard
             REQUIRE(std::fread(xml.data(), 1, xml.size(), stream) == xml.size());
         REQUIRE(std::fclose(stream) == 0);
         size_t count = 0;
-        for (size_t at = 0; (at = xml.find("<heap nr=", at)) != std::string::npos;
-             at += 9)
+        for (size_t at = 0; (at = xml.find("<heap nr=", at)) != std::string::npos; at += 9)
             ++count;
         return count;
     };
@@ -93,7 +92,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_ffmpeg_log_bridge) {
     CHECK(capture->records.size() == 1);
     if (!capture->records.empty()) {
         CHECK(capture->records.front().first == LogLevel::debug);
-        CHECK(capture->records.front().second.find("runtime dependency FFmpeg debug") != std::string::npos);
+        CHECK(capture->records.front().second.find("runtime dependency FFmpeg debug") !=
+              std::string::npos);
     }
     configure_ffmpeg_logging(FfmpegLogLevel::error);
     Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
@@ -186,8 +186,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_edge_node_needs_no_data_backen
     try {
         (void)load_yaml_config(yaml);
     } catch (const std::runtime_error& error) {
-        refused = std::string(error.what()).find("storage.hosts_extents is true") !=
-                  std::string::npos;
+        refused =
+            std::string(error.what()).find("storage.hosts_extents is true") != std::string::npos;
     }
     CHECK(refused);
 }
@@ -217,8 +217,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_a_repair_weight_of_zer
     try {
         (void)load_yaml_config(yaml);
     } catch (const std::runtime_error& error) {
-        refused = std::string(error.what()).find("repair_weight must be 1..10000") !=
-                  std::string::npos;
+        refused =
+            std::string(error.what()).find("repair_weight must be 1..10000") != std::string::npos;
     }
     CHECK(refused);
 }
@@ -256,9 +256,11 @@ MACHA_FAST_TEST("runtime_dependencies", test_books_enabled_is_the_one_switch_for
 #if MACHA_HAVE_BOOKS
     write("books:\n  enabled: true\n");
     CHECK(load_yaml_config(yaml).catalogue.scanner.books.enabled);
-    write("books:\n  enabled: true\ncatalogue:\n  scanner:\n    providers:\n      books:\n        enabled: false\n");
+    write("books:\n  enabled: true\ncatalogue:\n  scanner:\n    providers:\n      books:\n        "
+          "enabled: false\n");
     CHECK(!load_yaml_config(yaml).catalogue.scanner.books.enabled);
-    write("books:\n  enabled: true\n  conversion:\n    enabled: true\n    mobitool: /usr/bin/mobitool\n"
+    write("books:\n  enabled: true\n  conversion:\n    enabled: true\n    mobitool: "
+          "/usr/bin/mobitool\n"
           "    cache_limit: 1G\n    timeout_ms: 60000\n    max_concurrent: 2\n");
     const auto converting = load_yaml_config(yaml);
     CHECK(converting.books.conversion.enabled);
@@ -745,9 +747,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     // The advertised API endpoint is an origin; a path is rejected, since a
     // client treating it as an origin would drop it.
     for (const char* invalid_endpoint :
-         {"https://node.example/macha", "node.example:7438", "ftp://node.example",
-          "https://", "https://node.example:0", "https://node.example:99999",
-          "https://node.example?x=1"}) {
+         {"https://node.example/macha", "node.example:7438", "ftp://node.example", "https://",
+          "https://node.example:0", "https://node.example:99999", "https://node.example?x=1"}) {
         auto invalid = yc;
         invalid.catalogue.api.advertised_endpoint = invalid_endpoint;
         bool rejected = false;
@@ -760,8 +761,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     }
     // Scheme and host, with or without a port, and a bracketed IPv6 literal
     // are accepted; https here with plain http on the bind is TLS offload.
-    for (const char* valid_endpoint : {"http://node.example", "https://node.example:443",
-                                       "http://[2001:db8::1]:7438"}) {
+    for (const char* valid_endpoint :
+         {"http://node.example", "https://node.example:443", "http://[2001:db8::1]:7438"}) {
         auto valid = yc;
         valid.catalogue.api.advertised_endpoint = valid_endpoint;
         bool rejected = false;
@@ -785,18 +786,21 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     }
 
     // Configuration starts from an explicit YAML file; the CLI overrides it.
-    std::vector<std::string> override_args{"macha", "--config", yaml.string(),
-                                            "--port", "8123", "--replicas", "5",
-                                            "--write-copies", "3",
-                                            "--write-stall", "1600",
-                                            "--read-ahead", "4", "--failure-domain", "site-a",
-                                            "--connect-timeout", "1700",
-                                            "--max-frame-size", "320K",
-                                            "--control-stall-notice", "4200",
-                                            "--data-stall-notice", "90000",
-                                            "--metadata-cache", "125",
-                                            "--log-level", "DEBUG",
-                                            "--ffmpeg-log-level", "WARNING"};
+    std::vector<std::string> override_args{"macha",       "--config",
+                                           yaml.string(), "--port",
+                                           "8123",        "--replicas",
+                                           "5",           "--write-copies",
+                                           "3",           "--write-stall",
+                                           "1600",        "--read-ahead",
+                                           "4",           "--failure-domain",
+                                           "site-a",      "--connect-timeout",
+                                           "1700",        "--max-frame-size",
+                                           "320K",        "--control-stall-notice",
+                                           "4200",        "--data-stall-notice",
+                                           "90000",       "--metadata-cache",
+                                           "125",         "--log-level",
+                                           "DEBUG",       "--ffmpeg-log-level",
+                                           "WARNING"};
     std::vector<char*> override_argv;
     for (auto& arg : override_args)
         override_argv.push_back(arg.data());
@@ -839,8 +843,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
         CHECK(rejected);
     }
 
-    for (const auto& bad : std::vector<std::vector<std::string>>{
-             {"--log-level", "TRACE"}, {"--port", "0"}}) {
+    for (const auto& bad :
+         std::vector<std::vector<std::string>>{{"--log-level", "TRACE"}, {"--port", "0"}}) {
         std::vector<std::string> bad_args{"macha", "--config", yaml.string()};
         bad_args.insert(bad_args.end(), bad.begin(), bad.end());
         std::vector<char*> bad_argv;
@@ -854,7 +858,6 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
         }
         CHECK(rejected);
     }
-
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_password_checks_may_never_fill_the_control_lane) {
@@ -978,7 +981,8 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
         auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
         std::ifstream input(path, std::ios::binary);
         REQUIRE(input.good());
-        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        std::string bytes((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
         return Bytes(bytes.begin(), bytes.end());
     };
     auto write_fixture = [&](const std::string& path, const Bytes& bytes) {
@@ -1000,38 +1004,34 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
 
     const auto tagged_bytes = fixture_bytes("tagged.mp3");
     const Bytes embedded_cover{
-        0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a,
-        0x00, 0x00, 0x00, 0x0d, 'I', 'H', 'D', 'R',
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde,
-        0x00, 0x00, 0x00, 0x0c, 'I', 'D', 'A', 'T', 0x78, 0x9c,
-        0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00,
-        0xc9, 0xfe, 0x92, 0xef, 0x00, 0x00, 0x00, 0x00, 'I', 'E',
-        'N', 'D', 0xae, 0x42, 0x60, 0x82};
+        0x89, 'P',  'N',  'G',  0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 'I',  'H',
+        'D',  'R',  0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+        0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 'I',  'D',  'A',  'T',  0x78,
+        0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xc9, 0xfe, 0x92,
+        0xef, 0x00, 0x00, 0x00, 0x00, 'I',  'E',  'N',  'D',  0xae, 0x42, 0x60, 0x82};
     auto with_apic = [](const Bytes& input, const Bytes& cover) {
-        if (input.size() < 10 || std::string_view(reinterpret_cast<const char*>(input.data()), 3) != "ID3")
+        if (input.size() < 10 ||
+            std::string_view(reinterpret_cast<const char*>(input.data()), 3) != "ID3")
             throw std::runtime_error("tagged MP3 fixture has no ID3 header");
         auto decode_synchsafe = [](const uint8_t* p) -> size_t {
             return (static_cast<size_t>(p[0] & 0x7f) << 21) |
                    (static_cast<size_t>(p[1] & 0x7f) << 14) |
-                   (static_cast<size_t>(p[2] & 0x7f) << 7) |
-                   static_cast<size_t>(p[3] & 0x7f);
+                   (static_cast<size_t>(p[2] & 0x7f) << 7) | static_cast<size_t>(p[3] & 0x7f);
         };
         auto encode_synchsafe = [](size_t n) {
             return std::array<uint8_t, 4>{
-                static_cast<uint8_t>((n >> 21) & 0x7f),
-                static_cast<uint8_t>((n >> 14) & 0x7f),
-                static_cast<uint8_t>((n >> 7) & 0x7f),
-                static_cast<uint8_t>(n & 0x7f)};
+                static_cast<uint8_t>((n >> 21) & 0x7f), static_cast<uint8_t>((n >> 14) & 0x7f),
+                static_cast<uint8_t>((n >> 7) & 0x7f), static_cast<uint8_t>(n & 0x7f)};
         };
         const auto tag_size = decode_synchsafe(input.data() + 6);
-        if (10 + tag_size > input.size()) throw std::runtime_error("invalid ID3 fixture size");
+        if (10 + tag_size > input.size())
+            throw std::runtime_error("invalid ID3 fixture size");
         Bytes payload{0x03};
         const std::string mime = "image/png";
         payload.insert(payload.end(), mime.begin(), mime.end());
         payload.push_back(0);
         payload.push_back(0x03); // front cover
-        payload.push_back(0);   // empty UTF-8 description
+        payload.push_back(0);    // empty UTF-8 description
         payload.insert(payload.end(), cover.begin(), cover.end());
         Bytes frame{'A', 'P', 'I', 'C'};
         auto frame_size = encode_synchsafe(payload.size());
@@ -1054,7 +1054,8 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
     write_fixture(tagged_path, tagged_with_cover);
 
     auto tagged_entry = service.filesystem().getattr(tagged_path);
-    auto tagged_file = music_source.probe_file(service.filesystem(), "/Music", tagged_path, tagged_entry);
+    auto tagged_file =
+        music_source.probe_file(service.filesystem(), "/Music", tagged_path, tagged_entry);
     REQUIRE(!tagged_file.candidates.empty());
     REQUIRE(tagged_file.artwork.size() == 1);
     CHECK(tagged_file.artwork.front().role == "cover");
@@ -1075,9 +1076,11 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
     // Embedded APIC and provider artwork are independent candidates; sharing
     // the role "cover" does not let one replace the other.
     auto music_art_http = std::make_unique<FakeHttpClient>();
-    music_art_http->add("/ws/2/release/rel-tagged-1", 200, "application/json",
+    music_art_http->add(
+        "/ws/2/release/rel-tagged-1", 200, "application/json",
         R"JSON({"id":"rel-tagged-1","title":"I'm Raving The Remixes","date":"1996-01-01","artist-credit":[{"name":"Scooter","artist":{"id":"artist-tagged-1","name":"Scooter"}}],"release-group":{"id":"rg-tagged-1"},"media":[{"position":1,"tracks":[{"position":1,"title":"I'm Raving (Progressive Remix)","recording":{"id":"rec-tagged-1","title":"I'm Raving (Progressive Remix)"}}]}]})JSON");
-    music_art_http->add("coverartarchive.org/release/rel-tagged-1", 200, "application/json",
+    music_art_http->add(
+        "coverartarchive.org/release/rel-tagged-1", 200, "application/json",
         R"JSON({"images":[{"front":true,"image":"https://provider.example/cover.jpg","thumbnails":{"500":"https://provider.example/cover.jpg"}}]})JSON");
     const Bytes provider_cover{0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x03, 0x04};
     music_art_http->add_bytes("provider.example/cover.jpg", 200, "image/jpeg", provider_cover);
@@ -1091,8 +1094,9 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
     music_art_config.music.musicbrainz.contact = "https://example.test/macha";
     music_art_config.music.discogs.enabled = false;
     music_art_config.max_provider_requests_per_scan = 8;
-    CatalogueScanner music_art_scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
-                                       music_art_config, std::move(music_art_http));
+    CatalogueScanner music_art_scanner(
+        service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
+        service.catalogue_hints(), music_art_config, std::move(music_art_http));
     CHECK(music_art_scanner.scan_once() == 1);
     auto music_album = service.catalogue().get("musicbrainz:album:rg-tagged-1");
     REQUIRE(music_album.has_value());
@@ -1107,25 +1111,28 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
                       [&](const auto& art) { return art.id == provider_id; }));
     CHECK(service.local_state().data().has(embedded_id));
     CHECK(service.local_state().data().has(provider_id));
-
-
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_probe_failure_reports_why_it_failed) {
     // The engine's failure reason reaches the client unchanged: unreadable
     // bytes may succeed on another node, unparseable bytes will not anywhere.
     struct UnreachableInput : MediaInput {
-        uint64_t size() const override { return 8ULL * 1024 * 1024; }
+        uint64_t size() const override {
+            return 8ULL * 1024 * 1024;
+        }
         size_t read(uint64_t, std::span<uint8_t>, Clock::time_point, std::atomic_bool*) override {
             throw std::runtime_error("extent unavailable: no route to any replica");
         }
     };
     struct BytesInput : MediaInput {
         Bytes bytes;
-        uint64_t size() const override { return bytes.size(); }
+        uint64_t size() const override {
+            return bytes.size();
+        }
         size_t read(uint64_t offset, std::span<uint8_t> out, Clock::time_point,
                     std::atomic_bool*) override {
-            if (offset >= bytes.size()) return 0;
+            if (offset >= bytes.size())
+                return 0;
             const auto n = std::min<size_t>(out.size(), bytes.size() - offset);
             std::copy_n(bytes.begin() + static_cast<ptrdiff_t>(offset), n, out.begin());
             return n;

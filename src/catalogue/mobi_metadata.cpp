@@ -180,10 +180,9 @@ std::string strip_markup(std::string_view text) {
 
 // CP1252 0x80-0x9F; the five unassigned bytes keep their Latin-1 code point.
 constexpr uint16_t cp1252_high[32] = {
-    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
-    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
-    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178};
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+    0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
+    0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178};
 
 std::string cp1252_to_utf8(std::string_view text) {
     std::string out;
@@ -411,17 +410,28 @@ Bytes read_record(const Source& source, const Record& record, size_t limit) {
 
 std::optional<std::string> locale_language(uint32_t locale) {
     switch (locale & 0xFF) {
-    case 4: return "zh";
-    case 7: return "de";
-    case 9: return "en";
-    case 10: return "es";
-    case 12: return "fr";
-    case 16: return "it";
-    case 17: return "ja";
-    case 19: return "nl";
-    case 22: return "pt";
-    case 25: return "ru";
-    default: return std::nullopt;
+    case 4:
+        return "zh";
+    case 7:
+        return "de";
+    case 9:
+        return "en";
+    case 10:
+        return "es";
+    case 12:
+        return "fr";
+    case 16:
+        return "it";
+    case 17:
+        return "ja";
+    case 19:
+        return "nl";
+    case 22:
+        return "pt";
+    case 25:
+        return "ru";
+    default:
+        return std::nullopt;
     }
 }
 
@@ -501,13 +511,14 @@ MobiMetadata read_mobi_metadata(uint64_t size,
     // A combined KF7 + KF8 file: the record after the BOUNDARY record is a
     // KF8 record 0, read only when the first header has no title.
     if (const auto boundary = header.number(exth_kf8_boundary);
-        boundary && *boundary > 0 && static_cast<uint64_t>(*boundary) + 1 < database.records.size()) {
+        boundary && *boundary > 0 &&
+        static_cast<uint64_t>(*boundary) + 1 < database.records.size()) {
         const auto& marker = database.records[*boundary];
         if (marker.length >= 8 && as_text(fetch(source, marker.offset, 8)) == "BOUNDARY") {
             out.kf8 = true;
             if (header_title(header).empty()) {
-                const auto kf8_record0 = read_record(source, database.records[*boundary + 1],
-                                                     limits.max_header_bytes);
+                const auto kf8_record0 =
+                    read_record(source, database.records[*boundary + 1], limits.max_header_bytes);
                 header = parse_header(kf8_record0, *boundary + 1);
             }
         }

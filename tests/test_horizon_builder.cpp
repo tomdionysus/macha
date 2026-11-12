@@ -24,7 +24,9 @@ ObjectId id(uint8_t n) {
     return out;
 }
 
-std::vector<ObjectId> ids_of(std::span<const ObjectId> span) { return {span.begin(), span.end()}; }
+std::vector<ObjectId> ids_of(std::span<const ObjectId> span) {
+    return {span.begin(), span.end()};
+}
 
 // A frozen view of a reference count trie holding `ids`.
 ObjectTrie::Snapshot view_of(const std::filesystem::path& dir, const std::vector<ObjectId>& ids) {
@@ -63,7 +65,9 @@ FsEntry directory() {
 class OnceNodeStore final : public NamespaceNodeStore {
   public:
     explicit OnceNodeStore(const NamespaceNodeStore& inner) : inner_(inner) {}
-    ObjectId put(std::span<const uint8_t>) override { throw std::logic_error("read-only"); }
+    ObjectId put(std::span<const uint8_t>) override {
+        throw std::logic_error("read-only");
+    }
     std::optional<Bytes> get(const ObjectId& node) const override {
         if (!served_.insert(node).second)
             return std::nullopt;
@@ -173,8 +177,7 @@ MACHA_FAST_TEST("horizon_builder", test_inventory_is_both_live_sets_and_the_cata
     CHECK(!inventory->catalogue_complete());
     CHECK((ids_of(inventory->all(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(2), id(3)}));
-    CHECK((ids_of(inventory->all(RetentionClass::control)) ==
-           std::vector<ObjectId>{id(6), id(7)}));
+    CHECK((ids_of(inventory->all(RetentionClass::control)) == std::vector<ObjectId>{id(6), id(7)}));
     // A tombstone revived by catalogue data is stale, as one the namespace revives is.
     CHECK(inventory->stale_garbage().size() == 1 && inventory->stale_garbage()[0].id == id(2));
     CHECK(inventory->garbage().size() == 1 && inventory->garbage()[0].id == id(8));
@@ -235,8 +238,8 @@ MACHA_FAST_TEST("horizon_builder", test_inventory_control_set_holds_the_namespac
     bool threw = false;
     std::vector<ObjectId> second;
     try {
-        for_each_namespace_entry(snapshot, &once, [](const std::string&, const FsEntry&) {},
-                                 second);
+        for_each_namespace_entry(
+            snapshot, &once, [](const std::string&, const FsEntry&) {}, second);
     } catch (const std::exception&) {
         threw = true;
     }
@@ -267,8 +270,8 @@ MACHA_FAST_TEST("horizon_builder", test_release_over_a_tree_matches_the_pass_bui
     catalogue_conflict.left_catalogue_root = id(41);
     snapshot.conflicts["catalogue"] = catalogue_conflict;
     const auto head = view_of(snapshot, 0x51);
-    const auto catalogue = catalogue_of({{id(40), {{id(8), id(1)}, {id(9)}}},
-                                         {id(41), {{id(10)}, {id(11), id(9)}}}});
+    const auto catalogue =
+        catalogue_of({{id(40), {{id(8), id(1)}, {id(9)}}}, {id(41), {{id(10)}, {id(11), id(9)}}}});
 
     check_matches_reference(head, nodes, nodes, catalogue);
     const auto built = build_release(head, nodes, catalogue);
@@ -281,7 +284,8 @@ MACHA_FAST_TEST("horizon_builder", test_release_over_a_tree_matches_the_pass_bui
     CHECK(built.horizon->size(RetentionClass::control) == 2 + nodes.nodes());
 }
 
-MACHA_FAST_TEST("horizon_builder", test_an_unreadable_catalogue_root_leaves_the_release_incomplete) {
+MACHA_FAST_TEST("horizon_builder",
+                test_an_unreadable_catalogue_root_leaves_the_release_incomplete) {
     MetadataSnapshot snapshot;
     snapshot.entries["/f"] = file({{1, false}});
     snapshot.catalogue_root = id(40);
@@ -297,10 +301,9 @@ MACHA_FAST_TEST("horizon_builder", test_an_unreadable_catalogue_root_leaves_the_
     const auto built = build_release(head, nodes, catalogue);
     CHECK(!built.complete);
     // What could be read is still in the horizon.
-    CHECK((ids_of(built.horizon->all(RetentionClass::data)) ==
-           std::vector<ObjectId>{id(1), id(8)}));
-    CHECK((ids_of(built.horizon->all(RetentionClass::control)) ==
-           std::vector<ObjectId>{id(9)}));
+    CHECK(
+        (ids_of(built.horizon->all(RetentionClass::data)) == std::vector<ObjectId>{id(1), id(8)}));
+    CHECK((ids_of(built.horizon->all(RetentionClass::control)) == std::vector<ObjectId>{id(9)}));
 }
 
 MACHA_FAST_TEST("horizon_builder", test_an_unreadable_tree_node_leaves_the_release_incomplete) {
@@ -318,8 +321,8 @@ MACHA_FAST_TEST("horizon_builder", test_an_unreadable_tree_node_leaves_the_relea
     OnceNodeStore again(nodes);
     const auto built = build_release(head, again, catalogue);
     CHECK(!built.complete);
-    CHECK((ids_of(built.horizon->all(RetentionClass::data)) ==
-           std::vector<ObjectId>{id(1), id(2)}));
+    CHECK(
+        (ids_of(built.horizon->all(RetentionClass::data)) == std::vector<ObjectId>{id(1), id(2)}));
 }
 
 MACHA_FAST_TEST("horizon_builder", test_an_empty_head_releases_against_nothing) {

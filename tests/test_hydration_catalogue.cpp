@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "stand_in_peer.hpp"
 #include "contract/stopping.hpp"
-#include "torrent/torrent_extent_journal.hpp"
+#include "stand_in_peer.hpp"
 #include "stepped_time.hpp"
+#include "torrent/torrent_extent_journal.hpp"
 #if MACHA_HAVE_BOOKS
 #include "catalogue/book_conversion.hpp"
 #endif
-#include "test_backend_support.hpp"
 #include "api/acquisition_api.hpp"
 #include "api/paging.hpp"
 #include "subsystem/subsystem_abi.hpp"
 #include "subsystem/subsystem_registry.hpp"
 #include "supervised.hpp"
+#include "test_backend_support.hpp"
 #include "torrent/torrent_coordinator.hpp"
 
 #ifdef MACHA_TEST_TORRENT_PLUGIN
@@ -48,13 +48,16 @@ class LoadedTorrentPlugin {
 
     ~LoadedTorrentPlugin() {
         subsystem_.reset();
-        if (handle_) ::dlclose(handle_);
+        if (handle_)
+            ::dlclose(handle_);
     }
 
     LoadedTorrentPlugin(const LoadedTorrentPlugin&) = delete;
     LoadedTorrentPlugin& operator=(const LoadedTorrentPlugin&) = delete;
 
-    Subsystem& subsystem() { return *subsystem_; }
+    Subsystem& subsystem() {
+        return *subsystem_;
+    }
 };
 #endif
 
@@ -67,11 +70,13 @@ std::map<std::string, std::string, std::less<>> parse_test_query(std::string_vie
     size_t pos = 0;
     while (pos <= query.size()) {
         auto amp = query.find('&', pos);
-        auto part = query.substr(pos, amp == std::string_view::npos ? query.size() - pos : amp - pos);
+        auto part =
+            query.substr(pos, amp == std::string_view::npos ? query.size() - pos : amp - pos);
         auto eq = part.find('=');
         out[std::string(part.substr(0, eq))] =
             eq == std::string_view::npos ? "" : std::string(part.substr(eq + 1));
-        if (amp == std::string_view::npos) break;
+        if (amp == std::string_view::npos)
+            break;
         pos = amp + 1;
     }
     return out;
@@ -87,28 +92,50 @@ class CatalogueNode {
     std::unique_ptr<CatalogueHintQueue> hints_;
 
   public:
-    explicit CatalogueNode(std::string_view name, const std::function<void(Config&)>& configure = {},
+    explicit CatalogueNode(std::string_view name,
+                           const std::function<void(Config&)>& configure = {},
                            std::function<void(const MetadataPublicationContext&)> guard = {})
         : node_(name) {
-        if (configure) configure(node_.config());
-        if (guard) node_.set_publication_guard(std::move(guard));
+        if (configure)
+            configure(node_.config());
+        if (guard)
+            node_.set_publication_guard(std::move(guard));
         node_.start();
         auto& bare = node_.node();
-        catalogue_ = std::make_unique<CatalogueManager>(bare, bare.local_state(), bare.metadata_server(),
-                                                        node_.store(), node_.metadata(), bare.ledger());
+        catalogue_ =
+            std::make_unique<CatalogueManager>(bare, bare.local_state(), bare.metadata_server(),
+                                               node_.store(), node_.metadata(), bare.ledger());
         hints_ = std::make_unique<CatalogueHintQueue>(node_.config().state_path);
     }
 
-    BareNode& node() { return node_.node(); }
-    const Config& config() const { return node_.config(); }
-    const std::filesystem::path& path() const { return node_.path(); }
-    FileSystem& filesystem() { return node_.filesystem(); }
-    MetadataManager& metadata() { return node_.metadata(); }
-    DistributedStore& store() { return node_.store(); }
-    CatalogueManager& catalogue() { return *catalogue_; }
-    CatalogueHintQueue& hints() { return *hints_; }
+    BareNode& node() {
+        return node_.node();
+    }
+    const Config& config() const {
+        return node_.config();
+    }
+    const std::filesystem::path& path() const {
+        return node_.path();
+    }
+    FileSystem& filesystem() {
+        return node_.filesystem();
+    }
+    MetadataManager& metadata() {
+        return node_.metadata();
+    }
+    DistributedStore& store() {
+        return node_.store();
+    }
+    CatalogueManager& catalogue() {
+        return *catalogue_;
+    }
+    CatalogueHintQueue& hints() {
+        return *hints_;
+    }
 
-    void mkdir(const std::string& path) { filesystem().mkdir(path, 0755, getuid(), getgid()); }
+    void mkdir(const std::string& path) {
+        filesystem().mkdir(path, 0755, getuid(), getgid());
+    }
 
     // Writes `bytes` at `path`, replacing what is there, and returns its media id.
     std::string write(const std::string& path, const Bytes& bytes) {
@@ -146,14 +173,19 @@ Json api_body(const HttpResponse& response) {
 
 HttpRequest api_request(std::string method, std::string path, Bytes body = {},
                         std::map<std::string, std::string, std::less<>> headers = {}) {
-    return {.method = std::move(method), .path = std::move(path), .query = {},
-            .headers = std::move(headers), .body = std::move(body), .session = {}};
+    return {.method = std::move(method),
+            .path = std::move(path),
+            .query = {},
+            .headers = std::move(headers),
+            .body = std::move(body),
+            .session = {}};
 }
 
 std::filesystem::path write_host_file(const std::filesystem::path& path, const Bytes& bytes) {
     std::filesystem::create_directories(path.parent_path());
     std::ofstream out(path, std::ios::binary);
-    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
     return path;
 }
 
@@ -176,7 +208,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_hydration_scheduler_orders_runs_and_
     std::set<ObjectId> present;
     std::vector<HydrationRequest> requests;
     for (size_t i = 0; i < 7; ++i) {
-        auto request = scheduler.next(hints, [&](const ObjectId& id) { return present.contains(id); });
+        auto request =
+            scheduler.next(hints, [&](const ObjectId& id) { return present.contains(id); });
         REQUIRE(request.has_value());
         requests.push_back(*request);
         present.insert(request->object);
@@ -186,8 +219,10 @@ MACHA_FAST_TEST("hydration_catalogue", test_hydration_scheduler_orders_runs_and_
     CHECK(requests[1].object == b);
     CHECK(requests[2].object == c);
     CHECK(requests[3].object == n0); // interleaved before the current file completes.
-    auto n0_at = std::find_if(requests.begin(), requests.end(), [&](const auto& r) { return r.object == n0; });
-    auto n1_at = std::find_if(requests.begin(), requests.end(), [&](const auto& r) { return r.object == n1; });
+    auto n0_at = std::find_if(requests.begin(), requests.end(),
+                              [&](const auto& r) { return r.object == n0; });
+    auto n1_at = std::find_if(requests.begin(), requests.end(),
+                              [&](const auto& r) { return r.object == n1; });
     REQUIRE(n0_at != requests.end());
     REQUIRE(n1_at != requests.end());
     CHECK(n0_at < n1_at); // an ordered speculative run can never start in its middle.
@@ -196,9 +231,9 @@ MACHA_FAST_TEST("hydration_catalogue", test_hydration_scheduler_orders_runs_and_
     scheduler.reset();
     present.clear();
     auto blocked = [&](const ObjectId& id) { return id == n0; };
-    auto blocked_request = scheduler.next({{"next", {n0, n1, n2}, 300, "next_episode"}},
-                                          [&](const ObjectId& id) { return present.contains(id); },
-                                          blocked);
+    auto blocked_request = scheduler.next(
+        {{"next", {n0, n1, n2}, 300, "next_episode"}},
+        [&](const ObjectId& id) { return present.contains(id); }, blocked);
     CHECK(!blocked_request.has_value());
 
     PlaybackTracker tracker;
@@ -377,8 +412,10 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     REQUIRE(n1.wait_local_state_ready(10s));
     REQUIRE(n2.wait_local_state_ready(10s));
 
-    DistributedStore source(n1, n1.local_state(), n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
-    DistributedStore target(n2, n2.local_state(), n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
+    DistributedStore source(n1, n1.local_state(), n1.resources.activity, n1.resources.data,
+                            n1.resources.memory, n1.resources.events);
+    DistributedStore target(n2, n2.local_state(), n2.resources.activity, n2.resources.data,
+                            n2.resources.memory, n2.resources.events);
     auto make_remote = [&](uint8_t value) {
         Bytes data(128 * 1024, value);
         auto id = object_id(data);
@@ -397,15 +434,20 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
 
     class StaticHints final : public HydrationHintProvider {
         std::vector<HydrationHint> hints_;
+
       public:
         explicit StaticHints(std::vector<HydrationHint> hints) : hints_(std::move(hints)) {}
-        std::string_view name() const override { return "test"; }
-        std::vector<HydrationHint> hints() override { return hints_; }
+        std::string_view name() const override {
+            return "test";
+        }
+        std::vector<HydrationHint> hints() override {
+            return hints_;
+        }
     };
-    auto provider = std::make_shared<StaticHints>(std::vector<HydrationHint>{
-        {"current", {a, b}, 1000, "read_ahead"},
-        {"current", {a, b, c}, 700, "current_file"},
-        {"next", {n0, nnext}, 300, "next_episode"}});
+    auto provider = std::make_shared<StaticHints>(
+        std::vector<HydrationHint>{{"current", {a, b}, 1000, "read_ahead"},
+                                   {"current", {a, b, c}, 700, "current_file"},
+                                   {"next", {n0, nnext}, 300, "next_episode"}});
 
     HydrationConfig config;
     CacheHydrator hydrator(target, config);
@@ -430,8 +472,8 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     const auto parallel0 = make_remote(66);
     const auto parallel1 = make_remote(67);
     const auto parallel2 = make_remote(68);
-    auto concurrent_provider = std::make_shared<StaticHints>(
-        std::vector<HydrationHint>{{"parallel", {parallel0, parallel1, parallel2}, 500, "current_file"}});
+    auto concurrent_provider = std::make_shared<StaticHints>(std::vector<HydrationHint>{
+        {"parallel", {parallel0, parallel1, parallel2}, 500, "current_file"}});
     HydrationConfig concurrent_config;
     concurrent_config.interval = 10ms;
     concurrent_config.max_inflight = 2;
@@ -464,9 +506,12 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
         mutable std::mutex mutex_;
         std::vector<HydrationHint> hints_;
         std::function<void()> wake_;
+
       public:
         std::atomic_uint calls{};
-        std::string_view name() const override { return "notifying-test"; }
+        std::string_view name() const override {
+            return "notifying-test";
+        }
         std::vector<HydrationHint> hints() override {
             ++calls;
             std::lock_guard lock(mutex_);
@@ -483,7 +528,8 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
                 hints_ = std::move(hints);
                 wake = wake_;
             }
-            if (wake) wake();
+            if (wake)
+                wake();
         }
     };
     auto notifying_provider = std::make_shared<NotifyingHints>();
@@ -510,9 +556,12 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
         bool entered_{};
         bool released_{};
         ObjectId object_;
+
       public:
         explicit BlockingHints(ObjectId object) : object_(object) {}
-        std::string_view name() const override { return "blocking-stop-test"; }
+        std::string_view name() const override {
+            return "blocking-stop-test";
+        }
         std::vector<HydrationHint> hints() override {
             std::unique_lock lock(mutex_);
             entered_ = true;
@@ -573,22 +622,22 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     detailed_profile.probe.format = "mov,mp4,m4a,3gp,3g2,mj2";
     detailed_profile.probe.duration_seconds = 7265.125;
     detailed_profile.probe.bitrate = 5'123'456;
-    detailed_profile.probe.streams.push_back(MediaStreamInfo{
-        0, MediaStreamType::video, "hevc", "Main 10", "und", 3840, 2160,
-        0, 0, 10, true, false, 4'700'000, false});
-    detailed_profile.probe.streams.push_back(MediaStreamInfo{
-        2, MediaStreamType::audio, "eac3", "", "eng", 0, 0,
-        6, 48000, 24, true, false, 384'000, false});
-    detailed_profile.probe.streams.push_back(MediaStreamInfo{
-        7, MediaStreamType::subtitle, "hdmv_pgs_subtitle", "", "fra", 0, 0,
-        0, 0, 0, false, true, 0, false});
+    detailed_profile.probe.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "hevc",
+                                                             "Main 10", "und", 3840, 2160, 0, 0, 10,
+                                                             true, false, 4'700'000, false});
+    detailed_profile.probe.streams.push_back(MediaStreamInfo{2, MediaStreamType::audio, "eac3", "",
+                                                             "eng", 0, 0, 6, 48000, 24, true, false,
+                                                             384'000, false});
+    detailed_profile.probe.streams.push_back(MediaStreamInfo{7, MediaStreamType::subtitle,
+                                                             "hdmv_pgs_subtitle", "", "fra", 0, 0,
+                                                             0, 0, 0, false, true, 0, false});
     const std::string detailed_media_id = "macha:" + std::string(64, 'a');
     codec_snapshot.media_profiles.emplace(detailed_media_id, detailed_profile);
     codec_roundtrip = decode_catalogue(encode_catalogue(codec_snapshot));
     REQUIRE(codec_roundtrip.media_profiles.contains(detailed_media_id));
     CHECK(codec_roundtrip.media_profiles.at(detailed_media_id) == detailed_profile);
-    CHECK(valid_catalogue_media_profile(
-        detailed_media_id, codec_roundtrip.media_profiles.at(detailed_media_id)));
+    CHECK(valid_catalogue_media_profile(detailed_media_id,
+                                        codec_roundtrip.media_profiles.at(detailed_media_id)));
 
     // Unknown/incomplete semantic data remains decodable so one bad cached
     // profile cannot poison the complete catalogue snapshot. Consumers treat
@@ -599,15 +648,14 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     codec_snapshot.media_profiles[detailed_media_id] = incomplete;
     codec_roundtrip = decode_catalogue(encode_catalogue(codec_snapshot));
     REQUIRE(codec_roundtrip.media_profiles.contains(detailed_media_id));
-    CHECK(!valid_catalogue_media_profile(
-        detailed_media_id, codec_roundtrip.media_profiles.at(detailed_media_id)));
+    CHECK(!valid_catalogue_media_profile(detailed_media_id,
+                                         codec_roundtrip.media_profiles.at(detailed_media_id)));
 
     FsEntry fake;
     fake.type = EntryType::file;
     fake.size = 123456;
 
-    auto episode = probe_media_path(
-        "/TV/The Expanse/Season 02/The.Expanse.S02E05.Home.mkv", fake);
+    auto episode = probe_media_path("/TV/The Expanse/Season 02/The.Expanse.S02E05.Home.mkv", fake);
     REQUIRE(episode.has_value());
     CHECK(episode->kind == MediaProbeKind::episode);
     CHECK(episode->series == "The Expanse");
@@ -615,41 +663,72 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     CHECK(episode->episode == 5);
     CHECK(episode->title == "Home");
 
-    auto movie = probe_media_path(
-        "/Movies/Blade.Runner.2049.2017.1080p.BluRay.mkv", fake);
+    auto movie = probe_media_path("/Movies/Blade.Runner.2049.2017.1080p.BluRay.mkv", fake);
     REQUIRE(movie.has_value());
     CHECK(movie->kind == MediaProbeKind::movie);
     CHECK(movie->title == "Blade Runner 2049");
     CHECK(movie->year == 2017);
 
-    struct MovieRegression { const char* path; const char* title; int year; const char* edition{}; };
+    struct MovieRegression {
+        const char* path;
+        const char* title;
+        int year;
+        const char* edition{};
+    };
     for (const auto& regression : std::array{
-             MovieRegression{"/Movies/01 Men In Black 1 - Will Smith 1997 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 1", 1997},
-             MovieRegression{"/Movies/02 Men In Black 2 - Will Smith 2002 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 2", 2002},
-             MovieRegression{"/Movies/03 Men In Black 3 - Will Smith 2012 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 3", 2012},
-             MovieRegression{"/Movies/12.Monkeys.1995.1080p.BluRay.x264.AAC5.1.mp4", "12 Monkeys", 1995},
-             MovieRegression{"/Movies/1994.Pulp.Fiction.1920x816.BDRip.x264.DTS-HD.MA.mkv", "Pulp Fiction", 1994},
-             MovieRegression{"/Movies/Apollo.13.1995.Remastered.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv", "Apollo 13", 1995, "Remastered"},
-             MovieRegression{"/Movies/Bo.Burnham.Inside.2021.1080p.NF.WEBRip.DDP.5.1.H.265-EDGE2020.mkv", "Bo Burnham Inside", 2021},
-             MovieRegression{"/Movies/Corpse.Bride.2005.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv", "Corpse Bride", 2005},
-             MovieRegression{"/Movies/Leon.the.Professional.Extended.1994.BrRip.x264.YIFY.mp4", "Leon the Professional", 1994, "Extended"},
-             MovieRegression{"/Movies/Requiem.For.A.Dream.DIRECTORS.CUT.2000.1080p.BrRip.x264.YIFY.mp4", "Requiem For A Dream", 2000, "DIRECTORS CUT"},
-             MovieRegression{"/Movies/Rebel.Moon.Part.One.Directors.Cut.1080p.NF.WEBRip.AAC5.1.10bits.x265-Rapta.mkv", "Rebel Moon Part One", 0, "Directors Cut"},
-             MovieRegression{"/Movies/2003.Kill.Bill-.Volume.1.1920x802.BDRip.x264.DTS-HD.MA.mkv", "Kill Bill Volume 1", 2003},
-             MovieRegression{"/Movies/Soldier - Sci-fi 1998 Eng Rus Comm Multi Subs 720p [H264-mp4].mp4", "Soldier", 1998},
+             MovieRegression{"/Movies/01 Men In Black 1 - Will Smith 1997 Eng Ita Multi-Subs 1080p "
+                             "[H264-mp4].mp4",
+                             "Men In Black 1", 1997},
+             MovieRegression{"/Movies/02 Men In Black 2 - Will Smith 2002 Eng Ita Multi-Subs 1080p "
+                             "[H264-mp4].mp4",
+                             "Men In Black 2", 2002},
+             MovieRegression{"/Movies/03 Men In Black 3 - Will Smith 2012 Eng Ita Multi-Subs 1080p "
+                             "[H264-mp4].mp4",
+                             "Men In Black 3", 2012},
+             MovieRegression{"/Movies/12.Monkeys.1995.1080p.BluRay.x264.AAC5.1.mp4", "12 Monkeys",
+                             1995},
+             MovieRegression{"/Movies/1994.Pulp.Fiction.1920x816.BDRip.x264.DTS-HD.MA.mkv",
+                             "Pulp Fiction", 1994},
+             MovieRegression{
+                 "/Movies/Apollo.13.1995.Remastered.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv",
+                 "Apollo 13", 1995, "Remastered"},
+             MovieRegression{
+                 "/Movies/Bo.Burnham.Inside.2021.1080p.NF.WEBRip.DDP.5.1.H.265-EDGE2020.mkv",
+                 "Bo Burnham Inside", 2021},
+             MovieRegression{"/Movies/Corpse.Bride.2005.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv",
+                             "Corpse Bride", 2005},
+             MovieRegression{"/Movies/Leon.the.Professional.Extended.1994.BrRip.x264.YIFY.mp4",
+                             "Leon the Professional", 1994, "Extended"},
+             MovieRegression{
+                 "/Movies/Requiem.For.A.Dream.DIRECTORS.CUT.2000.1080p.BrRip.x264.YIFY.mp4",
+                 "Requiem For A Dream", 2000, "DIRECTORS CUT"},
+             MovieRegression{
+                 "/Movies/"
+                 "Rebel.Moon.Part.One.Directors.Cut.1080p.NF.WEBRip.AAC5.1.10bits.x265-Rapta.mkv",
+                 "Rebel Moon Part One", 0, "Directors Cut"},
+             MovieRegression{"/Movies/2003.Kill.Bill-.Volume.1.1920x802.BDRip.x264.DTS-HD.MA.mkv",
+                             "Kill Bill Volume 1", 2003},
+             MovieRegression{
+                 "/Movies/Soldier - Sci-fi 1998 Eng Rus Comm Multi Subs 720p [H264-mp4].mp4",
+                 "Soldier", 1998},
              // A number the calendar has not reached is title text, not a
              // release year.
-             MovieRegression{"/Movies/Blade Runner 2049.HDRip.XviD.AC3-EVO.avi", "Blade Runner 2049", 0},
+             MovieRegression{"/Movies/Blade Runner 2049.HDRip.XviD.AC3-EVO.avi",
+                             "Blade Runner 2049", 0},
              MovieRegression{"/Movies/Death Race 2050 1080p BluRay x265.mkv", "Death Race 2050", 0},
          }) {
         auto parsed = probe_media_path(regression.path, fake);
         REQUIRE(parsed.has_value());
         CHECK(parsed->kind == MediaProbeKind::movie);
         CHECK(parsed->title == regression.title);
-        if (regression.year) CHECK(parsed->year == regression.year);
-        else CHECK(!parsed->year.has_value());
-        if (regression.edition) CHECK(parsed->edition == std::optional<std::string>{regression.edition});
-        else CHECK(!parsed->edition.has_value());
+        if (regression.year)
+            CHECK(parsed->year == regression.year);
+        else
+            CHECK(!parsed->year.has_value());
+        if (regression.edition)
+            CHECK(parsed->edition == std::optional<std::string>{regression.edition});
+        else
+            CHECK(!parsed->edition.has_value());
     }
 
     auto apollo_candidates = probe_media_candidates(
@@ -659,12 +738,10 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     CHECK(apollo_candidates.front().score > apollo_candidates.back().score);
     CHECK(!apollo_candidates.front().evidence.empty());
 
-    auto compact_candidates = probe_media_candidates(
-        "/Movies/japhson-romeoandjuliet.mkv", fake);
-    auto compact = std::find_if(compact_candidates.begin(), compact_candidates.end(),
-                                [](const auto& candidate) {
-                                    return candidate.generator == "movie-compact-title";
-                                });
+    auto compact_candidates = probe_media_candidates("/Movies/japhson-romeoandjuliet.mkv", fake);
+    auto compact = std::find_if(
+        compact_candidates.begin(), compact_candidates.end(),
+        [](const auto& candidate) { return candidate.generator == "movie-compact-title"; });
     REQUIRE(compact != compact_candidates.end());
     CHECK(compact->probe.title == "romeo and juliet");
 
@@ -677,24 +754,52 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
         const char* title;
     };
     for (const auto& regression : std::array{
-             EpisodeRegression{"/TV/Big.Mistakes.S01E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Big Mistakes", 0, 1, 8, ""},
-             EpisodeRegression{"/TV/Stranger.Things.S05E01.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 1, ""},
-             EpisodeRegression{"/TV/Stranger.Things.S05E03.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 3, ""},
-             EpisodeRegression{"/TV/Stranger.Things.S05E04.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 4, ""},
-             EpisodeRegression{"/TV/Stranger.Things.S05E05.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 5, ""},
-             EpisodeRegression{"/TV/Stranger.Things.S05E06.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 6, ""},
-             EpisodeRegression{"/TV/Stranger.Things.S05E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 8, ""},
-             EpisodeRegression{"/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica (2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv", "Battlestar Galactica", 2003, 2, 1, "Scattered"},
-             EpisodeRegression{"/TV/Ballykissangel (1996)/Season 2/Ballykissangel - S02E09 - As Happy as a Turkey on Boxing Day.mkv", "Ballykissangel", 1996, 2, 9, "As Happy as a Turkey on Boxing Day"},
-             EpisodeRegression{"/TV/Allo Allo 1984 Season 1 to 3 Complete DVDRip x264 [i_c]/Allo Allo 1984 Season 1/01 - Allo Allo S1e00 - The British Are Coming [Pilot].mkv", "Allo Allo", 0, 1, 0, "The British Are Coming [Pilot]"},
-             EpisodeRegression{"/TV/Test Show S01E01 - Ordinary Episode [rartv].mkv", "Test Show", 0, 1, 1, "Ordinary Episode"},
-             EpisodeRegression{"/TV/Black Books (2000)/Black Books (2000) - S01E01 - Cooking the Books (576p DVD x265 Ghost).mkv", "Black Books", 2000, 1, 1, "Cooking the Books"},
+             EpisodeRegression{"/TV/Big.Mistakes.S01E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                               "Big Mistakes", 0, 1, 8, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E01.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                               "Stranger Things", 0, 5, 1, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E03.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                               "Stranger Things", 0, 5, 3, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E04.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                               "Stranger Things", 0, 5, 4, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E05.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                               "Stranger Things", 0, 5, 5, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E06.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                               "Stranger Things", 0, 5, 6, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                               "Stranger Things", 0, 5, 8, ""},
+             EpisodeRegression{"/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay "
+                               "x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica "
+                               "(2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv",
+                               "Battlestar Galactica", 2003, 2, 1, "Scattered"},
+             EpisodeRegression{"/TV/Ballykissangel (1996)/Season 2/Ballykissangel - S02E09 - As "
+                               "Happy as a Turkey on Boxing Day.mkv",
+                               "Ballykissangel", 1996, 2, 9, "As Happy as a Turkey on Boxing Day"},
+             EpisodeRegression{
+                 "/TV/Allo Allo 1984 Season 1 to 3 Complete DVDRip x264 [i_c]/Allo Allo 1984 "
+                 "Season 1/01 - Allo Allo S1e00 - The British Are Coming [Pilot].mkv",
+                 "Allo Allo", 0, 1, 0, "The British Are Coming [Pilot]"},
+             EpisodeRegression{"/TV/Test Show S01E01 - Ordinary Episode [rartv].mkv", "Test Show",
+                               0, 1, 1, "Ordinary Episode"},
+             EpisodeRegression{"/TV/Black Books (2000)/Black Books (2000) - S01E01 - Cooking the "
+                               "Books (576p DVD x265 Ghost).mkv",
+                               "Black Books", 2000, 1, 1, "Cooking the Books"},
              EpisodeRegression{"/TV/Black Books (2000)/S01E02.mkv", "Black Books", 2000, 1, 2, ""},
-             EpisodeRegression{"/TV/Blackadder.1982.S01-S04.1080p.BluRay.EAC3.2.0.x265-iVy/S01E01.mkv", "Blackadder", 1982, 1, 1, ""},
-             EpisodeRegression{"/TV/Black.Jesus.S01.1080p.AMZN.WEBRip.DDP5.1.x264-Cinefeel[rartv]/S01E01.mkv", "Black Jesus", 0, 1, 1, ""},
-             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/S02E01.mkv", "Black Jesus", 0, 2, 1, ""},
-             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/Black.Jesus.S02E05.Tasty.Tudi.s.1080p.WEB-DL.DD5.1.H.264-BTN.mkv", "Black Jesus", 0, 2, 5, "Tasty Tudi's"},
-             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/Black.Jesus.S02E07.Thy.Neighbor.s.Strife.1080p.WEB-DL.DD5.1.H.264-BTN.mkv", "Black Jesus", 0, 2, 7, "Thy Neighbor's Strife"},
+             EpisodeRegression{
+                 "/TV/Blackadder.1982.S01-S04.1080p.BluRay.EAC3.2.0.x265-iVy/S01E01.mkv",
+                 "Blackadder", 1982, 1, 1, ""},
+             EpisodeRegression{
+                 "/TV/Black.Jesus.S01.1080p.AMZN.WEBRip.DDP5.1.x264-Cinefeel[rartv]/S01E01.mkv",
+                 "Black Jesus", 0, 1, 1, ""},
+             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/S02E01.mkv",
+                               "Black Jesus", 0, 2, 1, ""},
+             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/"
+                               "Black.Jesus.S02E05.Tasty.Tudi.s.1080p.WEB-DL.DD5.1.H.264-BTN.mkv",
+                               "Black Jesus", 0, 2, 5, "Tasty Tudi's"},
+             EpisodeRegression{
+                 "/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/"
+                 "Black.Jesus.S02E07.Thy.Neighbor.s.Strife.1080p.WEB-DL.DD5.1.H.264-BTN.mkv",
+                 "Black Jesus", 0, 2, 7, "Thy Neighbor's Strife"},
          }) {
         auto parsed = probe_media_path(regression.path, fake);
         REQUIRE(parsed.has_value());
@@ -703,12 +808,16 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
         CHECK(parsed->season == regression.season);
         CHECK(parsed->episode == regression.episode);
         CHECK(parsed->title == regression.title);
-        if (regression.year) CHECK(parsed->year == regression.year);
-        else CHECK(!parsed->year.has_value());
+        if (regression.year)
+            CHECK(parsed->year == regression.year);
+        else
+            CHECK(!parsed->year.has_value());
     }
 
-    auto multi_episode = probe_media_path(
-        "/TV/Battlestar Galactica (2003)/Season 4/Battlestar Galactica (2003) - S04E19-E20 - Daybreak (1080p BluRay x265 RZeroX).mkv", fake);
+    auto multi_episode =
+        probe_media_path("/TV/Battlestar Galactica (2003)/Season 4/Battlestar Galactica (2003) - "
+                         "S04E19-E20 - Daybreak (1080p BluRay x265 RZeroX).mkv",
+                         fake);
     REQUIRE(multi_episode.has_value());
     CHECK(multi_episode->kind == MediaProbeKind::episode);
     CHECK(multi_episode->series == "Battlestar Galactica");
@@ -718,8 +827,10 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     CHECK(multi_episode->episode_end == 20);
     CHECK(multi_episode->title == "Daybreak");
 
-    auto special_directory = probe_media_path(
-        "/TV/Battlestar Galactica (2003)/Specials/Battlestar Galactica (2003) - S00E23 - The Resistance (1) (480p BluRay x265 RZeroX).mkv", fake);
+    auto special_directory =
+        probe_media_path("/TV/Battlestar Galactica (2003)/Specials/Battlestar Galactica (2003) - "
+                         "S00E23 - The Resistance (1) (480p BluRay x265 RZeroX).mkv",
+                         fake);
     REQUIRE(special_directory.has_value());
     CHECK(special_directory->series == "Battlestar Galactica");
     CHECK(special_directory->year == 2003);
@@ -727,21 +838,21 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     CHECK(special_directory->episode == 23);
     CHECK(special_directory->title == "The Resistance (1)");
 
-    const auto battlestar_path =
-        "/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica (2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv";
+    const auto battlestar_path = "/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay "
+                                 "x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica "
+                                 "(2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv";
     auto battlestar_candidates = probe_media_candidates(battlestar_path, fake, "/TV");
     auto battlestar_yearless = std::find_if(
-        battlestar_candidates.begin(), battlestar_candidates.end(), [](const auto& candidate) {
-            return candidate.generator == "episode-filename-yearless";
-        });
+        battlestar_candidates.begin(), battlestar_candidates.end(),
+        [](const auto& candidate) { return candidate.generator == "episode-filename-yearless"; });
     REQUIRE(battlestar_yearless != battlestar_candidates.end());
     CHECK(battlestar_yearless->probe.series == "Battlestar Galactica");
     CHECK(!battlestar_yearless->probe.year.has_value());
     CHECK(battlestar_yearless->probe.season == 2);
     CHECK(battlestar_yearless->probe.episode == 1);
 
-    auto track = probe_media_path(
-        "/Music/Pink Floyd/The Dark Side of the Moon/01 - Speak to Me.flac", fake);
+    auto track =
+        probe_media_path("/Music/Pink Floyd/The Dark Side of the Moon/01 - Speak to Me.flac", fake);
     REQUIRE(track.has_value());
     CHECK(track->kind == MediaProbeKind::track);
     CHECK(track->artist == "Pink Floyd");
@@ -749,8 +860,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     CHECK(track->track == 1);
     CHECK(track->title == "Speak to Me");
 
-    auto disc_track = probe_media_path(
-        "/Music/Pink Floyd/The Wall/CD 2/03 - Hey You.flac", fake);
+    auto disc_track = probe_media_path("/Music/Pink Floyd/The Wall/CD 2/03 - Hey You.flac", fake);
     REQUIRE(disc_track.has_value());
     CHECK(disc_track->artist == "Pink Floyd");
     CHECK(disc_track->album == "The Wall");
@@ -759,7 +869,9 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     CHECK(disc_track->title == "Hey You");
 
     auto discography_track = probe_media_path(
-        "/Music/A Tribe Called Quest Discography @ 320 (8 Albums)(RAP)(by dragan09)/1990 - Peoples Instinctive Travels And The Path/16 Can I Kick It_ (Extended Bollerho.mp3", fake);
+        "/Music/A Tribe Called Quest Discography @ 320 (8 Albums)(RAP)(by dragan09)/1990 - Peoples "
+        "Instinctive Travels And The Path/16 Can I Kick It_ (Extended Bollerho.mp3",
+        fake);
     REQUIRE(discography_track.has_value());
     CHECK(discography_track->artist == "A Tribe Called Quest");
     CHECK(discography_track->album == "Peoples Instinctive Travels And The Path");
@@ -775,20 +887,20 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     tagged_music.album_artist = "Various Artists";
     tagged_music.track_artist = "Massive Attack";
     tagged_music.artist = tagged_music.album_artist;
-    auto tagged_candidates = probe_media_candidates(
-        MediaProbeContext{"/Music", tagged_music.path, fake, &tagged_music});
-    auto embedded_candidate = std::find_if(tagged_candidates.begin(), tagged_candidates.end(),
-                                           [](const auto& candidate) {
-                                               return candidate.generator == "music-embedded-tags";
-                                           });
-    auto recording_candidate = std::find_if(tagged_candidates.begin(), tagged_candidates.end(),
-                                            [](const auto& candidate) {
-                                                return candidate.generator == "music-recording-tags";
-                                            });
-    auto merged_candidate = std::find_if(tagged_candidates.begin(), tagged_candidates.end(),
-                                         [](const auto& candidate) {
-                                             return candidate.generator == "music-tags-plus-path";
-                                         });
+    auto tagged_candidates =
+        probe_media_candidates(MediaProbeContext{"/Music", tagged_music.path, fake, &tagged_music});
+    auto embedded_candidate =
+        std::find_if(tagged_candidates.begin(), tagged_candidates.end(), [](const auto& candidate) {
+            return candidate.generator == "music-embedded-tags";
+        });
+    auto recording_candidate =
+        std::find_if(tagged_candidates.begin(), tagged_candidates.end(), [](const auto& candidate) {
+            return candidate.generator == "music-recording-tags";
+        });
+    auto merged_candidate =
+        std::find_if(tagged_candidates.begin(), tagged_candidates.end(), [](const auto& candidate) {
+            return candidate.generator == "music-tags-plus-path";
+        });
     REQUIRE(embedded_candidate != tagged_candidates.end());
     REQUIRE(recording_candidate != tagged_candidates.end());
     REQUIRE(merged_candidate != tagged_candidates.end());
@@ -804,9 +916,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     auto untagged_music_candidates = probe_media_candidates(
         "/Music/Pink Floyd/The Dark Side of the Moon/01 - Speak to Me.flac", fake, "/Music");
     auto structured_recording = std::find_if(
-        untagged_music_candidates.begin(), untagged_music_candidates.end(), [](const auto& candidate) {
-            return candidate.generator == "music-structured-recording";
-        });
+        untagged_music_candidates.begin(), untagged_music_candidates.end(),
+        [](const auto& candidate) { return candidate.generator == "music-structured-recording"; });
     REQUIRE(structured_recording != untagged_music_candidates.end());
     CHECK(structured_recording->probe.lookup_strategy ==
           MediaProbeLookupStrategy::music_recording_first);
@@ -820,10 +931,12 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
         out << "test-token\n";
     }
     FakeHttpClient tmdb_http;
-    tmdb_http.add("/search/tv", 200, "application/json",
-                  R"({"results":[{"id":1402,"name":"The Walking Dead","overview":"Show overview","first_air_date":"2010-10-31","poster_path":"/show.jpg","backdrop_path":"/show-bg.jpg"}]})");
-    tmdb_http.add("/tv/1402/season/1", 200, "application/json",
-                  R"({"id":3643,"name":"Season 1","overview":"Season overview","poster_path":"/season.jpg","episodes":[{"id":63056,"episode_number":1,"name":"Days Gone Bye","overview":"Episode overview","still_path":"/episode.jpg"}]})");
+    tmdb_http.add(
+        "/search/tv", 200, "application/json",
+        R"({"results":[{"id":1402,"name":"The Walking Dead","overview":"Show overview","first_air_date":"2010-10-31","poster_path":"/show.jpg","backdrop_path":"/show-bg.jpg"}]})");
+    tmdb_http.add(
+        "/tv/1402/season/1", 200, "application/json",
+        R"({"id":3643,"name":"Season 1","overview":"Season overview","poster_path":"/season.jpg","episodes":[{"id":63056,"episode_number":1,"name":"Days Gone Bye","overview":"Episode overview","still_path":"/episode.jpg"}]})");
     CatalogueTmdbConfig tmdb_config;
     tmdb_config.token_file = token;
     TmdbProvider tmdb(tmdb_http, tmdb_config);
@@ -845,10 +958,12 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // A one-year TV premiere difference is evidence, not a hard rejection.
     // Release folders frequently use a pilot/miniseries/production year.
     FakeHttpClient adjacent_year_http;
-    adjacent_year_http.add("query=Adjacent%20Year%20Show&language=en-GB", 200, "application/json",
-                           R"({"results":[{"id":1500,"name":"Adjacent Year Show","first_air_date":"2004-01-01"}]})");
-    adjacent_year_http.add("/tv/1500/season/1", 200, "application/json",
-                           R"({"id":1501,"name":"Season 1","episodes":[{"id":1502,"episode_number":1,"name":"Pilot"}]})");
+    adjacent_year_http.add(
+        "query=Adjacent%20Year%20Show&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":1500,"name":"Adjacent Year Show","first_air_date":"2004-01-01"}]})");
+    adjacent_year_http.add(
+        "/tv/1500/season/1", 200, "application/json",
+        R"({"id":1501,"name":"Season 1","episodes":[{"id":1502,"episode_number":1,"name":"Pilot"}]})");
     TmdbProvider adjacent_year_tmdb(adjacent_year_http, tmdb_config);
     MediaProbe adjacent_year_probe;
     adjacent_year_probe.kind = MediaProbeKind::episode;
@@ -874,11 +989,13 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // cache that negative season result and let the scanner try the yearless
     // episode candidate without repeatedly spending one request per episode.
     FakeHttpClient battlestar_http;
-    battlestar_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
-                        R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"},{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    battlestar_http.add(
+        "query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"},{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
     battlestar_http.add("/tv/101/season/2", 404, "application/json", R"({})");
-    battlestar_http.add("/tv/1972/season/2", 200, "application/json",
-                        R"({"id":202,"name":"Season 2","episodes":[{"id":203,"episode_number":1,"name":"Scattered"},{"id":204,"episode_number":2,"name":"Valley of Darkness"}]})");
+    battlestar_http.add(
+        "/tv/1972/season/2", 200, "application/json",
+        R"({"id":202,"name":"Season 2","episodes":[{"id":203,"episode_number":1,"name":"Scattered"},{"id":204,"episode_number":2,"name":"Valley of Darkness"}]})");
     TmdbProvider battlestar_tmdb(battlestar_http, tmdb_config);
     MediaProbe battlestar_probe;
     battlestar_probe.kind = MediaProbeKind::episode;
@@ -910,10 +1027,12 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // filename-title differences. TMDB's title is canonical; release titles are
     // secondary evidence once the numbered identity is strong.
     FakeHttpClient title_variation_http;
-    title_variation_http.add("query=Blue%20Lights&language=en-GB", 200, "application/json",
-                             R"({"results":[{"id":2000,"name":"Blue Lights","first_air_date":"2023-03-27"}]})");
-    title_variation_http.add("/tv/2000/season/1", 200, "application/json",
-                             R"({"id":2001,"name":"Season 1","episodes":[{"id":2006,"episode_number":6,"name":"Love the One You're With"}]})");
+    title_variation_http.add(
+        "query=Blue%20Lights&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":2000,"name":"Blue Lights","first_air_date":"2023-03-27"}]})");
+    title_variation_http.add(
+        "/tv/2000/season/1", 200, "application/json",
+        R"({"id":2001,"name":"Season 1","episodes":[{"id":2006,"episode_number":6,"name":"Love the One You're With"}]})");
     TmdbProvider title_variation_tmdb(title_variation_http, tmdb_config);
     MediaProbe title_variation_probe;
     title_variation_probe.kind = MediaProbeKind::episode;
@@ -930,10 +1049,12 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // Dots replacing apostrophes in release names are a punctuation artefact,
     // not evidence that an otherwise matching episode is different.
     FakeHttpClient possessive_http;
-    possessive_http.add("query=Black%20Jesus&language=en-GB", 200, "application/json",
-                        R"({"results":[{"id":2100,"name":"Black Jesus","first_air_date":"2014-08-07"}]})");
-    possessive_http.add("/tv/2100/season/2", 200, "application/json",
-                        R"({"id":2101,"name":"Season 2","episodes":[{"id":2105,"episode_number":5,"name":"Tasty Tudi's"}]})");
+    possessive_http.add(
+        "query=Black%20Jesus&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":2100,"name":"Black Jesus","first_air_date":"2014-08-07"}]})");
+    possessive_http.add(
+        "/tv/2100/season/2", 200, "application/json",
+        R"({"id":2101,"name":"Season 2","episodes":[{"id":2105,"episode_number":5,"name":"Tasty Tudi's"}]})");
     TmdbProvider possessive_tmdb(possessive_http, tmdb_config);
     MediaProbe possessive_probe;
     possessive_probe.kind = MediaProbeKind::episode;
@@ -950,10 +1071,12 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // ordering schemes. Keep the already-resolved show/season, but allow a very
     // strong title to remap the local special number to TMDB's canonical one.
     FakeHttpClient special_remap_http;
-    special_remap_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
-                           R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"}]})");
-    special_remap_http.add("/tv/1972/season/0", 200, "application/json",
-                           R"json({"id":2200,"name":"Specials","episodes":[{"id":2202,"episode_number":2,"name":"The Resistance (1)"},{"id":2223,"episode_number":23,"name":"Unrelated Special"}]})json");
+    special_remap_http.add(
+        "query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"}]})");
+    special_remap_http.add(
+        "/tv/1972/season/0", 200, "application/json",
+        R"json({"id":2200,"name":"Specials","episodes":[{"id":2202,"episode_number":2,"name":"The Resistance (1)"},{"id":2223,"episode_number":23,"name":"Unrelated Special"}]})json");
     TmdbProvider special_remap_tmdb(special_remap_http, tmdb_config);
     MediaProbe special_remap_probe;
     special_remap_probe.kind = MediaProbeKind::episode;
@@ -971,11 +1094,13 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // separate one-season TV entity. Exact-year identity plus missing season 0
     // is enough to try the corresponding season-1 episode.
     FakeHttpClient miniseries_http;
-    miniseries_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
-                        R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    miniseries_http.add(
+        "query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
     miniseries_http.add("/tv/101/season/0", 404, "application/json", R"({})");
-    miniseries_http.add("/tv/101/season/1", 200, "application/json",
-                        R"({"id":2300,"name":"Miniseries","episodes":[{"id":2301,"episode_number":1,"name":"Part 1"},{"id":2302,"episode_number":2,"name":"Part 2"}]})");
+    miniseries_http.add(
+        "/tv/101/season/1", 200, "application/json",
+        R"({"id":2300,"name":"Miniseries","episodes":[{"id":2301,"episode_number":1,"name":"Part 1"},{"id":2302,"episode_number":2,"name":"Part 2"}]})");
     TmdbProvider miniseries_tmdb(miniseries_http, tmdb_config);
     MediaProbe miniseries_probe;
     miniseries_probe.kind = MediaProbeKind::episode;
@@ -993,15 +1118,19 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // If a legacy special is a standalone TMDB movie rather than an episode,
     // recover it through the movie catalogue path instead of dropping it.
     FakeHttpClient standalone_special_http;
-    standalone_special_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
-                                R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    standalone_special_http.add(
+        "query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
     standalone_special_http.add("/tv/101/season/0", 404, "application/json", R"({})");
-    standalone_special_http.add("/tv/101/season/1", 200, "application/json",
-                                R"({"id":2400,"name":"Miniseries","episodes":[{"id":2401,"episode_number":1,"name":"Part 1"},{"id":2402,"episode_number":2,"name":"Part 2"}]})");
-    standalone_special_http.add("query=Battlestar%20Galactica%20The%20Plan&language=en-GB", 200, "application/json",
-                                R"({"results":[{"id":2403,"title":"Battlestar Galactica: The Plan","release_date":"2009-10-27"}]})");
-    standalone_special_http.add("/movie/2403", 200, "application/json",
-                                R"({"id":2403,"title":"Battlestar Galactica: The Plan","release_date":"2009-10-27"})");
+    standalone_special_http.add(
+        "/tv/101/season/1", 200, "application/json",
+        R"({"id":2400,"name":"Miniseries","episodes":[{"id":2401,"episode_number":1,"name":"Part 1"},{"id":2402,"episode_number":2,"name":"Part 2"}]})");
+    standalone_special_http.add(
+        "query=Battlestar%20Galactica%20The%20Plan&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":2403,"title":"Battlestar Galactica: The Plan","release_date":"2009-10-27"}]})");
+    standalone_special_http.add(
+        "/movie/2403", 200, "application/json",
+        R"({"id":2403,"title":"Battlestar Galactica: The Plan","release_date":"2009-10-27"})");
     TmdbProvider standalone_special_tmdb(standalone_special_http, tmdb_config);
     MediaProbe standalone_special_probe;
     standalone_special_probe.kind = MediaProbeKind::episode;
@@ -1022,10 +1151,12 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // Multi-episode files retain one media object while emitting every TMDB
     // episode identity covered by the filename range.
     FakeHttpClient range_http;
-    range_http.add("query=Range%20Show&language=en-GB", 200, "application/json",
-                   R"({"results":[{"id":2500,"name":"Range Show","first_air_date":"2020-01-01"}]})");
-    range_http.add("/tv/2500/season/4", 200, "application/json",
-                   R"({"id":2501,"name":"Season 4","episodes":[{"id":2519,"episode_number":19,"name":"Part One"},{"id":2520,"episode_number":20,"name":"Part Two"}]})");
+    range_http.add(
+        "query=Range%20Show&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":2500,"name":"Range Show","first_air_date":"2020-01-01"}]})");
+    range_http.add(
+        "/tv/2500/season/4", 200, "application/json",
+        R"({"id":2501,"name":"Season 4","episodes":[{"id":2519,"episode_number":19,"name":"Part One"},{"id":2520,"episode_number":20,"name":"Part Two"}]})");
     TmdbProvider range_tmdb(range_http, tmdb_config);
     MediaProbe range_probe;
     range_probe.kind = MediaProbeKind::episode;
@@ -1048,41 +1179,46 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // between release filenames and canonical provider titles. The year remains
     // part of the score, so this does not turn matching into a first-result win.
     FakeHttpClient movie_http;
-    movie_http.add("query=Men%20In%20Black%202&language=en-GB&primary_release_year=2002",
-                   200, "application/json",
-                   R"({"results":[{"id":1001,"title":"Men in Black II","release_date":"2002-07-03"}]})");
+    movie_http.add(
+        "query=Men%20In%20Black%202&language=en-GB&primary_release_year=2002", 200,
+        "application/json",
+        R"({"results":[{"id":1001,"title":"Men in Black II","release_date":"2002-07-03"}]})");
     movie_http.add("/movie/1001", 200, "application/json",
                    R"({"id":1001,"title":"Men in Black II","release_date":"2002-07-03"})");
-    movie_http.add("query=12%20Monkeys&language=en-GB&primary_release_year=1995",
-                   200, "application/json",
-                   R"({"results":[{"id":1002,"title":"Twelve Monkeys","release_date":"1995-12-29"}]})");
+    movie_http.add(
+        "query=12%20Monkeys&language=en-GB&primary_release_year=1995", 200, "application/json",
+        R"({"results":[{"id":1002,"title":"Twelve Monkeys","release_date":"1995-12-29"}]})");
     movie_http.add("/movie/1002", 200, "application/json",
                    R"({"id":1002,"title":"Twelve Monkeys","release_date":"1995-12-29"})");
-    movie_http.add("query=A%20Knights%20Tale&language=en-GB&primary_release_year=2001",
-                   200, "application/json",
-                   R"({"results":[{"id":1003,"title":"A Knight's Tale","release_date":"2001-05-11"}]})");
+    movie_http.add(
+        "query=A%20Knights%20Tale&language=en-GB&primary_release_year=2001", 200,
+        "application/json",
+        R"({"results":[{"id":1003,"title":"A Knight's Tale","release_date":"2001-05-11"}]})");
     movie_http.add("/movie/1003", 200, "application/json",
                    R"({"id":1003,"title":"A Knight's Tale","release_date":"2001-05-11"})");
-    movie_http.add("query=Kill%20Bill%20Volume%201&language=en-GB&primary_release_year=2003",
-                   200, "application/json",
-                   R"({"results":[{"id":1004,"title":"Kill Bill: Vol. 1","release_date":"2003-10-10"}]})");
+    movie_http.add(
+        "query=Kill%20Bill%20Volume%201&language=en-GB&primary_release_year=2003", 200,
+        "application/json",
+        R"({"results":[{"id":1004,"title":"Kill Bill: Vol. 1","release_date":"2003-10-10"}]})");
     movie_http.add("/movie/1004", 200, "application/json",
                    R"({"id":1004,"title":"Kill Bill: Vol. 1","release_date":"2003-10-10"})");
-    movie_http.add("query=Shrek%204&language=en-GB&primary_release_year=2010",
-                   200, "application/json",
-                   R"({"results":[{"id":1005,"title":"Shrek Forever After","release_date":"2010-05-16"}]})");
+    movie_http.add(
+        "query=Shrek%204&language=en-GB&primary_release_year=2010", 200, "application/json",
+        R"({"results":[{"id":1005,"title":"Shrek Forever After","release_date":"2010-05-16"}]})");
     movie_http.add("/movie/1005", 200, "application/json",
                    R"({"id":1005,"title":"Shrek Forever After","release_date":"2010-05-16"})");
-    movie_http.add("query=Shichinin%20no%20samurai&language=en-GB&primary_release_year=1954",
-                   200, "application/json",
-                   R"({"results":[{"id":1006,"title":"Seven Samurai","release_date":"1954-04-26"}]})");
+    movie_http.add(
+        "query=Shichinin%20no%20samurai&language=en-GB&primary_release_year=1954", 200,
+        "application/json",
+        R"({"results":[{"id":1006,"title":"Seven Samurai","release_date":"1954-04-26"}]})");
     movie_http.add("/movie/1006", 200, "application/json",
                    R"({"id":1006,"title":"Seven Samurai","release_date":"1954-04-26"})");
-    movie_http.add("query=Rebel%20Moon%20Part%20One&language=en-GB",
-                   200, "application/json",
-                   R"({"results":[{"id":1007,"title":"Rebel Moon - Part One: A Child of Fire","release_date":"2023-12-15"}]})");
-    movie_http.add("/movie/1007", 200, "application/json",
-                   R"({"id":1007,"title":"Rebel Moon - Part One: A Child of Fire","release_date":"2023-12-15"})");
+    movie_http.add(
+        "query=Rebel%20Moon%20Part%20One&language=en-GB", 200, "application/json",
+        R"({"results":[{"id":1007,"title":"Rebel Moon - Part One: A Child of Fire","release_date":"2023-12-15"}]})");
+    movie_http.add(
+        "/movie/1007", 200, "application/json",
+        R"({"id":1007,"title":"Rebel Moon - Part One: A Child of Fire","release_date":"2023-12-15"})");
     TmdbProvider movie_tmdb(movie_http, tmdb_config);
 
     MediaProbe mib_probe;
@@ -1105,7 +1241,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     REQUIRE(monkeys_match.has_value());
     REQUIRE(monkeys_match->items.size() == 1);
     CHECK(monkeys_match->items.front().title == "Twelve Monkeys");
-    CHECK(monkeys_match->items.front().media_ids == std::vector<std::string>{"macha:test-12-monkeys"});
+    CHECK(monkeys_match->items.front().media_ids ==
+          std::vector<std::string>{"macha:test-12-monkeys"});
 
     auto punctuation_probe = mib_probe;
     punctuation_probe.title = "A Knights Tale";
@@ -1150,12 +1287,15 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // MusicBrainz resolves one release, then maps the local track onto its
     // recording; Cover Art Archive provides the front cover URL.
     FakeHttpClient mb_http;
-    mb_http.add("/ws/2/release?", 200, "application/json",
-                R"({"releases":[{"id":"rel-1","title":"The Dark Side of the Moon","score":100,"artist-credit":[{"name":"Pink Floyd","artist":{"id":"artist-1","name":"Pink Floyd"}}]}]})");
-    mb_http.add("/ws/2/release/rel-1", 200, "application/json",
-                R"({"id":"rel-1","title":"The Dark Side of the Moon","date":"1973-03-01","artist-credit":[{"name":"Pink Floyd","artist":{"id":"artist-1","name":"Pink Floyd"}}],"release-group":{"id":"rg-1"},"media":[{"position":1,"tracks":[{"position":1,"title":"Speak to Me","recording":{"id":"rec-1","title":"Speak to Me"}}]}]})");
-    mb_http.add("coverartarchive.org/release/rel-1", 200, "application/json",
-                R"({"images":[{"front":true,"image":"https://images.example/original.jpg","thumbnails":{"500":"https://images.example/500.jpg"}}]})");
+    mb_http.add(
+        "/ws/2/release?", 200, "application/json",
+        R"({"releases":[{"id":"rel-1","title":"The Dark Side of the Moon","score":100,"artist-credit":[{"name":"Pink Floyd","artist":{"id":"artist-1","name":"Pink Floyd"}}]}]})");
+    mb_http.add(
+        "/ws/2/release/rel-1", 200, "application/json",
+        R"({"id":"rel-1","title":"The Dark Side of the Moon","date":"1973-03-01","artist-credit":[{"name":"Pink Floyd","artist":{"id":"artist-1","name":"Pink Floyd"}}],"release-group":{"id":"rg-1"},"media":[{"position":1,"tracks":[{"position":1,"title":"Speak to Me","recording":{"id":"rec-1","title":"Speak to Me"}}]}]})");
+    mb_http.add(
+        "coverartarchive.org/release/rel-1", 200, "application/json",
+        R"({"images":[{"front":true,"image":"https://images.example/original.jpg","thumbnails":{"500":"https://images.example/500.jpg"}}]})");
     CatalogueMusicBrainzConfig mb_config;
     mb_config.contact = "https://example.test/macha";
     // Requests to MusicBrainz are spaced by their gate's interval, a second
@@ -1186,11 +1326,14 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     // If tags/filename give artist+title but no trustworthy album, use a
     // recording search rather than inventing a release from directory names.
     FakeHttpClient mb_recording_http;
-    mb_recording_http.add("/ws/2/recording?", 200, "application/json",
+    mb_recording_http.add(
+        "/ws/2/recording?", 200, "application/json",
         R"JSON({"recordings":[{"id":"rec-2","title":"The First Time (Raven Remix)","score":100,"artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}]}]})JSON");
-    mb_recording_http.add("/ws/2/recording/rec-2", 200, "application/json",
+    mb_recording_http.add(
+        "/ws/2/recording/rec-2", 200, "application/json",
         R"JSON({"id":"rec-2","title":"The First Time (Raven Remix)","artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}],"releases":[{"id":"rel-2","title":"The First Time"}]})JSON");
-    mb_recording_http.add("/ws/2/release/rel-2", 200, "application/json",
+    mb_recording_http.add(
+        "/ws/2/release/rel-2", 200, "application/json",
         R"JSON({"id":"rel-2","title":"The First Time","date":"1995-05-01","artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}],"release-group":{"id":"rg-2"},"media":[{"position":1,"tracks":[{"position":1,"title":"The First Time (Raven Remix)","recording":{"id":"rec-2","title":"The First Time (Raven Remix)"}}]}]})JSON");
     MusicBrainzProvider mb_recording(mb_recording_http, mb_config, unpaced());
     MediaProbe recording_probe;
@@ -1205,11 +1348,14 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     CHECK(recording_match->items[2].external_ids.at("musicbrainz") == "rec-2");
 
     FakeHttpClient mb_compilation_http;
-    mb_compilation_http.add("/ws/2/recording?", 200, "application/json",
+    mb_compilation_http.add(
+        "/ws/2/recording?", 200, "application/json",
         R"JSON({"recordings":[{"id":"rec-3","title":"Teardrop","score":100,"artist-credit":[{"name":"Massive Attack","artist":{"id":"artist-3","name":"Massive Attack"}}]}]})JSON");
-    mb_compilation_http.add("/ws/2/recording/rec-3", 200, "application/json",
+    mb_compilation_http.add(
+        "/ws/2/recording/rec-3", 200, "application/json",
         R"JSON({"id":"rec-3","title":"Teardrop","artist-credit":[{"name":"Massive Attack","artist":{"id":"artist-3","name":"Massive Attack"}}],"releases":[{"id":"rel-other","title":"Mezzanine"},{"id":"rel-collected","title":"Collected"}]})JSON");
-    mb_compilation_http.add("/ws/2/release/rel-collected", 200, "application/json",
+    mb_compilation_http.add(
+        "/ws/2/release/rel-collected", 200, "application/json",
         R"JSON({"id":"rel-collected","title":"Collected","date":"2006-03-27","artist-credit":[{"name":"Various Artists","artist":{"id":"artist-va","name":"Various Artists"}}],"release-group":{"id":"rg-collected"},"media":[{"position":1,"tracks":[{"position":4,"title":"Teardrop","recording":{"id":"rec-3","title":"Teardrop"}}]}]})JSON");
     MusicBrainzProvider mb_compilation(mb_compilation_http, mb_config, unpaced());
     MediaProbe compilation_probe;
@@ -1268,10 +1414,12 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     }
     FakeHttpClient fallback_music_http;
     fallback_music_http.add("musicbrainz.org/ws/2", 503, "application/json", R"({})");
-    fallback_music_http.add("api.discogs.com/database/search", 200, "application/json",
-                            R"({"results":[{"id":500,"type":"release","title":"Clannad - Crann Ull","year":1980}]})");
-    fallback_music_http.add("api.discogs.com/releases/500", 200, "application/json",
-                            R"({"id":500,"title":"Crann Ull","year":1980,"master_id":600,"artists":[{"id":700,"name":"Clannad"}],"tracklist":[{"position":"7","type_":"track","title":"Gathering Mushrooms"}],"images":[{"type":"primary","uri":"https://img.discogs.example/500.jpg"}]})");
+    fallback_music_http.add(
+        "api.discogs.com/database/search", 200, "application/json",
+        R"({"results":[{"id":500,"type":"release","title":"Clannad - Crann Ull","year":1980}]})");
+    fallback_music_http.add(
+        "api.discogs.com/releases/500", 200, "application/json",
+        R"({"id":500,"title":"Crann Ull","year":1980,"master_id":600,"artists":[{"id":700,"name":"Clannad"}],"tracklist":[{"position":"7","type_":"track","title":"Gathering Mushrooms"}],"images":[{"type":"primary","uri":"https://img.discogs.example/500.jpg"}]})");
     CatalogueMusicProviderConfig fallback_music_config;
     fallback_music_config.roots = {"/Music"};
     fallback_music_config.musicbrainz.enabled = true;
@@ -1443,7 +1591,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
         auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
         std::ifstream input(path, std::ios::binary);
         REQUIRE(input.good());
-        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        std::string bytes((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
         return Bytes(bytes.begin(), bytes.end());
     };
     auto write_fixture = [&](const std::string& path, const Bytes& bytes) {
@@ -1483,15 +1632,13 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     CHECK(nested_probe->title == "I'm Raving");
 
     node.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
-    node.filesystem().create_file("/Movies/Blade.Runner.2049.2017.1080p.mkv", 0644,
-                                     getuid(), getgid());
+    node.filesystem().create_file("/Movies/Blade.Runner.2049.2017.1080p.mkv", 0644, getuid(),
+                                  getgid());
     auto bytes = pattern(32768);
-    auto writer = node.filesystem().open_write(
-        "/Movies/Blade.Runner.2049.2017.1080p.mkv", true);
+    auto writer = node.filesystem().open_write("/Movies/Blade.Runner.2049.2017.1080p.mkv", true);
     REQUIRE(writer->write(0, bytes) == bytes.size());
     writer->commit();
-    auto entry = node.filesystem().getattr(
-        "/Movies/Blade.Runner.2049.2017.1080p.mkv");
+    auto entry = node.filesystem().getattr("/Movies/Blade.Runner.2049.2017.1080p.mkv");
     auto media_id = file_media_id(entry);
 
     auto scanner_token = node.path() / "scanner-tmdb.token";
@@ -1500,12 +1647,14 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
         out << "scanner-token\n";
     }
     auto fake_http = std::make_unique<FakeHttpClient>();
-    fake_http->add("/search/movie", 200, "application/json",
-                   R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
-    fake_http->add("/movie/335984", 200, "application/json",
-                   R"({"id":335984,"title":"Blade Runner 2049","overview":"A blade runner uncovers a long-buried secret.","release_date":"2017-10-04","poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","belongs_to_collection":{"id":422837,"name":"Blade Runner Collection"}})");
-    fake_http->add_bytes("/t/p/w500/poster.jpg", 200, "image/jpeg", Bytes{1,2,3,4,5});
-    fake_http->add_bytes("/t/p/w500/backdrop.jpg", 200, "image/jpeg", Bytes{6,7,8,9});
+    fake_http->add(
+        "/search/movie", 200, "application/json",
+        R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
+    fake_http->add(
+        "/movie/335984", 200, "application/json",
+        R"({"id":335984,"title":"Blade Runner 2049","overview":"A blade runner uncovers a long-buried secret.","release_date":"2017-10-04","poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","belongs_to_collection":{"id":422837,"name":"Blade Runner Collection"}})");
+    fake_http->add_bytes("/t/p/w500/poster.jpg", 200, "image/jpeg", Bytes{1, 2, 3, 4, 5});
+    fake_http->add_bytes("/t/p/w500/backdrop.jpg", 200, "image/jpeg", Bytes{6, 7, 8, 9});
 
     CatalogueScannerConfig scanner_config;
     scanner_config.enabled = true;
@@ -1517,8 +1666,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
     auto profile_engine = std::make_shared<FakeMediaEngine>();
-    CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(), node.hints(),
-                             scanner_config, std::move(fake_http), 5s, profile_engine);
+    CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(),
+                             node.catalogue(), node.hints(), scanner_config, std::move(fake_http),
+                             5s, profile_engine);
     const auto namespace_before_scan = node.filesystem().namespace_signature();
     CHECK(scanner.scan_once() == 1);
     CHECK(node.filesystem().namespace_signature() == namespace_before_scan);
@@ -1569,14 +1719,15 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     CHECK(twice->artwork.size() == 2);
     CHECK(twice->external_ids.at("tmdb") == "335984");
     CHECK(twice->external_ids.at("macha_metadata_locked") == "1");
-    CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), media_id) != twice->media_ids.end());
-    CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), alternate_id) != twice->media_ids.end());
+    CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), media_id) !=
+          twice->media_ids.end());
+    CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), alternate_id) !=
+          twice->media_ids.end());
 
     // Clear Metadata removes the catalogue entity rather than saving an empty
     // matched item, and returns the exact media identities that became
     // unbound, so only those files go to the unmatched list.
-    auto cleared = node.catalogue().clear_metadata_with_media(
-        "tmdb:movie:335984", twice->revision);
+    auto cleared = node.catalogue().clear_metadata_with_media("tmdb:movie:335984", twice->revision);
     CHECK(cleared.removed_items == 1);
     CHECK(cleared.media_ids.size() == 2);
     CHECK(std::find(cleared.media_ids.begin(), cleared.media_ids.end(), media_id) !=
@@ -1597,8 +1748,10 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     CHECK(scanner.scan_once() == 0);
     auto partial = node.catalogue().get("tmdb:movie:335984");
     REQUIRE(partial.has_value());
-    CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), media_id) != partial->media_ids.end());
-    CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), alternate_id) != partial->media_ids.end());
+    CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), media_id) !=
+          partial->media_ids.end());
+    CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), alternate_id) !=
+          partial->media_ids.end());
 
     // Once the previously unavailable root exists, the scan is complete and
     // destructive reconciliation may safely remove the vanished first binding.
@@ -1628,8 +1781,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     auto* blocking_http_ptr = blocking_http.get();
     auto cancel_config = scanner_config;
     cancel_config.movies.roots = {"/Movies"};
-    CatalogueScanner cancel_scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(), node.hints(),
-                                    cancel_config, std::move(blocking_http));
+    CatalogueScanner cancel_scanner(node.node(), node.node().metadata_server(), node.filesystem(),
+                                    node.catalogue(), node.hints(), cancel_config,
+                                    std::move(blocking_http));
     // Scanner startup is idle on an already-operated library, so request the
     // pass whose in-flight provider request this test exercises.
     cancel_scanner.request_rescan();
@@ -1660,16 +1814,19 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     REQUIRE(budget_media_ids.size() == budget_files.size());
     auto budget_http = std::make_unique<FakeHttpClient>();
     auto* budget_http_ptr = budget_http.get();
-    budget_http->add("query=Budget%20One", 200, "application/json",
-                     R"({"results":[{"id":2001,"title":"Budget One","release_date":"2020-01-01"}]})");
+    budget_http->add(
+        "query=Budget%20One", 200, "application/json",
+        R"({"results":[{"id":2001,"title":"Budget One","release_date":"2020-01-01"}]})");
     budget_http->add("/movie/2001", 200, "application/json",
                      R"({"id":2001,"title":"Budget One","release_date":"2020-01-01"})");
-    budget_http->add("query=Budget%20Two", 200, "application/json",
-                     R"({"results":[{"id":2002,"title":"Budget Two","release_date":"2021-01-01"}]})");
+    budget_http->add(
+        "query=Budget%20Two", 200, "application/json",
+        R"({"results":[{"id":2002,"title":"Budget Two","release_date":"2021-01-01"}]})");
     budget_http->add("/movie/2002", 200, "application/json",
                      R"({"id":2002,"title":"Budget Two","release_date":"2021-01-01"})");
-    budget_http->add("query=Budget%20Three", 200, "application/json",
-                     R"({"results":[{"id":2003,"title":"Budget Three","release_date":"2022-01-01"}]})");
+    budget_http->add(
+        "query=Budget%20Three", 200, "application/json",
+        R"({"results":[{"id":2003,"title":"Budget Three","release_date":"2022-01-01"}]})");
     budget_http->add("/movie/2003", 200, "application/json",
                      R"({"id":2003,"title":"Budget Three","release_date":"2022-01-01"})");
 
@@ -1677,13 +1834,15 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     budget_config.movies.roots = {"/Budget"};
     budget_config.max_provider_requests_per_scan = 4;
     budget_config.provider_batch_delay = 1000ms;
-    CatalogueScanner budget_scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(), node.hints(),
-                                    budget_config, std::move(budget_http));
+    CatalogueScanner budget_scanner(node.node(), node.node().metadata_server(), node.filesystem(),
+                                    node.catalogue(), node.hints(), budget_config,
+                                    std::move(budget_http));
     CHECK(budget_scanner.scan_once() == 2);
     CHECK(budget_http_ptr->requests() == 4);
     size_t first_batch_items = 0;
     for (const auto* id : {"tmdb:movie:2001", "tmdb:movie:2002", "tmdb:movie:2003"})
-        if (node.catalogue().get(id).has_value()) ++first_batch_items;
+        if (node.catalogue().get(id).has_value())
+            ++first_batch_items;
     CHECK(first_batch_items == 2);
     CHECK(budget_scanner.scan_once() == 1);
     CHECK(budget_http_ptr->requests() == 6);
@@ -1728,8 +1887,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_recon
     fair_config.music.roots = {"/FairMusic"};
     fair_config.music.musicbrainz.enabled = true;
     fair_config.max_provider_requests_per_scan = 3;
-    CatalogueScanner fair_scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(), node.hints(),
-                                  fair_config, std::move(fair_http));
+    CatalogueScanner fair_scanner(node.node(), node.node().metadata_server(), node.filesystem(),
+                                  node.catalogue(), node.hints(), fair_config,
+                                  std::move(fair_http));
     CHECK(fair_scanner.scan_once() == 0);
     CHECK(fair_http_ptr->requests() == 3);
     CHECK(fair_http_ptr->requests_containing("/search/movie") == 1);
@@ -1772,12 +1932,15 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_admits_only_what_is_rea
         config.rescan_max_delay = 1s;
         auto http = std::make_unique<FakeHttpClient>();
         auto* requests = http.get();
-        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
-                                 node.hints(), config, std::move(http));
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(),
+                                 node.catalogue(), node.hints(), config, std::move(http));
         scanner.start();
-        REQUIRE(wait_until([&] {
-            return std::filesystem::exists(node.config().state_path / "catalogue" / "scanner.state");
-        }, 2s));
+        REQUIRE(wait_until(
+            [&] {
+                return std::filesystem::exists(node.config().state_path / "catalogue" /
+                                               "scanner.state");
+            },
+            2s));
         // Past the rescan debounce: a walk would have happened by now.
         std::this_thread::sleep_for(80ms);
         scanner.stop();
@@ -1797,12 +1960,14 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_admits_only_what_is_rea
         const auto empty_media_id = file_media_id(empty_entry);
         auto http = std::make_unique<FakeHttpClient>();
         auto* requests = http.get();
-        http->add("/search/movie", 200, "application/json",
-                  R"({"results":[{"id":4242,"title":"Transient Movie","release_date":"2026-01-01"}]})");
+        http->add(
+            "/search/movie", 200, "application/json",
+            R"({"results":[{"id":4242,"title":"Transient Movie","release_date":"2026-01-01"}]})");
         http->add("/movie/4242", 200, "application/json",
                   R"({"id":4242,"title":"Transient Movie","release_date":"2026-01-01"})");
-        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
-                                 node.hints(), scanner_for("/Transient"), std::move(http));
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(),
+                                 node.catalogue(), node.hints(), scanner_for("/Transient"),
+                                 std::move(http));
         CHECK(scanner.scan_once() == 0);
         CHECK(node.hints().summary().total == 0);
         CHECK(requests->requests() == 0);
@@ -1831,13 +1996,15 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_admits_only_what_is_rea
     {
         node.mkdir("/Profiles");
         const auto media_id = node.write("/Profiles/Profile.Failure.2026.mp4", pattern(32771));
-        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
-                                 node.hints(), scanner_for("/Profiles"), std::make_unique<FakeHttpClient>(), 5s,
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(),
+                                 node.catalogue(), node.hints(), scanner_for("/Profiles"),
+                                 std::make_unique<FakeHttpClient>(), 5s,
                                  std::make_shared<FakeMediaEngine>());
         CHECK(scanner.request_media_profiles({media_id}) == 1);
         std::string queued_id;
         for (const auto& hint : node.hints().list())
-            if (hint.state == CatalogueHintState::queued) queued_id = hint.id;
+            if (hint.state == CatalogueHintState::queued)
+                queued_id = hint.id;
         REQUIRE(!queued_id.empty());
         node.hints().fail(queued_id, "synthetic_failure", "synthetic profile failure");
         CHECK(scanner.request_media_profiles({media_id}) == 0);
@@ -1852,20 +2019,23 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_admits_only_what_is_rea
     {
         node.mkdir("/Samples");
         node.mkdir("/Samples/Sample");
-        const auto film = node.write("/Samples/Blade.Runner.2049.2017.1080p.mkv", pattern(32768, 1));
+        const auto film =
+            node.write("/Samples/Blade.Runner.2049.2017.1080p.mkv", pattern(32768, 1));
         (void)node.write("/Samples/Sample/Blade.Runner.2049.2017.1080p.mkv", pattern(32768, 2));
         (void)node.write("/Samples/Blade.Runner.2049.2017.1080p-sample.mkv", pattern(32768, 3));
         const auto blade_runner = [] {
             auto http = std::make_unique<FakeHttpClient>();
-            http->add("/search/movie", 200, "application/json",
-                      R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
+            http->add(
+                "/search/movie", 200, "application/json",
+                R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
             http->add("/movie/335984", 200, "application/json",
                       R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"})");
             return http;
         };
         const auto config = scanner_for("/Samples");
-        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
-                                 node.hints(), config, blade_runner(), 5s, std::make_shared<FakeMediaEngine>());
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(),
+                                 node.catalogue(), node.hints(), config, blade_runner(), 5s,
+                                 std::make_shared<FakeMediaEngine>());
         CHECK(scanner.scan_once() == 1);
         const auto item = node.catalogue().get("tmdb:movie:335984");
         REQUIRE(item.has_value());
@@ -1873,9 +2043,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_admits_only_what_is_rea
 
         auto everything_config = config;
         everything_config.ignore_terms.clear();
-        CatalogueScanner everything(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
-                                    node.hints(), everything_config, blade_runner(), 5s,
-                                    std::make_shared<FakeMediaEngine>());
+        CatalogueScanner everything(node.node(), node.node().metadata_server(), node.filesystem(),
+                                    node.catalogue(), node.hints(), everything_config,
+                                    blade_runner(), 5s, std::make_shared<FakeMediaEngine>());
         (void)everything.scan_once();
         const auto all = node.catalogue().get("tmdb:movie:335984");
         REQUIRE(all.has_value());
@@ -1886,12 +2056,15 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_admits_only_what_is_rea
     // next batch; absent from a snapshot taken after the hint, it is gone.
     {
         node.mkdir("/Late");
-        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
-                                 node.hints(), scanner_for("/Late"), std::make_unique<FakeHttpClient>());
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(),
+                                 node.catalogue(), node.hints(), scanner_for("/Late"),
+                                 std::make_unique<FakeHttpClient>());
         const auto claim = [&](const std::string& id) {
             // Earlier blocks left settled hints; claim until this one comes up.
-            for (auto claimed = node.hints().claim_next(); claimed; claimed = node.hints().claim_next())
-                if (claimed->id == id) return *claimed;
+            for (auto claimed = node.hints().claim_next(); claimed;
+                 claimed = node.hints().claim_next())
+                if (claimed->id == id)
+                    return *claimed;
             throw std::runtime_error("hint was never claimable: " + id);
         };
         const auto snapshot = node.metadata().snapshot(); // no such file in it
@@ -1933,10 +2106,12 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
     Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            return s1.node().membership().active().size() >= 2 &&
+                   s2.node().membership().active().size() >= 2;
+        },
+        5s));
 
     Service* non_coordinator = s1.node().node_id() > s2.node().node_id() ? &s1 : &s2;
     CatalogueScannerConfig scanner_config;
@@ -1949,9 +2124,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
     auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::all);
     Log::set_logger(capture);
     CatalogueScanner scanner(non_coordinator->node(), non_coordinator->metadata_server(),
-                             non_coordinator->filesystem(),
-                             non_coordinator->catalogue(), non_coordinator->catalogue_hints(),
-                             scanner_config, std::make_unique<FakeHttpClient>(), 1s);
+                             non_coordinator->filesystem(), non_coordinator->catalogue(),
+                             non_coordinator->catalogue_hints(), scanner_config,
+                             std::make_unique<FakeHttpClient>(), 1s);
     scanner.start();
     std::this_thread::sleep_for(1200ms);
     scanner.stop();
@@ -1966,9 +2141,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
             continue;
         const auto marker = message.find(" iterations=");
         REQUIRE(marker != std::string::npos);
-        max_iterations = std::max(
-            max_iterations,
-            static_cast<uint64_t>(std::stoull(message.substr(marker + 12))));
+        max_iterations = std::max(max_iterations,
+                                  static_cast<uint64_t>(std::stoull(message.substr(marker + 12))));
         saw_report = true;
     }
     CHECK(saw_report);
@@ -1981,7 +2155,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
     s1.stop();
 }
 
-MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_follows_machadfs_rename_and_delete) {
+MACHA_FAST_TEST("hydration_catalogue",
+                test_catalogue_hint_queue_follows_machadfs_rename_and_delete) {
     TempDir temp;
     const auto state = temp.path() / "manage-hints";
 
@@ -2007,20 +2182,20 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_follows_machadf
     CHECK(hints.rename_prefix("/Movies/B/in-flight.mkv", "/Movies/C/in-flight.mkv") == 1);
     CHECK(!hints.get(processing_id).has_value());
     auto after_processing_move = hints.list();
-    auto requeued = std::find_if(after_processing_move.begin(), after_processing_move.end(), [](const auto& hint) {
-        return hint.path == "/Movies/C/in-flight.mkv";
-    });
+    auto requeued =
+        std::find_if(after_processing_move.begin(), after_processing_move.end(),
+                     [](const auto& hint) { return hint.path == "/Movies/C/in-flight.mkv"; });
     REQUIRE(requeued != after_processing_move.end());
     CHECK(requeued->state == CatalogueHintState::queued);
 
     CHECK(hints.erase_prefix("/Movies/B") == 1);
     auto after_erase = hints.list();
-    CHECK(std::none_of(after_erase.begin(), after_erase.end(), [](const auto& hint) {
-        return hint.path == "/Movies/B/unknown.mkv";
-    }));
+    CHECK(std::none_of(after_erase.begin(), after_erase.end(),
+                       [](const auto& hint) { return hint.path == "/Movies/B/unknown.mkv"; }));
 }
 
-MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coalescing_and_priority) {
+MACHA_FAST_TEST("hydration_catalogue",
+                test_catalogue_hint_queue_persistence_coalescing_and_priority) {
     TempDir temp;
     const auto state = temp.path() / "hint-state";
 
@@ -2071,8 +2246,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
         // raises the same canonical-path item to the highest current priority.
         hints.submit("/Movies/Unknown.mkv", "manual", "manual:1",
                      CatalogueHintPriority::manual_rescan);
-        hints.submit("/Movies/Unknown.mkv", "ingest", "job-1",
-                     CatalogueHintPriority::ingest);
+        hints.submit("/Movies/Unknown.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
         auto coalesced = hints.get(no_match_id);
         REQUIRE(coalesced.has_value());
         CHECK(coalesced->state == CatalogueHintState::queued);
@@ -2125,8 +2299,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
     std::string cursor_id;
     {
         CatalogueHintQueue cursor(cursor_state);
-        cursor_id = cursor.submit("/Music/Artist/Album/01 - Track.mp3", "scanner",
-                                  "macha:cursor", CatalogueHintPriority::periodic_scan);
+        cursor_id = cursor.submit("/Music/Artist/Album/01 - Track.mp3", "scanner", "macha:cursor",
+                                  CatalogueHintPriority::periodic_scan);
         auto claimed = cursor.claim_next();
         REQUIRE(claimed.has_value());
         cursor.advance_candidate(cursor_id, 2);
@@ -2152,13 +2326,15 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
         failure_id = failure_queue.submit("/Movies/Broken.mkv", "scanner", "macha:broken",
                                           CatalogueHintPriority::periodic_scan);
         REQUIRE(failure_queue.claim_next().has_value());
-        CHECK(!failure_queue.record_failure(failure_id, "synthetic_failure", "first failure", 0, 2));
+        CHECK(
+            !failure_queue.record_failure(failure_id, "synthetic_failure", "first failure", 0, 2));
         auto once = failure_queue.get(failure_id);
         REQUIRE(once.has_value());
         CHECK(once->state == CatalogueHintState::deferred);
         CHECK(once->failures == 1);
         REQUIRE(failure_queue.claim_next().has_value());
-        CHECK(failure_queue.record_failure(failure_id, "synthetic_failure", "second failure", 0, 2));
+        CHECK(
+            failure_queue.record_failure(failure_id, "synthetic_failure", "second failure", 0, 2));
         auto dead = failure_queue.get(failure_id);
         REQUIRE(dead.has_value());
         CHECK(dead->state == CatalogueHintState::failed);
@@ -2190,7 +2366,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
         REQUIRE(failed_once.has_value());
         CHECK(failed_once->failures == 1);
         REQUIRE(queue.claim_next().has_value());
-        queue.defer(id, "catalogue_unavailable", "metadata durability temporarily unavailable", unix_ms() + 1000);
+        queue.defer(id, "catalogue_unavailable", "metadata durability temporarily unavailable",
+                    unix_ms() + 1000);
         auto deferred = queue.get(id);
         REQUIRE(deferred.has_value());
         CHECK(deferred->state == CatalogueHintState::deferred);
@@ -2223,8 +2400,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
     CHECK(!wake.wait_for_change({}, revision, 5ms));
     std::jthread producer([&] {
         std::this_thread::sleep_for(20ms);
-        wake.submit("/Movies/Wake.mkv", "ingest", "wake-job",
-                    CatalogueHintPriority::ingest);
+        wake.submit("/Movies/Wake.mkv", "ingest", "wake-job", CatalogueHintPriority::ingest);
     });
     CHECK(wake.wait_for_change({}, revision, 500ms));
     auto ready_delay = wake.next_ready_delay();
@@ -2269,7 +2445,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_an_ingest_and_its_torrent_read_one_c
     }
 }
 
-MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_jobs_publication_travels_the_wire_and_reaches_the_api) {
+MACHA_FAST_TEST("hydration_catalogue",
+                test_a_torrent_jobs_publication_travels_the_wire_and_reaches_the_api) {
     // A downloaded torrent waits while its extents are published into the
     // store; the job says how far that has got, and why it is waiting.
     TorrentJob job;
@@ -2321,7 +2498,8 @@ class TableTorrentService final : public TorrentService {
     bool set_state(std::string_view id, TorrentJobState state) {
         std::lock_guard lock(mutex_);
         const auto found = jobs_.find(id);
-        if (found == jobs_.end()) return false;
+        if (found == jobs_.end())
+            return false;
         found->second.state = state;
         return true;
     }
@@ -2332,16 +2510,21 @@ class TableTorrentService final : public TorrentService {
         jobs_[job.id] = std::move(job);
     }
 
-    bool enabled() const noexcept override { return true; }
+    bool enabled() const noexcept override {
+        return true;
+    }
     void reconfigure(TorrentConfig) override {}
-    std::string add(std::string) override { throw std::runtime_error("adds go through the coordinator"); }
+    std::string add(std::string) override {
+        throw std::runtime_error("adds go through the coordinator");
+    }
     std::string add_search_result(std::string) override {
         throw std::runtime_error("adds go through the coordinator");
     }
     std::vector<TorrentJob> jobs() const override {
         std::lock_guard lock(mutex_);
         std::vector<TorrentJob> out;
-        for (const auto& [_, job] : jobs_) out.push_back(job);
+        for (const auto& [_, job] : jobs_)
+            out.push_back(job);
         return out;
     }
     std::optional<TorrentJob> job(std::string_view id) const override {
@@ -2349,19 +2532,32 @@ class TableTorrentService final : public TorrentService {
         const auto found = jobs_.find(id);
         return found == jobs_.end() ? std::nullopt : std::optional<TorrentJob>{found->second};
     }
-    bool pause(std::string_view id) override { return set_state(id, TorrentJobState::paused); }
-    bool resume(std::string_view id) override { return set_state(id, TorrentJobState::downloading); }
-    bool retry(std::string_view) override { return false; }
-    bool cancel(std::string_view id) override { return set_state(id, TorrentJobState::cancelled); }
+    bool pause(std::string_view id) override {
+        return set_state(id, TorrentJobState::paused);
+    }
+    bool resume(std::string_view id) override {
+        return set_state(id, TorrentJobState::downloading);
+    }
+    bool retry(std::string_view) override {
+        return false;
+    }
+    bool cancel(std::string_view id) override {
+        return set_state(id, TorrentJobState::cancelled);
+    }
     bool clear(std::string_view id) override {
         std::lock_guard lock(mutex_);
         const auto found = jobs_.find(id);
-        if (found == jobs_.end()) return false;
+        if (found == jobs_.end())
+            return false;
         jobs_.erase(found);
         return true;
     }
-    Placement place(std::string_view, bool) override { return {}; }
-    Offer offer() const override { return {true, {}, 8, 0}; }
+    Placement place(std::string_view, bool) override {
+        return {};
+    }
+    Offer offer() const override {
+        return {true, {}, 8, 0};
+    }
     Resolved resolve(std::string_view uri, bool) override {
         return {std::string(uri), magnet_info_hash(uri), magnet_display_name(uri)};
     }
@@ -2380,7 +2576,8 @@ class TableTorrentService final : public TorrentService {
 
 } // namespace
 
-MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_and_are_driven_by_their_owner) {
+MACHA_TEST("hydration_catalogue",
+           test_torrent_requests_belong_to_the_cluster_and_are_driven_by_their_owner) {
     // TorrentCoordinator and the acquisition API on one node. With nothing
     // providing torrents the node answers from the cluster view and takes adds
     // that wait for a capable node. With a torrent service published it claims
@@ -2430,8 +2627,9 @@ MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_an
 
         // Torrents belong to the cluster: a node that cannot run one still
         // takes the add, and it waits for a node that can.
-        const auto added = call("POST", "/api/v1/torrents/jobs",
-                                R"({"magnet":"magnet:?xt=urn:btih:1234567890123456789012345678901234567890&dn=Waiting"})");
+        const auto added = call(
+            "POST", "/api/v1/torrents/jobs",
+            R"({"magnet":"magnet:?xt=urn:btih:1234567890123456789012345678901234567890&dn=Waiting"})");
         REQUIRE(added.status == 202);
         const auto body = api_body(added);
         CHECK(body.find("node_id")->isNull());
@@ -2446,8 +2644,9 @@ MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_an
         const auto id = body.find("id")->asString();
 
         // One request holds a torrent: a second add is refused naming it.
-        const auto again = call("POST", "/api/v1/torrents/jobs",
-                                R"({"magnet":"magnet:?xt=urn:btih:1234567890123456789012345678901234567890"})");
+        const auto again =
+            call("POST", "/api/v1/torrents/jobs",
+                 R"({"magnet":"magnet:?xt=urn:btih:1234567890123456789012345678901234567890"})");
         CHECK(again.status == 409);
         const auto refusal = api_body(again);
         CHECK(refusal.find("status")->asString() == "torrent_already_added");
@@ -2460,32 +2659,40 @@ MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_an
         const auto paused = call("POST", "/api/v1/torrents/jobs/" + id + "/pause");
         CHECK(paused.status == 202);
         CHECK(api_body(paused).find("desired")->asString() == "paused");
-        const auto patched = call("PATCH", "/api/v1/torrents/jobs/" + id, R"({"remove_after_ms":3600000})");
+        const auto patched =
+            call("PATCH", "/api/v1/torrents/jobs/" + id, R"({"remove_after_ms":3600000})");
         CHECK(patched.status == 200);
         CHECK(api_body(patched).find("remove_after_ms")->asUInt64() == 3600000);
-        CHECK(call("PATCH", "/api/v1/torrents/jobs/" + id, R"({"remove_after_ms":86400001})").status == 400);
+        CHECK(call("PATCH", "/api/v1/torrents/jobs/" + id, R"({"remove_after_ms":86400001})")
+                  .status == 400);
         CHECK(call("POST", "/api/v1/torrents/jobs/" + id + "/clear").status == 202);
         CHECK(api_body(call("GET", "/api/v1/torrents/jobs")).find("jobs")->asArray().empty());
 
         // Added already paused, in the same write: no pause to race.
-        const auto held = call("POST", "/api/v1/torrents/jobs",
-                               R"({"magnet":"magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd&dn=Held","paused":true})");
+        const auto held = call(
+            "POST", "/api/v1/torrents/jobs",
+            R"({"magnet":"magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd&dn=Held","paused":true})");
         REQUIRE(held.status == 202);
         CHECK(api_body(held).find("job")->find("desired")->asString() == "paused");
         const auto held_id = api_body(held).find("id")->asString();
         const auto resumed = call("POST", "/api/v1/torrents/jobs/" + held_id + "/resume");
         CHECK(resumed.status == 202);
         CHECK(api_body(resumed).find("desired")->asString() == "active");
-        CHECK(call("POST", "/api/v1/torrents/jobs",
-                   R"({"magnet":"magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","paused":"yes"})").status == 400);
+        CHECK(
+            call(
+                "POST", "/api/v1/torrents/jobs",
+                R"({"magnet":"magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","paused":"yes"})")
+                .status == 400);
         CHECK(call("POST", "/api/v1/torrents/jobs/" + held_id + "/clear").status == 202);
 
         // A pin to a node that cannot run torrents is refused.
-        const auto pinned = call("POST", "/api/v1/torrents/jobs",
-                                 R"({"magnet":"magnet:?xt=urn:btih:2234567890123456789012345678901234567890","node_id":")" +
-                                     to_string(self) + R"("})");
+        const auto pinned = call(
+            "POST", "/api/v1/torrents/jobs",
+            R"({"magnet":"magnet:?xt=urn:btih:2234567890123456789012345678901234567890","node_id":")" +
+                to_string(self) + R"("})");
         CHECK(pinned.status == 409);
-        CHECK(api_body(pinned).find("error")->find("reason")->asString() == "node_not_torrent_capable");
+        CHECK(api_body(pinned).find("error")->find("reason")->asString() ==
+              "node_not_torrent_capable");
         CHECK(call("GET", "/api/v1/torrents/jobs/whatever").status == 404);
         CHECK(call("POST", "/api/v1/torrents/jobs/whatever/pause").status == 404);
         const auto ingests = call("GET", "/api/v1/ingest/jobs");
@@ -2506,8 +2713,9 @@ MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_an
     // under the request's id, applies the operator's intent to it, and lets it
     // go when it is cleared.
     {
-        const auto added = coordinator.add("magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=Owned",
-                                           false, std::nullopt, std::nullopt);
+        const auto added =
+            coordinator.add("magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=Owned",
+                            false, std::nullopt, std::nullopt);
         REQUIRE(added.status == 202);
         const auto id = added.request->id;
         CHECK(added.request->phase == TorrentPhase::awaiting_node);
@@ -2561,7 +2769,8 @@ MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_an
         CHECK(r->claim->node_id == self);
         coordinator.pass_now();
         CHECK(coordinator.request("done-job").has_value()); // no delay set: kept
-        REQUIRE(coordinator.patch("done-job", std::optional<uint64_t>{0}, std::nullopt).status == 200);
+        REQUIRE(coordinator.patch("done-job", std::optional<uint64_t>{0}, std::nullopt).status ==
+                200);
         coordinator.pass_now();
         CHECK(!coordinator.request("done-job").has_value());
         CHECK(!torrents->job("done-job").has_value());
@@ -2663,8 +2872,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_job_is_saved_only_when_its
     job.updated_unix_ms = 1;
 
     auto same = job;
-    same.updated_unix_ms = 2;       // the timestamp is not the record
-    same.download_rate = 5000;      // nor are the live counters
+    same.updated_unix_ms = 2;  // the timestamp is not the record
+    same.download_rate = 5000; // nor are the live counters
     same.peers = 12;
     same.eta_seconds = 60;
     CHECK(torrent_job_change(job, same) == TorrentJobChange::none);
@@ -2690,18 +2899,21 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_job_is_saved_only_when_its
 namespace {
 uint64_t torrent_thread_faults() {
     for (const auto& status : supervised_thread_statuses())
-        if (status.name == "torrent") return status.faults;
+        if (status.name == "torrent")
+            return status.faults;
     return 0;
 }
 
 size_t torrent_thread_running() {
     for (const auto& status : supervised_thread_statuses())
-        if (status.name == "torrent") return status.running;
+        if (status.name == "torrent")
+            return status.running;
     return 0;
 }
 
 Json::Object recorded_torrent(const std::filesystem::path& staging, const std::string& id,
-                              const std::string& hash, const std::string& state, uint64_t created = 1) {
+                              const std::string& hash, const std::string& state,
+                              uint64_t created = 1) {
     const auto payload = staging / "torrents" / id;
     std::filesystem::create_directories(payload);
     Json::Object job;
@@ -2718,9 +2930,9 @@ Json::Object recorded_torrent(const std::filesystem::path& staging, const std::s
 }
 
 // A failed torrent job with the failed ingest it handed its payload to.
-void record_failed_import(Json::Array& torrents, Json::Array& ingests, const std::filesystem::path& staging,
-                          const std::string& torrent_id, const std::string& ingest_id,
-                          const std::string& hash) {
+void record_failed_import(Json::Array& torrents, Json::Array& ingests,
+                          const std::filesystem::path& staging, const std::string& torrent_id,
+                          const std::string& ingest_id, const std::string& hash) {
     auto torrent = recorded_torrent(staging, torrent_id, hash, "failed");
     torrent["bytes_total"] = static_cast<uint64_t>(1234);
     torrent["bytes_completed"] = static_cast<uint64_t>(1234);
@@ -2762,7 +2974,8 @@ void write_jobs_file(const std::filesystem::path& path, uint64_t version, Json::
 
 // Integrated: the real libmacha-torrent module, loaded as SubsystemSupervisor
 // loads it, restoring jobs.json into a libtorrent session.
-MACHA_TEST("hydration_catalogue", test_the_torrent_plugin_restores_its_jobs_and_runs_them_through_the_engine) {
+MACHA_TEST("hydration_catalogue",
+           test_the_torrent_plugin_restores_its_jobs_and_runs_them_through_the_engine) {
     const std::string duplicated(40, '5');
     TestNode fixture("torrent-plugin");
     fixture.prepare();
@@ -2772,15 +2985,21 @@ MACHA_TEST("hydration_catalogue", test_the_torrent_plugin_restores_its_jobs_and_
         Json::Array torrents;
         Json::Array ingests;
         // Saved without an info_hash: backfilled from its magnet on load.
-        auto done = recorded_torrent(staging_path, "torrent-done", std::string(40, '3'), "completed");
+        auto done =
+            recorded_torrent(staging_path, "torrent-done", std::string(40, '3'), "completed");
         done.erase("info_hash");
         torrents.emplace_back(std::move(done));
-        record_failed_import(torrents, ingests, staging_path, "torrent-retry", "ingest-retry", std::string(40, '1'));
-        record_failed_import(torrents, ingests, staging_path, "torrent-follow", "ingest-follow", std::string(40, 'f'));
-        torrents.emplace_back(recorded_torrent(staging_path, "torrent-pause", std::string(40, '2'), "queued"));
+        record_failed_import(torrents, ingests, staging_path, "torrent-retry", "ingest-retry",
+                             std::string(40, '1'));
+        record_failed_import(torrents, ingests, staging_path, "torrent-follow", "ingest-follow",
+                             std::string(40, 'f'));
+        torrents.emplace_back(
+            recorded_torrent(staging_path, "torrent-pause", std::string(40, '2'), "queued"));
         // Two jobs recorded for one torrent, the later one listed first.
-        torrents.emplace_back(recorded_torrent(staging_path, "dup-second", duplicated, "queued", 20));
-        torrents.emplace_back(recorded_torrent(staging_path, "dup-first", duplicated, "queued", 10));
+        torrents.emplace_back(
+            recorded_torrent(staging_path, "dup-second", duplicated, "queued", 20));
+        torrents.emplace_back(
+            recorded_torrent(staging_path, "dup-first", duplicated, "queued", 10));
         write_jobs_file(state_path / "torrent" / "jobs.json", 1, std::move(torrents));
         write_jobs_file(state_path / "ingest" / "jobs.json", 2, std::move(ingests));
     }
@@ -2819,14 +3038,17 @@ MACHA_TEST("hydration_catalogue", test_the_torrent_plugin_restores_its_jobs_and_
     LoadedTorrentPlugin plugin(context);
     struct StopPlugin {
         LoadedTorrentPlugin& plugin;
-        ~StopPlugin() { plugin.subsystem().stop(); }
+        ~StopPlugin() {
+            plugin.subsystem().stop();
+        }
     } stop_plugin{plugin};
     const auto torrents_owner = registry.torrent();
     REQUIRE(torrents_owner);
     auto& torrents = *torrents_owner;
     TorrentSearchManager search(torrent_config);
     ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
-    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs, state_path);
+    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
+                                   state_path);
     AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
     const auto post = [&](const std::string& path) {
         HttpRequest request;
@@ -2882,8 +3104,9 @@ MACHA_TEST("hydration_catalogue", test_the_torrent_plugin_restores_its_jobs_and_
     // A request claimed here runs in the engine under the request's id and
     // follows the operator's intent.
     {
-        const auto added = coordinator.add("magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=Owned",
-                                           false, std::nullopt, std::nullopt);
+        const auto added =
+            coordinator.add("magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=Owned",
+                            false, std::nullopt, std::nullopt);
         REQUIRE(added.status == 202);
         const auto id = added.request->id;
         coordinator.pass_now();
@@ -2919,7 +3142,8 @@ MACHA_TEST("hydration_catalogue", test_the_torrent_plugin_restores_its_jobs_and_
     // add is refused with the holder's id, whatever the holder's state, until
     // it is cleared and nothing of it is left in the session.
     {
-        const std::string magnet = "magnet:?xt=urn:btih:4444444444444444444444444444444444444444&dn=Twice";
+        const std::string magnet =
+            "magnet:?xt=urn:btih:4444444444444444444444444444444444444444&dn=Twice";
         const auto first = torrents.place(magnet, false);
         REQUIRE(first.placed);
         const auto again = torrents.place(magnet, false);
@@ -2929,7 +3153,8 @@ MACHA_TEST("hydration_catalogue", test_the_torrent_plugin_restores_its_jobs_and_
         CHECK(again.node_id == self);
         size_t holding = 0;
         for (const auto& job : torrents.jobs())
-            if (job.info_hash == "4444444444444444444444444444444444444444") ++holding;
+            if (job.info_hash == "4444444444444444444444444444444444444444")
+                ++holding;
         CHECK(holding == 1);
         REQUIRE(torrents.cancel(first.job_id));
         CHECK(torrents.place(magnet, false).reason == "torrent_already_added");
@@ -2947,10 +3172,12 @@ MACHA_TEST("hydration_catalogue", test_the_torrent_plugin_restores_its_jobs_and_
     time.advance(11s);
     REQUIRE(wait_until([&] { return time.reads() >= reads + 4; }, 10s));
     CHECK(torrent_thread_faults() == faults_before);
-    for (const auto& job : torrents.jobs()) CHECK(job.error_code != "torrent_fault");
+    for (const auto& job : torrents.jobs())
+        CHECK(job.error_code != "torrent_fault");
     // The worker is still inside its loop, and a new job is still taken.
     CHECK(torrent_thread_running() == 1);
-    const auto fresh = torrents.place("magnet:?xt=urn:btih:6666666666666666666666666666666666666666&dn=After", false);
+    const auto fresh = torrents.place(
+        "magnet:?xt=urn:btih:6666666666666666666666666666666666666666&dn=After", false);
     REQUIRE(fresh.placed);
     CHECK(torrents.job(fresh.job_id).has_value());
     // The worker has sampled the restored handles by now: the explicit pause
@@ -2962,9 +3189,8 @@ MACHA_TEST("hydration_catalogue", test_the_torrent_plugin_restores_its_jobs_and_
     // Resumed through the ingest's own route, the ingest is queued (its workers
     // are not running here) and the torrent follows it back, failure cleared.
     REQUIRE(post("/api/v1/ingest/jobs/ingest-follow/resume").status == 200);
-    REQUIRE(wait_until([&] {
-        return torrents.job("torrent-follow")->state == TorrentJobState::importing;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] { return torrents.job("torrent-follow")->state == TorrentJobState::importing; }, 5s));
     CHECK(torrents.job("torrent-follow")->error.empty());
     CHECK(torrents.job("torrent-follow")->error_code.empty());
 }
@@ -3008,8 +3234,8 @@ struct PublishedSource {
     std::vector<ObjectId> ids;
 };
 
-PublishedSource make_published_source(const std::filesystem::path& root, uint64_t extent_size, FileSystem& fs,
-                                      const Bytes& bytes, bool store_them) {
+PublishedSource make_published_source(const std::filesystem::path& root, uint64_t extent_size,
+                                      FileSystem& fs, const Bytes& bytes, bool store_them) {
     PublishedSource out;
     out.root = root;
     out.name = "Published Movie 2024.mkv";
@@ -3038,8 +3264,10 @@ Bytes read_whole(FileSystem& fs, const std::string& path, uint64_t size) {
     auto reader = fs.open_read(path);
     size_t done = 0;
     while (done < out.size()) {
-        const auto got = reader->read(done, std::span<uint8_t>(out.data() + done, out.size() - done));
-        if (!got) break;
+        const auto got =
+            reader->read(done, std::span<uint8_t>(out.data() + done, out.size() - done));
+        if (!got)
+            break;
         done += got;
     }
     out.resize(done);
@@ -3101,10 +3329,13 @@ class CommitGate {
     }
 
     void operator()(const MetadataPublicationContext& context) {
-        if (!context.delta) return;
+        if (!context.delta)
+            return;
         std::vector<std::string_view> paths;
-        for (const auto& [path, _] : context.delta->upsert_entries) paths.push_back(path);
-        for (const auto& [path, _] : context.delta->append_entries) paths.push_back(path);
+        for (const auto& [path, _] : context.delta->upsert_entries)
+            paths.push_back(path);
+        for (const auto& [path, _] : context.delta->append_entries)
+            paths.push_back(path);
         std::unique_lock lock(mutex_);
         bool block = false;
         for (auto& hold : holds_) {
@@ -3112,11 +3343,15 @@ class CommitGate {
                 return hold.ending ? path.ends_with(hold.name)
                                    : path.find(hold.name) != std::string_view::npos;
             });
-            if (!named) continue;
-            if (hold.skip) --hold.skip;
-            else block = true;
+            if (!named)
+                continue;
+            if (hold.skip)
+                --hold.skip;
+            else
+                block = true;
         }
-        if (!block) return;
+        if (!block)
+            return;
         ++held_;
         cv_.wait(lock, [&] { return holds_.empty(); });
         --held_;
@@ -3137,7 +3372,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_fil
     auto& fs = node.filesystem();
     node.mkdir("/Movies");
     node.mkdir("/Movies/The Martian (2015)");
-    fs.create_file("/Movies/The Martian (2015)/The.Martian.2015.EXTENDED.1080p.mkv", 0644, getuid(), getgid());
+    fs.create_file("/Movies/The Martian (2015)/The.Martian.2015.EXTENDED.1080p.mkv", 0644, getuid(),
+                   getgid());
 
     const auto external = node.path() / "external-import";
     const auto media = write_host_file(external / "Queue Test Movie 2024.mkv", pattern(512 * 1024));
@@ -3152,11 +3388,13 @@ MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_fil
     (void)write_host_file(rome / "Season 1/Extras" / "Menu Art.mkv", first_menu);
     (void)write_host_file(rome / "Season 2/Extras" / "Menu Art.mkv", second_menu);
     const auto published_bytes = pattern(2 * node.config().extent_size + 1000, 5);
-    const auto published = make_published_source(node.path() / "published-import", node.config().extent_size, fs,
-                                                 published_bytes, true);
+    const auto published = make_published_source(
+        node.path() / "published-import", node.config().extent_size, fs, published_bytes, true);
     const auto martian = node.path() / "martian";
-    (void)write_host_file(martian / "the.martian.2015.extended.720p.bluray.x264-nezu.mkv", pattern(64 * 1024 + 5, 5));
-    (void)write_host_file(martian / "the.martian.2015.extended.1080p.mkv", pattern(64 * 1024 + 6, 6));
+    (void)write_host_file(martian / "the.martian.2015.extended.720p.bluray.x264-nezu.mkv",
+                          pattern(64 * 1024 + 5, 5));
+    (void)write_host_file(martian / "the.martian.2015.extended.1080p.mkv",
+                          pattern(64 * 1024 + 6, 6));
 
     IngestConfig config;
     config.enabled = true;
@@ -3171,22 +3409,26 @@ MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_fil
     // Copied, the job waits on the catalogue; the hint's outcome completes it.
     {
         const auto id = ingest.submit_path(external);
-        REQUIRE(wait_until([&] {
-            auto job = ingest.job(id);
-            return job && job->state == IngestJobState::cataloguing;
-        }, 10s));
+        REQUIRE(wait_until(
+            [&] {
+                auto job = ingest.job(id);
+                return job && job->state == IngestJobState::cataloguing;
+            },
+            10s));
         const auto summary = node.hints().summary("ingest", id);
         REQUIRE(summary.total == 1);
         REQUIRE(summary.pending == 1);
         auto hint = node.hints().claim_next();
         REQUIRE(hint.has_value());
         CHECK(hint->origins.size() == 1);
-        node.hints().mark_catalogued(hint->id, "movies", "macha:test-ingest-media", {"test:movie:queue"},
-                                     "synthetic match");
-        REQUIRE(wait_until([&] {
-            auto job = ingest.job(id);
-            return job && job->state == IngestJobState::completed;
-        }, 5s));
+        node.hints().mark_catalogued(hint->id, "movies", "macha:test-ingest-media",
+                                     {"test:movie:queue"}, "synthetic match");
+        REQUIRE(wait_until(
+            [&] {
+                auto job = ingest.job(id);
+                return job && job->state == IngestJobState::completed;
+            },
+            5s));
         const auto completed = ingest.job(id);
         REQUIRE(completed.has_value());
         CHECK(completed->catalogue_total == 1);
@@ -3207,9 +3449,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_fil
     const auto rome_id = ingest.submit_path(rome);
     const auto published_id = ingest.submit_path(published.root);
     const auto martian_id = ingest.submit_path(martian);
-    REQUIRE(wait_until([&] {
-        return all_imports_copied(ingest, {rome_id, published_id, martian_id});
-    }, 60s));
+    REQUIRE(wait_until(
+        [&] { return all_imports_copied(ingest, {rome_id, published_id, martian_id}); }, 60s));
 
     {
         // Two same-named files, neither yet in the filesystem.
@@ -3232,7 +3473,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_fil
         const auto entry = fs.getattr(destination);
         CHECK(entry.size == published_bytes.size());
         REQUIRE(entry.extents.size() == published.ids.size());
-        for (size_t i = 0; i < published.ids.size(); ++i) CHECK(entry.extents[i].id == published.ids[i]);
+        for (size_t i = 0; i < published.ids.size(); ++i)
+            CHECK(entry.extents[i].id == published.ids[i]);
         CHECK(read_whole(fs, destination, published_bytes.size()) == published_bytes);
     }
     {
@@ -3244,11 +3486,13 @@ MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_fil
         for (const auto& file : job->files) {
             CHECK(file.destination_path.starts_with("/Movies/The Martian (2015)/"));
             if (file.source_path.ends_with("1080p.mkv"))
-                CHECK(file.destination_path != "/Movies/The Martian (2015)/the.martian.2015.extended.1080p.mkv");
+                CHECK(file.destination_path !=
+                      "/Movies/The Martian (2015)/the.martian.2015.extended.1080p.mkv");
         }
         size_t martian_folders = 0;
         for (const auto& [name, entry] : fs.readdir("/Movies"))
-            if (entry.type == EntryType::directory && name.find("artian") != std::string::npos) ++martian_folders;
+            if (entry.type == EntryType::directory && name.find("artian") != std::string::npos)
+                ++martian_folders;
         CHECK(martian_folders == 1);
     }
     ingest.stop();
@@ -3273,7 +3517,9 @@ MACHA_TEST("hydration_catalogue", test_a_pause_or_cancel_accepted_during_the_fin
         IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
         struct ReleaseGate {
             CommitGate& gate;
-            ~ReleaseGate() { gate.release_all(); }
+            ~ReleaseGate() {
+                gate.release_all();
+            }
         } release_gate{gate};
         const auto id = ingest.submit_path(roots.front());
         ingest.start();
@@ -3322,7 +3568,9 @@ MACHA_TEST("hydration_catalogue", test_a_pause_or_cancel_accepted_while_the_work
         IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
         struct ReleaseGate {
             CommitGate& gate;
-            ~ReleaseGate() { gate.release_all(); }
+            ~ReleaseGate() {
+                gate.release_all();
+            }
         } release_gate{gate};
         const auto id = ingest.submit_path(roots.front());
         ingest.start();
@@ -3358,10 +3606,12 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_are_paused_resumed_and_cance
     // waits on the paused file alone; resuming that file finishes the job, and
     // the cancelled file is never imported and leaves the job's totals.
     CommitGate gate;
-    CatalogueNode node("ingest-files", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    CatalogueNode node("ingest-files", {},
+                       [&](const MetadataPublicationContext& context) { gate(context); });
     constexpr size_t file_bytes = 1024 * 1024;
     const auto root = node.path() / "three-files";
-    const std::vector<std::string> names{"Alpha Movie 2024.mkv", "Beta Movie 2024.mkv", "Gamma Movie 2024.mkv"};
+    const std::vector<std::string> names{"Alpha Movie 2024.mkv", "Beta Movie 2024.mkv",
+                                         "Gamma Movie 2024.mkv"};
     for (const auto& name : names) {
         (void)write_host_file(root / name, pattern(file_bytes));
         gate.hold(name, 1);
@@ -3375,19 +3625,25 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_are_paused_resumed_and_cance
     IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
     struct ReleaseGate {
         CommitGate& gate;
-        ~ReleaseGate() { gate.release_all(); }
+        ~ReleaseGate() {
+            gate.release_all();
+        }
     } release_gate{gate};
     const auto id = ingest.submit_path(root);
     ingest.start();
 
-    REQUIRE(wait_until([&] {
-        const auto job = ingest.job(id);
-        return job && job->state == IngestJobState::importing && !job->current_file.empty() && gate.held() > 0;
-    }, 30s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest.job(id);
+            return job && job->state == IngestJobState::importing && !job->current_file.empty() &&
+                   gate.held() > 0;
+        },
+        30s));
     const auto planned = *ingest.job(id);
     REQUIRE(planned.files.size() == 3);
     size_t held = 0;
-    while (planned.files[held].source_path != planned.current_file) ++held;
+    while (planned.files[held].source_path != planned.current_file)
+        ++held;
     const size_t cancelled = (held + 1) % 3;
     const size_t other = (held + 2) % 3;
 
@@ -3407,10 +3663,12 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_are_paused_resumed_and_cance
 
     gate.release_all();
     // The other file is copied; then only the paused one is left.
-    REQUIRE(wait_until([&] {
-        const auto job = ingest.job(id);
-        return job && job->state == IngestJobState::paused && job->files[other].completed;
-    }, 60s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest.job(id);
+            return job && job->state == IngestJobState::paused && job->files[other].completed;
+        },
+        60s));
     {
         const auto job = *ingest.job(id);
         CHECK(job.held_by_files);
@@ -3426,7 +3684,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_are_paused_resumed_and_cance
     const auto done = *ingest.job(id);
     CHECK(done.files_completed == 2);
     CHECK(done.files_total == 2);
-    CHECK(read_whole(node.filesystem(), done.files[held].destination_path, file_bytes) == pattern(file_bytes));
+    CHECK(read_whole(node.filesystem(), done.files[held].destination_path, file_bytes) ==
+          pattern(file_bytes));
     CHECK(!done.files[cancelled].completed);
     CHECK(absent(node.filesystem(), done.files[cancelled].destination_path));
     CHECK(absent(node.filesystem(), done.files[cancelled].temporary_path));
@@ -3438,20 +3697,24 @@ std::string partial_of(const std::string& destination, const std::string& id) {
     return destination + ".macha-ingest-" + id.substr(0, 12) + ".part";
 }
 
-MACHA_TEST("hydration_catalogue", test_an_error_of_one_file_fails_that_file_and_the_job_carries_on) {
+MACHA_TEST("hydration_catalogue",
+           test_an_error_of_one_file_fails_that_file_and_the_job_carries_on) {
     // Five files, the job paused inside the first real copy. Four meet an
     // error that is theirs alone, each fails with its code, and the fifth is
     // imported: the job completes with a count of what failed, the same after
     // a restart and on the wire.
     CommitGate gate;
-    CatalogueNode node("ingest-file-failures", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    CatalogueNode node("ingest-file-failures", {},
+                       [&](const MetadataPublicationContext& context) { gate(context); });
     auto& fs = node.filesystem();
     constexpr size_t file_bytes = 1024 * 1024;
     const auto root = node.path() / "five-files";
-    const std::vector<std::string> names{"Alpha Movie 2024.mkv", "Beta Movie 2024.mkv", "Gamma Movie 2024.mkv",
-                                         "Delta Movie 2024.mkv", "Epsilon Movie 2024.mkv"};
+    const std::vector<std::string> names{"Alpha Movie 2024.mkv", "Beta Movie 2024.mkv",
+                                         "Gamma Movie 2024.mkv", "Delta Movie 2024.mkv",
+                                         "Epsilon Movie 2024.mkv"};
     uint8_t seed = 10;
-    for (const auto& name : names) (void)write_host_file(root / name, pattern(file_bytes, seed++));
+    for (const auto& name : names)
+        (void)write_host_file(root / name, pattern(file_bytes, seed++));
     IngestConfig config;
     config.enabled = true;
     config.staging_path = node.path() / "staging";
@@ -3461,7 +3724,9 @@ MACHA_TEST("hydration_catalogue", test_an_error_of_one_file_fails_that_file_and_
     auto ingest = std::make_unique<IngestManager>(node.node(), fs, node.hints(), config);
     struct ReleaseGate {
         CommitGate& gate;
-        ~ReleaseGate() { gate.release_all(); }
+        ~ReleaseGate() {
+            gate.release_all();
+        }
     } release_gate{gate};
     const auto id = ingest->submit_path(root);
 
@@ -3473,19 +3738,25 @@ MACHA_TEST("hydration_catalogue", test_an_error_of_one_file_fails_that_file_and_
 
     gate.hold(".macha-ingest-", 1);
     ingest->start();
-    REQUIRE(wait_until([&] {
-        const auto job = ingest->job(id);
-        return job && job->state == IngestJobState::importing && !job->current_file.empty() && gate.held() > 0;
-    }, 30s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest->job(id);
+            return job && job->state == IngestJobState::importing && !job->current_file.empty() &&
+                   gate.held() > 0;
+        },
+        30s));
     const auto planned = *ingest->job(id);
     REQUIRE(planned.files.size() == 5);
     std::map<std::string, size_t> role;
     std::vector<size_t> others;
     for (size_t i = 0; i < 5; ++i) {
         const auto& file = planned.files[i];
-        if (file.source_path == planned.current_file) role["renamed_over"] = i;
-        else if (file.source_path.ends_with("Delta Movie 2024.mkv")) role["partial"] = i;
-        else others.push_back(i);
+        if (file.source_path == planned.current_file)
+            role["renamed_over"] = i;
+        else if (file.source_path.ends_with("Delta Movie 2024.mkv"))
+            role["partial"] = i;
+        else
+            others.push_back(i);
     }
     REQUIRE(role.size() == 2);
     REQUIRE(others.size() == 3);
@@ -3497,8 +3768,12 @@ MACHA_TEST("hydration_catalogue", test_an_error_of_one_file_fails_that_file_and_
     gate.release_all();
     REQUIRE(wait_until([&] { return ingest->active_jobs() == 0; }, 30s));
     const auto& policy = node.config().filesystem;
-    const auto create = [&](const std::string& path) { fs.create_file(path, 0644, policy.root_uid, policy.root_gid); };
-    const auto dirname = [](const std::string& path) { return std::filesystem::path(path).parent_path().string(); };
+    const auto create = [&](const std::string& path) {
+        fs.create_file(path, 0644, policy.root_uid, policy.root_gid);
+    };
+    const auto dirname = [](const std::string& path) {
+        return std::filesystem::path(path).parent_path().string();
+    };
     // The destination appears while the copy runs, and before one starts.
     create(planned.files[role["renamed_over"]].destination_path);
     node.mkdir(dirname(planned.files[role["conflict"]].destination_path));
@@ -3507,11 +3782,14 @@ MACHA_TEST("hydration_catalogue", test_an_error_of_one_file_fails_that_file_and_
     create(dirname(planned.files[role["parent"]].destination_path));
     REQUIRE(ingest->resume(id));
 
-    REQUIRE(wait_until([&] {
-        const auto job = ingest->job(id);
-        return job && (job->state == IngestJobState::cataloguing || job->state == IngestJobState::completed ||
-                       job->state == IngestJobState::failed);
-    }, 60s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest->job(id);
+            return job && (job->state == IngestJobState::cataloguing ||
+                           job->state == IngestJobState::completed ||
+                           job->state == IngestJobState::failed);
+        },
+        60s));
     const auto check = [&](const IngestJob& job) {
         CHECK(job.state != IngestJobState::failed);
         CHECK(job.error_code.empty());
@@ -3521,10 +3799,11 @@ MACHA_TEST("hydration_catalogue", test_an_error_of_one_file_fails_that_file_and_
         CHECK(job.bytes_total == file_bytes);
         CHECK(job.bytes_completed == file_bytes);
         CHECK(ingest_file_state_name(job, role["imported"]) == "completed");
-        const std::map<std::string, std::string> codes{{"renamed_over", "destination_conflict"},
-                                                       {"conflict", "destination_conflict"},
-                                                       {"parent", "destination_parent_not_directory"},
-                                                       {"partial", "partial_not_file"}};
+        const std::map<std::string, std::string> codes{
+            {"renamed_over", "destination_conflict"},
+            {"conflict", "destination_conflict"},
+            {"parent", "destination_parent_not_directory"},
+            {"partial", "partial_not_file"}};
         for (const auto& [name, code] : codes) {
             const auto& file = job.files[role[name]];
             CHECK(ingest_file_state_name(job, role[name]) == "failed");
@@ -3535,12 +3814,14 @@ MACHA_TEST("hydration_catalogue", test_an_error_of_one_file_fails_that_file_and_
     };
     const auto done = *ingest->job(id);
     check(done);
-    CHECK(read_whole(fs, done.files[role["imported"]].destination_path, file_bytes).size() == file_bytes);
+    CHECK(read_whole(fs, done.files[role["imported"]].destination_path, file_bytes).size() ==
+          file_bytes);
     CHECK(absent(fs, done.files[role["renamed_over"]].temporary_path));
     // What was already there is untouched, and each source stays.
     CHECK(fs.getattr(done.files[role["renamed_over"]].destination_path).size == 0);
     CHECK(fs.getattr(done.files[role["conflict"]].destination_path).size == 0);
-    for (const auto& name : names) CHECK(std::filesystem::exists(root / name));
+    for (const auto& name : names)
+        CHECK(std::filesystem::exists(root / name));
 
     // On the wire, and in what the API sends.
     check(parse_ingest_job_wire(ingest_job_wire_json(done)));
@@ -3561,11 +3842,13 @@ MACHA_TEST("hydration_catalogue", test_an_error_of_one_file_fails_that_file_and_
     restarted.stop();
 }
 
-MACHA_TEST("hydration_catalogue", test_a_failed_file_refuses_pause_and_resume_and_can_be_cancelled) {
+MACHA_TEST("hydration_catalogue",
+           test_a_failed_file_refuses_pause_and_resume_and_can_be_cancelled) {
     // The other file held by a file pause, so the job waits with the failure
     // on record and is not yet finished.
     CommitGate gate;
-    CatalogueNode node("ingest-failed-file-actions", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    CatalogueNode node("ingest-failed-file-actions", {},
+                       [&](const MetadataPublicationContext& context) { gate(context); });
     auto& fs = node.filesystem();
     constexpr size_t file_bytes = 1024 * 1024;
     const auto root = node.path() / "two-files";
@@ -3580,7 +3863,9 @@ MACHA_TEST("hydration_catalogue", test_a_failed_file_refuses_pause_and_resume_an
     IngestManager ingest(node.node(), fs, node.hints(), config);
     struct ReleaseGate {
         CommitGate& gate;
-        ~ReleaseGate() { gate.release_all(); }
+        ~ReleaseGate() {
+            gate.release_all();
+        }
     } release_gate{gate};
     const auto id = ingest.submit_path(root);
     // A file where Beta's folder goes.
@@ -3596,11 +3881,13 @@ MACHA_TEST("hydration_catalogue", test_a_failed_file_refuses_pause_and_resume_an
     const size_t beta = 1 - alpha;
     REQUIRE(ingest.file_action(id, alpha, "pause_file").changed);
     gate.release_all();
-    REQUIRE(wait_until([&] {
-        const auto job = ingest.job(id);
-        return job && (job->state == IngestJobState::failed ||
-                       (job->state == IngestJobState::paused && job->held_by_files));
-    }, 60s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest.job(id);
+            return job && (job->state == IngestJobState::failed ||
+                           (job->state == IngestJobState::paused && job->held_by_files));
+        },
+        60s));
     {
         const auto job = *ingest.job(id);
         CHECK(job.state == IngestJobState::paused);
@@ -3626,7 +3913,8 @@ MACHA_TEST("hydration_catalogue", test_a_files_actions_work_on_a_failed_job) {
     // A job failed by a commit that failed: it can be restarted, so what it
     // will run can be changed first.
     CommitGate gate;
-    CatalogueNode node("ingest-failed-job-actions", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    CatalogueNode node("ingest-failed-job-actions", {},
+                       [&](const MetadataPublicationContext& context) { gate(context); });
     constexpr size_t file_bytes = 1024 * 1024;
     const auto root = node.path() / "two-files";
     (void)write_host_file(root / "Alpha Movie 2024.mkv", pattern(file_bytes, 30));
@@ -3640,7 +3928,9 @@ MACHA_TEST("hydration_catalogue", test_a_files_actions_work_on_a_failed_job) {
     IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
     struct ReleaseGate {
         CommitGate& gate;
-        ~ReleaseGate() { gate.release_all(); }
+        ~ReleaseGate() {
+            gate.release_all();
+        }
     } release_gate{gate};
     gate.hold(".macha-ingest-", 1);
     const auto id = ingest.submit_path(root);
@@ -3648,14 +3938,17 @@ MACHA_TEST("hydration_catalogue", test_a_files_actions_work_on_a_failed_job) {
     REQUIRE(wait_until([&] { return gate.held() > 0; }, 30s));
     const auto planned = *ingest.job(id);
     size_t worked = 0;
-    while (planned.files[worked].source_path != planned.current_file) ++worked;
+    while (planned.files[worked].source_path != planned.current_file)
+        ++worked;
     const size_t other = 1 - worked;
     gate.fail_on_release();
     gate.release_all();
-    REQUIRE(wait_until([&] {
-        const auto job = ingest.job(id);
-        return job && job->state == IngestJobState::failed;
-    }, 30s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest.job(id);
+            return job && job->state == IngestJobState::failed;
+        },
+        30s));
 
     CHECK(ingest.file_action(id, other, "pause_file").changed);
     CHECK(ingest.file_action(id, other, "resume_file").changed);
@@ -3720,9 +4013,10 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_a_series_extras_under_the_se
         files.insert(files.end(), job->files.begin(), job->files.end());
     }
     const auto file_at = [&](std::string_view source) {
-        const auto found = std::find_if(files.begin(), files.end(), [&](const IngestFileProgress& file) {
-            return file.source_path.ends_with(source);
-        });
+        const auto found =
+            std::find_if(files.begin(), files.end(), [&](const IngestFileProgress& file) {
+                return file.source_path.ends_with(source);
+            });
         REQUIRE(found != files.end());
         return *found;
     };
@@ -3746,11 +4040,14 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_a_series_extras_under_the_se
           other_show + "/Bonus Disc/Deleted Scenes.mkv");
 
     const auto solo = series_of("Solo Show/Solo Show S01E01.mkv");
-    CHECK(file_at("Solo Show/Extras/Making Of Solo.mkv").destination_path == solo + "/Extras/Making Of Solo.mkv");
+    CHECK(file_at("Solo Show/Extras/Making Of Solo.mkv").destination_path ==
+          solo + "/Extras/Making Of Solo.mkv");
 
-    CHECK(file_at("A Film (2015)/Featurettes/Making Of The Film.mkv").destination_path.starts_with("/Movies/"));
+    CHECK(file_at("A Film (2015)/Featurettes/Making Of The Film.mkv")
+              .destination_path.starts_with("/Movies/"));
     CHECK(file_at("A Film (2015)/Featurettes/Making Of The Film.mkv").catalogue_candidate);
-    CHECK(file_at("Unmatched Set/Disc 1 Extras/Garth Commercial.mkv").destination_path.starts_with("/Movies/"));
+    CHECK(file_at("Unmatched Set/Disc 1 Extras/Garth Commercial.mkv")
+              .destination_path.starts_with("/Movies/"));
     ingest.stop();
 }
 
@@ -3785,14 +4082,16 @@ MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_m
     // stalling the rest, the cancelled job's partial goes, the cleared job
     // never comes back, and resume completes the paused copy.
     CommitGate gate;
-    CatalogueNode node("ingest-control", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    CatalogueNode node("ingest-control", {},
+                       [&](const MetadataPublicationContext& context) { gate(context); });
     constexpr size_t job_count = 6;
     constexpr size_t bound = 3;
     constexpr size_t file_bytes = 1024 * 1024;
     const auto roots = make_import_roots(node.path(), job_count, file_bytes);
     // The first commit naming a file creates its partial; the second is its
     // first checkpoint, with three more to come.
-    for (size_t i = 0; i < job_count; ++i) gate.hold("Concurrent Movie " + std::to_string(i) + " 2024.mkv", 1);
+    for (size_t i = 0; i < job_count; ++i)
+        gate.hold("Concurrent Movie " + std::to_string(i) + " 2024.mkv", 1);
 
     IngestConfig config;
     config.enabled = true;
@@ -3806,18 +4105,22 @@ MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_m
     // before the manager joins them.
     struct ReleaseGate {
         CommitGate& gate;
-        ~ReleaseGate() { gate.release_all(); }
+        ~ReleaseGate() {
+            gate.release_all();
+        }
     } release_gate{gate};
     // Submitted before start(), so every worker wakes to claimable work.
     std::vector<std::string> ids;
-    for (const auto& root : roots) ids.push_back(ingest.submit_path(root));
+    for (const auto& root : roots)
+        ids.push_back(ingest.submit_path(root));
     CHECK(ingest.active_jobs() == 0);
     ingest.start();
 
     const auto importing = [&] {
         std::vector<IngestJob> out;
         for (const auto& id : ids)
-            if (auto job = ingest.job(id); job && job->state == IngestJobState::importing) out.push_back(*job);
+            if (auto job = ingest.job(id); job && job->state == IngestJobState::importing)
+                out.push_back(*job);
         return out;
     };
     REQUIRE(wait_until([&] { return importing().size() >= bound && gate.held() > 0; }, 30s));
@@ -3831,9 +4134,11 @@ MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_m
     const auto& cleared = claimed[2];
     std::vector<std::string> untouched;
     for (const auto& id : ids)
-        if (id != paused.id && id != cancelled.id && id != cleared.id) untouched.push_back(id);
+        if (id != paused.id && id != cancelled.id && id != cleared.id)
+            untouched.push_back(id);
     REQUIRE(untouched.size() == job_count - bound);
-    for (const auto& id : untouched) CHECK(ingest.job(id)->state == IngestJobState::queued);
+    for (const auto& id : untouched)
+        CHECK(ingest.job(id)->state == IngestJobState::queued);
 
     // Each takes effect in the job's record at once, with its worker still inside the copy.
     REQUIRE(ingest.pause(paused.id));
@@ -3867,8 +4172,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_m
     // Resume queues the paused job again and it completes its copy.
     REQUIRE(ingest.resume(paused.id));
     REQUIRE(wait_until([&] { return all_imports_copied(ingest, {paused.id}); }, 60s));
-    CHECK(read_whole(node.filesystem(), ingest.job(paused.id)->files.front().destination_path, file_bytes) ==
-          pattern(file_bytes));
+    CHECK(read_whole(node.filesystem(), ingest.job(paused.id)->files.front().destination_path,
+                     file_bytes) == pattern(file_bytes));
     // clear() is the API's delete: terminal jobs go, and stay gone.
     REQUIRE(ingest.clear(cancelled.id));
     CHECK(!ingest.job(cancelled.id).has_value());
@@ -3883,7 +4188,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_m
 // re-bases on the partial as it is and continues, and the file arrives whole.
 MACHA_TEST("hydration_catalogue", test_ingest_rebases_when_its_partial_is_rolled_back) {
     CommitGate gate;
-    CatalogueNode node("ingest-rebase", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    CatalogueNode node("ingest-rebase", {},
+                       [&](const MetadataPublicationContext& context) { gate(context); });
     constexpr size_t file_bytes = 1024 * 1024;
     constexpr size_t checkpoint = 256 * 1024;
     const auto roots = make_import_roots(node.path(), 1, file_bytes);
@@ -3899,7 +4205,9 @@ MACHA_TEST("hydration_catalogue", test_ingest_rebases_when_its_partial_is_rolled
     IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
     struct ReleaseGate {
         CommitGate& gate;
-        ~ReleaseGate() { gate.release_all(); }
+        ~ReleaseGate() {
+            gate.release_all();
+        }
     } release_gate{gate};
     const auto id = ingest.submit_path(roots.front());
     ingest.start();
@@ -3928,7 +4236,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_rebases_when_its_partial_is_rolled
     REQUIRE(wait_until(
         [&] {
             const auto job = ingest.job(id);
-            return job && (job->state == IngestJobState::failed || all_imports_copied(ingest, {id}));
+            return job &&
+                   (job->state == IngestJobState::failed || all_imports_copied(ingest, {id}));
         },
         60s));
     const auto job = ingest.job(id);
@@ -3975,8 +4284,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_blocks_while_storage_is_unavailabl
     ingest.start();
     const auto settled = [&] {
         const auto job = ingest.job(id);
-        return job && (job->state == IngestJobState::blocked ||
-                       job->state == IngestJobState::failed);
+        return job &&
+               (job->state == IngestJobState::blocked || job->state == IngestJobState::failed);
     };
     REQUIRE(wait_until(settled, 30s));
     {
@@ -3990,7 +4299,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_blocks_while_storage_is_unavailabl
     REQUIRE(wait_until(
         [&] {
             const auto job = ingest.job(id);
-            return job && (job->state == IngestJobState::failed || all_imports_copied(ingest, {id}));
+            return job &&
+                   (job->state == IngestJobState::failed || all_imports_copied(ingest, {id}));
         },
         60s));
     const auto job = ingest.job(id);
@@ -4016,13 +4326,15 @@ MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_
     auto& service = fixture.start();
 
     const auto bytes = pattern(2 * fixture.config().extent_size + 1000);
-    const auto source = make_published_source(fixture.path() / "unpublished-import", fixture.config().extent_size,
-                                              service.filesystem(), bytes, false);
+    const auto source =
+        make_published_source(fixture.path() / "unpublished-import", fixture.config().extent_size,
+                              service.filesystem(), bytes, false);
     IngestConfig ingest_config;
     ingest_config.enabled = true;
     ingest_config.staging_path = fixture.path() / "staging";
     ingest_config.source_roots = {source.root};
-    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(), ingest_config);
+    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
+                         ingest_config);
     const auto id = ingest.submit_path(source.root);
     ingest.start();
     REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
@@ -4033,7 +4345,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_
     const auto entry = service.filesystem().getattr(destination);
     CHECK(entry.size == bytes.size());
     for (const auto& extent : entry.extents)
-        for (const auto& bogus : source.ids) CHECK(extent.id != bogus);
+        for (const auto& bogus : source.ids)
+            CHECK(extent.id != bogus);
     CHECK(read_whole(service.filesystem(), destination, bytes.size()) == bytes);
     ingest.stop();
 }
@@ -4056,10 +4369,12 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // genesis while its bootstrap peer has not yet entered active membership.
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
-    DistributedStore store1(n1, n1.local_state(), n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
+    DistributedStore store1(n1, n1.local_state(), n1.resources.activity, n1.resources.data,
+                            n1.resources.memory, n1.resources.events);
     auto metadata1_store = macha::test_support::distributed_store_for(n1);
     MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), *metadata1_store);
-    CatalogueManager catalogue1(n1, n1.local_state(), n1.metadata_server(), store1, metadata1, n1.ledger());
+    CatalogueManager catalogue1(n1, n1.local_state(), n1.metadata_server(), store1, metadata1,
+                                n1.ledger());
 
     CatalogueItem first;
     first.id = "test:movie:remote-first";
@@ -4069,21 +4384,25 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
 
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
-    DistributedStore store2(n2, n2.local_state(), n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
+    DistributedStore store2(n2, n2.local_state(), n2.resources.activity, n2.resources.data,
+                            n2.resources.memory, n2.resources.events);
     auto metadata2_store = macha::test_support::distributed_store_for(n2);
     MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), *metadata2_store);
-    CatalogueManager catalogue2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2, n2.ledger());
+    CatalogueManager catalogue2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2,
+                                n2.ledger());
 
     // Cold-load node two from node one's committed catalogue. There is no Service
     // here, so no catalogue maintenance thread can refresh it behind the test.
-    REQUIRE(wait_until([&] {
-        try {
-            auto item = catalogue2.get(first.id);
-            return item && item->title == first.title;
-        } catch (...) {
-            return false;
-        }
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                auto item = catalogue2.get(first.id);
+                return item && item->title == first.title;
+            } catch (...) {
+                return false;
+            }
+        },
+        5s));
     const auto before = catalogue2.status();
     REQUIRE(before.ready);
 
@@ -4096,9 +4415,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
 
     // Membership/metadata propagation tells node two that a newer generation
     // exists. The catalogue itself is deliberately still the old cached root.
-    REQUIRE(wait_until([&] {
-        return n2.known_metadata_generation() >= writer_status.metadata_generation;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] { return n2.known_metadata_generation() >= writer_status.metadata_generation; }, 5s));
     const auto stale = catalogue2.status();
     CHECK(stale.metadata_generation == before.metadata_generation);
     CHECK(stale.known_metadata_generation >= writer_status.metadata_generation);
@@ -4108,14 +4426,16 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // into quorum reads. FUSE may adopt a newer snapshot only after some control-
     // plane owner has already decoded it locally. Repeated getattr therefore
     // leaves MetadataManager's available generation unchanged.
-    FileSystem fs2(n2.config(), n2.node_id(), n2.membership(), n2.local_state(), n2.metadata_server(), store2, metadata2, n2.resources.memory);
+    FileSystem fs2(n2.config(), n2.node_id(), n2.membership(), n2.local_state(),
+                   n2.metadata_server(), store2, metadata2, n2.resources.memory);
     FuseConfig fuse_config;
     fuse_config.commit_workers = 1;
     auto frontend = make_fuse_frontend(fs2, n2.resources.memory, fuse_config);
     const auto available_before_fuse = metadata2.available_snapshot_view();
     REQUIRE(available_before_fuse.has_value());
     const auto namespace_revision_before = metadata2.available_namespace_revision();
-    for (int i = 0; i < 64; ++i) CHECK(frontend->getattr("/").type == EntryType::directory);
+    for (int i = 0; i < 64; ++i)
+        CHECK(frontend->getattr("/").type == EntryType::directory);
     const auto available_after_fuse = metadata2.available_snapshot_view();
     REQUIRE(available_after_fuse.has_value());
     CHECK(available_after_fuse->generation == available_before_fuse->generation);
@@ -4160,10 +4480,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
                                        .path = "/api/v1/catalogue/status",
                                        .query = {},
                                        .headers = {},
-                                       .body = {}, .session = {}});
+                                       .body = {},
+                                       .session = {}});
     REQUIRE(status_response.status == 200);
-    auto status_json = Json::parse(std::string(status_response.body.begin(),
-                                               status_response.body.end()));
+    auto status_json =
+        Json::parse(std::string(status_response.body.begin(), status_response.body.end()));
     REQUIRE(status_json.find("metadata_generation") != nullptr);
     REQUIRE(status_json.find("known_metadata_generation") != nullptr);
     CHECK(status_json.find("metadata_generation")->asInt64() ==
@@ -4204,20 +4525,23 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     // Node two's decoded cache lives by a clock the test steps.
     SteppedTime time;
     auto metadata2_store = macha::test_support::distributed_store_for(n2);
-    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), *metadata2_store, {}, time);
+    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), *metadata2_store, {},
+                              time);
 
     std::optional<MetadataSnapshotView> initial2;
-    REQUIRE(wait_until([&] {
-        try {
-            auto view = metadata2.snapshot_view();
-            if (view.generation != initial1.generation)
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                auto view = metadata2.snapshot_view();
+                if (view.generation != initial1.generation)
+                    return false;
+                initial2 = std::move(view);
+                return true;
+            } catch (const std::exception&) {
                 return false;
-            initial2 = std::move(view);
-            return true;
-        } catch (const std::exception&) {
-            return false;
-        }
-    }, 5s));
+            }
+        },
+        5s));
     REQUIRE(initial2.has_value());
 
     auto base = n1.metadata_replica().current();
@@ -4231,8 +4555,7 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     next.payload = encode_snapshot_v14(same);
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
     REQUIRE(n1.metadata_replica().store_commit(next));
-    REQUIRE(n1.metadata_replica().accept_commit(
-        {next.generation, next.hash, 1, {n1.node_id()}}));
+    REQUIRE(n1.metadata_replica().accept_commit({next.generation, next.hash, 1, {n1.node_id()}}));
 
     // With no generation notice, the decoded view is legitimately reused until
     // the configured metadata TTL expires.
@@ -4352,8 +4675,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_effective_music_artwork_re
     snapshot.items.emplace(compilation.id, compilation);
     const auto view = CatalogueView::of(snapshot);
 
-    CHECK(effective_catalogue_artwork(view, artist) ==
-          std::vector<CatalogueArtwork>{newest_a_art});
+    CHECK(effective_catalogue_artwork(view, artist) == std::vector<CatalogueArtwork>{newest_a_art});
     CHECK(effective_catalogue_artwork(view, track) == std::vector<CatalogueArtwork>{old_art});
     CHECK(effective_catalogue_artwork(view, explicit_track) ==
           std::vector<CatalogueArtwork>{track_art});
@@ -4397,12 +4719,13 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_indexes_round_trip_and_older_s
         w.string(item.title);
         w.string(item.sort_title);
         w.string(item.synopsis);
-        w.u8(0);                               // no parent
-        for (int i = 0; i < 5; ++i) w.u8(0);   // year, season, episode, disc, track absent
-        w.u32(0);                              // aliases
-        w.u32(0);                              // external ids
-        w.u32(0);                              // media ids
-        w.u32(0);                              // artwork
+        w.u8(0); // no parent
+        for (int i = 0; i < 5; ++i)
+            w.u8(0); // year, season, episode, disc, track absent
+        w.u32(0);    // aliases
+        w.u32(0);    // external ids
+        w.u32(0);    // media ids
+        w.u32(0);    // artwork
         w.u64(item.revision);
         w.i64(item.updated_ns);
     };
@@ -4411,7 +4734,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_indexes_round_trip_and_older_s
         w.raw(std::array<uint8_t, 8>{'M', 'C', 'A', 'T', '0', '0', '2', '1'});
         w.u32(1);
         older_item(w);
-        w.u32(0);                              // profiles; no index section
+        w.u32(0); // profiles; no index section
         const auto read_back = decode_catalogue(w.take());
         CHECK(read_back.items.contains(item.id));
         CHECK(read_back.media_indexes.empty());
@@ -4421,8 +4744,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_indexes_round_trip_and_older_s
         w.raw(std::array<uint8_t, 8>{'M', 'C', 'A', 'T', '0', '0', '2', '2'});
         w.u32(1);
         older_item(w);
-        w.u32(0);                              // profiles
-        w.u32(1);                              // one index
+        w.u32(0); // profiles
+        w.u32(1); // one index
         w.string(media_id);
         w.fixed(index.bytes);
         const auto read_back = decode_catalogue(w.take());
@@ -4433,7 +4756,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_indexes_round_trip_and_older_s
     }
 }
 
-MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and_protects_its_control_objects) {
+MACHA_TEST("hydration_catalogue",
+           test_catalogue_on_one_node_predicts_caches_and_protects_its_control_objects) {
     // CatalogueManager, MachaDFS and the catalogue predictor on one node:
     // prediction resolves against real file manifests; the media-id index and
     // the decoded catalogue survive unrelated namespace and metadata churn;
@@ -4473,8 +4797,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
         season2.title = "Season 2";
         season2.season_number = 2;
         season2 = add(season2);
-        const auto episode = [&](std::string id, std::string title, const CatalogueItem& season, int number,
-                                 const FsEntry& file) {
+        const auto episode = [&](std::string id, std::string title, const CatalogueItem& season,
+                                 int number, const FsEntry& file) {
             CatalogueItem item;
             item.id = std::move(id);
             item.kind = CatalogueKind::episode;
@@ -4507,7 +4831,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
         HydrationConfig prediction_config;
         prediction_config.catalogue_lookahead = 1;
         PlaybackTracker tracker;
-        CatalogueSequenceHintProvider predictor(tracker, node.filesystem(), node.catalogue(), prediction_config);
+        CatalogueSequenceHintProvider predictor(tracker, node.filesystem(), node.catalogue(),
+                                                prediction_config);
         const auto check_prediction = [&](const std::string& path, const FsEntry& current,
                                           const FsEntry& expected, const char* reason) {
             auto active = tracker.open(path, current);
@@ -4608,13 +4933,15 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
     // A cold load from the sharded CONTROL representation is ready without the
     // referenced artwork DATA held locally.
     {
-        auto item = node.upsert("test:movie:artwork-missing", CatalogueKind::movie, "Catalogue Still Loads");
-        const auto artwork = node.catalogue().put_artwork(item.id, "poster", "image/jpeg",
-                                                          Bytes{0x01, 0x02, 0x03, 0x04}, item.revision);
+        auto item = node.upsert("test:movie:artwork-missing", CatalogueKind::movie,
+                                "Catalogue Still Loads");
+        const auto artwork = node.catalogue().put_artwork(
+            item.id, "poster", "image/jpeg", Bytes{0x01, 0x02, 0x03, 0x04}, item.revision);
         REQUIRE(node.node().local_store().remove(artwork.id));
         REQUIRE(!node.node().local_store().has(artwork.id));
-        CatalogueManager reloaded(node.node(), node.node().local_state(), node.node().metadata_server(),
-                                  node.store(), node.metadata(), node.node().ledger());
+        CatalogueManager reloaded(node.node(), node.node().local_state(),
+                                  node.node().metadata_server(), node.store(), node.metadata(),
+                                  node.node().ledger());
         reloaded.repair_once();
         const auto status = reloaded.status();
         CHECK(status.ready);
@@ -4648,20 +4975,24 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
         const auto tree_nodes = [&] {
             std::vector<ObjectId> nodes;
             const auto reader = node.filesystem().namespace_nodes();
-            for_each_namespace_entry(node.metadata().snapshot(), &reader,
-                                     [](const std::string&, const FsEntry&) {}, nodes);
+            for_each_namespace_entry(
+                node.metadata().snapshot(), &reader, [](const std::string&, const FsEntry&) {},
+                nodes);
             std::sort(nodes.begin(), nodes.end());
             nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
             return nodes;
         };
         const auto no_catalogue = tree_nodes();
-        for (int i = 0; i < 4; ++i) (void)node.catalogue().control_gc_step(no_catalogue, 0ms, 64);
+        for (int i = 0; i < 4; ++i)
+            (void)node.catalogue().control_gc_step(no_catalogue, 0ms, 64);
         CHECK(control.has(staged_id));
-        (void)node.upsert("movie:control-publication-fence", CatalogueKind::movie, "Control Publication Fence");
+        (void)node.upsert("movie:control-publication-fence", CatalogueKind::movie,
+                          "Control Publication Fence");
         std::this_thread::sleep_for(5ms);
         auto maintenance = maintenance_inventory(node.catalogue());
         REQUIRE(maintenance.complete);
-        std::vector<ObjectId> live(maintenance.control_live.begin(), maintenance.control_live.end());
+        std::vector<ObjectId> live(maintenance.control_live.begin(),
+                                   maintenance.control_live.end());
         for (const auto& id : tree_nodes())
             live.push_back(id);
         std::sort(live.begin(), live.end());
@@ -4706,7 +5037,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and
 // leaves is the one a reader loading the root from scratch finds: every item
 // in its own shard, none left behind in a shard it moved out of or was
 // removed from.
-MACHA_TEST("hydration_catalogue", test_a_catalogue_write_touches_its_own_shards_and_leaves_a_whole_catalogue) {
+MACHA_TEST("hydration_catalogue",
+           test_a_catalogue_write_touches_its_own_shards_and_leaves_a_whole_catalogue) {
     CatalogueNode node("catalogue-shards");
     auto& catalogue = node.catalogue();
     const auto item_of = [](int n, const std::string& title) {
@@ -4718,8 +5050,8 @@ MACHA_TEST("hydration_catalogue", test_a_catalogue_write_touches_its_own_shards_
     };
     const auto agrees = [&] {
         CatalogueManager from_root(node.node(), node.node().local_state(),
-                                   node.node().metadata_server(), node.store(),
-                                   node.metadata(), node.node().ledger());
+                                   node.node().metadata_server(), node.store(), node.metadata(),
+                                   node.node().ledger());
         from_root.repair_once();
         const auto loaded = from_root.snapshot();
         const auto held = catalogue.snapshot();
@@ -4756,10 +5088,12 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_page_resumes_after_its_cursor_and_
     };
     const auto page_of = [&](std::map<std::string, std::string, std::less<>> query) {
         HttpRequest request;
-        for (auto& [name, value] : query) request.query[name] = value;
+        for (auto& [name, value] : query)
+            request.query[name] = value;
         PageQuery page;
         const auto bad = read_page_query(request, page);
-        return std::pair{page, bad ? std::optional<std::string>(json_body_code(*bad)) : std::nullopt};
+        return std::pair{page,
+                         bad ? std::optional<std::string>(json_body_code(*bad)) : std::nullopt};
     };
     const auto key = [](const std::string& entry) -> std::string_view { return entry; };
 
@@ -4809,7 +5143,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_lists_page_in_key_order) {
                           "Paging " + std::string(1, static_cast<char>('z' - i)));
     const auto get = [&](std::string path, std::map<std::string, std::string, std::less<>> query) {
         auto request = api_request("GET", std::move(path));
-        for (auto& [name, value] : query) request.query[name] = value;
+        for (auto& [name, value] : query)
+            request.query[name] = value;
         auto response = api.handle(request);
         REQUIRE(response.status == 200);
         return Json::parse(std::string(response.body.begin(), response.body.end()));
@@ -4838,7 +5173,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_lists_page_in_key_order) {
         CHECK(page.size() <= 10);
         paged.insert(paged.end(), page.begin(), page.end());
         ++pages;
-        if (body.find("next_cursor")->isNull()) break;
+        if (body.find("next_cursor")->isNull())
+            break;
         query["cursor"] = body.find("next_cursor")->asString();
         REQUIRE(pages < 10);
     }
@@ -4853,7 +5189,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_lists_page_in_key_order) {
         const auto body = get("/api/v1/catalogue/search", query);
         const auto page = ids(body);
         found.insert(found.end(), page.begin(), page.end());
-        if (body.find("next_cursor")->isNull()) break;
+        if (body.find("next_cursor")->isNull())
+            break;
         query["cursor"] = body.find("next_cursor")->asString();
     }
     auto sorted = found;
@@ -4872,10 +5209,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
     // exempt and refuse tampering or expiry; media indexes are served immutably.
     CatalogueNode node("catalogue-api");
     CatalogueApi api(node.catalogue(), node.hints());
-    const auto call = [&](CatalogueApi& on, std::string method, std::string path, std::string body = {},
+    const auto call = [&](CatalogueApi& on, std::string method, std::string path,
+                          std::string body = {},
                           std::map<std::string, std::string, std::less<>> headers = {}) {
-        return on.handle(api_request(std::move(method), std::move(path), Bytes(body.begin(), body.end()),
-                                     std::move(headers)));
+        return on.handle(api_request(std::move(method), std::move(path),
+                                     Bytes(body.begin(), body.end()), std::move(headers)));
     };
 
     // A whole PUT that leaves out media_ids keeps the item's files; PATCH
@@ -4892,13 +5230,16 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         const auto item_call = [&](std::string method, std::string id, std::string body) {
             return call(api, std::move(method), "/api/v1/catalogue/items/" + id, std::move(body));
         };
-        REQUIRE(item_call("PUT", "movie%3Aedit-test", R"({"kind":"movie","title":"Renamed"})").status == 200);
+        REQUIRE(
+            item_call("PUT", "movie%3Aedit-test", R"({"kind":"movie","title":"Renamed"})").status ==
+            200);
         auto stored = node.catalogue().get(movie.id);
         REQUIRE(stored.has_value());
         CHECK(stored->title == "Renamed");
         CHECK((stored->media_ids == std::vector<std::string>{"macha:file-a", "macha:file-b"}));
         CHECK(stored->external_ids.at("macha_metadata_locked") == "1");
-        REQUIRE(item_call("PATCH", "movie%3Aedit-test", R"({"year":1999,"lock":false})").status == 200);
+        REQUIRE(item_call("PATCH", "movie%3Aedit-test", R"({"year":1999,"lock":false})").status ==
+                200);
         stored = node.catalogue().get(movie.id);
         CHECK(stored->title == "Renamed");
         CHECK(stored->year == std::optional<int32_t>{1999});
@@ -4921,7 +5262,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         CHECK(api_body(wrong).find("parent_kind")->asString() == "show");
         CHECK(!node.catalogue().get("episode:edit-test").has_value());
         CHECK(item_call("PUT", "season%3Aedit-test",
-                        R"({"kind":"season","title":"S1","parent_id":"show:edit-test"})").status == 201);
+                        R"({"kind":"season","title":"S1","parent_id":"show:edit-test"})")
+                  .status == 201);
     }
 
     // `kind` may repeat, `parent` keeps one item's children, both filter before
@@ -4933,17 +5275,20 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         (void)node.upsert("movie:ember", CatalogueKind::movie, "Ember");
         (void)node.upsert("show:ember", CatalogueKind::show, "Ember Show");
         (void)node.upsert("season:ember-1", CatalogueKind::season, "Ember Season", "show:ember");
-        (void)node.upsert("season:other-1", CatalogueKind::season, "Ember Season Elsewhere", "show:other");
+        (void)node.upsert("season:other-1", CatalogueKind::season, "Ember Season Elsewhere",
+                          "show:other");
         const auto search = [&](std::map<std::string, std::vector<std::string>, std::less<>> all) {
             auto request = api_request("GET", "/api/v1/catalogue/search");
-            for (const auto& [key, values] : all) request.query[key] = values.back();
+            for (const auto& [key, values] : all)
+                request.query[key] = values.back();
             request.query_all = std::move(all);
             return api.handle(request);
         };
         const auto ids = [](const HttpResponse& response) {
             std::set<std::string> out;
             const auto body = api_body(response);
-            for (const auto& item : body.find("items")->asArray()) out.insert(item.find("id")->asString());
+            for (const auto& item : body.find("items")->asArray())
+                out.insert(item.find("id")->asString());
             return out;
         };
         auto kinds = search({{"q", {"ember"}}, {"kind", {"movie", "show"}}, {"limit", {"2"}}});
@@ -4954,7 +5299,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         CHECK((ids(children) == std::set<std::string>{"season:ember-1"}));
         auto unknown = search({{"q", {"ember"}}, {"kind", {"film"}}});
         CHECK(unknown.status == 400);
-        CHECK(std::string(unknown.body.begin(), unknown.body.end()).find("bad_kind") != std::string::npos);
+        CHECK(std::string(unknown.body.begin(), unknown.body.end()).find("bad_kind") !=
+              std::string::npos);
     }
 
     // A track inherits its album's cover as effective_artwork for display; it
@@ -4968,24 +5314,31 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         album.parent_id = artist.id;
         album.year = 2024;
         album = node.catalogue().upsert(album);
-        const auto track = node.upsert("track:api-test", CatalogueKind::track, "API Track", album.id);
+        const auto track =
+            node.upsert("track:api-test", CatalogueKind::track, "API Track", album.id);
         const Bytes cover_bytes{0x10, 0x20, 0x30, 0x40};
-        const auto cover = node.catalogue().put_artwork(album.id, "cover", "image/jpeg", cover_bytes, album.revision);
+        const auto cover = node.catalogue().put_artwork(album.id, "cover", "image/jpeg",
+                                                        cover_bytes, album.revision);
         const auto track_response = call(api, "GET", "/api/v1/catalogue/items/track%3Aapi-test");
         REQUIRE(track_response.status == 200);
         const auto track_json = api_body(track_response);
         REQUIRE(track_json.find("artwork")->isArray());
         CHECK(track_json.find("artwork")->asArray().empty());
         REQUIRE(track_json.find("effective_artwork")->asArray().size() == 1);
-        CHECK(track_json.find("effective_artwork")->asArray().front().find("id")->asString() == to_string(cover.id));
-        const auto artist_json = api_body(call(api, "GET", "/api/v1/catalogue/items/artist%3Aapi-test"));
+        CHECK(track_json.find("effective_artwork")->asArray().front().find("id")->asString() ==
+              to_string(cover.id));
+        const auto artist_json =
+            api_body(call(api, "GET", "/api/v1/catalogue/items/artist%3Aapi-test"));
         REQUIRE(artist_json.find("effective_artwork")->asArray().size() == 1);
-        CHECK(artist_json.find("effective_artwork")->asArray().front().find("id")->asString() == to_string(cover.id));
-        auto artwork_response = call(api, "GET", "/api/v1/catalogue/artwork/" + to_string(cover.id));
+        CHECK(artist_json.find("effective_artwork")->asArray().front().find("id")->asString() ==
+              to_string(cover.id));
+        auto artwork_response =
+            call(api, "GET", "/api/v1/catalogue/artwork/" + to_string(cover.id));
         REQUIRE(artwork_response.status == 200);
         CHECK(artwork_response.body == cover_bytes);
-        auto put = api.handle(api_request("PUT", "/api/v1/catalogue/items/track%3Aapi-test", track_response.body,
-                                          {{"if-match", "\"rev-" + std::to_string(track.revision) + "\""}}));
+        auto put = api.handle(
+            api_request("PUT", "/api/v1/catalogue/items/track%3Aapi-test", track_response.body,
+                        {{"if-match", "\"rev-" + std::to_string(track.revision) + "\""}}));
         REQUIRE(put.status == 200);
         auto stored = node.catalogue().get(track.id);
         REQUIRE(stored.has_value());
@@ -5004,12 +5357,14 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         album.title = "Signed URL Album";
         album = node.catalogue().upsert(album);
         const Bytes cover_bytes{0x01, 0x02, 0x03, 0x04};
-        (void)node.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes, album.revision);
+        (void)node.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes,
+                                           album.revision);
         CHECK(Config{}.catalogue.api.artwork_capability_ttl == std::chrono::hours(24 * 30));
         const std::chrono::milliseconds ttl = std::chrono::hours(24);
         CatalogueApi signing(node.catalogue(), node.hints(), {}, {}, ttl);
         const auto artwork_url = [&](CatalogueApi& on) {
-            const auto response = call(on, "GET", "/api/v1/catalogue/items/album%3Asigned-url-test");
+            const auto response =
+                call(on, "GET", "/api/v1/catalogue/items/album%3Asigned-url-test");
             REQUIRE(response.status == 200);
             const auto json = api_body(response);
             REQUIRE(json.find("artwork")->asArray().size() == 1);
@@ -5032,7 +5387,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         const auto listed = api_body(call(signing, "GET", "/api/v1/catalogue/items"));
         bool found = false;
         for (const auto& item : listed.find("items")->asArray()) {
-            if (item.find("id")->asString() != album.id) continue;
+            if (item.find("id")->asString() != album.id)
+                continue;
             found = true;
             CHECK(item.find("artwork")->asArray().front().find("url")->asString() == first);
         }
@@ -5109,23 +5465,26 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         auto stored = node.catalogue().media_index(media_id);
         REQUIRE(stored.has_value());
         CHECK(std::string(stored->begin(), stored->end()) == body);
-        CHECK(maintenance_inventory(node.catalogue()).live.contains(object_id(Bytes(body.begin(), body.end()))));
+        CHECK(maintenance_inventory(node.catalogue())
+                  .live.contains(object_id(Bytes(body.begin(), body.end()))));
         // A catalogue loaded from its root has the index too.
         {
             CatalogueManager from_root(node.node(), node.node().local_state(),
-                                       node.node().metadata_server(), node.store(),
-                                       node.metadata(), node.node().ledger());
+                                       node.node().metadata_server(), node.store(), node.metadata(),
+                                       node.node().ledger());
             from_root.repair_once();
             auto loaded = from_root.media_index(media_id);
             REQUIRE(loaded.has_value());
             CHECK(std::string(loaded->begin(), loaded->end()) == body);
         }
         int calls = 0;
-        CatalogueApi index_api(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(24 * 30), {},
-                               [&](const std::string& id) -> std::optional<Bytes> {
+        CatalogueApi index_api(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(24 * 30),
+                               {}, [&](const std::string& id) -> std::optional<Bytes> {
                                    ++calls;
-                                   if (id == media_id) return node.catalogue().media_index(id);
-                                   if (id == "macha:mpegts") throw KeyframeIndexUnsupported("no byte index");
+                                   if (id == media_id)
+                                       return node.catalogue().media_index(id);
+                                   if (id == "macha:mpegts")
+                                       throw KeyframeIndexUnsupported("no byte index");
                                    return std::nullopt;
                                });
         const auto get = [&](const std::string& id) {
@@ -5140,8 +5499,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         CHECK(get("macha:gone").status == 404);
         auto unsupported = get("macha:mpegts");
         CHECK(unsupported.status == 422);
-        CHECK(std::string(unsupported.body.begin(), unsupported.body.end()).find("keyframes_not_supported") !=
-              std::string::npos);
+        CHECK(std::string(unsupported.body.begin(), unsupported.body.end())
+                  .find("keyframes_not_supported") != std::string::npos);
         CHECK(calls == 3);
         (void)node.catalogue().prune_media_profiles({});
         CHECK(!node.catalogue().media_index(media_id).has_value());
@@ -5201,8 +5560,8 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     episode = s1.catalogue().upsert(episode);
 
     auto first_art_bytes = pattern(64 * 1024 + 17);
-    auto first_art = s1.catalogue().put_artwork(show.id, "poster", "image/jpeg",
-                                                first_art_bytes, show.revision);
+    auto first_art =
+        s1.catalogue().put_artwork(show.id, "poster", "image/jpeg", first_art_bytes, show.revision);
     show = *s1.catalogue().get(show.id);
     CHECK(s1.catalogue().search("pilot").front().id == episode.id);
 
@@ -5212,33 +5571,49 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     // be able to read it from the elected/fallback owner.
     Service s2(c2, keys, test_durability_window);
     s2.start();
-    REQUIRE(wait_until([&] {
-        auto status = s2.catalogue().status();
-        return status.ready && status.items == 2 && status.artwork_objects == 1;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = s2.catalogue().status();
+            return status.ready && status.items == 2 && status.artwork_objects == 1;
+        },
+        10s));
     REQUIRE(s2.catalogue().get(episode.id).has_value());
     CHECK(s2.catalogue().search("test programme").front().id == show.id);
     // status.artwork_objects counts what this node's CATALOGUE knows about.
     // The bytes behind it are a DATA object the node may still be fetching, so
     // the count going to 1 does not mean artwork() can answer yet. Wait for the
     // fetch itself rather than for the count that precedes it.
-    REQUIRE(wait_until([&] {
-        try { return s2.catalogue().artwork(first_art.id).has_value(); } catch (...) { return false; }
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                return s2.catalogue().artwork(first_art.id).has_value();
+            } catch (...) {
+                return false;
+            }
+        },
+        10s));
     auto s2_first_art = s2.catalogue().artwork(first_art.id);
     REQUIRE(s2_first_art.has_value());
     CHECK(s2_first_art->bytes == first_art_bytes);
 
     Service s3(c3, keys, test_durability_window);
     s3.start();
-    REQUIRE(wait_until([&] {
-        auto status = s3.catalogue().status();
-        return status.ready && status.items == 2 && status.artwork_objects == 1;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = s3.catalogue().status();
+            return status.ready && status.items == 2 && status.artwork_objects == 1;
+        },
+        10s));
     CHECK(s3.catalogue().list(CatalogueKind::episode).size() == 1);
-    REQUIRE(wait_until([&] {
-        try { return s3.catalogue().artwork(first_art.id).has_value(); } catch (...) { return false; }
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                return s3.catalogue().artwork(first_art.id).has_value();
+            } catch (...) {
+                return false;
+            }
+        },
+        10s));
     auto s3_first_art = s3.catalogue().artwork(first_art.id);
     REQUIRE(s3_first_art.has_value());
     CHECK(s3_first_art->bytes == first_art_bytes);
@@ -5247,11 +5622,13 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     // joining nodes have learned routes to one another.  R=1 placement and
     // fallback reads are only meaningful against a common membership view, so
     // establish that precondition rather than racing topology dissemination.
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() == 3 &&
-               s2.node().membership().active().size() == 3 &&
-               s3.node().membership().active().size() == 3;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            return s1.node().membership().active().size() == 3 &&
+                   s2.node().membership().active().size() == 3 &&
+                   s3.node().membership().active().size() == 3;
+        },
+        10s));
 
     // Replacing the poster retires the old DATA object in committed metadata.
     // With a zero grace period, reachability GC must delete the old authoritative
@@ -5259,8 +5636,8 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     // replacement.
     auto second_art_bytes = pattern(96 * 1024 + 3);
     second_art_bytes[0] ^= 0xa5;
-    auto second_art = s2.catalogue().put_artwork(show.id, "poster", "image/jpeg",
-                                                 second_art_bytes, show.revision);
+    auto second_art = s2.catalogue().put_artwork(show.id, "poster", "image/jpeg", second_art_bytes,
+                                                 show.revision);
     auto has_second_artwork_reference = [&](Service& service) {
         try {
             // Namespace and catalogue share Service's MetadataManager. Force the
@@ -5280,11 +5657,12 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     // `ready` means the node has a usable catalogue, not that it has observed
     // the just-committed generation.  Wait for the replacement reference to
     // converge before testing distributed DATA reads for that ObjectId.
-    REQUIRE(wait_until([&] {
-        return has_second_artwork_reference(s1) &&
-               has_second_artwork_reference(s2) &&
-               has_second_artwork_reference(s3);
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            return has_second_artwork_reference(s1) && has_second_artwork_reference(s2) &&
+                   has_second_artwork_reference(s3);
+        },
+        10s));
     auto s1_second_art = s1.catalogue().artwork(second_art.id);
     auto s2_second_art = s2.catalogue().artwork(second_art.id);
     auto s3_second_art = s3.catalogue().artwork(second_art.id);
@@ -5299,26 +5677,31 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     // and ordinary DATA GC must reclaim the old artwork. If a replica were
     // offline, that claim would remain as the physical safety barrier for a
     // potentially unseen accepted branch.
-    REQUIRE(wait_until([&] {
-        return !s1.local_state().data().has(first_art.id) &&
-               !s2.local_state().data().has(first_art.id) &&
-               !s3.local_state().data().has(first_art.id);
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            return !s1.local_state().data().has(first_art.id) &&
+                   !s2.local_state().data().has(first_art.id) &&
+                   !s3.local_state().data().has(first_art.id);
+        },
+        10s));
 
     CatalogueApi api(s3.catalogue(), s3.catalogue_hints());
     CHECK(!s3.catalogue().definitely_absent(show.id));
     CHECK(s3.catalogue().definitely_absent("show:does-not-exist"));
-    auto missing_clear = api.handle({.method = "DELETE",
-                                     .path = "/api/v1/catalogue/items/show%3Adoes-not-exist/metadata",
-                                     .query = {},
-                                     .headers = {},
-                                     .body = {}, .session = {}});
+    auto missing_clear =
+        api.handle({.method = "DELETE",
+                    .path = "/api/v1/catalogue/items/show%3Adoes-not-exist/metadata",
+                    .query = {},
+                    .headers = {},
+                    .body = {},
+                    .session = {}});
     CHECK(missing_clear.status == 404);
     auto status_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/status",
                                        .query = {},
                                        .headers = {},
-                                       .body = {}, .session = {}});
+                                       .body = {},
+                                       .session = {}});
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
@@ -5329,7 +5712,8 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
                                        .headers = {},
-                                       .body = {}, .session = {}});
+                                       .body = {},
+                                       .session = {}});
     CHECK(search_response.status == 200);
     std::string search_body(search_response.body.begin(), search_response.body.end());
     CHECK(search_body.find("episode:test:1:1") != std::string::npos);
@@ -5343,7 +5727,8 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
              .path = "/api/v1/catalogue/items/show:test/metadata",
              .query = {},
              .headers = {{"if-match", "\"rev-" + std::to_string(revision) + "\""}},
-             .body = {}, .session = {}});
+             .body = {},
+             .session = {}});
     };
     auto clear_response = clear(show.revision + 1);
     // The poster replacement did not mutate the copy of `show`; use the current
@@ -5403,8 +5788,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
                 run_begins.push_back(service->metadata_convergence_diagnostics());
             }
         }
-        if (stage == "metadata-repair-begin" &&
-            gate_metadata.load(std::memory_order_acquire) &&
+        if (stage == "metadata-repair-begin" && gate_metadata.load(std::memory_order_acquire) &&
             !gate_once.exchange(true, std::memory_order_acq_rel)) {
             metadata_gate.enter_and_wait();
         }
@@ -5413,7 +5797,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     Service s2(c2, keys, test_durability_window);
     struct GateOpener {
         TestGate& gate;
-        ~GateOpener() { gate.open(); }
+        ~GateOpener() {
+            gate.open();
+        }
     } open_on_exit{metadata_gate};
 
     s1.start();
@@ -5431,34 +5817,37 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     item.title = "Initial Catalogue Title";
     item = s2.catalogue().upsert(item);
     auto initial_bytes = pattern(32 * 1024 + 11, 41);
-    auto initial_art = s2.catalogue().put_artwork(
-        item.id, "poster", "image/jpeg", initial_bytes, item.revision);
+    auto initial_art =
+        s2.catalogue().put_artwork(item.id, "poster", "image/jpeg", initial_bytes, item.revision);
     item = *s2.catalogue().get(item.id);
 
-    REQUIRE(wait_until([&] {
-        try {
-            const auto found = s1.catalogue().get(item.id);
-            return found && found->title == "Initial Catalogue Title" &&
-                   !s1.catalogue().search("initial catalogue").empty();
-        } catch (...) {
-            return false;
-        }
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                const auto found = s1.catalogue().get(item.id);
+                return found && found->title == "Initial Catalogue Title" &&
+                       !s1.catalogue().search("initial catalogue").empty();
+            } catch (...) {
+                return false;
+            }
+        },
+        10s));
     // The baseline is s1 at s2's root, artwork included: the title alone
     // arrives a commit earlier.
-    REQUIRE(wait_until([&] {
-        return s1.catalogue().status().root == s2.catalogue().status().root;
-    }, 10s));
+    REQUIRE(wait_until([&] { return s1.catalogue().status().root == s2.catalogue().status().root; },
+                       10s));
     // The baseline must be the snapshot that satisfied quiescence: a second
     // sample can catch a newly scheduled run and put every delta off by one.
     ConvergenceDemandDiagnostics convergence_before{};
-    REQUIRE(wait_until([&] {
-        const auto d = s1.metadata_convergence_diagnostics();
-        if (d.scheduled || d.runs_scheduled != d.runs_completed)
-            return false;
-        convergence_before = d;
-        return true;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto d = s1.metadata_convergence_diagnostics();
+            if (d.scheduled || d.runs_scheduled != d.runs_completed)
+                return false;
+            convergence_before = d;
+            return true;
+        },
+        5s));
     const auto convergence_events = [&] {
         return s1.resources().events.count(NodeEvent::metadata) +
                s1.resources().events.count(NodeEvent::topology);
@@ -5484,8 +5873,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         item = s2.catalogue().upsert(item, item.revision);
         burst_roots.insert(s2.catalogue().status().root);
         auto bytes = pattern(32 * 1024 + index, static_cast<uint8_t>(41 + index));
-        auto art = s2.catalogue().put_artwork(
-            item.id, "poster", "image/jpeg", bytes, item.revision);
+        auto art =
+            s2.catalogue().put_artwork(item.id, "poster", "image/jpeg", bytes, item.revision);
         burst_roots.insert(s2.catalogue().status().root);
         if (index < 4)
             superseded.push_back(art.id);
@@ -5494,30 +5883,29 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             initial_art = art;
         }
     }
-    const auto final_generation =
-        s2.local_state().replica().committed_generation();
-    REQUIRE(wait_until([&] {
-        return s1.metadata_server().known_generation() >= final_generation;
-    }, 5s));
+    const auto final_generation = s2.local_state().replica().committed_generation();
+    REQUIRE(wait_until([&] { return s1.metadata_server().known_generation() >= final_generation; },
+                       5s));
     metadata_gate.open();
-    const bool final_state_ready = wait_until([&] {
-        try {
-            const auto status = s1.catalogue().status();
-            const auto found = s1.catalogue().get(item.id);
-            // Reconciliation may publish a later merge/retention generation
-            // after the writer-side generation captured above. A newer cached
-            // view is valid only when it also contains the exact final item and
-            // artwork state asserted below.
-            return status.metadata_generation >= final_generation && found &&
-                   found->title == "Final Catalogue Title" &&
-                   std::any_of(found->artwork.begin(), found->artwork.end(),
-                               [&](const CatalogueArtwork& art) {
-                                   return art.id == initial_art.id;
-                               });
-        } catch (...) {
-            return false;
-        }
-    }, 10s);
+    const bool final_state_ready = wait_until(
+        [&] {
+            try {
+                const auto status = s1.catalogue().status();
+                const auto found = s1.catalogue().get(item.id);
+                // Reconciliation may publish a later merge/retention generation
+                // after the writer-side generation captured above. A newer cached
+                // view is valid only when it also contains the exact final item and
+                // artwork state asserted below.
+                return status.metadata_generation >= final_generation && found &&
+                       found->title == "Final Catalogue Title" &&
+                       std::any_of(
+                           found->artwork.begin(), found->artwork.end(),
+                           [&](const CatalogueArtwork& art) { return art.id == initial_art.id; });
+            } catch (...) {
+                return false;
+            }
+        },
+        10s);
     if (!final_state_ready) {
         const auto status = s1.catalogue().status();
         const auto found = s1.catalogue().get(item.id);
@@ -5535,11 +5923,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             "catalogue final state missing: cached_generation=" +
             std::to_string(status.metadata_generation) +
             " known_generation=" + std::to_string(status.known_metadata_generation) +
-            " available_generation=" +
-            std::to_string(available ? available->generation : 0) +
+            " available_generation=" + std::to_string(available ? available->generation : 0) +
             " expected_generation=" + std::to_string(final_generation) +
-            " title=" + (found ? found->title : std::string("<missing>")) +
-            " artwork=" + artwork +
+            " title=" + (found ? found->title : std::string("<missing>")) + " artwork=" + artwork +
             " expected_artwork=" + to_string(initial_art.id) +
             " convergence_requested=" + std::to_string(convergence.requested_epoch) +
             " convergence_completed=" + std::to_string(convergence.completed_epoch) +
@@ -5560,10 +5946,12 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     // metadata (artwork and retention commits replicating) is not this burst.
     // The pure one-follow-up state-machine contract is covered by the
     // dedicated ConvergenceDemand test.
-    REQUIRE(wait_until([&] {
-        std::lock_guard lock(run_begins_mutex);
-        return run_begins.size() >= 2;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            std::lock_guard lock(run_begins_mutex);
+            return run_begins.size() >= 2;
+        },
+        10s));
     ConvergenceDemandDiagnostics follow_up{};
     {
         std::lock_guard lock(run_begins_mutex);
@@ -5589,13 +5977,12 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     // and at least one.
     const auto installs_delta = s1.catalogue().installs() - installs_before;
     if (installs_delta < 1 || installs_delta > burst_roots.size()) {
-        throw std::runtime_error(
-            "unexpected catalogue install count for one burst: installs=" +
-            std::to_string(installs_delta) +
-            " burst_roots=" + std::to_string(burst_roots.size()) +
-            " scheduled_delta=" + std::to_string(scheduled_delta) +
-            " completed_delta=" + std::to_string(completed_delta) +
-            " events=" + std::to_string(events_delta));
+        throw std::runtime_error("unexpected catalogue install count for one burst: installs=" +
+                                 std::to_string(installs_delta) +
+                                 " burst_roots=" + std::to_string(burst_roots.size()) +
+                                 " scheduled_delta=" + std::to_string(scheduled_delta) +
+                                 " completed_delta=" + std::to_string(completed_delta) +
+                                 " events=" + std::to_string(events_delta));
     }
 
     const auto unreclaimed = [&] {
@@ -5611,8 +5998,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         // A bounded second chance only classifies the failure as slow or
         // stuck; it never turns it into a pass.
         const bool eventually = wait_until(unreclaimed, 15s);
-        const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            Clock::now() - gc_started).count();
+        const auto total_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - gc_started)
+                .count();
         // Name what is left and on which node.
         std::string remaining;
         for (const auto& id : superseded) {
@@ -5636,9 +6024,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
                 claims += ' ';
             claims += to_string(id).substr(0, 12);
             claims += ":s1=";
-            claims += s1.local_state().retention().retained(RetentionClass::data, id) ? "held" : "free";
+            claims +=
+                s1.local_state().retention().retained(RetentionClass::data, id) ? "held" : "free";
             claims += ",s2=";
-            claims += s2.local_state().retention().retained(RetentionClass::data, id) ? "held" : "free";
+            claims +=
+                s2.local_state().retention().retained(RetentionClass::data, id) ? "held" : "free";
             const auto state = s2.local_state().retention().claims(RetentionClass::data, id);
             claims += "(adds:";
             for (const auto& [origin, sequence] : state.adds)
@@ -5665,8 +6055,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             " s2_stage_now=" + s2.maintenance_stage() + " " + s2.maintenance_sleep_diagnostic() +
             " claims=[" + claims + "] s2_release_view=" +
             (view2 ? std::to_string(view2->generation) : std::string("none")) +
-            " s2_release_clock=[" + clock2 + "] s2_committed=" +
-            std::to_string(s2.local_state().replica().committed_generation()) +
+            " s2_release_clock=[" + clock2 +
+            "] s2_committed=" + std::to_string(s2.local_state().replica().committed_generation()) +
             " s2_known=" + std::to_string(s2.metadata_server().known_generation()) +
             " s2_all_reachable=" + (s2.node().membership().all_known_reachable() ? "yes" : "no") +
             " s2_stable=" + (cluster2.stable ? "yes" : "no") +
@@ -5674,7 +6064,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             " s1_heads=" + std::to_string(s1.local_state().replica().accepted_heads().size()) +
             " s2_self=" + to_string(s2.node().node_id()).substr(0, 6) +
             " s1_self=" + to_string(s1.node().node_id()).substr(0, 6) + " | " +
-            
+
             "superseded catalogue artwork was not reclaimed within 12s: remaining=[" + remaining +
             "] superseded_count=" + std::to_string(superseded.size()) +
             " s1_catalogue_generation=" + std::to_string(status1.metadata_generation) +
@@ -5682,9 +6072,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             " s1_artwork_objects=" + std::to_string(status1.artwork_objects) +
             " s2_catalogue_generation=" + std::to_string(status2.metadata_generation) +
             " s2_artwork_objects=" + std::to_string(status2.artwork_objects) +
-            " installs_delta=" + std::to_string(installs_delta) +
-            " reclaimed_eventually=" + (eventually ? "yes" : "no") +
-            " total_ms=" + std::to_string(total_ms));
+            " installs_delta=" + std::to_string(installs_delta) + " reclaimed_eventually=" +
+            (eventually ? "yes" : "no") + " total_ms=" + std::to_string(total_ms));
     }
 
     s2.stop();
@@ -5696,8 +6085,10 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_failed_hint_outlives_the_job_that_
     // that the file was never catalogued.
     TempDir dir;
     CatalogueHintQueue hints(dir.path());
-    const auto failed_id = hints.submit("/TV/Show/S01E01.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
-    const auto matched_id = hints.submit("/TV/Show/S01E02.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
+    const auto failed_id =
+        hints.submit("/TV/Show/S01E01.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
+    const auto matched_id =
+        hints.submit("/TV/Show/S01E02.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
     auto first = hints.claim_next();
     auto second = hints.claim_next();
     REQUIRE(first.has_value());
@@ -5745,8 +6136,8 @@ MACHA_TEST("hydration_catalogue", test_an_ingest_waits_out_a_missing_staging_dir
     config.staging_path = staging_path;
     config.blocked_retry = 200ms;
     IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
-    const auto id = ingest.submit_path(staged.parent_path(), "torrent", "job", "Staged Movie", false,
-                                       true, true);
+    const auto id = ingest.submit_path(staged.parent_path(), "torrent", "job", "Staged Movie",
+                                       false, true, true);
     // The disk goes before the job runs.
     auto away = staging_path;
     away += ".away";
@@ -5763,12 +6154,13 @@ MACHA_TEST("hydration_catalogue", test_an_ingest_waits_out_a_missing_staging_dir
 
     std::filesystem::rename(away, staging_path);
     REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 30s));
-    CHECK(read_whole(node.filesystem(), ingest.job(id)->files.front().destination_path, file_bytes) ==
-          pattern(file_bytes));
+    CHECK(read_whole(node.filesystem(), ingest.job(id)->files.front().destination_path,
+                     file_bytes) == pattern(file_bytes));
     ingest.stop();
 }
 
-MACHA_FAST_TEST("hydration_catalogue", test_a_discarded_payload_leaves_at_once_and_is_deleted_later) {
+MACHA_FAST_TEST("hydration_catalogue",
+                test_a_discarded_payload_leaves_at_once_and_is_deleted_later) {
     // A discarded payload is renamed into staging's trash, still counted, and
     // deleted when the trash is emptied.
     TempDir dir;
@@ -5793,7 +6185,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_discarded_payload_leaves_at_once_a
 }
 
 #if MACHA_HAVE_BOOKS
-MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and_served_as_content) {
+MACHA_TEST("hydration_catalogue",
+           test_books_are_catalogued_from_their_files_and_served_as_content) {
     // Books over one node: an EPUB's own record and a path-only PDF become
     // books, authors and series; nothing is profiled; the API filters by
     // author and series, checks references, answers a book's profile with
@@ -5805,7 +6198,8 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
         auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
         std::ifstream input(path, std::ios::binary);
         REQUIRE(input.good());
-        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        std::string bytes((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
         return Bytes(bytes.begin(), bytes.end());
     };
     node.mkdir("/Books");
@@ -5814,7 +6208,8 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
     node.mkdir("/Books/Neil Gaiman & Terry Pratchett");
     node.mkdir("/Books/Neil Gaiman & Terry Pratchett/Good Omens (1990)");
     const std::string epub_path = "/Books/Terry Pratchett/Guards! Guards!/guards.epub";
-    const std::string pdf_path = "/Books/Neil Gaiman & Terry Pratchett/Good Omens (1990)/Good Omens.pdf";
+    const std::string pdf_path =
+        "/Books/Neil Gaiman & Terry Pratchett/Good Omens (1990)/Good Omens.pdf";
     const auto epub_bytes = fixture_bytes("guards.epub");
     const auto epub_id = node.write(epub_path, epub_bytes);
     const auto pdf_id = node.write(pdf_path, pattern(8192, 7));
@@ -5899,7 +6294,8 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
     CHECK(node.catalogue().get("series:discworld")->title == "Discworld");
     auto omens = node.catalogue().get("book:good-omens:neil-gaiman");
     REQUIRE(omens.has_value());
-    CHECK((omens->author_ids == std::vector<std::string>{"author:neil-gaiman", "author:terry-pratchett"}));
+    CHECK((omens->author_ids ==
+           std::vector<std::string>{"author:neil-gaiman", "author:terry-pratchett"}));
     CHECK(omens->year == std::optional<int32_t>{1990});
     CHECK(omens->series.empty());
     CHECK(omens->media_ids == std::vector<std::string>{pdf_id});
@@ -5911,20 +6307,22 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
     CatalogueApi api(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(1), {}, {}, {},
                      [&](const std::string& media_id) -> std::optional<MediaContentSource> {
                          auto found = fs.find_media(media_id);
-                         if (!found) return std::nullopt;
+                         if (!found)
+                             return std::nullopt;
                          auto handle = fs.open_read(found->second, found->first, false);
-                         return MediaContentSource{found->second.size,
-                                                   found->first.substr(found->first.find_last_of('/') + 1),
-                                                   [handle](uint64_t offset, std::span<uint8_t> into) {
-                                                       return handle->read(offset, into);
-                                                   }};
+                         return MediaContentSource{
+                             found->second.size,
+                             found->first.substr(found->first.find_last_of('/') + 1),
+                             [handle](uint64_t offset, std::span<uint8_t> into) {
+                                 return handle->read(offset, into);
+                             }};
                      });
     const auto call = [&](std::string method, std::string path,
                           std::map<std::string, std::string, std::less<>> query = {},
                           std::string body = {},
                           std::map<std::string, std::string, std::less<>> headers = {}) {
-        auto request = api_request(std::move(method), std::move(path), Bytes(body.begin(), body.end()),
-                                   std::move(headers));
+        auto request = api_request(std::move(method), std::move(path),
+                                   Bytes(body.begin(), body.end()), std::move(headers));
         request.query = std::move(query);
         return api.handle(request);
     };
@@ -5935,13 +6333,17 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
             out.insert(item.find("id")->asString());
         return out;
     };
-    auto by_author = call("GET", "/api/v1/catalogue/items", {{"type", "book"}, {"author", "author:terry-pratchett"}});
+    auto by_author = call("GET", "/api/v1/catalogue/items",
+                          {{"type", "book"}, {"author", "author:terry-pratchett"}});
     REQUIRE(by_author.status == 200);
-    CHECK((ids(by_author) == std::set<std::string>{"book:isbn:9780552134620", "book:good-omens:neil-gaiman"}));
-    auto by_series = call("GET", "/api/v1/catalogue/items", {{"type", "book"}, {"series", "series:city-watch"}});
+    CHECK((ids(by_author) ==
+           std::set<std::string>{"book:isbn:9780552134620", "book:good-omens:neil-gaiman"}));
+    auto by_series =
+        call("GET", "/api/v1/catalogue/items", {{"type", "book"}, {"series", "series:city-watch"}});
     REQUIRE(by_series.status == 200);
     CHECK((ids(by_series) == std::set<std::string>{"book:isbn:9780552134620"}));
-    auto searched = call("GET", "/api/v1/catalogue/search", {{"q", "guards"}, {"kind", "book"}, {"author", "author:neil-gaiman"}});
+    auto searched = call("GET", "/api/v1/catalogue/search",
+                         {{"q", "guards"}, {"kind", "book"}, {"author", "author:neil-gaiman"}});
     REQUIRE(searched.status == 200);
     CHECK(ids(searched).empty());
     auto item = call("GET", "/api/v1/catalogue/items/book%3Aisbn%3A9780552134620");
@@ -5951,7 +6353,8 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
     CHECK(item_json.find("parent_id")->isNull());
     REQUIRE(item_json.find("author_ids")->asArray().size() == 1);
     REQUIRE(item_json.find("series")->asArray().size() == 2);
-    CHECK(item_json.find("series")->asArray().front().find("series_id")->asString() == "series:discworld");
+    CHECK(item_json.find("series")->asArray().front().find("series_id")->asString() ==
+          "series:discworld");
     CHECK(item_json.find("series")->asArray().front().find("index")->asInt64() == 8);
     CHECK(item_json.find("language")->asString() == "en");
     CHECK(item_json.find("publisher")->asString() == "Corgi");
@@ -5969,16 +6372,19 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
     CHECK(missing.status == 400);
     CHECK(api_body(missing).find("error")->asString() == "reference_not_found");
     CHECK(api_body(missing).find("reference_id")->asString() == "author:nobody");
-    auto wrong = call("PUT", "/api/v1/catalogue/items/book%3Ahand", {},
-                      R"({"kind":"book","title":"Hand Book","series":[{"series_id":"author:terry-pratchett","index":2.5}]})");
+    auto wrong = call(
+        "PUT", "/api/v1/catalogue/items/book%3Ahand", {},
+        R"({"kind":"book","title":"Hand Book","series":[{"series_id":"author:terry-pratchett","index":2.5}]})");
     CHECK(wrong.status == 400);
     CHECK(api_body(wrong).find("error")->asString() == "bad_reference_kind");
     CHECK(api_body(wrong).find("reference_kind")->asString() == "author");
-    auto not_a_book = call("PUT", "/api/v1/catalogue/items/movie%3Ahand", {},
-                           R"({"kind":"movie","title":"Film","author_ids":["author:terry-pratchett"]})");
+    auto not_a_book =
+        call("PUT", "/api/v1/catalogue/items/movie%3Ahand", {},
+             R"({"kind":"movie","title":"Film","author_ids":["author:terry-pratchett"]})");
     CHECK(not_a_book.status == 400);
-    auto hand = call("PUT", "/api/v1/catalogue/items/book%3Ahand", {},
-                     R"({"kind":"book","title":"Hand Book","author_ids":["author:terry-pratchett"],"series":[{"series_id":"series:discworld","index":8.5}],"language":"en-GB"})");
+    auto hand = call(
+        "PUT", "/api/v1/catalogue/items/book%3Ahand", {},
+        R"({"kind":"book","title":"Hand Book","author_ids":["author:terry-pratchett"],"series":[{"series_id":"series:discworld","index":8.5}],"language":"en-GB"})");
     REQUIRE(hand.status == 201);
     CHECK(api_body(hand).find("series")->asArray().front().find("index")->asNumber() == 8.5);
     CHECK(node.catalogue().get("book:hand")->language == std::optional<std::string>{"en-GB"});
@@ -5996,8 +6402,8 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
     CHECK(!whole.headers.contains("Content-Disposition"));
     REQUIRE(whole.stream);
     CHECK(whole.stream->size() == epub_bytes.size());
-    auto ranged = call("GET", "/api/v1/catalogue/media/" + epub_id + "/content", {{"download", "1"}}, {},
-                       {{"range", "bytes=0-3"}});
+    auto ranged = call("GET", "/api/v1/catalogue/media/" + epub_id + "/content",
+                       {{"download", "1"}}, {}, {{"range", "bytes=0-3"}});
     REQUIRE(ranged.status == 206);
     CHECK(ranged.headers.at("Content-Range") == "bytes 0-3/" + std::to_string(epub_bytes.size()));
     CHECK(ranged.headers.at("Content-Disposition") == "attachment; filename=\"guards.epub\"");
@@ -6008,7 +6414,9 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
     auto pdf = call("GET", "/api/v1/catalogue/media/" + pdf_id + "/content");
     REQUIRE(pdf.status == 200);
     CHECK(pdf.content_type == "application/pdf");
-    CHECK(call("GET", "/api/v1/catalogue/media/" + epub_id + "/content", {}, {}, {{"range", "bytes=99999999-"}}).status == 416);
+    CHECK(call("GET", "/api/v1/catalogue/media/" + epub_id + "/content", {}, {},
+               {{"range", "bytes=99999999-"}})
+              .status == 416);
     CHECK(call("GET", "/api/v1/catalogue/media/macha%3Aabsent/content").status == 404);
     CHECK(call("GET", "/api/v1/catalogue/media/path%3A%2Fx/content").status == 400);
 
@@ -6019,7 +6427,8 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
     CHECK(!node.catalogue().get("book:good-omens:neil-gaiman").has_value());
     CHECK(!node.catalogue().get("author:neil-gaiman").has_value());
     CHECK(node.catalogue().get("author:terry-pratchett").has_value());
-    auto unbound = node.catalogue().unbind_media(std::string_view("book:isbn:9780552134620"), epub_id, {});
+    auto unbound =
+        node.catalogue().unbind_media(std::string_view("book:isbn:9780552134620"), epub_id, {});
     CHECK(unbound.bound);
     CHECK(!node.catalogue().get("book:isbn:9780552134620").has_value());
     CHECK(!node.catalogue().get("series:city-watch").has_value());
@@ -6028,26 +6437,34 @@ MACHA_TEST("hydration_catalogue", test_books_are_catalogued_from_their_files_and
     CHECK(node.catalogue().get("book:hand").has_value());
 }
 
-MACHA_FAST_TEST("hydration_catalogue", test_open_library_enriches_a_book_and_the_probe_alone_catalogues_it) {
+MACHA_FAST_TEST("hydration_catalogue",
+                test_open_library_enriches_a_book_and_the_probe_alone_catalogues_it) {
     // OpenLibraryProvider over a fake HTTP client: an ISBN finds the edition,
     // its work and its authors; a title and author search needs the author to
     // agree; the editor's search and artwork options; and the ids a probe
     // alone gives, so a provider match and a file-only match meet.
     FakeHttpClient http;
-    http.add("/isbn/9780552134620.json", 200, "application/json",
-             R"({"key":"/books/OL1M","title":"Guards! Guards!","authors":[{"key":"/authors/OL2A"}],"works":[{"key":"/works/OL3W"}],"publishers":["Corgi"],"publish_date":"1990","languages":[{"key":"/languages/eng"}],"covers":[123,-1],"isbn_13":["9780552134620"]})");
-    http.add("/authors/OL2A.json", 200, "application/json", R"({"key":"/authors/OL2A","name":"Terry Pratchett"})");
+    http.add(
+        "/isbn/9780552134620.json", 200, "application/json",
+        R"({"key":"/books/OL1M","title":"Guards! Guards!","authors":[{"key":"/authors/OL2A"}],"works":[{"key":"/works/OL3W"}],"publishers":["Corgi"],"publish_date":"1990","languages":[{"key":"/languages/eng"}],"covers":[123,-1],"isbn_13":["9780552134620"]})");
+    http.add("/authors/OL2A.json", 200, "application/json",
+             R"({"key":"/authors/OL2A","name":"Terry Pratchett"})");
     http.add("/books/OL1M.json", 200, "application/json",
              R"({"key":"/books/OL1M","title":"Guards! Guards!","covers":[123]})");
-    http.add("/works/OL3W.json", 200, "application/json",
-             R"({"key":"/works/OL3W","title":"Guards! Guards!","description":{"type":"/type/text","value":"The dragon is back."},"authors":[{"author":{"key":"/authors/OL2A"}}],"covers":[456]})");
-    http.add("/search.json", 200, "application/json",
-             R"({"docs":[{"key":"/works/OL9W","title":"Mort","author_name":["Terry Pratchett"],"author_key":["OL2A"],"first_publish_year":1987,"cover_i":789},{"key":"/works/OL10W","title":"Mort","author_name":["Someone Else"],"first_publish_year":2001}]})");
-    http.add("/works/OL9W.json", 200, "application/json",
-             R"({"key":"/works/OL9W","title":"Mort","authors":[{"author":{"key":"/authors/OL2A"}}]})");
-    http.add("/works/OL10W.json", 200, "application/json", R"({"key":"/works/OL10W","title":"Mort"})");
+    http.add(
+        "/works/OL3W.json", 200, "application/json",
+        R"({"key":"/works/OL3W","title":"Guards! Guards!","description":{"type":"/type/text","value":"The dragon is back."},"authors":[{"author":{"key":"/authors/OL2A"}}],"covers":[456]})");
+    http.add(
+        "/search.json", 200, "application/json",
+        R"({"docs":[{"key":"/works/OL9W","title":"Mort","author_name":["Terry Pratchett"],"author_key":["OL2A"],"first_publish_year":1987,"cover_i":789},{"key":"/works/OL10W","title":"Mort","author_name":["Someone Else"],"first_publish_year":2001}]})");
+    http.add(
+        "/works/OL9W.json", 200, "application/json",
+        R"({"key":"/works/OL9W","title":"Mort","authors":[{"author":{"key":"/authors/OL2A"}}]})");
+    http.add("/works/OL10W.json", 200, "application/json",
+             R"({"key":"/works/OL10W","title":"Mort"})");
     CatalogueOpenLibraryConfig config;
-    OpenLibraryProvider provider(http, config, std::make_shared<ProviderGate>(std::chrono::milliseconds(0)));
+    OpenLibraryProvider provider(http, config,
+                                 std::make_shared<ProviderGate>(std::chrono::milliseconds(0)));
     CHECK(provider.supports(MediaProbeKind::book));
     CHECK(!provider.supports(MediaProbeKind::track));
 
@@ -6143,7 +6560,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_open_library_enriches_a_book_and_the
     CHECK(book_match_from_probe(no_isbn)->items.back().id == "book:guards-guards:terry-pratchett");
 }
 
-MACHA_TEST("hydration_catalogue", test_mobi_books_in_title_author_folders_are_read_and_old_matches_replaced) {
+MACHA_TEST("hydration_catalogue",
+           test_mobi_books_in_title_author_folders_are_read_and_old_matches_replaced) {
     // The layout that caught 0.92.0: /Books/<Title>/<Author>/<Title - Author>.mobi
     // with cover.jpg beside it. The MOBI header gives the record and the
     // cover; a path-only book reads its title from the file name the folders
@@ -6156,16 +6574,20 @@ MACHA_TEST("hydration_catalogue", test_mobi_books_in_title_author_folders_are_re
         auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
         std::ifstream input(path, std::ios::binary);
         REQUIRE(input.good());
-        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        std::string bytes((std::istreambuf_iterator<char>(input)),
+                          std::istreambuf_iterator<char>());
         return Bytes(bytes.begin(), bytes.end());
     };
-    for (const auto* dir : {"/Books", "/Books/A Hat Full of Sky", "/Books/A Hat Full of Sky/Terry Pratchett",
-                            "/Books/Eric", "/Books/Eric/Terry Pratchett", "/Books/Terry Pratchett",
-                            "/Books/Terry Pratchett/Mort (12)", "/Books/Hand", "/Books/Hand/Someone"})
+    for (const auto* dir :
+         {"/Books", "/Books/A Hat Full of Sky", "/Books/A Hat Full of Sky/Terry Pratchett",
+          "/Books/Eric", "/Books/Eric/Terry Pratchett", "/Books/Terry Pratchett",
+          "/Books/Terry Pratchett/Mort (12)", "/Books/Hand", "/Books/Hand/Someone"})
         node.mkdir(dir);
-    const std::string hat = "/Books/A Hat Full of Sky/Terry Pratchett/A Hat Full of Sky - Terry Pratchett.mobi";
+    const std::string hat =
+        "/Books/A Hat Full of Sky/Terry Pratchett/A Hat Full of Sky - Terry Pratchett.mobi";
     const auto hat_id = node.write(hat, fixture("hat-full-of-sky.mobi"));
-    (void)node.write("/Books/A Hat Full of Sky/Terry Pratchett/cover.jpg", Bytes{0xFF, 0xD8, 0xFF, 1, 2});
+    (void)node.write("/Books/A Hat Full of Sky/Terry Pratchett/cover.jpg",
+                     Bytes{0xFF, 0xD8, 0xFF, 1, 2});
     const std::string eric = "/Books/Eric/Terry Pratchett/Eric - Terry Pratchett.pdf";
     const auto eric_id = node.write(eric, pattern(4096, 3));
     const Bytes eric_cover{0xFF, 0xD8, 0xFF, 9, 9, 9};
@@ -6178,7 +6600,8 @@ MACHA_TEST("hydration_catalogue", test_mobi_books_in_title_author_folders_are_re
         R"(<dc:title>Mort</dc:title><dc:creator opf:role="aut">Terry Pratchett</dc:creator>)"
         R"(<meta name="calibre:series" content="Discworld"/><meta name="calibre:series_index" content="4"/>)"
         R"(</metadata></package>)";
-    (void)node.write("/Books/Terry Pratchett/Mort (12)/metadata.opf", Bytes(opf.begin(), opf.end()));
+    (void)node.write("/Books/Terry Pratchett/Mort (12)/metadata.opf",
+                     Bytes(opf.begin(), opf.end()));
     const std::string hand = "/Books/Hand/Someone/Hand - Someone.pdf";
     const auto hand_id = node.write(hand, pattern(4096, 5));
 
@@ -6213,7 +6636,8 @@ MACHA_TEST("hydration_catalogue", test_mobi_books_in_title_author_folders_are_re
         hand_book.author_ids = {hand_author.id};
         hand_book.media_ids = {hand_id};
         hand_book.external_ids["macha_metadata_locked"] = "1";
-        node.catalogue().upsert_many({wrong_author, wrong_book, eric_author, eric_book, hand_author, hand_book});
+        node.catalogue().upsert_many(
+            {wrong_author, wrong_book, eric_author, eric_book, hand_author, hand_book});
     }
 
     CatalogueScannerConfig config;
@@ -6223,8 +6647,8 @@ MACHA_TEST("hydration_catalogue", test_mobi_books_in_title_author_folders_are_re
     config.music.enabled = false;
     config.books.enabled = true;
     config.books.openlibrary.enabled = false;
-    CatalogueScanner scanner(node.node(), node.node().metadata_server(), fs, node.catalogue(), node.hints(),
-                             config, std::make_unique<FakeHttpClient>());
+    CatalogueScanner scanner(node.node(), node.node().metadata_server(), fs, node.catalogue(),
+                             node.hints(), config, std::make_unique<FakeHttpClient>());
     CHECK(scanner.scan_once() == 3);
 
     // The MOBI header: title, author, ISBN, publisher, date, and its own
@@ -6307,7 +6731,8 @@ MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue
     const auto converter = node.path() / "mobitool";
     {
         std::ofstream out(converter);
-        out << "#!/bin/sh\nname=$(basename \"$4\")\n{ printf 'EPUB:'; cat \"$4\"; } > \"$3/${name%.*}.epub\"\n";
+        out << "#!/bin/sh\nname=$(basename \"$4\")\n{ printf 'EPUB:'; cat \"$4\"; } > "
+               "\"$3/${name%.*}.epub\"\n";
     }
     std::filesystem::permissions(converter, std::filesystem::perms::owner_all);
     BookConversionConfig conversion;
@@ -6317,7 +6742,8 @@ MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue
     conversions.start();
     const auto content = [&](const std::string& media_id) -> std::optional<MediaContentSource> {
         auto found = fs.find_media(media_id);
-        if (!found) return std::nullopt;
+        if (!found)
+            return std::nullopt;
         auto handle = fs.open_read(found->second, found->first, false);
         return MediaContentSource{found->second.size,
                                   found->first.substr(found->first.find_last_of('/') + 1),
@@ -6325,9 +6751,10 @@ MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue
                                       return handle->read(offset, into);
                                   }};
     };
-    CatalogueApi api(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(1), {}, {}, {}, content,
-                     &conversions);
-    CatalogueApi without(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(1), {}, {}, {}, content);
+    CatalogueApi api(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(1), {}, {}, {},
+                     content, &conversions);
+    CatalogueApi without(node.catalogue(), node.hints(), {}, {}, std::chrono::hours(1), {}, {}, {},
+                         content);
     const auto call = [](CatalogueApi& on, std::string method, std::string path,
                          std::map<std::string, std::string, std::less<>> query = {},
                          std::map<std::string, std::string, std::less<>> headers = {}) {
@@ -6339,7 +6766,8 @@ MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue
 
     auto unavailable = call(without, "PUT", base + "epub");
     CHECK(unavailable.status == 503);
-    CHECK(api_body(unavailable).find("error")->find("code")->asString() == "conversion_unavailable");
+    CHECK(api_body(unavailable).find("error")->find("code")->asString() ==
+          "conversion_unavailable");
     CHECK(call(api, "PUT", base + "docx").status == 400);
     CHECK(api_body(call(api, "PUT", base + "mobi")).find("error")->asString() == "bad_format");
     auto not_book = call(api, "PUT", "/api/v1/catalogue/media/" + movie_id + "/conversions/epub");
@@ -6351,10 +6779,12 @@ MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue
     REQUIRE((started.status == 202 || started.status == 200));
     CHECK(api_body(started).find("format")->asString() == "epub");
     CHECK(api_body(started).find("mime_type")->asString() == "application/epub+zip");
-    REQUIRE(wait_until([&] {
-        auto state = call(api, "GET", base + "epub");
-        return state.status == 200 && api_body(state).find("status")->asString() == "ready";
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            auto state = call(api, "GET", base + "epub");
+            return state.status == 200 && api_body(state).find("status")->asString() == "ready";
+        },
+        10s));
     auto state = api_body(call(api, "GET", base + "epub"));
     CHECK(state.find("size")->asUInt64() == 2048 + 5);
     CHECK(state.find("error_code")->isNull());
@@ -6380,12 +6810,12 @@ MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue
 
 MACHA_TEST("hydration_catalogue", test_ingest_files_a_book_under_its_first_author) {
     // A host EPUB is read for its record and planned under the books root.
-    CatalogueNode node("ingest-books", [](Config& config) {
-        config.catalogue.scanner.books.enabled = true;
-    });
+    CatalogueNode node("ingest-books",
+                       [](Config& config) { config.catalogue.scanner.books.enabled = true; });
     auto& fs = node.filesystem();
     node.mkdir("/Books");
-    const auto fixture = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / "guards.epub";
+    const auto fixture =
+        std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / "guards.epub";
     std::ifstream input(fixture, std::ios::binary);
     REQUIRE(input.good());
     std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
@@ -6406,16 +6836,20 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_a_book_under_its_first_autho
     IngestManager ingest(node.node(), fs, node.hints(), config);
     ingest.start();
     const auto id = ingest.submit_path(external);
-    REQUIRE(wait_until([&] {
-        auto job = ingest.job(id);
-        return job && job->state == IngestJobState::cataloguing;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            auto job = ingest.job(id);
+            return job && job->state == IngestJobState::cataloguing;
+        },
+        10s));
     auto job = ingest.job(id);
     REQUIRE(job.has_value());
     std::set<std::string> destinations;
-    for (const auto& file : job->files) destinations.insert(file.destination_path);
-    CHECK((destinations == std::set<std::string>{"/Books/Terry Pratchett/Guards! Guards!/guards.epub",
-                                                 "/Books/Neil Gaiman/Neverwhere/Neil Gaiman - Neverwhere.pdf"}));
+    for (const auto& file : job->files)
+        destinations.insert(file.destination_path);
+    CHECK((destinations ==
+           std::set<std::string>{"/Books/Terry Pratchett/Guards! Guards!/guards.epub",
+                                 "/Books/Neil Gaiman/Neverwhere/Neil Gaiman - Neverwhere.pdf"}));
     CHECK(fs.getattr("/Books/Terry Pratchett/Guards! Guards!/guards.epub").size == text.size());
     ingest.stop();
 }
@@ -6423,4 +6857,3 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_a_book_under_its_first_autho
 #endif
 
 } // namespace
-

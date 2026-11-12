@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "cluster/distributed_store.hpp"
 #include "contract/object_ledger.hpp"
 #include "contract/thread_safety.hpp"
-#include "metadata/metadata_server.hpp"
-#include "cluster/distributed_store.hpp"
 #include "media/media_engine.hpp"
-#include "storage/unreferenced_since.hpp"
 #include "metadata/metadata_manager.hpp"
+#include "metadata/metadata_server.hpp"
+#include "storage/unreferenced_since.hpp"
 
 #include <array>
-#include <map>
-#include <span>
-#include <memory>
-#include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -127,7 +127,7 @@ class CatalogueView {
     using ShardIds = std::array<std::optional<ObjectId>, catalogue_shard_count>;
 
     // Every value of one of a shard's maps, across the shards.
-    template <class Map, const Map Shard::*Member> class Range {
+    template <class Map, const Map Shard::* Member> class Range {
       public:
         class iterator {
             const Shards* shards_{};
@@ -154,8 +154,12 @@ class CatalogueView {
                     at_ = ((*(*shards_)[0]).*Member).begin();
                 settle();
             }
-            reference operator*() const { return *at_; }
-            const value_type* operator->() const { return &*at_; }
+            reference operator*() const {
+                return *at_;
+            }
+            const value_type* operator->() const {
+                return &*at_;
+            }
             iterator& operator++() {
                 ++at_;
                 settle();
@@ -166,8 +170,12 @@ class CatalogueView {
             }
         };
         explicit Range(const Shards& shards) : shards_(&shards) {}
-        iterator begin() const { return iterator(shards_); }
-        iterator end() const { return {}; }
+        iterator begin() const {
+            return iterator(shards_);
+        }
+        iterator end() const {
+            return {};
+        }
 
       private:
         const Shards* shards_;
@@ -181,7 +189,9 @@ class CatalogueView {
     const CatalogueItem* item(std::string_view id) const;
     const CatalogueSnapshot::MediaProfile* media_profile(std::string_view media_id) const;
     const ObjectId* media_index(std::string_view media_id) const;
-    size_t item_count() const noexcept { return item_count_; }
+    size_t item_count() const noexcept {
+        return item_count_;
+    }
 
     Range<std::map<std::string, CatalogueItem>, &Shard::items> items() const {
         return Range<std::map<std::string, CatalogueItem>, &Shard::items>(shards_);
@@ -197,8 +207,12 @@ class CatalogueView {
         return Range<std::map<std::string, ObjectId, std::less<>>, &Shard::media_indexes>(shards_);
     }
 
-    const Shards& shards() const noexcept { return shards_; }
-    const ShardIds& shard_ids() const noexcept { return ids_; }
+    const Shards& shards() const noexcept {
+        return shards_;
+    }
+    const ShardIds& shard_ids() const noexcept {
+        return ids_;
+    }
     // The whole catalogue as one snapshot: a copy.
     CatalogueSnapshot merged() const;
 
@@ -286,13 +300,13 @@ struct ResolvedMediaProfile {
 
 Bytes encode_catalogue(const CatalogueSnapshot&);
 CatalogueSnapshot decode_catalogue(std::span<const uint8_t>);
-std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
-    const CatalogueSnapshot& base, const CatalogueSnapshot& left,
-    const CatalogueSnapshot& right);
+std::optional<CatalogueSnapshot> merge_catalogue_snapshots(const CatalogueSnapshot& base,
+                                                           const CatalogueSnapshot& left,
+                                                           const CatalogueSnapshot& right);
 std::string catalogue_kind_name(CatalogueKind);
 std::optional<CatalogueKind> parse_catalogue_kind(std::string_view);
 std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueView&,
-                                                           const CatalogueItem&);
+                                                          const CatalogueItem&);
 // What a decoded catalogue holds in memory, estimated from its containers.
 uint64_t catalogue_resident_bytes(const CatalogueSnapshot&);
 uint64_t catalogue_resident_bytes(const CatalogueView&);
@@ -359,10 +373,10 @@ class CatalogueManager {
         std::exception_ptr error MACHA_GUARDED_BY(mutex);
     };
     mutable Mutex media_profile_mutex_;
-    std::map<std::string, MediaProbeResult, std::less<>> resolved_media_profiles_
-        MACHA_GUARDED_BY(media_profile_mutex_);
-    std::map<std::string, std::shared_ptr<MediaProfileFlight>, std::less<>> media_profile_flights_
-        MACHA_GUARDED_BY(media_profile_mutex_);
+    std::map<std::string, MediaProbeResult, std::less<>>
+        resolved_media_profiles_ MACHA_GUARDED_BY(media_profile_mutex_);
+    std::map<std::string, std::shared_ptr<MediaProfileFlight>, std::less<>>
+        media_profile_flights_ MACHA_GUARDED_BY(media_profile_mutex_);
     // Owned by the maintenance thread, the only caller of control_gc_step().
     LocalStore::Cursor control_gc_cursor_;
     std::optional<ObjectId> control_converged_root_ MACHA_GUARDED_BY(mutex_);
@@ -422,7 +436,9 @@ class CatalogueManager {
     CatalogueManager(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore&, MetadataView&,
                      const ObjectLedger&);
 
-    const ClusterKeys& cluster_keys() const noexcept { return node_.keys(); }
+    const ClusterKeys& cluster_keys() const noexcept {
+        return node_.keys();
+    }
 
     // Installs the catalogue at this node's head: what a head change asks
     // for.
@@ -456,9 +472,8 @@ class CatalogueManager {
     std::shared_ptr<const CatalogueView> snapshot_view(const WorkContext&);
     std::optional<CatalogueItem> get(std::string_view id);
     std::optional<MediaProbeResult> media_profile(std::string_view media_id);
-    ResolvedMediaProfile resolve_media_profile(
-        std::string media_id, Clock::time_point deadline,
-        std::function<MediaProbeResult()> generate);
+    ResolvedMediaProfile resolve_media_profile(std::string media_id, Clock::time_point deadline,
+                                               std::function<MediaProbeResult()> generate);
     void put_media_profile(std::string media_id, MediaProbeResult profile);
     void put_media_profiles(std::map<std::string, MediaProbeResult, std::less<>> profiles);
     size_t prune_media_profiles(const std::set<std::string>& live_media_ids);
@@ -480,8 +495,8 @@ class CatalogueManager {
     std::vector<CatalogueItem> upsert_many(std::vector<CatalogueItem>);
     bool erase(std::string_view id, std::optional<uint64_t> expected_revision = {});
     bool definitely_absent(std::string_view id) const;
-    CatalogueClearResult clear_metadata_with_media(
-        std::string_view id, std::optional<uint64_t> expected_revision = {});
+    CatalogueClearResult clear_metadata_with_media(std::string_view id,
+                                                   std::optional<uint64_t> expected_revision = {});
     size_t clear_metadata(std::string_view id, std::optional<uint64_t> expected_revision = {});
     // Unbinds `media_id` from item `item_id`, or from every item when none is
     // named. A movie, episode or track left with no media is removed, and so
@@ -490,8 +505,8 @@ class CatalogueManager {
     CatalogueUnbindResult unbind_media(std::optional<std::string_view> item_id,
                                        std::string_view media_id,
                                        std::optional<uint64_t> expected_revision = {});
-    CatalogueArtwork put_artwork(std::string_view item_id, std::string role,
-                                 std::string mime_type, std::span<const uint8_t> bytes,
+    CatalogueArtwork put_artwork(std::string_view item_id, std::string role, std::string mime_type,
+                                 std::span<const uint8_t> bytes,
                                  std::optional<uint64_t> expected_revision = {},
                                  FrameType frame = FrameType::speculative);
     CatalogueArtwork stage_artwork(std::string role, std::string mime_type,
@@ -504,20 +519,20 @@ class CatalogueManager {
     bool artwork_durability_barrier(DistributedStore::DurabilityBatch& batch,
                                     FrameType frame = FrameType::speculative);
     // Whether this node holds the artwork object itself.
-    bool artwork_held_here(const ObjectId& id) const { return store_.held_here(id); }
+    bool artwork_held_here(const ObjectId& id) const {
+        return store_.held_here(id);
+    }
     // `vanished_media`: media a complete scan found nowhere in the namespace.
     // With `prune_missing`, every leaf drops them, manual items included; a
     // manual item stays when its last file goes.
-    void reconcile_scanner(const std::vector<CatalogueItem>& discovered,
-                           const std::set<std::string>& active_media_ids,
-                           bool prune_missing = true,
-                           std::optional<Hash256> expected_namespace = std::nullopt,
-                           const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {},
-                           const std::set<std::string>& vanished_media = {},
-                           FrameType frame = FrameType::speculative,
-                           // Items a match replaces, each with the files it
-                           // takes from them; an item left with none goes.
-                           const std::map<std::string, std::set<std::string>>& superseded = {});
+    void reconcile_scanner(
+        const std::vector<CatalogueItem>& discovered, const std::set<std::string>& active_media_ids,
+        bool prune_missing = true, std::optional<Hash256> expected_namespace = std::nullopt,
+        const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {},
+        const std::set<std::string>& vanished_media = {}, FrameType frame = FrameType::speculative,
+        // Items a match replaces, each with the files it
+        // takes from them; an item left with none goes.
+        const std::map<std::string, std::set<std::string>>& superseded = {});
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     // The maintenance inventory's catalogue half, called in order (spec A4):
     // the head (may read the committed record when behind), then the read of
@@ -527,12 +542,12 @@ class CatalogueManager {
     CatalogueMaintenanceHead maintenance_head();
     CatalogueMaintenance maintenance_objects(const CatalogueMaintenanceHead&);
     CatalogueRetentionObjects retention_objects(const std::optional<ObjectId>& old_root,
-                                                 const std::optional<ObjectId>& new_root);
+                                                const std::optional<ObjectId>& new_root);
     // Given `sightings`, an object goes only once this node has seen it
     // unreferenced and unclaimed for `grace`.
-    size_t control_gc_step(const IdLookup& live,
-                           std::chrono::milliseconds grace, size_t operation_budget = 32,
-                           UnreferencedSince* sightings = nullptr, uint64_t now_unix_ms = 0);
+    size_t control_gc_step(const IdLookup& live, std::chrono::milliseconds grace,
+                           size_t operation_budget = 32, UnreferencedSince* sightings = nullptr,
+                           uint64_t now_unix_ms = 0);
 };
 
 } // namespace macha

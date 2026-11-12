@@ -14,10 +14,8 @@ namespace {
 uint32_t be32(std::span<const uint8_t> bytes) {
     if (bytes.size() != 4)
         throw DecodeError("truncated FUSE journal frame length");
-    return (static_cast<uint32_t>(bytes[0]) << 24U) |
-           (static_cast<uint32_t>(bytes[1]) << 16U) |
-           (static_cast<uint32_t>(bytes[2]) << 8U) |
-           static_cast<uint32_t>(bytes[3]);
+    return (static_cast<uint32_t>(bytes[0]) << 24U) | (static_cast<uint32_t>(bytes[1]) << 16U) |
+           (static_cast<uint32_t>(bytes[2]) << 8U) | static_cast<uint32_t>(bytes[3]);
 }
 
 } // namespace

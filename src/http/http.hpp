@@ -164,9 +164,12 @@ class ReaderBody final : public HttpBodySource {
     ReaderBody(std::function<size_t(uint64_t, std::span<uint8_t>)> read, uint64_t base,
                uint64_t size)
         : read_(std::move(read)), base_(base), size_(size) {}
-    uint64_t size() const override { return size_; }
+    uint64_t size() const override {
+        return size_;
+    }
     size_t read(uint64_t offset, std::span<uint8_t> destination) override {
-        if (offset >= size_) return 0;
+        if (offset >= size_)
+            return 0;
         auto wanted = static_cast<size_t>(std::min<uint64_t>(destination.size(), size_ - offset));
         return read_(base_ + offset, destination.first(wanted));
     }

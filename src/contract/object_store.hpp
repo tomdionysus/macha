@@ -14,11 +14,11 @@ namespace macha {
 
 // The identity of what a store holds: its held trie's root hash, which
 // depends only on the held ids, so it changes when and only when what is
-// held changes, and any two stores holding the same ids share it. `removals` counts ids that stopped being held
-// since the process started (a removal, a loss, a disk going away): a view
-// whose removals equal the store's never claims what the store has dropped,
-// though the store may have gained since. `complete` is false while a disk is
-// still being seeded, when the store cannot say what it holds.
+// held changes, and any two stores holding the same ids share it. `removals` counts ids that
+// stopped being held since the process started (a removal, a loss, a disk going away): a view whose
+// removals equal the store's never claims what the store has dropped, though the store may have
+// gained since. `complete` is false while a disk is still being seeded, when the store cannot say
+// what it holds.
 struct HeldIdentity {
     Hash256 hash{};
     uint64_t removals{};

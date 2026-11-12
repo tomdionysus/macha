@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "fuse/fuse_journal.hpp"
 #include "fuse/fuse_adapter.hpp"
+#include "fuse/fuse_journal.hpp"
 #include "test_backend_support.hpp"
 #include <cerrno>
-#include <fstream>
-#include <iostream>
 #include <csignal>
 #include <fcntl.h>
+#include <fstream>
+#include <iostream>
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -39,12 +39,24 @@ class FilesystemNode {
         node_.filesystem().mkdir("/.ready", 0755, getuid(), getgid());
     }
 
-    TestNode& node() { return node_; }
-    FileSystem& fs() { return node_.filesystem(); }
-    RetainedMemoryLedger& memory() { return node_.resources().memory; }
-    LocalState& local() { return node_.node().local_state(); }
-    const Config& config() { return node_.config(); }
-    const std::filesystem::path& path() const { return node_.path(); }
+    TestNode& node() {
+        return node_;
+    }
+    FileSystem& fs() {
+        return node_.filesystem();
+    }
+    RetainedMemoryLedger& memory() {
+        return node_.resources().memory;
+    }
+    LocalState& local() {
+        return node_.node().local_state();
+    }
+    const Config& config() {
+        return node_.config();
+    }
+    const std::filesystem::path& path() const {
+        return node_.path();
+    }
 
     FuseConfig fuse(std::string_view name) {
         auto fuse = node_.config().fuse;
@@ -74,7 +86,9 @@ class FilesystemNode {
 struct HeldFrontend {
     HeldLoaderAdmission* loader{};
     std::shared_ptr<FuseFrontend> frontend;
-    FuseFrontend* operator->() const { return frontend.get(); }
+    FuseFrontend* operator->() const {
+        return frontend.get();
+    }
 };
 
 HeldFrontend held_frontend(FilesystemNode& node, const FuseConfig& fuse, bool hold = true) {
@@ -85,8 +99,8 @@ HeldFrontend held_frontend(FilesystemNode& node, const FuseConfig& fuse, bool ho
     return {loader, node.frontend(fuse, std::move(admission))};
 }
 
-HeldFrontend held_frontend(FilesystemNode& node, const FuseConfig& fuse,
-                           PublicationTarget& target, bool hold = true) {
+HeldFrontend held_frontend(FilesystemNode& node, const FuseConfig& fuse, PublicationTarget& target,
+                           bool hold = true) {
     auto admission = std::make_unique<HeldLoaderAdmission>();
     auto* loader = admission.get();
     if (hold)
@@ -105,8 +119,7 @@ class InterposedTarget final : public PublicationTarget {
         std::atomic_uint64_t written_{};
 
       public:
-        Writer(InterposedTarget& target, std::string path,
-               std::shared_ptr<PublicationWriter> inner)
+        Writer(InterposedTarget& target, std::string path, std::shared_ptr<PublicationWriter> inner)
             : target_(target), path_(std::move(path)), inner_(std::move(inner)) {}
 
         WritePreparation prepare_write(uint64_t offset, uint64_t byte_budget) override {
@@ -122,7 +135,9 @@ class InterposedTarget final : public PublicationTarget {
                 target_.after_write(total);
             return written;
         }
-        void truncate(uint64_t size) override { inner_->truncate(size); }
+        void truncate(uint64_t size) override {
+            inner_->truncate(size);
+        }
         void drain_staging() override {
             if (target_.before_drain)
                 target_.before_drain(written_.load(std::memory_order_relaxed));
@@ -136,8 +151,12 @@ class InterposedTarget final : public PublicationTarget {
             if (target_.after_commit)
                 target_.after_commit(path_);
         }
-        FsEntry committed_entry() const override { return inner_->committed_entry(); }
-        WriteHandleDiagnostics diagnostics() const override { return inner_->diagnostics(); }
+        FsEntry committed_entry() const override {
+            return inner_->committed_entry();
+        }
+        WriteHandleDiagnostics diagnostics() const override {
+            return inner_->diagnostics();
+        }
     };
 
     PublicationTarget& real_;
@@ -156,7 +175,9 @@ class InterposedTarget final : public PublicationTarget {
 
     explicit InterposedTarget(PublicationTarget& real) : real_(real) {}
 
-    uint64_t reachability_epoch() const noexcept override { return reachability.load(); }
+    uint64_t reachability_epoch() const noexcept override {
+        return reachability.load();
+    }
 
     std::shared_ptr<PublicationWriter> open_publication(const std::string& path, bool cache_puts,
                                                         uint64_t pipeline_bytes,
@@ -173,7 +194,9 @@ class InterposedTarget final : public PublicationTarget {
 // worker parked in it.
 struct GateOpener {
     TestGate& gate;
-    ~GateOpener() { gate.open(); }
+    ~GateOpener() {
+        gate.open();
+    }
 };
 
 bool absent(FileSystem& fs, const std::string& path) {
@@ -211,8 +234,7 @@ uint64_t publication_bytes(RetainedMemoryLedger& memory) {
     return memory.stats().owner_bytes[static_cast<size_t>(MemoryOwner::publication)];
 }
 
-template <class Fn>
-int error_code_of(Fn&& fn) {
+template <class Fn> int error_code_of(Fn&& fn) {
     try {
         fn();
     } catch (const FsError& e) {
@@ -425,10 +447,9 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         REQUIRE(hog.has_value());
 
         std::atomic_uint64_t stalled_progress{0};
-        auto stalled = fs.open_write("/stalled.bin", false, false,
-                                     WriteDurability::publication_generation, 0,
-                                     DataWorkContext(FrameType::loader, extent, {}, nullptr,
-                                                     &stalled_progress, 100ms));
+        auto stalled = fs.open_write(
+            "/stalled.bin", false, false, WriteDurability::publication_generation, 0,
+            DataWorkContext(FrameType::loader, extent, {}, nullptr, &stalled_progress, 100ms));
         const auto stalled_started = std::chrono::steady_clock::now();
         CHECK(error_code_of([&] { (void)stalled->write(0, contents); }) == EAGAIN);
         CHECK(std::chrono::steady_clock::now() - stalled_started < 10s);
@@ -443,10 +464,9 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
                 std::this_thread::sleep_for(20ms);
             }
         });
-        auto moving = fs.open_write("/moving.bin", false, false,
-                                    WriteDurability::publication_generation, 0,
-                                    DataWorkContext(FrameType::loader, extent, {}, nullptr,
-                                                    &moving_progress, 100ms));
+        auto moving = fs.open_write(
+            "/moving.bin", false, false, WriteDurability::publication_generation, 0,
+            DataWorkContext(FrameType::loader, extent, {}, nullptr, &moving_progress, 100ms));
         CHECK(error_code_of([&] { (void)moving->write(0, contents); }) == EAGAIN);
         CHECK(std::chrono::steady_clock::now() - moving_started > 500ms);
     }
@@ -468,9 +488,9 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         write_file(fs, "/loader.bin", contents);
         (void)fs.store().take_interactive_bytes();
 
-        auto loader = fs.open_write("/loader.bin", false, false,
-                                    WriteDurability::publication_generation, 0,
-                                    DataWorkContext(FrameType::loader, extent));
+        auto loader =
+            fs.open_write("/loader.bin", false, false, WriteDurability::publication_generation, 0,
+                          DataWorkContext(FrameType::loader, extent));
         const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x5a);
         REQUIRE(loader->write(17, {&replacement, 1}) == 1);
         loader->commit();
@@ -487,9 +507,9 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         CHECK(fs.store().take_foreground_bytes() == 0);
 
         fs.create_file("/interactive.bin", 0644, getuid(), getgid());
-        auto interactive = fs.open_write("/interactive.bin", true, false,
-                                         WriteDurability::immediate, 0,
-                                         DataWorkContext(FrameType::read_ahead, extent));
+        auto interactive =
+            fs.open_write("/interactive.bin", true, false, WriteDurability::immediate, 0,
+                          DataWorkContext(FrameType::read_ahead, extent));
         const auto bytes = pattern(4096);
         REQUIRE(interactive->write(0, bytes) == bytes.size());
         CHECK(fs.store().take_interactive_bytes() == bytes.size());
@@ -500,9 +520,9 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
     {
         auto contents = pattern(4 * extent);
         write_file(fs, "/large.bin", contents);
-        auto loader = fs.open_write("/large.bin", false, false,
-                                    WriteDurability::publication_generation, 0,
-                                    DataWorkContext(FrameType::loader, extent));
+        auto loader =
+            fs.open_write("/large.bin", false, false, WriteDurability::publication_generation, 0,
+                          DataWorkContext(FrameType::loader, extent));
         const auto overlay = loader->prepare_write(17, extent);
         CHECK(overlay.ready);
         CHECK(overlay.bytes_processed == 0);
@@ -537,9 +557,9 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         auto expected = pattern(8 * extent);
         write_file(fs, "/changed.bin", expected);
         const auto original = expected;
-        auto writer = fs.open_write("/changed.bin", false, false,
-                                    WriteDurability::publication_generation, 0,
-                                    DataWorkContext(FrameType::loader, extent));
+        auto writer =
+            fs.open_write("/changed.bin", false, false, WriteDurability::publication_generation, 0,
+                          DataWorkContext(FrameType::loader, extent));
         const Bytes first{0xa1, 0xa2, 0xa3};
         const Bytes overlapping{0xb1, 0xb2, 0xb3};
         const Bytes distant{0xc1, 0xc2};
@@ -823,8 +843,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
         auto fuse = node.fuse("overlay");
         fuse.max_spool_bytes = 64ULL * 1024 * 1024;
         auto frontend = held_frontend(node, fuse);
-        auto handle = frontend->create("/append-verify.bin", 0644, getuid(), getgid(), true, true,
-                                       false);
+        auto handle =
+            frontend->create("/append-verify.bin", 0644, getuid(), getgid(), true, true, false);
         constexpr size_t chunk_size = 4096;
         constexpr size_t chunks = 256;
         Bytes expected(chunk_size * chunks);
@@ -993,8 +1013,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
         CHECK(hints.front().objects[0] == base_entry.extents[1].id);
         CHECK(hints.front().objects[1] == base_entry.extents[2].id);
         CHECK(hints.front().objects[2] == base_entry.extents[3].id);
-        const std::set<ObjectId> unique(hints.front().objects.begin(),
-                                        hints.front().objects.end());
+        const std::set<ObjectId> unique(hints.front().objects.begin(), hints.front().objects.end());
         CHECK(unique.size() == hints.front().objects.size());
 
         frontend->truncate(handle.inode, 32768);
@@ -1031,8 +1050,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
         const auto entry = fs.getattr("/read-cache.bin");
         REQUIRE(entry.extents.size() >= 2);
         const auto payload_bytes = [&] {
-            return node.memory().stats().owner_bytes[static_cast<size_t>(
-                MemoryOwner::object_payload)];
+            return node.memory()
+                .stats()
+                .owner_bytes[static_cast<size_t>(MemoryOwner::object_payload)];
         };
         {
             auto frontend = node.frontend(node.fuse("read-cache"));
@@ -1202,8 +1222,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
         auto fuse = node.fuse("inode-ownership");
         auto frontend = node.frontend(fuse);
         const auto baseline = frontend->status().inode_count;
-        auto created = frontend->create("/open-unlinked.bin", 0600, getuid(), getgid(), true,
-                                        false, false);
+        auto created =
+            frontend->create("/open-unlinked.bin", 0600, getuid(), getgid(), true, false, false);
         REQUIRE(frontend->wait_for_idle(10s));
         frontend->unlink("/open-unlinked.bin");
         REQUIRE(frontend->wait_for_idle(10s));
@@ -1360,10 +1380,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         auto fuse = node.fuse("closed-first");
         fuse.commit_workers = 1;
         auto frontend = held_frontend(node, fuse, false);
-        auto open_large = frontend->create("/open-large.bin", 0644, getuid(), getgid(), false, true,
-                                           false);
-        auto closed_small = frontend->create("/closed-small.bin", 0644, getuid(), getgid(), false,
-                                             true, false);
+        auto open_large =
+            frontend->create("/open-large.bin", 0644, getuid(), getgid(), false, true, false);
+        auto closed_small =
+            frontend->create("/closed-small.bin", 0644, getuid(), getgid(), false, true, false);
         REQUIRE(frontend->wait_for_idle(10s));
         const auto large = pattern(8 * extent, 51);
         const auto small = pattern(64 * 1024, 52);
@@ -1395,12 +1415,12 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         auto frontend = held_frontend(node, fuse, false);
         auto pathological = frontend->create("/open-pathological.bin", 0644, getuid(), getgid(),
                                              false, true, false);
-        auto closed_large = frontend->create("/closed-large.bin", 0644, getuid(), getgid(), false,
-                                             true, false);
-        auto closed_small = frontend->create("/closed-small-2.bin", 0644, getuid(), getgid(),
-                                             false, true, false);
-        auto blocked_follower = frontend->create("/blocked-follower.bin", 0644, getuid(), getgid(),
-                                                 false, true, false);
+        auto closed_large =
+            frontend->create("/closed-large.bin", 0644, getuid(), getgid(), false, true, false);
+        auto closed_small =
+            frontend->create("/closed-small-2.bin", 0644, getuid(), getgid(), false, true, false);
+        auto blocked_follower =
+            frontend->create("/blocked-follower.bin", 0644, getuid(), getgid(), false, true, false);
         REQUIRE(frontend->wait_for_idle(10s));
         frontend.loader->hold();
         // Deliberately bad FIFO order filling the spool exactly to its 50%
@@ -1422,8 +1442,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
             const auto byte = pattern(1, 84);
             return frontend->write(blocked_follower.inode, 0, byte);
         });
-        REQUIRE(wait_until(
-            [&] { return frontend->status().spool_throttle_waits > throttled; }, 10s));
+        REQUIRE(
+            wait_until([&] { return frontend->status().spool_throttle_waits > throttled; }, 10s));
         CHECK(admitted.wait_for(scaled(0s)) == std::future_status::timeout);
         CHECK(fs.getattr("/closed-small-2.bin").size == 0);
         CHECK(fs.getattr("/closed-large.bin").size == 0);
@@ -1480,8 +1500,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         REQUIRE(frontend->wait_for_idle(30s));
         {
             std::lock_guard lock(order_mutex);
-            const std::vector<std::string> small_first{"/quantum-small.bin",
-                                                       "/quantum-large.bin"};
+            const std::vector<std::string> small_first{"/quantum-small.bin", "/quantum-large.bin"};
             CHECK(commit_order == small_first);
         }
         const auto status = frontend->status();
@@ -1594,8 +1613,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         auto frontend = node.frontend(fuse);
         // The progress counter is the FileSystem's, shared by every writer.
         const auto progress_before = frontend->diagnostics().data_publication_progress_events;
-        auto handle = frontend->create("/progress-counter.bin", 0644, getuid(), getgid(), false,
-                                       true, false);
+        auto handle =
+            frontend->create("/progress-counter.bin", 0644, getuid(), getgid(), false, true, false);
         // Sixteen writes, each its own quantum (a quantum equal to the extent
         // yields after one write), retiring four extents and one commit.
         const auto contents = pattern(4 * extent, 77);
@@ -1630,8 +1649,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
                 throw FsError(EIO, "staged extent put failed");
         };
         auto frontend = node.frontend(fuse, target);
-        auto handle = frontend->create("/transient-cursor.bin", 0644, getuid(), getgid(), false,
-                                       true, false);
+        auto handle =
+            frontend->create("/transient-cursor.bin", 0644, getuid(), getgid(), false, true, false);
         REQUIRE(frontend->wait_for_idle(10s));
         const auto contents = pattern(3 * extent + 12345, 73);
         REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
@@ -1672,8 +1691,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         const auto payload = pattern(8 * extent);
         REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
         frontend->release(handle.inode, true);
-        REQUIRE(wait_until([&] { return held.load() && frontend->status().active_data == 0; },
-                           10s));
+        REQUIRE(
+            wait_until([&] { return held.load() && frontend->status().active_data == 0; }, 10s));
         const auto paused = frontend->status();
         // Held after its first chunk, it stops before taking a whole extent.
         CHECK(paused.data_publication_bytes_read < extent);
@@ -1840,7 +1859,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
         REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
         auto blocked = std::async(std::launch::async, [&] {
             const auto second = pattern(256 * 1024, 52);
-            return error_code_of([&] { (void)frontend->write(handle.inode, first.size(), second); });
+            return error_code_of(
+                [&] { (void)frontend->write(handle.inode, first.size(), second); });
         });
         REQUIRE(wait_until([&] { return frontend->status().spool_throttle_waits >= 1; }, 10s));
         CHECK(blocked.wait_for(scaled(0s)) == std::future_status::timeout);
@@ -1875,8 +1895,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
         REQUIRE(std::filesystem::exists(journal));
         bool refused = false;
         for (size_t i = 0; i < 256 && !refused; ++i) {
-            const auto code = error_code_of(
-                [&] { frontend->mkdir("/journal-budget-" + std::to_string(i), 0700, getuid(), getgid()); });
+            const auto code = error_code_of([&] {
+                frontend->mkdir("/journal-budget-" + std::to_string(i), 0700, getuid(), getgid());
+            });
             REQUIRE((code == 0 || code == ENOSPC));
             refused = code == ENOSPC;
         }
@@ -1903,8 +1924,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
         fuse.max_pending_write_bytes = 128 * 1024;
         fuse.timeouts.write = 2s;
         auto frontend = held_frontend(node, fuse);
-        auto handle = frontend->create("/write-byte-bound.bin", 0600, getuid(), getgid(), true,
-                                       true, false);
+        auto handle =
+            frontend->create("/write-byte-bound.bin", 0600, getuid(), getgid(), true, true, false);
         const auto payload = pattern(128 * 1024, 91);
         REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
         REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
@@ -1983,7 +2004,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
         CHECK(progressed.operation_metadata_waits >= 1);
         CHECK(progressed.data_publications_completed >= 1);
         CHECK(progressed.operation_metadata_bytes <= progressed.operation_metadata_limit_bytes);
-        CHECK(progressed.peak_operation_metadata_bytes <= progressed.operation_metadata_limit_bytes);
+        CHECK(progressed.peak_operation_metadata_bytes <=
+              progressed.operation_metadata_limit_bytes);
         frontend->release(handle.inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
         REQUIRE(wait_until(
@@ -2100,8 +2122,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_failures_back_off_and_park) 
         const auto contents = pattern(256 * 1024 + 17, 91);
         {
             auto frontend = held_frontend(node, fuse);
-            auto handle =
-                frontend->open("/removed-before-replay.bin", true, true, false, false);
+            auto handle = frontend->open("/removed-before-replay.bin", true, true, false, false);
             REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
             frontend->release(handle.inode, true);
             REQUIRE(wait_until([&] { return frontend->status().pending_data == 1; }, 10s));
@@ -2360,7 +2381,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_journal_recovery) {
         constexpr size_t batch_limit = 256;
         std::vector<FilesystemNamespaceMutation> creates;
         for (size_t i = 0; i < operations; ++i)
-            creates.push_back(namespace_mutation(Kind::create, root + "/bulk-" + std::to_string(i)));
+            creates.push_back(
+                namespace_mutation(Kind::create, root + "/bulk-" + std::to_string(i)));
         CHECK(fs.apply_namespace_batch(creates).applied == operations);
         admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
             for (size_t i = 0; i < operations; ++i)
@@ -2798,7 +2820,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_journal_recovery) {
             REQUIRE(frontend.write(first.inode, 96 * 1024, tail) == tail.size());
             frontend.release(first.inode, true);
             frontend.rename(root + "/TV/Buffy", new_dir);
-            auto removed = frontend.create(removed_path, 0644, getuid(), getgid(), true, true, false);
+            auto removed =
+                frontend.create(removed_path, 0644, getuid(), getgid(), true, true, false);
             const auto removed_bytes = pattern(32 * 1024 + 3);
             REQUIRE(frontend.write(removed.inode, 0, removed_bytes) == removed_bytes.size());
             frontend.release(removed.inode, true);
@@ -2858,8 +2881,8 @@ struct JournalFrame {
 
 std::vector<JournalFrame> fuse_journal_frames(const Bytes& bytes) {
     std::vector<JournalFrame> frames;
-    const auto scan = scan_fuse_journal_frames(
-        bytes, 8, [&](std::span<const uint8_t> payload, size_t offset) {
+    const auto scan =
+        scan_fuse_journal_frames(bytes, 8, [&](std::span<const uint8_t> payload, size_t offset) {
             frames.push_back({offset, 4 + payload.size() + 32});
         });
     REQUIRE(scan.discarded_tail == 0);
@@ -2908,8 +2931,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_data_journal_recovery) {
         admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
             frontend.mkdir("/TV", 0755, getuid(), getgid());
             frontend.mkdir("/TV/Buffy", 0755, getuid(), getgid());
-            auto handle =
-                frontend.create("/TV/Buffy/S07E01.mp4", 0644, getuid(), getgid(), true, true, false);
+            auto handle = frontend.create("/TV/Buffy/S07E01.mp4", 0644, getuid(), getgid(), true,
+                                          true, false);
             inode = handle.inode;
             REQUIRE(frontend.write(inode, 0, payload) == payload.size());
             frontend.release(inode, true);
@@ -3243,7 +3266,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_data_journal_recovery) {
             frontend.release(inode_a, true);
             frontend.rename("/fz/a.bin", "/fz/b.bin", false);
             frontend.mkdir("/fz/sub", 0755, getuid(), getgid());
-            auto c = frontend.create("/fz-seeded/c.bin", 0600, getuid(), getgid(), true, true, false);
+            auto c =
+                frontend.create("/fz-seeded/c.bin", 0600, getuid(), getgid(), true, true, false);
             const auto bytes_c = pattern(8 * 1024, 72);
             REQUIRE(frontend.write(c.inode, 0, bytes_c) == bytes_c.size());
             frontend.release(c.inode, true);
@@ -3282,20 +3306,22 @@ MACHA_TEST("filesystem_fuse", test_fuse_data_journal_recovery) {
         };
         for (size_t i = 0; i < frames.size(); ++i) {
             const auto& frame = frames[i];
-            const auto label = "frame " + std::to_string(i) + " of " + std::to_string(frames.size());
+            const auto label =
+                "frame " + std::to_string(i) + " of " + std::to_string(frames.size());
             const Bytes truncated(pristine.begin(),
-                                  pristine.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
+                                  pristine.begin() +
+                                      static_cast<ptrdiff_t>(frame.offset + frame.size));
             // Recovery may append (re-journalled descriptors, markers for
             // dropped operations), so only the start is asserted.
-            run_variant("truncate after " + label, truncated, [&](FuseFrontend&) {
-                CHECK(std::filesystem::file_size(journal) >= 8);
-            });
+            run_variant("truncate after " + label, truncated,
+                        [&](FuseFrontend&) { CHECK(std::filesystem::file_size(journal) >= 8); });
             Bytes dropped = pristine;
             dropped.erase(dropped.begin() + static_cast<ptrdiff_t>(frame.offset),
                           dropped.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
             run_variant("drop " + label, dropped, [](FuseFrontend&) {});
             Bytes duplicated = pristine;
-            duplicated.insert(duplicated.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size),
+            duplicated.insert(duplicated.begin() +
+                                  static_cast<ptrdiff_t>(frame.offset + frame.size),
                               pristine.begin() + static_cast<ptrdiff_t>(frame.offset),
                               pristine.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
             run_variant("duplicate " + label, duplicated, [](FuseFrontend&) {});
@@ -3383,8 +3409,8 @@ MACHA_TEST("filesystem_fuse", test_management_api_reports_and_acts_on_fuse_state
     };
 
     {
-        auto frontend =
-            make_fuse_frontend(service.filesystem(), service.resources().memory, fuse_config("status"));
+        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
+                                           fuse_config("status"));
         service.registry().publish_fuse(frontend);
         frontend->mkdir("/status-counter", 0755, getuid(), getgid());
         REQUIRE(frontend->wait_for_idle(10s));
@@ -3399,7 +3425,8 @@ MACHA_TEST("filesystem_fuse", test_management_api_reports_and_acts_on_fuse_state
         const auto response =
             raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
         CHECK(response.find("HTTP/1.1 200") != std::string::npos);
-        const auto diagnostics_root = status_diagnostics_response(config.catalogue.api.port, service);
+        const auto diagnostics_root =
+            status_diagnostics_response(config.catalogue.api.port, service);
         const auto* diagnostics = diagnostics_root.find("diagnostics");
         REQUIRE(diagnostics != nullptr);
 
@@ -3438,33 +3465,58 @@ MACHA_TEST("filesystem_fuse", test_management_api_reports_and_acts_on_fuse_state
               2 * config.extent_size);
         CHECK(filesystem->find("operation_metadata_limit_bytes")->asUInt64() ==
               config.fuse.max_operation_metadata_bytes);
-        for (const auto* field :
-             {"spool_publish_rate_bytes_per_second", "spool_publish_rate_window_bytes",
-              "spool_publish_rate_window_ms", "spool_throttle_waits", "spool_throttle_wait_ms",
-              "pending_write_request_bytes", "peak_pending_write_request_bytes",
-              "extent_executor_workers", "extent_executor_queued", "extent_executor_active",
-              "extent_executor_peak_queued", "extent_executor_peak_active",
-              "extent_executor_submitted", "inode_count", "peak_inode_count",
-              "reclaimed_inode_count", "data_publication_requests",
-              "data_publication_notifications_suppressed", "spool_pressure_publication_sweeps",
-              "data_publication_coalesced_queued", "data_publication_coalesced_running",
-              "data_publication_coalesced_unconfirmed", "data_publications_started",
-              "data_publications_completed", "data_publication_peak_active",
-              "data_publication_quanta", "data_publication_yields",
-              "data_publication_peak_inflight_bytes", "data_publication_peak_pipeline_extents",
-              "data_closed_priority_selections", "data_retirement_priority_selections",
-              "data_publication_bytes_read", "data_publication_bytes_committed",
-              "data_publication_bytes_confirmed", "data_publication_completed_spool_bytes_read",
-              "data_publication_completed_source_bytes_read",
-              "data_publication_completed_reused_extents",
-              "data_publication_completed_put_extents", "data_overlay_read_queries",
-              "data_overlay_ranges_examined", "data_overlay_descriptors_copied",
-              "retained_data_operations", "retained_data_operation_bytes",
-              "retained_overlay_ranges", "retained_overlay_bytes",
-              "retained_publication_operations", "retained_publication_operation_bytes",
-              "operation_metadata_bytes", "peak_operation_metadata_bytes",
-              "operation_metadata_waits", "retained_durability_tickets",
-              "data_publication_inflight_bytes"}) {
+        for (const auto* field : {"spool_publish_rate_bytes_per_second",
+                                  "spool_publish_rate_window_bytes",
+                                  "spool_publish_rate_window_ms",
+                                  "spool_throttle_waits",
+                                  "spool_throttle_wait_ms",
+                                  "pending_write_request_bytes",
+                                  "peak_pending_write_request_bytes",
+                                  "extent_executor_workers",
+                                  "extent_executor_queued",
+                                  "extent_executor_active",
+                                  "extent_executor_peak_queued",
+                                  "extent_executor_peak_active",
+                                  "extent_executor_submitted",
+                                  "inode_count",
+                                  "peak_inode_count",
+                                  "reclaimed_inode_count",
+                                  "data_publication_requests",
+                                  "data_publication_notifications_suppressed",
+                                  "spool_pressure_publication_sweeps",
+                                  "data_publication_coalesced_queued",
+                                  "data_publication_coalesced_running",
+                                  "data_publication_coalesced_unconfirmed",
+                                  "data_publications_started",
+                                  "data_publications_completed",
+                                  "data_publication_peak_active",
+                                  "data_publication_quanta",
+                                  "data_publication_yields",
+                                  "data_publication_peak_inflight_bytes",
+                                  "data_publication_peak_pipeline_extents",
+                                  "data_closed_priority_selections",
+                                  "data_retirement_priority_selections",
+                                  "data_publication_bytes_read",
+                                  "data_publication_bytes_committed",
+                                  "data_publication_bytes_confirmed",
+                                  "data_publication_completed_spool_bytes_read",
+                                  "data_publication_completed_source_bytes_read",
+                                  "data_publication_completed_reused_extents",
+                                  "data_publication_completed_put_extents",
+                                  "data_overlay_read_queries",
+                                  "data_overlay_ranges_examined",
+                                  "data_overlay_descriptors_copied",
+                                  "retained_data_operations",
+                                  "retained_data_operation_bytes",
+                                  "retained_overlay_ranges",
+                                  "retained_overlay_bytes",
+                                  "retained_publication_operations",
+                                  "retained_publication_operation_bytes",
+                                  "operation_metadata_bytes",
+                                  "peak_operation_metadata_bytes",
+                                  "operation_metadata_waits",
+                                  "retained_durability_tickets",
+                                  "data_publication_inflight_bytes"}) {
             if (filesystem->find(field) == nullptr)
                 std::cerr << "status filesystem lacks " << field << "\n";
             CHECK(filesystem->find(field) != nullptr);
@@ -3520,9 +3572,8 @@ MACHA_TEST("filesystem_fuse", test_management_api_reports_and_acts_on_fuse_state
             {
                 auto admission = std::make_unique<HeldLoaderAdmission>();
                 admission->hold();
-                auto frontend = make_fuse_frontend(service.filesystem(),
-                                                   service.resources().memory, fuse,
-                                                   std::move(admission));
+                auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
+                                                   fuse, std::move(admission));
                 if (rename)
                     frontend->rename("/moved", "/moved-away");
                 else
@@ -3537,8 +3588,8 @@ MACHA_TEST("filesystem_fuse", test_management_api_reports_and_acts_on_fuse_state
             auto recovered =
                 make_fuse_frontend(service.filesystem(), service.resources().memory, fuse);
             service.registry().publish_fuse(recovered);
-            REQUIRE(wait_until(
-                [&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
+            REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); },
+                               10s));
             const auto blocked = recovered->blocked_namespace_operation();
             REQUIRE(blocked.has_value());
 
@@ -3686,7 +3737,8 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_k
     config.write_copies = 1;
     config.fuse.publication_quiet = 0ms;
     auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
+    auto frontend =
+        make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
 
     constexpr int titles = 60;
     frontend->mkdir("/Movies", 0755, getuid(), getgid());
@@ -3696,8 +3748,8 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_k
         frontend->mkdir(title + "/Subs", 0755, getuid(), getgid());
         frontend->mkdir(title + "/Featurettes", 0755, getuid(), getgid());
         if (i % 2 == 0) {
-            auto handle = frontend->create(title + "/film.mkv", 0644, getuid(), getgid(), false,
-                                           true, false);
+            auto handle =
+                frontend->create(title + "/film.mkv", 0644, getuid(), getgid(), false, true, false);
             const auto bytes = pattern(4096 + static_cast<size_t>(i), static_cast<uint8_t>(i));
             REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
             frontend->release(handle.inode, true);
@@ -3915,8 +3967,9 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
         tombstones_of(snapshot, [&](const ObjectId& id) { return batches.get(id); });
     int64_t latest_retirement{};
     for (const auto& id : retired_ids) {
-        const auto found = std::find_if(garbage.begin(), garbage.end(),
-                                        [&](const GarbageRef& garbage) { return garbage.id == id; });
+        const auto found =
+            std::find_if(garbage.begin(), garbage.end(),
+                         [&](const GarbageRef& garbage) { return garbage.id == id; });
         REQUIRE(found != garbage.end());
         latest_retirement = std::max(latest_retirement, found->retired_at_ns);
         CHECK(service.local_state().data().has(id));
@@ -3951,11 +4004,10 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
         before_grace.runs_completed != before.runs_completed + 2)
         std::cerr << "convergence before grace: runs_scheduled " << before.runs_scheduled << " -> "
                   << before_grace.runs_scheduled << ", runs_completed " << before.runs_completed
-                  << " -> " << before_grace.runs_completed << ", events "
-                  << before.events_received << " -> " << before_grace.events_received
-                  << ", epoch requested/completed " << before_grace.requested_epoch << "/"
-                  << before_grace.completed_epoch << ", scheduled " << before_grace.scheduled
-                  << "\n";
+                  << " -> " << before_grace.runs_completed << ", events " << before.events_received
+                  << " -> " << before_grace.events_received << ", epoch requested/completed "
+                  << before_grace.requested_epoch << "/" << before_grace.completed_epoch
+                  << ", scheduled " << before_grace.scheduled << "\n";
     CHECK(before_grace.runs_scheduled == before.runs_scheduled + 2);
     CHECK(before_grace.runs_completed == before.runs_completed + 2);
     // The pass sleeps to the grace's end exactly: the one millisecond left.

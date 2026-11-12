@@ -48,8 +48,10 @@ std::string torrent_info_hash_hex(const lt::info_hash_t& hashes) {
         return hex(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(digest.data()),
                                             digest.size()));
     };
-    if (hashes.has_v1()) return text(hashes.v1);
-    if (hashes.has_v2()) return text(hashes.v2);
+    if (hashes.has_v1())
+        return text(hashes.v1);
+    if (hashes.has_v2())
+        return text(hashes.v2);
     return {};
 }
 
@@ -57,20 +59,23 @@ TorrentCheckPhase torrent_check_phase(const lt::torrent_status& status) {
     if (status.state != lt::torrent_status::checking_files &&
         status.state != lt::torrent_status::checking_resume_data)
         return TorrentCheckPhase::none;
-    if (!(status.flags & lt::torrent_flags::paused)) return TorrentCheckPhase::checking;
+    if (!(status.flags & lt::torrent_flags::paused))
+        return TorrentCheckPhase::checking;
     // Paused and auto-managed: the queue will start it. Paused and not: held
     // by Macha, and it will not be checked until released.
     return (status.flags & lt::torrent_flags::auto_managed) ? TorrentCheckPhase::queued
                                                             : TorrentCheckPhase::none;
 }
 
-std::optional<lt::add_torrent_params>
-load_torrent_resume(const std::filesystem::path& path, std::string_view expected_info_hash_hex) {
+std::optional<lt::add_torrent_params> load_torrent_resume(const std::filesystem::path& path,
+                                                          std::string_view expected_info_hash_hex) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) return std::nullopt;
+    if (!in)
+        return std::nullopt;
     const std::vector<char> buffer((std::istreambuf_iterator<char>(in)),
                                    std::istreambuf_iterator<char>());
-    if (buffer.empty()) return std::nullopt;
+    if (buffer.empty())
+        return std::nullopt;
     lt::error_code error;
     auto params = lt::read_resume_data(buffer, error);
     if (error) {

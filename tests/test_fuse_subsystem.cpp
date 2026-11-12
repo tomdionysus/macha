@@ -70,9 +70,8 @@ class TestMountDriver final : public FuseMountDriver {
         control_->mounted = true;
         control_->cv.notify_all();
 
-        control_->cv.wait(lock, [&] {
-            return exit_requested_ || control_->lose_mount || stop.stop_requested();
-        });
+        control_->cv.wait(
+            lock, [&] { return exit_requested_ || control_->lose_mount || stop.stop_requested(); });
         control_->mounted = false;
         if (control_->lose_mount) {
             control_->lose_mount = false; // one loss per mount attempt.
@@ -147,10 +146,12 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_mounts_and_publishes_its_fronte
     supervisor.add_builtin("fuse", make_fuse_subsystem);
     supervisor.start(context_for(config, service, registry));
 
-    REQUIRE(wait_until([&] {
-        auto status = fuse_status(supervisor);
-        return status && status->state == SubsystemState::running;
-    }, 20s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = fuse_status(supervisor);
+            return status && status->state == SubsystemState::running;
+        },
+        20s));
     control->wait_mounted();
 
     // Published and usable: nothing core asks the frontend for needs the kernel.
@@ -178,10 +179,12 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_clean_stop_is_not_a_fault) {
     supervisor.add_builtin("fuse", make_fuse_subsystem);
     supervisor.start(context_for(config, service, registry));
 
-    REQUIRE(wait_until([&] {
-        auto status = fuse_status(supervisor);
-        return status && status->state == SubsystemState::running;
-    }, 20s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = fuse_status(supervisor);
+            return status && status->state == SubsystemState::running;
+        },
+        20s));
     control->wait_mounted();
 
     auto before = fuse_status(supervisor);
@@ -205,10 +208,12 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_rebuilds_the_mount_after_losing
     supervisor.add_builtin("fuse", make_fuse_subsystem);
     supervisor.start(context_for(config, service, registry));
 
-    REQUIRE(wait_until([&] {
-        auto status = fuse_status(supervisor);
-        return status && status->state == SubsystemState::running;
-    }, 20s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = fuse_status(supervisor);
+            return status && status->state == SubsystemState::running;
+        },
+        20s));
     control->wait_mounted();
     auto first = registry.fuse();
     REQUIRE(first);
@@ -217,17 +222,21 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_rebuilds_the_mount_after_losing
     // reload, a vanished mountpoint).
     control->lose();
 
-    REQUIRE(wait_until([&] {
-        auto status = fuse_status(supervisor);
-        return status && status->restart_count >= 1;
-    }, 20s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = fuse_status(supervisor);
+            return status && status->restart_count >= 1;
+        },
+        20s));
     CHECK(fuse_status(supervisor)->last_fault.find("disappeared") != std::string::npos);
 
     // It is rebuilt: a new mount attempt, a new frontend, no process restart.
-    REQUIRE(wait_until([&] {
-        auto status = fuse_status(supervisor);
-        return status && status->state == SubsystemState::running && control->run_count() >= 2;
-    }, 20s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = fuse_status(supervisor);
+            return status && status->state == SubsystemState::running && control->run_count() >= 2;
+        },
+        20s));
     control->wait_mounted();
 
     auto second = registry.fuse();
@@ -242,7 +251,7 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_rebuilds_the_mount_after_losing
 }
 
 MACHA_TEST("fuse_subsystem",
-          test_fuse_subsystem_construction_fault_leaves_the_rest_of_the_node_serving) {
+           test_fuse_subsystem_construction_fault_leaves_the_rest_of_the_node_serving) {
     TestService fixture("fuse-subsystem-construction-fault", ConfigProfile::isolated);
     auto& service = fixture.start();
     auto control = install_test_mount_driver();
@@ -252,7 +261,10 @@ MACHA_TEST("fuse_subsystem",
     // A spool directory that cannot exist (its parent is a regular file), so
     // construction fails before any FUSE request is served.
     const auto blocker = fixture.path() / "not-a-directory";
-    { std::ofstream out(blocker); out << "x"; }
+    {
+        std::ofstream out(blocker);
+        out << "x";
+    }
     config.fuse.spool_path = blocker / "spool";
     config.fuse.operation_journal_path = blocker / "spool" / "operations.log";
 
@@ -261,10 +273,12 @@ MACHA_TEST("fuse_subsystem",
     supervisor.add_builtin("fuse", make_fuse_subsystem);
     supervisor.start(context_for(config, service, registry));
 
-    REQUIRE(wait_until([&] {
-        auto status = fuse_status(supervisor);
-        return status && status->restart_count >= 2;
-    }, 20s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = fuse_status(supervisor);
+            return status && status->restart_count >= 2;
+        },
+        20s));
 
     auto status = fuse_status(supervisor);
     REQUIRE(status);
@@ -290,10 +304,12 @@ MACHA_TEST("fuse_subsystem",
     config.fuse.spool_path = fixture.path() / "spool";
     config.fuse.operation_journal_path = fixture.path() / "spool" / "operations.log";
 
-    REQUIRE(wait_until([&] {
-        auto current = fuse_status(supervisor);
-        return current && current->state == SubsystemState::running;
-    }, 20s));
+    REQUIRE(wait_until(
+        [&] {
+            auto current = fuse_status(supervisor);
+            return current && current->state == SubsystemState::running;
+        },
+        20s));
     CHECK(registry.fuse());
 
     supervisor.stop();
@@ -313,10 +329,12 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_without_a_mount_path_is_unavail
     supervisor.start(context_for(config, service, registry));
 
     // No mount configured is a choice, not a fault: `unavailable`, no retries.
-    REQUIRE(wait_until([&] {
-        auto status = fuse_status(supervisor);
-        return status && status->state == SubsystemState::unavailable;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = fuse_status(supervisor);
+            return status && status->state == SubsystemState::unavailable;
+        },
+        10s));
     CHECK(fuse_status(supervisor)->restart_count == 0);
     CHECK(control->run_count() == 0);
     CHECK(!registry.fuse());
@@ -336,10 +354,12 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_without_a_mount_driver_is_unava
     supervisor.add_builtin("fuse", make_fuse_subsystem);
     supervisor.start(context_for(config, service, registry));
 
-    REQUIRE(wait_until([&] {
-        auto status = fuse_status(supervisor);
-        return status && status->state == SubsystemState::unavailable;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            auto status = fuse_status(supervisor);
+            return status && status->state == SubsystemState::unavailable;
+        },
+        10s));
     // No amount of retrying links a mount adapter into a binary that has none.
     CHECK(fuse_status(supervisor)->restart_count == 0);
     CHECK(!registry.fuse());
@@ -369,10 +389,12 @@ MACHA_TEST("fuse_subsystem", test_fuse_plugin_loads_over_the_real_dlopen_path) {
     SubsystemSupervisor supervisor(plugin_dir.path(), fast_policy());
     supervisor.start(context_for(config, service, registry));
 
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].state == SubsystemState::unavailable;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            auto statuses = supervisor.statuses();
+            return statuses.size() == 1 && statuses[0].state == SubsystemState::unavailable;
+        },
+        10s));
 
     auto statuses = supervisor.statuses();
     REQUIRE(statuses.size() == 1);

@@ -72,9 +72,15 @@ class SealedJournal {
     void reset();
 
     // Frames replayed or appended since open; bytes() is the file's length.
-    uint64_t frames() const noexcept { return frames_; }
-    uint64_t bytes() const noexcept { return bytes_; }
-    const std::filesystem::path& path() const noexcept { return path_; }
+    uint64_t frames() const noexcept {
+        return frames_;
+    }
+    uint64_t bytes() const noexcept {
+        return bytes_;
+    }
+    const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
 
   private:
     std::filesystem::path path_;

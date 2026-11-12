@@ -9,13 +9,13 @@
 #include "json.hpp"
 #include "media/media_engine.hpp"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
-#include <functional>
 
 namespace macha {
 
@@ -31,13 +31,12 @@ class PlaybackManager {
     using MediaFacts = std::function<void(Json::Object& entry, std::string_view media_id)>;
     // `time`: what sessions' idle clocks and a failed start's retention are
     // measured by.
-    PlaybackManager(FileSystem&, TranscodeRateBook&, RetainedMemoryLedger&, CatalogueManager&,
-                    CatalogueApiConfig, StreamingConfig,
-                    std::shared_ptr<MediaEngine> = {},
-                    std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
-                    MediaInformationService* media_information = nullptr,
-                    MediaFacts media_facts = {},
-                    const TimeSource& time = steady_time_source());
+    PlaybackManager(
+        FileSystem&, TranscodeRateBook&, RetainedMemoryLedger&, CatalogueManager&,
+        CatalogueApiConfig, StreamingConfig, std::shared_ptr<MediaEngine> = {},
+        std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
+        MediaInformationService* media_information = nullptr, MediaFacts media_facts = {},
+        const TimeSource& time = steady_time_source());
     ~PlaybackManager();
     PlaybackManager(const PlaybackManager&) = delete;
     PlaybackManager& operator=(const PlaybackManager&) = delete;

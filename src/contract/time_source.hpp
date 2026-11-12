@@ -23,7 +23,9 @@ class TimeSource {
 // The process's steady clock. Stateless.
 class SteadyTimeSource final : public TimeSource {
   public:
-    Clock::time_point now() const noexcept override { return Clock::now(); }
+    Clock::time_point now() const noexcept override {
+        return Clock::now();
+    }
 };
 
 // The process's SteadyTimeSource. It holds no state, so one instance living

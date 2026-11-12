@@ -33,7 +33,9 @@ template <class Item, class Key> struct Page {
     std::vector<Item> items;
     Cursor<Key> next;
     Stop stopped{Stop::end};
-    bool complete() const noexcept { return stopped == Stop::end; }
+    bool complete() const noexcept {
+        return stopped == Stop::end;
+    }
 };
 
 // Decides when background work gives way (repair's weighted share, a higher
@@ -69,7 +71,9 @@ class Budget {
         return *this;
     }
 
-    const WorkContext& context() const noexcept { return context_; }
+    const WorkContext& context() const noexcept {
+        return context_;
+    }
 
     // Why the walk must stop before its next step, if it must: cancellation,
     // then either deadline, then the yield source. take_* checks the bounds.
@@ -100,8 +104,12 @@ class Budget {
         *bytes_left_ -= n;
         return true;
     }
-    std::optional<size_t> operations_left() const noexcept { return operations_left_; }
-    std::optional<uint64_t> bytes_left() const noexcept { return bytes_left_; }
+    std::optional<size_t> operations_left() const noexcept {
+        return operations_left_;
+    }
+    std::optional<uint64_t> bytes_left() const noexcept {
+        return bytes_left_;
+    }
 
   private:
     WorkContext context_;

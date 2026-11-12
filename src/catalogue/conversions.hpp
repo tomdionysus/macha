@@ -34,9 +34,12 @@ struct ConversionState {
 
 inline const char* conversion_phase_name(ConversionState::Phase phase) noexcept {
     switch (phase) {
-    case ConversionState::Phase::converting: return "converting";
-    case ConversionState::Phase::ready: return "ready";
-    case ConversionState::Phase::failed: return "failed";
+    case ConversionState::Phase::converting:
+        return "converting";
+    case ConversionState::Phase::ready:
+        return "ready";
+    case ConversionState::Phase::failed:
+        return "failed";
     }
     return "failed";
 }

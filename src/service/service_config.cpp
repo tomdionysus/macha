@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/service.hpp"
 
-#include "media/ffmpeg_log.hpp"
 #include "log.hpp"
+#include "media/ffmpeg_log.hpp"
 
 namespace macha {
 
@@ -13,7 +13,8 @@ void Service::reload_config() {
         return;
     }
     auto updated = load_yaml_config(*node_.config().config_file);
-    if (updated.state_path != node_.config().state_path || updated.key_file != node_.config().key_file)
+    if (updated.state_path != node_.config().state_path ||
+        updated.key_file != node_.config().key_file)
         throw std::runtime_error("state_path/key_file cannot be changed by live reload");
     if (updated.fuse.spool_path != node_.config().fuse.spool_path ||
         updated.fuse.operation_journal_path != node_.config().fuse.operation_journal_path)
@@ -22,7 +23,8 @@ void Service::reload_config() {
         throw std::runtime_error("extent_size cannot be changed for an existing namespace");
     if (updated.replication != node_.config().replication ||
         updated.metadata_write_copies != node_.config().metadata_write_copies)
-        throw std::runtime_error("dht.replicas and dht.metadata_write_copies changes require a restart");
+        throw std::runtime_error(
+            "dht.replicas and dht.metadata_write_copies changes require a restart");
     if (updated.runtime.glibc_arena_max != node_.config().runtime.glibc_arena_max)
         throw std::runtime_error("runtime.glibc_arena_max changes require a process restart");
     const auto& current_streaming = node_.config().streaming;
@@ -46,9 +48,10 @@ void Service::reload_config() {
     if (auto torrents = registry_.torrent())
         torrents->reconfigure(updated.torrent);
     if (streaming_restart_required)
-        Log::warn("streaming enable/buffer/probe/path/codec changes require restart; live limits were reloaded");
-    Log::info("reloaded storage backends, persistent cache, catalogue scanner, ingest, torrent, hydration and streaming limits");
+        Log::warn("streaming enable/buffer/probe/path/codec changes require restart; live limits "
+                  "were reloaded");
+    Log::info("reloaded storage backends, persistent cache, catalogue scanner, ingest, torrent, "
+              "hydration and streaming limits");
 }
-
 
 } // namespace macha

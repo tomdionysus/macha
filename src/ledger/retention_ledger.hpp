@@ -22,14 +22,17 @@ class RetentionLedger final : public ObjectLedger {
                     const ObjectStore& control) noexcept
         : claims_(claims), data_(data), control_(control) {}
 
-    Page<ObjectId, ObjectId> claimed(RetentionClass, Cursor<ObjectId> from,
-                                     Budget&) const override;
+    Page<ObjectId, ObjectId> claimed(RetentionClass, Cursor<ObjectId> from, Budget&) const override;
     bool held(RetentionClass, const ObjectId&) const override;
     HeldView held_view(RetentionClass type) const override {
         return (type == RetentionClass::data ? data_ : control_).held_view();
     }
-    InventoryHandle inventory() const override { return inventory_.handle(); }
-    ReleaseHandle release() const override { return release_.handle(); }
+    InventoryHandle inventory() const override {
+        return inventory_.handle();
+    }
+    ReleaseHandle release() const override {
+        return release_.handle();
+    }
     void publish(InventoryHandle) override;
     bool publish(ReleaseBuild) override;
     bool retained(RetentionClass type, const ObjectId& id) const override {

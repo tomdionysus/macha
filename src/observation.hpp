@@ -132,10 +132,10 @@ class Observations {
     const size_t max_series_;
     const size_t max_events_;
     mutable Mutex mutex_;
-    std::map<std::string, std::unique_ptr<LatencyHistogram>, std::less<>> histograms_
-        MACHA_GUARDED_BY(mutex_);
-    std::map<std::string, std::unique_ptr<std::atomic<uint64_t>>, std::less<>> counters_
-        MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, std::unique_ptr<LatencyHistogram>, std::less<>>
+        histograms_ MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, std::unique_ptr<std::atomic<uint64_t>>, std::less<>>
+        counters_ MACHA_GUARDED_BY(mutex_);
     std::deque<ObservationEvent> events_ MACHA_GUARDED_BY(mutex_);
     LatencyHistogram overflow_histogram_;
     // Where increments to a counter past the bound go; never reported.
@@ -177,8 +177,7 @@ std::string observation_route_label(std::string_view method, std::string_view pa
 // p99 and its non-empty buckets as [index, count] pairs, so windows can be
 // merged exactly offline. Deterministic: equal inputs render equal text.
 std::string render_observation_window(uint64_t start_unix_ms, uint64_t end_unix_ms,
-                                      std::string_view version,
-                                      const ObservationSnapshot& window,
+                                      std::string_view version, const ObservationSnapshot& window,
                                       const std::map<std::string, uint64_t>& gauges);
 std::string render_observation_event(const ObservationEvent&);
 

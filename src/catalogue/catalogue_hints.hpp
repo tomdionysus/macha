@@ -6,15 +6,15 @@
 #include <chrono>
 #include <compare>
 #include <condition_variable>
-#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
-#include <string>
 #include <stop_token>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -25,7 +25,7 @@ inline constexpr int periodic_scan = 10;
 inline constexpr int namespace_mutation = 50;
 inline constexpr int manual_rescan = 80;
 inline constexpr int ingest = 100;
-}
+} // namespace CatalogueHintPriority
 
 enum class CatalogueHintState {
     queued,
@@ -86,7 +86,9 @@ struct CatalogueHintSummary {
     size_t failed{};
     std::vector<CatalogueHint> hints;
 
-    bool terminal() const noexcept { return total != 0 && pending == 0; }
+    bool terminal() const noexcept {
+        return total != 0 && pending == 0;
+    }
 };
 
 class CatalogueHintQueue {
@@ -95,7 +97,8 @@ class CatalogueHintQueue {
     mutable IoMutex mutex_;
     std::condition_variable_any change_cv_;
     uint64_t revision_ MACHA_GUARDED_BY(mutex_){};
-    std::map<std::string, CatalogueHint, std::less<>> hints_ MACHA_GUARDED_BY(mutex_); // canonical path -> hint
+    std::map<std::string, CatalogueHint, std::less<>>
+        hints_ MACHA_GUARDED_BY(mutex_); // canonical path -> hint
     std::map<std::string, uint64_t, std::less<>> lane_served_ MACHA_GUARDED_BY(mutex_);
     uint64_t schedule_sequence_ MACHA_GUARDED_BY(mutex_){};
     bool state_dirty_ MACHA_GUARDED_BY(mutex_){};
@@ -114,8 +117,7 @@ class CatalogueHintQueue {
     explicit CatalogueHintQueue(const std::filesystem::path& state_path);
     ~CatalogueHintQueue();
 
-    std::string submit(std::string path, std::string source, std::string source_ref,
-                       int priority);
+    std::string submit(std::string path, std::string source, std::string source_ref, int priority);
     std::vector<std::string> submit_many(std::vector<CatalogueHintSubmission>);
     std::optional<CatalogueHint> claim_next();
     std::optional<std::chrono::milliseconds> next_ready_delay() const;
@@ -123,8 +125,7 @@ class CatalogueHintQueue {
     bool wait_for_change(std::stop_token, uint64_t observed_revision,
                          std::chrono::milliseconds timeout);
     void mark_catalogued(std::string_view id, std::string provider, std::string media_id,
-                         std::vector<std::string> catalogue_item_ids,
-                         std::string result = {});
+                         std::vector<std::string> catalogue_item_ids, std::string result = {});
     void mark_no_match(std::string_view id, std::string provider, std::string media_id,
                        std::string result = {});
     // Puts the file at `path` in the unmatched list as it is, to be identified
@@ -132,7 +133,8 @@ class CatalogueHintQueue {
     // the same content there does not reopen it. Returns the hint id.
     std::string put_unmatched(std::string path, std::string media_id);
     void advance_candidate(std::string_view id, size_t next_cursor);
-    void defer(std::string_view id, std::string code, std::string error, uint64_t retry_after_unix_ms);
+    void defer(std::string_view id, std::string code, std::string error,
+               uint64_t retry_after_unix_ms);
     size_t defer_matching(const std::function<bool(const CatalogueHint&)>& predicate,
                           std::string code, std::string error, uint64_t retry_after_unix_ms);
     bool record_failure(std::string_view id, std::string code, std::string error,

@@ -33,7 +33,9 @@ bool RetentionLedger::held(RetentionClass type, const ObjectId& id) const {
     return type == RetentionClass::data ? data_.has(id) : control_.has(id);
 }
 
-void RetentionLedger::publish(InventoryHandle inventory) { inventory_.publish(std::move(inventory)); }
+void RetentionLedger::publish(InventoryHandle inventory) {
+    inventory_.publish(std::move(inventory));
+}
 
 size_t RetentionLedger::release_unreferenced(RetentionClass type, const ReleaseHorizon& release,
                                              size_t operation_budget) {

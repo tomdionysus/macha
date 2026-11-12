@@ -32,9 +32,15 @@ class LocalServices {
     LocalServices(const LocalServices&) = delete;
     LocalServices& operator=(const LocalServices&) = delete;
 
-    LocalState& state() noexcept { return state_; }
-    MetadataServer& metadata() noexcept { return metadata_; }
-    StorageServer& storage() noexcept { return storage_; }
+    LocalState& state() noexcept {
+        return state_;
+    }
+    MetadataServer& metadata() noexcept {
+        return metadata_;
+    }
+    StorageServer& storage() noexcept {
+        return storage_;
+    }
 
   private:
     NodeResources& resources_;

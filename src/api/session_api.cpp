@@ -16,8 +16,7 @@ Json parse_body(const HttpRequest& request) {
     return root;
 }
 
-Json session_json(const AuthSession& session, const UserStore& users,
-                  std::string_view token = {}) {
+Json session_json(const AuthSession& session, const UserStore& users, std::string_view token = {}) {
     Json::Array roles;
     for (const auto& role : session.roles)
         roles.push_back(role);
@@ -112,10 +111,10 @@ CredentialResult PasswordCredentialValidator::validate(const Json& credentials) 
 SessionApi::SessionApi(NodeRuntime& node, Accounts& accounts,
                        std::unique_ptr<CredentialValidator> validator)
     : sessions_(accounts.sessions()), accounts_(accounts),
-      validator_(validator ? std::move(validator)
-                           : std::make_unique<PasswordCredentialValidator>(
-                                 accounts.users(), node.config().session,
-                                 accounts.password_work())) {}
+      validator_(validator
+                     ? std::move(validator)
+                     : std::make_unique<PasswordCredentialValidator>(
+                           accounts.users(), node.config().session, accounts.password_work())) {}
 
 bool SessionApi::capability_request(const HttpRequest& request) {
     return request.method == "POST" && request.path == "/api/v1/session";
@@ -144,8 +143,8 @@ HttpResponse SessionApi::handle(const HttpRequest& request) {
                 return http_error(403, "anonymous_disabled",
                                   "this cluster requires a username and password");
             case CredentialOutcome::rate_limited: {
-                auto response = http_error(429, "try_later",
-                                           "too many password checks; retry shortly");
+                auto response =
+                    http_error(429, "try_later", "too many password checks; retry shortly");
                 response.headers["Retry-After"] = "1";
                 return response;
             }
@@ -159,7 +158,8 @@ HttpResponse SessionApi::handle(const HttpRequest& request) {
                 return http_error(429, "too_many_sessions",
                                   "this node's session capacity is exhausted; retry shortly");
             accounts_.propagate_session(minted->session);
-            return http_json(201, session_json(minted->session, accounts_.users(), minted->bearer_token).dump());
+            return http_json(
+                201, session_json(minted->session, accounts_.users(), minted->bearer_token).dump());
         }
 
         // Every other route under /api/v1/session acts on the caller's current

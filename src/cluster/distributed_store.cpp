@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/distributed_store.hpp"
 #include "cluster/call_deadline.hpp"
-#include "diagnostics.hpp"
+#include "cluster/placement.hpp"
+#include "cluster/rpc_refusal.hpp"
 #include "codec.hpp"
+#include "diagnostics.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
 #include "observation.hpp"
-#include "cluster/placement.hpp"
-#include "cluster/rpc_refusal.hpp"
 #include "supervised.hpp"
 #include <algorithm>
 #include <chrono>
@@ -28,8 +28,7 @@ uint64_t since_ms(Clock::time_point since) {
 
 bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled,
                   const std::function<bool()>& abort = {}) {
-    return (cancelled && cancelled->load(std::memory_order_relaxed)) ||
-           (abort && abort()) ||
+    return (cancelled && cancelled->load(std::memory_order_relaxed)) || (abort && abort()) ||
            (deadline != Clock::time_point{} && Clock::now() >= deadline);
 }
 
@@ -60,15 +59,13 @@ DistributedStore::ObjectData take_object_reply_payload(RpcMessage message,
 } // namespace
 
 void DistributedStore::DurabilityBatch::add(DurabilityRequirement next) {
-    auto same_replica_keys = [](const DurabilityRequirement& a,
-                                const DurabilityRequirement& b) {
+    auto same_replica_keys = [](const DurabilityRequirement& a, const DurabilityRequirement& b) {
         if (a.required != b.required || a.replicas.size() != b.replicas.size())
             return false;
         for (size_t i = 0; i < a.replicas.size(); ++i) {
             const auto& left = a.replicas[i];
             const auto& right = b.replicas[i];
-            if (left.id != right.id || left.epoch != right.epoch ||
-                left.domain != right.domain ||
+            if (left.id != right.id || left.epoch != right.epoch || left.domain != right.domain ||
                 left.backend_instance != right.backend_instance)
                 return false;
         }
@@ -90,8 +87,7 @@ void DistributedStore::DurabilityBatch::add(DurabilityRequirement next) {
     for (const auto& existing : requirements)
         if (dominates(existing, next))
             return;
-    std::erase_if(requirements,
-                  [&](const auto& existing) { return dominates(next, existing); });
+    std::erase_if(requirements, [&](const auto& existing) { return dominates(next, existing); });
     requirements.push_back(std::move(next));
 }
 
@@ -155,9 +151,8 @@ ObjectId DistributedStore::put(std::span<const uint8_t> data, FrameType frame_ty
     }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     if (Log::enabled(LogLevel::all))
-        Log::trace("DIAG object-put id=" + to_string(id) +
-               " bytes=" + std::to_string(data.size()) +
-               " ms=" + std::to_string(elapsed.count()));
+        Log::trace("DIAG object-put id=" + to_string(id) + " bytes=" + std::to_string(data.size()) +
+                   " ms=" + std::to_string(elapsed.count()));
     return id;
 }
 
@@ -166,8 +161,8 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data,
     return put(id, data, FrameType::loader, cancelled);
 }
 
-bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data,
-                           FrameType frame_type, std::atomic_bool* cancelled) {
+bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, FrameType frame_type,
+                           std::atomic_bool* cancelled) {
     return put_impl(id, data, frame_type, cancelled, nullptr);
 }
 
@@ -224,8 +219,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     const size_t target = std::min(n_.config().replication, nodes.size());
     // Copies sought before the write returns. One copy is a write; the rest
     // are sought from the nodes present and otherwise left to repair.
-    const size_t floor =
-        std::max<size_t>(1, std::min(n_.config().write_copies, nodes.size()));
+    const size_t floor = std::max<size_t>(1, std::min(n_.config().write_copies, nodes.size()));
     const size_t need = floor;
 
     Writer writer;
@@ -287,14 +281,11 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
             Log::debug("object write quorum id=" + to_string(id) +
                        " bytes=" + std::to_string(data.size()) +
-                       " replicas=" + std::to_string(target) +
-                       " required=" + std::to_string(need) +
-                       " minimum=" + std::to_string(floor) +
-                       " success=" + std::to_string(success) +
+                       " replicas=" + std::to_string(target) + " required=" + std::to_string(need) +
+                       " minimum=" + std::to_string(floor) + " success=" + std::to_string(success) +
                        " local_ms=" + std::to_string(local_store_time.count()) +
-                       " remote_max_ms=" + std::to_string(remote_max_time.count()) +
-                       " total_ms=" + std::to_string(elapsed.count()) +
-                       " result=" + std::to_string(ok ? 1 : 0));
+                       " remote_max_ms=" + std::to_string(remote_max_time.count()) + " total_ms=" +
+                       std::to_string(elapsed.count()) + " result=" + std::to_string(ok ? 1 : 0));
         }
         return ok;
     };
@@ -317,9 +308,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             if (batch) {
                 if (const auto token = local_.data().put_deferred(id, data)) {
                     ++success;
-                    successful_replicas.push_back(
-                        {owner.id, n_.durability_epoch(), token->domain, token->generation,
-                         token->backend_instance});
+                    successful_replicas.push_back({owner.id, n_.durability_epoch(), token->domain,
+                                                   token->generation, token->backend_instance});
                 } else {
                     ++replacement_needed;
                 }
@@ -337,7 +327,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             item.owner = owner;
             item.started = Clock::now();
             const auto type = batch ? MessageType::put_object_deferred : MessageType::put_object;
-            item.rpc.emplace(n_.call_async(owner, type, payload, frame_type, call_deadline::object_transfer));
+            item.rpc.emplace(
+                n_.call_async(owner, type, payload, frame_type, call_deadline::object_transfer));
             pending.push_back(std::move(item));
         } catch (...) {
             ++replacement_needed;
@@ -379,9 +370,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
                     if (!item.done && item.rpc)
                         item.rpc->cancel();
                 Log::debug("object write made no progress within budget id=" + to_string(id) +
-                           " budget_ms=" + std::to_string(budget.count()) +
-                           " success=" + std::to_string(success) +
-                           " sought=" + std::to_string(need));
+                           " budget_ms=" + std::to_string(budget.count()) + " success=" +
+                           std::to_string(success) + " sought=" + std::to_string(need));
                 return finish(success > 0 && !work->cancelled(), success);
             }
         }
@@ -402,9 +392,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
                     ++replacement_needed;
                     progressed = true;
                     if (Log::enabled(LogLevel::debug)) {
-                        Log::debug("object write stalled; spilling id=" + to_string(id) +
-                                   " peer=" + to_string(item.owner.id).substr(0, 12) +
-                                   " no_progress_ms=" +
+                        Log::debug("object write stalled; spilling id=" + to_string(id) + " peer=" +
+                                   to_string(item.owner.id).substr(0, 12) + " no_progress_ms=" +
                                    std::to_string(item.rpc->idle_for().count()));
                     }
                 }
@@ -440,9 +429,9 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             if (ok) {
                 ++success;
                 if (batch)
-                    successful_replicas.push_back(
-                        {item.owner.id, *durability_epoch, durability_domain,
-                         durability_generation, durability_backend_instance});
+                    successful_replicas.push_back({item.owner.id, *durability_epoch,
+                                                   durability_domain, durability_generation,
+                                                   durability_backend_instance});
                 note_network(data.size(), Clock::now() - item.started);
             } else if (!item.spilled) {
                 ++replacement_needed;
@@ -515,16 +504,16 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
     std::map<ReplicaKey, uint64_t> wanted_map;
     for (const auto& requirement : batch.requirements) {
         for (const auto& replica : requirement.replicas) {
-            auto& generation = wanted_map[
-                {replica.id, replica.epoch, replica.domain, replica.backend_instance}];
+            auto& generation =
+                wanted_map[{replica.id, replica.epoch, replica.domain, replica.backend_instance}];
             generation = std::max(generation, replica.generation);
         }
     }
     std::vector<DurableReplica> wanted;
     wanted.reserve(wanted_map.size());
     for (const auto& [key, generation] : wanted_map) {
-        wanted.push_back({std::get<0>(key), std::get<1>(key), std::get<2>(key), generation,
-                          std::get<3>(key)});
+        wanted.push_back(
+            {std::get<0>(key), std::get<1>(key), std::get<2>(key), generation, std::get<3>(key)});
     }
 
     std::map<NodeId, NodeInfo> peers;
@@ -559,7 +548,8 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
             PendingBarrier item;
             item.replica = replica;
             item.rpc.emplace(n_.call_async(found->second, MessageType::object_durability_barrier,
-                                           payload.data(), frame_type, call_deadline::object_transfer));
+                                           payload.data(), frame_type,
+                                           call_deadline::object_transfer));
             pending.push_back(std::move(item));
         } catch (const std::exception& error) {
             // Still transient (an unsent request is "ask again"), but the
@@ -685,8 +675,9 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
                     payload.u32(static_cast<uint32_t>(end - offset));
                     for (size_t i = offset; i < end; ++i)
                         payload.fixed(ids[i].bytes);
-                    auto reply = n_.call(found->second, MessageType::object_durability_barrier,
-                                         payload.data(), frame_type, call_deadline::object_transfer);
+                    auto reply =
+                        n_.call(found->second, MessageType::object_durability_barrier,
+                                payload.data(), frame_type, call_deadline::object_transfer);
                     if (reply.message.type != MessageType::ok) {
                         probe_outcome = "probe-refused: " + reply_error_text(reply);
                         break;
@@ -762,8 +753,7 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
                 detail += " replica=" + to_string(replica.id).substr(0, 12) +
                           " epoch=" + to_string(replica.epoch).substr(0, 8) +
                           " gen=" + std::to_string(replica.generation) + " outcome=\"" +
-                          (seen == outcome.end() ? std::string("unexamined") : seen->second) +
-                          "\"";
+                          (seen == outcome.end() ? std::string("unexamined") : seen->second) + "\"";
             }
         }
         if (count < requirement.required) {
@@ -779,7 +769,6 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
     }
     return all_durable;
 }
-
 
 RpcReply DistributedStore::bounded_control_call(const NodeInfo& target, MessageType type,
                                                 std::span<const uint8_t> payload,
@@ -798,8 +787,7 @@ RpcReply DistributedStore::bounded_control_call(const NodeInfo& target, MessageT
 }
 
 bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_class,
-                                 const std::vector<ObjectId>& input,
-                                 const RetentionDot& dot) {
+                                 const std::vector<ObjectId>& input, const RetentionDot& dot) {
     if (input.empty())
         return true;
     auto ids = input;
@@ -817,9 +805,8 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
             // The bytes were verified when put; scrub finds later corruption.
             // No DATA admission for an index lookup; the remote handler matches.
             const bool present = !local_.retention().deleting(id) &&
-                                 (object_class == RetentionClass::data
-                                      ? local_.data().has(id)
-                                      : local_.control().has(id));
+                                 (object_class == RetentionClass::data ? local_.data().has(id)
+                                                                       : local_.control().has(id));
             if (!present)
                 return false;
         }
@@ -899,12 +886,12 @@ std::vector<ObjectId> DistributedStore::retain_data(const std::vector<ObjectId>&
         barrier_short.fetch_add(under_claimed, std::memory_order_relaxed);
         const auto total = since_ms(started);
         if (total >= 250 && Log::enabled(LogLevel::debug))
-            Log::debug("DATA retention barrier ids=" + std::to_string(ids.size()) +
-                       " nodes=" + std::to_string(batches.size()) + " total_ms=" +
-                       std::to_string(total) + " scan_ms=" + std::to_string(scan_ms) +
-                       " short=" + std::to_string(short_count) +
-                       " fallback_claims=" + std::to_string(fallback_claims) +
-                       " under_claimed=" + std::to_string(under_claimed));
+            Log::debug(
+                "DATA retention barrier ids=" + std::to_string(ids.size()) +
+                " nodes=" + std::to_string(batches.size()) + " total_ms=" + std::to_string(total) +
+                " scan_ms=" + std::to_string(scan_ms) + " short=" + std::to_string(short_count) +
+                " fallback_claims=" + std::to_string(fallback_claims) +
+                " under_claimed=" + std::to_string(under_claimed));
     };
 
     if (!short_ids.empty()) {
@@ -946,9 +933,10 @@ std::vector<ObjectId> DistributedStore::retain_data(const std::vector<ObjectId>&
                 continue;
             const NodeInfo target = found->second;
             const std::vector<ObjectId>* ids_ptr = &batch;
-            claims.emplace_back(node_id, std::async(std::launch::async, [this, target, ids_ptr, dot] {
-                return retain_on(target, RetentionClass::data, *ids_ptr, dot);
-            }));
+            claims.emplace_back(node_id,
+                                std::async(std::launch::async, [this, target, ids_ptr, dot] {
+                                    return retain_on(target, RetentionClass::data, *ids_ptr, dot);
+                                }));
         }
         for (auto& [node_id, result] : claims) {
             bool ok = false;
@@ -1018,8 +1006,8 @@ bool DistributedStore::put_here(const ObjectId& id, std::span<const uint8_t> dat
                                 FrameType frame_type) {
     if (!holds_extents())
         return put(id, data, frame_type);
-    auto resource = data_resources_.acquire(DataWorkContext(frame_type, data.size(), {}, nullptr),
-                                            data.size());
+    auto resource =
+        data_resources_.acquire(DataWorkContext(frame_type, data.size(), {}, nullptr), data.size());
     if (!resource)
         return put(id, data, frame_type);
     const bool held = local_.data().has(id);
@@ -1035,15 +1023,16 @@ bool DistributedStore::put_deferred_here(const ObjectId& id, std::span<const uin
                                          DurabilityBatch& batch, FrameType frame_type) {
     if (!holds_extents())
         return put_deferred(id, data, batch, frame_type);
-    auto resource = data_resources_.acquire(DataWorkContext(frame_type, data.size(), {}, nullptr),
-                                            data.size());
+    auto resource =
+        data_resources_.acquire(DataWorkContext(frame_type, data.size(), {}, nullptr), data.size());
     if (!resource)
         return put_deferred(id, data, batch, frame_type);
     const bool held = local_.data().has(id);
     const auto token = local_.data().put_deferred(id, data);
     if (!token)
         return put_deferred(id, data, batch, frame_type);
-    batch.add({id, 1,
+    batch.add({id,
+               1,
                {DurableReplica{n_.node_id(), n_.durability_epoch(), token->domain,
                                token->generation, token->backend_instance}}});
     if (!held)
@@ -1069,28 +1058,26 @@ std::vector<ObjectId> DistributedStore::retain_data_here(const std::vector<Objec
     return elsewhere;
 }
 
-bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
-                                      const RetentionDot& dot, ClaimScope scope) {
+bool DistributedStore::retain_control(const std::vector<ObjectId>& input, const RetentionDot& dot,
+                                      ClaimScope scope) {
     auto ids = input;
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (ids.empty())
         return true;
 
-    const size_t sought = scope == ClaimScope::here
-                              ? 1
-                              : scope == ClaimScope::every_node
-                                    ? std::numeric_limits<size_t>::max()
-                                    : std::max<size_t>(1, n_.config().metadata_write_copies);
+    const size_t sought = scope == ClaimScope::here ? 1
+                          : scope == ClaimScope::every_node
+                              ? std::numeric_limits<size_t>::max()
+                              : std::max<size_t>(1, n_.config().metadata_write_copies);
     const auto started = Clock::now();
     auto active = n_.membership().active();
     if (scope == ClaimScope::here)
         std::erase_if(active, [&](const NodeInfo& node) { return node.id != n_.node_id(); });
     // Local first, then the nearest measured peer: this runs inside the
     // writer's metadata mutation.
-    active = order_commit_replicas(active, n_.node_id(), [&](const NodeId& peer) {
-        return n_.peer_latency(peer);
-    });
+    active = order_commit_replicas(active, n_.node_id(),
+                                   [&](const NodeId& peer) { return n_.peer_latency(peer); });
 
     // A retention claim asserts this node holds the object and peer copies
     // derive from ours. An object that cannot be made local now is not
@@ -1146,7 +1133,8 @@ DistributedStore::DistributedStore(ClusterNode& n, LocalState& local, ActivityCl
                                    RetainedMemoryLedger& retained_memory, NodeEvents& events,
                                    DistributedStoreOptions options)
     : n_(n), local_(local), activity_(activity), data_resources_(data_resources),
-      retained_memory_(retained_memory), events_(events), repair_trace_(std::move(options.repair_trace)) {
+      retained_memory_(retained_memory), events_(events),
+      repair_trace_(std::move(options.repair_trace)) {
     if (options.repair_position) {
         repair_position_path_ = std::move(*options.repair_position);
         std::ifstream in(repair_position_path_);
@@ -1155,13 +1143,13 @@ DistributedStore::DistributedStore(ClusterNode& n, LocalState& local, ActivityCl
             repair_push_resume_ = settled;
     }
     prompt_thread_ = std::jthread([this](std::stop_token stop) {
-        run_supervised_loop("prompt-replication", stop, [this, stop] { prompt_replication_loop(stop); });
+        run_supervised_loop("prompt-replication", stop,
+                            [this, stop] { prompt_replication_loop(stop); });
     });
     local_writer_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("local-copy-writer", stop, [this, stop] { local_writer_loop(stop); });
     });
 }
-
 
 void DistributedStore::save_repair_position(bool force) {
     if (repair_position_path_.empty() || repair_push_settled_ == repair_position_saved_)
@@ -1239,7 +1227,8 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
                 return !prompt_queue_.empty() ||
                        (!retry.empty() && retry.front().due <= Clock::now());
             });
-            if (stop.stop_requested()) return;
+            if (stop.stop_requested())
+                return;
             if (!prompt_queue_.empty()) {
                 id = prompt_queue_.front();
                 prompt_queue_.pop_front();
@@ -1269,16 +1258,19 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
                       [](const Retry& a, const Retry& b) { return a.due < b.due; });
         };
         try {
-            if (!local_.data().has(*id)) continue; // gone (deleted, or never local)
+            if (!local_.data().has(*id))
+                continue; // gone (deleted, or never local)
             auto nodes = ranked(*id);
             const size_t target = std::min(n_.config().replication, nodes.size());
-            if (target < 2) continue;
+            if (target < 2)
+                continue;
             const uint64_t room_needed = std::max<uint64_t>(n_.config().extent_size, 1);
             size_t holders = 1; // the local copy
             bool skipped_full = false;
             std::optional<NodeInfo> destination;
             for (const auto& node : nodes) {
-                if (node.id == n_.node_id()) continue;
+                if (node.id == n_.node_id())
+                    continue;
                 bool present = false;
                 try {
                     present = has_on(node, *id);
@@ -1286,7 +1278,8 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
                     present = false;
                 }
                 if (present) {
-                    if (++holders >= 2) break;
+                    if (++holders >= 2)
+                        break;
                     continue;
                 }
                 // Room as the node gossips it; a refused put wastes the link.
@@ -1294,9 +1287,11 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
                     skipped_full = true;
                     continue;
                 }
-                if (!destination) destination = node;
+                if (!destination)
+                    destination = node;
             }
-            if (holders >= 2) continue;
+            if (holders >= 2)
+                continue;
             if (!destination) {
                 if (skipped_full) {
                     prompt_skipped_no_room_.fetch_add(1, std::memory_order_relaxed);
@@ -1305,7 +1300,8 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
                 continue;
             }
             auto data = local_.data().get(*id);
-            if (!data) continue;
+            if (!data)
+                continue;
             if (put_on(*destination, *id, *data, false)) {
                 prompt_copies_.fetch_add(1, std::memory_order_relaxed);
                 events_.notify(NodeEvent::storage);
@@ -1327,8 +1323,8 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
                               std::span<const uint8_t> data, bool foreground) {
     const auto frame_type = foreground ? FrameType::foreground : FrameType::speculative;
     if (target.id == n_.node_id()) {
-        auto resource = data_resources_.acquire(
-            DataWorkContext(frame_type, data.size()), data.size());
+        auto resource =
+            data_resources_.acquire(DataWorkContext(frame_type, data.size()), data.size());
         if (!resource)
             return false;
         if (!local_.data().has(id))
@@ -1340,8 +1336,9 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
     writer.fixed(id.bytes);
     writer.bytes(data);
     auto started = Clock::now();
-    bool ok = n_.call(target, MessageType::put_object, writer.data(), frame_type, call_deadline::object_transfer).message.type ==
-              MessageType::ok;
+    bool ok = n_.call(target, MessageType::put_object, writer.data(), frame_type,
+                      call_deadline::object_transfer)
+                  .message.type == MessageType::ok;
     if (ok)
         note_network(data.size(), Clock::now() - started);
     if (foreground)
@@ -1351,9 +1348,9 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
 
 DistributedStore::ObjectData
 DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType frame_type,
-                           const std::shared_ptr<SharedFetch>& shared,
-                           Clock::time_point deadline, std::atomic_bool* cancelled,
-                           const std::function<bool()>& abort, FetchAnswer& answer) {
+                           const std::shared_ptr<SharedFetch>& shared, Clock::time_point deadline,
+                           std::atomic_bool* cancelled, const std::function<bool()>& abort,
+                           FetchAnswer& answer) {
     answer = FetchAnswer::try_later;
     try {
         if (target.id == n_.node_id()) {
@@ -1364,9 +1361,9 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
                 n_.config().extent_size);
             if (!resource)
                 return {};
-            auto memory = retained_memory_.acquire(
-                work_class(frame_type), MemoryOwner::object_payload,
-                n_.config().extent_size, deadline, cancelled);
+            auto memory =
+                retained_memory_.acquire(work_class(frame_type), MemoryOwner::object_payload,
+                                         n_.config().extent_size, deadline, cancelled);
             if (!memory)
                 return {};
             const bool every_backend = local_.data().every_backend_online();
@@ -1378,8 +1375,7 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
             }
             auto object = std::make_shared<ObjectBuffer>();
             object->bytes = std::move(*bytes);
-            object->retained_memory =
-                std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
+            object->retained_memory = std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
             object->retained_memory->push_back(std::move(*memory));
             answer = FetchAnswer::ok;
             return object;
@@ -1388,7 +1384,8 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
         Writer writer;
         writer.fixed(id.bytes);
         auto started = Clock::now();
-        auto rpc = n_.call_async(target, MessageType::get_object, writer.data(), frame_type, call_deadline::object_transfer);
+        auto rpc = n_.call_async(target, MessageType::get_object, writer.data(), frame_type,
+                                 call_deadline::object_transfer);
         if (shared) {
             FrameType effective;
             {
@@ -1404,8 +1401,8 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
                 // Cancellation aborts the RPC only while no other waiter
                 // depends on the shared fetch; otherwise the cancelled caller
                 // discards the result.
-                const bool may_cancel = !shared ||
-                    shared->waiters.load(std::memory_order_relaxed) == 0;
+                const bool may_cancel =
+                    !shared || shared->waiters.load(std::memory_order_relaxed) == 0;
                 if (!may_cancel)
                     continue;
                 rpc.cancel();
@@ -1464,18 +1461,21 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
     // not cancel a transfer others may need.
     if (deadline != Clock::time_point{}) {
         auto try_private = [&](std::vector<NodeInfo> candidates) -> ObjectData {
-            std::erase_if(candidates, [&](const NodeInfo& node) { return node.id == n_.node_id(); });
+            std::erase_if(candidates,
+                          [&](const NodeInfo& node) { return node.id == n_.node_id(); });
             size_t attempt = 0;
-            const auto work = foreground ? ReplicaWorkClass::foreground
-                                         : ReplicaWorkClass::speculative;
+            const auto work =
+                foreground ? ReplicaWorkClass::foreground : ReplicaWorkClass::speculative;
             while (!candidates.empty() && !read_aborted(deadline, cancelled, abort)) {
                 auto ordered = replica_selector_.order(candidates, stripe + attempt, work);
-                if (ordered.empty()) break;
+                if (ordered.empty())
+                    break;
                 const auto target = ordered.front();
-                auto found = std::find_if(candidates.begin(), candidates.end(), [&](const NodeInfo& node) {
-                    return node.id == target.id;
-                });
-                if (found != candidates.end()) candidates.erase(found);
+                auto found =
+                    std::find_if(candidates.begin(), candidates.end(),
+                                 [&](const NodeInfo& node) { return node.id == target.id; });
+                if (found != candidates.end())
+                    candidates.erase(found);
 
                 auto started = Clock::now();
                 replica_selector_.started(target, work);
@@ -1484,7 +1484,8 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
                     get_from(target, id, frame_type, nullptr, deadline, cancelled, abort, one);
                 replica_selector_.finished(target, work, data ? data->bytes.size() : 0,
                                            Clock::now() - started, static_cast<bool>(data));
-                if (data) return data;
+                if (data)
+                    return data;
                 ++asked;
                 all_absent = all_absent && one == FetchAnswer::not_found;
                 ++attempt;
@@ -1496,17 +1497,18 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
 
         auto preferred = owners(id);
         std::set<NodeId> preferred_ids;
-        for (const auto& node : preferred) preferred_ids.insert(node.id);
+        for (const auto& node : preferred)
+            preferred_ids.insert(node.id);
         auto data = try_private(std::move(preferred));
         if (!data && !read_aborted(deadline, cancelled, abort)) {
             auto fallback = ranked(id);
-            std::erase_if(fallback, [&](const NodeInfo& node) {
-                return preferred_ids.contains(node.id);
-            });
+            std::erase_if(fallback,
+                          [&](const NodeInfo& node) { return preferred_ids.contains(node.id); });
             data = try_private(std::move(fallback));
         }
         if (data) {
-            if (foreground) note_foreground(data->bytes.size());
+            if (foreground)
+                note_foreground(data->bytes.size());
             if (opportunistic_persist)
                 enqueue_local_copy(id, data->bytes, should_own(id));
         }
@@ -1630,9 +1632,8 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
             if (ordered.empty())
                 break;
             const auto target = ordered.front();
-            auto found = std::find_if(candidates.begin(), candidates.end(), [&](const NodeInfo& n) {
-                return n.id == target.id;
-            });
+            auto found = std::find_if(candidates.begin(), candidates.end(),
+                                      [&](const NodeInfo& n) { return n.id == target.id; });
             if (found != candidates.end())
                 candidates.erase(found);
 
@@ -1654,13 +1655,12 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
             // The transfer belongs to the ObjectId, not its leader: a cancelled
             // leader may abort the RPC only while no other reader has joined.
             FetchAnswer one{};
-            auto data =
-                get_from(target, id, transfer_type, shared, {}, cancelled, abort, one);
+            auto data = get_from(target, id, transfer_type, shared, {}, cancelled, abort, one);
             {
                 Lock lock(shared->mutex);
                 replica_selector_.finished(target, shared->active_class,
-                                           data ? data->bytes.size() : 0,
-                                           Clock::now() - started, static_cast<bool>(data));
+                                           data ? data->bytes.size() : 0, Clock::now() - started,
+                                           static_cast<bool>(data));
                 shared->active_peer.reset();
             }
             if (data)
@@ -1702,8 +1702,8 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
 std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bool foreground,
                                            Clock::time_point deadline,
                                            std::atomic_bool* cancelled) {
-    return get(id, stripe, foreground ? FrameType::foreground : FrameType::speculative,
-               deadline, cancelled);
+    return get(id, stripe, foreground ? FrameType::foreground : FrameType::speculative, deadline,
+               cancelled);
 }
 
 std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, FrameType frame_type,
@@ -1715,11 +1715,13 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
     return data->bytes;
 }
 
-DistributedStore::ObjectData
-DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_type,
-                             Clock::time_point deadline, std::atomic_bool* cancelled) {
+DistributedStore::ObjectData DistributedStore::get_shared(const ObjectId& id, size_t stripe,
+                                                          FrameType frame_type,
+                                                          Clock::time_point deadline,
+                                                          std::atomic_bool* cancelled) {
     const bool foreground = frame_type == FrameType::foreground;
-    const bool interactive = frame_type == FrameType::foreground || frame_type == FrameType::read_ahead;
+    const bool interactive =
+        frame_type == FrameType::foreground || frame_type == FrameType::read_ahead;
     // Record foreground demand before any storage access, so the first
     // playback read already suppresses lower-priority publication.
     if (foreground)
@@ -1731,10 +1733,8 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
         if (foreground && elapsed >= std::chrono::milliseconds(250) &&
             Log::enabled(LogLevel::debug)) {
             Log::debug("playback object read source=" + std::string(source) +
-                       " stripe=" + std::to_string(stripe) +
-                       " id=" + to_string(id) +
-                       " result=" + std::to_string(ok ? 1 : 0) +
-                       " bytes=" + std::to_string(bytes) +
+                       " stripe=" + std::to_string(stripe) + " id=" + to_string(id) +
+                       " result=" + std::to_string(ok ? 1 : 0) + " bytes=" + std::to_string(bytes) +
                        " elapsed_ms=" + std::to_string(elapsed.count()));
         }
         return elapsed;
@@ -1744,9 +1744,9 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
         n_.config().extent_size);
     if (!local_resource)
         return {};
-    auto local_memory = retained_memory_.acquire(
-        work_class(frame_type), MemoryOwner::object_payload,
-        n_.config().extent_size, deadline, cancelled);
+    auto local_memory =
+        retained_memory_.acquire(work_class(frame_type), MemoryOwner::object_payload,
+                                 n_.config().extent_size, deadline, cancelled);
     if (!local_memory)
         return {};
     auto local_data = local_.data().get(id);
@@ -1756,13 +1756,11 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
             activity_.note(frame_type, data->size());
         auto elapsed = log_playback_read("owned", data->size(), true);
         if (Log::enabled(LogLevel::all))
-            Log::trace("DIAG object-get id=" + to_string(id) +
-                   " source=owned bytes=" + std::to_string(data->size()) +
-                   " ms=" + std::to_string(elapsed.count()));
+            Log::trace("DIAG object-get id=" + to_string(id) + " source=owned bytes=" +
+                       std::to_string(data->size()) + " ms=" + std::to_string(elapsed.count()));
         auto object = std::make_shared<ObjectBuffer>();
         object->bytes = std::move(*data);
-        object->retained_memory =
-            std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
+        object->retained_memory = std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
         object->retained_memory->push_back(std::move(*local_memory));
         return object;
     }
@@ -1773,9 +1771,9 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
         n_.config().extent_size);
     if (!cache_resource)
         return {};
-    auto cache_memory = retained_memory_.acquire(
-        work_class(frame_type), MemoryOwner::object_payload,
-        n_.config().extent_size, deadline, cancelled);
+    auto cache_memory =
+        retained_memory_.acquire(work_class(frame_type), MemoryOwner::object_payload,
+                                 n_.config().extent_size, deadline, cancelled);
     if (!cache_memory)
         return {};
     auto cache_data = local_.cache().get(id);
@@ -1787,13 +1785,11 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
             enqueue_local_copy(id, *cached, true);
         auto elapsed = log_playback_read("cache", cached->size(), true);
         if (Log::enabled(LogLevel::all))
-            Log::trace("DIAG object-get id=" + to_string(id) +
-                   " source=cache bytes=" + std::to_string(cached->size()) +
-                   " ms=" + std::to_string(elapsed.count()));
+            Log::trace("DIAG object-get id=" + to_string(id) + " source=cache bytes=" +
+                       std::to_string(cached->size()) + " ms=" + std::to_string(elapsed.count()));
         auto object = std::make_shared<ObjectBuffer>();
         object->bytes = std::move(*cached);
-        object->retained_memory =
-            std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
+        object->retained_memory = std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
         object->retained_memory->push_back(std::move(*cache_memory));
         return object;
     }
@@ -1801,23 +1797,23 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
 
     if (read_aborted(deadline, cancelled))
         return {};
-    auto data = get_remote(id, stripe, frame_type,
-                           foreground, interactive, deadline, cancelled);
+    auto data = get_remote(id, stripe, frame_type, foreground, interactive, deadline, cancelled);
     if (data && frame_type == FrameType::read_ahead)
         activity_.note(frame_type, data->bytes.size());
-    auto elapsed = log_playback_read("remote", data ? data->bytes.size() : 0,
-                                     static_cast<bool>(data));
+    auto elapsed =
+        log_playback_read("remote", data ? data->bytes.size() : 0, static_cast<bool>(data));
     if (Log::enabled(LogLevel::all))
         Log::trace("DIAG object-get id=" + to_string(id) +
-               " source=remote result=" + std::to_string(data ? 1 : 0) +
-               " bytes=" + std::to_string(data ? data->bytes.size() : 0) +
-               " ms=" + std::to_string(elapsed.count()));
+                   " source=remote result=" + std::to_string(data ? 1 : 0) +
+                   " bytes=" + std::to_string(data ? data->bytes.size() : 0) +
+                   " ms=" + std::to_string(elapsed.count()));
     return data;
 }
 
-std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_objects(
-    const std::map<NodeId, NodeInfo>& node_info,
-    const std::map<NodeId, std::vector<ObjectId>>& ids_by_node, FrameType frame_type) {
+std::map<NodeId, std::map<ObjectId, bool>>
+DistributedStore::batched_have_objects(const std::map<NodeId, NodeInfo>& node_info,
+                                       const std::map<NodeId, std::vector<ObjectId>>& ids_by_node,
+                                       FrameType frame_type) {
     std::map<NodeId, std::map<ObjectId, bool>> results;
 
     // Local node: index lookup, no RPC. No DATA admission: it owns no buffer,
@@ -1842,8 +1838,9 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_object
             continue;
         for (size_t offset = 0; offset < ids.size(); offset += batch_size) {
             const size_t end = std::min(ids.size(), offset + batch_size);
-            chunks.push_back({node_id, std::vector<ObjectId>(ids.begin() + static_cast<long>(offset),
-                                                              ids.begin() + static_cast<long>(end))});
+            chunks.push_back(
+                {node_id, std::vector<ObjectId>(ids.begin() + static_cast<long>(offset),
+                                                ids.begin() + static_cast<long>(end))});
         }
     }
 
@@ -1921,9 +1918,9 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_object
     return results;
 }
 
-std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
-    const std::map<NodeId, NodeInfo>& node_info,
-    const std::map<NodeId, std::vector<ObjectId>>& ids_by_node) {
+std::map<NodeId, std::map<ObjectId, bool>>
+DistributedStore::validated_presence(const std::map<NodeId, NodeInfo>& node_info,
+                                     const std::map<NodeId, std::vector<ObjectId>>& ids_by_node) {
     std::map<NodeId, std::map<ObjectId, bool>> results;
     struct InFlight {
         const NodeInfo* node;
@@ -1937,17 +1934,18 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
             continue;
         for (size_t offset = 0; offset < ids.size(); offset += have_valid_objects_max) {
             const auto end = std::min(ids.size(), offset + have_valid_objects_max);
-            InFlight request{&found->second,
-                             {ids.begin() + static_cast<long>(offset),
-                              ids.begin() + static_cast<long>(end)},
-                             {}};
+            InFlight request{
+                &found->second,
+                {ids.begin() + static_cast<long>(offset), ids.begin() + static_cast<long>(end)},
+                {}};
             Writer writer;
             writer.u32(static_cast<uint32_t>(request.ids.size()));
             for (const auto& id : request.ids)
                 writer.fixed(id.bytes);
             try {
-                request.rpc = n_.call_async(found->second, MessageType::have_valid_objects,
-                                            writer.data(), FrameType::speculative, call_deadline::presence_probe);
+                request.rpc =
+                    n_.call_async(found->second, MessageType::have_valid_objects, writer.data(),
+                                  FrameType::speculative, call_deadline::presence_probe);
             } catch (const std::exception& error) {
                 Log::debug("repair presence batch peer=" + found->second.host +
                            " error=" + error.what());
@@ -1956,13 +1954,14 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
         }
     }
 
-    const auto one_at_a_time = [&](const NodeInfo& node, const ObjectId& id) -> std::optional<bool> {
+    const auto one_at_a_time = [&](const NodeInfo& node,
+                                   const ObjectId& id) -> std::optional<bool> {
         Writer writer;
         writer.fixed(id.bytes);
         try {
-            auto reply =
-                n_.call_async(node, MessageType::have_object, writer.data(), FrameType::speculative, call_deadline::presence_probe)
-                    .get();
+            auto reply = n_.call_async(node, MessageType::have_object, writer.data(),
+                                       FrameType::speculative, call_deadline::presence_probe)
+                             .get();
             if (reply.message.type != MessageType::bool_reply)
                 return std::nullopt;
             Reader reader(reply.message.payload);
@@ -2116,8 +2115,8 @@ bool DistributedStore::offer_control_on(const NodeInfo& target, const std::vecto
         for (size_t i = offset; i < end; ++i)
             writer.fixed(ids[i].bytes);
         try {
-            auto reply = bounded_control_call(target, MessageType::have_control_objects,
-                                              writer.data());
+            auto reply =
+                bounded_control_call(target, MessageType::have_control_objects, writer.data());
             if (reply.message.type != MessageType::have_control_objects_reply)
                 throw std::runtime_error(reply_error_text(reply));
             Reader reader(reply.message.payload);
@@ -2129,16 +2128,15 @@ bool DistributedStore::offer_control_on(const NodeInfo& target, const std::vecto
                     missing.push_back(ids[i]);
             reader.finish();
         } catch (const std::exception& error) {
-            Log::debug("CONTROL presence probe peer=" + target.host +
-                       " error=" + error.what() + "; sending the whole graph");
+            Log::debug("CONTROL presence probe peer=" + target.host + " error=" + error.what() +
+                       "; sending the whole graph");
             missing = ids;
             break;
         }
     }
     if (missing.size() != ids.size() && Log::enabled(LogLevel::debug))
-        Log::debug("CONTROL graph peer=" + target.host +
-                   " referenced=" + std::to_string(ids.size()) +
-                   " missing=" + std::to_string(missing.size()));
+        Log::debug("CONTROL graph peer=" + target.host + " referenced=" +
+                   std::to_string(ids.size()) + " missing=" + std::to_string(missing.size()));
     if (missing.empty())
         return true;
 
@@ -2147,8 +2145,7 @@ bool DistributedStore::offer_control_on(const NodeInfo& target, const std::vecto
     // until answered, so the limit is the smaller of the two. A quarter of
     // it, because this graph shares the lane with heartbeats, commits and
     // status traffic; taking more than a share of a shared budget overruns it.
-    const size_t connection_budget =
-        std::min(max_pending_rpc_requests, max_peer_outbound_messages);
+    const size_t connection_budget = std::min(max_pending_rpc_requests, max_peer_outbound_messages);
     const size_t put_window = std::max<size_t>(1, connection_budget / 4);
     std::vector<std::pair<AsyncRpc, size_t>> in_flight;
     in_flight.reserve(std::min(put_window, missing.size()));
@@ -2185,9 +2182,9 @@ bool DistributedStore::offer_control_on(const NodeInfo& target, const std::vecto
         writer.fixed(id.bytes);
         writer.bytes(*bytes);
         try {
-            in_flight.emplace_back(
-                n_.call_async(target, MessageType::put_control_object, writer.data(), frame, call_deadline::metadata),
-                bytes->size());
+            in_flight.emplace_back(n_.call_async(target, MessageType::put_control_object,
+                                                 writer.data(), frame, call_deadline::metadata),
+                                   bytes->size());
         } catch (const std::exception& error) {
             Log::debug("CONTROL object store peer=" + target.host + " error=" + error.what());
             for (auto& [rpc, _] : in_flight)
@@ -2260,8 +2257,8 @@ bool DistributedStore::hydrate(const ObjectId& id, size_t stripe, FrameType fram
     auto data = get_remote(id, stripe, frame_type, false, false);
     if (!data)
         return false;
-    auto resource = data_resources_.acquire(
-        DataWorkContext(frame_type, data->bytes.size()), data->bytes.size());
+    auto resource = data_resources_.acquire(DataWorkContext(frame_type, data->bytes.size()),
+                                            data->bytes.size());
     return resource && local_.cache().put(id, data->bytes);
 }
 
@@ -2276,18 +2273,17 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
             return true;
     }
     if (auto cached = local_.cache().get(id)) {
-        auto resource = data_resources_.acquire(
-            DataWorkContext(local_class, cached->size()), cached->size());
+        auto resource =
+            data_resources_.acquire(DataWorkContext(local_class, cached->size()), cached->size());
         if (resource && local_.data().put(id, *cached))
             return true;
     }
-    auto data = get_remote(id, 0,
-                           foreground ? FrameType::foreground : FrameType::speculative,
+    auto data = get_remote(id, 0, foreground ? FrameType::foreground : FrameType::speculative,
                            foreground, false);
     if (!data)
         return false;
-    auto resource = data_resources_.acquire(
-        DataWorkContext(local_class, data->bytes.size()), data->bytes.size());
+    auto resource = data_resources_.acquire(DataWorkContext(local_class, data->bytes.size()),
+                                            data->bytes.size());
     return resource && local_.data().put(id, data->bytes);
 }
 
@@ -2334,7 +2330,7 @@ uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
 }
 
 uint64_t DistributedStore::repair_once(uint64_t byte_budget,
-                                      std::optional<std::span<const ObjectId>> live) {
+                                       std::optional<std::span<const ObjectId>> live) {
     return repair_step(byte_budget ? byte_budget : std::numeric_limits<uint64_t>::max(), 0,
                        live ? std::optional<IdLookup>(*live) : std::nullopt)
         .bytes_transferred;
@@ -2429,17 +2425,13 @@ DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const
     return out;
 }
 
-DistributedStore::RepairResult
-DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
-                              std::optional<IdLookup> live,
-                              const std::function<bool()>& should_yield,
-                              uint64_t live_generation,
-                              const std::function<bool(const ObjectId&)>& unavailable,
-                              std::optional<std::span<const ObjectId>> pull,
-                              const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>&
-                                  known_present,
-                              std::optional<std::span<const ObjectId>> push, uint64_t pull_version,
-                              uint64_t push_version) {
+DistributedStore::RepairResult DistributedStore::repair_step(
+    uint64_t byte_budget, size_t operation_budget, std::optional<IdLookup> live,
+    const std::function<bool()>& should_yield, uint64_t live_generation,
+    const std::function<bool(const ObjectId&)>& unavailable,
+    std::optional<std::span<const ObjectId>> pull,
+    const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>& known_present,
+    std::optional<std::span<const ObjectId>> push, uint64_t pull_version, uint64_t push_version) {
     RepairResult result;
     result.complete = false;
     auto& transferred = result.bytes_transferred;
@@ -2456,9 +2448,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     // live set per slice, which would make idle repair O(store).
     const std::optional<const ObjectId*> live_identity =
         live ? std::optional<const ObjectId*>(live->sorted().data()) : std::nullopt;
-    const bool generation_changed =
-        live_generation ? repair_live_generation_ != live_generation
-                        : repair_live_identity_ != live_identity;
+    const bool generation_changed = live_generation ? repair_live_generation_ != live_generation
+                                                    : repair_live_identity_ != live_identity;
     const auto reset_push_window = [&] {
         repair_push_window_.clear();
         repair_push_presence_.clear();
@@ -2546,9 +2537,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
     // Bound local/live-set examinations separately from remote operations: a
     // settled object needs no RPC, so the RPC budget alone would not bound a tick.
-    const size_t scan_budget = operation_budget
-                                   ? std::clamp<size_t>(operation_budget * 4, 16, 64)
-                                   : std::numeric_limits<size_t>::max();
+    const size_t scan_budget = operation_budget ? std::clamp<size_t>(operation_budget * 4, 16, 64)
+                                                : std::numeric_limits<size_t>::max();
     size_t scanned_total = 0;
 
     // A peer whose advertised free space cannot take an extent is neither
@@ -2869,8 +2859,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 writer.fixed(send.id.bytes);
                 writer.bytes(*send.data);
                 try {
-                    send.rpc = n_.call_async(send.peer, MessageType::put_object, writer.data(),
-                                             FrameType::speculative, call_deadline::object_transfer);
+                    send.rpc =
+                        n_.call_async(send.peer, MessageType::put_object, writer.data(),
+                                      FrameType::speculative, call_deadline::object_transfer);
                 } catch (const std::exception& error) {
                     Log::debug("repair push peer=" + send.peer.host + " error=" + error.what());
                 }
@@ -2953,8 +2944,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             FetchAnswer answer{};
             // The fetch runs to completion and is kept even if repair yields,
             // so a node that is never quiet still pulls.
-            auto data = get_remote(id, 0, FrameType::speculative, false, false, {}, nullptr, {},
-                                   &answer);
+            auto data =
+                get_remote(id, 0, FrameType::speculative, false, false, {}, nullptr, {}, &answer);
             if (data) {
                 auto resource = data_resources_.acquire(
                     DataWorkContext(FrameType::speculative, data->bytes.size()),
@@ -3012,9 +3003,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
         if (!stopped && !result.credit_limited && !repair_pull_complete_ && pull_list &&
             !pull_list->empty()) {
-            auto it = repair_pull_after_
-                          ? std::upper_bound(pull_list->begin(), pull_list->end(), *repair_pull_after_)
-                          : pull_list->begin();
+            auto it = repair_pull_after_ ? std::upper_bound(pull_list->begin(), pull_list->end(),
+                                                            *repair_pull_after_)
+                                         : pull_list->begin();
             // An object that needs nothing is an index lookup: it does not count
             // against the scan budget, only against its own, far larger one, so a
             // settled stretch of the list is passed in one step.
@@ -3114,8 +3105,8 @@ void DistributedStore::enqueue_local_copy(const ObjectId& id, std::span<const ui
     if (!cache && !promote)
         return;
 
-    auto memory = retained_memory_.try_acquire(WorkClass::speculative,
-                                               MemoryOwner::object_payload, data.size());
+    auto memory = retained_memory_.try_acquire(WorkClass::speculative, MemoryOwner::object_payload,
+                                               data.size());
     if (!memory) {
         // Log the drop, so an unfilled cache is distinguishable from a broken one.
         Log::debug("opportunistic persistence skipped object=" + to_string(id) +

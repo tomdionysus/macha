@@ -55,8 +55,8 @@ bool ControlObjectFetch::pull(const ObjectId& id, const Observer& observe) {
             last_failure = target.host + ": " + e.what();
         }
     }
-    Log::warn("control object unavailable id=" + hex(id.bytes) + " peers_asked=" +
-              std::to_string(asked) + " last_failure=" + last_failure);
+    Log::warn("control object unavailable id=" + hex(id.bytes) +
+              " peers_asked=" + std::to_string(asked) + " last_failure=" + last_failure);
     return false;
 }
 

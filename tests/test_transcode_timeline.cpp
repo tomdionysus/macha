@@ -79,7 +79,9 @@ struct Synthesized {
 
 struct EncoderContext {
     AVCodecContext* ctx{};
-    ~EncoderContext() { avcodec_free_context(&ctx); }
+    ~EncoderContext() {
+        avcodec_free_context(&ctx);
+    }
 };
 
 // Drains one encoder into the muxer; a null frame flushes what it still holds
@@ -87,10 +89,12 @@ struct EncoderContext {
 void drain_encoder(AVFormatContext* out, AVCodecContext* enc, AVStream* stream, AVFrame* frame) {
     require_av(avcodec_send_frame(enc, frame), "send frame to source encoder");
     AVPacket* packet = av_packet_alloc();
-    if (!packet) throw std::runtime_error("allocate source packet");
+    if (!packet)
+        throw std::runtime_error("allocate source packet");
     while (true) {
         const int rc = avcodec_receive_packet(enc, packet);
-        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF)
+            break;
         if (rc < 0) {
             av_packet_free(&packet);
             require_av(rc, "receive source packet");
@@ -111,20 +115,23 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
     // mpeg4: in every ordinary build, and fast; the source codec is not under test.
     const auto* video_codec = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
     const auto* audio_codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
-    if (!video_codec || !audio_codec) throw std::runtime_error("source encoders unavailable");
+    if (!video_codec || !audio_codec)
+        throw std::runtime_error("source encoders unavailable");
 
     AVFormatContext* out = nullptr;
     require_av(avformat_alloc_output_context2(&out, nullptr, muxer, path.c_str()),
                "allocate source container");
     const std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)> out_guard(
         out, [](AVFormatContext* c) {
-            if (c && c->pb) avio_closep(&c->pb);
+            if (c && c->pb)
+                avio_closep(&c->pb);
             avformat_free_context(c);
         });
 
     EncoderContext video;
     video.ctx = avcodec_alloc_context3(video_codec);
-    if (!video.ctx) throw std::runtime_error("allocate source video encoder");
+    if (!video.ctx)
+        throw std::runtime_error("allocate source video encoder");
     video.ctx->width = kWidth;
     video.ctx->height = kHeight;
     video.ctx->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -139,7 +146,8 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
 
     EncoderContext audio;
     audio.ctx = avcodec_alloc_context3(audio_codec);
-    if (!audio.ctx) throw std::runtime_error("allocate source audio encoder");
+    if (!audio.ctx)
+        throw std::runtime_error("allocate source audio encoder");
     audio.ctx->sample_rate = kSampleRate;
     audio.ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
     audio.ctx->time_base = AVRational{1, kSampleRate};
@@ -152,7 +160,8 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
 
     AVStream* video_stream = avformat_new_stream(out, nullptr);
     AVStream* audio_stream = avformat_new_stream(out, nullptr);
-    if (!video_stream || !audio_stream) throw std::runtime_error("allocate source streams");
+    if (!video_stream || !audio_stream)
+        throw std::runtime_error("allocate source streams");
     require_av(avcodec_parameters_from_context(video_stream->codecpar, video.ctx),
                "copy source video parameters");
     require_av(avcodec_parameters_from_context(audio_stream->codecpar, audio.ctx),
@@ -165,7 +174,8 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
 
     AVFrame* video_frame = av_frame_alloc();
     AVFrame* audio_frame = av_frame_alloc();
-    if (!video_frame || !audio_frame) throw std::runtime_error("allocate source frames");
+    if (!video_frame || !audio_frame)
+        throw std::runtime_error("allocate source frames");
     const std::unique_ptr<AVFrame, void (*)(AVFrame*)> video_frame_guard(
         video_frame, [](AVFrame* f) { av_frame_free(&f); });
     const std::unique_ptr<AVFrame, void (*)(AVFrame*)> audio_frame_guard(
@@ -206,8 +216,7 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
         drain_encoder(out, video.ctx, video_stream, video_frame);
 
         // Keep audio just ahead of video so the interleaver never buffers a whole stream.
-        const int64_t audio_target =
-            av_rescale(frame_index + 1, kSampleRate, kFrameRate);
+        const int64_t audio_target = av_rescale(frame_index + 1, kSampleRate, kFrameRate);
         while (audio_sample < audio_target && audio_sample < total_audio_samples) {
             require_av(av_frame_make_writable(audio_frame), "make source audio frame writable");
             for (int channel = 0; channel < kChannels; ++channel) {
@@ -235,14 +244,17 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
     result.audio_stream = audio_stream->index;
 
     std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error("reopen synthesized source");
+    if (!in)
+        throw std::runtime_error("reopen synthesized source");
     in.seekg(0, std::ios::end);
     const auto size = in.tellg();
-    if (size <= 0) throw std::runtime_error("synthesized source is empty");
+    if (size <= 0)
+        throw std::runtime_error("synthesized source is empty");
     result.bytes.resize(static_cast<size_t>(size));
     in.seekg(0);
     in.read(reinterpret_cast<char*>(result.bytes.data()), size);
-    if (!in) throw std::runtime_error("read synthesized source");
+    if (!in)
+        throw std::runtime_error("read synthesized source");
     return result;
 }
 
@@ -253,10 +265,13 @@ class MemoryInput final : public MediaInput {
 
   public:
     explicit MemoryInput(const Bytes& bytes) : bytes_(bytes) {}
-    uint64_t size() const override { return bytes_.size(); }
+    uint64_t size() const override {
+        return bytes_.size();
+    }
     size_t read(uint64_t offset, std::span<uint8_t> destination, Clock::time_point,
                 std::atomic_bool*) override {
-        if (offset >= bytes_.size()) return 0;
+        if (offset >= bytes_.size())
+            return 0;
         const auto available = static_cast<size_t>(bytes_.size() - offset);
         const auto n = std::min(destination.size(), available);
         std::copy_n(bytes_.begin() + static_cast<ptrdiff_t>(offset), n, destination.begin());
@@ -274,7 +289,9 @@ struct StreamTimeline {
     double last_seconds{};
     double end_seconds{}; // last presentation time plus that packet's duration
     // Media actually carried, start to end: the number drift moves.
-    double span_seconds() const { return end_seconds - first_seconds; }
+    double span_seconds() const {
+        return end_seconds - first_seconds;
+    }
 };
 
 struct Timeline {
@@ -282,7 +299,8 @@ struct Timeline {
     StreamTimeline audio;
     std::string describe() const {
         auto one = [](const char* label, const StreamTimeline& s) {
-            if (!s.present) return std::string(label) + "=absent ";
+            if (!s.present)
+                return std::string(label) + "=absent ";
             return std::string(label) + "={packets=" + std::to_string(s.packets) +
                    " first=" + std::to_string(s.first_seconds) +
                    " end=" + std::to_string(s.end_seconds) +
@@ -299,7 +317,8 @@ struct ReadCursor {
 
 int read_packet(void* opaque, uint8_t* buffer, int size) {
     auto* cursor = static_cast<ReadCursor*>(opaque);
-    if (cursor->offset >= cursor->bytes->size()) return AVERROR_EOF;
+    if (cursor->offset >= cursor->bytes->size())
+        return AVERROR_EOF;
     const auto available = cursor->bytes->size() - cursor->offset;
     const auto n = std::min(static_cast<size_t>(size), available);
     std::memcpy(buffer, cursor->bytes->data() + cursor->offset, n);
@@ -310,11 +329,15 @@ int read_packet(void* opaque, uint8_t* buffer, int size) {
 int64_t seek_packet(void* opaque, int64_t offset, int whence) {
     auto* cursor = static_cast<ReadCursor*>(opaque);
     const auto size = static_cast<int64_t>(cursor->bytes->size());
-    if (whence == AVSEEK_SIZE) return size;
+    if (whence == AVSEEK_SIZE)
+        return size;
     int64_t target = offset;
-    if (whence == SEEK_CUR) target = static_cast<int64_t>(cursor->offset) + offset;
-    else if (whence == SEEK_END) target = size + offset;
-    if (target < 0 || target > size) return AVERROR(EINVAL);
+    if (whence == SEEK_CUR)
+        target = static_cast<int64_t>(cursor->offset) + offset;
+    else if (whence == SEEK_END)
+        target = size + offset;
+    if (target < 0 || target > size)
+        return AVERROR(EINVAL);
     cursor->offset = static_cast<size_t>(target);
     return target;
 }
@@ -323,9 +346,10 @@ Timeline measure(const Bytes& fragmented_mp4) {
     ReadCursor cursor{&fragmented_mp4, 0};
     constexpr int kBufferSize = 32768;
     auto* buffer = static_cast<uint8_t*>(av_malloc(kBufferSize));
-    if (!buffer) throw std::runtime_error("allocate demuxer buffer");
-    AVIOContext* io = avio_alloc_context(buffer, kBufferSize, 0, &cursor, &read_packet, nullptr,
-                                         &seek_packet);
+    if (!buffer)
+        throw std::runtime_error("allocate demuxer buffer");
+    AVIOContext* io =
+        avio_alloc_context(buffer, kBufferSize, 0, &cursor, &read_packet, nullptr, &seek_packet);
     if (!io) {
         av_free(buffer);
         throw std::runtime_error("allocate demuxer io");
@@ -351,15 +375,18 @@ Timeline measure(const Bytes& fragmented_mp4) {
 
     Timeline timeline;
     AVPacket* packet = av_packet_alloc();
-    if (!packet) throw std::runtime_error("allocate measurement packet");
+    if (!packet)
+        throw std::runtime_error("allocate measurement packet");
     const std::unique_ptr<AVPacket, void (*)(AVPacket*)> packet_guard(
         packet, [](AVPacket* p) { av_packet_free(&p); });
 
     while (av_read_frame(in, packet) >= 0) {
         const AVStream* stream = in->streams[packet->stream_index];
         StreamTimeline* target = nullptr;
-        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) target = &timeline.video;
-        else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) target = &timeline.audio;
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            target = &timeline.video;
+        else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            target = &timeline.audio;
         if (!target) {
             av_packet_unref(packet);
             continue;
@@ -370,10 +397,9 @@ Timeline measure(const Bytes& fragmented_mp4) {
             continue;
         }
         const double seconds = static_cast<double>(pts) * av_q2d(stream->time_base);
-        const double duration = packet->duration > 0
-                                    ? static_cast<double>(packet->duration) *
-                                          av_q2d(stream->time_base)
-                                    : 0.0;
+        const double duration =
+            packet->duration > 0 ? static_cast<double>(packet->duration) * av_q2d(stream->time_base)
+                                 : 0.0;
         if (!target->present) {
             target->present = true;
             target->first_seconds = seconds;
@@ -434,8 +460,8 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
     plan.audio_codec = "aac";
     plan.seek = seek;
 
-    auto vod = engine.prepare_hls_vod(source, plan, probe.duration_seconds, kSegmentDuration,
-                                      false, std::chrono::milliseconds{60000});
+    auto vod = engine.prepare_hls_vod(source, plan, probe.duration_seconds, kSegmentDuration, false,
+                                      std::chrono::milliseconds{60000});
     REQUIRE(!vod.segment_durations.empty());
 
     auto session = engine.start_hls(source, vod, kSegmentDuration, 8, 64ULL * 1024 * 1024, spill);
@@ -462,7 +488,8 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
     run.probed_seconds = probe.duration_seconds;
     run.planned_segments = vod.segment_durations.size();
     run.planned_seconds = 0.0;
-    for (double d : vod.segment_durations) run.planned_seconds += d;
+    for (double d : vod.segment_durations)
+        run.planned_seconds += d;
 
     // Consume until the store stops producing rather than demanding one fragment
     // per planned entry.
@@ -471,14 +498,17 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
         std::ostringstream name;
         name << "segment-" << std::setfill('0') << std::setw(6) << i << ".m4s";
         const auto fragment = store->wait_object(name.str(), std::chrono::milliseconds{60000});
-        if (!fragment) break;
+        if (!fragment)
+            break;
         collected.insert(collected.end(), fragment->begin(), fragment->end());
         fragments.push_back(*fragment);
         ++run.segments;
         // The store withholds the playlist once an error is set; keep the last one served.
-        if (auto text = store->playlist(); !text.empty()) run.playlist = std::move(text);
+        if (auto text = store->playlist(); !text.empty())
+            run.playlist = std::move(text);
     }
-    if (auto text = store->playlist(); !text.empty()) run.playlist = std::move(text);
+    if (auto text = store->playlist(); !text.empty())
+        run.playlist = std::move(text);
     run.production_error = store->snapshot().error;
 
     for (size_t at = run.playlist.find("#EXTINF:"); at != std::string::npos;
@@ -537,11 +567,14 @@ void report(const char* label, const TranscodeRun& run) {
     std::cout << label << ": " << run.timeline.describe() << "probed=" << run.probed_seconds
               << "s fragments=" << run.segments << " for a " << run.planned_segments
               << "-entry plan of " << run.planned_seconds << "s\n";
-    if (!run.production_error.empty()) std::cout << "  production error: " << run.production_error << "\n";
+    if (!run.production_error.empty())
+        std::cout << "  production error: " << run.production_error << "\n";
     for (size_t i = 0; i < run.fragment_media_seconds.size(); ++i)
         std::cout << "  fragment " << i << " media=" << run.fragment_media_seconds[i]
-                  << "s declared=" << (i < run.fragment_declared_seconds.size()
-                                           ? run.fragment_declared_seconds[i] : -1.0) << "s\n";
+                  << "s declared="
+                  << (i < run.fragment_declared_seconds.size() ? run.fragment_declared_seconds[i]
+                                                               : -1.0)
+                  << "s\n";
 }
 
 } // namespace
@@ -562,8 +595,8 @@ MACHA_HEAVY_TEST("transcode_timeline", test_transcoded_audio_and_video_carry_the
     const auto synthesized = synthesize_source(source_path);
     REQUIRE(synthesized.bytes.size() > 0);
 
-    const auto run = transcode(*engine, synthesized, temp.path() / "spill",
-                               std::chrono::milliseconds{0});
+    const auto run =
+        transcode(*engine, synthesized, temp.path() / "spill", std::chrono::milliseconds{0});
     report("transcode timeline", run);
 
     // A generation that produced all of its media finishes clean.
@@ -644,8 +677,8 @@ MACHA_HEAVY_TEST("transcode_timeline", test_a_transcode_start_reports_its_prerol
     const auto source_path = temp.path() / "source.mkv";
     const auto synthesized = synthesize_source(source_path);
 
-    const auto run = transcode(*engine, synthesized, temp.path() / "spill",
-                               std::chrono::milliseconds{60500});
+    const auto run =
+        transcode(*engine, synthesized, temp.path() / "spill", std::chrono::milliseconds{60500});
     std::cout << "start progress: bytes=" << run.start_bytes_read
               << " preroll_total_us=" << run.start_preroll_total_us
               << " preroll_decoded_us=" << run.start_preroll_decoded_us
@@ -680,16 +713,19 @@ MACHA_HEAVY_TEST("transcode_timeline", test_a_keyframe_index_places_every_keyfra
         };
         const auto index = engine->keyframe_index(source, std::chrono::milliseconds{30000});
         REQUIRE(index.has_value());
-        std::cout << muxer << ": container=" << index->container << " streams=" << index->streams.size();
+        std::cout << muxer << ": container=" << index->container
+                  << " streams=" << index->streams.size();
         for (const auto& stream : index->streams)
-            std::cout << " [" << stream.index << " " << stream.codec << " " << stream.entries.size() << "]";
+            std::cout << " [" << stream.index << " " << stream.codec << " " << stream.entries.size()
+                      << "]";
         std::cout << " duration_ms=" << index->duration_ms << "\n";
         CHECK(index->container == (mp4 ? "mp4" : "matroska"));
         CHECK(index->exact_offsets == mp4);
         CHECK(index->size_bytes == synthesized.bytes.size());
         CHECK(std::llabs(index->duration_ms - static_cast<int64_t>(kSourceSeconds * 1000)) < 1000);
-        const auto video = std::find_if(index->streams.begin(), index->streams.end(),
-                                        [](const auto& s) { return s.type == MediaStreamType::video; });
+        const auto video =
+            std::find_if(index->streams.begin(), index->streams.end(),
+                         [](const auto& s) { return s.type == MediaStreamType::video; });
         REQUIRE(video != index->streams.end());
         // One keyframe a second, give or take the ends.
         CHECK(video->entries.size() >= static_cast<size_t>(kSourceSeconds) - 2);
@@ -698,13 +734,15 @@ MACHA_HEAVY_TEST("transcode_timeline", test_a_keyframe_index_places_every_keyfra
             for (size_t i = 0; i < stream.entries.size(); ++i) {
                 CHECK(stream.entries[i].second < synthesized.bytes.size());
                 CHECK(stream.entries[i].first <= index->duration_ms);
-                if (i) CHECK(stream.entries[i].second >= stream.entries[i - 1].second);
+                if (i)
+                    CHECK(stream.entries[i].second >= stream.entries[i - 1].second);
             }
         }
         if (mp4) {
             // Every AAC frame is a sync sample; the index keeps one a second.
-            const auto audio = std::find_if(index->streams.begin(), index->streams.end(),
-                                            [](const auto& s) { return s.type == MediaStreamType::audio; });
+            const auto audio =
+                std::find_if(index->streams.begin(), index->streams.end(),
+                             [](const auto& s) { return s.type == MediaStreamType::audio; });
             REQUIRE(audio != index->streams.end());
             CHECK(audio->entries.size() >= static_cast<size_t>(kSourceSeconds) - 2);
             CHECK(audio->entries.size() <= static_cast<size_t>(kSourceSeconds) + 2);

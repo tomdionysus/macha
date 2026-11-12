@@ -52,7 +52,9 @@ class ServicesBench {
         node->stop();
     }
 
-    const std::filesystem::path& path() const { return cluster_.path(); }
+    const std::filesystem::path& path() const {
+        return cluster_.path();
+    }
     std::vector<std::string> events() const {
         std::lock_guard lock(mutex_);
         return events_;

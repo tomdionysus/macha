@@ -33,7 +33,9 @@ namespace macha {
 struct TorrentPublicationProgress {
     size_t published{};
     size_t extents{};
-    bool complete() const { return published >= extents; }
+    bool complete() const {
+        return published >= extents;
+    }
 };
 
 // Verified pieces routed from the session's alerts (manager thread) to the
@@ -46,12 +48,14 @@ class TorrentPieceVerifications {
 
     void piece_verified(const std::string& save_path, int piece) {
         Lock lock(mutex_);
-        if (sink_) sink_(save_path, piece);
+        if (sink_)
+            sink_(save_path, piece);
     }
     // Empty when no backend is publishing or none holds this torrent.
     std::optional<TorrentPublicationProgress> publication(const std::string& save_path) {
         Lock lock(mutex_);
-        if (!progress_) return std::nullopt;
+        if (!progress_)
+            return std::nullopt;
         return progress_(save_path);
     }
     void attach(Sink sink, Progress progress) {
@@ -88,7 +92,8 @@ struct TorrentDiskHooks {
     // Stores one extent durably and returns its id, or nothing on failure (the
     // backend retries). `abort` is set at shutdown to end a write promptly; the
     // unjournalled extent is published again on resume.
-    std::function<std::optional<ObjectId>(std::span<const uint8_t>, std::atomic_bool& abort)> publish;
+    std::function<std::optional<ObjectId>(std::span<const uint8_t>, std::atomic_bool& abort)>
+        publish;
     std::shared_ptr<TorrentPieceVerifications> verifications;
     // How long a failed publication waits before it is tried again.
     std::chrono::milliseconds publish_retry{std::chrono::seconds(30)};

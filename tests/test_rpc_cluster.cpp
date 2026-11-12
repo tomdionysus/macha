@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "stand_in_peer.hpp"
-#include "test_backend_support.hpp"
-#include "fake_cluster_node.hpp"
 #include "acquisition/cluster_jobs.hpp"
-#include "subsystem/subsystem_registry.hpp"
-#include "torrent/torrent_coordinator.hpp"
-#include "metadata/namespace_control_store.hpp"
 #include "cluster/placement.hpp"
 #include "cluster/rpc_refusal.hpp"
+#include "fake_cluster_node.hpp"
+#include "metadata/namespace_control_store.hpp"
+#include "stand_in_peer.hpp"
 #include "startup_progress.hpp"
+#include "subsystem/subsystem_registry.hpp"
+#include "test_backend_support.hpp"
+#include "torrent/torrent_coordinator.hpp"
 
 #include <cstring>
 #include <netinet/in.h>
@@ -143,7 +143,8 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_publishes_at_the_floor_and_copies_
     auto full_store = full_bench.store();
     const auto other = pattern(128 * 1024, 7);
     CHECK(full_store->put(object_id(other), other));
-    REQUIRE(wait_until([&] { return full_store->repair_diagnostics().prompt_skipped_no_room == 1; }));
+    REQUIRE(
+        wait_until([&] { return full_store->repair_diagnostics().prompt_skipped_no_room == 1; }));
     const auto diagnostics = full_store->repair_diagnostics();
     CHECK(diagnostics.prompt_dropped == 1);
     CHECK(diagnostics.prompt_copies == 0);
@@ -165,8 +166,8 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_replaces_a_replica_that_cannot_be_
     // the other stands by.
     const auto data = pattern(64 * 1024, 5);
     std::vector<NodeId> remote;
-    for (const auto& node : capacity_placement_nodes(object_id(data).bytes,
-                                                     bench.node.membership().active(), 3))
+    for (const auto& node :
+         capacity_placement_nodes(object_id(data).bytes, bench.node.membership().active(), 3))
         if (node.id != bench.node.node_id())
             remote.push_back(node.id);
     REQUIRE(remote.size() == 2);
@@ -198,8 +199,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_claims_ask_nothing_more_about_objects_
     const auto held = object_id(held_bytes);
     std::mutex mutex;
     std::map<MessageType, size_t> calls;
-    bench.node.add_peer(StoreBench::peer(), [&](MessageType type, const Bytes& request,
-                                                FrameType) {
+    bench.node.add_peer(StoreBench::peer(), [&](MessageType type, const Bytes& request, FrameType) {
         {
             std::lock_guard lock(mutex);
             ++calls[type];
@@ -239,9 +239,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_to_a_silent_replica_returns_on_the
         c.write_copies = 2;
         c.write_stall = 50ms;
     });
-    const auto peer_puts = [&] {
-        return bench.node.calls_of(MessageType::put_object_deferred);
-    };
+    const auto peer_puts = [&] { return bench.node.calls_of(MessageType::put_object_deferred); };
     std::atomic_bool silent{true};
     TestGate held;
     const auto peer = StoreBench::peer();
@@ -287,8 +285,8 @@ MACHA_FAST_TEST("rpc_cluster", test_store_concurrent_readers_share_one_fetch_and
         reply_gate.enter_and_wait();
         auto reply = object_reply(bytes);
         reply.retained_memory = std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
-        reply.retained_memory->push_back(*memory.try_acquire(
-            WorkClass::viewer, MemoryOwner::rpc_frame, reply.payload.size()));
+        reply.retained_memory->push_back(
+            *memory.try_acquire(WorkClass::viewer, MemoryOwner::rpc_frame, reply.payload.size()));
         return reply;
     });
     const auto held = [&] {
@@ -471,10 +469,12 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_push_sends_nothing_to_a_peer_that_can
 
         peer.busy = false;
         peer.cannot_say = false;
-        CHECK(wait_until([&] {
-            (void)store->repair_step(8ULL * 1024 * 1024, 16, live);
-            return peer.puts.load() == live.size();
-        }, 10s));
+        CHECK(wait_until(
+            [&] {
+                (void)store->repair_step(8ULL * 1024 * 1024, 16, live);
+                return peer.puts.load() == live.size();
+            },
+            10s));
     }
 }
 
@@ -505,8 +505,8 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_pushes_past_a_peer_with_no_room) {
     for (uint32_t salt = 0;; ++salt) {
         REQUIRE(salt < 4096);
         bytes = pattern(64 * 1024 + salt, 31);
-        const auto ranked = capacity_placement_nodes(object_id(bytes).bytes,
-                                                     bench.node.membership().active(), 3);
+        const auto ranked =
+            capacity_placement_nodes(object_id(bytes).bytes, bench.node.membership().active(), 3);
         if (ranked.size() == 4 && ranked[3].id == fallback.id &&
             std::any_of(ranked.begin(), ranked.begin() + 3,
                         [&](const NodeInfo& node) { return node.id == full.id; }))
@@ -553,7 +553,8 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_pushes_from_what_peers_hold_without_a
     using Known = std::function<std::optional<bool>(const NodeId&, const ObjectId&)>;
 
     const Known all_held = [](const NodeId&, const ObjectId&) { return std::optional<bool>(true); };
-    const auto settled = bench.store()->repair_step(budget, 16, live, {}, 0, {}, std::nullopt, all_held);
+    const auto settled =
+        bench.store()->repair_step(budget, 16, live, {}, 0, {}, std::nullopt, all_held);
     CHECK(settled.push_examined == live.size());
     CHECK(peer.batch_requests.load() == 0);
     CHECK(peer.puts.load() == 0);
@@ -670,7 +671,8 @@ MACHA_FAST_TEST("rpc_cluster", test_the_repair_step_that_first_sees_a_new_pull_l
     const std::vector<ObjectId> none;
     const std::vector<ObjectId> named{wanted};
     const auto step = [&](const std::vector<ObjectId>& pull, uint64_t version) {
-        return store->repair_step(budget, 16, std::nullopt, {}, 0, {}, std::span<const ObjectId>(pull), {},
+        return store->repair_step(budget, 16, std::nullopt, {}, 0, {},
+                                  std::span<const ObjectId>(pull), {},
                                   std::span<const ObjectId>(none), version, 1);
     };
 
@@ -703,7 +705,8 @@ MACHA_FAST_TEST("rpc_cluster", test_a_pull_list_new_while_the_push_runs_is_not_p
     const std::vector<ObjectId> first_list{object_id(first_bytes)};
     const std::vector<ObjectId> second_list{second};
     const auto step = [&](const std::vector<ObjectId>& pull, uint64_t version) {
-        return store->repair_step(budget, 16, std::nullopt, {}, 0, {}, std::span<const ObjectId>(pull), {},
+        return store->repair_step(budget, 16, std::nullopt, {}, 0, {},
+                                  std::span<const ObjectId>(pull), {},
                                   std::span<const ObjectId>(pushing), version, 1);
     };
 
@@ -832,13 +835,14 @@ MACHA_FAST_TEST("rpc_cluster", test_repair_keeps_a_pull_that_was_in_flight_when_
 
 // A peer that holds `bytes` and serves them.
 void add_serving_peer(StoreBench& bench, const Bytes& bytes) {
-    bench.node.add_peer(StoreBench::peer(), [bytes](MessageType type, const Bytes& request, FrameType) {
-        if (type == MessageType::get_object)
-            return object_reply(bytes);
-        if (type == MessageType::have_valid_objects)
-            return presence_reply(request, true);
-        return RpcMessage{MessageType::ok, {}};
-    });
+    bench.node.add_peer(StoreBench::peer(),
+                        [bytes](MessageType type, const Bytes& request, FrameType) {
+                            if (type == MessageType::get_object)
+                                return object_reply(bytes);
+                            if (type == MessageType::have_valid_objects)
+                                return presence_reply(request, true);
+                            return RpcMessage{MessageType::ok, {}};
+                        });
 }
 
 // A corrupt local copy (it fails authentication) is never served: the read
@@ -963,34 +967,58 @@ MACHA_FAST_TEST("rpc_cluster", test_startup_gate_fires_on_silence_not_on_slow_pr
 struct SurveyCountingView final : MetadataView {
     MetadataSnapshotView view;
     std::atomic_uint surveys{};
-    std::optional<MetadataSnapshotView> current() const override { return view; }
-    MetadataSnapshotView local() override { return view; }
+    std::optional<MetadataSnapshotView> current() const override {
+        return view;
+    }
+    MetadataSnapshotView local() override {
+        return view;
+    }
     MetadataSnapshotView converged() override {
         ++surveys;
         return view;
     }
-    MetadataSnapshotView converged(const WorkContext&) override { return converged(); }
-    uint64_t current_generation() const noexcept override { return view.generation; }
-    uint64_t current_namespace_revision() const noexcept override { return 0; }
+    MetadataSnapshotView converged(const WorkContext&) override {
+        return converged();
+    }
+    uint64_t current_generation() const noexcept override {
+        return view.generation;
+    }
+    uint64_t current_namespace_revision() const noexcept override {
+        return 0;
+    }
     MetadataRecord record() override {
         ++surveys;
         return {};
     }
-    std::optional<MetadataSnapshotView> release_head() const override { return view; }
-    MetadataClusterStatus status() const noexcept override { return {}; }
+    std::optional<MetadataSnapshotView> release_head() const override {
+        return view;
+    }
+    MetadataClusterStatus status() const noexcept override {
+        return {};
+    }
     MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>&,
                                 size_t, std::optional<MetadataMutationIdentity>) override {
         throw std::runtime_error("read-only view");
     }
-    bool resolve_conflict(const std::string&, std::string_view) override { return false; }
-    uint64_t conflicts_superseded() const noexcept override { return 0; }
-    uint64_t conflicts_resolved() const noexcept override { return 0; }
-    MetadataHeadStanding head_standing() const noexcept override { return {}; }
+    bool resolve_conflict(const std::string&, std::string_view) override {
+        return false;
+    }
+    uint64_t conflicts_superseded() const noexcept override {
+        return 0;
+    }
+    uint64_t conflicts_resolved() const noexcept override {
+        return 0;
+    }
+    MetadataHeadStanding head_standing() const noexcept override {
+        return {};
+    }
     std::optional<std::optional<ObjectId>>
     common_ancestor_catalogue_root(const Hash256&, const Hash256&) const override {
         return {};
     }
-    MetadataMutationTiming mutation_timing() const noexcept override { return {}; }
+    MetadataMutationTiming mutation_timing() const noexcept override {
+        return {};
+    }
     Page<std::pair<std::string, FsEntry>, std::string>
     entries(const MetadataSnapshotView& v, Cursor<std::string> from, Budget& budget) override {
         return namespace_entries(*v.snapshot, nullptr, std::move(from), budget);
@@ -1080,11 +1108,13 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
         std::atomic_bool watching{true};
         StandInPeer viewer(cluster, "viewer",
                            {.bootstrap = {{"127.0.0.1", p2}},
-                            .telemetry = [&](dannan::status::Telemetry& record) {
-                                if (watching.load())
-                                    record.set_traffic(250, {{static_cast<uint8_t>(FrameType::foreground),
-                                                              0, 0, 1'300'000, 0}});
-                            },
+                            .telemetry =
+                                [&](dannan::status::Telemetry& record) {
+                                    if (watching.load())
+                                        record.set_traffic(
+                                            250, {{static_cast<uint8_t>(FrameType::foreground), 0,
+                                                   0, 1'300'000, 0}});
+                                },
                             .hosts_extents = false});
         viewer.start();
         REQUIRE(wait_until([&] { return s2.node().peer_viewers_active(3000ms); }));
@@ -1109,9 +1139,12 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
             std::this_thread::sleep_for(5ms);
         }
     });
-    REQUIRE(wait_until([&] {
-        return s2.resources().activity.idle_for(WorkClass::loader) < c2.maintenance.foreground_quiet;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            return s2.resources().activity.idle_for(WorkClass::loader) <
+                   c2.maintenance.foreground_quiet;
+        },
+        5s));
     const auto [id, bytes] = lose_a_copy(2);
     const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
     CHECK(s2.resources().activity.idle_for(WorkClass::loader) < c2.maintenance.foreground_quiet);
@@ -1149,13 +1182,15 @@ MACHA_TEST("rpc_cluster", test_mutual_bootstrap_prunes_cross_dial) {
     // A late dial still in flight can land after the route is canonical, so
     // wait for one quiet window (six heartbeats with nothing created on either
     // side), then assert that the next is quiet too: the churn stops.
-    REQUIRE(wait_until([&] {
-        const auto a0 = n1.rpc_stats().connections_created;
-        const auto b0 = n2.rpc_stats().connections_created;
-        std::this_thread::sleep_for(120ms);
-        return n1.rpc_stats().connections_created == a0 &&
-               n2.rpc_stats().connections_created == b0;
-    }, 5s, 0ms));
+    REQUIRE(wait_until(
+        [&] {
+            const auto a0 = n1.rpc_stats().connections_created;
+            const auto b0 = n2.rpc_stats().connections_created;
+            std::this_thread::sleep_for(120ms);
+            return n1.rpc_stats().connections_created == a0 &&
+                   n2.rpc_stats().connections_created == b0;
+        },
+        5s, 0ms));
 
     const auto a_before = n1.rpc_stats();
     const auto b_before = n2.rpc_stats();
@@ -1196,7 +1231,9 @@ MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_bef
     peer.start();
     struct GateOpener {
         TestGate& gate;
-        ~GateOpener() { gate.open(); }
+        ~GateOpener() {
+            gate.open();
+        }
     } open_on_exit{blocked};
 
     const auto endpoint = peer.endpoint();
@@ -1255,8 +1292,8 @@ MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_gives_up_when_nothing_is_mo
 
     const auto started = Clock::now();
     auto third = arbiter.acquire(context, chunk);
-    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - started);
+    const auto waited =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     // It gives up after the no-progress window instead of hanging.
     CHECK(!third.has_value());
     CHECK(waited >= 200ms);
@@ -1339,8 +1376,9 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
 
     // Presence validation reads the whole object, so it goes through
     // speculative DATA admission, not a CONTROL worker.
-    auto blocked_validation = client.call_async(endpoint, MessageType::have_object, request.data(),
-                                                FrameType::speculative, call_deadline::presence_probe);
+    auto blocked_validation =
+        client.call_async(endpoint, MessageType::have_object, request.data(),
+                          FrameType::speculative, call_deadline::presence_probe);
     REQUIRE(blocked_validation.wait_for(scaled(1s)) == std::future_status::ready);
     CHECK(blocked_validation.get().message.type == MessageType::error);
     auto second_control = client.call(endpoint, MessageType::ping, {}, FrameType::control, 500ms);
@@ -1350,8 +1388,10 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     first.reset();
     REQUIRE(blocked_loader.wait_for(scaled(1s)) == std::future_status::ready);
     CHECK(blocked_loader.get().message.type == MessageType::object_reply);
-    CHECK(client.call(endpoint, MessageType::have_object, request.data(), FrameType::speculative, 500ms)
-              .message.type == MessageType::bool_reply);
+    CHECK(
+        client
+            .call(endpoint, MessageType::have_object, request.data(), FrameType::speculative, 500ms)
+            .message.type == MessageType::bool_reply);
 
     const auto stats = node.resources.data.stats();
     CHECK(stats.viewer_admissions >= 1);
@@ -1504,7 +1544,6 @@ MACHA_TEST("rpc_cluster", test_nodes_seeking_different_copy_counts_share_one_nam
     s1.stop();
 }
 
-
 MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -1563,13 +1602,15 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
 
     // Each node answered from its own commit; the two then merge.
     const auto sees = [](Service& service, const std::string& path) {
-        return wait_until([&] {
-            try {
-                return service.filesystem().getattr(path).type == EntryType::directory;
-            } catch (...) {
-                return false;
-            }
-        }, 20s);
+        return wait_until(
+            [&] {
+                try {
+                    return service.filesystem().getattr(path).type == EntryType::directory;
+                } catch (...) {
+                    return false;
+                }
+            },
+            20s);
     };
     CHECK(sees(s1, "/from-node-2"));
     CHECK(sees(s2, "/from-node-1"));
@@ -1658,8 +1699,8 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
                    s1.local_state().replica().committed().hash ==
                        s2.local_state().replica().committed().hash &&
                    s1.local_state().replica().accepted_heads().size() == 1 &&
-                   s2.local_state().replica().accepted_heads().size() == 1 &&
-                   !d1.scheduled && d1.runs_scheduled == d1.runs_completed && !d2.scheduled &&
+                   s2.local_state().replica().accepted_heads().size() == 1 && !d1.scheduled &&
+                   d1.runs_scheduled == d1.runs_completed && !d2.scheduled &&
                    d2.runs_scheduled == d2.runs_completed;
         },
         10s));
@@ -1686,8 +1727,8 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
     }
     const auto final_generation = s2.local_state().replica().committed_generation();
     CHECK(final_generation == baseline_generation + burst + 1);
-    REQUIRE(
-        wait_until([&] { return s1.metadata_server().known_generation() >= final_generation; }, 5s));
+    REQUIRE(wait_until([&] { return s1.metadata_server().known_generation() >= final_generation; },
+                       5s));
     CHECK(s2.node().metadata_announcements() == announcements_before + burst + 1);
 
     // While the run is held the node counts the burst; the pass turns it into
@@ -1725,10 +1766,10 @@ MACHA_TEST("rpc_cluster", test_failed_convergence_retries_once_per_burst_of_even
     const auto p1 = free_port();
     const auto p2 = free_port();
 
-    auto c1 = config_for(cluster.path() / "retry-burst-n1", cluster.keyfile(), p1,
-                         {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "retry-burst-n2", cluster.keyfile(), p2,
-                         {{"127.0.0.1", p1}});
+    auto c1 =
+        config_for(cluster.path() / "retry-burst-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 =
+        config_for(cluster.path() / "retry-burst-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
     c1.write_copies = c2.write_copies = 1;
     c1.metadata_write_copies = c2.metadata_write_copies = 1;
@@ -2131,7 +2172,8 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
 MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
-    auto config = config_for(cluster.path() / "unknown-history", cluster.keyfile(), free_port(), {});
+    auto config =
+        config_for(cluster.path() / "unknown-history", cluster.keyfile(), free_port(), {});
     config.metadata_cache = std::chrono::milliseconds(0);
     BareNode node(config, keys);
     node.start();
@@ -2147,7 +2189,9 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
         entry.gid = getgid();
         return entry;
     };
-    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/mine"] = directory(); });
+    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) {
+        delta.upsert_entries["/mine"] = directory();
+    });
     const auto mine = node.metadata_replica().committed();
     REQUIRE(mine.generation > 1);
 
@@ -2160,7 +2204,8 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     foreign_delta.erase_entries.push_back("/mine");
     foreign_delta.upsert_entries["/theirs"] = made;
     auto foreign_snapshot = macha::test_support::with_namespace_delta(
-        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store, foreign_delta);
+        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store,
+        foreign_delta);
     foreign_snapshot.mutation_sequences.clear();
     foreign_snapshot.legacy_clock.emplace();
     foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
@@ -2179,7 +2224,8 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     REQUIRE(node.metadata_replica().accepted_heads().size() == 2);
 
     const auto holds = [&](const MetadataSnapshot& snapshot, std::string_view path) {
-        return macha::test_support::namespace_holds(snapshot, node.local_state().control(), *metadata_store, path);
+        return macha::test_support::namespace_holds(snapshot, node.local_state().control(),
+                                                    *metadata_store, path);
     };
     const auto merged = metadata.snapshot();
     CHECK(holds(merged, "/mine"));
@@ -2188,7 +2234,9 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     CHECK(node.metadata_replica().accepted_heads().size() == 1);
     CHECK(metadata.head_standing().set_aside == 0);
 
-    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/more"] = directory(); });
+    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) {
+        delta.upsert_entries["/more"] = directory();
+    });
     CHECK(holds(metadata.snapshot(), "/theirs"));
     CHECK(holds(metadata.snapshot(), "/more"));
     node.stop();
@@ -2278,8 +2326,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     REQUIRE(n2.wait_local_state_ready(10s));
     REQUIRE(wait_until(
         [&] {
-            return n1.membership().active().size() >= 2 &&
-                   n2.membership().active().size() >= 2;
+            return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
         },
         10s));
 
@@ -2387,7 +2434,9 @@ MACHA_TEST("rpc_cluster", test_service_startup_gate_spares_progress_and_ends_a_s
         });
     struct ReleaseGate {
         TestGate& gate;
-        ~ReleaseGate() { gate.open(); }
+        ~ReleaseGate() {
+            gate.open();
+        }
     } release{stall_gate};
 
     service.start();
@@ -2504,8 +2553,8 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     }
     const auto final = s1.local_state().replica().committed();
     CHECK(final.generation == base.generation + burst);
-    REQUIRE(wait_until([&] { return s2.local_state().replica().committed().hash == final.hash; },
-                       10s));
+    REQUIRE(
+        wait_until([&] { return s2.local_state().replica().committed().hash == final.hash; }, 10s));
 
     s3 = std::make_unique<Service>(c3, keys, test_durability_window);
     s3->start();
@@ -2544,7 +2593,8 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     s1.stop();
 }
 
-MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_on_a_node_with_no_namespace_yet_resumes_when_it_has_one) {
+MACHA_HEAVY_TEST("rpc_cluster",
+                 test_an_ingest_on_a_node_with_no_namespace_yet_resumes_when_it_has_one) {
     // A node still waiting for its bootstrap peer has no namespace to write:
     // an ingest there blocks with metadata_unavailable, is retried, and
     // completes once the peer has arrived and the namespace has formed.
@@ -2572,7 +2622,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_on_a_node_with_no_namespace_yet_r
     const auto bytes = pattern(256 * 1024, 5);
     {
         std::ofstream out(root / "Blocked Movie 2024.mkv", std::ios::binary);
-        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
     }
     IngestConfig ingest_config;
     ingest_config.enabled = true;
@@ -2584,20 +2635,25 @@ MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_on_a_node_with_no_namespace_yet_r
     const auto id = ingest.submit_path(root);
     ingest.start();
 
-    REQUIRE(wait_until([&] {
-        const auto job = ingest.job(id);
-        return job && job->state == IngestJobState::blocked && job->error_code == "metadata_unavailable";
-    }, 30s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest.job(id);
+            return job && job->state == IngestJobState::blocked &&
+                   job->error_code == "metadata_unavailable";
+        },
+        30s));
     // Retried, and still waiting rather than failed.
     std::this_thread::sleep_for(1s);
     CHECK(ingest.job(id)->state != IngestJobState::failed);
 
     s2 = std::make_unique<Service>(c2, keys, test_durability_window);
     s2->start();
-    REQUIRE(wait_until([&] {
-        const auto job = ingest.job(id);
-        return job && job->files_total == 1 && job->files_completed == 1;
-    }, 60s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto job = ingest.job(id);
+            return job && job->files_total == 1 && job->files_completed == 1;
+        },
+        60s));
     CHECK(ingest.job(id)->state != IngestJobState::failed);
     ingest.stop();
     s2->stop();
@@ -2695,13 +2751,15 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_file_touch_commits_while_a_holder_is_away
     // The returning holder learns the change from the head.
     s3 = std::make_unique<Service>(c3, keys, test_durability_window);
     s3->start();
-    REQUIRE(wait_until([&] {
-        try {
-            return (s3->filesystem().getattr("/retained.bin").mode & 0777U) == 0600U;
-        } catch (...) {
-            return false;
-        }
-    }, 30s));
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                return (s3->filesystem().getattr("/retained.bin").mode & 0777U) == 0600U;
+            } catch (...) {
+                return false;
+            }
+        },
+        30s));
 
     s3->stop();
     s2.stop();
@@ -2886,7 +2944,8 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
                s3->node().membership().active().size() == 3;
     }));
     // An accepted branch first, so maintenance runs against valid metadata.
-    REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/base", 0755, getuid(), getgid()); }));
+    REQUIRE(
+        retry_while_not_ready([&] { s1.filesystem().mkdir("/base", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until([&] {
         try {
             return s2.filesystem().getattr("/base").type == EntryType::directory;
@@ -3031,7 +3090,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
         // One accepted base everywhere before partitioning into two writable pairs.
         REQUIRE(retry_while_not_ready(
             [&] { s1.filesystem().mkdir("/base", 0755, getuid(), getgid()); }));
-        MetadataManager initial_repair(s1.node(), s1.local_state(), s1.metadata_server(), s1.store());
+        MetadataManager initial_repair(s1.node(), s1.local_state(), s1.metadata_server(),
+                                       s1.store());
         // A round in which a reachable peer did not take the head says so and
         // is run again.
         REQUIRE(retry_while_not_ready([&] { initial_repair.repair_once(); }));
@@ -3209,16 +3269,20 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         auto snapshot = m1.snapshot();
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 2);
-        CHECK(wait_until([&] {
-            try {
-                return s2.filesystem().getattr("/after-grow").type == EntryType::directory;
-            } catch (...) {
-                return false;
-            }
-        }, 20s));
+        CHECK(wait_until(
+            [&] {
+                try {
+                    return s2.filesystem().getattr("/after-grow").type == EntryType::directory;
+                } catch (...) {
+                    return false;
+                }
+            },
+            20s));
 
-        DistributedStore r1(s1.node(), s1.local_state(), s1.resources().activity, s1.resources().data, s1.resources().memory, s1.resources().events);
-        DistributedStore r2(s2.node(), s2.local_state(), s2.resources().activity, s2.resources().data, s2.resources().memory, s2.resources().events);
+        DistributedStore r1(s1.node(), s1.local_state(), s1.resources().activity,
+                            s1.resources().data, s1.resources().memory, s1.resources().events);
+        DistributedStore r2(s2.node(), s2.local_state(), s2.resources().activity,
+                            s2.resources().data, s2.resources().memory, s2.resources().events);
         REQUIRE(wait_until([&] {
             r1.repair_once(1024 * 1024);
             r2.repair_once(1024 * 1024);
@@ -3248,13 +3312,15 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 1);
         CHECK(snapshot.metadata_write_replicas_required == 1);
-        CHECK(wait_until([&] {
-            try {
-                return s1.filesystem().getattr("/after-shrink").type == EntryType::directory;
-            } catch (...) {
-                return false;
-            }
-        }, 20s));
+        CHECK(wait_until(
+            [&] {
+                try {
+                    return s1.filesystem().getattr("/after-shrink").type == EntryType::directory;
+                } catch (...) {
+                    return false;
+                }
+            },
+            20s));
 
         auto reader = s2.filesystem().open_read("/policy.bin");
         Bytes output(input.size());
@@ -3313,7 +3379,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     // R=2 is convergence, W=1 the floor; drive repair directly rather than
     // waiting on the maintenance scheduler.
     DistributedStore initial_convergence(s2->node(), s2->local_state(), s2->resources().activity,
-                           s2->resources().data, s2->resources().memory, s2->resources().events);
+                                         s2->resources().data, s2->resources().memory,
+                                         s2->resources().events);
     REQUIRE(wait_until([&] {
         initial_convergence.repair_once(16ULL * 1024 * 1024, objects);
         return std::all_of(objects.begin(), objects.end(),
@@ -3321,7 +3388,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     }));
 
     // One metadata pass makes node 2 a durable checkpoint witness first.
-    MetadataManager witness_repair(s2->node(), s2->local_state(), s2->metadata_server(), s2->store());
+    MetadataManager witness_repair(s2->node(), s2->local_state(), s2->metadata_server(),
+                                   s2->store());
     witness_repair.repair_once();
     CHECK(s2->local_state().replica().committed().generation > 1);
 
@@ -3370,8 +3438,10 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
         10s));
 
     // With the namespace recovered, repair repopulates the replacement from the survivor.
-    DistributedStore replacement_convergence(replacement->node(), replacement->local_state(), replacement->resources().activity,
-                           replacement->resources().data, replacement->resources().memory, replacement->resources().events);
+    DistributedStore replacement_convergence(
+        replacement->node(), replacement->local_state(), replacement->resources().activity,
+        replacement->resources().data, replacement->resources().memory,
+        replacement->resources().events);
     REQUIRE(wait_until(
         [&] {
             replacement_convergence.repair_once(16ULL * 1024 * 1024, objects);
@@ -3419,9 +3489,9 @@ struct DurableTrio {
         const uint16_t first = free_port();
         for (size_t i = 0; i < 3; ++i) {
             const auto dir = cluster.path() / ("n" + std::to_string(i + 1));
-            auto config = i == 0 ? config_for(dir, cluster.keyfile(), first)
-                                 : config_for(dir, cluster.keyfile(), free_port(),
-                                              {{"127.0.0.1", first}});
+            auto config =
+                i == 0 ? config_for(dir, cluster.keyfile(), first)
+                       : config_for(dir, cluster.keyfile(), free_port(), {{"127.0.0.1", first}});
             config.storage_packing = StoragePackingConfig{0, 0};
             config.replication = 3;
             config.write_copies = data_floor;
@@ -3450,7 +3520,9 @@ struct DurableTrio {
             if (*it)
                 (*it)->stop();
     }
-    Service& operator[](size_t i) { return *nodes[i]; }
+    Service& operator[](size_t i) {
+        return *nodes[i];
+    }
     void stop(size_t i) {
         nodes[i]->stop();
         nodes[i].reset();
@@ -3484,13 +3556,15 @@ bool becomes_directory(Service& node, const std::string& path) {
 }
 
 bool file_arrives(Service& node, const std::string& path, uint64_t size) {
-    return wait_until([&] {
-        try {
-            return node.filesystem().getattr(path).size == size;
-        } catch (const std::exception&) {
-            return false;
-        }
-    }, 20s);
+    return wait_until(
+        [&] {
+            try {
+                return node.filesystem().getattr(path).size == size;
+            } catch (const std::exception&) {
+                return false;
+            }
+        },
+        20s);
 }
 
 Bytes read_whole(Service& node, const std::string& path, size_t size) {
@@ -3629,9 +3703,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_ma
     const uint16_t first = free_port();
     auto node_config = [&](size_t i) {
         const auto dir = cluster.path() / ("n" + std::to_string(i + 1));
-        auto config = i == 0 ? config_for(dir, cluster.keyfile(), first)
-                             : config_for(dir, cluster.keyfile(), free_port(),
-                                          {{"127.0.0.1", first}});
+        auto config = i == 0
+                          ? config_for(dir, cluster.keyfile(), first)
+                          : config_for(dir, cluster.keyfile(), free_port(), {{"127.0.0.1", first}});
         config.storage_packing = StoragePackingConfig{0, 0};
         config.replication = 3;
         config.write_copies = 2;
@@ -3732,8 +3806,8 @@ class StalledCalls {
         }
         for (auto& promise : held) {
             try {
-                promise->set_exception(
-                    std::make_exception_ptr(std::runtime_error("RPC failed: the stall was released")));
+                promise->set_exception(std::make_exception_ptr(
+                    std::runtime_error("RPC failed: the stall was released")));
             } catch (const std::future_error&) {
             }
         }
@@ -3747,7 +3821,8 @@ class StalledCalls {
 
 // Needs the libmacha-torrent plugin, built only when libtorrent is found.
 #ifdef MACHA_TEST_PLUGIN_DIR
-MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not_block_local_writes) {
+MACHA_TEST("rpc_cluster",
+           test_metadata_repair_stalled_on_a_silent_peer_does_not_block_local_writes) {
     // repair_once() runs its per-peer fan-out without mutation_mutex_: with
     // the has_metadata_history_entry probe to a silent peer held, a foreground
     // write does not wait.
@@ -3755,10 +3830,10 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
     const auto p2 = free_port();
-    auto c1 = config_for(cluster.path() / "silent-repair-n1", cluster.keyfile(), p1,
-                         {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "silent-repair-n2", cluster.keyfile(), p2,
-                         {{"127.0.0.1", p1}});
+    auto c1 =
+        config_for(cluster.path() / "silent-repair-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 =
+        config_for(cluster.path() / "silent-repair-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
     c1.metadata_write_copies = c2.metadata_write_copies = 1;
 
@@ -3944,13 +4019,15 @@ MACHA_TEST("rpc_cluster", test_a_peer_that_stalls_on_a_commit_is_not_waited_for_
     REQUIRE(retry_while_not_ready(
         [&] { s1.filesystem().mkdir("/established", 0755, getuid(), getgid()); }));
     const auto sees = [](Service& service, const std::string& path) {
-        return wait_until([&] {
-            try {
-                return service.filesystem().getattr(path).type == EntryType::directory;
-            } catch (...) {
-                return false;
-            }
-        }, 20s);
+        return wait_until(
+            [&] {
+                try {
+                    return service.filesystem().getattr(path).type == EntryType::directory;
+                } catch (...) {
+                    return false;
+                }
+            },
+            20s);
     };
     REQUIRE(sees(s2, "/established"));
 
@@ -3983,8 +4060,10 @@ MACHA_TEST("rpc_cluster", test_every_nodes_unmatched_files_are_listed_and_handle
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
     const auto p2 = free_port();
-    auto c1 = config_for(cluster.path() / "unmatched-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "unmatched-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    auto c1 =
+        config_for(cluster.path() / "unmatched-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 =
+        config_for(cluster.path() / "unmatched-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
     c1.write_copies = c2.write_copies = 1;
     c1.metadata_write_copies = c2.metadata_write_copies = 1;
@@ -4004,15 +4083,19 @@ MACHA_TEST("rpc_cluster", test_every_nodes_unmatched_files_are_listed_and_handle
     write_file(fs1, "/Movies/deleted.mkv", pattern(4096, 2));
     const auto matched_media = file_media_id(fs1.getattr("/Movies/matched.mkv"));
     const auto deleted_media = file_media_id(fs1.getattr("/Movies/deleted.mkv"));
-    const auto matched_id = s1.catalogue_hints().put_unmatched("/Movies/matched.mkv", matched_media);
-    const auto deleted_id = s1.catalogue_hints().put_unmatched("/Movies/deleted.mkv", deleted_media);
-    REQUIRE(wait_until([&] {
-        try {
-            return s2.filesystem().getattr("/Movies/deleted.mkv").size == 4096;
-        } catch (const FsError&) {
-            return false;
-        }
-    }, 10s));
+    const auto matched_id =
+        s1.catalogue_hints().put_unmatched("/Movies/matched.mkv", matched_media);
+    const auto deleted_id =
+        s1.catalogue_hints().put_unmatched("/Movies/deleted.mkv", deleted_media);
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                return s2.filesystem().getattr("/Movies/deleted.mkv").size == 4096;
+            } catch (const FsError&) {
+                return false;
+            }
+        },
+        10s));
 
     const auto handle = [](Service& service, std::string method, std::string path,
                            std::string body = {}) {
@@ -4028,16 +4111,19 @@ MACHA_TEST("rpc_cluster", test_every_nodes_unmatched_files_are_listed_and_handle
         const auto parsed = Json::parse(
             std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
         std::set<std::string> ids;
-        for (const auto& item : parsed.find("items")->asArray()) ids.insert(item.find("id")->asString());
+        for (const auto& item : parsed.find("items")->asArray())
+            ids.insert(item.find("id")->asString());
         return ids;
     };
 
     CHECK(s2.catalogue_hints().list().empty());
     // Node 2 asks only a peer whose telemetry names a release that answers.
-    REQUIRE(wait_until([&] {
-        return runs_at_least(s2.node().telemetry().all(), s1.node().node_id(),
-                             ClusterUnmatchedView::first_version);
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            return runs_at_least(s2.node().telemetry().all(), s1.node().node_id(),
+                                 ClusterUnmatchedView::first_version);
+        },
+        10s));
     s2.cluster_unmatched().refresh_now();
     CHECK((listed(s2) == std::set<std::string>{matched_id, deleted_id}));
     CHECK((listed(s1) == std::set<std::string>{matched_id, deleted_id}));
@@ -4111,8 +4197,8 @@ MACHA_TEST("rpc_cluster", test_ingest_job_pinned_to_a_node_runs_there) {
         return service.acquisition_api().handle(request);
     };
     const auto body_json = [](const HttpResponse& response) {
-        return Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                       response.body.size()));
+        return Json::parse(
+            std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
     };
     const auto path_field = "\"path\":\"" + source_file.string() + "\"";
 
@@ -4129,15 +4215,15 @@ MACHA_TEST("rpc_cluster", test_ingest_job_pinned_to_a_node_runs_there) {
     CHECK(!s2.ingest().job(id).has_value());
 
     // Node 1's own refusal comes back as it is.
-    const auto outside = submit(s2, "{\"path\":\"" + cluster.path().string() +
-                                        "\",\"node_id\":\"" + node1 + "\"}");
+    const auto outside =
+        submit(s2, "{\"path\":\"" + cluster.path().string() + "\",\"node_id\":\"" + node1 + "\"}");
     CHECK(outside.status == 400);
     CHECK(body_json(outside).find("error")->find("message")->asString().find("source_roots") !=
           std::string::npos);
 
     // A node that is not a member.
-    const auto stranger = submit(s2, "{" + path_field + ",\"node_id\":\"" +
-                                         to_string(random_node_id()) + "\"}");
+    const auto stranger =
+        submit(s2, "{" + path_field + ",\"node_id\":\"" + to_string(random_node_id()) + "\"}");
     CHECK(stranger.status == 409);
     CHECK(body_json(stranger).find("error")->find("reason")->asString() == "node_not_member");
 
@@ -4160,10 +4246,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         out << "not really media, just needs to exist";
     }
 
-    auto c1 = config_for(cluster.path() / "jobvis-n1", cluster.keyfile(), p1,
-                         {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "jobvis-n2", cluster.keyfile(), p2,
-                         {{"127.0.0.1", p1}});
+    auto c1 = config_for(cluster.path() / "jobvis-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "jobvis-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
     c1.write_copies = c2.write_copies = 1;
     c1.metadata_write_copies = c2.metadata_write_copies = 1;
@@ -4198,7 +4282,7 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     s2.start();
     REQUIRE(wait_until([&] {
         return s1.node().membership().active().size() >= 2 &&
-              s2.node().membership().active().size() >= 2;
+               s2.node().membership().active().size() >= 2;
     }));
 
     const auto node1_id = to_string(s1.node().node_id());
@@ -4227,8 +4311,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     // on their own lifecycle threads, so it appears shortly after ready.
     std::shared_ptr<TorrentService> s1_torrents;
     REQUIRE(wait_until([&] { return (s1_torrents = s1.torrents()) != nullptr; }, 5s));
-    const auto torrent_id = s1_torrents->add(
-        "magnet:?xt=urn:btih:3333333333333333333333333333333333333333&dn=Test");
+    const auto torrent_id =
+        s1_torrents->add("magnet:?xt=urn:btih:3333333333333333333333333333333333333333&dn=Test");
     // add() only creates the session entry, so pausing at once is reliable.
     REQUIRE(s1_torrents->pause(torrent_id));
 
@@ -4262,7 +4346,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         bool found = false;
         for (const auto& job : jobs->asArray()) {
             const auto* id = job.find("id");
-            if (!id || id->asString() != ingest_id) continue;
+            if (!id || id->asString() != ingest_id)
+                continue;
             found = true;
             const auto* node_id = job.find("node_id");
             REQUIRE(node_id != nullptr);
@@ -4289,7 +4374,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
 
     // --- Ingest: resume from the non-owning node actually lands on node 1 ---
     {
-        const auto response = post(s2.acquisition_api(), "/api/v1/ingest/jobs/" + ingest_id + "/resume");
+        const auto response =
+            post(s2.acquisition_api(), "/api/v1/ingest/jobs/" + ingest_id + "/resume");
         REQUIRE(response.status == 200);
         const auto parsed = body_json(response);
         const auto* node_id = parsed.find("node_id");
@@ -4308,7 +4394,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     // --- Torrent: node 1's existing job becomes a cluster request its
     // coordinator claims, visible from node 2 ---
     s1.torrent_coordinator().pass_now();
-    REQUIRE(wait_until([&] { return s2.torrent_coordinator().request(torrent_id).has_value(); }, 10s));
+    REQUIRE(
+        wait_until([&] { return s2.torrent_coordinator().request(torrent_id).has_value(); }, 10s));
     s2.cluster_jobs().refresh_now();
     {
         const auto response = get(s2.acquisition_api(), "/api/v1/torrents/jobs");
@@ -4316,7 +4403,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         const auto parsed = body_json(response);
         bool found = false;
         for (const auto& job : parsed.find("jobs")->asArray()) {
-            if (job.find("id")->asString() != torrent_id) continue;
+            if (job.find("id")->asString() != torrent_id)
+                continue;
             found = true;
             CHECK(job.find("node_id")->asString() == node1_id);
             CHECK(job.find("phase")->asString() == "downloading");
@@ -4336,11 +4424,13 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         const auto parsed = body_json(response);
         CHECK(parsed.find("desired")->asString() == "active");
         CHECK(parsed.find("node_id")->asString() == node1_id);
-        REQUIRE(wait_until([&] {
-            s1.torrent_coordinator().pass_now();
-            const auto job = s1_torrents->job(torrent_id);
-            return job && job->state != TorrentJobState::paused;
-        }, 10s));
+        REQUIRE(wait_until(
+            [&] {
+                s1.torrent_coordinator().pass_now();
+                const auto job = s1_torrents->job(torrent_id);
+                return job && job->state != TorrentJobState::paused;
+            },
+            10s));
     }
 
     // --- Torrent: the capable nodes, as node 2 sees them: node 1 only ---
@@ -4369,12 +4459,15 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
             return s2.acquisition_api().handle(request);
         };
         // Pinned to node 2 itself: it cannot run torrents.
-        const auto here = add(R"({"magnet":"magnet:?xt=urn:btih:4444444444444444444444444444444444444444","node_id":")" +
-                              to_string(s2.node().node_id()) + R"("})");
+        const auto here = add(
+            R"({"magnet":"magnet:?xt=urn:btih:4444444444444444444444444444444444444444","node_id":")" +
+            to_string(s2.node().node_id()) + R"("})");
         CHECK(here.status == 409);
-        CHECK(body_json(here).find("error")->find("reason")->asString() == "node_not_torrent_capable");
+        CHECK(body_json(here).find("error")->find("reason")->asString() ==
+              "node_not_torrent_capable");
 
-        const auto queued = add(R"({"magnet":"magnet:?xt=urn:btih:4444444444444444444444444444444444444444&dn=Queued"})");
+        const auto queued = add(
+            R"({"magnet":"magnet:?xt=urn:btih:4444444444444444444444444444444444444444&dn=Queued"})");
         REQUIRE(queued.status == 202);
         const auto body = body_json(queued);
         CHECK(body.find("node_id")->isNull()); // the cluster chooses
@@ -4385,30 +4478,40 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         bool listed = false;
         const auto listing = body_json(get(s2.acquisition_api(), "/api/v1/torrents/jobs"));
         for (const auto& job : listing.find("jobs")->asArray())
-            if (job.find("id")->asString() == queued_id) listed = true;
+            if (job.find("id")->asString() == queued_id)
+                listed = true;
         CHECK(listed);
         // Node 1, the only capable node, claims and starts it.
-        REQUIRE(wait_until([&] {
-            s1.torrent_coordinator().pass_now();
-            return s1_torrents->job(queued_id).has_value();
-        }, 15s));
-        REQUIRE(wait_until([&] {
-            const auto r = s2.torrent_coordinator().request(queued_id);
-            return r && r->claim && to_string(r->claim->node_id) == node1_id;
-        }, 10s));
+        REQUIRE(wait_until(
+            [&] {
+                s1.torrent_coordinator().pass_now();
+                return s1_torrents->job(queued_id).has_value();
+            },
+            15s));
+        REQUIRE(wait_until(
+            [&] {
+                const auto r = s2.torrent_coordinator().request(queued_id);
+                return r && r->claim && to_string(r->claim->node_id) == node1_id;
+            },
+            10s));
 
         // The same torrent again, through either node, is the one job.
-        const auto again = add(R"({"magnet":"magnet:?xt=urn:btih:4444444444444444444444444444444444444444"})");
+        const auto again =
+            add(R"({"magnet":"magnet:?xt=urn:btih:4444444444444444444444444444444444444444"})");
         CHECK(again.status == 409);
         CHECK(body_json(again).find("id")->asString() == queued_id);
 
         // Cancelled through node 2; node 1 stops it and says so.
-        REQUIRE(post(s2.acquisition_api(), "/api/v1/torrents/jobs/" + queued_id + "/cancel").status == 202);
-        REQUIRE(wait_until([&] {
-            s1.torrent_coordinator().pass_now();
-            const auto r = s2.torrent_coordinator().request(queued_id);
-            return r && r->phase == TorrentPhase::cancelled;
-        }, 15s));
+        REQUIRE(
+            post(s2.acquisition_api(), "/api/v1/torrents/jobs/" + queued_id + "/cancel").status ==
+            202);
+        REQUIRE(wait_until(
+            [&] {
+                s1.torrent_coordinator().pass_now();
+                const auto r = s2.torrent_coordinator().request(queued_id);
+                return r && r->phase == TorrentPhase::cancelled;
+            },
+            15s));
     }
 
     // --- A job that exists nowhere still 404s cluster-wide, not just locally ---
@@ -4441,7 +4544,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         bool found = false;
         for (const auto& job : jobs->asArray()) {
             const auto* id = job.find("id");
-            if (id && id->asString() == ingest_id) found = true;
+            if (id && id->asString() == ingest_id)
+                found = true;
         }
         CHECK(found);
     }
@@ -4452,13 +4556,16 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
 // A node truncates its own history while its peer is away, and goes on
 // committing. The peer returns holding the head from before the truncation,
 // takes the newer head, and the two serve one namespace.
-MACHA_TEST("rpc_cluster", test_a_node_truncates_its_history_with_its_peer_away_and_the_peer_converges) {
+MACHA_TEST("rpc_cluster",
+           test_a_node_truncates_its_history_with_its_peer_away_and_the_peer_converges) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     auto p1 = free_port();
     auto p2 = free_port();
-    auto c1 = config_for(cluster.path() / "truncate-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "truncate-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    auto c1 =
+        config_for(cluster.path() / "truncate-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 =
+        config_for(cluster.path() / "truncate-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     Service s1(c1, keys, test_durability_window);
     auto s2 = std::make_unique<Service>(c2, keys, test_durability_window);
     s1.start();
@@ -4557,7 +4664,9 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
         entry.gid = getgid();
         return entry;
     };
-    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) { delta.upsert_entries["/mine"] = directory(); });
+    metadata.mutate_delta([&](MetadataSnapshot&, MetadataDelta& delta) {
+        delta.upsert_entries["/mine"] = directory();
+    });
     const auto mine = replica.committed();
 
     // Another author's head, which this node's clock does not cover.
@@ -4569,7 +4678,8 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
     foreign_delta.erase_entries.push_back("/mine");
     foreign_delta.upsert_entries["/theirs"] = made;
     auto foreign_snapshot = macha::test_support::with_namespace_delta(
-        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store, foreign_delta);
+        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store,
+        foreign_delta);
     foreign_snapshot.mutation_sequences.clear();
     foreign_snapshot.legacy_clock.emplace();
     foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
@@ -4594,7 +4704,8 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
     CHECK(replica.accepted_heads().size() == 2);
 
     const auto holds = [&](const MetadataSnapshot& snapshot, std::string_view path) {
-        return macha::test_support::namespace_holds(snapshot, node.local_state().control(), *metadata_store, path);
+        return macha::test_support::namespace_holds(snapshot, node.local_state().control(),
+                                                    *metadata_store, path);
     };
     // Reading merges the two; the one head then becomes the root.
     CHECK(holds(metadata.snapshot(), "/theirs"));
@@ -4671,9 +4782,9 @@ MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_
     // The wire call itself, independently of the driver.
     Writer request;
     request.fixed(head.bytes);
-    auto reply = s2->node().call(s1.node().membership().self(),
-                                 MessageType::get_metadata_history_record, request.take(),
-                                 FrameType::control, call_deadline::metadata);
+    auto reply =
+        s2->node().call(s1.node().membership().self(), MessageType::get_metadata_history_record,
+                        request.take(), FrameType::control, call_deadline::metadata);
     REQUIRE(reply.message.type == MessageType::metadata_history_entry_reply);
     auto served = decode_metadata_history_entry(reply.message.payload);
     CHECK(served.hash == head);
@@ -4710,14 +4821,16 @@ MACHA_TEST("rpc_cluster", test_inbound_auto_resolves_from_dial_back_and_survives
                 node->stop();
             node.reset();
         }
-        ~RuntimeNode() { stop(); }
+        ~RuntimeNode() {
+            stop();
+        }
     };
 
     RuntimeNode hub(hub_config, keys);
     hub.start();
 
-    auto site_config = cluster.node_config(
-        "site", 0, {Endpoint{hub_config.advertise_host, hub_config.port}});
+    auto site_config =
+        cluster.node_config("site", 0, {Endpoint{hub_config.advertise_host, hub_config.port}});
     site_config.advertise_host = "192.0.2.1";
     site_config.connect_timeout = 300ms;
     site_config.inbound_reprobe_while_incapable = 300ms;
@@ -4776,9 +4889,7 @@ MACHA_TEST("rpc_cluster", test_inbound_auto_resolves_from_dial_back_and_survives
 
 } // namespace
 
-namespace {
-
-} // namespace
+namespace {} // namespace
 
 // The transport's behaviours as the Dannan extraction inventory lists them
 // (dannan/TODO/2026-11-03-macha-function-inventory.md, "Transport and
@@ -4851,8 +4962,8 @@ MACHA_TEST("rpc_cluster", test_no_progress_deadline_follows_the_lane_configured)
         });
         bool slow_ok = false;
         try {
-            slow_ok =
-                node.call(endpoint, slow, Bytes{2}, slow_frame, call_deadline::control).message.type != MessageType::error;
+            slow_ok = node.call(endpoint, slow, Bytes{2}, slow_frame, call_deadline::control)
+                          .message.type != MessageType::error;
         } catch (const std::exception&) {
         }
         releaser.join();

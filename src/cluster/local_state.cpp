@@ -2,13 +2,13 @@
 #include "cluster/local_state.hpp"
 #include "cluster/control_objects.hpp"
 
+#include "ledger/reference_counts.hpp"
 #include "log.hpp"
 #include "metadata/metadata.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "startup_progress.hpp"
 #include "storage/local_store.hpp"
 #include "storage/persistent_cache.hpp"
-#include "ledger/reference_counts.hpp"
 #include "storage/retention.hpp"
 #include "storage/storage_pool.hpp"
 #include "supervised.hpp"
@@ -101,11 +101,11 @@ void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
                 cfg.io_pressure_outlier_percent});
             Log::info("data io pressure gate enabled expected_ms=" +
                       std::to_string(cfg.io_pressure_overhead_ms) + "+" +
-                      std::to_string(cfg.io_pressure_per_mib_ms) + "/MiB slowdown_percent=" +
-                      std::to_string(cfg.io_pressure_slowdown_percent) + " release_percent=" +
-                      std::to_string(cfg.io_pressure_release_percent) + " outlier_percent=" +
-                      std::to_string(cfg.io_pressure_outlier_percent) + " min_background=" +
-                      std::to_string(cfg.io_pressure_min_background));
+                      std::to_string(cfg.io_pressure_per_mib_ms) +
+                      "/MiB slowdown_percent=" + std::to_string(cfg.io_pressure_slowdown_percent) +
+                      " release_percent=" + std::to_string(cfg.io_pressure_release_percent) +
+                      " outlier_percent=" + std::to_string(cfg.io_pressure_outlier_percent) +
+                      " min_background=" + std::to_string(cfg.io_pressure_min_background));
         }
         const auto used = pool->used();
         const auto capacity = pool->limit();
@@ -119,7 +119,8 @@ void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
                   (cfg.storage_backends.empty() ? " (hosts no extents)" : ""));
         if (!cfg.storage_backends.empty() && data_->online_backends() == 0)
             Log::warn("node data storage degraded: no disk online of " +
-                      std::to_string(cfg.storage_backends.size()) + "; running without one until it returns");
+                      std::to_string(cfg.storage_backends.size()) +
+                      "; running without one until it returns");
     } catch (const RecoveryCancelled&) {
         throw;
     } catch (const std::exception& error) {
@@ -129,9 +130,9 @@ void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
     }
 }
 
-void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
-                               ClusterNode& node, RecoveryProgress& progress,
-                               const StageHook& hook, std::stop_token stop) {
+void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity, ClusterNode& node,
+                               RecoveryProgress& progress, const StageHook& hook,
+                               std::stop_token stop) {
     try {
         stage(hook, "control-storage", stop);
         LocalStoreOptions control_options{cfg.metadata_store.limit, 0,
@@ -140,9 +141,8 @@ void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
         control_options.ledger_dir = cfg.state_path / "ledger" / "control";
         control_options.ledger_cache_bytes = ledger_cache_share(cfg, LedgerShare::control_held);
         control_ = std::make_unique<LocalStore>(
-            cfg.metadata_store.path, control_options,
-            identity.keys.storage, LocalStoreMode::authoritative, nullptr,
-            posix_local_store_files());
+            cfg.metadata_store.path, control_options, identity.keys.storage,
+            LocalStoreMode::authoritative, nullptr, posix_local_store_files());
         control_fetch_ = std::make_unique<ControlObjectFetch>(node, *control_);
         note_startup_progress();
         progress.mark(RecoveryProgress::control_storage);

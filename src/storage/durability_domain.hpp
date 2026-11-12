@@ -9,10 +9,10 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
-#include <string>
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -67,7 +67,9 @@ class DurabilityDomain {
     DurabilityDomain(const DurabilityDomain&) = delete;
     DurabilityDomain& operator=(const DurabilityDomain&) = delete;
 
-    uint64_t id() const noexcept { return id_; }
+    uint64_t id() const noexcept {
+        return id_;
+    }
     void add_representative(std::filesystem::path);
 
     // Called only after the mutation's write/rename/unlink syscalls have

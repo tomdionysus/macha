@@ -26,7 +26,9 @@ void sync_file(const std::filesystem::path& path) {
         throw std::runtime_error("cannot open durability file: " + std::string(strerror(errno)));
     }
     int rc;
-    do { rc = ::fsync(fd); } while (rc != 0 && errno == EINTR);
+    do {
+        rc = ::fsync(fd);
+    } while (rc != 0 && errno == EINTR);
     const int saved = errno;
     ::close(fd);
     if (rc != 0)
@@ -44,7 +46,9 @@ void sync_directory(const std::filesystem::path& path) {
                                  std::string(strerror(errno)));
     }
     int rc;
-    do { rc = ::fsync(fd); } while (rc != 0 && errno == EINTR);
+    do {
+        rc = ::fsync(fd);
+    } while (rc != 0 && errno == EINTR);
     const int saved = errno;
     ::close(fd);
     if (rc != 0)
@@ -83,13 +87,12 @@ void DurabilityDomain::add_representative(std::filesystem::path path) {
         return;
     path = path.lexically_normal();
     Lock lock(mutex_);
-    if (std::find(representatives_.begin(), representatives_.end(), path) ==
-        representatives_.end())
+    if (std::find(representatives_.begin(), representatives_.end(), path) == representatives_.end())
         representatives_.push_back(std::move(path));
 }
 
-DurabilityDomain::Generation DurabilityDomain::complete_mutation(
-    std::filesystem::path file, std::filesystem::path directory) {
+DurabilityDomain::Generation DurabilityDomain::complete_mutation(std::filesystem::path file,
+                                                                 std::filesystem::path directory) {
     Lock lock(mutex_);
     if (failure_)
         std::rethrow_exception(failure_);
@@ -173,7 +176,9 @@ void DurabilityDomain::perform_barrier(Generation cut, std::vector<PortableMutat
             continue;
         }
         int rc;
-        do { rc = ::syncfs(fd); } while (rc != 0 && errno == EINTR);
+        do {
+            rc = ::syncfs(fd);
+        } while (rc != 0 && errno == EINTR);
         last_error = errno;
         ::close(fd);
         if (rc == 0) {
@@ -270,12 +275,12 @@ void DurabilityDomain::loop(std::stop_token stop) {
             durable_generation_ = std::max(durable_generation_, cut);
 #if !defined(__linux__)
             const auto durable = durable_generation_;
-            portable_mutations_.erase(
-                portable_mutations_.begin(),
-                std::find_if(portable_mutations_.begin(), portable_mutations_.end(),
-                             [&](const PortableMutation& mutation) {
-                                 return mutation.generation > durable;
-                             }));
+            portable_mutations_.erase(portable_mutations_.begin(),
+                                      std::find_if(portable_mutations_.begin(),
+                                                   portable_mutations_.end(),
+                                                   [&](const PortableMutation& mutation) {
+                                                       return mutation.generation > durable;
+                                                   }));
 #endif
             if (requested_generation_ <= durable_generation_)
                 requested_generation_ = durable_generation_;

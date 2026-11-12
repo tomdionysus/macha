@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "cluster/public_connectivity.hpp"
+#include "coverage.hpp"
 #include "fuse/fuse_mountpoint.hpp"
 #include "macha_version.hpp"
-#include "test_backend_support.hpp"
 #include "retained_memory.hpp"
 #include "supervised.hpp"
-#include "coverage.hpp"
+#include "test_backend_support.hpp"
 #include "write_behind.hpp"
 #include <arpa/inet.h>
-#include <thread>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <future>
-#include "cluster/public_connectivity.hpp"
 #include <fcntl.h>
+#include <future>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 
 #include <filesystem>
@@ -127,9 +127,8 @@ MACHA_TEST("foundations", test_data_resource_arbiter_reserves_viewer_headroom) {
     REQUIRE(second.has_value());
     REQUIRE(third.has_value());
 
-    auto blocked_loader = std::async(std::launch::async, [&] {
-        return resources.acquire(loader_context, 1);
-    });
+    auto blocked_loader =
+        std::async(std::launch::async, [&] { return resources.acquire(loader_context, 1); });
     CHECK(blocked_loader.wait_for(scaled(20ms)) == std::future_status::timeout);
     auto blocked_speculative = std::async(std::launch::async, [&] {
         return resources.acquire(DataWorkContext(FrameType::speculative, 1), 1);
@@ -682,7 +681,8 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
         finished.store(true);
         CHECK(!blocked.has_value());
     });
-    while (!started.load()) std::this_thread::yield();
+    while (!started.load())
+        std::this_thread::yield();
     for (int i = 0; i < 200 && ledger.stats().waits[2] == 0; ++i)
         std::this_thread::sleep_for(1ms);
     CHECK(ledger.stats().waits[2] > 0);
@@ -696,7 +696,8 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
         (void)ledger.acquire(WorkClass::viewer, MemoryOwner::playback_segment, 40,
                              RetainedMemoryLedger::Clock::now() + 1s, &viewer_cancel);
     });
-    while (!viewer_started.load()) std::this_thread::yield();
+    while (!viewer_started.load())
+        std::this_thread::yield();
     for (int i = 0; i < 200 && ledger.stats().waits[0] + ledger.stats().waits[3] == 0; ++i)
         std::this_thread::sleep_for(1ms);
     CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::rpc_frame, 1).has_value());
@@ -712,8 +713,7 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
 
         // Beyond the reserve it defers; unbounded priority would starve the
         // node's own publication.
-        CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::rpc_frame, 4)
-                   .has_value());
+        CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::rpc_frame, 4).has_value());
         // The reserve is for reassembly only; other speculative work defers.
         CHECK(!ledger.try_acquire(WorkClass::speculative, MemoryOwner::cache, 1).has_value());
     }
@@ -794,8 +794,8 @@ MACHA_TEST("foundations", test_every_subsystem_thread_is_run_supervised) {
                 }
             }
             if (!guarded)
-                unguarded.push_back(entry.path().filename().string() + ":" +
-                                    std::to_string(i + 1) + ": " + lines[i]);
+                unguarded.push_back(entry.path().filename().string() + ":" + std::to_string(i + 1) +
+                                    ": " + lines[i]);
         }
     }
 
@@ -810,7 +810,8 @@ MACHA_TEST("foundations", test_every_subsystem_thread_is_run_supervised) {
 namespace {
 std::optional<SupervisedThreadStatus> supervised_status_of(std::string_view name) {
     for (auto& status : supervised_thread_statuses())
-        if (status.name == name) return status;
+        if (status.name == name)
+            return status;
     return std::nullopt;
 }
 } // namespace
@@ -829,7 +830,8 @@ MACHA_TEST("foundations", test_a_supervised_loop_that_throws_runs_again) {
     std::atomic<int> runs{0};
     std::jthread thread([&](std::stop_token stop) {
         run_supervised_loop("test-loop-restarts", stop, [&] {
-            if (++runs == 1) throw std::runtime_error("first run fails");
+            if (++runs == 1)
+                throw std::runtime_error("first run fails");
         });
     });
     REQUIRE(wait_until([&] { return runs.load() == 2; }, 5s));
@@ -853,10 +855,12 @@ MACHA_TEST("foundations", test_a_supervised_loop_in_backoff_stops_when_asked) {
             throw 7; // not a std::exception
         });
     });
-    REQUIRE(wait_until([&] {
-        const auto status = supervised_status_of("test-loop-backoff-stop");
-        return status && status->restarting == 1;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto status = supervised_status_of("test-loop-backoff-stop");
+            return status && status->restarting == 1;
+        },
+        5s));
     const auto asked = std::chrono::steady_clock::now();
     thread.request_stop();
     thread.join();
@@ -891,7 +895,8 @@ MACHA_TEST("foundations", test_an_escalating_thread_hands_its_fault_to_the_sink)
     std::string reason;
     std::thread thread([&] {
         run_supervised_escalating(
-            "test-escalates", [&] {
+            "test-escalates",
+            [&] {
                 ++runs;
                 throw std::runtime_error("invalid torrent handle used");
             },
@@ -911,8 +916,8 @@ Config minimal_valid_config() {
     Config config;
     config.state_path = "/tmp/does-not-need-to-exist-for-this-test";
     config.key_file = "/tmp/does-not-need-to-exist-for-this-test.key";
-    config.storage_backends.push_back({.path = "/tmp/does-not-need-to-exist-for-this-test/data",
-                                       .limit = 1});
+    config.storage_backends.push_back(
+        {.path = "/tmp/does-not-need-to-exist-for-this-test/data", .limit = 1});
     return config;
 }
 } // namespace
@@ -963,8 +968,7 @@ MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorre
 
     // A literal IPv6 advertise must be bracketed or libtorrent cannot parse
     // the port off it.
-    CHECK(torrent_listen_interfaces(config, "fd0e:9c96:30a3::bb4") ==
-          "[fd0e:9c96:30a3::bb4]:6881");
+    CHECK(torrent_listen_interfaces(config, "fd0e:9c96:30a3::bb4") == "[fd0e:9c96:30a3::bb4]:6881");
 
     // No usable advertised address: bind every interface.
     CHECK(torrent_listen_interfaces(config, "") == "0.0.0.0:6881,[::]:6881");
@@ -984,8 +988,8 @@ MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorre
     // and it may resolve to a NATed address the node does not hold.
     config.listen_interfaces.clear();
     config.listen_port = 6881;
-    for (const auto* name : {"inverbeg.macha.network", "macnessa.macha.network",
-                             "localhost", "node-1", "example.com."}) {
+    for (const auto* name : {"inverbeg.macha.network", "macnessa.macha.network", "localhost",
+                             "node-1", "example.com."}) {
         CHECK(torrent_listen_interfaces(config, name) == "0.0.0.0:6881,[::]:6881");
     }
 
@@ -1000,8 +1004,7 @@ MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorre
 
     // The operator override still wins.
     config.listen_interfaces = "0.0.0.0:6881,[::]:6881";
-    CHECK(torrent_listen_interfaces(config, "inverbeg.macha.network") ==
-          "0.0.0.0:6881,[::]:6881");
+    CHECK(torrent_listen_interfaces(config, "inverbeg.macha.network") == "0.0.0.0:6881,[::]:6881");
 }
 
 MACHA_TEST("foundations", test_retry_budget_is_reachable_once_backoff_reaches_its_ceiling) {
@@ -1139,8 +1142,8 @@ MACHA_FAST_TEST("foundations", test_configuration_tristates_and_hosting_rules) {
     try {
         (void)normalize_config(insists);
     } catch (const std::runtime_error& error) {
-        refused = std::string(error.what()).find("storage.hosts_extents is true") !=
-                  std::string::npos;
+        refused =
+            std::string(error.what()).find("storage.hosts_extents is true") != std::string::npos;
     }
     CHECK(refused);
 
@@ -1184,7 +1187,8 @@ MACHA_FAST_TEST("foundations", test_transcode_rates_keep_a_median_per_class_and_
     const auto rates = reloaded.summary();
     REQUIRE(rates.size() == 3);
     const auto find = [&](const std::string& codec) {
-        return *std::find_if(rates.begin(), rates.end(), [&](const auto& rate) { return rate.codec == codec; });
+        return *std::find_if(rates.begin(), rates.end(),
+                             [&](const auto& rate) { return rate.codec == codec; });
     };
     CHECK(find("hevc").rate_milli == 330);
     CHECK(find("hevc").observations == 3);
@@ -1224,8 +1228,7 @@ MACHA_FAST_TEST("foundations", test_message_routes_answer_only_while_bound) {
     CHECK(reply.type == MessageType::ingest_jobs_reply);
     CHECK(reply.payload == Bytes({3, 2, 1}));
     // Each type is its own binding.
-    CHECK(routes.dispatch(peer, FrameType::control,
-                          RpcMessage{MessageType::get_torrent_jobs, {}})
+    CHECK(routes.dispatch(peer, FrameType::control, RpcMessage{MessageType::get_torrent_jobs, {}})
               .type == MessageType::error);
 
     // A handler that throws answers an error carrying the reason.
@@ -1254,7 +1257,8 @@ MACHA_FAST_TEST("foundations", test_rpc_refusals_say_whether_asking_again_may_he
 
     const auto gone = rpc_refusal(error_reply(404, "not_found", "object not found"));
     REQUIRE(gone);
-    CHECK((gone->status == 404 && gone->code == "not_found" && gone->message == "object not found"));
+    CHECK(
+        (gone->status == 404 && gone->code == "not_found" && gone->message == "object not found"));
     CHECK(!rpc_try_later(*gone));
     for (const uint16_t status : {429, 500, 502, 503, 504})
         CHECK(rpc_try_later(*rpc_refusal(error_reply(status, "x", "y"))));
@@ -1292,7 +1296,7 @@ MACHA_FAST_TEST("foundations", test_write_behind_acts_once_per_window) {
     WriteBehind behind(8);
     CHECK(!behind.window_filled(3));
     CHECK(!behind.window_filled(4));
-    CHECK(behind.window_filled(1));  // 8: a window, which starts again
+    CHECK(behind.window_filled(1)); // 8: a window, which starts again
     CHECK(!behind.window_filled(7));
     CHECK(behind.window_filled(20)); // one large write fills one window
     CHECK(!behind.window_filled(0));
@@ -1326,6 +1330,4 @@ MACHA_FAST_TEST("foundations", test_write_behind_leaves_what_was_written_intact)
 
 } // namespace
 
-namespace {
-
-} // namespace
+namespace {} // namespace

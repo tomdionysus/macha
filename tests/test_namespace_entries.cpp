@@ -58,8 +58,7 @@ std::vector<NamespaceItem> by_callback(const MetadataSnapshot& snapshot,
 }
 
 std::vector<NamespaceItem> by_pages(const MetadataSnapshot& snapshot,
-                                    const NamespaceNodeStore* store, size_t bound,
-                                    size_t& pages) {
+                                    const NamespaceNodeStore* store, size_t bound, size_t& pages) {
     std::vector<NamespaceItem> out;
     Cursor<std::string> cursor;
     pages = 0;
@@ -85,7 +84,8 @@ std::vector<NamespaceItem> by_pages(const MetadataSnapshot& snapshot,
     }
 }
 
-MACHA_FAST_TEST("namespace_entries", test_pages_visit_what_the_callback_walk_visits_on_every_shape) {
+MACHA_FAST_TEST("namespace_entries",
+                test_pages_visit_what_the_callback_walk_visits_on_every_shape) {
     for (size_t count : {0U, 1U, 2U, 3U, 7U, 31U, 100U, 257U}) {
         MemoryNamespaceNodeStore store;
         MetadataSnapshot tree;
@@ -138,7 +138,8 @@ MACHA_FAST_TEST("namespace_entries", test_a_cursor_between_paths_resumes_after_i
     for (const auto* snapshot : {&map, &tree}) {
         Budget budget;
         budget.operations(100);
-        const auto page = namespace_entries(*snapshot, &store, Cursor<std::string>{between}, budget);
+        const auto page =
+            namespace_entries(*snapshot, &store, Cursor<std::string>{between}, budget);
         CHECK(!page.items.empty());
         CHECK(page.items.front().first > between);
         CHECK(page.items.front().first <= all[5].first);
@@ -200,7 +201,8 @@ MACHA_TEST("namespace_entries", test_the_metadata_view_pages_a_live_namespace) {
     MetadataView& metadata = service.metadata_manager();
     const auto view = metadata.converged();
 
-    auto nodes = ControlNamespaceNodeStore::for_reading(service.local_state().control(), service.filesystem().store());
+    auto nodes = ControlNamespaceNodeStore::for_reading(service.local_state().control(),
+                                                        service.filesystem().store());
     const auto expected = by_callback(*view.snapshot, &nodes);
     CHECK(expected.size() >= 12);
     std::vector<NamespaceItem> paged;

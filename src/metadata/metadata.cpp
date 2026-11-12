@@ -419,13 +419,11 @@ int metadata_delta_version(std::span<const uint8_t> data) {
     return static_cast<int>(data[7] - '0');
 }
 
-
 Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSnapshot& snapshot) {
     if (metadata_delta_version(delta) < 5)
         throw DecodeError("bad metadata delta");
     return encode_snapshot_v14(snapshot);
 }
-
 
 void hash_u8(Sha256Hasher& hash, uint8_t value) {
     hash.update(std::span<const uint8_t>(&value, 1));
@@ -678,8 +676,7 @@ std::optional<FsEntry> conflict_installed_entry(const MetadataConflict& conflict
 }
 
 std::optional<ObjectId> conflict_installed_catalogue_root(const MetadataConflict& conflict) {
-    return conflict.later_installed ? conflict.left_catalogue_root
-                                    : conflict.base_catalogue_root;
+    return conflict.later_installed ? conflict.left_catalogue_root : conflict.base_catalogue_root;
 }
 
 const FsEntry& later_entry(const FsEntry& a, const FsEntry& b) {
@@ -705,17 +702,16 @@ size_t prune_superseded_conflicts(MetadataSnapshot& snapshot, const NamespaceLoo
             // Identical alternatives over a base need no decision: the
             // lesser is installed.
             if (!superseded && !lookup && !conflict.later_installed && conflict.left_entry &&
-                conflict.right_entry &&
-                same_content(*conflict.left_entry, *conflict.right_entry)) {
+                conflict.right_entry && same_content(*conflict.left_entry, *conflict.right_entry)) {
                 snapshot.entries[conflict.key] = (*conflict.left_entry < *conflict.right_entry)
                                                      ? *conflict.left_entry
                                                      : *conflict.right_entry;
                 superseded = true;
             }
         } else if (conflict.kind == MetadataConflictKind::catalogue_root) {
-            superseded = snapshot.catalogue_root != conflict_installed_catalogue_root(conflict) ||
-                         (conflict.later_installed &&
-                          snapshot.catalogue_dot != conflict.installed_dot);
+            superseded =
+                snapshot.catalogue_root != conflict_installed_catalogue_root(conflict) ||
+                (conflict.later_installed && snapshot.catalogue_dot != conflict.installed_dot);
         }
         if (superseded) {
             it = snapshot.conflicts.erase(it);
@@ -731,7 +727,8 @@ void encode_torrent_requests(Writer& w, const MetadataSnapshot& s) {
         throw std::runtime_error("too many torrent requests");
     w.u32(static_cast<uint32_t>(s.torrent_requests.size()));
     for (const auto& [id, request] : s.torrent_requests) {
-        if (id != request.id) throw std::runtime_error("torrent request keyed by another id");
+        if (id != request.id)
+            throw std::runtime_error("torrent request keyed by another id");
         encode_torrent_request(w, request);
     }
 }
@@ -1010,11 +1007,11 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
         throw std::logic_error("metadata delta still holds pending tombstones");
     // DLT11 is DLT10 then the tombstone batches named and dropped, written
     // when a mutation names or drops one.
-    const bool v11 =
-        !delta.add_tombstone_batches.empty() || !delta.drop_tombstone_batches.empty();
+    const bool v11 = !delta.add_tombstone_batches.empty() || !delta.drop_tombstone_batches.empty();
     // DLT10 is DLT9 with a content dot on every append and a trailing legacy
     // clock, written when a mutation carries either.
-    const bool v10 = v11 || delta.set_legacy_clock.has_value() || delta.set_catalogue_dot.has_value() ||
+    const bool v10 = v11 || delta.set_legacy_clock.has_value() ||
+                     delta.set_catalogue_dot.has_value() ||
                      std::any_of(delta.append_entries.begin(), delta.append_entries.end(),
                                  [](const auto& item) { return bool(item.second.content); });
     const bool topology =
@@ -1027,8 +1024,9 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
     // DLT7 when DLT5/6 cannot express it: one topology set without the other,
     // or canonical garbage order. Both sets together still encode as DLT6; a
     // peer that rejects DLT7 is covered by the sender's full-record fallback.
-    const bool v7 = v8 || delta.canonical_garbage ||
-                    (delta.replace_merge_parents.has_value() != delta.replace_conflicts.has_value());
+    const bool v7 =
+        v8 || delta.canonical_garbage ||
+        (delta.replace_merge_parents.has_value() != delta.replace_conflicts.has_value());
     const bool v6 = !v7 && topology;
     Writer w;
     w.raw(v11   ? magic_v11
@@ -1134,11 +1132,13 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
     if (v9) {
         w.u32(static_cast<uint32_t>(delta.upsert_torrent_requests.size()));
         for (const auto& [id, request] : delta.upsert_torrent_requests) {
-            if (id != request.id) throw std::invalid_argument("torrent request keyed by another id");
+            if (id != request.id)
+                throw std::invalid_argument("torrent request keyed by another id");
             encode_torrent_request(w, request);
         }
         w.u32(static_cast<uint32_t>(delta.erase_torrent_requests.size()));
-        for (const auto& id : delta.erase_torrent_requests) w.string(id);
+        for (const auto& id : delta.erase_torrent_requests)
+            w.string(id);
     }
     if (v10) {
         w.u8(delta.set_legacy_clock.has_value());
@@ -1514,13 +1514,11 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
     // Deltas can erase, replace and append tombstones but not reorder retained
     // ones. A canonical (ObjectId-sorted) target uses DLT7's sort-after-apply;
     // otherwise the target order must be reachable by erase-then-append.
-    const auto contains_id = [](const std::vector<const GarbageRef*>& sorted,
-                                const ObjectId& id) {
-        const auto found = std::lower_bound(
-            sorted.begin(), sorted.end(), id,
-            [](const GarbageRef* value, const ObjectId& candidate) {
-                return value->id < candidate;
-            });
+    const auto contains_id = [](const std::vector<const GarbageRef*>& sorted, const ObjectId& id) {
+        const auto found = std::lower_bound(sorted.begin(), sorted.end(), id,
+                                            [](const GarbageRef* value, const ObjectId& candidate) {
+                                                return value->id < candidate;
+                                            });
         return found != sorted.end() && (*found)->id == id;
     };
     const bool garbage_changed =
@@ -1849,8 +1847,8 @@ MetadataRecord decode_metadata_record(std::span<const uint8_t> d) {
     return m;
 }
 
-std::vector<Hash256> metadata_history_materialization_dependencies(
-    const MetadataHistoryEntry& entry) {
+std::vector<Hash256>
+metadata_history_materialization_dependencies(const MetadataHistoryEntry& entry) {
     if (entry.body == MetadataHistoryEntry::Body::delta)
         return {entry.previous};
     return {};
@@ -2044,8 +2042,7 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
     durable_replace_file(author_chain_broken_p_, reason);
 
     std::vector<std::filesystem::path> quarantined;
-    for (const auto& path :
-         {checkpoint_p_, journal_p_, history_p_, heads_p_}) {
+    for (const auto& path : {checkpoint_p_, journal_p_, history_p_, heads_p_}) {
         if (auto moved = quarantine_metadata_file(path, stamp))
             quarantined.push_back(*moved);
     }
@@ -2445,10 +2442,11 @@ Bytes MetadataReplica::encode_history_frame(const MetadataHistoryEntry& entry_va
     return frame.take();
 }
 
-MetadataReplica::HistoryIndexEntry MetadataReplica::index_history_entry(
-    const MetadataHistoryEntry& value, uint64_t file_offset, uint64_t frame_bytes) {
-    return HistoryIndexEntry{value.generation, value.previous, value.hash, value.previous_known,
-                             value.merge_parents, value.body, file_offset, frame_bytes};
+MetadataReplica::HistoryIndexEntry
+MetadataReplica::index_history_entry(const MetadataHistoryEntry& value, uint64_t file_offset,
+                                     uint64_t frame_bytes) {
+    return HistoryIndexEntry{value.generation,    value.previous, value.hash,  value.previous_known,
+                             value.merge_parents, value.body,     file_offset, frame_bytes};
 }
 
 MetadataHistoryEntry MetadataReplica::read_history_entry(const HistoryIndexEntry& index) const {
@@ -2487,8 +2485,7 @@ void MetadataReplica::append_history(const MetadataHistoryEntry& entry_value) {
     auto bytes = encode_history_frame(entry_value);
     const auto file_offset = history_bytes_;
     write_history_frame(bytes);
-    history_.emplace(entry_value.hash,
-                     index_history_entry(entry_value, file_offset, bytes.size()));
+    history_.emplace(entry_value.hash, index_history_entry(entry_value, file_offset, bytes.size()));
     ++history_records_;
     history_bytes_ += bytes.size();
 }
@@ -2537,7 +2534,8 @@ next_history_frame(std::istream& file, uint64_t from, uint64_t file_size, uint64
         const auto wanted = std::min(window, file_size - at);
         file.clear();
         file.seekg(static_cast<std::streamoff>(at), std::ios::beg);
-        if (!file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(wanted))) {
+        if (!file.read(reinterpret_cast<char*>(buffer.data()),
+                       static_cast<std::streamsize>(wanted))) {
             read_failed = true;
             return std::nullopt;
         }
@@ -2555,7 +2553,8 @@ next_history_frame(std::istream& file, uint64_t from, uint64_t file_size, uint64
             Bytes frame(static_cast<size_t>(length));
             file.clear();
             file.seekg(static_cast<std::streamoff>(at + i + 4), std::ios::beg);
-            if (!file.read(reinterpret_cast<char*>(frame.data()), static_cast<std::streamsize>(length))) {
+            if (!file.read(reinterpret_cast<char*>(frame.data()),
+                           static_cast<std::streamsize>(length))) {
                 read_failed = true;
                 return std::nullopt;
             }
@@ -2632,7 +2631,8 @@ void MetadataReplica::load_history() {
             // says nothing about where the next one starts. A later frame that
             // opens means this is damage and everything from there on is good;
             // none means a torn tail.
-            const auto next = next_history_frame(scan, offset + 1, file_size, max_record, open_frame, read_failed);
+            const auto next = next_history_frame(scan, offset + 1, file_size, max_record,
+                                                 open_frame, read_failed);
             if (read_failed)
                 break;
             if (!next) {
@@ -2642,7 +2642,8 @@ void MetadataReplica::load_history() {
             }
             ++skipped;
             if (skipped == 1)
-                first_skipped = "offset=" + std::to_string(offset) + ": frame does not authenticate";
+                first_skipped =
+                    "offset=" + std::to_string(offset) + ": frame does not authenticate";
             offset = *next;
             valid = offset;
             stream.clear();
@@ -2689,7 +2690,8 @@ void MetadataReplica::load_history() {
                 // conflicting identity is corruption.
                 if (existing->second.generation != entry_value.generation ||
                     existing->second.previous != entry_value.previous)
-                    throw DecodeError("duplicate metadata history record with conflicting identity");
+                    throw DecodeError(
+                        "duplicate metadata history record with conflicting identity");
                 if (entry_value.body == MetadataHistoryEntry::Body::full)
                     existing->second = std::move(index);
             } else {
@@ -2713,16 +2715,16 @@ void MetadataReplica::load_history() {
     }
     if (skipped)
         Log::warn("metadata history skipped frames that could not be replayed path=" +
-                  history_p_.string() + " count=" + std::to_string(skipped) + " first=" +
-                  first_skipped + "; dependent heads are repaired live from peers");
+                  history_p_.string() + " count=" + std::to_string(skipped) +
+                  " first=" + first_skipped + "; dependent heads are repaired live from peers");
 
     if (read_failed) {
         // The disk did not answer, which says nothing about what is on it. Nothing
         // is cut: what was not read is read at the next open, and heads needing it
         // are repaired live from peers meanwhile.
-        Log::warn("metadata history read failed path=" + history_p_.string() + " offset=" +
-                  std::to_string(offset) + " unread_bytes=" + std::to_string(file_size - offset) +
-                  "; nothing cut");
+        Log::warn("metadata history read failed path=" + history_p_.string() +
+                  " offset=" + std::to_string(offset) +
+                  " unread_bytes=" + std::to_string(file_size - offset) + "; nothing cut");
         history_bytes_ = file_size;
         return;
     }
@@ -2784,8 +2786,8 @@ void MetadataReplica::load_heads() {
                 const auto reason = diagnose_unreconstructable_locked(value.hash);
                 Log::error("metadata accepted head is not reconstructible locally; keeping it "
                            "for live repair from peers hash=" +
-                           hex(value.hash.bytes) + " generation=" +
-                           std::to_string(value.generation) + " reason=" + reason);
+                           hex(value.hash.bytes) +
+                           " generation=" + std::to_string(value.generation) + " reason=" + reason);
                 unreconstructable_head_retry_at_[value.hash] =
                     Clock::now() + unreconstructable_retry_cooldown;
                 accepted_heads_.emplace(value.hash, std::move(value));
@@ -2854,7 +2856,7 @@ bool MetadataReplica::prune_accepted_heads_locked() {
 }
 
 bool MetadataReplica::accepted_head_is_ancestor_locked(const Hash256& ancestor,
-                                                        const Hash256& descendant) const {
+                                                       const Hash256& descendant) const {
     if (history_is_ancestor_locked(ancestor, descendant))
         return true;
 
@@ -2956,7 +2958,8 @@ bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
             continue;
         auto record = historical_locked(hash);
         if (!record) {
-            const auto reason = flag_unreconstructable_locked(hash, now, "materialized head refresh");
+            const auto reason =
+                flag_unreconstructable_locked(hash, now, "materialized head refresh");
             throw std::runtime_error("accepted metadata head cannot be reconstructed hash=" +
                                      hex(hash.bytes) + " reason=" + reason);
         }
@@ -3048,8 +3051,8 @@ size_t MetadataReplica::expire_set_aside(uint64_t now_unix_ms, std::chrono::mill
     bool changed = false;
     for (auto it = set_aside_since_.begin(); it != set_aside_since_.end();) {
         const bool held = accepted_heads_.contains(it->first);
-        const bool expired = held && set_aside_.contains(it->first) &&
-                             accepted_heads_.size() > 1 && now_unix_ms >= it->second &&
+        const bool expired = held && set_aside_.contains(it->first) && accepted_heads_.size() > 1 &&
+                             now_unix_ms >= it->second &&
                              now_unix_ms - it->second >= static_cast<uint64_t>(horizon.count());
         if (expired) {
             accepted_heads_.erase(it->first);
@@ -3092,9 +3095,8 @@ void MetadataReplica::clear_set_aside() {
 std::vector<MetadataRecord> MetadataReplica::usable_heads() const {
     auto heads = accepted_heads();
     Lock lock(m_);
-    std::erase_if(heads, [&](const MetadataRecord& head) MACHA_REQUIRES(m_) {
-        return set_aside_.contains(head.hash);
-    });
+    std::erase_if(heads, [&](const MetadataRecord& head)
+                             MACHA_REQUIRES(m_) { return set_aside_.contains(head.hash); });
     return heads;
 }
 
@@ -3156,9 +3158,10 @@ MetadataHistoryEntry MetadataReplica::history_for_current(std::span<const uint8_
     return entry_value;
 }
 
-std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materialization_locked(
-    const MetadataRecord& record, std::shared_ptr<const MetadataSnapshot> snapshot,
-    uint64_t resident_bytes) const {
+std::shared_ptr<const MetadataMaterialization>
+MetadataReplica::cache_materialization_locked(const MetadataRecord& record,
+                                              std::shared_ptr<const MetadataSnapshot> snapshot,
+                                              uint64_t resident_bytes) const {
     constexpr size_t cache_limit = 64;
     auto found = materialized_history_.find(record.hash);
     if (found != materialized_history_.end()) {
@@ -3169,8 +3172,8 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materializ
     if (!snapshot)
         snapshot = std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload));
     auto value = resident_bytes
-                     ? std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
-                           record, std::move(snapshot), resident_bytes})
+                     ? std::make_shared<const MetadataMaterialization>(
+                           MetadataMaterialization{record, std::move(snapshot), resident_bytes})
                      : make_materialization(record, std::move(snapshot));
     const uint64_t bytes = value->resident_bytes;
     const bool incoming_pinned = record.hash == cur_.hash || record.hash == committed_.hash;
@@ -3198,9 +3201,8 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materializ
     // Over budget and unpinned: return it uncached.
     if (bytes > materialized_history_limit_bytes_ && !incoming_pinned)
         return value;
-    materialized_history_.emplace(record.hash,
-                                  MaterializedHistoryEntry{value, ++materialized_history_clock_,
-                                                           bytes});
+    materialized_history_.emplace(
+        record.hash, MaterializedHistoryEntry{value, ++materialized_history_clock_, bytes});
     materialized_history_bytes_ += bytes;
     return value;
 }
@@ -3300,8 +3302,7 @@ MetadataReplica::materialized_locked(const Hash256& target) const {
     if (working_record.hash != target)
         return {};
     return cache_materialization_locked(
-        working_record,
-        std::make_shared<const MetadataSnapshot>(std::move(working_snapshot)));
+        working_record, std::make_shared<const MetadataSnapshot>(std::move(working_snapshot)));
 }
 
 std::optional<MetadataRecord> MetadataReplica::historical_locked(const Hash256& target) const {
@@ -3378,8 +3379,7 @@ std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(const Has
         if (found == history_.end())
             continue;
         if (found->second.previous_known ||
-            (found->second.previous != Hash256{} &&
-             history_.contains(found->second.previous))) {
+            (found->second.previous != Hash256{} && history_.contains(found->second.previous))) {
             pending.push_back(found->second.previous);
         } else if (found->second.previous != Hash256{}) {
             // The boundary parent may be the common ancestor; do not walk
@@ -3418,8 +3418,7 @@ std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(const Has
         if (found == history_.end())
             continue;
         if (found->second.previous_known ||
-            (found->second.previous != Hash256{} &&
-             history_.contains(found->second.previous))) {
+            (found->second.previous != Hash256{} && history_.contains(found->second.previous))) {
             pending.push_back(found->second.previous);
         } else if (found->second.previous != Hash256{}) {
             // As above: matched, not traversed.
@@ -3455,12 +3454,12 @@ std::optional<MetadataHistoryLinks> MetadataReplica::history_links(const Hash256
     if (found == history_.end())
         return {};
     return MetadataHistoryLinks{found->second.generation, found->second.previous,
-                                found->second.previous_known,
-                                found->second.merge_parents, found->second.body};
+                                found->second.previous_known, found->second.merge_parents,
+                                found->second.body};
 }
 
-std::optional<MetadataHistoryEntry> MetadataReplica::full_history_record(
-    const Hash256& hash) const {
+std::optional<MetadataHistoryEntry>
+MetadataReplica::full_history_record(const Hash256& hash) const {
     auto value = materialized(hash);
     if (!value)
         return {};
@@ -3468,8 +3467,8 @@ std::optional<MetadataHistoryEntry> MetadataReplica::full_history_record(
     entry.generation = value->record.generation;
     entry.previous = value->record.previous;
     entry.hash = value->record.hash;
-    entry.previous_known = entry.generation > 1 && entry.previous != Hash256{} &&
-                           history_contains(entry.previous);
+    entry.previous_known =
+        entry.generation > 1 && entry.previous != Hash256{} && history_contains(entry.previous);
     entry.merge_parents = value->snapshot->merge_parents;
     entry.body = MetadataHistoryEntry::Body::full;
     entry.payload.assign(value->record.payload.begin(), value->record.payload.end());
@@ -3486,8 +3485,8 @@ std::vector<Hash256> MetadataReplica::unreconstructable_heads() const {
 }
 
 std::string MetadataReplica::flag_unreconstructable_locked(const Hash256& hash,
-                                                            Clock::time_point now,
-                                                            std::string_view context) const {
+                                                           Clock::time_point now,
+                                                           std::string_view context) const {
     const HeadsRevisionBump heads_bump(heads_revision_);
     const bool first_failure = !unreconstructable_head_retry_at_.contains(hash);
     unreconstructable_head_retry_at_[hash] = now + unreconstructable_retry_cooldown;
@@ -3524,8 +3523,9 @@ std::string MetadataReplica::diagnose_unreconstructable_locked(const Hash256& ta
         chain.push_back(cursor);
         auto parent = history_.find(cursor.previous);
         if (parent == history_.end())
-            return "delta " + describe(cursor) + " primary parent hash=" +
-                   hex(cursor.previous.bytes) + " absent from local history";
+            return "delta " + describe(cursor) +
+                   " primary parent hash=" + hex(cursor.previous.bytes) +
+                   " absent from local history";
         if (!metadata_delta_succession_valid(parent->second.generation, cursor.generation))
             return "delta " + describe(cursor) + " violates succession over parent gen=" +
                    std::to_string(parent->second.generation);
@@ -3544,8 +3544,7 @@ std::string MetadataReplica::diagnose_unreconstructable_locked(const Hash256& ta
         }
     }
     // The chain was not replayed: report only what was checked.
-    return "delta chain from anchor " + describe(cursor) + " over " +
-           std::to_string(chain.size()) +
+    return "delta chain from anchor " + describe(cursor) + " over " + std::to_string(chain.size()) +
            " frame(s) is structurally sound and every frame is readable; the failure is in "
            "materialisation itself and was not diagnosed here (replay it with "
            "macha-metadata-dump --objects to find the frame)";
@@ -3609,16 +3608,16 @@ bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) 
             // Drop only this certificate.
             Log::error("metadata accepted head certificate does not match its repaired record; "
                        "dropping the certificate hash=" +
-                       hex(entry.hash.bytes) + " generation=" +
-                       std::to_string(head->second.generation));
+                       hex(entry.hash.bytes) +
+                       " generation=" + std::to_string(head->second.generation));
             accepted_heads_.erase(head);
             persist_heads_locked();
         }
     }
     Log::info(std::string("metadata history re-anchored ") +
               (superseded ? "superseding unreplayable frame" : "with new record") +
-              " hash=" + hex(entry.hash.bytes) + " generation=" +
-              std::to_string(entry.generation) + " bytes=" + std::to_string(frame.size()));
+              " hash=" + hex(entry.hash.bytes) + " generation=" + std::to_string(entry.generation) +
+              " bytes=" + std::to_string(frame.size()));
     if (prune_accepted_heads_locked())
         persist_heads_locked();
     // Another flagged head may make the refresh throw; this repair still succeeded.
@@ -3667,7 +3666,8 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
             snapshot = std::make_shared<const MetadataSnapshot>(std::move(decoded));
         } else {
             auto decoded = *parent->snapshot;
-            apply_metadata_delta_in_place(decoded, decode_metadata_delta(entry.payload), namespace_applier_);
+            apply_metadata_delta_in_place(decoded, decode_metadata_delta(entry.payload),
+                                          namespace_applier_);
             record.payload = encode_snapshot_for_delta(entry.payload, decoded);
             snapshot = std::make_shared<const MetadataSnapshot>(std::move(decoded));
         }
@@ -3684,8 +3684,7 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
         Lock lock(m_);
         if (history_.contains(entry.hash))
             return true;
-        if (entry.body == MetadataHistoryEntry::Body::delta &&
-            !history_.contains(entry.previous))
+        if (entry.body == MetadataHistoryEntry::Body::delta && !history_.contains(entry.previous))
             return false;
     }
     uint64_t file_offset;
@@ -3695,12 +3694,10 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
     }
     write_history_frame(frame);
     Lock lock(m_);
-    history_.emplace(entry.hash,
-                     index_history_entry(entry, file_offset, frame.size()));
+    history_.emplace(entry.hash, index_history_entry(entry, file_offset, frame.size()));
     ++history_records_;
     history_bytes_ += frame.size();
-    cache_materialization_locked(candidate->record, candidate->snapshot,
-                                 candidate->resident_bytes);
+    cache_materialization_locked(candidate->record, candidate->snapshot, candidate->resident_bytes);
     std::optional<MetadataRecord> pending_checkpoint;
     if (prune_accepted_heads_locked()) {
         persist_heads_locked();
@@ -3725,8 +3722,8 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     entry_value.generation = record.generation;
     entry_value.previous = record.previous;
     entry_value.hash = record.hash;
-    entry_value.previous_known = record.generation > 1 && record.previous != Hash256{} &&
-                                 history_contains(record.previous);
+    entry_value.previous_known =
+        record.generation > 1 && record.previous != Hash256{} && history_contains(record.previous);
     try {
         entry_value.merge_parents = decode_snapshot(record.payload).merge_parents;
     } catch (...) {
@@ -3751,9 +3748,9 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
             auto parent = materialized(entry_value.previous);
             if (!parent ||
                 !metadata_delta_succession_valid(parent->record.generation, record.generation)) {
-                Log::debug("metadata delta body rejected generation=" +
-                           std::to_string(record.generation) +
-                           (parent ? " reason=succession" : " reason=parent-not-materialized"));
+                Log::debug(
+                    "metadata delta body rejected generation=" + std::to_string(record.generation) +
+                    (parent ? " reason=succession" : " reason=parent-not-materialized"));
                 return false;
             }
             auto snapshot = *parent->snapshot;
@@ -3778,9 +3775,9 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
         if (entry_value.body == MetadataHistoryEntry::Body::delta)
             Log::debug("metadata delta body rejected generation=" +
                        std::to_string(record.generation) + " reason=" +
-                       (!reconstructed ? "no-reconstruction"
+                       (!reconstructed                                    ? "no-reconstruction"
                         : reconstructed->record.payload != record.payload ? "payload-mismatch"
-                                                                           : "identity-mismatch"));
+                                                                          : "identity-mismatch"));
         return false;
     }
     auto frame = encode_history_frame(entry_value);
@@ -3801,8 +3798,7 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     }
     write_history_frame(frame);
     Lock lock(m_);
-    history_.emplace(entry_value.hash,
-                     index_history_entry(entry_value, file_offset, frame.size()));
+    history_.emplace(entry_value.hash, index_history_entry(entry_value, file_offset, frame.size()));
     ++history_records_;
     history_bytes_ += frame.size();
     cache_materialization_locked(reconstructed->record, reconstructed->snapshot,
@@ -3941,7 +3937,8 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input, bool* heads
             }
         }
     }
-    if (pending_checkpoint) persist(checkpoint_p_, *pending_checkpoint);
+    if (pending_checkpoint)
+        persist(checkpoint_p_, *pending_checkpoint);
     return true;
 }
 
@@ -4099,15 +4096,14 @@ MetadataReplica::materialized(const Hash256& hash) const {
         return {};
     }
 
-    auto value = make_materialization(
-        std::move(working_record),
-        std::make_shared<const MetadataSnapshot>(std::move(working_snapshot)));
+    auto value =
+        make_materialization(std::move(working_record),
+                             std::make_shared<const MetadataSnapshot>(std::move(working_snapshot)));
 
     Lock lock(m_);
     // Cache only the requested result, and only if compaction has not removed it.
     if (history_.contains(value->record.hash))
-        value = cache_materialization_locked(value->record, value->snapshot,
-                                             value->resident_bytes);
+        value = cache_materialization_locked(value->record, value->snapshot, value->resident_bytes);
     if (auto cached = materialized_history_.find(hash); cached != materialized_history_.end())
         return cached->second.value;
     return value && value->record.hash == hash ? value

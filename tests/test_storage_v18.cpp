@@ -77,26 +77,29 @@ class HeldOperation {
     void hold(InterposedLocalStoreFiles& files, InterposedLocalStoreFiles::Op op,
               std::filesystem::path path = {}) {
         files_ = &files;
-        files.before([this, op, path](InterposedLocalStoreFiles::Op seen,
-                                      const std::filesystem::path& at) {
-            if (seen != op || (!path.empty() && at != path))
-                return;
-            if (calls_.fetch_add(1) == 0) {
-                entered_.set_value();
-                released_.wait();
-            }
-        });
+        files.before(
+            [this, op, path](InterposedLocalStoreFiles::Op seen, const std::filesystem::path& at) {
+                if (seen != op || (!path.empty() && at != path))
+                    return;
+                if (calls_.fetch_add(1) == 0) {
+                    entered_.set_value();
+                    released_.wait();
+                }
+            });
     }
-    bool entered() { return entered_future_.wait_for(scaled(2s)) == std::future_status::ready; }
+    bool entered() {
+        return entered_future_.wait_for(scaled(2s)) == std::future_status::ready;
+    }
     void release() {
         if (!released_once_.exchange(true))
             release_.set_value();
     }
-    uint64_t calls() const { return calls_.load(); }
+    uint64_t calls() const {
+        return calls_.load();
+    }
 };
 
-template <class T>
-bool ready(std::future<T>& future, std::chrono::milliseconds within = 2s) {
+template <class T> bool ready(std::future<T>& future, std::chrono::milliseconds within = 2s) {
     return future.wait_for(within) == std::future_status::ready;
 }
 
@@ -230,8 +233,8 @@ MACHA_FAST_TEST("storage_v18", test_pack_recovery_settles_each_kind_of_damage) {
     };
     std::vector<Tail> tails;
     tails.push_back({"incomplete record",
-                     Bytes{'M', 'A', 'C', 'H', 'P', 'K', '0', '1', 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                           11, 12, 13, 14, 15},
+                     Bytes{'M', 'A', 'C', 'H', 'P', 'K', '0', '1', 1,  2,  3, 4,
+                           5,   6,   7,   8,   9,   10,  11,  12,  13, 14, 15},
                      true});
     tails.push_back({"zero-filled header", Bytes(pack_header_size, 0), false});
     tails.push_back({"garbage header", pattern(pack_header_size, 0x5a), false});
@@ -339,12 +342,14 @@ MACHA_FAST_TEST("storage_v18", test_held_device_io_blocks_only_its_own_object) {
         HeldOperation held;
         held.hold(files, InterposedLocalStoreFiles::Op::install,
                   store.object_path(object_id(loader)));
-        auto write = std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
+        auto write =
+            std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
         REQUIRE(held.entered());
         auto read = std::async(std::launch::async, [&] { return store.get(object_id(viewer)); });
         REQUIRE(ready(read));
         CHECK(read.get() == std::optional<Bytes>{viewer});
-        auto same = std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
+        auto same =
+            std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
         CHECK(!ready(same, 20ms));
         held.release();
         REQUIRE(ready(write));
@@ -390,12 +395,14 @@ MACHA_FAST_TEST("storage_v18", test_held_device_io_blocks_only_its_own_object) {
         const auto loader = pattern(128 * 1024, 0x73);
         HeldOperation held;
         held.hold(files, InterposedLocalStoreFiles::Op::append);
-        auto write = std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
+        auto write =
+            std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
         REQUIRE(held.entered());
         auto read = std::async(std::launch::async, [&] { return store.get(object_id(viewer)); });
         REQUIRE(ready(read));
         CHECK(read.get() == std::optional<Bytes>{viewer});
-        auto same = std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
+        auto same =
+            std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
         CHECK(!ready(same, 20ms));
         CHECK(held.calls() == 1);
         held.release();
@@ -424,7 +431,8 @@ MACHA_FAST_TEST("storage_v18", test_held_device_io_blocks_only_its_own_object) {
         REQUIRE(held.entered());
         auto packed_read =
             std::async(std::launch::async, [&] { return store.get(object_id(packed_viewer)); });
-        auto loose_read = std::async(std::launch::async, [&] { return store.get(object_id(viewer)); });
+        auto loose_read =
+            std::async(std::launch::async, [&] { return store.get(object_id(viewer)); });
         REQUIRE(ready(packed_read));
         REQUIRE(ready(loose_read));
         CHECK(packed_read.get() == std::optional<Bytes>{packed_viewer});
@@ -517,9 +525,8 @@ MACHA_FAST_TEST("storage_v18", test_presence_is_known_without_reading_objects) {
 
     LocalStore reopened(root, options, key);
     // Every loose object name, including the truncated file's.
-    REQUIRE(wait_until([&] {
-        return reopened.diagnostics().presence_index_entries == more_loose.size() + 2;
-    }));
+    REQUIRE(wait_until(
+        [&] { return reopened.diagnostics().presence_index_entries == more_loose.size() + 2; }));
     for (const auto& id : more_loose)
         CHECK(reopened.has(id));
     CHECK(reopened.has(object_id(loose)));
@@ -633,7 +640,8 @@ MACHA_TEST("storage_v18", test_a_store_tells_a_bad_record_from_a_failed_read) {
         return false;
     };
     {
-        LocalStore packed(t.path() / "packed", packed_options(64ULL * 1024 * 1024, 16ULL * 1024 * 1024), key);
+        LocalStore packed(t.path() / "packed",
+                          packed_options(64ULL * 1024 * 1024, 16ULL * 1024 * 1024), key);
         const auto first = pattern(16 * 1024, 1);
         const auto last = pattern(16 * 1024, 2);
         REQUIRE(packed.put(object_id(first), first));
@@ -693,10 +701,15 @@ class StorageClusterNode {
         : config_(std::move(config)), keys_(keys) {}
     ~StorageClusterNode() {
         if (started_ && node_) {
-            try { node_->stop(); } catch (...) {}
+            try {
+                node_->stop();
+            } catch (...) {
+            }
         }
     }
-    Config& config() { return config_; }
+    Config& config() {
+        return config_;
+    }
     void prepare() {
         REQUIRE(!node_);
         for (const auto& backend : config_.storage_backends)
@@ -706,15 +719,20 @@ class StorageClusterNode {
         node_ = std::make_unique<BareNode>(config_, keys_);
     }
     void start() {
-        if (!node_) prepare();
+        if (!node_)
+            prepare();
         node_->start();
         started_ = true;
         REQUIRE(node_->wait_local_state_ready(10s));
-        store_ = std::make_unique<DistributedStore>(*node_, node_->local_state(), node_->resources.activity,
-                                                    node_->resources.data, node_->resources.memory, node_->resources.events);
+        store_ = std::make_unique<DistributedStore>(
+            *node_, node_->local_state(), node_->resources.activity, node_->resources.data,
+            node_->resources.memory, node_->resources.events);
         metadata_store_ = macha::test_support::distributed_store_for(*node_);
-        metadata_ = std::make_unique<MetadataManager>(*node_, node_->local_state(), node_->metadata_server(), *metadata_store_);
-        catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->local_state(), node_->metadata_server(), *store_, *metadata_, node_->ledger());
+        metadata_ = std::make_unique<MetadataManager>(*node_, node_->local_state(),
+                                                      node_->metadata_server(), *metadata_store_);
+        catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->local_state(),
+                                                        node_->metadata_server(), *store_,
+                                                        *metadata_, node_->ledger());
     }
     // A process restart in miniature: a fresh NodeRuntime over the same
     // on-disk state gets a fresh durability epoch and fresh backend instance
@@ -734,11 +752,26 @@ class StorageClusterNode {
         node_.reset();
         started_ = false;
     }
-    BareNode& node() { REQUIRE(node_); return *node_; }
-    LocalState& local_state() { REQUIRE(node_); return node_->local_state(); }
-    DistributedStore& store() { REQUIRE(store_); return *store_; }
-    MetadataManager& metadata() { REQUIRE(metadata_); return *metadata_; }
-    CatalogueManager& catalogue() { REQUIRE(catalogue_); return *catalogue_; }
+    BareNode& node() {
+        REQUIRE(node_);
+        return *node_;
+    }
+    LocalState& local_state() {
+        REQUIRE(node_);
+        return node_->local_state();
+    }
+    DistributedStore& store() {
+        REQUIRE(store_);
+        return *store_;
+    }
+    MetadataManager& metadata() {
+        REQUIRE(metadata_);
+        return *metadata_;
+    }
+    CatalogueManager& catalogue() {
+        REQUIRE(catalogue_);
+        return *catalogue_;
+    }
 };
 
 Config storage_node_config(const TestCluster& cluster, std::string_view name, uint16_t port,
@@ -763,14 +796,17 @@ Config storage_node_config(const TestCluster& cluster, std::string_view name, ui
     return config;
 }
 
-Bytes preferred_for(NodeRuntime& observer, const NodeId& preferred, size_t bytes, uint8_t salt_start = 0) {
+Bytes preferred_for(NodeRuntime& observer, const NodeId& preferred, size_t bytes,
+                    uint8_t salt_start = 0) {
     // Placement uses the observer's active membership, so the preferred node
     // must be active there before any candidate can prefer it.
-    REQUIRE(wait_until([&] {
-        const auto active = observer.membership().active();
-        return std::any_of(active.begin(), active.end(),
-                           [&](const NodeInfo& node) { return node.id == preferred; });
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto active = observer.membership().active();
+            return std::any_of(active.begin(), active.end(),
+                               [&](const NodeInfo& node) { return node.id == preferred; });
+        },
+        10s));
     // The whole counter is written into the object so all 4096 candidates are
     // distinct, enough to find a node with a small capacity weight.
     auto data = pattern(bytes, salt_start);
@@ -808,9 +844,8 @@ MACHA_TEST("storage_v18", test_a_full_preferred_node_spills_data_but_not_control
     const auto large_port = free_port();
     StorageClusterNode small(storage_node_config(cluster, "small", small_port, 384ULL * 1024, 1, 2),
                              cluster.keys());
-    StorageClusterNode large(storage_node_config(cluster, "large", large_port,
-                                                 16ULL * 1024 * 1024, 1, 2,
-                                                 {{"127.0.0.1", small_port}}),
+    StorageClusterNode large(storage_node_config(cluster, "large", large_port, 16ULL * 1024 * 1024,
+                                                 1, 2, {{"127.0.0.1", small_port}}),
                              cluster.keys());
     small.start();
     large.start();
@@ -857,15 +892,17 @@ MACHA_TEST("storage_v18", test_a_full_preferred_node_spills_data_but_not_control
 
     // The reader's view is its own head: maintenance's merge (no maintenance
     // runs in this fixture) brings the writer's commit into it.
-    REQUIRE(wait_until([&] {
-        try {
-            small.metadata().repair_once();
-            small.catalogue().follow_head();
-            return small.catalogue().get(item.id).has_value();
-        } catch (...) {
-            return false;
-        }
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                small.metadata().repair_once();
+                small.catalogue().follow_head();
+                return small.catalogue().get(item.id).has_value();
+            } catch (...) {
+                return false;
+            }
+        },
+        10s));
     auto fetched = small.catalogue().artwork(art.id);
     REQUIRE(fetched.has_value());
     CHECK(fetched->bytes == art_bytes);
@@ -878,9 +915,9 @@ MACHA_TEST("storage_v18", test_a_full_preferred_node_spills_data_but_not_control
 MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable_objects) {
     TestCluster cluster;
     const auto lonely_port = free_port();
-    StorageClusterNode node(storage_node_config(cluster, "lonely", lonely_port, 8ULL * 1024 * 1024,
-                                                2, 1),
-                            cluster.keys());
+    StorageClusterNode node(
+        storage_node_config(cluster, "lonely", lonely_port, 8ULL * 1024 * 1024, 2, 1),
+        cluster.keys());
     node.start();
 
     const auto present_bytes = pattern(64 * 1024, 7);
@@ -912,7 +949,8 @@ MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable
     {
         std::vector<ObjectId> settled;
         for (int i = 0; i < 1000; ++i)
-            settled.push_back(object_id(pattern(256 + static_cast<size_t>(i), static_cast<uint8_t>(i))));
+            settled.push_back(
+                object_id(pattern(256 + static_cast<size_t>(i), static_cast<uint8_t>(i))));
         std::sort(settled.begin(), settled.end());
         const auto long_pass =
             node.store().repair_step(4ULL * 1024 * 1024, 16, settled, {}, 0, unavailable);
@@ -924,8 +962,8 @@ MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable
         // the live set beside it.
         std::vector<ObjectId> lacking{settled[10], settled[500]};
         std::sort(lacking.begin(), lacking.end());
-        const auto listed = node.store().repair_step(4ULL * 1024 * 1024, 16, settled, {}, 0,
-                                                     unavailable, lacking);
+        const auto listed =
+            node.store().repair_step(4ULL * 1024 * 1024, 16, settled, {}, 0, unavailable, lacking);
         CHECK(listed.pull_examined == lacking.size());
         CHECK(asked == lacking);
         asked.clear();
@@ -944,18 +982,22 @@ MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable
 
     // A peer with every disk online that does not hold it says so, and the
     // peer's arrival makes the waiting object due at once.
-    StorageClusterNode peer(storage_node_config(cluster, "peer", free_port(), 8ULL * 1024 * 1024,
-                                                2, 1, {{"127.0.0.1", lonely_port}}),
+    StorageClusterNode peer(storage_node_config(cluster, "peer", free_port(), 8ULL * 1024 * 1024, 2,
+                                                1, {{"127.0.0.1", lonely_port}}),
                             cluster.keys());
     peer.start();
-    REQUIRE(wait_until([&] {
-        return node.node().membership().active().size() == 2 &&
-               peer.node().membership().active().size() == 2;
-    }, 10s));
-    REQUIRE(wait_until([&] {
-        (void)step();
-        return node.store().repair_diagnostics().pull_unsourceable > 0;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            return node.node().membership().active().size() == 2 &&
+                   peer.node().membership().active().size() == 2;
+        },
+        10s));
+    REQUIRE(wait_until(
+        [&] {
+            (void)step();
+            return node.store().repair_diagnostics().pull_unsourceable > 0;
+        },
+        10s));
     CHECK(!peer.local_state().data().has(missing));
     // With a held object beside it in the live set (sorted: repair
     // binary-searches it), only the missing one is unsourceable.
@@ -987,10 +1029,12 @@ MACHA_TEST("storage_v18", test_a_busy_peer_still_says_what_it_does_not_hold) {
                          cluster.keys());
     a.start();
     b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            return a.node().membership().active().size() == 2 &&
+                   b.node().membership().active().size() == 2;
+        },
+        10s));
     NodeInfo peer;
     for (const auto& member : a.node().membership().active())
         if (member.id == b.node().node_id())
@@ -1039,9 +1083,9 @@ MACHA_TEST("storage_v18", test_durability_barrier_across_peer_restarts) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
     const auto b_port = free_port();
-    StorageClusterNode a(storage_node_config(cluster, "epoch-a", a_port, 64ULL * 1024 * 1024, 2, 1,
-                                             {}, 2),
-                         cluster.keys());
+    StorageClusterNode a(
+        storage_node_config(cluster, "epoch-a", a_port, 64ULL * 1024 * 1024, 2, 1, {}, 2),
+        cluster.keys());
     StorageClusterNode b(storage_node_config(cluster, "epoch-b", b_port, 64ULL * 1024 * 1024, 2, 1,
                                              {{"127.0.0.1", a_port}}, 2),
                          cluster.keys());
@@ -1049,10 +1093,12 @@ MACHA_TEST("storage_v18", test_durability_barrier_across_peer_restarts) {
     b.start();
     // Active, and each node's capacity known to the other: placement weighs by it.
     const auto both_active = [&] {
-        return wait_until([&] {
-            return capacities_known(a.node().membership().active(), 2) &&
-                   capacities_known(b.node().membership().active(), 2);
-        }, 10s);
+        return wait_until(
+            [&] {
+                return capacities_known(a.node().membership().active(), 2) &&
+                       capacities_known(b.node().membership().active(), 2);
+            },
+            10s);
     };
     REQUIRE(both_active());
 
@@ -1068,11 +1114,13 @@ MACHA_TEST("storage_v18", test_durability_barrier_across_peer_restarts) {
     std::vector<ObjectId> unsatisfiable;
     bool durable = false;
     const auto definitive = [&] {
-        return wait_until([&] {
-            unsatisfiable.clear();
-            durable = a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable);
-            return durable || !unsatisfiable.empty();
-        }, 30s);
+        return wait_until(
+            [&] {
+                unsatisfiable.clear();
+                durable = a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable);
+                return durable || !unsatisfiable.empty();
+            },
+            30s);
     };
 
     const auto old_epoch = b.node().durability_epoch();
@@ -1112,19 +1160,23 @@ MACHA_TEST("storage_v18", test_min_write_two_uses_fallback_when_preferred_replic
     // preferred replica, not capacity-weighted placement.
     constexpr uint64_t node_limit = 2ULL * 1024 * 1024;
     auto a_config = storage_node_config(cluster, "a", a_port, node_limit, 2, 1, {}, 2);
-    auto b_config = storage_node_config(cluster, "b", b_port, node_limit, 2, 1,
-                                        {{"127.0.0.1", a_port}}, 2);
-    auto c_config = storage_node_config(cluster, "c", c_port, node_limit, 2, 1,
-                                        {{"127.0.0.1", a_port}}, 2);
+    auto b_config =
+        storage_node_config(cluster, "b", b_port, node_limit, 2, 1, {{"127.0.0.1", a_port}}, 2);
+    auto c_config =
+        storage_node_config(cluster, "c", c_port, node_limit, 2, 1, {{"127.0.0.1", a_port}}, 2);
     StorageClusterNode a(std::move(a_config), cluster.keys());
     StorageClusterNode b(std::move(b_config), cluster.keys());
     StorageClusterNode c(std::move(c_config), cluster.keys());
-    a.start(); b.start(); c.start();
-    REQUIRE(wait_until([&] {
-        return capacities_known(a.node().membership().active(), 3) &&
-               capacities_known(b.node().membership().active(), 3) &&
-               capacities_known(c.node().membership().active(), 3);
-    }, 5s));
+    a.start();
+    b.start();
+    c.start();
+    REQUIRE(wait_until(
+        [&] {
+            return capacities_known(a.node().membership().active(), 3) &&
+                   capacities_known(b.node().membership().active(), 3) &&
+                   capacities_known(c.node().membership().active(), 3);
+        },
+        5s));
 
     fill_data_store(a.local_state().data());
     Bytes data;
@@ -1133,7 +1185,8 @@ MACHA_TEST("storage_v18", test_min_write_two_uses_fallback_when_preferred_replic
         data = pattern(128 * 1024, static_cast<uint8_t>(i));
         data[0] ^= static_cast<uint8_t>(i * 13U);
         order = capacity_placement_nodes(object_id(data).bytes, b.node().membership().active(), 2);
-        if (!order.empty() && order.front().id == a.node().node_id()) break;
+        if (!order.empty() && order.front().id == a.node().node_id())
+            break;
     }
     REQUIRE(!order.empty());
     REQUIRE(order.front().id == a.node().node_id());
@@ -1158,28 +1211,32 @@ MACHA_TEST("storage_v18", test_min_write_floor_publishes_then_repair_converges_t
     REQUIRE(first.store().put(id, data));
     CHECK(first.local_state().data().has(id));
 
-    auto second_config = storage_node_config(
-        cluster, "second", second_port, 8ULL * 1024 * 1024, 2, 1,
-        {{"127.0.0.1", first_port}});
+    auto second_config = storage_node_config(cluster, "second", second_port, 8ULL * 1024 * 1024, 2,
+                                             1, {{"127.0.0.1", first_port}});
     StorageClusterNode second(std::move(second_config), cluster.keys());
     second.start();
-    REQUIRE(wait_until([&] {
-        return first.node().membership().active().size() == 2 &&
-               second.node().membership().active().size() == 2;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            return first.node().membership().active().size() == 2 &&
+                   second.node().membership().active().size() == 2;
+        },
+        5s));
     CHECK(!second.local_state().data().has(id));
 
     const std::vector<ObjectId> live{id};
-    REQUIRE(wait_until([&] {
-        first.store().repair_once(4ULL * 1024 * 1024, live);
-        second.store().repair_once(4ULL * 1024 * 1024, live);
-        return first.local_state().data().has(id) && second.local_state().data().has(id);
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            first.store().repair_once(4ULL * 1024 * 1024, live);
+            second.store().repair_once(4ULL * 1024 * 1024, live);
+            return first.local_state().data().has(id) && second.local_state().data().has(id);
+        },
+        5s));
     REQUIRE(second.local_state().data().get(id).has_value());
     CHECK(*second.local_state().data().get(id) == data);
 }
 
-MACHA_TEST("storage_v18", test_nodes_replicating_to_each_other_do_not_hold_their_slots_across_the_peer) {
+MACHA_TEST("storage_v18",
+           test_nodes_replicating_to_each_other_do_not_hold_their_slots_across_the_peer) {
     // Each node has one background DATA slot and replicates its own objects
     // to the other. A sender that kept its slot while the peer admitted the
     // object would leave both nodes waiting on each other's slot.
@@ -1195,10 +1252,12 @@ MACHA_TEST("storage_v18", test_nodes_replicating_to_each_other_do_not_hold_their
     StorageClusterNode b(std::move(b_config), cluster.keys());
     a.start();
     b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            return a.node().membership().active().size() == 2 &&
+                   b.node().membership().active().size() == 2;
+        },
+        5s));
 
     constexpr size_t threads_per_node = 4;
     constexpr size_t objects_per_thread = 8;
@@ -1237,10 +1296,12 @@ MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_wit
     StorageClusterNode b(std::move(b_config), cluster.keys());
     a.start();
     b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            return a.node().membership().active().size() == 2 &&
+                   b.node().membership().active().size() == 2;
+        },
+        5s));
 
     constexpr size_t extents = 3000;
     std::vector<ObjectId> ids;
@@ -1281,10 +1342,12 @@ MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget
     StorageClusterNode b(std::move(b_config), cluster.keys());
     a.start();
     b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            return a.node().membership().active().size() == 2 &&
+                   b.node().membership().active().size() == 2;
+        },
+        10s));
 
     // Two windows past the budget.
     const size_t count = max_pending_rpc_requests * 2;
@@ -1345,10 +1408,12 @@ MACHA_TEST("storage_v18", test_a_control_offer_sends_only_what_the_peer_lacks) {
     StorageClusterNode b(std::move(b_config), cluster.keys());
     a.start();
     b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            return a.node().membership().active().size() == 2 &&
+                   b.node().membership().active().size() == 2;
+        },
+        5s));
 
     const auto held = pattern(64 * 1024, 31);
     const auto lacking = pattern(64 * 1024, 32);
@@ -1380,21 +1445,27 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
     const auto a_port = free_port();
     const auto b_port = free_port();
     auto a_config = storage_node_config(cluster, "control-a", a_port, 8ULL * 1024 * 1024, 1, 2);
-    auto b_config = storage_node_config(
-        cluster, "control-b", b_port, 8ULL * 1024 * 1024, 1, 2,
-        {{"127.0.0.1", a_port}});
+    auto b_config = storage_node_config(cluster, "control-b", b_port, 8ULL * 1024 * 1024, 1, 2,
+                                        {{"127.0.0.1", a_port}});
     StorageClusterNode a(std::move(a_config), cluster.keys());
     StorageClusterNode b(std::move(b_config), cluster.keys());
     a.start();
     b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 5s));
-    REQUIRE(wait_until([&] {
-        try { return b.metadata().snapshot().metadata_voters.empty(); }
-        catch (...) { return false; }
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            return a.node().membership().active().size() == 2 &&
+                   b.node().membership().active().size() == 2;
+        },
+        5s));
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                return b.metadata().snapshot().metadata_voters.empty();
+            } catch (...) {
+                return false;
+            }
+        },
+        5s));
 
     CatalogueItem item;
     item.id = "tmdb:movie:1800";
@@ -1413,21 +1484,24 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
     REQUIRE(a.node().control_store().get(root).has_value());
     // And a's head carries the commit once maintenance's merge has run (no
     // maintenance runs in this fixture).
-    REQUIRE(wait_until([&] {
-        try {
-            a.metadata().repair_once();
-            return a.metadata().local().snapshot->catalogue_root == root;
-        } catch (...) {
-            return false;
-        }
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                a.metadata().repair_once();
+                return a.metadata().local().snapshot->catalogue_root == root;
+            } catch (...) {
+                return false;
+            }
+        },
+        10s));
     // The namespace tree's nodes are CONTROL objects too, but namespace repair
     // restores them, not the catalogue's.
     std::vector<ObjectId> tree;
     {
-        const auto reader = ControlNamespaceNodeStore::for_reading(a.node().control_store(), a.store());
-        for_each_namespace_entry(a.metadata().snapshot(), &reader,
-                                 [](const std::string&, const FsEntry&) {}, tree);
+        const auto reader =
+            ControlNamespaceNodeStore::for_reading(a.node().control_store(), a.store());
+        for_each_namespace_entry(
+            a.metadata().snapshot(), &reader, [](const std::string&, const FsEntry&) {}, tree);
     }
     auto referenced = a.node().control_store().list();
     std::erase_if(referenced, [&](const ObjectId& id) {
@@ -1444,7 +1518,8 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
     // A fresh catalogue manager has no in-memory snapshot to hide the missing
     // physical control objects. Repair must fetch the manifest/shards from the
     // other metadata replica and leave them durable locally again.
-    CatalogueManager fresh(a.node(), a.node().local_state(), a.node().metadata_server(), a.store(), a.metadata(), a.node().ledger());
+    CatalogueManager fresh(a.node(), a.node().local_state(), a.node().metadata_server(), a.store(),
+                           a.metadata(), a.node().ledger());
     fresh.repair_once();
     REQUIRE(fresh.get(item.id).has_value());
     for (const auto& id : referenced)
@@ -1486,18 +1561,20 @@ MACHA_TEST("storage_v18", test_edge_node_never_owns_and_its_writes_land_on_owner
         std::sort(out.begin(), out.end());
         return out;
     };
-    REQUIRE(wait_until([&] {
-        const auto view1 = hosting_view(s1.node());
-        const auto view2 = hosting_view(s2.node());
-        return edge.node().membership().active().size() == 3 &&
-               s1.node().membership().active().size() == 3 &&
-               s2.node().membership().active().size() == 3 &&
-               !s1.node().membership().hosts_extents(edge_id) &&
-               !s2.node().membership().hosts_extents(edge_id) &&
-               view1.size() == 2 && view1 == view2 &&
-               std::all_of(view1.begin(), view1.end(),
-                           [](const auto& member) { return std::get<1>(member) > 0; });
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto view1 = hosting_view(s1.node());
+            const auto view2 = hosting_view(s2.node());
+            return edge.node().membership().active().size() == 3 &&
+                   s1.node().membership().active().size() == 3 &&
+                   s2.node().membership().active().size() == 3 &&
+                   !s1.node().membership().hosts_extents(edge_id) &&
+                   !s2.node().membership().hosts_extents(edge_id) && view1.size() == 2 &&
+                   view1 == view2 &&
+                   std::all_of(view1.begin(), view1.end(),
+                               [](const auto& member) { return std::get<1>(member) > 0; });
+        },
+        10s));
 
     // Never an owner, from any node's point of view, for any key.
     size_t owned_by_s1 = 0, owned_by_s2 = 0;
@@ -1514,8 +1591,8 @@ MACHA_TEST("storage_v18", test_edge_node_never_owns_and_its_writes_land_on_owner
     CHECK(owned_by_s2 > 0);
     CHECK(owned_by_s1 + owned_by_s2 == 512);
     if (owned_by_s1 + owned_by_s2 != 512)
-        Log::warn("edge-node placement views disagree owned_by_s1=" +
-                  std::to_string(owned_by_s1) + " owned_by_s2=" + std::to_string(owned_by_s2));
+        Log::warn("edge-node placement views disagree owned_by_s1=" + std::to_string(owned_by_s1) +
+                  " owned_by_s2=" + std::to_string(owned_by_s2));
 
     // A write from the edge node reaches an owner and stays off the edge.
     const auto data = pattern(256 * 1024, 7);
@@ -1574,10 +1651,12 @@ MACHA_TEST("storage_v18", test_node_that_stops_hosting_drains_through_repair) {
     s1.start();
     s2.start();
     const auto s2_id = s2.node().node_id();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() == 2 &&
-               s2.node().membership().active().size() == 2;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            return s1.node().membership().active().size() == 2 &&
+                   s2.node().membership().active().size() == 2;
+        },
+        10s));
 
     // Objects s2 owns while it still hosts.
     std::vector<ObjectId> owned;
@@ -1603,15 +1682,16 @@ MACHA_TEST("storage_v18", test_node_that_stops_hosting_drains_through_repair) {
 
     // Repair on the draining node pushes each copy to its owner and removes
     // the local one once the owner holds it.
-    REQUIRE(wait_until([&] {
-        (void)s2.store().repair_once();
-        return std::all_of(owned.begin(), owned.end(), [&](const ObjectId& id) {
-            return s1.node().local_store().has(id) && !s2.node().local_store().has(id);
-        });
-    }, 20s, 100ms));
+    REQUIRE(wait_until(
+        [&] {
+            (void)s2.store().repair_once();
+            return std::all_of(owned.begin(), owned.end(), [&](const ObjectId& id) {
+                return s1.node().local_store().has(id) && !s2.node().local_store().has(id);
+            });
+        },
+        20s, 100ms));
     for (const auto& id : owned) {
         const auto read = s2.store().get(id, 0, FrameType::speculative);
         CHECK(read.has_value());
     }
 }
-

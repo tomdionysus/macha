@@ -340,7 +340,9 @@ MACHA_TEST("availability", test_a_survey_a_peer_could_not_finish_keeps_what_was_
 class FailingSource final : public TrieSource {
   public:
     explicit FailingSource(ObjectTrie::Snapshot trie) : inner_(std::move(trie)) {}
-    ObjectTrie::Summary root() override { return inner_.root(); }
+    ObjectTrie::Summary root() override {
+        return inner_.root();
+    }
     std::vector<ObjectTrie::Children> children(std::span<const ObjectTrie::Prefix> p) override {
         throw std::runtime_error("peer went away");
         return inner_.children(p);
@@ -405,13 +407,13 @@ MACHA_FAST_TEST("availability", test_the_survey_by_diff_finds_what_no_node_holds
     TempDir dir;
     auto here_a = held_trie(dir.path() / "here-a", split(mine, 0));
     auto here_b = held_trie(dir.path() / "here-b", split(mine, 1));
-    const auto here = std::make_shared<const TrieUnion>(
-        std::vector{here_a->snapshot(), here_b->snapshot()});
+    const auto here =
+        std::make_shared<const TrieUnion>(std::vector{here_a->snapshot(), here_b->snapshot()});
     auto one_a = held_trie(dir.path() / "one-a", split(first, 0));
     auto one_b = held_trie(dir.path() / "one-b", split(first, 2));
     auto two = held_trie(dir.path() / "two", second);
-    UnionSource one_source(std::make_shared<const TrieUnion>(
-        std::vector{one_a->snapshot(), one_b->snapshot()}));
+    UnionSource one_source(
+        std::make_shared<const TrieUnion>(std::vector{one_a->snapshot(), one_b->snapshot()}));
     SnapshotSource two_source(two->snapshot());
     std::vector<TrieSource*> peers{&one_source, &two_source};
     const std::vector<ObjectId> referenced_list(referenced.begin(), referenced.end());
@@ -480,8 +482,8 @@ MACHA_FAST_TEST("availability", test_what_is_not_held_pauses_over_the_ids_beside
         others.push_back(numbered_id(i));
     const ReferencedSets sets(ReferencedSets::Views{}, others, {});
     size_t pauses = 0;
-    const auto missing = sets.not_held(RetentionClass::data, std::span<const ObjectTrie::Snapshot>{},
-                                       [&] { ++pauses; });
+    const auto missing = sets.not_held(RetentionClass::data,
+                                       std::span<const ObjectTrie::Snapshot>{}, [&] { ++pauses; });
     CHECK(missing.size() == others.size());
     CHECK(pauses == 2);
 }
@@ -564,8 +566,8 @@ MACHA_FAST_TEST("availability", test_items_take_their_best_file_and_sets_count_t
     file("macha:undecided", 4, 0, 2);
 
     CatalogueSnapshot catalogue;
-    const auto item = [&](const std::string& id, CatalogueKind kind,
-                          std::vector<std::string> media, std::optional<std::string> parent = {}) {
+    const auto item = [&](const std::string& id, CatalogueKind kind, std::vector<std::string> media,
+                          std::optional<std::string> parent = {}) {
         CatalogueItem value;
         value.id = id;
         value.kind = kind;
@@ -625,7 +627,8 @@ MACHA_FAST_TEST("availability", test_items_take_their_best_file_and_sets_count_t
 
     // A parent cycle ends instead of looping.
     catalogue.items["show"].parent_id = "s1";
-    CHECK(item_availability(CatalogueView::of(catalogue), &survey).size() == catalogue.items.size());
+    CHECK(item_availability(CatalogueView::of(catalogue), &survey).size() ==
+          catalogue.items.size());
 }
 
 MACHA_FAST_TEST("availability", test_the_item_table_is_rebuilt_only_when_a_snapshot_changes) {
@@ -861,8 +864,8 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
     first.filesystem().mkdir("/dir", 0755, getuid(), getgid());
     write_file(first.filesystem(), "/dir/holed.bin", pattern(extent * 3, 2));
 
-    const auto path_of = [](Service& service, std::string_view path)
-        -> std::optional<PathAvailability> {
+    const auto path_of = [](Service& service,
+                            std::string_view path) -> std::optional<PathAvailability> {
         const auto snapshot = service.availability().snapshot();
         if (!snapshot)
             return {};
@@ -940,9 +943,8 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
             [&] {
                 std::ifstream in(kept, std::ios::binary);
                 const Bytes bytes{std::istreambuf_iterator<char>(in), {}};
-                return !bytes.empty() &&
-                       decode_availability_paths(bytes).paths ==
-                           service->availability().snapshot()->paths;
+                return !bytes.empty() && decode_availability_paths(bytes).paths ==
+                                             service->availability().snapshot()->paths;
             },
             10s));
     }
@@ -957,8 +959,8 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
         return first.files_api().handle(request);
     };
     const auto json = [](const HttpResponse& response) {
-        return Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                       response.body.size()));
+        return Json::parse(
+            std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
     };
     {
         const auto response = get("/api/v1/files/dir/holed.bin");
@@ -996,8 +998,9 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
         std::map<std::string, std::string> listed;
         for (const auto& entry : root.find("entries")->asArray())
             listed[entry.find("path")->asString()] = entry.find("availability")->asString();
-        CHECK(listed == (std::map<std::string, std::string>{
-                            {"/dir", "partial"}, {"/later.bin", "complete"}, {"/whole.bin", "complete"}}));
+        CHECK(listed == (std::map<std::string, std::string>{{"/dir", "partial"},
+                                                            {"/later.bin", "complete"},
+                                                            {"/whole.bin", "complete"}}));
         CHECK(json(get("/api/v1/files/dir")).find("entries")->asArray().size() == 1);
         CHECK(json(get("/api/v1/files")).find("path")->asString() == "/");
     }
@@ -1072,7 +1075,10 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
     CHECK(get("/api/v1/files/nowhere").status == 404);
     CHECK(get("/api/v1/files/dir", "macha:00").status == 400);
     CHECK(get("/api/v1/files", "not-a-hash").status == 400);
-    CHECK(json(get("/api/v1/files", "macha:" + std::string(64, '0'))).find("files")->asArray().empty());
+    CHECK(json(get("/api/v1/files", "macha:" + std::string(64, '0')))
+              .find("files")
+              ->asArray()
+              .empty());
     {
         HttpRequest post;
         post.method = "POST";

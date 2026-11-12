@@ -51,9 +51,9 @@ struct TorrentClaim {
 
 struct TorrentRequest {
     // Set once, by the node that took the add.
-    std::string id;         // 32 lowercase hex, the job id clients use
-    std::string info_hash;  // v1 hex, else v2; the cluster-wide duplicate key
-    std::string source;     // canonical magnet, or "object:<hex>" for stored metainfo
+    std::string id;        // 32 lowercase hex, the job id clients use
+    std::string info_hash; // v1 hex, else v2; the cluster-wide duplicate key
+    std::string source;    // canonical magnet, or "object:<hex>" for stored metainfo
     uint64_t created_unix_ms{};
     NodeId created_by{};
 

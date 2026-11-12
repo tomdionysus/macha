@@ -19,14 +19,16 @@ class TrieSource {
     virtual ObjectTrie::Summary root() = 0;
     virtual std::vector<ObjectTrie::Children> children(std::span<const ObjectTrie::Prefix>) = 0;
     virtual std::vector<std::vector<ObjectTrie::Record>>
-    records(std::span<const ObjectTrie::Prefix>) = 0;
+        records(std::span<const ObjectTrie::Prefix>) = 0;
 };
 
 // A snapshot as a source. Keeps its own copy of the snapshot.
 class SnapshotSource final : public TrieSource {
   public:
     explicit SnapshotSource(ObjectTrie::Snapshot snapshot) : snapshot_(std::move(snapshot)) {}
-    ObjectTrie::Summary root() override { return {snapshot_.size(), snapshot_.root_hash()}; }
+    ObjectTrie::Summary root() override {
+        return {snapshot_.size(), snapshot_.root_hash()};
+    }
     std::vector<ObjectTrie::Children> children(std::span<const ObjectTrie::Prefix> p) override {
         return snapshot_.children(p);
     }

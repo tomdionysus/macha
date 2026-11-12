@@ -8,9 +8,9 @@
 
 #include <algorithm>
 #include <bit>
-#include <limits>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <tuple>
 
 namespace macha {
@@ -116,14 +116,14 @@ struct CatalogueManifest {
     std::array<std::optional<ObjectId>, catalogue_shard_count> shards;
 };
 
-
 Bytes encode_catalogue_manifest(const CatalogueManifest& manifest) {
     Writer writer;
     writer.raw(manifest_magic);
     writer.u32(catalogue_shard_count);
     for (const auto& shard : manifest.shards) {
         writer.u8(shard.has_value());
-        if (shard) writer.fixed(shard->bytes);
+        if (shard)
+            writer.fixed(shard->bytes);
     }
     return writer.take();
 }
@@ -137,7 +137,8 @@ CatalogueManifest decode_catalogue_manifest(std::span<const uint8_t> bytes) {
         throw DecodeError("unsupported catalogue shard count");
     CatalogueManifest manifest;
     for (auto& shard : manifest.shards) {
-        if (reader.u8()) shard = ObjectId{reader.fixed<32>()};
+        if (reader.u8())
+            shard = ObjectId{reader.fixed<32>()};
     }
     reader.finish();
     return manifest;
@@ -149,9 +150,10 @@ CatalogueManifest decode_catalogue_manifest(std::span<const uint8_t> bytes) {
 // they differ. A key only `after` holds is hashed to find its slot and kept
 // in `added`; the view's own keys carry their slot.
 template <class Map>
-void diff_slots(const std::array<const Map*, catalogue_shard_count>& before, const Map& after,
-                std::array<bool, catalogue_shard_count>& touched,
-                std::array<std::vector<typename Map::const_iterator>, catalogue_shard_count>& added) {
+void diff_slots(
+    const std::array<const Map*, catalogue_shard_count>& before, const Map& after,
+    std::array<bool, catalogue_shard_count>& touched,
+    std::array<std::vector<typename Map::const_iterator>, catalogue_shard_count>& added) {
     using Iterator = typename Map::const_iterator;
     struct Cursor {
         Iterator at, end;
@@ -283,13 +285,15 @@ CatalogueSnapshot::MediaProfile decode_media_profile(Reader& r) {
     profile.probe.duration_seconds = std::bit_cast<double>(r.u64());
     profile.probe.bitrate = r.u64();
     const auto count = r.u32();
-    if (count > 100000) throw DecodeError("too many media streams");
+    if (count > 100000)
+        throw DecodeError("too many media streams");
     profile.probe.streams.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         MediaStreamInfo stream;
         stream.index = static_cast<int32_t>(r.u32());
         const auto type = r.u8();
-        if (!valid_stream_type(type)) throw DecodeError("bad media stream type");
+        if (!valid_stream_type(type))
+            throw DecodeError("bad media stream type");
         stream.type = static_cast<MediaStreamType>(type);
         stream.codec = r.string(1024 * 1024);
         stream.profile = r.string(1024 * 1024);
@@ -358,7 +362,8 @@ const CatalogueItem* CatalogueView::item(std::string_view id) const {
     return found == shard->items.end() ? nullptr : &found->second;
 }
 
-const CatalogueSnapshot::MediaProfile* CatalogueView::media_profile(std::string_view media_id) const {
+const CatalogueSnapshot::MediaProfile*
+CatalogueView::media_profile(std::string_view media_id) const {
     const auto& shard = shards_[catalogue_shard(media_id)];
     if (!shard)
         return nullptr;
@@ -392,7 +397,9 @@ class CatalogueDraft {
     CatalogueDraft(CatalogueDraft&&) = default;
     CatalogueDraft& operator=(CatalogueDraft&&) = default;
 
-    const std::shared_ptr<const CatalogueView>& base() const noexcept { return base_; }
+    const std::shared_ptr<const CatalogueView>& base() const noexcept {
+        return base_;
+    }
 
     const CatalogueItem* item(std::string_view id) const {
         const auto* shard = read(catalogue_shard(id));
@@ -478,7 +485,9 @@ class CatalogueDraft {
                     f(id, index);
     }
 
-    bool written(size_t slot) const noexcept { return written_[slot].has_value(); }
+    bool written(size_t slot) const noexcept {
+        return written_[slot].has_value();
+    }
     // The written shard, none if the write left it empty.
     std::shared_ptr<const CatalogueSnapshot> take(size_t slot) {
         auto& shard = *written_[slot];
@@ -505,8 +514,8 @@ class CatalogueDraft {
     std::array<std::optional<CatalogueSnapshot>, catalogue_shard_count> written_;
 };
 
-bool valid_catalogue_media_profile(
-    std::string_view media_id, const CatalogueSnapshot::MediaProfile& profile) {
+bool valid_catalogue_media_profile(std::string_view media_id,
+                                   const CatalogueSnapshot::MediaProfile& profile) {
     if (!media_id.starts_with("macha:") || profile.schema_version < 1 ||
         profile.schema_version > catalogue_media_profile_schema || !profile.complete ||
         profile.probe.format.empty() || !std::isfinite(profile.probe.duration_seconds) ||
@@ -574,13 +583,15 @@ Bytes encode_catalogue(const CatalogueSnapshot& snapshot) {
     }
     w.u32(snapshot.media_profiles.size());
     for (const auto& [media_id, profile] : snapshot.media_profiles) {
-        if (media_id.empty()) throw std::runtime_error("invalid catalogue media profile identity");
+        if (media_id.empty())
+            throw std::runtime_error("invalid catalogue media profile identity");
         w.string(media_id);
         encode_media_profile(w, profile);
     }
     w.u32(snapshot.media_indexes.size());
     for (const auto& [media_id, index] : snapshot.media_indexes) {
-        if (media_id.empty()) throw std::runtime_error("invalid catalogue media index identity");
+        if (media_id.empty())
+            throw std::runtime_error("invalid catalogue media index identity");
         w.string(media_id);
         w.fixed(index.bytes);
     }
@@ -661,7 +672,8 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
     }
     if (!legacy) {
         const auto profile_count = r.u32();
-        if (profile_count > 1000000) throw DecodeError("too many media profiles");
+        if (profile_count > 1000000)
+            throw DecodeError("too many media profiles");
         for (uint32_t i = 0; i < profile_count; ++i) {
             auto media_id = r.string(1024 * 1024);
             auto profile = decode_media_profile(r);
@@ -672,11 +684,13 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
     }
     if (!legacy && !v0021) {
         const auto index_count = r.u32();
-        if (index_count > 1000000) throw DecodeError("too many media indexes");
+        if (index_count > 1000000)
+            throw DecodeError("too many media indexes");
         for (uint32_t i = 0; i < index_count; ++i) {
             auto media_id = r.string(1024 * 1024);
             ObjectId index{r.fixed<32>()};
-            if (media_id.empty() || !snapshot.media_indexes.emplace(std::move(media_id), index).second)
+            if (media_id.empty() ||
+                !snapshot.media_indexes.emplace(std::move(media_id), index).second)
                 throw DecodeError("invalid or duplicate media index identity");
         }
     }
@@ -684,16 +698,15 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
     return snapshot;
 }
 
-std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
-    const CatalogueSnapshot& base, const CatalogueSnapshot& left,
-    const CatalogueSnapshot& right) {
+std::optional<CatalogueSnapshot> merge_catalogue_snapshots(const CatalogueSnapshot& base,
+                                                           const CatalogueSnapshot& left,
+                                                           const CatalogueSnapshot& right) {
     std::set<std::string> ids;
     for (const auto* source : {&base.items, &left.items, &right.items})
         for (const auto& [id, _] : *source)
             ids.insert(id);
 
-    auto find_item = [](const auto& items, const std::string& id)
-        -> std::optional<CatalogueItem> {
+    auto find_item = [](const auto& items, const std::string& id) -> std::optional<CatalogueItem> {
         auto found = items.find(id);
         if (found == items.end())
             return {};
@@ -720,36 +733,51 @@ std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
 
     std::set<std::string> media_ids;
     for (const auto* source : {&base.media_profiles, &left.media_profiles, &right.media_profiles})
-        for (const auto& [id, _] : *source) media_ids.insert(id);
+        for (const auto& [id, _] : *source)
+            media_ids.insert(id);
     for (const auto& id : media_ids) {
         auto find = [&](const auto& profiles) -> std::optional<CatalogueSnapshot::MediaProfile> {
             auto it = profiles.find(id);
-            return it == profiles.end() ? std::optional<CatalogueSnapshot::MediaProfile>{} : it->second;
+            return it == profiles.end() ? std::optional<CatalogueSnapshot::MediaProfile>{}
+                                        : it->second;
         };
-        const auto b = find(base.media_profiles), l = find(left.media_profiles), r = find(right.media_profiles);
+        const auto b = find(base.media_profiles), l = find(left.media_profiles),
+                   r = find(right.media_profiles);
         std::optional<CatalogueSnapshot::MediaProfile> selected;
-        if (l == r) selected = l;
-        else if (l == b) selected = r;
-        else if (r == b) selected = l;
-        else return {};
-        if (selected) merged.media_profiles.emplace(id, std::move(*selected));
+        if (l == r)
+            selected = l;
+        else if (l == b)
+            selected = r;
+        else if (r == b)
+            selected = l;
+        else
+            return {};
+        if (selected)
+            merged.media_profiles.emplace(id, std::move(*selected));
     }
 
     std::set<std::string> indexed;
     for (const auto* source : {&base.media_indexes, &left.media_indexes, &right.media_indexes})
-        for (const auto& [id, _] : *source) indexed.insert(id);
+        for (const auto& [id, _] : *source)
+            indexed.insert(id);
     for (const auto& id : indexed) {
         auto find = [&](const auto& indexes) -> std::optional<ObjectId> {
             auto it = indexes.find(id);
             return it == indexes.end() ? std::optional<ObjectId>{} : it->second;
         };
-        const auto b = find(base.media_indexes), l = find(left.media_indexes), r = find(right.media_indexes);
+        const auto b = find(base.media_indexes), l = find(left.media_indexes),
+                   r = find(right.media_indexes);
         std::optional<ObjectId> selected;
-        if (l == r) selected = l;
-        else if (l == b) selected = r;
-        else if (r == b) selected = l;
-        else return {};
-        if (selected) merged.media_indexes.emplace(id, *selected);
+        if (l == r)
+            selected = l;
+        else if (l == b)
+            selected = r;
+        else if (r == b)
+            selected = l;
+        else
+            return {};
+        if (selected)
+            merged.media_indexes.emplace(id, *selected);
     }
 
     // A parent deletion on one branch with a child change on the other is not
@@ -833,16 +861,26 @@ uint64_t catalogue_resident_bytes(const CatalogueView& view) {
 
 std::string catalogue_kind_name(CatalogueKind kind) {
     switch (kind) {
-    case CatalogueKind::movie: return "movie";
-    case CatalogueKind::show: return "show";
-    case CatalogueKind::season: return "season";
-    case CatalogueKind::episode: return "episode";
-    case CatalogueKind::artist: return "artist";
-    case CatalogueKind::album: return "album";
-    case CatalogueKind::track: return "track";
-    case CatalogueKind::book: return "book";
-    case CatalogueKind::author: return "author";
-    case CatalogueKind::series: return "series";
+    case CatalogueKind::movie:
+        return "movie";
+    case CatalogueKind::show:
+        return "show";
+    case CatalogueKind::season:
+        return "season";
+    case CatalogueKind::episode:
+        return "episode";
+    case CatalogueKind::artist:
+        return "artist";
+    case CatalogueKind::album:
+        return "album";
+    case CatalogueKind::track:
+        return "track";
+    case CatalogueKind::book:
+        return "book";
+    case CatalogueKind::author:
+        return "author";
+    case CatalogueKind::series:
+        return "series";
     }
     return "unknown";
 }
@@ -872,21 +910,31 @@ bool CatalogueItem::refers_to(std::string_view id) const noexcept {
 }
 
 std::optional<CatalogueKind> parse_catalogue_kind(std::string_view value) {
-    if (value == "movie") return CatalogueKind::movie;
-    if (value == "show") return CatalogueKind::show;
-    if (value == "season") return CatalogueKind::season;
-    if (value == "episode") return CatalogueKind::episode;
-    if (value == "artist") return CatalogueKind::artist;
-    if (value == "album") return CatalogueKind::album;
-    if (value == "track") return CatalogueKind::track;
-    if (value == "book") return CatalogueKind::book;
-    if (value == "author") return CatalogueKind::author;
-    if (value == "series") return CatalogueKind::series;
+    if (value == "movie")
+        return CatalogueKind::movie;
+    if (value == "show")
+        return CatalogueKind::show;
+    if (value == "season")
+        return CatalogueKind::season;
+    if (value == "episode")
+        return CatalogueKind::episode;
+    if (value == "artist")
+        return CatalogueKind::artist;
+    if (value == "album")
+        return CatalogueKind::album;
+    if (value == "track")
+        return CatalogueKind::track;
+    if (value == "book")
+        return CatalogueKind::book;
+    if (value == "author")
+        return CatalogueKind::author;
+    if (value == "series")
+        return CatalogueKind::series;
     return {};
 }
 
 std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueView& catalogue,
-                                                           const CatalogueItem& item) {
+                                                          const CatalogueItem& item) {
     if (!item.artwork.empty())
         return item.artwork;
 
@@ -918,11 +966,11 @@ std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueView& c
                 !chosen ? std::string{}
                         : (chosen->sort_title.empty() ? chosen->title : chosen->sort_title);
             const bool earlier =
-                !chosen || (index.has_value() != chosen_index.has_value() ? index.has_value()
-                            : index && chosen_index && *index != *chosen_index
-                                ? *index < *chosen_index
-                                : std::tie(candidate_sort, candidate.id) <
-                                      std::tie(chosen_sort, chosen->id));
+                !chosen ||
+                (index.has_value() != chosen_index.has_value() ? index.has_value()
+                 : index && chosen_index && *index != *chosen_index
+                     ? *index < *chosen_index
+                     : std::tie(candidate_sort, candidate.id) < std::tie(chosen_sort, chosen->id));
             if (earlier) {
                 chosen = &candidate;
                 chosen_index = index;
@@ -967,8 +1015,8 @@ std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueView& c
 CatalogueManager::CatalogueManager(NodeRuntime& node, LocalState& local,
                                    MetadataServer& metadata_server, DistributedStore& store,
                                    MetadataView& metadata, const ObjectLedger& ledger)
-    : node_(node), local_(local), ledger_(ledger), metadata_server_(metadata_server),
-      store_(store), metadata_(metadata) {}
+    : node_(node), local_(local), ledger_(ledger), metadata_server_(metadata_server), store_(store),
+      metadata_(metadata) {}
 
 std::set<ObjectId> CatalogueManager::data_object_ids(const CatalogueSnapshot& snapshot) {
     std::set<ObjectId> ids;
@@ -1020,15 +1068,17 @@ CatalogueManager::load_view(const std::optional<ObjectId>& root, const Catalogue
             throw CatalogueUnavailable("catalogue shard unavailable: " + to_string(*shard_id));
         auto encoded_shard = local_.control().get(*shard_id);
         if (!encoded_shard)
-            throw CatalogueUnavailable("catalogue shard unavailable locally: " + to_string(*shard_id));
+            throw CatalogueUnavailable("catalogue shard unavailable locally: " +
+                                       to_string(*shard_id));
         read_ms += ms_since(read_started);
         ++read_shards;
         bytes += encoded_shard->size();
         auto shard = decode_catalogue(*encoded_shard);
         // Every key must hash to the slot that holds it, or lookups miss it.
         const auto misplaced = [&](const auto& map) {
-            return std::any_of(map.begin(), map.end(),
-                               [&](const auto& entry) { return catalogue_shard(entry.first) != i; });
+            return std::any_of(map.begin(), map.end(), [&](const auto& entry) {
+                return catalogue_shard(entry.first) != i;
+            });
         };
         if (misplaced(shard.items) || misplaced(shard.media_profiles) ||
             misplaced(shard.media_indexes))
@@ -1084,7 +1134,8 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
         std::vector<ObjectId> objects{*root};
         objects.reserve(catalogue_shard_count + 1);
         for (const auto& shard_id : manifest.shards) {
-            if (!shard_id) continue;
+            if (!shard_id)
+                continue;
             if (!store_.ensure_control_local(*shard_id))
                 throw CatalogueUnavailable("catalogue shard unavailable for control repair: " +
                                            to_string(*shard_id));
@@ -1098,9 +1149,8 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
         Log::debug("catalogue control convergence root=" + to_string(*root).substr(0, 12) +
                    " objects=" + std::to_string(objects.size()) +
                    " sent=" + std::to_string(offer.objects_sent) +
-                   " bytes=" + std::to_string(offer.bytes_sent) +
-                   " nodes=" + std::to_string(active_nodes.size()) +
-                   " complete=" + (complete ? "yes" : "no") +
+                   " bytes=" + std::to_string(offer.bytes_sent) + " nodes=" +
+                   std::to_string(active_nodes.size()) + " complete=" + (complete ? "yes" : "no") +
                    " ms=" + std::to_string(ms_since(offer_started)));
 
         Lock lock(mutex_);
@@ -1138,7 +1188,8 @@ void CatalogueManager::install_head(std::shared_ptr<const CatalogueView> known,
             // whatever the generation did.
             Lock lock(mutex_);
             if (ready_ && cached_root_ == root) {
-                cached_metadata_generation_ = std::max(cached_metadata_generation_, head.generation);
+                cached_metadata_generation_ =
+                    std::max(cached_metadata_generation_, head.generation);
                 last_sync_unix_ms_ = unix_ms();
                 return;
             }
@@ -1186,13 +1237,11 @@ void CatalogueManager::install_head(std::shared_ptr<const CatalogueView> known,
                        (root ? to_string(*root).substr(0, 12) : std::string("none")) +
                        " generation=" + std::to_string(head.generation) +
                        " source=" + (loaded ? "loaded" : "commit") +
-                       " items=" + std::to_string(view->item_count()) +
-                       " decoded_shards=" + std::to_string(decoded) +
-                       " resident_bytes=" + std::to_string(resident) +
+                       " items=" + std::to_string(view->item_count()) + " decoded_shards=" +
+                       std::to_string(decoded) + " resident_bytes=" + std::to_string(resident) +
                        " install_ms=" + std::to_string(install_ms) +
                        " count_ms=" + std::to_string(ms_since(count_started)) +
-                       " installs=" + std::to_string(installs) +
-                       " loads=" + std::to_string(loads));
+                       " installs=" + std::to_string(installs) + " loads=" + std::to_string(loads));
         }
     } catch (const std::exception& e) {
         // The previous view keeps serving; the next head change retries.
@@ -1337,7 +1386,8 @@ CatalogueStatus CatalogueManager::status() const {
     std::set<ObjectId> art;
     if (cached)
         for (const auto& [_, item] : cached->items())
-            for (const auto& artwork : item.artwork) art.insert(artwork.id);
+            for (const auto& artwork : item.artwork)
+                art.insert(artwork.id);
     status.artwork_objects = art.size();
     for (const auto& id : art)
         status.local_artwork_objects += local_.data().has(id) ? 1 : 0;
@@ -1364,8 +1414,7 @@ uint64_t CatalogueManager::resident_bytes() {
     return view ? catalogue_resident_bytes(*view) : 0;
 }
 
-std::shared_ptr<const CatalogueView>
-CatalogueManager::snapshot_view(const WorkContext& context) {
+std::shared_ptr<const CatalogueView> CatalogueManager::snapshot_view(const WorkContext& context) {
     bool warm = false;
     {
         Lock lock(mutex_);
@@ -1391,11 +1440,12 @@ std::optional<MediaProbeResult> CatalogueManager::media_profile(std::string_view
     return found->probe;
 }
 
-ResolvedMediaProfile CatalogueManager::resolve_media_profile(
-    std::string media_id, Clock::time_point deadline,
-    std::function<MediaProbeResult()> generate) {
+ResolvedMediaProfile
+CatalogueManager::resolve_media_profile(std::string media_id, Clock::time_point deadline,
+                                        std::function<MediaProbeResult()> generate) {
     try {
-        if (auto persisted = media_profile(media_id)) return {*persisted, false, false};
+        if (auto persisted = media_profile(media_id))
+            return {*persisted, false, false};
     } catch (const std::exception& e) {
         Log::warn("immutable media profile lookup unavailable media=" + media_id +
                   " error=" + e.what() + "; retaining bounded generation fallback");
@@ -1408,17 +1458,19 @@ ResolvedMediaProfile CatalogueManager::resolve_media_profile(
         if (auto cached = resolved_media_profiles_.find(media_id);
             cached != resolved_media_profiles_.end())
             return {cached->second, false, false};
-        auto [it, inserted] = media_profile_flights_.try_emplace(
-            media_id, std::make_shared<MediaProfileFlight>());
+        auto [it, inserted] =
+            media_profile_flights_.try_emplace(media_id, std::make_shared<MediaProfileFlight>());
         flight = it->second;
         owner = inserted;
     }
     if (!owner) {
         Lock lock(flight->mutex);
-        if (!flight->cv.wait_until(lock.native(), deadline,
-                                   [&]() MACHA_REQUIRES(flight->mutex) { return flight->complete; }))
+        if (!flight->cv.wait_until(lock.native(), deadline, [&]() MACHA_REQUIRES(flight->mutex) {
+                return flight->complete;
+            }))
             throw std::runtime_error("timed out waiting for concurrent immutable media profiling");
-        if (flight->error) std::rethrow_exception(flight->error);
+        if (flight->error)
+            std::rethrow_exception(flight->error);
         return {*flight->result, false, true};
     }
 
@@ -1469,28 +1521,33 @@ void CatalogueManager::put_media_profile(std::string media_id, MediaProbeResult 
 
 void CatalogueManager::put_media_profiles(
     std::map<std::string, MediaProbeResult, std::less<>> profiles) {
-    if (profiles.empty()) return;
+    if (profiles.empty())
+        return;
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
     auto [expected_root, view] = installed();
     CatalogueDraft current(view);
     bool changed = false;
     for (auto& [media_id, probe] : profiles) {
-        CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, std::move(probe)};
-        if (!valid_catalogue_media_profile(media_id, profile)) continue;
+        CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true,
+                                                std::move(probe)};
+        if (!valid_catalogue_media_profile(media_id, profile))
+            continue;
         if (const auto* found = current.media_profile(media_id); found && *found == profile)
             continue;
         current.put_media_profile(media_id, std::move(profile));
         changed = true;
     }
-    if (!changed) return;
+    if (!changed)
+        return;
     commit(expected_root, std::move(current));
 }
 
 std::optional<Bytes> CatalogueManager::media_index(std::string_view media_id) {
     auto snapshot = current_snapshot();
     const auto* found = snapshot->media_index(media_id);
-    if (!found) return {};
+    if (!found)
+        return {};
     return store_.get(*found, 0, FrameType::foreground);
 }
 
@@ -1510,8 +1567,7 @@ void CatalogueManager::put_media_index(std::string media_id, std::span<const uin
     commit(expected_root, std::move(current));
 }
 
-size_t CatalogueManager::prune_media_profiles(
-    const std::set<std::string>& live_media_ids) {
+size_t CatalogueManager::prune_media_profiles(const std::set<std::string>& live_media_ids) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
     auto [expected_root, view] = installed();
@@ -1526,7 +1582,8 @@ size_t CatalogueManager::prune_media_profiles(
         if (!live_media_ids.contains(media_id))
             indexes.push_back(media_id);
     });
-    if (profiles.empty() && indexes.empty()) return 0;
+    if (profiles.empty() && indexes.empty())
+        return 0;
     for (const auto& media_id : profiles)
         current.erase_media_profile(media_id);
     for (const auto& media_id : indexes)
@@ -1534,9 +1591,8 @@ size_t CatalogueManager::prune_media_profiles(
     commit(expected_root, std::move(current));
     {
         Lock lock(media_profile_mutex_);
-        std::erase_if(resolved_media_profiles_, [&](const auto& item) {
-            return !live_media_ids.contains(item.first);
-        });
+        std::erase_if(resolved_media_profiles_,
+                      [&](const auto& item) { return !live_media_ids.contains(item.first); });
     }
     return profiles.size();
 }
@@ -1563,12 +1619,14 @@ std::vector<CatalogueItem> CatalogueManager::list(std::optional<CatalogueKind> k
     return out;
 }
 
-std::vector<CatalogueItem> CatalogueManager::search(
-    std::string_view query, size_t limit, const std::function<bool(const CatalogueItem&)>& keep) {
+std::vector<CatalogueItem>
+CatalogueManager::search(std::string_view query, size_t limit,
+                         const std::function<bool(const CatalogueItem&)>& keep) {
     auto snapshot = current_snapshot();
     std::vector<std::pair<double, CatalogueItem>> ranked;
     for (const auto& [_, item] : snapshot->items()) {
-        if (keep && !keep(item)) continue;
+        if (keep && !keep(item))
+            continue;
         auto s = score(query, item);
         if (s > 0.0)
             ranked.emplace_back(s, item);
@@ -1628,9 +1686,9 @@ CatalogueManager::PreparedCommit CatalogueManager::prepare(CatalogueDraft&& draf
     return out;
 }
 
-CatalogueManager::PreparedCommit CatalogueManager::prepare(const std::optional<ObjectId>& expected_root,
-                                                           const CatalogueSnapshot& next,
-                                                           const std::set<ObjectId>& old_artwork) {
+CatalogueManager::PreparedCommit
+CatalogueManager::prepare(const std::optional<ObjectId>& expected_root,
+                          const CatalogueSnapshot& next, const std::set<ObjectId>& old_artwork) {
     PreparedCommit out;
     const auto new_artwork = data_object_ids(next);
     std::set_difference(new_artwork.begin(), new_artwork.end(), old_artwork.begin(),
@@ -1733,9 +1791,11 @@ void CatalogueManager::publish(
     for (const auto& id : prepared.added) {
         // Held here is enough; only one that is not is fetched to prove it
         // exists somewhere.
-        if (local_.data().has(id)) continue;
+        if (local_.data().has(id))
+            continue;
         if (!store_.get(id, 0, frame))
-            throw CatalogueUnavailable("referenced artwork object is unavailable: " + to_string(id));
+            throw CatalogueUnavailable("referenced artwork object is unavailable: " +
+                                       to_string(id));
     }
 
     CatalogueManifest old_manifest;
@@ -1855,8 +1915,7 @@ void CatalogueManager::publish(
 }
 
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,
-                                        std::optional<uint64_t> expected_revision,
-                                        FrameType frame) {
+                                       std::optional<uint64_t> expected_revision, FrameType frame) {
     if (item.id.empty())
         throw std::runtime_error("catalogue item id is required");
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
@@ -1879,7 +1938,8 @@ CatalogueItem CatalogueManager::upsert(CatalogueItem item,
 }
 
 std::vector<CatalogueItem> CatalogueManager::upsert_many(std::vector<CatalogueItem> items) {
-    if (items.empty()) return {};
+    if (items.empty())
+        return {};
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
     auto [expected_root, view] = installed();
@@ -1933,16 +1993,17 @@ bool CatalogueManager::definitely_absent(std::string_view id) const {
     // If MetadataManager has decoded the known generation and the catalogue
     // root is unchanged, the cache is current despite an older generation: a
     // memory-only proof, sparing a replica repair for a definite 404.
-    if (auto available = metadata_.current();
-        available && available->generation >= known_generation &&
-        available->snapshot->catalogue_root == cached_root)
+    if (auto available = metadata_.current(); available &&
+                                              available->generation >= known_generation &&
+                                              available->snapshot->catalogue_root == cached_root)
         return true;
 
     return false;
 }
 
-CatalogueClearResult CatalogueManager::clear_metadata_with_media(
-    std::string_view id, std::optional<uint64_t> expected_revision) {
+CatalogueClearResult
+CatalogueManager::clear_metadata_with_media(std::string_view id,
+                                            std::optional<uint64_t> expected_revision) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
     auto [expected_root, view] = installed();
@@ -2102,8 +2163,7 @@ size_t CatalogueManager::clear_metadata(std::string_view id,
 }
 
 CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string mime_type,
-                                                   std::span<const uint8_t> bytes,
-                                                   FrameType frame) {
+                                                 std::span<const uint8_t> bytes, FrameType frame) {
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
@@ -2112,9 +2172,10 @@ CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string m
     return art;
 }
 
-CatalogueArtwork CatalogueManager::stage_artwork_deferred(
-    std::string role, std::string mime_type, std::span<const uint8_t> bytes,
-    DistributedStore::DurabilityBatch& batch, FrameType frame) {
+CatalogueArtwork CatalogueManager::stage_artwork_deferred(std::string role, std::string mime_type,
+                                                          std::span<const uint8_t> bytes,
+                                                          DistributedStore::DurabilityBatch& batch,
+                                                          FrameType frame) {
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
@@ -2130,14 +2191,12 @@ bool CatalogueManager::artwork_durability_barrier(DistributedStore::DurabilityBa
     return store_.durability_barrier(batch, frame);
 }
 
-void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& discovered,
-                                         const std::set<std::string>& active_media_ids,
-                                         bool prune_missing,
-                                         std::optional<Hash256> expected_namespace,
-                                         const std::map<std::string, MediaProbeResult, std::less<>>& profiles,
-                                         const std::set<std::string>& vanished_media,
-                                         FrameType frame,
-                                         const std::map<std::string, std::set<std::string>>& superseded) {
+void CatalogueManager::reconcile_scanner(
+    const std::vector<CatalogueItem>& discovered, const std::set<std::string>& active_media_ids,
+    bool prune_missing, std::optional<Hash256> expected_namespace,
+    const std::map<std::string, MediaProbeResult, std::less<>>& profiles,
+    const std::set<std::string>& vanished_media, FrameType frame,
+    const std::map<std::string, std::set<std::string>>& superseded) {
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
     auto [expected_root, view] = installed();
@@ -2146,7 +2205,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
 
     for (const auto& [media_id, probe] : profiles) {
         CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, probe};
-        if (!valid_catalogue_media_profile(media_id, profile)) continue;
+        if (!valid_catalogue_media_profile(media_id, profile))
+            continue;
         if (const auto* found = current.media_profile(media_id); found && *found == profile)
             continue;
         current.put_media_profile(media_id, std::move(profile));
@@ -2161,9 +2221,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                a.disc_number == b.disc_number && a.track_number == b.track_number &&
                a.aliases == b.aliases && a.external_ids == b.external_ids &&
                a.media_ids == b.media_ids && a.artwork == b.artwork &&
-               a.author_ids == b.author_ids && a.series == b.series &&
-               a.language == b.language && a.publisher == b.publisher &&
-               a.published == b.published;
+               a.author_ids == b.author_ids && a.series == b.series && a.language == b.language &&
+               a.publisher == b.publisher && a.published == b.published;
     };
 
     for (auto item : discovered) {
@@ -2198,7 +2257,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                     item.artwork.begin(), item.artwork.end(), [&](const auto& candidate) {
                         return candidate.role == art.role && candidate.id == art.id;
                     });
-                if (!already_present) item.artwork.push_back(art);
+                if (!already_present)
+                    item.artwork.push_back(art);
             }
             // A match may be another file of a known item: keep existing
             // bindings; vanished ones are removed below.
@@ -2225,13 +2285,17 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
     // with it.
     if (!superseded.empty()) {
         std::set<std::string> discovered_ids;
-        for (const auto& item : discovered) discovered_ids.insert(item.id);
+        for (const auto& item : discovered)
+            discovered_ids.insert(item.id);
         for (const auto& [id, files] : superseded) {
-            if (discovered_ids.contains(id)) continue;
+            if (discovered_ids.contains(id))
+                continue;
             const auto* found = current.item(id);
-            if (!found || catalogue_item_locked(*found)) continue;
+            if (!found || catalogue_item_locked(*found))
+                continue;
             auto item = *found;
-            std::erase_if(item.media_ids, [&](const std::string& media) { return files.contains(media); });
+            std::erase_if(item.media_ids,
+                          [&](const std::string& media) { return files.contains(media); });
             if (item.media_ids.empty()) {
                 current.erase(id);
             } else {
@@ -2246,14 +2310,15 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
             std::set<std::string> referenced;
             current.for_each_item([&](const std::string&, const CatalogueItem& item) {
                 referenced.insert(item.author_ids.begin(), item.author_ids.end());
-                for (const auto& ref : item.series) referenced.insert(ref.series_id);
+                for (const auto& ref : item.series)
+                    referenced.insert(ref.series_id);
             });
             std::vector<std::string> orphans;
             current.for_each_item([&](const std::string& id, const CatalogueItem& item) {
                 const auto marker = item.external_ids.find("macha_scanner");
                 const bool scanner = marker != item.external_ids.end() && marker->second == "1";
-                if (scanner && catalogue_referenced_kind(item.kind) && !catalogue_item_locked(item) &&
-                    !referenced.contains(id))
+                if (scanner && catalogue_referenced_kind(item.kind) &&
+                    !catalogue_item_locked(item) && !referenced.contains(id))
                     orphans.push_back(id);
             });
             for (const auto& id : orphans) {
@@ -2279,11 +2344,11 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                 return;
             if (!scanner && vanished_media.empty())
                 return;
-            const bool loses = std::any_of(
-                item.media_ids.begin(), item.media_ids.end(), [&](const std::string& media) {
-                    return scanner ? !active_media_ids.contains(media)
-                                   : vanished_media.contains(media);
-                });
+            const bool loses = std::any_of(item.media_ids.begin(), item.media_ids.end(),
+                                           [&](const std::string& media) {
+                                               return scanner ? !active_media_ids.contains(media)
+                                                              : vanished_media.contains(media);
+                                           });
             if (loses)
                 rebind.push_back(id);
         });
@@ -2346,10 +2411,10 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
 }
 
 CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::string role,
-                                                std::string mime_type,
-                                                std::span<const uint8_t> bytes,
-                                                std::optional<uint64_t> expected_revision,
-                                                FrameType frame) {
+                                               std::string mime_type,
+                                               std::span<const uint8_t> bytes,
+                                               std::optional<uint64_t> expected_revision,
+                                               FrameType frame) {
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     auto item = get(item_id);
@@ -2360,9 +2425,8 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
 
     CatalogueArtwork art = stage_artwork(std::move(role), std::move(mime_type), bytes, frame);
 
-    std::erase_if(item->artwork, [&](const CatalogueArtwork& existing) {
-        return existing.role == art.role;
-    });
+    std::erase_if(item->artwork,
+                  [&](const CatalogueArtwork& existing) { return existing.role == art.role; });
     item->artwork.push_back(art);
     try {
         (void)upsert(*item, item->revision, frame);
@@ -2409,9 +2473,9 @@ std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId&
     return CatalogueArtworkContent{std::move(*mime_type), std::move(*bytes)};
 }
 
-
-CatalogueRetentionObjects CatalogueManager::retention_objects(
-    const std::optional<ObjectId>& old_root, const std::optional<ObjectId>& new_root) {
+CatalogueRetentionObjects
+CatalogueManager::retention_objects(const std::optional<ObjectId>& old_root,
+                                    const std::optional<ObjectId>& new_root) {
     CatalogueRetentionObjects out;
     if (!new_root)
         return out;
@@ -2420,7 +2484,8 @@ CatalogueRetentionObjects CatalogueManager::retention_objects(
         throw CatalogueUnavailable("catalogue manifest unavailable for retention publication");
     auto encoded_manifest = local_.control().get(*new_root);
     if (!encoded_manifest)
-        throw CatalogueUnavailable("catalogue manifest unavailable locally for retention publication");
+        throw CatalogueUnavailable(
+            "catalogue manifest unavailable locally for retention publication");
     const auto manifest = decode_catalogue_manifest(*encoded_manifest);
     // Only a shard the two roots do not share can hold anything new: the
     // rest are the same object, claimed when it was written. An old root
@@ -2526,7 +2591,8 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
                 if (auto encoded = local_.control().get(*root)) {
                     const auto manifest = decode_catalogue_manifest(*encoded);
                     for (const auto& shard : manifest.shards)
-                        if (shard) out.control_live.insert(*shard);
+                        if (shard)
+                            out.control_live.insert(*shard);
                 }
             }
         } catch (...) {
@@ -2571,8 +2637,8 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     {
         Lock lock(mutex_);
         const bool root_converged = ready_ && cached_root_ == metadata_root;
-        out.complete = metadata_current && root_readable && root_converged &&
-                       protected_roots_complete;
+        out.complete =
+            metadata_current && root_readable && root_converged && protected_roots_complete;
     }
     if (cached) {
         for (const auto& id : data_object_ids(*cached))
@@ -2581,11 +2647,11 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     return out;
 }
 
-size_t CatalogueManager::control_gc_step(const IdLookup& live,
-                                         std::chrono::milliseconds grace,
-                                         size_t operation_budget,
-                                         UnreferencedSince* sightings, uint64_t now_unix_ms) {
-    if (!operation_budget) return 0;
+size_t CatalogueManager::control_gc_step(const IdLookup& live, std::chrono::milliseconds grace,
+                                         size_t operation_budget, UnreferencedSince* sightings,
+                                         uint64_t now_unix_ms) {
+    if (!operation_budget)
+        return 0;
 
     // Publication is data-before-metadata, so a future root's CONTROL objects
     // are briefly unreferenced. Time is no fence: the root may advance between
@@ -2600,15 +2666,16 @@ size_t CatalogueManager::control_gc_step(const IdLookup& live,
         root_epoch = control_gc_root_epoch_;
         root_epoch_sequence = control_gc_root_epoch_sequence_;
     }
-    const auto since_root = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - root_epoch);
+    const auto since_root =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - root_epoch);
     const auto staged_since_root = since_root + std::chrono::milliseconds(1);
 
     size_t removed = 0;
     bool exhausted = false;
     for (size_t operations = 0; operations < operation_budget && !exhausted; ++operations) {
         auto id = local_.control().next_object(control_gc_cursor_, exhausted);
-        if (!id) continue;
+        if (!id)
+            continue;
 
         if (live.contains(*id)) {
             if (sightings)

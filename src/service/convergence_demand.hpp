@@ -37,8 +37,7 @@ class ConvergenceDemand {
 
     bool schedule_edge() noexcept {
         bool expected = false;
-        if (scheduled_.compare_exchange_strong(expected, true,
-                                               std::memory_order_acq_rel)) {
+        if (scheduled_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
             runs_scheduled_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
@@ -48,9 +47,8 @@ class ConvergenceDemand {
   public:
     bool request(uint64_t generation) noexcept {
         auto current = latest_generation_.load(std::memory_order_relaxed);
-        while (current < generation &&
-               !latest_generation_.compare_exchange_weak(
-                   current, generation, std::memory_order_relaxed)) {
+        while (current < generation && !latest_generation_.compare_exchange_weak(
+                                           current, generation, std::memory_order_relaxed)) {
         }
         events_received_.fetch_add(1, std::memory_order_relaxed);
         requested_epoch_.fetch_add(1, std::memory_order_release);
@@ -62,8 +60,7 @@ class ConvergenceDemand {
             return std::nullopt;
         // request() publishes the generation before the epoch release.
         const auto epoch = requested_epoch_.load(std::memory_order_acquire);
-        return ConvergenceDemandSnapshot{
-            epoch, latest_generation_.load(std::memory_order_relaxed)};
+        return ConvergenceDemandSnapshot{epoch, latest_generation_.load(std::memory_order_relaxed)};
     }
 
     // Returns true when an event arrived during the completed run and exactly

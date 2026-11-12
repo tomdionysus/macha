@@ -17,9 +17,9 @@ std::string normalize_utf8(std::string_view value, CFStringNormalizationForm for
     if (value.size() > static_cast<size_t>(std::numeric_limits<CFIndex>::max()))
         return std::string(value);
 
-    auto source = CFStringCreateWithBytes(
-        kCFAllocatorDefault, reinterpret_cast<const UInt8*>(value.data()),
-        static_cast<CFIndex>(value.size()), kCFStringEncodingUTF8, false);
+    auto source =
+        CFStringCreateWithBytes(kCFAllocatorDefault, reinterpret_cast<const UInt8*>(value.data()),
+                                static_cast<CFIndex>(value.size()), kCFStringEncodingUTF8, false);
     if (!source)
         return std::string(value);
 

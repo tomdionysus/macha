@@ -6,11 +6,11 @@
 #include "fuse/fuse_adapter.hpp"
 #include "crypto.hpp"
 #include "diagnostics.hpp"
+#include "filesystem/macos_unicode.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "fuse/fuse_mountpoint.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
-#include "filesystem/macos_unicode.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -35,9 +35,9 @@
 #include <sstream>
 #include <stop_token>
 #include <string_view>
-#include <vector>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <vector>
 #if defined(__linux__)
 #include <sys/mount.h>
 #endif
@@ -569,8 +569,8 @@ class LibfuseMountDriver final : public FuseMountDriver {
         std::vector<char*> fuse_argv;
         for (auto& arg : fuse_arg_storage)
             fuse_argv.push_back(arg.data());
-        struct fuse_args args = FUSE_ARGS_INIT(static_cast<int>(fuse_argv.size()),
-                                               fuse_argv.data());
+        struct fuse_args args =
+            FUSE_ARGS_INIT(static_cast<int>(fuse_argv.size()), fuse_argv.data());
         auto ops = operations();
         struct fuse* instance = fuse_new(&args, &ops, sizeof(ops), &frontend);
         if (!instance) {
@@ -587,8 +587,7 @@ class LibfuseMountDriver final : public FuseMountDriver {
             fuse_unmount(instance);
             fuse_destroy(instance);
             fuse_opt_free_args(&args);
-            return {false,
-                    "fail-closed mountpoint protection could not be installed for " + mount};
+            return {false, "fail-closed mountpoint protection could not be installed for " + mount};
         }
 
         auto* session = fuse_get_session(instance);
@@ -610,56 +609,57 @@ class LibfuseMountDriver final : public FuseMountDriver {
         std::atomic_bool mount_seen{true};
 
         std::jthread mount_watchdog([&](std::stop_token watchdog_stop) {
-          run_supervised_once("fuse-mount-watchdog", [&] {
-            size_t consecutive_misses = 0;
-            size_t consecutive_probe_errors = 0;
-            constexpr size_t missing_threshold = 3;
-            while (!watchdog_stop.stop_requested()) {
-                std::this_thread::sleep_for(config.watchdog_interval);
-                if (watchdog_stop.stop_requested())
-                    break;
+            run_supervised_once("fuse-mount-watchdog", [&] {
+                size_t consecutive_misses = 0;
+                size_t consecutive_probe_errors = 0;
+                constexpr size_t missing_threshold = 3;
+                while (!watchdog_stop.stop_requested()) {
+                    std::this_thread::sleep_for(config.watchdog_interval);
+                    if (watchdog_stop.stop_requested())
+                        break;
 
-                const auto probe = probe_macha_mountpoint(mount);
-                if (probe.state == MountTableState::macha_fuse) {
-                    mount_seen.store(true);
-                    consecutive_misses = 0;
-                    consecutive_probe_errors = 0;
-                    continue;
-                }
-                if (probe.state == MountTableState::probe_error) {
-                    // E.g. EMFILE must not trigger a false fail-closed shutdown;
-                    // only successful probes reporting absence count as misses.
-                    consecutive_misses = 0;
-                    ++consecutive_probe_errors;
-                    if (consecutive_probe_errors == 1 || consecutive_probe_errors % 30 == 0) {
-                        Log::warn("FUSE mount-table watchdog probe failed mount=" + mount +
-                                  " error=" + std::string(std::strerror(probe.error)) +
-                                  " consecutive_errors=" +
-                                  std::to_string(consecutive_probe_errors) +
-                                  "; retaining previous mount state");
+                    const auto probe = probe_macha_mountpoint(mount);
+                    if (probe.state == MountTableState::macha_fuse) {
+                        mount_seen.store(true);
+                        consecutive_misses = 0;
+                        consecutive_probe_errors = 0;
+                        continue;
                     }
-                    continue;
-                }
+                    if (probe.state == MountTableState::probe_error) {
+                        // E.g. EMFILE must not trigger a false fail-closed shutdown;
+                        // only successful probes reporting absence count as misses.
+                        consecutive_misses = 0;
+                        ++consecutive_probe_errors;
+                        if (consecutive_probe_errors == 1 || consecutive_probe_errors % 30 == 0) {
+                            Log::warn(
+                                "FUSE mount-table watchdog probe failed mount=" + mount +
+                                " error=" + std::string(std::strerror(probe.error)) +
+                                " consecutive_errors=" + std::to_string(consecutive_probe_errors) +
+                                "; retaining previous mount state");
+                        }
+                        continue;
+                    }
 
-                consecutive_probe_errors = 0;
-                if (!mount_seen.load())
-                    continue;
-                if (++consecutive_misses < missing_threshold) {
-                    Log::debug("FUSE mount-table watchdog miss " +
-                               std::to_string(consecutive_misses) + "/" +
-                               std::to_string(missing_threshold) + " mount=" + mount);
-                    continue;
+                    consecutive_probe_errors = 0;
+                    if (!mount_seen.load())
+                        continue;
+                    if (++consecutive_misses < missing_threshold) {
+                        Log::debug("FUSE mount-table watchdog miss " +
+                                   std::to_string(consecutive_misses) + "/" +
+                                   std::to_string(missing_threshold) + " mount=" + mount);
+                        continue;
+                    }
+                    unexpected_mount_loss.store(true);
+                    Log::error(
+                        "FUSE mount disappeared for three consecutive successful watchdog "
+                        "checks; the namespace is fail-closed and the mount will be rebuilt");
+                    filesystem.request_io_cancellation();
+                    // Never fuse_unmount: our mount is gone and whatever occupies
+                    // the path is not ours. The dead fuse fd returns the loop.
+                    fuse_session_exit(session);
+                    return;
                 }
-                unexpected_mount_loss.store(true);
-                Log::error("FUSE mount disappeared for three consecutive successful watchdog "
-                           "checks; the namespace is fail-closed and the mount will be rebuilt");
-                filesystem.request_io_cancellation();
-                // Never fuse_unmount: our mount is gone and whatever occupies
-                // the path is not ours. The dead fuse fd returns the loop.
-                fuse_session_exit(session);
-                return;
-            }
-          });
+            });
         });
 
         Log::debug("FUSE mount established path=" + mount);
@@ -706,8 +706,9 @@ class LibfuseMountDriver final : public FuseMountDriver {
 
 // Linking this translation unit gives a build the ability to mount.
 const bool g_libfuse_driver_registered = [] {
-    set_fuse_mount_driver_factory(
-        []() -> std::unique_ptr<FuseMountDriver> { return std::make_unique<LibfuseMountDriver>(); });
+    set_fuse_mount_driver_factory([]() -> std::unique_ptr<FuseMountDriver> {
+        return std::make_unique<LibfuseMountDriver>();
+    });
     return true;
 }();
 

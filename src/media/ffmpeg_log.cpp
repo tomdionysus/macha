@@ -10,8 +10,8 @@ extern "C" {
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
-#include <string>
 #include <stdexcept>
+#include <string>
 
 namespace macha {
 namespace {
@@ -61,8 +61,8 @@ void ffmpeg_log_callback(void* avcl, int level, const char* fmt, va_list vl) {
     char buffer[8192];
     va_list copy;
     va_copy(copy, vl);
-    const int used = av_log_format_line2(avcl, level, fmt, copy, buffer, sizeof(buffer),
-                                         &print_prefix);
+    const int used =
+        av_log_format_line2(avcl, level, fmt, copy, buffer, sizeof(buffer), &print_prefix);
     va_end(copy);
     if (used <= 0)
         return;

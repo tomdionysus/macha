@@ -37,7 +37,9 @@ class ClusterJobView {
     void stop();
     // Polls every active peer once on the caller's thread.
     void refresh_now();
-    std::chrono::milliseconds refresh_interval() const noexcept { return refresh_interval_; }
+    std::chrono::milliseconds refresh_interval() const noexcept {
+        return refresh_interval_;
+    }
     NodeId local_node_id() const;
 
     // Where a list's entries came from. Unreachable: jobs from the last

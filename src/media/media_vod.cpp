@@ -23,10 +23,12 @@ bool format_token(std::string_view names, std::string_view wanted) {
     size_t begin = 0;
     while (begin <= names.size()) {
         const auto end = names.find(',', begin);
-        const auto token = names.substr(begin, end == std::string_view::npos ? names.size() - begin
-                                                                             : end - begin);
-        if (token == wanted) return true;
-        if (end == std::string_view::npos) break;
+        const auto token =
+            names.substr(begin, end == std::string_view::npos ? names.size() - begin : end - begin);
+        if (token == wanted)
+            return true;
+        if (end == std::string_view::npos)
+            break;
         begin = end + 1;
     }
     return false;
@@ -42,14 +44,14 @@ int64_t keyframe_ms(double seconds) {
 } // namespace
 
 int64_t clamp_seek_ms(int64_t requested_seek_ms, double duration_seconds) {
-    if (!(duration_seconds > 0.0)) return 0;
+    if (!(duration_seconds > 0.0))
+        return 0;
     const auto duration_ms = static_cast<int64_t>(std::floor(duration_seconds * 1000.0));
     return std::clamp<int64_t>(requested_seek_ms, 0, std::max<int64_t>(0, duration_ms - 1));
 }
 
 std::optional<IndexedPlan> indexed_plan(std::span<const double> keyframe_seconds,
-                                        double duration_seconds,
-                                        int64_t requested_seek_ms,
+                                        double duration_seconds, int64_t requested_seek_ms,
                                         double target_segment_seconds) {
     if (!(duration_seconds > kMinimumDuration) || !(target_segment_seconds > kMinimumDuration))
         return std::nullopt;
@@ -68,8 +70,10 @@ std::optional<IndexedPlan> indexed_plan(std::span<const double> keyframe_seconds
             seconds >= duration_seconds - kMinimumDuration)
             continue;
         const auto candidate_ms = keyframe_ms(seconds);
-        if (candidate_ms > result.seek_requested_ms) continue;
-        if (have_baseline && candidate_ms < result.seek_ms) continue;
+        if (candidate_ms > result.seek_requested_ms)
+            continue;
+        if (have_baseline && candidate_ms < result.seek_ms)
+            continue;
         result.seek_ms = candidate_ms;
         baseline_seconds = seconds;
         have_baseline = true;
@@ -94,7 +98,8 @@ std::optional<IndexedPlan> indexed_plan(std::span<const double> keyframe_seconds
     double wanted = baseline_seconds + target_segment_seconds;
     for (size_t i = 1; i < keyframes.size(); ++i) {
         const double seconds = keyframes[i];
-        if (seconds + kTimestampEpsilon < wanted) continue;
+        if (seconds + kTimestampEpsilon < wanted)
+            continue;
         starts.push_back(seconds);
         wanted = seconds + target_segment_seconds;
     }
@@ -107,8 +112,7 @@ std::optional<IndexedPlan> indexed_plan(std::span<const double> keyframe_seconds
 
     result.longest_segment_seconds =
         *std::max_element(result.segment_durations.begin(), result.segment_durations.end());
-    const double maximum_segment =
-        std::max(kMaximumFragmentSeconds, target_segment_seconds * 3.0);
+    const double maximum_segment = std::max(kMaximumFragmentSeconds, target_segment_seconds * 3.0);
     const double maximum_tail = std::max(kMaximumTailSeconds, target_segment_seconds * 3.0);
     if (result.segment_durations.back() > maximum_tail + kTimestampEpsilon)
         return std::nullopt;
@@ -129,7 +133,8 @@ IndexDensity index_density(std::span<const double> keyframe_seconds, double dura
     gaps.reserve(keyframe_seconds.size() + 1);
     double previous = 0.0;
     for (const double seconds : keyframe_seconds) {
-        if (!std::isfinite(seconds)) continue;
+        if (!std::isfinite(seconds))
+            continue;
         gaps.push_back(std::max(0.0, seconds - previous));
         previous = seconds;
     }

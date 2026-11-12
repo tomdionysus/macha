@@ -287,9 +287,10 @@ MACHA_FAST_TEST("mobi_metadata", test_asin_used_only_when_it_is_an_isbn) {
 
 MACHA_FAST_TEST("mobi_metadata", test_publisher_description_and_date) {
     Header header;
-    header.exth = {exth(101, " Corgi "),
-                   exth(103, "<p>A tale of &quot;dragons&quot;</p>\n<p>&amp; the&nbsp;Watch&#x2026;</p>"),
-                   exth(106, " 1989-11-01T00:00:00+00:00 ")};
+    header.exth = {
+        exth(101, " Corgi "),
+        exth(103, "<p>A tale of &quot;dragons&quot;</p>\n<p>&amp; the&nbsp;Watch&#x2026;</p>"),
+        exth(106, " 1989-11-01T00:00:00+00:00 ")};
     const auto metadata = read_bytes(book(header));
     CHECK(metadata.publisher == "Corgi");
     CHECK(metadata.description == "A tale of \"dragons\" & the Watch\xE2\x80\xA6");
@@ -648,7 +649,8 @@ MACHA_FAST_TEST("mobi_metadata", test_host_file_overload) {
     const auto file = book(header, {cover});
     {
         std::ofstream out(path, std::ios::binary);
-        out.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+        out.write(reinterpret_cast<const char*>(file.data()),
+                  static_cast<std::streamsize>(file.size()));
     }
     const auto metadata = read_mobi_metadata(path);
     CHECK(metadata.title == "On Disk");
@@ -671,9 +673,9 @@ MACHA_FAST_TEST("mobi_metadata", test_truncation_and_flip_fuzz_never_crashes) {
     Header kf7;
     kf7.first_image = 3;
     kf7.encoding = cp1252;
-    kf7.exth = {exth(100, "Author \xE9"), exth(101, "Publisher"), exth(103, "<p>Desc &amp;</p>"),
-                exth(104, "0-306-40615-2"), exth(106, "2020"), exth(503, "Title"),
-                exth_number(121, 4), exth_number(201, 0), exth_number(202, 0)};
+    kf7.exth = {exth(100, "Author \xE9"),   exth(101, "Publisher"), exth(103, "<p>Desc &amp;</p>"),
+                exth(104, "0-306-40615-2"), exth(106, "2020"),      exth(503, "Title"),
+                exth_number(121, 4),        exth_number(201, 0),    exth_number(202, 0)};
     Header kf8;
     kf8.version = 8;
     kf8.exth = {exth(503, "KF8")};
@@ -717,15 +719,19 @@ MACHA_FAST_TEST("mobi_metadata", test_book_credits_titles_and_dates_read_as_a_re
     CHECK((split_authors("Terry Pratchett, Stephen Briggs, Tina Hannan") ==
            Names{"Terry Pratchett", "Stephen Briggs", "Tina Hannan"}));
     CHECK((split_authors("Ian Stewart, Jack Cohen") == Names{"Ian Stewart", "Jack Cohen"}));
-    CHECK((split_authors("Pratchett, Terry; Baxter, Stephen") == Names{"Terry Pratchett", "Stephen Baxter"}));
-    CHECK((split_authors("Pratchett, Terry, Baxter, Stephen") == Names{"Terry Pratchett", "Stephen Baxter"}));
-    CHECK((split_authors("Terry Pratchett & Neil Gaiman") == Names{"Terry Pratchett", "Neil Gaiman"}));
+    CHECK((split_authors("Pratchett, Terry; Baxter, Stephen") ==
+           Names{"Terry Pratchett", "Stephen Baxter"}));
+    CHECK((split_authors("Pratchett, Terry, Baxter, Stephen") ==
+           Names{"Terry Pratchett", "Stephen Baxter"}));
+    CHECK((split_authors("Terry Pratchett & Neil Gaiman") ==
+           Names{"Terry Pratchett", "Neil Gaiman"}));
     CHECK((split_authors("Tolkien, J.R.R.") == Names{"J.R.R. Tolkien"}));
     CHECK((split_authors("Jean-Luc Picard") == Names{"Jean-Luc Picard"}));
     CHECK(split_authors("Unknown").empty());
     CHECK((split_authors("Unknown & Terry Pratchett") == Names{"Terry Pratchett"}));
 
-    auto [steam, steam_series] = book_title_series("Raising Steam: (Discworld novel 40) (Discworld Novels)");
+    auto [steam, steam_series] =
+        book_title_series("Raising Steam: (Discworld novel 40) (Discworld Novels)");
     CHECK(steam == "Raising Steam");
     REQUIRE(steam_series.size() == 1);
     CHECK(steam_series.front().name == "Discworld");
@@ -738,7 +744,8 @@ MACHA_FAST_TEST("mobi_metadata", test_book_credits_titles_and_dates_read_as_a_re
     auto [mort, mort_series] = book_title_series("Mort: A Discworld Novel");
     CHECK(mort == "Mort");
     CHECK(mort_series.size() == 1);
-    auto [plain, plain_series] = book_title_series("The Science of Discworld 1 - University of Warwick");
+    auto [plain, plain_series] =
+        book_title_series("The Science of Discworld 1 - University of Warwick");
     CHECK(plain == "The Science of Discworld 1 - University of Warwick");
     CHECK(plain_series.empty());
     auto [frank, frank_series] = book_title_series("Frankenstein: A Novel");

@@ -39,12 +39,12 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
     if (!counted) {
         for_each_namespace_entry(*head.snapshot, &nodes,
                                  [&](const std::string&, const FsEntry& entry) {
-            if (entry.type != EntryType::file)
-                return;
-            for (const auto& extent_ref : entry.extents)
-                if (!extent_ref.hole)
-                    data.push_back(extent_ref.id);
-        });
+                                     if (entry.type != EntryType::file)
+                                         return;
+                                     for (const auto& extent_ref : entry.extents)
+                                         if (!extent_ref.hole)
+                                             data.push_back(extent_ref.id);
+                                 });
     }
     const auto conflict_extents = metadata_conflict_extent_roots(*head.snapshot);
     data.insert(data.end(), conflict_extents.begin(), conflict_extents.end());

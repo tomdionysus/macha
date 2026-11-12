@@ -74,11 +74,21 @@ class FakeClusterNode final : public ClusterNode {
         }));
     }
 
-    const Config& config() const override { return config_; }
-    NodeId node_id() const override { return self_id_; }
-    NodeId durability_epoch() const override { return epoch_; }
-    Membership& membership() override { return members_; }
-    const Membership& membership() const override { return members_; }
+    const Config& config() const override {
+        return config_;
+    }
+    NodeId node_id() const override {
+        return self_id_;
+    }
+    NodeId durability_epoch() const override {
+        return epoch_;
+    }
+    Membership& membership() override {
+        return members_;
+    }
+    const Membership& membership() const override {
+        return members_;
+    }
     std::optional<std::chrono::milliseconds> peer_latency(const NodeId&) const override {
         return std::nullopt;
     }
@@ -169,10 +179,16 @@ class StoreBench {
                 test_durability_window) {
         node.advertise_storage(local.data().used(), local.data().limit());
     }
-    ~StoreBench() { resources.stop(); }
+    ~StoreBench() {
+        resources.stop();
+    }
 
-    const Config& config() const { return config_; }
-    const ClusterKeys& keys() const { return cluster_.keys(); }
+    const Config& config() const {
+        return config_;
+    }
+    const ClusterKeys& keys() const {
+        return cluster_.keys();
+    }
     // A DistributedStore over this node, as the root builds one.
     std::unique_ptr<DistributedStore> store(DistributedStoreOptions options = {}) {
         return std::make_unique<DistributedStore>(node, local, resources.activity, resources.data,

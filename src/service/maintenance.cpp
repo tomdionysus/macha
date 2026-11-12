@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/maintenance.hpp"
-#include "service/claim_walk.hpp"
 #include "contract/gates.hpp"
 #include "contract/stopping.hpp"
-#include "metadata/namespace_control_store.hpp"
 #include "diagnostics.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "log.hpp"
+#include "metadata/namespace_control_store.hpp"
 #include "observation.hpp"
+#include "service/claim_walk.hpp"
 #include "supervised.hpp"
 #include <algorithm>
 #include <cmath>
@@ -91,15 +91,13 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
     : node_(dependencies.node), local_(dependencies.local),
-      metadata_server_(dependencies.metadata_server), store_(dependencies.store), metadata_(dependencies.metadata),
-      metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
-      builder_(dependencies.builder), ledger_(dependencies.ledger),
-      data_unreferenced_(dependencies.data_unreferenced),
+      metadata_server_(dependencies.metadata_server), store_(dependencies.store),
+      metadata_(dependencies.metadata), metadata_upkeep_(dependencies.metadata_upkeep),
+      catalogue_(dependencies.catalogue), builder_(dependencies.builder),
+      ledger_(dependencies.ledger), data_unreferenced_(dependencies.data_unreferenced),
       control_unreferenced_(dependencies.control_unreferenced),
-      availability_(dependencies.availability),
-      media_information_(dependencies.media_information), events_(dependencies.events),
-      port_(dependencies.port),
-      clock_(std::move(dependencies.clock)),
+      availability_(dependencies.availability), media_information_(dependencies.media_information),
+      events_(dependencies.events), port_(dependencies.port), clock_(std::move(dependencies.clock)),
       maintenance_trace_(std::move(dependencies.trace)),
       maintenance_stage_hook_(std::move(dependencies.stage_hook)),
       constructed_(dependencies.constructed) {}
@@ -215,9 +213,9 @@ void Maintenance::maintain_garbage_metadata(const std::vector<GarbageRef>& erase
 }
 
 void Maintenance::maintain_tombstone_batches(const InventoryHorizon& inventory) {
-    const auto grace_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(node_.config().maintenance.garbage_grace)
-            .count();
+    const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              node_.config().maintenance.garbage_grace)
+                              .count();
     const auto now_ns = clock_->wall_ns();
     std::set<ObjectId> matured;
     for (const auto& batch : inventory.tombstone_batches())
@@ -246,8 +244,8 @@ void Maintenance::maintain_tombstone_batches(const InventoryHorizon& inventory) 
     });
 }
 
-double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds,
-                            double wall_seconds, double cpu_target) {
+double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds, double wall_seconds,
+                            double cpu_target) {
     if (wall_seconds <= 0.0)
         return 1.0;
     const double load = std::max(0.0, process_cpu_seconds - own_cpu_seconds) / wall_seconds;
@@ -366,9 +364,8 @@ void Maintenance::run(std::stop_token stop) {
         bool established_metadata_peer = false;
         for (const auto& peer : node_.membership().active()) {
             active_nodes.push_back(peer.id);
-            established_metadata_peer = established_metadata_peer ||
-                                        (peer.id != node_.node_id() &&
-                                         peer.metadata_generation > 1);
+            established_metadata_peer = established_metadata_peer || (peer.id != node_.node_id() &&
+                                                                      peer.metadata_generation > 1);
         }
         std::sort(active_nodes.begin(), active_nodes.end());
         const auto remote_epoch = node_.remote_metadata_epoch();
@@ -393,7 +390,8 @@ void Maintenance::run(std::stop_token stop) {
         auto cpu_now = std::clock();
         const auto own_cpu_ns = thread_cpu_time_ns();
         const double own_seconds =
-            static_cast<double>(own_cpu_ns >= last_own_cpu_ns ? own_cpu_ns - last_own_cpu_ns : 0) / 1e9;
+            static_cast<double>(own_cpu_ns >= last_own_cpu_ns ? own_cpu_ns - last_own_cpu_ns : 0) /
+            1e9;
         const double process_seconds = static_cast<double>(cpu_now - last_cpu) / CLOCKS_PER_SEC;
         last_wall = now;
         last_cpu = cpu_now;
@@ -458,16 +456,14 @@ void Maintenance::run(std::stop_token stop) {
             bool metadata_ready_for_dependants = !metadata_dirty;
             if (metadata_dirty &&
                 (metadata_retry_due == Clock::time_point{} || now >= metadata_retry_due)) {
-                if (local_.replica().committed_generation() <= 1 &&
-                    !established_metadata_peer &&
+                if (local_.replica().committed_generation() <= 1 && !established_metadata_peer &&
                     now < formation_settle_due) {
                     metadata_ready_for_dependants = false;
                     metadata_retry_due = formation_settle_due;
                 } else {
                     const bool virgin_follower =
                         local_.replica().committed_generation() <= 1 &&
-                        !established_metadata_peer &&
-                        !last_active_nodes.empty() &&
+                        !established_metadata_peer && !last_active_nodes.empty() &&
                         node_.node_id() !=
                             *std::min_element(last_active_nodes.begin(), last_active_nodes.end());
                     if (virgin_follower) {
@@ -493,7 +489,8 @@ void Maintenance::run(std::stop_token stop) {
                                     maintenance_stage_hook_("metadata-repair-begin");
                                 metadata_upkeep_.repair_step();
                                 metadata_upkeep_.note_replica_validation(true);
-                                metadata_dirty = port_.metadata_convergence.complete(*convergence_run);
+                                metadata_dirty =
+                                    port_.metadata_convergence.complete(*convergence_run);
                                 metadata_ready_for_dependants = !metadata_dirty;
                                 catalogue_dirty = true;
                                 metadata_retry_due = Clock::time_point{};
@@ -512,15 +509,14 @@ void Maintenance::run(std::stop_token stop) {
                                 // committed branch is still a valid reachability
                                 // source. Destructive GC is fenced on `stable`.
                                 const auto local = local_.replica().committed();
-                                if (local_.replica().recovery_required() ||
-                                    local.generation <= 1)
+                                if (local_.replica().recovery_required() || local.generation <= 1)
                                     throw;
                                 Log::debug("metadata repair deferred; continuing non-destructive "
                                            "maintenance: " +
                                            std::string(error.what()));
                             } catch (...) {
-                                metadata_upkeep_.note_replica_validation(false,
-                                                                   "metadata validation failed");
+                                metadata_upkeep_.note_replica_validation(
+                                    false, "metadata validation failed");
                                 convergence_failed_ = true;
                                 metadata_ready_for_dependants = false;
                                 metadata_retry_due = clock_->now() + metadata_retry_backoff;
@@ -529,8 +525,7 @@ void Maintenance::run(std::stop_token stop) {
                                              std::max(metadata_retry_backoff * 2,
                                                       maintenance_background_interval(policy)));
                                 const auto local = local_.replica().committed();
-                                if (local_.replica().recovery_required() ||
-                                    local.generation <= 1)
+                                if (local_.replica().recovery_required() || local.generation <= 1)
                                     throw;
                                 Log::debug("metadata repair deferred; continuing non-destructive "
                                            "maintenance");
@@ -571,10 +566,9 @@ void Maintenance::run(std::stop_token stop) {
                 : !allow_network_repair ? DistributedStore::RepairGate::share
                                         : DistributedStore::RepairGate::quiescent,
                 network_credit,
-                static_cast<uint8_t>(
-                    (viewer_busy ? DistributedStore::paced_by_viewer : 0) |
-                    (loader_busy ? DistributedStore::paced_by_loader : 0) |
-                    (peer_viewers ? DistributedStore::paced_by_peer_viewer : 0)));
+                static_cast<uint8_t>((viewer_busy ? DistributedStore::paced_by_viewer : 0) |
+                                     (loader_busy ? DistributedStore::paced_by_loader : 0) |
+                                     (peer_viewers ? DistributedStore::paced_by_peer_viewer : 0)));
             trace_gate("gate.repair", network_due,
                        flag("share", allow_network_repair) + " " +
                            flag("quiescent", now < network_quiescent_until));
@@ -648,9 +642,8 @@ void Maintenance::run(std::stop_token stop) {
                             " control_live=" +
                             std::to_string(inventory->size(RetentionClass::control)) +
                             " garbage=" + std::to_string(inventory->garbage().size()) +
-                            " stale_garbage=" +
-                            std::to_string(inventory->stale_garbage().size()) + " " +
-                            flag("catalogue_complete", inventory->catalogue_complete()));
+                            " stale_garbage=" + std::to_string(inventory->stale_garbage().size()) +
+                            " " + flag("catalogue_complete", inventory->catalogue_complete()));
                     observations().add("maintenance.inventory.live_objects",
                                        inventory->size(RetentionClass::data));
                     // A newly derived reachability set is never consumed destructively in the
@@ -659,15 +652,15 @@ void Maintenance::run(std::stop_token stop) {
                     gc_quiescent_until = clock_->now() + policy.foreground_quiet;
                 }
                 if (rebuilt_inventory && Log::enabled(LogLevel::all)) {
-                    Log::trace("DIAG maintenance-inventory generation=" +
-                               std::to_string(objects->metadata_generation) +
-                               " entries=" + std::to_string(objects->entries) +
-                               " extents=" + std::to_string(objects->extents) +
-                               " live=" + std::to_string(inventory->size(RetentionClass::data)) +
-                               " garbage=" + std::to_string(inventory->garbage().size()) +
-                               " stale_garbage=" +
-                               std::to_string(inventory->stale_garbage().size()) +
-                               " elapsed_ms=" + std::to_string(elapsed_ms(inventory_stage)));
+                    Log::trace(
+                        "DIAG maintenance-inventory generation=" +
+                        std::to_string(objects->metadata_generation) +
+                        " entries=" + std::to_string(objects->entries) +
+                        " extents=" + std::to_string(objects->extents) +
+                        " live=" + std::to_string(inventory->size(RetentionClass::data)) +
+                        " garbage=" + std::to_string(inventory->garbage().size()) +
+                        " stale_garbage=" + std::to_string(inventory->stale_garbage().size()) +
+                        " elapsed_ms=" + std::to_string(elapsed_ms(inventory_stage)));
                 }
 
                 survey();
@@ -700,7 +693,8 @@ void Maintenance::run(std::stop_token stop) {
                             const bool restored = type == RetentionClass::data
                                                       ? store.ensure_local(id, false)
                                                       : store.ensure_control_local(id);
-                            trace("claim-walk", walked + (restored ? " restored" : " not-restored"));
+                            trace("claim-walk",
+                                  walked + (restored ? " restored" : " not-restored"));
                             if (!restored)
                                 return Outcome::not_restored;
                             credit = std::max(0.0, credit - static_cast<double>(extent));
@@ -720,7 +714,9 @@ void Maintenance::run(std::stop_token stop) {
                         WeightedLoaderService& share;
                         const decltype(higher_class_active)& active;
                         const MaintenanceClock& clock;
-                        ~RepairTurn() { share.finished(clock.now(), active()); }
+                        ~RepairTurn() {
+                            share.finished(clock.now(), active());
+                        }
                     } repair_turn{repair_share, higher_class_active, *clock_};
                     enter_stage("retention-repair");
                     for (auto* walk : {&data_claim_walk, &control_claim_walk}) {
@@ -773,15 +769,16 @@ void Maintenance::run(std::stop_token stop) {
                         push_lacks = peer_lacks;
                         push_inventory = inventory;
                     }
-                    const auto known_present =
-                        [&](const NodeId& peer, const ObjectId& id) -> std::optional<bool> {
+                    const auto known_present = [&](const NodeId& peer,
+                                                   const ObjectId& id) -> std::optional<bool> {
                         if (!peer_lacks || !inventory ||
                             peer_lacks->generation != inventory->generation())
                             return std::nullopt;
                         const auto found = peer_lacks->lacks.find(peer);
                         if (found == peer_lacks->lacks.end())
                             return std::nullopt;
-                        return !std::binary_search(found->second->begin(), found->second->end(), id);
+                        return !std::binary_search(found->second->begin(), found->second->end(),
+                                                   id);
                     };
                     enter_stage("network-repair");
                     if (maintenance_stage_hook_)
@@ -819,8 +816,7 @@ void Maintenance::run(std::stop_token stop) {
                                            repair.push_examined);
                         observations().add("maintenance.repair.pull_examined." + load,
                                            repair.pull_examined);
-                        observations().add("maintenance.repair.retained_repairs",
-                                           retained_repairs);
+                        observations().add("maintenance.repair.retained_repairs", retained_repairs);
                     }
                     log_slow_stage("network-repair", repair_stage,
                                    "bytes=" + std::to_string(repair.bytes_transferred) +
@@ -838,7 +834,7 @@ void Maintenance::run(std::stop_token stop) {
                         // The credit deadline below wakes the loop when the
                         // next extent is affordable.
                         store_.note_repair_gate(DistributedStore::RepairGate::credit,
-                                                 network_credit);
+                                                network_credit);
                     } else if (repair.yielded) {
                         // Work is left. The higher class may have arrived after the pass
                         // began, so neither the busy wake nor the share's next turn may
@@ -960,8 +956,8 @@ void Maintenance::run(std::stop_token stop) {
                     enter_stage("control-gc");
                     const auto now_unix_ms = static_cast<uint64_t>(clock_->wall_ns() / 1'000'000);
                     const auto removed = catalogue_.control_gc_step(
-                        inventory->lookup(RetentionClass::control), policy.garbage_grace,
-                        32, &control_unreferenced_, now_unix_ms);
+                        inventory->lookup(RetentionClass::control), policy.garbage_grace, 32,
+                        &control_unreferenced_, now_unix_ms);
                     save_sightings(control_unreferenced_, control_sightings_saved_);
                     observations().add("catalogue.control_gc.removed", removed);
                     if (removed)
@@ -1000,8 +996,8 @@ void Maintenance::run(std::stop_token stop) {
                             trace_action("release.data", std::to_string(released));
                         if (released && Log::enabled(LogLevel::debug))
                             Log::debug("retention released DATA claims node=" +
-                                       to_string(node_.node_id()).substr(0, 6) + " count=" +
-                                       std::to_string(released));
+                                       to_string(node_.node_id()).substr(0, 6) +
+                                       " count=" + std::to_string(released));
                     } else if (!release_horizon_incomplete_logged) {
                         release_horizon_incomplete_logged = true;
                         Log::debug("retention release skipped: horizon incomplete");
@@ -1032,18 +1028,18 @@ void Maintenance::run(std::stop_token stop) {
                     const auto orphan_grace =
                         std::max(policy.garbage_grace, policy.no_progress_backoff);
                     auto gc = local_.data().gc_step(
-                        inventory->lookup(RetentionClass::data), protected_ids,
-                        orphan_grace, 64,
+                        inventory->lookup(RetentionClass::data), protected_ids, orphan_grace, 64,
                         [this] {
                             const auto quiet = node_.config().maintenance.foreground_quiet;
                             return store_.idle_for(WorkClass::viewer) < quiet ||
-                               store_.idle_for(WorkClass::loader) < quiet;
+                                   store_.idle_for(WorkClass::loader) < quiet;
                         },
                         [this](const ObjectId& id) {
                             return ledger_.retained(RetentionClass::data, id);
                         },
                         &data_unreferenced_, static_cast<uint64_t>(now_ns / 1'000'000),
-                        policy.garbage_grace, [this](const ObjectId& id) {
+                        policy.garbage_grace,
+                        [this](const ObjectId& id) {
                             return ledger_.claim_deletion(RetentionClass::data, id);
                         });
                     save_sightings(data_unreferenced_, data_sightings_saved_, gc.complete);
@@ -1064,15 +1060,14 @@ void Maintenance::run(std::stop_token stop) {
                                        " objects=" + std::to_string(gc.objects));
                     if ((gc.deferred || gc.objects || gc.yielded) && Log::enabled(LogLevel::debug))
                         Log::debug("garbage collection sweep node=" +
-                                   to_string(node_.node_id()).substr(0, 6) + " objects=" +
-                                   std::to_string(gc.objects) + " bytes=" +
-                                   std::to_string(gc.bytes) + " deferred=" +
-                                   std::to_string(gc.deferred ? 1 : 0) + " yielded=" +
-                                   std::to_string(gc.yielded ? 1 : 0) + " complete=" +
-                                   std::to_string(gc.complete ? 1 : 0) + " live=" +
+                                   to_string(node_.node_id()).substr(0, 6) +
+                                   " objects=" + std::to_string(gc.objects) +
+                                   " bytes=" + std::to_string(gc.bytes) +
+                                   " deferred=" + std::to_string(gc.deferred ? 1 : 0) +
+                                   " yielded=" + std::to_string(gc.yielded ? 1 : 0) +
+                                   " complete=" + std::to_string(gc.complete ? 1 : 0) + " live=" +
                                    std::to_string(inventory->size(RetentionClass::data)) +
-                                   " protected=" +
-                                   std::to_string(protected_ids.size()));
+                                   " protected=" + std::to_string(protected_ids.size()));
                     const auto pruned = ledger_.prune_unclaimed(RetentionClass::data, 64);
                     observations().add("retention.pruned.data", pruned);
                     if (pruned)
@@ -1105,8 +1100,8 @@ void Maintenance::run(std::stop_token stop) {
                 local_credit >= node_.config().extent_size) {
                 enter_stage("local-rebalance");
                 const auto rebalance_stage = Clock::now();
-                auto rebalance = local_.data().rebalance_step(
-                    static_cast<uint64_t>(local_credit), 64, [this] {
+                auto rebalance =
+                    local_.data().rebalance_step(static_cast<uint64_t>(local_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
                         return store_.idle_for(WorkClass::viewer) < quiet ||
                                store_.idle_for(WorkClass::loader) < quiet;
@@ -1219,8 +1214,7 @@ void Maintenance::run(std::stop_token stop) {
                     const auto data = local_.data().verify_step(directories);
                     const auto control = local_.control().verify_step(directories);
                     observations().add("ledger.verify.directories", directories);
-                    observations().add("ledger.verify.recorded",
-                                       data.recorded + control.recorded);
+                    observations().add("ledger.verify.recorded", data.recorded + control.recorded);
                     observations().add("ledger.verify.lost", data.lost + control.lost);
                     if (data.complete && control.complete) {
                         ledger_verify_due = now + std::chrono::hours(24);
@@ -1328,8 +1322,8 @@ void Maintenance::run(std::stop_token stop) {
             // A busy pass suppressed GC, repair and rebalance; it re-evaluates as soon as
             // the foreground quiet period is met, or at once if it already has, rather
             // than sleeping until an unrelated event.
-            auto idle = std::min(store_.idle_for(WorkClass::viewer),
-                                 store_.idle_for(WorkClass::loader));
+            auto idle =
+                std::min(store_.idle_for(WorkClass::viewer), store_.idle_for(WorkClass::loader));
             deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
                                                                 ? policy.foreground_quiet - idle
                                                                 : Clock::duration{}));
@@ -1352,11 +1346,12 @@ void Maintenance::run(std::stop_token stop) {
             if (network_quiescent_until != Clock::time_point::max() && repair_rate > 0.0 &&
                 network_credit < node_.config().extent_size) {
                 const auto seconds =
-                    (static_cast<double>(node_.config().extent_size) - network_credit) / repair_rate;
+                    (static_cast<double>(node_.config().extent_size) - network_credit) /
+                    repair_rate;
                 if (std::isfinite(seconds) && seconds > 0.0)
-                    deadline = std::min(deadline,
-                                        now_after_work + std::chrono::duration_cast<Clock::duration>(
-                                                             std::chrono::duration<double>(seconds)));
+                    deadline = std::min(deadline, now_after_work +
+                                                      std::chrono::duration_cast<Clock::duration>(
+                                                          std::chrono::duration<double>(seconds)));
             }
             if (network_quiescent_until != Clock::time_point::max()) {
                 const auto turn = repair_share.wait_for(now_after_work, repair_busy);
@@ -1387,11 +1382,10 @@ void Maintenance::run(std::stop_token stop) {
                     .count();
             };
             port_.last_wait_ms.store(relative(deadline), std::memory_order_release);
-            port_.last_gc_quiet_ms.store(relative(gc_quiescent_until),
-                                                std::memory_order_release);
-            port_.last_flags.store(static_cast<uint8_t>((busy ? 1 : 0) |
-                                                               (gc_due_this_pass ? 2 : 0)),
-                                          std::memory_order_release);
+            port_.last_gc_quiet_ms.store(relative(gc_quiescent_until), std::memory_order_release);
+            port_.last_flags.store(
+                static_cast<uint8_t>((busy ? 1 : 0) | (gc_due_this_pass ? 2 : 0)),
+                std::memory_order_release);
         }
         wait_for_events(stop, deadline);
     }

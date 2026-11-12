@@ -37,9 +37,9 @@ class StorageServer {
         PersistentBlockCache& cache;
     };
     StorageServer(NodeRuntime& node, const NodeIdentity& identity, Stores stores,
-                  DataResourceArbiter& data_resources, ActivityClocks& activity,
-                  NodeEvents& events, MessageRoutes& routes, size_t extent_size,
-                  uint64_t cache_max_blocks, std::chrono::milliseconds refresh_interval);
+                  DataResourceArbiter& data_resources, ActivityClocks& activity, NodeEvents& events,
+                  MessageRoutes& routes, size_t extent_size, uint64_t cache_max_blocks,
+                  std::chrono::milliseconds refresh_interval);
     ~StorageServer();
     StorageServer(const StorageServer&) = delete;
     StorageServer& operator=(const StorageServer&) = delete;

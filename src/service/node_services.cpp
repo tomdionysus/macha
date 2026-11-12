@@ -35,14 +35,13 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       // The guard reaches the catalogue, declared after this: it runs only
       // for a commit, which nothing makes before construction finishes.
       metadata_(node_, local_, metadata_server_, store_,
-                MetadataPublicationRetention{
-                    [this](const MetadataPublicationContext& context) {
-                        return retain_metadata_publication(context);
-                    },
-                    [this](const NodeId& origin, uint64_t sequence,
-                           const MetadataPublicationClaims& claims) {
-                        retain_on_peers(origin, sequence, claims);
-                    }},
+                MetadataPublicationRetention{[this](const MetadataPublicationContext& context) {
+                                                 return retain_metadata_publication(context);
+                                             },
+                                             [this](const NodeId& origin, uint64_t sequence,
+                                                    const MetadataPublicationClaims& claims) {
+                                                 retain_on_peers(origin, sequence, claims);
+                                             }},
                 steady_time_source()),
       ledger_(local_.retention(), local_.data(), local_.control()),
       data_unreferenced_(node_.config().state_path / "retention" / "unreferenced-data.bin"),
@@ -131,13 +130,11 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
       horizon_builder_(filesystem_, catalogue_, local_.control(), store_),
       files_api_(filesystem_, availability_),
-      maintenance_(
-          MaintenanceDependencies{node_, local_, metadata_server_, store_, metadata_, metadata_,
-                                  catalogue_, horizon_builder_, ledger_, data_unreferenced_,
-                                  control_unreferenced_, availability_,
-                                  media_information_,
-                                  resources_.events, port_, instruments_.clock, instruments_.trace,
-                                  instruments_.maintenance_stage_hook, instruments_.constructed}) {
+      maintenance_(MaintenanceDependencies{
+          node_, local_, metadata_server_, store_, metadata_, metadata_, catalogue_,
+          horizon_builder_, ledger_, data_unreferenced_, control_unreferenced_, availability_,
+          media_information_, resources_.events, port_, instruments_.clock, instruments_.trace,
+          instruments_.maintenance_stage_hook, instruments_.constructed}) {
     routes_.bind(MessageType::get_ingest_jobs,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return RpcMessage{MessageType::ingest_jobs_reply,
@@ -148,11 +145,10 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                      return RpcMessage{MessageType::ingest_job_action_reply,
                                        ingest_.handle_job_action(request.payload)};
                  });
-    routes_.bind(MessageType::submit_ingest_job,
-                 [this](const NodeInfo&, FrameType, const RpcMessage& request) {
-                     return RpcMessage{MessageType::ingest_submit_reply,
-                                       ingest_.handle_submit(request.payload)};
-                 });
+    routes_.bind(MessageType::submit_ingest_job, [this](const NodeInfo&, FrameType,
+                                                        const RpcMessage& request) {
+        return RpcMessage{MessageType::ingest_submit_reply, ingest_.handle_submit(request.payload)};
+    });
     routes_.bind(MessageType::get_unmatched_hints,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return RpcMessage{MessageType::unmatched_hints_reply,
@@ -240,7 +236,8 @@ void NodeServices::start() {
     note("start scanner");
     scanner_.start();
 #if MACHA_HAVE_BOOKS
-    if (book_conversions_) book_conversions_->start();
+    if (book_conversions_)
+        book_conversions_->start();
 #endif
     note("start hydration");
     hydration_.start();
@@ -339,7 +336,8 @@ void NodeServices::stop() {
     note("stop scanner");
     scanner_.stop();
 #if MACHA_HAVE_BOOKS
-    if (book_conversions_) book_conversions_->stop();
+    if (book_conversions_)
+        book_conversions_->stop();
 #endif
     note("stop media-information");
     media_information_.stop();
@@ -364,13 +362,11 @@ NodeServices::retain_metadata_publication(const MetadataPublicationContext& cont
             Log::debug("metadata retention barrier dot=" + to_string(dot.origin).substr(0, 6) +
                        ":" + std::to_string(dot.sequence) + " total_ms=" + std::to_string(total) +
                        " decode_ms=" + std::to_string(decode_ms) +
-                       " collect_ms=" + std::to_string(collect_ms) +
-                       " catalogue_ms=" + std::to_string(catalogue_ms) +
-                       " data_ms=" + std::to_string(data_ms) +
+                       " collect_ms=" + std::to_string(collect_ms) + " catalogue_ms=" +
+                       std::to_string(catalogue_ms) + " data_ms=" + std::to_string(data_ms) +
                        " control_ms=" + std::to_string(control_ms) +
-                       " data_objects=" + std::to_string(data.size()) +
-                       " control_objects=" + std::to_string(control.size()) +
-                       " outcome=" + outcome);
+                       " data_objects=" + std::to_string(data.size()) + " control_objects=" +
+                       std::to_string(control.size()) + " outcome=" + outcome);
     };
 
     auto add_entry = [&](const FsEntry& entry) {
@@ -431,21 +427,20 @@ NodeServices::retain_metadata_publication(const MetadataPublicationContext& cont
         } else {
             // Fallback without a delta: compare the namespaces entry by entry (under
             // trees, a walk plus a lookup per path). Ordinary mutations carry a delta.
-            for_each_namespace_entry(
-                context.proposed, &namespace_nodes,
-                [&](const std::string& path, const FsEntry& entry) {
-                    const auto found = namespace_entry(before, &namespace_nodes, path);
-                    if (!found || *found != entry) {
-                        add_entry(entry);
-                        if (!merge && entry.type == EntryType::file)
-                            introduce(entry.extents);
-                    }
-                });
+            for_each_namespace_entry(context.proposed, &namespace_nodes,
+                                     [&](const std::string& path, const FsEntry& entry) {
+                                         const auto found =
+                                             namespace_entry(before, &namespace_nodes, path);
+                                         if (!found || *found != entry) {
+                                             add_entry(entry);
+                                             if (!merge && entry.type == EntryType::file)
+                                                 introduce(entry.extents);
+                                         }
+                                     });
             if (!merge && !introduced.empty())
-                for_each_namespace_entry(before, &namespace_nodes,
-                                         [&](const std::string&, const FsEntry& entry) {
-                                             carry(entry);
-                                         });
+                for_each_namespace_entry(
+                    before, &namespace_nodes,
+                    [&](const std::string&, const FsEntry& entry) { carry(entry); });
         }
 
         // Tree nodes this commit introduced need claims, as changed catalogue shards
@@ -472,7 +467,7 @@ NodeServices::retain_metadata_publication(const MetadataPublicationContext& cont
         if (catalogue_changed && context.proposed.catalogue_root) {
             const auto catalogue_started = Clock::now();
             auto objects = catalogue_.retention_objects(before.catalogue_root,
-                                                         context.proposed.catalogue_root);
+                                                        context.proposed.catalogue_root);
             catalogue_ms += since_ms(catalogue_started);
             data.insert(data.end(), objects.data.begin(), objects.data.end());
             control.insert(control.end(), objects.control.begin(), objects.control.end());
@@ -524,8 +519,7 @@ NodeServices::retain_metadata_publication(const MetadataPublicationContext& cont
     data_ms = since_ms(data_started);
     const auto control_started = Clock::now();
     const bool control_ok =
-        control.empty() ||
-        store_.retain_control(control, dot, DistributedStore::ClaimScope::here);
+        control.empty() || store_.retain_control(control, dot, DistributedStore::ClaimScope::here);
     control_ms = since_ms(control_started);
     if (!control_ok) {
         report("control-claim-failed");
@@ -558,6 +552,5 @@ void NodeServices::retain_on_peers(const NodeId& origin, uint64_t sequence,
                    " data_objects=" + std::to_string(claims.data.size()) +
                    " control_objects=" + std::to_string(claims.control.size()));
 }
-
 
 } // namespace macha

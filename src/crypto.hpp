@@ -47,7 +47,6 @@ Bytes aes_gcm_open(std::span<const uint8_t, 32>, std::span<const uint8_t, 12>,
                    std::span<const uint8_t, 16>, std::span<const uint8_t>,
                    std::span<const uint8_t> aad = {});
 X25519KeyPair x25519_generate();
-std::array<uint8_t, 32> x25519_shared(std::span<const uint8_t, 32>,
-                                      std::span<const uint8_t, 32>);
+std::array<uint8_t, 32> x25519_shared(std::span<const uint8_t, 32>, std::span<const uint8_t, 32>);
 bool constant_time_equal(std::span<const uint8_t>, std::span<const uint8_t>);
 } // namespace macha

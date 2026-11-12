@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-#include "ledger/held_ledger.hpp"
+#include "contract/object_store.hpp"
+#include "contract/thread_safety.hpp"
 #include "crypto.hpp"
+#include "ledger/held_ledger.hpp"
 #include "storage/durability_domain.hpp"
+#include "storage/presence_index.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
-#include "storage/presence_index.hpp"
-#include "contract/object_store.hpp"
-#include "contract/thread_safety.hpp"
 #include <map>
-#include <set>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <stop_token>
 #include <thread>
@@ -76,8 +76,8 @@ class LocalStoreFiles {
     virtual Bytes read(const std::filesystem::path&) MACHA_EXCLUDES(no_io) = 0;
     // `size` bytes at `offset`, or none if the file is shorter. Throws if the
     // file cannot be opened or closed.
-    virtual std::optional<Bytes> read_at(const std::filesystem::path&, uint64_t offset,
-                                         size_t size) MACHA_EXCLUDES(no_io) = 0;
+    virtual std::optional<Bytes> read_at(const std::filesystem::path&, uint64_t offset, size_t size)
+        MACHA_EXCLUDES(no_io) = 0;
     // Appends head then body, creating the file. A throw may leave part of
     // them appended.
     virtual void append(const std::filesystem::path&, std::span<const uint8_t> head,
@@ -245,8 +245,7 @@ class LocalStore final : public ObjectStore {
 
     std::filesystem::path path(const ObjectId&) const;
     void wait_for_accounting(Lock&) const MACHA_REQUIRES(m_);
-    bool wait_for_accounting(Lock&, std::stop_token, bool exact = false) const
-        MACHA_REQUIRES(m_);
+    bool wait_for_accounting(Lock&, std::stop_token, bool exact = false) const MACHA_REQUIRES(m_);
     // Waits for the scan under m_ alone, before a writer takes an object lock.
     void await_accounting() const MACHA_EXCLUDES(m_);
     void start_scan();
@@ -261,10 +260,10 @@ class LocalStore final : public ObjectStore {
         MACHA_EXCLUDES(m_, pack_io_mutex_);
     // Store a new object; m_ is released across the I/O. `generation` is the
     // durability generation to await (0 when none).
-    bool put_loose_locked(const ObjectId&, std::span<const uint8_t>, uint64_t& generation,
-                          Lock&) MACHA_REQUIRES(m_) MACHA_EXCLUDES(pack_io_mutex_);
-    bool put_packed_locked(const ObjectId&, std::span<const uint8_t>, uint64_t& generation,
-                           Lock&) MACHA_REQUIRES(m_) MACHA_EXCLUDES(pack_io_mutex_);
+    bool put_loose_locked(const ObjectId&, std::span<const uint8_t>, uint64_t& generation, Lock&)
+        MACHA_REQUIRES(m_) MACHA_EXCLUDES(pack_io_mutex_);
+    bool put_packed_locked(const ObjectId&, std::span<const uint8_t>, uint64_t& generation, Lock&)
+        MACHA_REQUIRES(m_) MACHA_EXCLUDES(pack_io_mutex_);
     void scan(std::stop_token) MACHA_EXCLUDES(m_);
     void warm_presence_index(std::stop_token) MACHA_EXCLUDES(m_);
     // Constructor only, before any other thread exists, so it takes no lock.
@@ -273,14 +272,13 @@ class LocalStore final : public ObjectStore {
     std::optional<Bytes> get_packed_locked(const ObjectId&, Lock&) const MACHA_REQUIRES(m_);
     // Releases m_ and takes pack_io_mutex_ across the append.
     bool append_pack_record_locked(uint8_t type, const ObjectId&, std::span<const uint8_t>,
-                                   uint64_t touched_ms, PackEntry*, uint64_t* record_size,
-                                   Lock&) MACHA_REQUIRES(m_) MACHA_EXCLUDES(pack_io_mutex_);
+                                   uint64_t touched_ms, PackEntry*, uint64_t* record_size, Lock&)
+        MACHA_REQUIRES(m_) MACHA_EXCLUDES(pack_io_mutex_);
     void select_active_pack_locked(uint64_t next_record_size) MACHA_REQUIRES(pack_io_mutex_);
     // Releases m_ (keeping pack_io_mutex_) across the compaction I/O.
     bool compact_packs_locked(Lock&) MACHA_REQUIRES(m_, pack_io_mutex_);
     // Releases m_ across the unlink.
-    bool remove_locked(const ObjectId&, Lock&) MACHA_REQUIRES(m_)
-        MACHA_EXCLUDES(pack_io_mutex_);
+    bool remove_locked(const ObjectId&, Lock&) MACHA_REQUIRES(m_) MACHA_EXCLUDES(pack_io_mutex_);
     bool physical_space_available_locked(uint64_t need) const MACHA_REQUIRES(m_);
     bool filesystem_space_available_for_reservations() const MACHA_EXCLUDES(m_);
     static std::optional<LooseStamp> loose_stamp(const std::filesystem::path&);
@@ -290,8 +288,7 @@ class LocalStore final : public ObjectStore {
     // Removes a zero-byte loose file and forgets the object. Every object has
     // a fixed header, so an empty file is only left by a crash or external
     // truncation. Caller holds the object's mutex, not m_. True if pruned.
-    bool prune_empty_loose(const ObjectId&, const std::filesystem::path&) const
-        MACHA_EXCLUDES(m_);
+    bool prune_empty_loose(const ObjectId&, const std::filesystem::path&) const MACHA_EXCLUDES(m_);
     // has() from the pack and presence indexes, or none before warm-up. Waits
     // only on m_; its body is a no-I/O region, so taking a lock held across
     // I/O here does not compile under Clang.
@@ -334,7 +331,9 @@ class LocalStore final : public ObjectStore {
     // the identity is incomplete and `held` answers nothing.
     HeldView held_view() const override;
     // The view's removal count alone: an atomic read.
-    uint64_t held_removals() const noexcept { return ledger_ ? ledger_->removals() : 0; }
+    uint64_t held_removals() const noexcept {
+        return ledger_ ? ledger_->removals() : 0;
+    }
     // Whether warm-up has finished and has() answers from the index alone.
     bool presence_authoritative() const {
         Lock lock(m_);
@@ -367,9 +366,15 @@ class LocalStore final : public ObjectStore {
     bool is_packed(const ObjectId&) const;
     bool compact_packs(std::stop_token = {});
 
-    uint64_t used() const { return used_.load(std::memory_order_relaxed); }
-    uint64_t limit() const { return limit_; }
-    bool scan_complete() const { return scan_complete_.load(std::memory_order_acquire); }
+    uint64_t used() const {
+        return used_.load(std::memory_order_relaxed);
+    }
+    uint64_t limit() const {
+        return limit_;
+    }
+    bool scan_complete() const {
+        return scan_complete_.load(std::memory_order_acquire);
+    }
     LocalStoreDiagnostics diagnostics() const noexcept {
         return {loose_reaffirmation_fast_paths_.load(std::memory_order_relaxed),
                 loose_reaffirmation_full_validations_.load(std::memory_order_relaxed),

@@ -51,12 +51,11 @@ void validate(Config& config) {
             shrink(config.runtime.reassembly_memory_reserve_bytes, "reassembly", reserves);
             Log::warn("MEMORY OVER LIMIT: the configured parts total " + mib(total) +
                       ", over runtime.memory_bytes " + mib(limit) +
-                      "; each shrinks by the same fraction: " + said +
-                      " (in-flight reserves " + reserves + ")");
+                      "; each shrinks by the same fraction: " + said + " (in-flight reserves " +
+                      reserves + ")");
         }
     }
-    if (!config.runtime.retained_memory_bytes ||
-        !config.runtime.control_memory_reserve_bytes ||
+    if (!config.runtime.retained_memory_bytes || !config.runtime.control_memory_reserve_bytes ||
         !config.runtime.viewer_memory_reserve_bytes ||
         !config.runtime.loader_memory_reserve_bytes ||
         config.runtime.control_memory_reserve_bytes > config.runtime.retained_memory_bytes ||
@@ -91,7 +90,8 @@ void validate(Config& config) {
     const auto validate_packing = [](const StoragePackingConfig& packing, const char* what) {
         if (!packing.threshold) {
             if (packing.target_size)
-                throw std::runtime_error(std::string(what) + ".target_size requires a nonzero threshold");
+                throw std::runtime_error(std::string(what) +
+                                         ".target_size requires a nonzero threshold");
             return;
         }
         if (!packing.target_size || packing.target_size < packing.threshold)
@@ -116,17 +116,15 @@ void validate(Config& config) {
         throw std::runtime_error("dht.io_pressure_release_percent must be below "
                                  "dht.io_pressure_slowdown_percent");
     // A zero expectation would make every operation infinitely slow.
-    if (config.io_pressure_slowdown_percent &&
-        !config.io_pressure_overhead_ms && !config.io_pressure_per_mib_ms)
+    if (config.io_pressure_slowdown_percent && !config.io_pressure_overhead_ms &&
+        !config.io_pressure_per_mib_ms)
         throw std::runtime_error("dht.io_pressure_overhead_ms and dht.io_pressure_per_mib_ms "
                                  "cannot both be zero");
     if (config.io_pressure_slowdown_percent && !config.io_pressure_min_background)
         throw std::runtime_error("dht.io_pressure_min_background must be at least 1: the loader is "
                                  "bounded under pressure, never stopped");
-    if (config.extent_size >
-        config.data_inflight_bytes - config.data_viewer_reserve_bytes)
-        throw std::runtime_error(
-            "dht DATA non-viewer capacity must fit one complete extent");
+    if (config.extent_size > config.data_inflight_bytes - config.data_viewer_reserve_bytes)
+        throw std::runtime_error("dht DATA non-viewer capacity must fit one complete extent");
     // Unlike DATA's bounded owner set, the metadata floor is any-node and may
     // exceed 31 copies in a large cluster.
     if (config.replication > 31)
@@ -137,8 +135,8 @@ void validate(Config& config) {
         throw std::runtime_error(
             "dht.retention_check_batch_size and dht.retention_check_concurrency must be nonzero");
     if (config.retention_check_batch_size * 32 + 4 > config.max_frame_size)
-        throw std::runtime_error(
-            "dht.retention_check_batch_size must fit one have_objects request within max_frame_size");
+        throw std::runtime_error("dht.retention_check_batch_size must fit one have_objects request "
+                                 "within max_frame_size");
     if (config.connect_timeout.count() < 100 || config.metadata_cache.count() < 0)
         throw std::runtime_error("invalid network/cache timeout");
     if (config.upnp.discovery_timeout < std::chrono::milliseconds(100) ||
@@ -158,8 +156,7 @@ void validate(Config& config) {
         throw std::runtime_error("metadata cache must be <= 5000ms");
     if (config.metadata_materialization_cache_bytes < 8ULL * 1024 * 1024 ||
         config.metadata_materialization_cache_bytes > 4ULL * 1024 * 1024 * 1024)
-        throw std::runtime_error(
-            "dht.metadata_materialization_cache_bytes must be 8M..4G");
+        throw std::runtime_error("dht.metadata_materialization_cache_bytes must be 8M..4G");
     if (config.fuse.entry_timeout > std::chrono::seconds(5) ||
         config.fuse.attr_timeout > std::chrono::seconds(5) ||
         config.fuse.negative_timeout > std::chrono::seconds(5))
@@ -179,13 +176,14 @@ void validate(Config& config) {
     if (!positive(config.fuse.absolute_request_timeout) ||
         config.fuse.absolute_request_timeout > fuse_max)
         throw std::runtime_error("fuse.absolute_request_timeout_ms must be 1..30000");
-    const std::array fuse_timeouts{config.fuse.timeouts.lookup,
-                                   config.fuse.timeouts.namespace_mutation,
-                                   config.fuse.timeouts.read, config.fuse.timeouts.write,
-                                   config.fuse.timeouts.sync, config.fuse.timeouts.lifecycle};
+    const std::array fuse_timeouts{
+        config.fuse.timeouts.lookup, config.fuse.timeouts.namespace_mutation,
+        config.fuse.timeouts.read,   config.fuse.timeouts.write,
+        config.fuse.timeouts.sync,   config.fuse.timeouts.lifecycle};
     for (auto timeout : fuse_timeouts) {
         if (!positive(timeout) || timeout > config.fuse.absolute_request_timeout)
-            throw std::runtime_error("fuse operation timeouts must be >0 and <= absolute_request_timeout_ms");
+            throw std::runtime_error(
+                "fuse operation timeouts must be >0 and <= absolute_request_timeout_ms");
     }
     if (config.fuse.request_workers < 6 || config.fuse.request_workers > 256)
         throw std::runtime_error("fuse.request_workers must be 6..256");
@@ -216,9 +214,8 @@ void validate(Config& config) {
         throw std::runtime_error(
             "fuse.publication_inflight_bytes must be a quantum multiple from quantum..16G");
     if (!config.fuse.publication_pipeline_bytes)
-        config.fuse.publication_pipeline_bytes =
-            std::min<uint64_t>(config.fuse.publication_quantum_bytes,
-                               static_cast<uint64_t>(config.extent_size) * 2);
+        config.fuse.publication_pipeline_bytes = std::min<uint64_t>(
+            config.fuse.publication_quantum_bytes, static_cast<uint64_t>(config.extent_size) * 2);
     if (config.fuse.publication_pipeline_bytes < config.extent_size ||
         config.fuse.publication_pipeline_bytes > config.fuse.publication_quantum_bytes ||
         config.fuse.publication_pipeline_bytes % config.extent_size ||
@@ -232,11 +229,10 @@ void validate(Config& config) {
     // commit_workers: an idle worker is worse than a slightly overcommitted
     // reserve, and the no-progress deadline still bounds the wait.
     if (!config.fuse.publication_max_open_writers) {
-        const auto per_writer = static_cast<uint64_t>(config.extent_size) +
-                                config.fuse.publication_pipeline_bytes;
-        config.fuse.publication_max_open_writers = static_cast<size_t>(
-            std::max<uint64_t>(config.fuse.commit_workers,
-                               config.runtime.loader_memory_reserve_bytes / per_writer));
+        const auto per_writer =
+            static_cast<uint64_t>(config.extent_size) + config.fuse.publication_pipeline_bytes;
+        config.fuse.publication_max_open_writers = static_cast<size_t>(std::max<uint64_t>(
+            config.fuse.commit_workers, config.runtime.loader_memory_reserve_bytes / per_writer));
     }
     if (!config.fuse.max_pending_requests || config.fuse.max_pending_requests > 65536 ||
         !config.fuse.max_pending_operations || config.fuse.max_pending_operations > 65536)
@@ -245,7 +241,8 @@ void validate(Config& config) {
         config.fuse.namespace_batch_operations > config.fuse.max_pending_operations)
         throw std::runtime_error(
             "fuse.namespace_batch_operations must be 1..max_pending_operations");
-    if (!config.fuse.namespace_batch_bytes || config.fuse.namespace_batch_bytes > 64ULL * 1024 * 1024)
+    if (!config.fuse.namespace_batch_bytes ||
+        config.fuse.namespace_batch_bytes > 64ULL * 1024 * 1024)
         throw std::runtime_error("fuse.namespace_batch_bytes must be 1..64M");
     if (!config.fuse.max_spool_bytes)
         throw std::runtime_error("fuse.max_spool_bytes must be nonzero");
@@ -271,7 +268,8 @@ void validate(Config& config) {
             "session.max_concurrent_password_checks must be below catalogue.api.control_workers");
     if (!config.catalogue.api.max_connections || config.catalogue.api.max_connections > 65536)
         throw std::runtime_error("catalogue.api.max_connections must be 1..65536");
-    if (!config.catalogue.api.max_queued_requests || config.catalogue.api.max_queued_requests > 65536)
+    if (!config.catalogue.api.max_queued_requests ||
+        config.catalogue.api.max_queued_requests > 65536)
         throw std::runtime_error("catalogue.api.max_queued_requests must be 1..65536");
     if (!config.catalogue.api.staging_chunks || config.catalogue.api.staging_chunks > 64)
         throw std::runtime_error("catalogue.api.staging_chunks must be 1..64");
@@ -334,7 +332,8 @@ void validate(Config& config) {
             throw std::runtime_error("books.conversion.mobitool must be an absolute path");
         if (conversion.max_concurrent < 1 || conversion.max_concurrent > 16)
             throw std::runtime_error("books.conversion.max_concurrent must be 1..16");
-        if (conversion.timeout < std::chrono::seconds(10) || conversion.timeout > std::chrono::hours(2))
+        if (conversion.timeout < std::chrono::seconds(10) ||
+            conversion.timeout > std::chrono::hours(2))
             throw std::runtime_error("books.conversion.timeout_ms must be 10000..7200000");
         if (conversion.cache_limit < 64ULL * 1024 * 1024)
             throw std::runtime_error("books.conversion.cache_limit must be at least 64M");
@@ -344,7 +343,8 @@ void validate(Config& config) {
     if (!config.torrent.max_active || config.torrent.max_active > 64)
         throw std::runtime_error("torrent.max_active must be 1..64");
     for (const auto& provider : config.torrent.search_providers) {
-        if (!provider.enabled) continue;
+        if (!provider.enabled)
+            continue;
         if (provider.name.empty())
             throw std::runtime_error("torrent.search.providers requires a non-empty name");
         if (provider.type != "torznab")
@@ -382,7 +382,8 @@ void validate(Config& config) {
                 "e.g. https://node.example:7438");
         const auto scheme = endpoint.substr(0, scheme_end);
         if (scheme != "http" && scheme != "https")
-            throw std::runtime_error("catalogue.api.advertised_endpoint scheme must be http or https");
+            throw std::runtime_error(
+                "catalogue.api.advertised_endpoint scheme must be http or https");
         const auto authority = endpoint.substr(scheme_end + 3);
         if (authority.empty())
             throw std::runtime_error("catalogue.api.advertised_endpoint must include a host");
@@ -395,15 +396,15 @@ void validate(Config& config) {
                 "catalogue.api.advertised_endpoint must not include a query or fragment");
         // IPv6 literals must be bracketed to separate the port.
         const auto close = authority.find(']');
-        const auto host_part = authority.front() == '[' ? authority.substr(0, close + 1) : authority;
+        const auto host_part =
+            authority.front() == '[' ? authority.substr(0, close + 1) : authority;
         if (authority.front() == '[' && close == std::string::npos)
             throw std::runtime_error(
                 "catalogue.api.advertised_endpoint has an unterminated IPv6 literal");
         const auto port_sep = authority.find(':', authority.front() == '[' ? close : 0);
         if (port_sep != std::string::npos) {
             const auto port = authority.substr(port_sep + 1);
-            if (port.empty() ||
-                port.find_first_not_of("0123456789") != std::string::npos ||
+            if (port.empty() || port.find_first_not_of("0123456789") != std::string::npos ||
                 std::stoul(port) == 0 || std::stoul(port) > 65535)
                 throw std::runtime_error("catalogue.api.advertised_endpoint has an invalid port");
         }
@@ -443,7 +444,8 @@ void validate(Config& config) {
     if (config.streaming.segment_memory_bytes < 4ULL * 1024 * 1024 ||
         config.streaming.segment_memory_bytes > 4ULL * 1024 * 1024 * 1024)
         throw std::runtime_error("streaming.segment_memory_bytes must be 4M..4G");
-    if (config.streaming.probe_bytes < 256ULL * 1024 || config.streaming.probe_bytes > 64ULL * 1024 * 1024)
+    if (config.streaming.probe_bytes < 256ULL * 1024 ||
+        config.streaming.probe_bytes > 64ULL * 1024 * 1024)
         throw std::runtime_error("streaming.probe_bytes must be 256K..64M");
     if (config.streaming.probe_analyze_duration < std::chrono::milliseconds(250) ||
         config.streaming.probe_analyze_duration > std::chrono::seconds(30))
@@ -461,16 +463,19 @@ void validate(Config& config) {
     if (config.catalogue.scanner.rescan_max_delay < std::chrono::seconds(1))
         throw std::runtime_error("catalogue.scanner.rescan_max_delay_ms must be >= 1000");
     if (config.catalogue.scanner.rescan_max_delay < config.catalogue.scanner.rescan_debounce)
-        throw std::runtime_error("catalogue.scanner.rescan_max_delay_ms must be >= rescan_debounce_ms");
+        throw std::runtime_error(
+            "catalogue.scanner.rescan_max_delay_ms must be >= rescan_debounce_ms");
     if (!config.catalogue.scanner.max_provider_requests_per_scan ||
         config.catalogue.scanner.max_provider_requests_per_scan > 10000)
-        throw std::runtime_error("catalogue.scanner.max_provider_requests_per_scan must be 1..10000");
+        throw std::runtime_error(
+            "catalogue.scanner.max_provider_requests_per_scan must be 1..10000");
     if (config.catalogue.scanner.provider_batch_delay < std::chrono::seconds(1) ||
         config.catalogue.scanner.provider_batch_delay > std::chrono::hours(1))
         throw std::runtime_error("catalogue.scanner.provider_batch_delay_ms must be 1000..3600000");
     const auto validate_provider_roots = [](std::string_view name, bool enabled,
                                             const std::vector<std::string>& roots) {
-        if (!enabled) return;
+        if (!enabled)
+            return;
         if (roots.empty())
             throw std::runtime_error("catalogue.scanner.providers." + std::string(name) +
                                      ".roots must not be empty");
@@ -506,24 +511,20 @@ void validate(Config& config) {
         config.catalogue.scanner.music.musicbrainz.contact.empty())
         throw std::runtime_error(
             "catalogue.scanner.providers.music.musicbrainz.contact is required");
-    if (config.catalogue.scanner.enabled &&
-        config.catalogue.scanner.music.enabled &&
+    if (config.catalogue.scanner.enabled && config.catalogue.scanner.music.enabled &&
         config.catalogue.scanner.music.discogs.enabled &&
         !config.catalogue.scanner.music.discogs.token_file)
-        throw std::runtime_error(
-            "catalogue.scanner.providers.music.discogs.token_file is required when Discogs is enabled");
-    if (config.catalogue.scanner.enabled &&
-        config.catalogue.scanner.movies.enabled &&
+        throw std::runtime_error("catalogue.scanner.providers.music.discogs.token_file is required "
+                                 "when Discogs is enabled");
+    if (config.catalogue.scanner.enabled && config.catalogue.scanner.movies.enabled &&
         config.catalogue.scanner.movies.tmdb.enabled &&
         !config.catalogue.scanner.movies.tmdb.token_file)
-        throw std::runtime_error(
-            "catalogue.scanner.providers.movies.tmdb.token_file is required when movie scanning is enabled");
-    if (config.catalogue.scanner.enabled &&
-        config.catalogue.scanner.tv.enabled &&
-        config.catalogue.scanner.tv.tmdb.enabled &&
-        !config.catalogue.scanner.tv.tmdb.token_file)
-        throw std::runtime_error(
-            "catalogue.scanner.providers.tv.tmdb.token_file is required when TV scanning is enabled");
+        throw std::runtime_error("catalogue.scanner.providers.movies.tmdb.token_file is required "
+                                 "when movie scanning is enabled");
+    if (config.catalogue.scanner.enabled && config.catalogue.scanner.tv.enabled &&
+        config.catalogue.scanner.tv.tmdb.enabled && !config.catalogue.scanner.tv.tmdb.token_file)
+        throw std::runtime_error("catalogue.scanner.providers.tv.tmdb.token_file is required when "
+                                 "TV scanning is enabled");
     if (config.hydration.interval < std::chrono::milliseconds(10))
         throw std::runtime_error("hydration.interval_ms must be >= 10ms");
     if (config.hydration.active_timeout < std::chrono::milliseconds(1000))
@@ -549,7 +550,7 @@ void validate(Config& config) {
         throw std::runtime_error("maintenance fractions must be between 0 and 1");
 }
 
- } // namespace
+} // namespace
 
 uint64_t parse_size(const std::string& value) {
     size_t split = 0;
@@ -687,6 +688,5 @@ std::vector<std::string> configuration_warnings(const Config& config) {
     }
     return out;
 }
-
 
 } // namespace macha

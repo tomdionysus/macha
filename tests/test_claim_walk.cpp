@@ -5,10 +5,10 @@
 // pattern and every credit limit that reaches a different decision.
 #include "contract/claim_store.hpp"
 #include "crypto.hpp"
-#include "service/claim_walk.hpp"
 #include "ledger/retention_ledger.hpp"
-#include "test_framework.hpp"
+#include "service/claim_walk.hpp"
 #include "test_backend_support.hpp"
+#include "test_framework.hpp"
 
 #include <map>
 #include <set>
@@ -27,7 +27,9 @@ ObjectId id_of(size_t i) {
 }
 
 struct FakeStore final : ObjectStore {
-    HeldView held_view() const override { return {}; }
+    HeldView held_view() const override {
+        return {};
+    }
     std::set<ObjectId> objects;
     mutable size_t asked{};
     bool has(const ObjectId& id) const override {
@@ -75,8 +77,8 @@ MACHA_FAST_TEST("claim_walk", test_retention_ledger_pages_every_live_claim_once)
         if (!released.empty()) {
             std::vector<ObjectId> keep = live;
             CHECK(retention.release_unreferenced(RetentionClass::data, keep,
-                                                 RetentionClock{{origin, 1}}, 64) ==
-                  released.size());
+                                                 RetentionClock{{origin, 1}},
+                                                 64) == released.size());
         }
         const RetentionLedger ledger(retention, data, control);
         for (size_t bound = 1; bound <= 10; ++bound) {
@@ -146,7 +148,8 @@ MACHA_FAST_TEST("claim_walk", test_retention_ledger_holds_by_class) {
     CHECK(control.asked == 3u);
 }
 
-MACHA_FAST_TEST("claim_walk", test_retention_ledger_publishes_horizons_and_refuses_an_incomplete_release) {
+MACHA_FAST_TEST("claim_walk",
+                test_retention_ledger_publishes_horizons_and_refuses_an_incomplete_release) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -159,7 +162,8 @@ MACHA_FAST_TEST("claim_walk", test_retention_ledger_publishes_horizons_and_refus
     CHECK(!ledger.release());
 
     const auto first = std::make_shared<const InventoryHorizon>(
-        3, true, std::vector<ObjectId>{id_of(1)}, std::vector<ObjectId>{}, std::vector<GarbageRef>{});
+        3, true, std::vector<ObjectId>{id_of(1)}, std::vector<ObjectId>{},
+        std::vector<GarbageRef>{});
     ledger.publish(first);
     const auto held = ledger.inventory();
     CHECK(held == first);
@@ -253,16 +257,32 @@ struct FakeLedger final : ObjectLedger {
     bool held(RetentionClass, const ObjectId& id) const override {
         return held_ids.contains(id);
     }
-    HeldView held_view(RetentionClass) const override { return {}; }
+    HeldView held_view(RetentionClass) const override {
+        return {};
+    }
     // The claim walk reads no horizon.
-    InventoryHandle inventory() const override { return {}; }
-    ReleaseHandle release() const override { return {}; }
+    InventoryHandle inventory() const override {
+        return {};
+    }
+    ReleaseHandle release() const override {
+        return {};
+    }
     void publish(InventoryHandle) override {}
-    bool publish(ReleaseBuild) override { return false; }
-    bool retained(RetentionClass, const ObjectId&) const override { return false; }
-    size_t release_unreferenced(RetentionClass, const ReleaseHorizon&, size_t) override { return 0; }
-    size_t prune_unclaimed(RetentionClass, size_t) override { return 0; }
-    bool compact_if_needed(size_t) override { return false; }
+    bool publish(ReleaseBuild) override {
+        return false;
+    }
+    bool retained(RetentionClass, const ObjectId&) const override {
+        return false;
+    }
+    size_t release_unreferenced(RetentionClass, const ReleaseHorizon&, size_t) override {
+        return 0;
+    }
+    size_t prune_unclaimed(RetentionClass, size_t) override {
+        return 0;
+    }
+    bool compact_if_needed(size_t) override {
+        return false;
+    }
 };
 
 // Restores until its credit runs out; `refused` ids are fetched but not

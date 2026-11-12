@@ -2,10 +2,10 @@
 #include "ledger/object_trie.hpp"
 
 #include "codec.hpp"
+#include "contract/thread_safety.hpp"
 #include "crypto.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
-#include "contract/thread_safety.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -295,8 +295,8 @@ ObjectTrie::NodePtr ObjectTrie::decode(std::span<const uint8_t> bytes, bool form
     return node;
 }
 
-ObjectTrie::NodePtr ObjectTrie::load_from(const Child& child, uint64_t generation,
-                                          const Read& read, NodeCache& cache, bool format1) {
+ObjectTrie::NodePtr ObjectTrie::load_from(const Child& child, uint64_t generation, const Read& read,
+                                          NodeCache& cache, bool format1) {
     if (child.node)
         return child.node;
     if (child.empty() || child.offset == unsaved)
@@ -330,8 +330,7 @@ ObjectTrie::Child ObjectTrie::build(uint8_t depth, std::vector<Record> records) 
         const auto byte = begin->first.bytes[depth];
         auto end = std::find_if(begin, records.end(),
                                 [&](const Record& r) { return r.first.bytes[depth] != byte; });
-        children[byte] =
-            build(static_cast<uint8_t>(depth + 1), std::vector<Record>(begin, end));
+        children[byte] = build(static_cast<uint8_t>(depth + 1), std::vector<Record>(begin, end));
         begin = end;
     }
     return child_of(make_interior(depth, std::move(children)));
@@ -439,9 +438,8 @@ void ObjectTrie::publish_root() const {
     const auto check = sha256(writer.data());
     writer.fixed(check.bytes);
     const auto& bytes = writer.data();
-    durable_replace_file(dir_ / "root",
-                         std::string_view(reinterpret_cast<const char*>(bytes.data()),
-                                          bytes.size()));
+    durable_replace_file(
+        dir_ / "root", std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
 }
 
 ObjectTrie::ObjectTrie(std::filesystem::path dir, std::array<uint8_t, 32> key, Options options)
@@ -497,8 +495,8 @@ ObjectTrie::ObjectTrie(std::filesystem::path dir, std::array<uint8_t, 32> key, O
                 Change change;
                 change.id.bytes = reader.fixed<32>();
                 if (reader.u8())
-                    change.value = u64_values ? format1_value(reader.u64())
-                                              : reader.bytes(value_max);
+                    change.value =
+                        u64_values ? format1_value(reader.u64()) : reader.bytes(value_max);
                 if (!changes.empty() && !(changes.back().id < change.id))
                     throw DecodeError("object trie journal frame out of order");
                 changes.push_back(change);
@@ -529,8 +527,8 @@ void ObjectTrie::write(std::span<const Change> sorted_unique) {
         if (change.value && change.value->size() > value_max)
             throw std::invalid_argument("object trie value too large");
     for (size_t from = 0; from < sorted_unique.size(); from += changes_per_frame) {
-        const auto part = sorted_unique.subspan(
-            from, std::min(changes_per_frame, sorted_unique.size() - from));
+        const auto part =
+            sorted_unique.subspan(from, std::min(changes_per_frame, sorted_unique.size() - from));
         Writer writer;
         writer.u8(journal_version);
         writer.u32(static_cast<uint32_t>(part.size()));
@@ -694,8 +692,8 @@ std::optional<Bytes> ObjectTrie::Snapshot::get(const ObjectId& id) const {
     const auto& source = *source_;
     return find(root_, id, [&](const Child& child) {
         return load_from(
-            child, source.generation,
-            [&](uint64_t offset) { return source.file->read_at(offset); }, *source.cache, false);
+            child, source.generation, [&](uint64_t offset) { return source.file->read_at(offset); },
+            *source.cache, false);
     });
 }
 
@@ -721,8 +719,8 @@ std::vector<ObjectTrie::Record> ObjectTrie::Snapshot::next(const std::optional<O
     const auto& source = *source_;
     collect(root_, after, after.has_value(), limit, out, [&](const Child& child) {
         return load_from(
-            child, source.generation,
-            [&](uint64_t offset) { return source.file->read_at(offset); }, *source.cache, false);
+            child, source.generation, [&](uint64_t offset) { return source.file->read_at(offset); },
+            *source.cache, false);
     });
     return out;
 }
@@ -749,8 +747,8 @@ ObjectTrie::Snapshot::children(std::span<const Prefix> prefixes) const {
     const auto& source = *source_;
     const auto load = [&](const Child& child) {
         return load_from(
-            child, source.generation,
-            [&](uint64_t offset) { return source.file->read_at(offset); }, *source.cache, false);
+            child, source.generation, [&](uint64_t offset) { return source.file->read_at(offset); },
+            *source.cache, false);
     };
     for (size_t i = 0; i < prefixes.size(); ++i) {
         const auto& prefix = prefixes[i];
@@ -792,8 +790,8 @@ ObjectTrie::Snapshot::records(std::span<const Prefix> prefixes, uint64_t most) c
     const auto& source = *source_;
     const std::function<NodePtr(const Child&)> load = [&](const Child& child) {
         return load_from(
-            child, source.generation,
-            [&](uint64_t offset) { return source.file->read_at(offset); }, *source.cache, false);
+            child, source.generation, [&](uint64_t offset) { return source.file->read_at(offset); },
+            *source.cache, false);
     };
     for (size_t i = 0; i < prefixes.size(); ++i) {
         const auto node = descend(root_, prefixes[i], load);

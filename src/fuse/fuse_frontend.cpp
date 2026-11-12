@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "observation.hpp"
 #include "fuse/fuse_frontend.hpp"
+#include "observation.hpp"
 
 #include "codec.hpp"
 #include "crypto.hpp"
+#include "filesystem/macos_unicode.hpp"
 #include "fuse/fuse_journal.hpp"
+#include "log.hpp"
 #include "retry_policy.hpp"
 #include "startup_progress.hpp"
-#include "log.hpp"
 #include "supervised.hpp"
-#include "filesystem/macos_unicode.hpp"
 
 #include <algorithm>
 #include <array>
@@ -450,18 +450,15 @@ struct FuseFrontend::State {
         }
     };
 
-    static bool overlay_ranges_mergeable(
-        const std::pair<const uint64_t, DataOverlayRange>& left,
-        const std::pair<const uint64_t, DataOverlayRange>& right) {
+    static bool overlay_ranges_mergeable(const std::pair<const uint64_t, DataOverlayRange>& left,
+                                         const std::pair<const uint64_t, DataOverlayRange>& right) {
         return left.second.end == right.first && left.second.zero == right.second.zero &&
-               (left.second.zero ||
-                left.second.spool_offset + (left.second.end - left.first) ==
-                    right.second.spool_offset);
+               (left.second.zero || left.second.spool_offset + (left.second.end - left.first) ==
+                                        right.second.spool_offset);
     }
 
-    static void assign_overlay_range_locked(Inode& inode, uint64_t begin, uint64_t end,
-                                            bool zero, uint64_t spool_offset = 0)
-        MACHA_REQUIRES(inode.mutex) {
+    static void assign_overlay_range_locked(Inode& inode, uint64_t begin, uint64_t end, bool zero,
+                                            uint64_t spool_offset = 0) MACHA_REQUIRES(inode.mutex) {
         if (begin >= end)
             return;
 
@@ -483,16 +480,14 @@ struct FuseFrontend::State {
             }
             if (existing_begin < begin) {
                 left = std::pair{existing_begin,
-                                 DataOverlayRange{begin, existing.spool_offset,
-                                                  existing.zero}};
+                                 DataOverlayRange{begin, existing.spool_offset, existing.zero}};
             }
             if (existing.end > end) {
-                right = std::pair{
-                    end, DataOverlayRange{existing.end,
-                                          existing.zero
-                                              ? 0
-                                              : existing.spool_offset + (end - existing_begin),
-                                          existing.zero}};
+                right = std::pair{end, DataOverlayRange{existing.end,
+                                                        existing.zero ? 0
+                                                                      : existing.spool_offset +
+                                                                            (end - existing_begin),
+                                                        existing.zero}};
             }
             it = inode.data_overlay.erase(it);
         }
@@ -500,8 +495,9 @@ struct FuseFrontend::State {
             inode.data_overlay.insert_or_assign(left->first, left->second);
         if (right)
             inode.data_overlay.insert_or_assign(right->first, right->second);
-        auto inserted = inode.data_overlay.insert_or_assign(
-            begin, DataOverlayRange{end, spool_offset, zero}).first;
+        auto inserted =
+            inode.data_overlay.insert_or_assign(begin, DataOverlayRange{end, spool_offset, zero})
+                .first;
 
         if (inserted != inode.data_overlay.begin()) {
             auto previous = std::prev(inserted);
@@ -667,8 +663,8 @@ struct FuseFrontend::State {
 
     Mutex durability_mutex;
     std::condition_variable_any durability_cv;
-    std::deque<std::shared_ptr<DurabilityTicket>> durability_queue
-        MACHA_GUARDED_BY(durability_mutex);
+    std::deque<std::shared_ptr<DurabilityTicket>>
+        durability_queue MACHA_GUARDED_BY(durability_mutex);
     // Started by start() and joined by stop(), on the lifecycle thread.
     std::jthread durability_worker;
     bool durability_poisoned MACHA_GUARDED_BY(durability_mutex){};
@@ -703,8 +699,8 @@ struct FuseFrontend::State {
 
     // Held across journal appends and namespace node reads.
     mutable IoMutex namespace_mutex;
-    std::map<std::string, std::shared_ptr<Inode>, std::less<>> paths
-        MACHA_GUARDED_BY(namespace_mutex);
+    std::map<std::string, std::shared_ptr<Inode>, std::less<>>
+        paths MACHA_GUARDED_BY(namespace_mutex);
     std::map<uint64_t, std::shared_ptr<Inode>> inodes MACHA_GUARDED_BY(namespace_mutex);
     uint64_t next_inode MACHA_GUARDED_BY(namespace_mutex){2};
     uint64_t next_namespace_sequence MACHA_GUARDED_BY(namespace_mutex){1};
@@ -776,11 +772,13 @@ struct FuseFrontend::State {
 
     struct WriteRequestLease {
         std::function<void()> release;
-        explicit WriteRequestLease(std::function<void()> callback)
-            : release(std::move(callback)) {}
+        explicit WriteRequestLease(std::function<void()> callback) : release(std::move(callback)) {}
         WriteRequestLease(const WriteRequestLease&) = delete;
         WriteRequestLease& operator=(const WriteRequestLease&) = delete;
-        ~WriteRequestLease() { if (release) release(); }
+        ~WriteRequestLease() {
+            if (release)
+                release();
+        }
     };
 
     mutable Mutex hint_mutex;
@@ -876,8 +874,9 @@ struct FuseFrontend::State {
     State(FileSystem& filesystem, RetainedMemoryLedger& memory, FuseConfig policy,
           std::unique_ptr<LoaderAdmission> loader_admission, PublicationTarget& target,
           std::stop_token startup_cancel = {})
-        : fs(filesystem), retained_memory(memory), config(std::move(policy)), startup_stop(std::move(startup_cancel)),
-          admission(std::move(loader_admission)), publication_target(target),
+        : fs(filesystem), retained_memory(memory), config(std::move(policy)),
+          startup_stop(std::move(startup_cancel)), admission(std::move(loader_admission)),
+          publication_target(target),
           spool_dir(config.spool_path.value_or(fs.config().state_path / "fuse-spool")),
           journal_path(config.operation_journal_path.value_or(spool_dir / "operations.log")),
           journal_dir(journal_path.parent_path().empty() ? std::filesystem::path(".")
@@ -885,17 +884,16 @@ struct FuseFrontend::State {
         // An unvalidated FuseConfig gets the same defaults Config validation
         // applies; zero would mean serial publication.
         if (!config.publication_pipeline_bytes)
-            config.publication_pipeline_bytes =
-                std::min<uint64_t>(config.publication_quantum_bytes,
-                                   static_cast<uint64_t>(fs.extent_size()) * 2);
+            config.publication_pipeline_bytes = std::min<uint64_t>(
+                config.publication_quantum_bytes, static_cast<uint64_t>(fs.extent_size()) * 2);
         // Unbounded open writers could fill the durable-lower budget with
         // partial extents and deadlock the ledger.
         if (!config.publication_max_open_writers) {
             const auto per_writer =
                 static_cast<uint64_t>(fs.extent_size()) + config.publication_pipeline_bytes;
-            config.publication_max_open_writers = static_cast<size_t>(std::max<uint64_t>(
-                config.commit_workers,
-                fs.config().runtime.loader_memory_reserve_bytes / per_writer));
+            config.publication_max_open_writers = static_cast<size_t>(
+                std::max<uint64_t>(config.commit_workers,
+                                   fs.config().runtime.loader_memory_reserve_bytes / per_writer));
         }
         fuse_namespace_origin = derive_fuse_namespace_origin(fs.node_id());
         if (!admission)
@@ -930,8 +928,8 @@ struct FuseFrontend::State {
         // capacity slack.
         constexpr uint64_t copies_with_capacity_slack = 4;
         const auto hashes = static_cast<uint64_t>(checksum_count) * sizeof(Hash256);
-        if (hashes > std::numeric_limits<uint64_t>::max() / copies_with_capacity_slack -
-                         sizeof(DataOp))
+        if (hashes >
+            std::numeric_limits<uint64_t>::max() / copies_with_capacity_slack - sizeof(DataOp))
             throw FsError(E2BIG, "FUSE operation metadata charge overflow");
         return copies_with_capacity_slack * (sizeof(DataOp) + hashes);
     }
@@ -941,11 +939,10 @@ struct FuseFrontend::State {
             return;
         {
             Lock lock(operation_metadata_mutex);
-            operation_metadata_bytes = bytes > operation_metadata_bytes
-                                           ? 0
-                                           : operation_metadata_bytes - bytes;
+            operation_metadata_bytes =
+                bytes > operation_metadata_bytes ? 0 : operation_metadata_bytes - bytes;
             operation_metadata_bytes_diagnostic.store(operation_metadata_bytes,
-                                                       std::memory_order_relaxed);
+                                                      std::memory_order_relaxed);
         }
         operation_metadata_cv.notify_all();
     }
@@ -958,15 +955,17 @@ struct FuseFrontend::State {
     static constexpr auto admission_notice = std::chrono::seconds(5);
 
     void note_admission_wait(const char* what, Clock::time_point since, uint64_t bytes) {
-        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since);
+        const auto waited =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since);
         if (waited >= admission_notice && waited.count() % 5000 < admission_slice.count())
             Log::debug(std::string("FUSE ") + what + " admission waiting bytes=" +
                        std::to_string(bytes) + " waited_ms=" + std::to_string(waited.count()) +
                        "; backpressure from publication, not an error");
     }
 
-    std::unique_ptr<WriteRequestLease> reserve_operation_metadata(
-        uint64_t bytes, Clock::time_point, const std::function<void()>& request_progress) {
+    std::unique_ptr<WriteRequestLease>
+    reserve_operation_metadata(uint64_t bytes, Clock::time_point,
+                               const std::function<void()>& request_progress) {
         if (bytes > config.max_operation_metadata_bytes)
             throw FsError(E2BIG, "single FUSE operation exceeds metadata byte limit");
         Lock lock(operation_metadata_mutex);
@@ -983,23 +982,24 @@ struct FuseFrontend::State {
         }
         operation_metadata_bytes += bytes;
         operation_metadata_bytes_diagnostic.store(operation_metadata_bytes,
-                                                   std::memory_order_relaxed);
+                                                  std::memory_order_relaxed);
         auto peak = peak_operation_metadata_bytes.load(std::memory_order_relaxed);
         while (peak < operation_metadata_bytes &&
-               !peak_operation_metadata_bytes.compare_exchange_weak(
-                   peak, operation_metadata_bytes, std::memory_order_relaxed)) {
+               !peak_operation_metadata_bytes.compare_exchange_weak(peak, operation_metadata_bytes,
+                                                                    std::memory_order_relaxed)) {
         }
-        return std::make_unique<WriteRequestLease>([this, bytes] {
-            release_operation_metadata(bytes);
-        });
+        return std::make_unique<WriteRequestLease>(
+            [this, bytes] { release_operation_metadata(bytes); });
     }
 
-    std::shared_ptr<RetainedMemoryLedger::Lease> reserve_process_memory(
-        WorkClass memory_class, MemoryOwner owner, uint64_t bytes, Clock::time_point) {
+    std::shared_ptr<RetainedMemoryLedger::Lease> reserve_process_memory(WorkClass memory_class,
+                                                                        MemoryOwner owner,
+                                                                        uint64_t bytes,
+                                                                        Clock::time_point) {
         const auto since = Clock::now();
         for (;;) {
-            auto lease = retained_memory.acquire(memory_class, owner, bytes,
-                                                             Clock::now() + admission_slice);
+            auto lease =
+                retained_memory.acquire(memory_class, owner, bytes, Clock::now() + admission_slice);
             if (lease)
                 return std::make_shared<RetainedMemoryLedger::Lease>(std::move(*lease));
             if (stopping.load(std::memory_order_relaxed))
@@ -1032,9 +1032,8 @@ struct FuseFrontend::State {
         }
         const auto open = open_publications.fetch_add(1, std::memory_order_relaxed) + 1;
         auto peak = peak_open_publications.load(std::memory_order_relaxed);
-        while (peak < open &&
-               !peak_open_publications.compare_exchange_weak(peak, open,
-                                                             std::memory_order_relaxed)) {
+        while (peak < open && !peak_open_publications.compare_exchange_weak(
+                                  peak, open, std::memory_order_relaxed)) {
         }
     }
 
@@ -1048,7 +1047,8 @@ struct FuseFrontend::State {
         const auto operation_count = static_cast<uint64_t>(inode.data_ops.size());
         const auto operation_memory = operation_bytes(inode.data_ops);
         const auto overlay_count = static_cast<uint64_t>(inode.data_overlay.size());
-        const auto overlay_memory = overlay_count *
+        const auto overlay_memory =
+            overlay_count *
             (sizeof(std::pair<const uint64_t, DataOverlayRange>) + 3 * sizeof(void*));
         uint64_t publication_count = 0;
         uint64_t publication_memory = 0;
@@ -1062,16 +1062,15 @@ struct FuseFrontend::State {
                           operation_memory);
         replace_accounted(retained_overlay_ranges, inode.accounted_overlay_ranges, overlay_count);
         replace_accounted(retained_overlay_bytes, inode.accounted_overlay_bytes, overlay_memory);
-        replace_accounted(retained_publication_operations,
-                          inode.accounted_publication_operations, publication_count);
+        replace_accounted(retained_publication_operations, inode.accounted_publication_operations,
+                          publication_count);
         replace_accounted(retained_publication_operation_bytes,
                           inode.accounted_publication_operation_bytes, publication_memory);
         uint64_t metadata_memory = 0;
         for (const auto& op : inode.data_ops)
             metadata_memory += op.metadata_charge;
         if (metadata_memory < inode.accounted_operation_metadata_bytes)
-            release_operation_metadata(inode.accounted_operation_metadata_bytes -
-                                       metadata_memory);
+            release_operation_metadata(inode.accounted_operation_metadata_bytes - metadata_memory);
         else if (metadata_memory > inode.accounted_operation_metadata_bytes) {
             // Recovery restores acknowledged ownership unconditionally; above
             // a lowered limit it blocks new work until publication drains it.
@@ -1079,7 +1078,7 @@ struct FuseFrontend::State {
             Lock metadata_lock(operation_metadata_mutex);
             operation_metadata_bytes += added;
             operation_metadata_bytes_diagnostic.store(operation_metadata_bytes,
-                                                       std::memory_order_relaxed);
+                                                      std::memory_order_relaxed);
             auto peak = peak_operation_metadata_bytes.load(std::memory_order_relaxed);
             while (peak < operation_metadata_bytes &&
                    !peak_operation_metadata_bytes.compare_exchange_weak(
@@ -1094,8 +1093,8 @@ struct FuseFrontend::State {
         replace_accounted(retained_data_operation_bytes, inode.accounted_data_operation_bytes, 0);
         replace_accounted(retained_overlay_ranges, inode.accounted_overlay_ranges, 0);
         replace_accounted(retained_overlay_bytes, inode.accounted_overlay_bytes, 0);
-        replace_accounted(retained_publication_operations,
-                          inode.accounted_publication_operations, 0);
+        replace_accounted(retained_publication_operations, inode.accounted_publication_operations,
+                          0);
         replace_accounted(retained_publication_operation_bytes,
                           inode.accounted_publication_operation_bytes, 0);
         release_operation_metadata(inode.accounted_operation_metadata_bytes);
@@ -1130,8 +1129,8 @@ struct FuseFrontend::State {
             {
                 Lock release_lock(write_request_mutex);
                 pending_write_request_bytes -= bytes;
-                pending_write_request_bytes_diagnostic.store(
-                    pending_write_request_bytes, std::memory_order_relaxed);
+                pending_write_request_bytes_diagnostic.store(pending_write_request_bytes,
+                                                             std::memory_order_relaxed);
             }
             write_request_cv.notify_all();
         });
@@ -1158,10 +1157,9 @@ struct FuseFrontend::State {
             !spool_drain_requested.load(std::memory_order_acquire))
             return;
         const auto limit = spool_progress_credit_limit();
-        spool_progress_credit_bytes =
-            bytes > limit - std::min(limit, spool_progress_credit_bytes)
-                ? limit
-                : spool_progress_credit_bytes + bytes;
+        spool_progress_credit_bytes = bytes > limit - std::min(limit, spool_progress_credit_bytes)
+                                          ? limit
+                                          : spool_progress_credit_bytes + bytes;
         ++spool_admission_revision;
         spool_admission_cv.notify_all();
     }
@@ -1209,15 +1207,13 @@ struct FuseFrontend::State {
             } else if (capacity_available && !rate_admitted &&
                        spool_publish_rate_bytes_per_second > 0.0) {
                 const auto full_rate_at = std::max<uint64_t>(
-                    throttle_start + 1,
-                    config.max_spool_bytes - config.max_spool_bytes / 10);
+                    throttle_start + 1, config.max_spool_bytes - config.max_spool_bytes / 10);
                 const auto pressure_span = full_rate_at - throttle_start;
-                const auto pressure_bytes =
-                    std::min(current - throttle_start, pressure_span);
+                const auto pressure_bytes = std::min(current - throttle_start, pressure_span);
                 // From up to 8x the drain rate, converging to 1x at 90% occupancy.
-                const double pressure = std::max(
-                    0.125, static_cast<double>(pressure_bytes) /
-                               static_cast<double>(std::max<uint64_t>(1, pressure_span)));
+                const double pressure =
+                    std::max(0.125, static_cast<double>(pressure_bytes) /
+                                        static_cast<double>(std::max<uint64_t>(1, pressure_span)));
                 const double admission_rate = spool_publish_rate_bytes_per_second / pressure;
                 if (next_spool_admission <= now) {
                     rate_admitted = true;
@@ -1301,11 +1297,9 @@ struct FuseFrontend::State {
                 spool_publish_rate_diagnostic.store(
                     static_cast<uint64_t>(spool_publish_rate_bytes_per_second),
                     std::memory_order_relaxed);
-                spool_publish_rate_window_bytes.store(sample->bytes,
-                                                      std::memory_order_relaxed);
-                spool_publish_rate_window_ms.store(
-                    static_cast<uint64_t>(sample->elapsed.count()),
-                    std::memory_order_relaxed);
+                spool_publish_rate_window_bytes.store(sample->bytes, std::memory_order_relaxed);
+                spool_publish_rate_window_ms.store(static_cast<uint64_t>(sample->elapsed.count()),
+                                                   std::memory_order_relaxed);
             }
         }
         const auto before = spool_bytes.load(std::memory_order_relaxed);
@@ -1418,8 +1412,9 @@ struct FuseFrontend::State {
         return true;
     }
 
-    [[maybe_unused]] static bool namespace_batch_compatible_legacy(
-        std::span<const NamespaceOp> current, const NamespaceOp& candidate) {
+    [[maybe_unused]] static bool
+    namespace_batch_compatible_legacy(std::span<const NamespaceOp> current,
+                                      const NamespaceOp& candidate) {
         if (current.empty())
             return true;
         const auto is_delete = [](NamespaceOp::Kind kind) {
@@ -1674,9 +1669,8 @@ struct FuseFrontend::State {
         }
     }
 
-    void append_journal_record_locked(std::span<const uint8_t> payload,
-                                      bool new_admission = false, bool sync = true)
-        MACHA_REQUIRES(journal_mutex) {
+    void append_journal_record_locked(std::span<const uint8_t> payload, bool new_admission = false,
+                                      bool sync = true) MACHA_REQUIRES(journal_mutex) {
         std::vector<Bytes> payloads;
         payloads.emplace_back(payload.begin(), payload.end());
         append_journal_records_locked(payloads, new_admission, sync);
@@ -2169,9 +2163,8 @@ struct FuseFrontend::State {
                                                              std::memory_order_relaxed);
                 Log::warn("FUSE operation journal checksum mismatch before EOF; quarantined the "
                           "tail and recovering the prefix offset=" +
-                          std::to_string(*corrupt_at) +
-                          " bytes=" + std::to_string(file_size - *corrupt_at) +
-                          " quarantine=" + quarantine);
+                          std::to_string(*corrupt_at) + " bytes=" +
+                          std::to_string(file_size - *corrupt_at) + " quarantine=" + quarantine);
             }
             if (last_good != file_size) {
                 if (::ftruncate(fd, static_cast<off_t>(last_good)) != 0)
@@ -2503,8 +2496,8 @@ struct FuseFrontend::State {
     }
 
     // Pure questions about a snapshot; `nodes` supplies tree nodes.
-    static bool snapshot_has_path(const MetadataSnapshot& snapshot,
-                                  const NamespaceNodeStore& nodes, std::string_view path) {
+    static bool snapshot_has_path(const MetadataSnapshot& snapshot, const NamespaceNodeStore& nodes,
+                                  std::string_view path) {
         return namespace_contains(snapshot, &nodes, normalize_path(std::string(path)));
     }
 
@@ -2565,14 +2558,22 @@ struct FuseFrontend::State {
 
     static std::string_view namespace_op_kind_name(NamespaceOp::Kind kind) {
         switch (kind) {
-        case NamespaceOp::Kind::mkdir: return "mkdir";
-        case NamespaceOp::Kind::create: return "create";
-        case NamespaceOp::Kind::rmdir: return "rmdir";
-        case NamespaceOp::Kind::unlink: return "unlink";
-        case NamespaceOp::Kind::rename: return "rename";
-        case NamespaceOp::Kind::chmod: return "chmod";
-        case NamespaceOp::Kind::chown: return "chown";
-        case NamespaceOp::Kind::utimens: return "utimens";
+        case NamespaceOp::Kind::mkdir:
+            return "mkdir";
+        case NamespaceOp::Kind::create:
+            return "create";
+        case NamespaceOp::Kind::rmdir:
+            return "rmdir";
+        case NamespaceOp::Kind::unlink:
+            return "unlink";
+        case NamespaceOp::Kind::rename:
+            return "rename";
+        case NamespaceOp::Kind::chmod:
+            return "chmod";
+        case NamespaceOp::Kind::chown:
+            return "chown";
+        case NamespaceOp::Kind::utimens:
+            return "utimens";
         }
         return "unknown";
     }
@@ -2592,8 +2593,8 @@ struct FuseFrontend::State {
     void note_inode_inserted_locked() MACHA_REQUIRES(namespace_mutex) {
         const auto current = inode_count.fetch_add(1, std::memory_order_relaxed) + 1;
         auto peak = peak_inode_count.load(std::memory_order_relaxed);
-        while (peak < current && !peak_inode_count.compare_exchange_weak(
-                                     peak, current, std::memory_order_relaxed)) {
+        while (peak < current &&
+               !peak_inode_count.compare_exchange_weak(peak, current, std::memory_order_relaxed)) {
         }
     }
 
@@ -2611,13 +2612,12 @@ struct FuseFrontend::State {
         const bool no_namespace_owner =
             !inode->namespace_references.load(std::memory_order_relaxed);
         const bool no_durability_owner = !inode->durability_pending;
-        const bool no_data_owner = inode->data_ops.empty() && !inode->data_enqueue_pending &&
-                                   !inode->data_queued && !inode->data_running &&
-                                   !inode->data_deferred && !inode->data_publication &&
-                                   !inode->unconfirmed_data_entry &&
-                                   !inode->unconfirmed_data_sequence;
-        const bool no_spool_owner = inode->spool_fd < 0 && inode->spool_path.empty() &&
-                                    !inode->spool_end;
+        const bool no_data_owner =
+            inode->data_ops.empty() && !inode->data_enqueue_pending && !inode->data_queued &&
+            !inode->data_running && !inode->data_deferred && !inode->data_publication &&
+            !inode->unconfirmed_data_entry && !inode->unconfirmed_data_sequence;
+        const bool no_spool_owner =
+            inode->spool_fd < 0 && inode->spool_path.empty() && !inode->spool_end;
         if (!detached || !no_handles || !no_namespace_owner || !no_durability_owner ||
             !no_data_owner || !no_spool_owner)
             return;
@@ -2635,8 +2635,7 @@ struct FuseFrontend::State {
     }
 
     // Install before the op's path edges stop owning their inodes.
-    void retain_namespace_references_locked(const NamespaceOp& op)
-        MACHA_REQUIRES(namespace_mutex) {
+    void retain_namespace_references_locked(const NamespaceOp& op) MACHA_REQUIRES(namespace_mutex) {
         for (auto id : namespace_operation_inodes(op)) {
             auto found = inodes.find(id);
             if (found == inodes.end())
@@ -2654,11 +2653,10 @@ struct FuseFrontend::State {
                     auto found = inodes.find(id);
                     if (found == inodes.end())
                         continue;
-                    const auto previous = found->second->namespace_references.fetch_sub(
-                        1, std::memory_order_relaxed);
+                    const auto previous =
+                        found->second->namespace_references.fetch_sub(1, std::memory_order_relaxed);
                     if (!previous) {
-                        found->second->namespace_references.fetch_add(
-                            1, std::memory_order_relaxed);
+                        found->second->namespace_references.fetch_add(1, std::memory_order_relaxed);
                         throw std::logic_error("FUSE namespace ownership underflow");
                     }
                     candidates.push_back(id);
@@ -2829,8 +2827,7 @@ struct FuseFrontend::State {
             if (!watermark_advanced &&
                 (inode->unconfirmed_data_entry || inode->data_enqueue_pending ||
                  inode->data_queued || inode->data_running || inode->data_deferred)) {
-                data_publication_notifications_suppressed.fetch_add(
-                    1, std::memory_order_relaxed);
+                data_publication_notifications_suppressed.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
             data_publication_requests.fetch_add(1, std::memory_order_relaxed);
@@ -2844,8 +2841,7 @@ struct FuseFrontend::State {
             if (inode->unconfirmed_data_entry) {
                 inode->data_deferred = true;
                 ++merged_publications;
-                data_publication_coalesced_unconfirmed.fetch_add(1,
-                                                                 std::memory_order_relaxed);
+                data_publication_coalesced_unconfirmed.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
             if (inode->data_enqueue_pending || inode->data_queued) {
@@ -2903,9 +2899,8 @@ struct FuseFrontend::State {
         const auto ns = static_cast<int64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(due.time_since_epoch()).count());
         auto current = deferred_retry_due_ns.load(std::memory_order_relaxed);
-        while ((current == 0 || ns < current) &&
-               !deferred_retry_due_ns.compare_exchange_weak(current, ns,
-                                                            std::memory_order_acq_rel)) {
+        while ((current == 0 || ns < current) && !deferred_retry_due_ns.compare_exchange_weak(
+                                                     current, ns, std::memory_order_acq_rel)) {
         }
         data_cv.notify_all();
     }
@@ -3134,7 +3129,7 @@ struct FuseFrontend::State {
                     release_namespace_references(abandoned_span);
                     namespace_view_diverged.store(true, std::memory_order_release);
                     Log::warn("FUSE async namespace publication operator-skipped seq=" +
-                             std::to_string(abandoned.sequence));
+                              std::to_string(abandoned.sequence));
                     batch.erase(batch.begin());
                     if (batch.empty())
                         break;
@@ -3151,7 +3146,8 @@ struct FuseFrontend::State {
                                                             batch.front().sequence};
                     // Otherwise retire a leading run of ops whose effect is
                     // already visible; safe for every kind as nothing re-applies.
-                    if (identity_batch && fuse_namespace_clock(*before.snapshot) >= identity.sequence)
+                    if (identity_batch &&
+                        fuse_namespace_clock(*before.snapshot) >= identity.sequence)
                         published_prefix = batch.size();
                     while (published_prefix < batch.size() &&
                            namespace_effect_confirmed(batch[published_prefix], *before.snapshot,
@@ -3284,21 +3280,21 @@ struct FuseFrontend::State {
                                 namespace_blocked_error_message =
                                     "retry budget exhausted: " + std::string(e.what());
                             }
-                            Log::error("FUSE async namespace publication blocked after " +
-                                       std::to_string(retry.total_failures()) +
-                                       " retryable failures seq=" +
-                                       std::to_string(blocked.sequence) + " error=" + e.what() +
-                                       "; still retrying every " +
-                                       std::to_string(delay->count()) + " ms");
+                            Log::error(
+                                "FUSE async namespace publication blocked after " +
+                                std::to_string(retry.total_failures()) +
+                                " retryable failures seq=" + std::to_string(blocked.sequence) +
+                                " error=" + e.what() + "; still retrying every " +
+                                std::to_string(delay->count()) + " ms");
                         }
                     }
                     Lock wait_lock(namespace_queue_mutex);
-                    namespace_cv.wait_for(
-                        wait_lock.native(), stop, *delay,
-                        [&]() MACHA_REQUIRES(namespace_queue_mutex) {
-                            return stopping.load() ||
-                                   namespace_skip_requested_sequence == batch.front().sequence;
-                        });
+                    namespace_cv.wait_for(wait_lock.native(), stop, *delay,
+                                          [&]() MACHA_REQUIRES(namespace_queue_mutex) {
+                                              return stopping.load() ||
+                                                     namespace_skip_requested_sequence ==
+                                                         batch.front().sequence;
+                                          });
                 }
             }
 
@@ -3517,8 +3513,8 @@ struct FuseFrontend::State {
                     if (namespace_inflight &&
                         namespace_inflight_sequence <= snapshot.required_namespace_sequence)
                         return false;
-                    return namespace_queue.empty() || namespace_queue.front().sequence >
-                                                          snapshot.required_namespace_sequence;
+                    return namespace_queue.empty() ||
+                           namespace_queue.front().sequence > snapshot.required_namespace_sequence;
                 };
                 namespace_cv.wait(namespace_lock.native(), dependencies_published);
             }
@@ -3574,8 +3570,7 @@ struct FuseFrontend::State {
             // replay bypasses the cache so a backlog cannot evict the working set.
             try {
                 publication->writer = publication_target.open_publication(
-                    *snapshot.published_path,
-                    config.write_through_cache && !publication->recovered,
+                    *snapshot.published_path, config.write_through_cache && !publication->recovered,
                     config.publication_pipeline_bytes,
                     DataWorkContext(FrameType::loader, config.publication_quantum_bytes, {},
                                     nullptr, &fs.write_progress(),
@@ -3645,15 +3640,14 @@ struct FuseFrontend::State {
                     // cursors across a yield.
                     if (remaining_quantum < fs.extent_size())
                         return yield_quantum();
-                    const auto preparation = publication->writer->prepare_write(
-                        write_offset, remaining_quantum);
+                    const auto preparation =
+                        publication->writer->prepare_write(write_offset, remaining_quantum);
                     served += preparation.bytes_processed;
                     if (!preparation.ready || served >= config.publication_quantum_bytes)
                         return yield_quantum();
-                    const auto chunk =
-                        static_cast<size_t>(std::min<uint64_t>(
-                            {buffer.size(), op.length - publication->operation_offset,
-                             config.publication_quantum_bytes - served}));
+                    const auto chunk = static_cast<size_t>(std::min<uint64_t>(
+                        {buffer.size(), op.length - publication->operation_offset,
+                         config.publication_quantum_bytes - served}));
                     if (publication->replay_spool.get() < 0) {
                         const int fd = ::open(snapshot.spool_path.c_str(), O_RDONLY);
                         if (fd < 0)
@@ -3671,9 +3665,8 @@ struct FuseFrontend::State {
                     data_publication_bytes_read.fetch_add(chunk, std::memory_order_relaxed);
                     publication->spool_bytes_read += chunk;
                     if (!op.spool_hashes.empty()) {
-                        const auto checksum_index =
-                            static_cast<size_t>(publication->operation_offset /
-                                                State::spool_checksum_chunk_size);
+                        const auto checksum_index = static_cast<size_t>(
+                            publication->operation_offset / State::spool_checksum_chunk_size);
                         if (checksum_index >= op.spool_hashes.size() ||
                             sha256(std::span<const uint8_t>{buffer.data(), chunk}) !=
                                 op.spool_hashes[checksum_index]) {
@@ -3681,8 +3674,7 @@ struct FuseFrontend::State {
                             return true;
                         }
                     }
-                    if (publication->writer->write(write_offset,
-                                                   {buffer.data(), chunk}) != chunk)
+                    if (publication->writer->write(write_offset, {buffer.data(), chunk}) != chunk)
                         throw FsError(EIO, "short replay into Macha write handle");
                     publication->operation_offset += chunk;
                     publication->unreported_spool_progress += chunk;
@@ -3706,8 +3698,7 @@ struct FuseFrontend::State {
             const auto remaining_quantum = config.publication_quantum_bytes - served;
             if (remaining_quantum < fs.extent_size())
                 return yield_quantum();
-            const auto commit_preparation =
-                publication->writer->prepare_commit(remaining_quantum);
+            const auto commit_preparation = publication->writer->prepare_commit(remaining_quantum);
             served += commit_preparation.bytes_processed;
             if (!commit_preparation.ready || served >= config.publication_quantum_bytes)
                 return yield_quantum();
@@ -3724,8 +3715,8 @@ struct FuseFrontend::State {
             data_publications_completed.fetch_add(1, std::memory_order_relaxed);
             data_publication_bytes_committed.fetch_add(publication->publication_bytes,
                                                        std::memory_order_relaxed);
-            data_publication_completed_spool_bytes_read.fetch_add(
-                publication->spool_bytes_read, std::memory_order_relaxed);
+            data_publication_completed_spool_bytes_read.fetch_add(publication->spool_bytes_read,
+                                                                  std::memory_order_relaxed);
             data_publication_completed_source_bytes_read.fetch_add(
                 completed_diagnostics.materialize_source_bytes +
                     completed_diagnostics.rebuild_source_bytes,
@@ -3790,10 +3781,11 @@ struct FuseFrontend::State {
         // Closed files first, so a large open import cannot hide complete
         // files; recovery provenance does not demote them. Handle state is
         // read now, since release() may close an already-queued inode.
-        auto loader = std::find_if(data_queue.begin(), data_queue.end(), [&](const DataQueueItem& item) {
-            Lock inode_lock(item.inode->mutex);
-            return item.inode->writable_handles == 0 && admissible(bounded, *item.inode);
-        });
+        auto loader =
+            std::find_if(data_queue.begin(), data_queue.end(), [&](const DataQueueItem& item) {
+                Lock inode_lock(item.inode->mutex);
+                return item.inode->writable_handles == 0 && admissible(bounded, *item.inode);
+            });
         if (loader != data_queue.end() && spool_under_pressure()) {
             struct RetirementScore {
                 uint64_t retirement_bytes{};
@@ -3816,30 +3808,26 @@ struct FuseFrontend::State {
                             op.sequence <= inode.published_data_sequence ||
                             op.sequence > target_sequence)
                             continue;
-                        total_bytes =
-                            op.length > std::numeric_limits<uint64_t>::max() - total_bytes
-                                ? std::numeric_limits<uint64_t>::max()
-                                : total_bytes + op.length;
+                        total_bytes = op.length > std::numeric_limits<uint64_t>::max() - total_bytes
+                                          ? std::numeric_limits<uint64_t>::max()
+                                          : total_bytes + op.length;
                     }
                 }
                 const bool later_generation =
                     inode.durability_pending ||
                     std::any_of(inode.data_ops.begin(), inode.data_ops.end(),
                                 [&](const DataOp& op) { return op.sequence > target_sequence; });
-                return RetirementScore{
-                    later_generation ? 0 : inode.spool_end,
-                    std::max<uint64_t>(1, total_bytes > processed_bytes
-                                              ? total_bytes - processed_bytes
-                                              : 1)};
+                return RetirementScore{later_generation ? 0 : inode.spool_end,
+                                       std::max<uint64_t>(1, total_bytes > processed_bytes
+                                                                 ? total_bytes - processed_bytes
+                                                                 : 1)};
             };
             const auto better = [](const RetirementScore& candidate,
                                    const RetirementScore& current) {
-                const auto candidate_return =
-                    static_cast<long double>(candidate.retirement_bytes) *
-                    static_cast<long double>(current.remaining_bytes);
-                const auto current_return =
-                    static_cast<long double>(current.retirement_bytes) *
-                    static_cast<long double>(candidate.remaining_bytes);
+                const auto candidate_return = static_cast<long double>(candidate.retirement_bytes) *
+                                              static_cast<long double>(current.remaining_bytes);
+                const auto current_return = static_cast<long double>(current.retirement_bytes) *
+                                            static_cast<long double>(candidate.remaining_bytes);
                 if (candidate_return != current_return)
                     return candidate_return > current_return;
                 if (candidate.remaining_bytes != current.remaining_bytes)
@@ -3872,11 +3860,10 @@ struct FuseFrontend::State {
         // Then files still open for writing.
         if (!bounded)
             return data_queue.begin();
-        return std::find_if(data_queue.begin(), data_queue.end(),
-                            [](const DataQueueItem& item) {
-                                Lock inode_lock(item.inode->mutex);
-                                return item.inode->data_publication != nullptr;
-                            });
+        return std::find_if(data_queue.begin(), data_queue.end(), [](const DataQueueItem& item) {
+            Lock inode_lock(item.inode->mutex);
+            return item.inode->data_publication != nullptr;
+        });
     }
 
     bool runnable_data_available_locked() MACHA_REQUIRES(data_queue_mutex) {
@@ -3914,8 +3901,7 @@ struct FuseFrontend::State {
                             data_cv.wait_until(lock.native(), stop, *due, arrived);
                         } else if (parked_publications.load(std::memory_order_relaxed)) {
                             // Nothing notifies a membership or storage change.
-                            data_cv.wait_for(lock.native(), stop, config.parked_recheck,
-                                             arrived);
+                            data_cv.wait_for(lock.native(), stop, config.parked_recheck, arrived);
                             lock.unlock();
                             readmit_parked_on_change();
                             lock.lock();
@@ -3957,29 +3943,25 @@ struct FuseFrontend::State {
                 {
                     Lock selected_inode_lock(selected->inode->mutex);
                     if (selected->inode->writable_handles == 0) {
-                        selected_closed_ahead_of_open =
-                            std::any_of(data_queue.begin(), selected,
-                                        [](const DataQueueItem& item) {
-                                            Lock inode_lock(item.inode->mutex);
-                                            return item.inode->writable_handles > 0;
-                                        });
+                        selected_closed_ahead_of_open = std::any_of(
+                            data_queue.begin(), selected, [](const DataQueueItem& item) {
+                                Lock inode_lock(item.inode->mutex);
+                                return item.inode->writable_handles > 0;
+                            });
                         if (spool_under_pressure()) {
                             const auto first_closed = std::find_if(
-                                data_queue.begin(), selected,
-                                [](const DataQueueItem& item) {
+                                data_queue.begin(), selected, [](const DataQueueItem& item) {
                                     Lock inode_lock(item.inode->mutex);
                                     return item.inode->writable_handles == 0;
                                 });
-                            selected_retirement_ahead_of_closed =
-                                first_closed != selected;
+                            selected_retirement_ahead_of_closed = first_closed != selected;
                         }
                     }
                 }
                 if (selected_closed_ahead_of_open)
                     data_closed_priority_selections.fetch_add(1, std::memory_order_relaxed);
                 if (selected_retirement_ahead_of_closed)
-                    data_retirement_priority_selections.fetch_add(1,
-                                                                   std::memory_order_relaxed);
+                    data_retirement_priority_selections.fetch_add(1, std::memory_order_relaxed);
                 if (writer_cap_reached())
                     data_publication_selections_under_writer_cap.fetch_add(
                         1, std::memory_order_relaxed);
@@ -3995,7 +3977,7 @@ struct FuseFrontend::State {
                 admission->started(Clock::now(), false);
                 publication_inflight_bytes += config.publication_quantum_bytes;
                 publication_inflight_bytes_diagnostic.store(publication_inflight_bytes,
-                                                             std::memory_order_relaxed);
+                                                            std::memory_order_relaxed);
                 data_publication_quanta.fetch_add(1, std::memory_order_relaxed);
                 auto byte_peak =
                     data_publication_peak_inflight_bytes.load(std::memory_order_relaxed);
@@ -4005,9 +3987,8 @@ struct FuseFrontend::State {
                 }
                 const auto active_now = active_data.fetch_add(1, std::memory_order_relaxed) + 1;
                 auto peak = data_publication_peak_active.load(std::memory_order_relaxed);
-                while (peak < active_now &&
-                       !data_publication_peak_active.compare_exchange_weak(
-                           peak, active_now, std::memory_order_relaxed)) {
+                while (peak < active_now && !data_publication_peak_active.compare_exchange_weak(
+                                                peak, active_now, std::memory_order_relaxed)) {
                 }
                 if (recovered)
                     ++active_recovery_data;
@@ -4071,17 +4052,19 @@ struct FuseFrontend::State {
                         abandon_data(inode, "file is no longer in the namespace");
                         abandoned = true;
                         publications_abandoned.fetch_add(1, std::memory_order_relaxed);
-                        Log::warn("FUSE data publication abandoned inode=" +
-                                  std::to_string(inode->id) + " last_path=" + path +
-                                  " unpublished_bytes=" + std::to_string(bytes) +
-                                  " reason=file is no longer in the namespace");
+                        Log::warn(
+                            "FUSE data publication abandoned inode=" + std::to_string(inode->id) +
+                            " last_path=" + path + " unpublished_bytes=" + std::to_string(bytes) +
+                            " reason=file is no longer in the namespace");
                     } catch (const FsError&) {
                         // Writes still reaching the spool; retry later.
                         retry = true;
                     }
                 }
                 const auto line = std::string("FUSE async data publication ") +
-                                  (replay ? "replay" : retry ? "retry" : "failed") +
+                                  (replay  ? "replay"
+                                   : retry ? "retry"
+                                           : "failed") +
                                   " inode=" + std::to_string(inode->id) + " error=" + e.what();
                 if (replay) {
                     Lock lock(inode->mutex);
@@ -4109,8 +4092,8 @@ struct FuseFrontend::State {
                             now - inode->publication_retry.failing_since());
                         path = inode->current_path;
                         if (!delay) {
-                            inode->parked = Inode::Parked{
-                                code, e.what(), now, publication_target.reachability_epoch()};
+                            inode->parked = Inode::Parked{code, e.what(), now,
+                                                          publication_target.reachability_epoch()};
                             set_data_publication_locked(*inode, nullptr);
                         }
                     }
@@ -4122,8 +4105,8 @@ struct FuseFrontend::State {
                         constexpr size_t repeat_every = 20;
                         const bool crossed = consecutive == escalate_at;
                         if (crossed)
-                            publications_retrying_persistently.fetch_add(
-                                1, std::memory_order_relaxed);
+                            publications_retrying_persistently.fetch_add(1,
+                                                                         std::memory_order_relaxed);
                         if (crossed || (consecutive > escalate_at &&
                                         (consecutive - escalate_at) % repeat_every == 0)) {
                             Log::warn("FUSE data publication failing repeatedly inode=" +
@@ -4139,13 +4122,13 @@ struct FuseFrontend::State {
                     } else {
                         parked_publications.fetch_add(1, std::memory_order_relaxed);
                         retry = false; // not readmitted; not poisoned either.
-                        Log::warn("FUSE data publication parked inode=" +
-                                  std::to_string(inode->id) + " path=" + path +
-                                  " attempts=" + std::to_string(attempts) +
-                                  " failing_for_ms=" + std::to_string(failing_for.count()) +
-                                  " error=" + e.what() +
-                                  "; retried when membership or storage changes, or via "
-                                  "manage/filesystem/parked-publications");
+                        Log::warn(
+                            "FUSE data publication parked inode=" + std::to_string(inode->id) +
+                            " path=" + path + " attempts=" + std::to_string(attempts) +
+                            " failing_for_ms=" + std::to_string(failing_for.count()) +
+                            " error=" + e.what() +
+                            "; retried when membership or storage changes, or via "
+                            "manage/filesystem/parked-publications");
                     }
                 } else {
                     // Terminal: poisons the inode until an operator acts.
@@ -4194,7 +4177,7 @@ struct FuseFrontend::State {
                     --reserved_publications;
                 publication_inflight_bytes -= config.publication_quantum_bytes;
                 publication_inflight_bytes_diagnostic.store(publication_inflight_bytes,
-                                                             std::memory_order_relaxed);
+                                                            std::memory_order_relaxed);
                 (void)active_data.fetch_sub(1, std::memory_order_relaxed);
                 if (recovered)
                     --active_recovery_data;
@@ -4280,7 +4263,8 @@ struct FuseFrontend::State {
                 continue;
             if (!namespace_effect_confirmed(op, snapshot, fs.namespace_nodes()))
                 Log::info("FUSE recovery retiring published namespace op whose effect is no "
-                          "longer visible seq=" + std::to_string(op.sequence) +
+                          "longer visible seq=" +
+                          std::to_string(op.sequence) +
                           " kind=" + std::string(namespace_op_kind_name(op.kind)) +
                           " from=" + op.from + (op.to.empty() ? "" : " to=" + op.to));
             confirmed_namespace.push_back(op);
@@ -4628,9 +4612,9 @@ struct FuseFrontend::State {
                 auto operations = recovery.data_ops.find(id);
                 if (operations != recovery.data_ops.end()) {
                     const auto done = recovery.data_done[id];
-                    const auto pending = static_cast<size_t>(std::count_if(
-                        operations->second.begin(), operations->second.end(),
-                        [&](const DataOp& op) { return op.sequence > done; }));
+                    const auto pending = static_cast<size_t>(
+                        std::count_if(operations->second.begin(), operations->second.end(),
+                                      [&](const DataOp& op) { return op.sequence > done; }));
                     if (pending) {
                         (void)journal_data_abandoned(id, operations->second.back().sequence,
                                                      pending);
@@ -4688,23 +4672,23 @@ struct FuseFrontend::State {
         for_each_namespace_entry(snapshot, &recovery_nodes,
                                  [&](const std::string& path, const FsEntry& entry)
                                      MACHA_REQUIRES(namespace_mutex) {
-            const auto key = canonical_path(path);
-            if (snapshot_path_shadowed(key, recovery))
-                return;
-            auto mapped = descriptor_by_published_path.find(key);
-            if (mapped != descriptor_by_published_path.end())
-                return;
-            auto inode = std::make_shared<Inode>();
-            Lock inode_lock(inode->mutex);
-            inode->id = path == "/" ? 1 : next_inode++;
-            inode->base = entry;
-            inode->visible = entry;
-            inode->current_path = path;
-            inode->published_path = path;
-            paths[key] = inode;
-            inodes[inode->id] = std::move(inode);
-            note_inode_inserted_locked();
-        });
+                                         const auto key = canonical_path(path);
+                                         if (snapshot_path_shadowed(key, recovery))
+                                             return;
+                                         auto mapped = descriptor_by_published_path.find(key);
+                                         if (mapped != descriptor_by_published_path.end())
+                                             return;
+                                         auto inode = std::make_shared<Inode>();
+                                         Lock inode_lock(inode->mutex);
+                                         inode->id = path == "/" ? 1 : next_inode++;
+                                         inode->base = entry;
+                                         inode->visible = entry;
+                                         inode->current_path = path;
+                                         inode->published_path = path;
+                                         paths[key] = inode;
+                                         inodes[inode->id] = std::move(inode);
+                                         note_inode_inserted_locked();
+                                     });
 
         for (auto id : needed) {
             const auto& descriptor = recovery.inodes.at(id);
@@ -4736,9 +4720,9 @@ struct FuseFrontend::State {
                             std::max(inode->next_data_sequence, op.sequence + 1);
                         if (op.sequence > done) {
                             auto recovered_op = op;
-                            auto memory = retained_memory.restore(
-                                WorkClass::loader, MemoryOwner::fuse_operation,
-                                recovered_op.metadata_charge);
+                            auto memory = retained_memory.restore(WorkClass::loader,
+                                                                  MemoryOwner::fuse_operation,
+                                                                  recovered_op.metadata_charge);
                             recovered_op.process_memory =
                                 std::make_shared<RetainedMemoryLedger::Lease>(std::move(memory));
                             inode->data_ops.push_back(std::move(recovered_op));
@@ -4793,8 +4777,8 @@ struct FuseFrontend::State {
                     auto winner = inode_wins ? inode : holder;
                     auto loser = inode_wins ? holder : inode;
                     Log::warn("FUSE journal recovery: two inodes resolve to one path; keeping "
-                              "the newer path=" + key + " kept_inode=" +
-                              std::to_string(winner->id) + " kept_seq=" +
+                              "the newer path=" +
+                              key + " kept_inode=" + std::to_string(winner->id) + " kept_seq=" +
                               std::to_string(inode_wins ? namespace_sequence : holder_sequence) +
                               " detached_inode=" + std::to_string(loser->id) + " detached_seq=" +
                               std::to_string(inode_wins ? holder_sequence : namespace_sequence) +
@@ -4875,8 +4859,7 @@ struct FuseFrontend::State {
                       " namespace=" + std::to_string(namespace_pending) +
                       " inodes=" + std::to_string(needed.size()) +
                       " skipped_frames=" + std::to_string(recovery.skipped_frames) +
-                      " done_without_published=" +
-                      std::to_string(recovery.done_without_published));
+                      " done_without_published=" + std::to_string(recovery.done_without_published));
         }
         reset_journal_if_idle();
     }
@@ -5067,7 +5050,8 @@ struct FuseFrontend::State {
             deferred("unconfirmed " + describe_unconfirmed_head(), view.namespace_revision);
             return;
         }
-        if (view.namespace_revision <= refreshed_namespace_revision.load(std::memory_order_acquire)) {
+        if (view.namespace_revision <=
+            refreshed_namespace_revision.load(std::memory_order_acquire)) {
             deferred("view-not-newer", view.namespace_revision);
             return;
         }
@@ -5079,84 +5063,84 @@ struct FuseFrontend::State {
         {
             Lock lock(namespace_mutex);
             {
-            // Admissions enqueue before releasing namespace_mutex, so a
-            // non-empty queue here means the snapshot predates local state.
-            Lock queue_lock(namespace_queue_mutex);
-            if (namespace_inflight || !namespace_queue.empty() || !namespace_unconfirmed.empty()) {
-                deferred("queue-race", view.namespace_revision);
-                return;
+                // Admissions enqueue before releasing namespace_mutex, so a
+                // non-empty queue here means the snapshot predates local state.
+                Lock queue_lock(namespace_queue_mutex);
+                if (namespace_inflight || !namespace_queue.empty() ||
+                    !namespace_unconfirmed.empty()) {
+                    deferred("queue-race", view.namespace_revision);
+                    return;
+                }
             }
-        }
             auto adopt_nodes = fs.namespace_nodes();
-            const auto adopt_entry = [&](const std::string& path, const FsEntry& entry)
-                                         MACHA_REQUIRES(namespace_mutex) {
-            ++walked;
-            const auto key = canonical_path(path);
-            auto found = paths.find(key);
-            if (found == paths.end()) {
-                auto inode = std::make_shared<Inode>();
+            const auto adopt_entry = [&](const std::string& path,
+                                         const FsEntry& entry) MACHA_REQUIRES(namespace_mutex) {
+                ++walked;
+                const auto key = canonical_path(path);
+                auto found = paths.find(key);
+                if (found == paths.end()) {
+                    auto inode = std::make_shared<Inode>();
+                    Lock inode_lock(inode->mutex);
+                    inode->id = path == "/" ? 1 : next_inode++;
+                    inode->base = entry;
+                    inode->visible = entry;
+                    inode->current_path = path;
+                    inode->published_path = path;
+                    paths[key] = inode;
+                    inodes[inode->id] = std::move(inode);
+                    note_inode_inserted_locked();
+                    ++adopted_new;
+                    return;
+                }
+                auto inode = found->second;
                 Lock inode_lock(inode->mutex);
-                inode->id = path == "/" ? 1 : next_inode++;
-                inode->base = entry;
-                inode->visible = entry;
-                inode->current_path = path;
+                const bool content_changed = !same_file_content(inode->base, entry);
+                // Snapshots carry no stable inode id. A dirty or open inode whose
+                // path now holds replacement content is detached, so old writes
+                // cannot commit into the new file. For an open read-only inode,
+                // changed content without a version advance marks replacement; an
+                // advancing version is an in-place change.
+                const bool replaced_open_inode =
+                    content_changed &&
+                    (!inode->data_ops.empty() || inode->durability_pending ||
+                     inode->unconfirmed_data_entry ||
+                     (inode->open_handles != 0 && entry.version <= inode->base.version));
+                if (replaced_open_inode && path != "/") {
+                    inode->published_path.reset();
+                    auto replacement = std::make_shared<Inode>();
+                    Lock replacement_lock(replacement->mutex);
+                    replacement->id = next_inode++;
+                    replacement->base = entry;
+                    replacement->visible = entry;
+                    replacement->current_path = path;
+                    replacement->published_path = path;
+                    found->second = replacement;
+                    inodes[replacement->id] = std::move(replacement);
+                    note_inode_inserted_locked();
+                    return;
+                }
                 inode->published_path = path;
-                paths[key] = inode;
-                inodes[inode->id] = std::move(inode);
-                note_inode_inserted_locked();
-                ++adopted_new;
-                return;
-            }
-            auto inode = found->second;
-            Lock inode_lock(inode->mutex);
-            const bool content_changed = !same_file_content(inode->base, entry);
-            // Snapshots carry no stable inode id. A dirty or open inode whose
-            // path now holds replacement content is detached, so old writes
-            // cannot commit into the new file. For an open read-only inode,
-            // changed content without a version advance marks replacement; an
-            // advancing version is an in-place change.
-            const bool replaced_open_inode =
-                content_changed &&
-                (!inode->data_ops.empty() || inode->durability_pending ||
-                 inode->unconfirmed_data_entry ||
-                 (inode->open_handles != 0 && entry.version <= inode->base.version));
-            if (replaced_open_inode && path != "/") {
-                inode->published_path.reset();
-                auto replacement = std::make_shared<Inode>();
-                Lock replacement_lock(replacement->mutex);
-                replacement->id = next_inode++;
-                replacement->base = entry;
-                replacement->visible = entry;
-                replacement->current_path = path;
-                replacement->published_path = path;
-                found->second = replacement;
-                inodes[replacement->id] = std::move(replacement);
-                note_inode_inserted_locked();
-                return;
-            }
-            inode->published_path = path;
-            if (inode->data_ops.empty() && !inode->durability_pending &&
-                !inode->unconfirmed_data_entry) {
-                inode->base = entry;
-                inode->visible = entry;
-                inode->admitted_size = entry.size;
-            }
+                if (inode->data_ops.empty() && !inode->durability_pending &&
+                    !inode->unconfirmed_data_entry) {
+                    inode->base = entry;
+                    inode->visible = entry;
+                    inode->admitted_size = entry.size;
+                }
             };
             // Remote unlink, POSIX semantics: the name goes now; open or dirty
             // state keeps the inode but cannot resurrect the path.
             const auto drop_path = [&](decltype(paths)::iterator it)
                                        MACHA_REQUIRES(namespace_mutex) {
-                auto inode = it->second;
-                Lock inode_lock(inode->mutex);
-                inode->published_path.reset();
-                // Reclaimed after namespace_mutex is released.
-                detached.push_back(inode->id);
-                return paths.erase(it);
-            };
+                                           auto inode = it->second;
+                                           Lock inode_lock(inode->mutex);
+                                           inode->published_path.reset();
+                                           // Reclaimed after namespace_mutex is released.
+                                           detached.push_back(inode->id);
+                                           return paths.erase(it);
+                                       };
 
-            const bool by_difference =
-                snapshot.namespace_root && adopted_namespace_root &&
-                !namespace_view_diverged.load(std::memory_order_acquire);
+            const bool by_difference = snapshot.namespace_root && adopted_namespace_root &&
+                                       !namespace_view_diverged.load(std::memory_order_acquire);
             if (by_difference) {
                 for (const auto& [path, difference] : diff_namespace_trees(
                          *adopted_namespace_root, *snapshot.namespace_root, adopt_nodes)) {
@@ -5190,9 +5174,9 @@ struct FuseFrontend::State {
                 for_each_namespace_entry(snapshot, &adopt_nodes,
                                          [&](const std::string& path, const FsEntry& entry)
                                              MACHA_REQUIRES(namespace_mutex) {
-                    seen.insert(canonical_path(path));
-                    adopt_entry(path, entry);
-                });
+                                                 seen.insert(canonical_path(path));
+                                                 adopt_entry(path, entry);
+                                             });
                 for (auto it = paths.begin(); it != paths.end();) {
                     if (it->first == canonical_path("/") || seen.contains(it->first))
                         ++it;
@@ -5202,17 +5186,16 @@ struct FuseFrontend::State {
             }
             adopted_namespace_root = snapshot.namespace_root;
             namespace_view_diverged.store(false, std::memory_order_release);
-            refreshed_namespace_revision.store(view.namespace_revision,
-                                                 std::memory_order_release);
+            refreshed_namespace_revision.store(view.namespace_revision, std::memory_order_release);
         }
         for (auto id : detached)
             reclaim_inode_if_quiescent(id);
         if (Log::enabled(LogLevel::debug))
-            Log::debug("FUSE namespace adopted revision=" + std::to_string(view.namespace_revision) +
-                       " generation=" + std::to_string(view.generation) +
-                       " visited=" + std::to_string(walked) +
-                       " new=" + std::to_string(adopted_new) +
-                       " detached=" + std::to_string(detached.size()));
+            Log::debug(
+                "FUSE namespace adopted revision=" + std::to_string(view.namespace_revision) +
+                " generation=" + std::to_string(view.generation) +
+                " visited=" + std::to_string(walked) + " new=" + std::to_string(adopted_new) +
+                " detached=" + std::to_string(detached.size()));
     }
 
     void start() {
@@ -5797,11 +5780,11 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
         }
         if (truncate_on_open)
             state_->wait_for_inode_durability(inode, deadline, cancelled);
-        auto process_memory = truncate_on_open
-                                  ? state_->reserve_process_memory(
-                                        WorkClass::loader, MemoryOwner::fuse_operation,
-                                        State::operation_metadata_charge(0), deadline)
-                                  : nullptr;
+        auto process_memory =
+            truncate_on_open
+                ? state_->reserve_process_memory(WorkClass::loader, MemoryOwner::fuse_operation,
+                                                 State::operation_metadata_charge(0), deadline)
+                : nullptr;
         auto metadata_admission = truncate_on_open
                                       ? state_->reserve_operation_metadata(
                                             State::operation_metadata_charge(0), deadline,
@@ -5947,16 +5930,15 @@ size_t FuseFrontend::read_impl(uint64_t inode_id,
             visible_size = inode->visible.size;
             if (offset >= visible_size || output.empty())
                 return size_t{0};
-            count = static_cast<size_t>(
-                std::min<uint64_t>(output.size(), visible_size - offset));
+            count = static_cast<size_t>(std::min<uint64_t>(output.size(), visible_size - offset));
             base_size = inode->base.size;
             base_version = inode->base.version;
             if (offset < base_size) {
                 bool need_snapshot = !read_session;
                 if (read_session) {
                     Lock session_lock(read_session->mutex);
-                    need_snapshot = !read_session->reader ||
-                                    read_session->base_version != base_version;
+                    need_snapshot =
+                        !read_session->reader || read_session->base_version != base_version;
                 }
                 if (need_snapshot)
                     base_snapshot = inode->base;
@@ -5979,16 +5961,14 @@ size_t FuseFrontend::read_impl(uint64_t inode_id,
                 const auto copy_end = std::min(requested_end, range->second.end);
                 if (copy_begin >= copy_end)
                     continue;
-                overlay.push_back(
-                    {copy_begin, copy_end,
-                     range->second.zero
-                         ? 0
-                         : range->second.spool_offset + (copy_begin - range->first),
-                     range->second.zero});
+                overlay.push_back({copy_begin, copy_end,
+                                   range->second.zero
+                                       ? 0
+                                       : range->second.spool_offset + (copy_begin - range->first),
+                                   range->second.zero});
             }
             state_->data_overlay_read_queries.fetch_add(1, std::memory_order_relaxed);
-            state_->data_overlay_ranges_examined.fetch_add(examined,
-                                                           std::memory_order_relaxed);
+            state_->data_overlay_ranges_examined.fetch_add(examined, std::memory_order_relaxed);
             state_->data_overlay_descriptors_copied.fetch_add(overlay.size(),
                                                               std::memory_order_relaxed);
         }
@@ -6005,17 +5985,16 @@ size_t FuseFrontend::read_impl(uint64_t inode_id,
                 if (!read_session->reader || read_session->base_version != base_version) {
                     if (!base_snapshot)
                         throw std::logic_error("FUSE read base snapshot unavailable");
-                    read_session->reader =
-                        state_->fs.open_read(*base_snapshot, logical_path, false,
-                                             FrameType::loader);
+                    read_session->reader = state_->fs.open_read(*base_snapshot, logical_path, false,
+                                                                FrameType::loader);
                     read_session->base_version = base_version;
                 }
                 reader = read_session->reader;
             } else {
                 if (!base_snapshot)
                     throw std::logic_error("FUSE read base snapshot unavailable");
-                reader = state_->fs.open_read(*base_snapshot, logical_path, false,
-                                              FrameType::loader);
+                reader =
+                    state_->fs.open_read(*base_snapshot, logical_path, false, FrameType::loader);
             }
             size_t done = 0;
             while (done < base_count) {
@@ -6104,20 +6083,18 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
         WorkClass::loader, MemoryOwner::fuse_request, data.size(), admission_deadline);
     Bytes owned(data.begin(), data.end());
     return dispatch(
-        FuseOperationClass::write, [this, inode_id, offset, append,
-                                    write_admission = std::move(write_admission),
-                                    process_write_admission = std::move(process_write_admission),
-                                    owned = std::move(owned)](
-                                       Clock::time_point deadline, std::atomic_bool& cancelled) {
+        FuseOperationClass::write,
+        [this, inode_id, offset, append, write_admission = std::move(write_admission),
+         process_write_admission = std::move(process_write_admission),
+         owned = std::move(owned)](Clock::time_point deadline, std::atomic_bool& cancelled) {
             (void)write_admission;
             (void)process_write_admission;
             auto inode = state_->resolve_inode(inode_id);
             state_->throw_if_durability_poisoned();
             check_deadline(deadline, cancelled);
 
-            const auto checksum_count =
-                (owned.size() + State::spool_checksum_chunk_size - 1) /
-                State::spool_checksum_chunk_size;
+            const auto checksum_count = (owned.size() + State::spool_checksum_chunk_size - 1) /
+                                        State::spool_checksum_chunk_size;
             const auto metadata_charge = State::operation_metadata_charge(checksum_count);
             auto process_operation = state_->reserve_process_memory(
                 WorkClass::loader, MemoryOwner::fuse_operation, metadata_charge, deadline);
@@ -6243,50 +6220,50 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
 }
 
 void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
-    dispatch(FuseOperationClass::write,
-             [this, inode_id, size](Clock::time_point deadline, std::atomic_bool& cancelled) {
-                 auto inode = state_->resolve_inode(inode_id);
-                 state_->wait_for_inode_durability(inode, deadline, cancelled);
-                 auto process_memory = state_->reserve_process_memory(
-                     WorkClass::loader, MemoryOwner::fuse_operation,
-                     State::operation_metadata_charge(0), deadline);
-                 auto metadata_admission = state_->reserve_operation_metadata(
-                     State::operation_metadata_charge(0), deadline,
-                     [&] { state_->request_data_publication(inode); });
-                 deadline = Clock::now() + timeout_for(FuseOperationClass::write);
-                 Lock lock(inode->mutex);
-                 check_deadline(deadline, cancelled);
-                 if (inode->visible.type != EntryType::file)
-                     throw FsError(EISDIR, "directory");
-                 if (inode->backend_error)
-                     throw FsError(*inode->backend_error, "asynchronous backend error");
-                 const auto seq = inode->next_data_sequence;
-                 const auto now = wall_time_ns();
-                 State::DataOp op;
-                 op.kind = State::DataOp::Kind::truncate;
-                 op.metadata_charge = State::operation_metadata_charge(0);
-                 op.process_memory = process_memory;
-                 op.sequence = seq;
-                 op.size = size;
-                 op.mtime_ns = now;
-                 op.ctime_ns = now;
-                 {
-                     Lock journal_admission(state_->journal_admission_mutex);
-                     state_->journal_inode_locked(inode);
-                     state_->journal_data_operation(inode->id, op);
-                 }
-                 inode->next_data_sequence = seq + 1;
-                 State::apply_data_overlay_locked(*inode, op);
-                 inode->data_ops.push_back(op);
-                 inode->accounted_operation_metadata_bytes += op.metadata_charge;
-                 metadata_admission->release = {};
-                 state_->refresh_retained_owners_locked(*inode);
-                 inode->durable_data_sequence = seq;
-                 inode->visible.size = size;
-                 inode->visible.mtime_ns = now;
-                 inode->visible.ctime_ns = now;
-                 inode->admitted_size = size;
-             });
+    dispatch(FuseOperationClass::write, [this, inode_id, size](Clock::time_point deadline,
+                                                               std::atomic_bool& cancelled) {
+        auto inode = state_->resolve_inode(inode_id);
+        state_->wait_for_inode_durability(inode, deadline, cancelled);
+        auto process_memory =
+            state_->reserve_process_memory(WorkClass::loader, MemoryOwner::fuse_operation,
+                                           State::operation_metadata_charge(0), deadline);
+        auto metadata_admission =
+            state_->reserve_operation_metadata(State::operation_metadata_charge(0), deadline,
+                                               [&] { state_->request_data_publication(inode); });
+        deadline = Clock::now() + timeout_for(FuseOperationClass::write);
+        Lock lock(inode->mutex);
+        check_deadline(deadline, cancelled);
+        if (inode->visible.type != EntryType::file)
+            throw FsError(EISDIR, "directory");
+        if (inode->backend_error)
+            throw FsError(*inode->backend_error, "asynchronous backend error");
+        const auto seq = inode->next_data_sequence;
+        const auto now = wall_time_ns();
+        State::DataOp op;
+        op.kind = State::DataOp::Kind::truncate;
+        op.metadata_charge = State::operation_metadata_charge(0);
+        op.process_memory = process_memory;
+        op.sequence = seq;
+        op.size = size;
+        op.mtime_ns = now;
+        op.ctime_ns = now;
+        {
+            Lock journal_admission(state_->journal_admission_mutex);
+            state_->journal_inode_locked(inode);
+            state_->journal_data_operation(inode->id, op);
+        }
+        inode->next_data_sequence = seq + 1;
+        State::apply_data_overlay_locked(*inode, op);
+        inode->data_ops.push_back(op);
+        inode->accounted_operation_metadata_bytes += op.metadata_charge;
+        metadata_admission->release = {};
+        state_->refresh_retained_owners_locked(*inode);
+        inode->durable_data_sequence = seq;
+        inode->visible.size = size;
+        inode->visible.mtime_ns = now;
+        inode->visible.ctime_ns = now;
+        inode->admitted_size = size;
+    });
 }
 
 void FuseFrontend::truncate(std::string_view path, uint64_t size) {
@@ -6430,8 +6407,7 @@ FuseFrontendStatus FuseFrontend::status() const {
     }
     out.inode_count = state_->inode_count.load(std::memory_order_relaxed);
     out.peak_inode_count = state_->peak_inode_count.load(std::memory_order_relaxed);
-    out.reclaimed_inode_count =
-        state_->reclaimed_inode_count.load(std::memory_order_relaxed);
+    out.reclaimed_inode_count = state_->reclaimed_inode_count.load(std::memory_order_relaxed);
     const auto diagnostics = this->diagnostics();
     out.timed_out_requests = diagnostics.timed_out_requests;
     out.merged_publications = diagnostics.merged_publications;
@@ -6441,22 +6417,17 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.spool_pressure_publication_sweeps = diagnostics.spool_pressure_publication_sweeps;
     out.data_publication_coalesced_queued = diagnostics.data_publication_coalesced_queued;
     out.data_publication_coalesced_running = diagnostics.data_publication_coalesced_running;
-    out.data_publication_coalesced_unconfirmed =
-        diagnostics.data_publication_coalesced_unconfirmed;
+    out.data_publication_coalesced_unconfirmed = diagnostics.data_publication_coalesced_unconfirmed;
     out.data_publications_started = diagnostics.data_publications_started;
     out.data_publications_completed = diagnostics.data_publications_completed;
     out.data_publication_peak_active = diagnostics.data_publication_peak_active;
     out.data_publication_quanta = diagnostics.data_publication_quanta;
     out.data_publication_yields = diagnostics.data_publication_yields;
-    out.data_publication_peak_inflight_bytes =
-        diagnostics.data_publication_peak_inflight_bytes;
-    out.data_publication_pipeline_limit_bytes =
-        diagnostics.data_publication_pipeline_limit_bytes;
-    out.data_publication_peak_pipeline_extents =
-        diagnostics.data_publication_peak_pipeline_extents;
+    out.data_publication_peak_inflight_bytes = diagnostics.data_publication_peak_inflight_bytes;
+    out.data_publication_pipeline_limit_bytes = diagnostics.data_publication_pipeline_limit_bytes;
+    out.data_publication_peak_pipeline_extents = diagnostics.data_publication_peak_pipeline_extents;
     out.data_closed_priority_selections = diagnostics.data_closed_priority_selections;
-    out.data_retirement_priority_selections =
-        diagnostics.data_retirement_priority_selections;
+    out.data_retirement_priority_selections = diagnostics.data_retirement_priority_selections;
     out.open_publications = diagnostics.open_publications;
     out.peak_open_publications = diagnostics.peak_open_publications;
     out.publication_max_open_writers = diagnostics.publication_max_open_writers;
@@ -6472,8 +6443,7 @@ FuseFrontendStatus FuseFrontend::status() const {
         diagnostics.data_publication_completed_source_bytes_read;
     out.data_publication_completed_reused_extents =
         diagnostics.data_publication_completed_reused_extents;
-    out.data_publication_completed_put_extents =
-        diagnostics.data_publication_completed_put_extents;
+    out.data_publication_completed_put_extents = diagnostics.data_publication_completed_put_extents;
     out.data_overlay_read_queries = diagnostics.data_overlay_read_queries;
     out.data_overlay_ranges_examined = diagnostics.data_overlay_ranges_examined;
     out.data_overlay_descriptors_copied = diagnostics.data_overlay_descriptors_copied;
@@ -6482,8 +6452,7 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.retained_overlay_ranges = diagnostics.retained_overlay_ranges;
     out.retained_overlay_bytes = diagnostics.retained_overlay_bytes;
     out.retained_publication_operations = diagnostics.retained_publication_operations;
-    out.retained_publication_operation_bytes =
-        diagnostics.retained_publication_operation_bytes;
+    out.retained_publication_operation_bytes = diagnostics.retained_publication_operation_bytes;
     out.operation_metadata_bytes = diagnostics.operation_metadata_bytes;
     out.peak_operation_metadata_bytes = diagnostics.peak_operation_metadata_bytes;
     out.operation_metadata_limit_bytes = diagnostics.operation_metadata_limit_bytes;
@@ -6505,8 +6474,7 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.journal_durability_barriers = diagnostics.journal_durability_barriers;
     out.spool_bytes = diagnostics.spool_bytes;
     out.spool_limit_bytes = diagnostics.spool_limit_bytes;
-    out.spool_publish_rate_bytes_per_second =
-        diagnostics.spool_publish_rate_bytes_per_second;
+    out.spool_publish_rate_bytes_per_second = diagnostics.spool_publish_rate_bytes_per_second;
     out.spool_publish_rate_window_bytes = diagnostics.spool_publish_rate_window_bytes;
     out.spool_publish_rate_window_ms = diagnostics.spool_publish_rate_window_ms;
     out.spool_throttle_waits = diagnostics.spool_throttle_waits;
@@ -6674,7 +6642,8 @@ std::vector<ParkedPublication> FuseFrontend::parked_publications() const {
         item.parked_for =
             std::chrono::duration_cast<std::chrono::milliseconds>(now - inode->parked->since);
         for (const auto& op : inode->data_ops)
-            if (op.kind == State::DataOp::Kind::write && op.sequence > inode->published_data_sequence)
+            if (op.kind == State::DataOp::Kind::write &&
+                op.sequence > inode->published_data_sequence)
                 item.pending_bytes += op.length;
         out.push_back(std::move(item));
     }

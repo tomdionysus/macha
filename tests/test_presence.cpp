@@ -39,7 +39,7 @@ struct Model {
 };
 
 enum class Op { installed, observed, forgotten, pruned, listed_one, listed_both, warmed };
-constexpr std::array ops{Op::installed, Op::observed, Op::forgotten, Op::pruned,
+constexpr std::array ops{Op::installed,  Op::observed,    Op::forgotten, Op::pruned,
                          Op::listed_one, Op::listed_both, Op::warmed};
 
 // Applies one event to both the index and the model, the model written from

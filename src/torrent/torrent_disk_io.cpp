@@ -71,7 +71,9 @@ lt::disk_buffer_holder hold(lt::buffer_allocator_interface& allocator, char* buf
 lt::error_code errno_code(int value) {
     return lt::error_code(value, boost::system::generic_category());
 }
-lt::error_code errno_code(const std::error_code& ec) { return errno_code(ec.value()); }
+lt::error_code errno_code(const std::error_code& ec) {
+    return errno_code(ec.value());
+}
 
 // A bounded descriptor cache: a torrent may have thousands of files.
 constexpr size_t max_open_files_per_torrent = 64;
@@ -127,11 +129,14 @@ struct Storage {
     bool scheduled{};
 
     Storage(const lt::file_storage& f, std::string path) : files(f), save_path(std::move(path)) {}
-    ~Storage() { close_all(); }
+    ~Storage() {
+        close_all();
+    }
 
     void close_all() {
         for (auto& [_, file] : open)
-            if (file.fd >= 0) ::close(file.fd);
+            if (file.fd >= 0)
+                ::close(file.fd);
         open.clear();
     }
 };
@@ -144,27 +149,32 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         const auto threads = std::max<size_t>(1, hooks_.threads);
         workers_.reserve(threads);
         for (size_t i = 0; i < threads; ++i)
-            workers_.emplace_back([this] {
-                run_supervised_once("torrent-disk-worker", [this] { worker(); });
-            });
+            workers_.emplace_back(
+                [this] { run_supervised_once("torrent-disk-worker", [this] { worker(); }); });
         if (publishing()) {
-            publisher_ = std::thread([this] {
-                run_supervised_once("torrent-disk-publisher", [this] { publisher(); });
-            });
+            publisher_ = std::thread(
+                [this] { run_supervised_once("torrent-disk-publisher", [this] { publisher(); }); });
             hooks_.verifications->attach(
-                [this](const std::string& save_path, int piece) { piece_verified(save_path, piece); },
+                [this](const std::string& save_path, int piece) {
+                    piece_verified(save_path, piece);
+                },
                 [this](const std::string& save_path) { return publication(save_path); });
         }
     }
 
-    ~MachaDiskIo() override { shut_down(); }
+    ~MachaDiskIo() override {
+        shut_down();
+    }
 
     // buffer_allocator_interface: every buffer this backend hands libtorrent
     // came from new char[].
-    void free_disk_buffer(char* buffer) override { delete[] buffer; }
+    void free_disk_buffer(char* buffer) override {
+        delete[] buffer;
+    }
 #if LIBTORRENT_VERSION_NUM >= 20100
     void free_multiple_buffers(lt::span<char*> buffers) override {
-        for (char* buffer : buffers) delete[] buffer;
+        for (char* buffer : buffers)
+            delete[] buffer;
     }
 #endif
 
@@ -178,7 +188,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                                    const std::shared_ptr<void>& torrent) override {
         auto storage = std::make_shared<Storage>(params.files, std::string(params.path));
         storage->owner = torrent;
-        if (publishing()) plan(*storage);
+        if (publishing())
+            plan(*storage);
         int index;
         if (!free_slots_.empty()) {
             index = free_slots_.back();
@@ -190,7 +201,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         }
         if (publishing()) {
             Lock lock(by_path_mutex_);
-            by_path_[storages_[static_cast<size_t>(index)]->save_path] = storages_[static_cast<size_t>(index)];
+            by_path_[storages_[static_cast<size_t>(index)]->save_path] =
+                storages_[static_cast<size_t>(index)];
         }
         return lt::storage_holder(lt::storage_index_t(static_cast<std::uint32_t>(index)), *this);
     }
@@ -198,7 +210,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     void remove_torrent(lt::storage_index_t index) override {
         // Queued jobs hold their own reference; the storage closes its files
         // when the last of them has run.
-        if (storages_[slot(index)]) storages_[slot(index)]->removed.store(true);
+        if (storages_[slot(index)])
+            storages_[slot(index)]->removed.store(true);
         if (publishing() && storages_[slot(index)]) {
             Lock lock(by_path_mutex_);
             by_path_.erase(storages_[slot(index)]->save_path);
@@ -207,7 +220,9 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         free_slots_.push_back(static_cast<int>(slot(index)));
     }
 
-    void abort(bool) override { shut_down(); }
+    void abort(bool) override {
+        shut_down();
+    }
 
     void async_read(lt::storage_index_t index, const lt::peer_request& request,
                     std::function<void(lt::disk_buffer_holder, const lt::storage_error&)> handler,
@@ -258,10 +273,11 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         return exceeded;
     }
 
-    void async_hash(lt::storage_index_t index, lt::piece_index_t piece,
-                    lt::span<lt::sha256_hash> block_hashes, lt::disk_job_flags_t flags,
-                    std::function<void(lt::piece_index_t, const lt::sha1_hash&,
-                                       const lt::storage_error&)> handler) override {
+    void async_hash(
+        lt::storage_index_t index, lt::piece_index_t piece, lt::span<lt::sha256_hash> block_hashes,
+        lt::disk_job_flags_t flags,
+        std::function<void(lt::piece_index_t, const lt::sha1_hash&, const lt::storage_error&)>
+            handler) override {
         auto storage = at(index);
         enqueue(storage, [this, storage, piece, block_hashes, flags, handler = std::move(handler)] {
             const auto& files = storage->files;
@@ -269,8 +285,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             const bool v2 = !block_hashes.empty();
             const int piece_size = v1 ? files.piece_size(piece) : 0;
             const int piece_size2 = v2 ? files.piece_size2(piece) : 0;
-            const int blocks = v1 ? (piece_size + lt::default_block_size - 1) / lt::default_block_size
-                                  : 0;
+            const int blocks =
+                v1 ? (piece_size + lt::default_block_size - 1) / lt::default_block_size : 0;
             const int blocks2 = v2 ? files.blocks_in_piece2(piece) : 0;
             auto admitted = admit(static_cast<uint64_t>(std::max(piece_size, piece_size2)));
             lt::storage_error error;
@@ -282,18 +298,21 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                 int offset = 0;
                 for (int i = 0; i < std::max(blocks, blocks2); ++i) {
                     const bool v2_block = i < blocks2;
-                    const int length = v1 ? std::min(lt::default_block_size, piece_size - offset) : 0;
+                    const int length =
+                        v1 ? std::min(lt::default_block_size, piece_size - offset) : 0;
                     const int length2 =
                         v2_block ? std::min(lt::default_block_size, piece_size2 - offset) : 0;
                     const int want = std::max(length, length2);
                     const int got = read(*storage, piece, offset, block.data(), want, error);
                     offset += lt::default_block_size;
-                    if (got <= 0) break;
-                    if (v1) v1_hasher.update({block.data(), std::min(got, length)});
+                    if (got <= 0)
+                        break;
+                    if (v1)
+                        v1_hasher.update({block.data(), std::min(got, length)});
                     if (v2_block)
-                        block_hashes[i] =
-                            lt::hasher256(lt::span<const char>{block.data(), std::min(got, length2)})
-                                .final();
+                        block_hashes[i] = lt::hasher256(lt::span<const char>{
+                                                            block.data(), std::min(got, length2)})
+                                              .final();
                 }
             }
             const lt::sha1_hash hash = v1 ? v1_hasher.final() : lt::sha1_hash();
@@ -301,10 +320,10 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         });
     }
 
-    void async_hash2(lt::storage_index_t index, lt::piece_index_t piece, int offset,
-                     lt::disk_job_flags_t,
-                     std::function<void(lt::piece_index_t, const lt::sha256_hash&,
-                                        const lt::storage_error&)> handler) override {
+    void async_hash2(
+        lt::storage_index_t index, lt::piece_index_t piece, int offset, lt::disk_job_flags_t,
+        std::function<void(lt::piece_index_t, const lt::sha256_hash&, const lt::storage_error&)>
+            handler) override {
         auto storage = at(index);
         enqueue(storage, [this, storage, piece, offset, handler = std::move(handler)] {
             const int length =
@@ -317,16 +336,18 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             } else {
                 std::vector<char> block(static_cast<size_t>(length));
                 const int got = read(*storage, piece, offset, block.data(), length, error);
-                if (got > 0) hasher.update({block.data(), got});
+                if (got > 0)
+                    hasher.update({block.data(), got});
             }
             const auto hash = hasher.final();
             boost::asio::post(ios_, [handler, piece, hash, error] { handler(piece, hash, error); });
         });
     }
 
-    void async_move_storage(lt::storage_index_t, std::string path, lt::move_flags_t,
-                            std::function<void(lt::status_t, const std::string&,
-                                               const lt::storage_error&)> handler) override {
+    void async_move_storage(
+        lt::storage_index_t, std::string path, lt::move_flags_t,
+        std::function<void(lt::status_t, const std::string&, const lt::storage_error&)> handler)
+        override {
         // Never moved: the save path is the job's staging directory for life.
         const lt::storage_error error(errno_code(EOPNOTSUPP), lt::operation_t::file_rename);
         boost::asio::post(ios_, [handler = std::move(handler), path = std::move(path), error] {
@@ -338,14 +359,15 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         auto storage = at(index);
         enqueue(storage, [this, storage, handler = std::move(handler)] {
             storage->close_all();
-            if (handler) boost::asio::post(ios_, handler);
+            if (handler)
+                boost::asio::post(ios_, handler);
         });
     }
 
-    void async_check_files(lt::storage_index_t index, const lt::add_torrent_params* resume,
-                           lt::aux::vector<std::string, lt::file_index_t>,
-                           std::function<void(lt::status_t, const lt::storage_error&)> handler)
-        override {
+    void async_check_files(
+        lt::storage_index_t index, const lt::add_torrent_params* resume,
+        lt::aux::vector<std::string, lt::file_index_t>,
+        std::function<void(lt::status_t, const lt::storage_error&)> handler) override {
         auto storage = at(index);
         // The resume data is valid only during this call.
         std::shared_ptr<lt::typed_bitfield<lt::piece_index_t>> have;
@@ -362,17 +384,18 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         auto storage = at(index);
         enqueue(storage, [this, storage, handler = std::move(handler)] {
             storage->close_all();
-            if (handler) boost::asio::post(ios_, handler);
+            if (handler)
+                boost::asio::post(ios_, handler);
         });
     }
 
-    void async_rename_file(lt::storage_index_t, lt::file_index_t file, std::string name,
-                           std::function<void(const std::string&, lt::file_index_t,
-                                              const lt::storage_error&)> handler) override {
+    void async_rename_file(
+        lt::storage_index_t, lt::file_index_t file, std::string name,
+        std::function<void(const std::string&, lt::file_index_t, const lt::storage_error&)> handler)
+        override {
         const lt::storage_error error(errno_code(EOPNOTSUPP), file, lt::operation_t::file_rename);
-        boost::asio::post(ios_, [handler = std::move(handler), name = std::move(name), file, error] {
-            handler(name, file, error);
-        });
+        boost::asio::post(ios_, [handler = std::move(handler), name = std::move(name), file,
+                                 error] { handler(name, file, error); });
     }
 
     void async_delete_files(lt::storage_index_t index, lt::remove_flags_t options,
@@ -381,7 +404,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         enqueue(storage, [this, storage, options, handler = std::move(handler)] {
             lt::storage_error error;
             storage->close_all();
-            if (options & lt::session_handle::delete_files) remove_payload(*storage, error);
+            if (options & lt::session_handle::delete_files)
+                remove_payload(*storage, error);
             boost::asio::post(ios_, [handler, error] { handler(error); });
         });
     }
@@ -389,13 +413,13 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     void async_set_file_priority(
         lt::storage_index_t, lt::aux::vector<lt::download_priority_t, lt::file_index_t> priorities,
         std::function<void(const lt::storage_error&,
-                           lt::aux::vector<lt::download_priority_t, lt::file_index_t>)> handler)
-        override {
+                           lt::aux::vector<lt::download_priority_t, lt::file_index_t>)>
+            handler) override {
         // Every file is downloaded; priorities are only echoed.
-        boost::asio::post(ios_, [handler = std::move(handler),
-                                 priorities = std::move(priorities)]() mutable {
-            handler(lt::storage_error(), std::move(priorities));
-        });
+        boost::asio::post(
+            ios_, [handler = std::move(handler), priorities = std::move(priorities)]() mutable {
+                handler(lt::storage_error(), std::move(priorities));
+            });
     }
 
     void async_clear_piece(lt::storage_index_t, lt::piece_index_t piece,
@@ -405,7 +429,9 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
 
     void update_stats_counters(lt::counters&) const override {}
 
-    std::vector<lt::open_file_state> get_status(lt::storage_index_t) const override { return {}; }
+    std::vector<lt::open_file_state> get_status(lt::storage_index_t) const override {
+        return {};
+    }
 
     void submit_jobs() override {}
 
@@ -432,7 +458,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
 
     // Publication has its own thread, so a slow put never holds up disk writes.
     Mutex by_path_mutex_;
-    std::unordered_map<std::string, std::weak_ptr<Storage>> by_path_ MACHA_GUARDED_BY(by_path_mutex_);
+    std::unordered_map<std::string, std::weak_ptr<Storage>>
+        by_path_ MACHA_GUARDED_BY(by_path_mutex_);
     struct PublishJob {
         std::shared_ptr<Storage> storage;
         size_t extent{};
@@ -457,9 +484,11 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         size_t published = 0;
         const auto recorded = TorrentExtentJournal::load(storage.save_path);
         for (const auto file : files.file_range()) {
-            if (files.pad_file_at(file)) continue;
+            if (files.pad_file_at(file))
+                continue;
             const auto size = static_cast<uint64_t>(files.file_size(file));
-            if (!size) continue;
+            if (!size)
+                continue;
             const auto relative = std::filesystem::path(files.file_path(file)).generic_string();
             const auto known = recorded.find(relative);
             for (uint64_t offset = 0; offset < size; offset += extent_size) {
@@ -469,17 +498,22 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                 extent.file_size = size;
                 extent.offset = offset;
                 extent.length = std::min(extent_size, size - offset);
-                extent.first_piece = static_cast<int>(files.map_file(file, static_cast<int64_t>(offset), 1).piece);
+                extent.first_piece =
+                    static_cast<int>(files.map_file(file, static_cast<int64_t>(offset), 1).piece);
                 extent.last_piece = static_cast<int>(
-                    files.map_file(file, static_cast<int64_t>(offset + extent.length - 1), 1).piece);
+                    files.map_file(file, static_cast<int64_t>(offset + extent.length - 1), 1)
+                        .piece);
                 if (known != recorded.end() && known->second.size == size) {
                     const auto it = known->second.extents.find(offset);
-                    extent.published = it != known->second.extents.end() && it->second.length == extent.length;
+                    extent.published =
+                        it != known->second.extents.end() && it->second.length == extent.length;
                 }
-                if (extent.published) ++published;
+                if (extent.published)
+                    ++published;
                 const auto index = storage.extents.size();
                 storage.extents.push_back(std::move(extent));
-                for (int piece = storage.extents[index].first_piece; piece <= storage.extents[index].last_piece; ++piece)
+                for (int piece = storage.extents[index].first_piece;
+                     piece <= storage.extents[index].last_piece; ++piece)
                     storage.piece_extents[static_cast<size_t>(piece)].push_back(index);
             }
         }
@@ -494,7 +528,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         {
             Lock lock(by_path_mutex_);
             const auto found = by_path_.find(save_path);
-            if (found != by_path_.end()) storage = found->second.lock();
+            if (found != by_path_.end())
+                storage = found->second.lock();
         }
         if (!storage || piece < 0 || static_cast<size_t>(piece) >= storage->piece_extents.size())
             return;
@@ -504,19 +539,23 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             storage->verified[static_cast<size_t>(piece)] = true;
             for (const auto index : storage->piece_extents[static_cast<size_t>(piece)]) {
                 auto& extent = storage->extents[index];
-                if (extent.published || extent.queued) continue;
+                if (extent.published || extent.queued)
+                    continue;
                 bool complete = true;
                 for (int p = extent.first_piece; p <= extent.last_piece && complete; ++p)
                     complete = storage->verified[static_cast<size_t>(p)];
-                if (!complete) continue;
+                if (!complete)
+                    continue;
                 extent.queued = true;
                 ready.push_back(index);
             }
         }
-        if (ready.empty()) return;
+        if (ready.empty())
+            return;
         {
             Lock lock(publish_queue_mutex_);
-            for (const auto index : ready) publish_queue_.push_back({storage, index, Clock::now()});
+            for (const auto index : ready)
+                publish_queue_.push_back({storage, index, Clock::now()});
         }
         publish_cv_.notify_one();
     }
@@ -527,9 +566,11 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         {
             Lock lock(by_path_mutex_);
             const auto found = by_path_.find(save_path);
-            if (found != by_path_.end()) storage = found->second.lock();
+            if (found != by_path_.end())
+                storage = found->second.lock();
         }
-        if (!storage) return std::nullopt;
+        if (!storage)
+            return std::nullopt;
         Lock lock(storage->publish_mutex);
         return TorrentPublicationProgress{storage->published_count, storage->extents.size()};
     }
@@ -540,19 +581,22 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             publish_cv_.wait(lock.native(), [this]() MACHA_REQUIRES(publish_queue_mutex_) {
                 return publisher_stopping_ || !publish_queue_.empty();
             });
-            if (publisher_stopping_) return;
+            if (publisher_stopping_)
+                return;
             const auto now = Clock::now();
             auto due = std::find_if(publish_queue_.begin(), publish_queue_.end(),
                                     [&](const PublishJob& job) { return job.not_before <= now; });
             if (due == publish_queue_.end()) {
                 auto next = publish_queue_.front().not_before;
-                for (const auto& job : publish_queue_) next = std::min(next, job.not_before);
+                for (const auto& job : publish_queue_)
+                    next = std::min(next, job.not_before);
                 publish_cv_.wait_until(lock.native(), next);
                 continue;
             }
             auto job = std::move(*due);
             publish_queue_.erase(due);
-            if (job.storage->removed.load()) continue;
+            if (job.storage->removed.load())
+                continue;
             lock.unlock();
             // No exception may escape the thread and terminate the process.
             bool published = false;
@@ -578,7 +622,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         std::vector<uint8_t> bytes(static_cast<size_t>(extent.length));
         {
             auto admitted = admit(extent.length);
-            if (!admitted && aborting_.load()) return false;
+            if (!admitted && aborting_.load())
+                return false;
             lt::storage_error error;
             if (!read_extent(storage, extent, bytes, error)) {
                 Log::warn("torrent extent read-back failed path=" + extent.relative_path +
@@ -591,17 +636,20 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         if (!id) {
             // Cancelled at shutdown, not failed: unjournalled, it is published
             // again on resume.
-            if (aborting_.load()) return false;
-            Log::warn("torrent extent publication failed path=" + extent.relative_path + " offset=" +
-                      std::to_string(extent.offset) + "; retrying");
+            if (aborting_.load())
+                return false;
+            Log::warn("torrent extent publication failed path=" + extent.relative_path +
+                      " offset=" + std::to_string(extent.offset) + "; retrying");
             return false;
         }
         try {
-            if (!storage.journal) storage.journal = std::make_unique<TorrentExtentJournal>(storage.save_path);
+            if (!storage.journal)
+                storage.journal = std::make_unique<TorrentExtentJournal>(storage.save_path);
             storage.journal->append(extent.relative_path, extent.file_size,
                                     {extent.offset, extent.length, *id});
         } catch (const std::exception& e) {
-            Log::warn("torrent extent journal append failed path=" + extent.relative_path + ": " + e.what());
+            Log::warn("torrent extent journal append failed path=" + extent.relative_path + ": " +
+                      e.what());
             return false;
         }
         Lock lock(storage.publish_mutex);
@@ -618,7 +666,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                      lt::storage_error& error) {
         // The planned path, not libtorrent's file_storage: the publisher must
         // not depend on the torrent's memory.
-        const auto path = (std::filesystem::path(storage.save_path) / extent.relative_path).string();
+        const auto path =
+            (std::filesystem::path(storage.save_path) / extent.relative_path).string();
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
             error = lt::storage_error(errno_code(errno), extent.file, lt::operation_t::file_open);
@@ -629,11 +678,13 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         while (done < out.size()) {
             const auto got = ::pread(fd, out.data() + done, out.size() - done,
                                      static_cast<off_t>(extent.offset + done));
-            if (got < 0 && errno == EINTR) continue;
+            if (got < 0 && errno == EINTR)
+                continue;
             if (got <= 0) {
-                error = lt::storage_error(got < 0 ? errno_code(errno)
-                                                  : lt::errors::make_error_code(lt::errors::file_too_short),
-                                          extent.file, lt::operation_t::file_read);
+                error = lt::storage_error(
+                    got < 0 ? errno_code(errno)
+                            : lt::errors::make_error_code(lt::errors::file_too_short),
+                    extent.file, lt::operation_t::file_read);
                 ::close(fd);
                 return false;
             }
@@ -657,7 +708,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     }
 
     std::shared_ptr<void> admit(uint64_t bytes) {
-        if (!hooks_.admit) return std::make_shared<int>(0);
+        if (!hooks_.admit)
+            return std::make_shared<int>(0);
         return hooks_.admit(bytes, aborting_);
     }
 
@@ -680,7 +732,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         while (true) {
             cv_.wait(lock.native(),
                      [this]() MACHA_REQUIRES(mutex_) { return stopping_ || !ready_.empty(); });
-            if (ready_.empty()) return;
+            if (ready_.empty())
+                return;
             auto storage = std::move(ready_.front());
             ready_.pop_front();
             auto job = std::move(storage->jobs.front());
@@ -718,21 +771,25 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                 publish_queue_.clear();
             }
             publish_cv_.notify_all();
-            if (publisher_.joinable()) publisher_.join();
+            if (publisher_.joinable())
+                publisher_.join();
         }
         {
             Lock lock(mutex_);
-            if (stopping_) return;
+            if (stopping_)
+                return;
             stopping_ = true;
         }
         cv_.notify_all();
         for (auto& thread : workers_)
-            if (thread.joinable()) thread.join();
+            if (thread.joinable())
+                thread.join();
     }
 
     void write_drained(uint64_t bytes) {
         const auto queued = queued_write_bytes_.fetch_sub(bytes) - bytes;
-        if (queued > queue_limit_.load(std::memory_order_relaxed) / 2) return;
+        if (queued > queue_limit_.load(std::memory_order_relaxed) / 2)
+            return;
         std::vector<std::shared_ptr<lt::disk_observer>> waiting;
         {
             Lock lock(mutex_);
@@ -743,13 +800,16 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     }
 
     void observe(Clock::time_point started, uint64_t bytes) const {
-        if (hooks_.observe) hooks_.observe(Clock::now() - started, bytes);
+        if (hooks_.observe)
+            hooks_.observe(Clock::now() - started, bytes);
     }
 
-    int descriptor(Storage& storage, lt::file_index_t file, bool writable, lt::storage_error& error) {
+    int descriptor(Storage& storage, lt::file_index_t file, bool writable,
+                   lt::storage_error& error) {
         auto found = storage.open.find(file);
         if (found != storage.open.end()) {
-            if (found->second.writable || !writable) return found->second.fd;
+            if (found->second.writable || !writable)
+                return found->second.fd;
             ::close(found->second.fd);
             storage.open.erase(found);
         }
@@ -765,8 +825,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         const int flags = writable ? (O_RDWR | O_CREAT | O_CLOEXEC) : (O_RDONLY | O_CLOEXEC);
         const int fd = ::open(path.c_str(), flags, 0644);
         if (fd < 0) {
-            error = lt::storage_error(errno_code(errno), file,
-                                      lt::operation_t::file_open);
+            error = lt::storage_error(errno_code(errno), file, lt::operation_t::file_open);
             return -1;
         }
         if (storage.open.size() >= max_open_files_per_torrent) {
@@ -791,27 +850,32 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                 continue;
             }
             const int fd = descriptor(storage, slice.file_index, false, error);
-            if (fd < 0) return total;
+            if (fd < 0)
+                return total;
             const auto started = Clock::now();
             size_t done = 0;
             while (done < want) {
-                const auto got = ::pread(fd, at_buffer + done, want - done,
-                                         static_cast<off_t>(slice.offset + static_cast<int64_t>(done)));
-                if (got < 0 && errno == EINTR) continue;
+                const auto got =
+                    ::pread(fd, at_buffer + done, want - done,
+                            static_cast<off_t>(slice.offset + static_cast<int64_t>(done)));
+                if (got < 0 && errno == EINTR)
+                    continue;
                 if (got < 0) {
-                    error = lt::storage_error(errno_code(errno),
-                                              slice.file_index, lt::operation_t::file_read);
+                    error = lt::storage_error(errno_code(errno), slice.file_index,
+                                              lt::operation_t::file_read);
                     return total + static_cast<int>(done);
                 }
-                if (got == 0) break;
+                if (got == 0)
+                    break;
                 done += static_cast<size_t>(got);
             }
             observe(started, done);
             total += static_cast<int>(done);
             if (done < want) {
                 if (done == 0)
-                    error = lt::storage_error(lt::errors::make_error_code(lt::errors::file_too_short),
-                                              slice.file_index, lt::operation_t::file_read);
+                    error =
+                        lt::storage_error(lt::errors::make_error_code(lt::errors::file_too_short),
+                                          slice.file_index, lt::operation_t::file_read);
                 return total;
             }
         }
@@ -825,18 +889,22 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             const char* from = in + total;
             const auto want = static_cast<size_t>(slice.size);
             total += static_cast<int>(want);
-            if (storage.files.pad_file_at(slice.file_index)) continue;
+            if (storage.files.pad_file_at(slice.file_index))
+                continue;
             const int fd = descriptor(storage, slice.file_index, true, error);
-            if (fd < 0) return;
+            if (fd < 0)
+                return;
             const auto started = Clock::now();
             size_t done = 0;
             while (done < want) {
-                const auto put = ::pwrite(fd, from + done, want - done,
-                                          static_cast<off_t>(slice.offset + static_cast<int64_t>(done)));
-                if (put < 0 && errno == EINTR) continue;
+                const auto put =
+                    ::pwrite(fd, from + done, want - done,
+                             static_cast<off_t>(slice.offset + static_cast<int64_t>(done)));
+                if (put < 0 && errno == EINTR)
+                    continue;
                 if (put <= 0) {
-                    error = lt::storage_error(errno_code(put < 0 ? errno : EIO),
-                                              slice.file_index, lt::operation_t::file_write);
+                    error = lt::storage_error(errno_code(put < 0 ? errno : EIO), slice.file_index,
+                                              lt::operation_t::file_write);
                     return;
                 }
                 done += static_cast<size_t>(put);
@@ -857,19 +925,23 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         }
         const auto& files = storage.files;
         auto size_on_disk = [&](lt::file_index_t file) -> int64_t {
-            struct stat st {};
-            if (::stat(files.file_path(file, storage.save_path).c_str(), &st) != 0) return -1;
+            struct stat st{};
+            if (::stat(files.file_path(file, storage.save_path).c_str(), &st) != 0)
+                return -1;
             return static_cast<int64_t>(st.st_size);
         };
         if (!have) {
             for (const auto file : files.file_range())
-                if (!files.pad_file_at(file) && size_on_disk(file) >= 0) return status_full_check;
+                if (!files.pad_file_at(file) && size_on_disk(file) >= 0)
+                    return status_full_check;
             return status_ok;
         }
         for (const auto piece : files.piece_range()) {
-            if (!have->get_bit(piece)) continue;
+            if (!have->get_bit(piece))
+                continue;
             for (const auto& slice : files.map_block(piece, 0, files.piece_size(piece))) {
-                if (files.pad_file_at(slice.file_index)) continue;
+                if (files.pad_file_at(slice.file_index))
+                    continue;
                 if (size_on_disk(slice.file_index) < slice.offset + slice.size)
                     return status_full_check;
             }
@@ -881,7 +953,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         const auto& files = storage.files;
         std::vector<std::filesystem::path> parents;
         for (const auto file : files.file_range()) {
-            if (files.pad_file_at(file)) continue;
+            if (files.pad_file_at(file))
+                continue;
             const std::filesystem::path path = files.file_path(file, storage.save_path);
             std::error_code ec;
             std::filesystem::remove(path, ec);
@@ -902,7 +975,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         for (auto dir : parents) {
             while (!dir.empty() && dir != root && dir.native().size() > root.native().size()) {
                 std::error_code ec;
-                if (!std::filesystem::remove(dir, ec)) break;
+                if (!std::filesystem::remove(dir, ec))
+                    break;
                 dir = dir.parent_path();
             }
         }
@@ -916,9 +990,12 @@ loader_admission(DataResourceArbiter& arbiter) {
     return [&arbiter](uint64_t bytes, const std::atomic_bool& aborting) -> std::shared_ptr<void> {
         while (!aborting.load()) {
             const auto deadline = DataWorkContext::Clock::now() + std::chrono::seconds(1);
-            auto lease = arbiter.acquire(DataWorkContext(FrameType::loader, bytes, deadline), bytes);
-            if (lease) return std::make_shared<DataResourceArbiter::Lease>(std::move(*lease));
-            if (DataWorkContext::Clock::now() < deadline) return nullptr;
+            auto lease =
+                arbiter.acquire(DataWorkContext(FrameType::loader, bytes, deadline), bytes);
+            if (lease)
+                return std::make_shared<DataResourceArbiter::Lease>(std::move(*lease));
+            if (DataWorkContext::Clock::now() < deadline)
+                return nullptr;
         }
         return nullptr;
     };

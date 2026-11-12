@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 
-#include "storage/local_store.hpp"
 #include "metadata/metadata.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "service/service.hpp"
+#include "storage/local_store.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -201,118 +201,118 @@ MACHA_TEST("namespace_service", test_the_inventory_and_the_media_index_follow_th
     make_solo(config);
     NodeId node_id{};
     const auto check = [&](Service& service, const std::string& root) {
-    auto& fs = service.filesystem();
-    const auto extent = config.extent_size;
-    const auto agrees = [&] {
-        const auto followed = fs.maintenance_objects_cached();
-        const auto walked = fs.walk_namespace_references();
-        const auto extents = followed->referenced_extents.ids();
-        const auto nodes = followed->referenced_nodes.ids();
-        CHECK(extents == walked.extents);
-        CHECK(nodes == walked.nodes);
-        // What the release horizon is given in place of its own walk.
-        const auto counted = fs.namespace_references(service.metadata_manager().snapshot());
-        REQUIRE(counted.has_value());
-        CHECK(counted->extents.ids() == walked.extents);
-        CHECK(counted->nodes.ids() == walked.nodes);
-        return extents == walked.extents && nodes == walked.nodes;
-    };
-    const auto write = [&](const std::string& path, const Bytes& bytes) {
-        try {
-            fs.create_file(path, 0644, getuid(), getgid());
-        } catch (const FsError&) {
-        }
-        auto writer = fs.open_write(path, true);
-        REQUIRE(writer->write(0, bytes) == bytes.size());
-        writer->commit();
-    };
-    fs.mkdir(root, 0755, getuid(), getgid());
-    REQUIRE(agrees());
-    const auto small = pattern(extent + extent / 2, 3); // two extents, inline
-    const auto large = pattern(extent * 9 + 17, 5);    // ten, a spine
-    write(root + "/small.bin", small);
-    REQUIRE(agrees());
-    write(root + "/large.bin", large);
-    REQUIRE(fs.getattr(root + "/large.bin").extents.size() > 8);
-    REQUIRE(agrees());
-    // The same content at a second path: the same extents and the same spine.
-    write(root + "/large-copy.bin", large);
-    REQUIRE(agrees());
-    const auto large_id = file_media_id(fs.getattr(root + "/large.bin"));
-    REQUIRE(fs.find_media(large_id).has_value());
-    fs.unlink(root + "/large.bin");
-    REQUIRE(agrees());
-    // The content is still held at its other path.
-    const auto survivor = fs.find_media(large_id);
-    REQUIRE(survivor.has_value());
-    CHECK(survivor->first == root + "/large-copy.bin");
-    const auto still = fs.maintenance_objects_cached();
-    for (const auto& extent : fs.getattr(root + "/large-copy.bin").extents)
-        CHECK(still->referenced_extents.get(extent.id).has_value());
+        auto& fs = service.filesystem();
+        const auto extent = config.extent_size;
+        const auto agrees = [&] {
+            const auto followed = fs.maintenance_objects_cached();
+            const auto walked = fs.walk_namespace_references();
+            const auto extents = followed->referenced_extents.ids();
+            const auto nodes = followed->referenced_nodes.ids();
+            CHECK(extents == walked.extents);
+            CHECK(nodes == walked.nodes);
+            // What the release horizon is given in place of its own walk.
+            const auto counted = fs.namespace_references(service.metadata_manager().snapshot());
+            REQUIRE(counted.has_value());
+            CHECK(counted->extents.ids() == walked.extents);
+            CHECK(counted->nodes.ids() == walked.nodes);
+            return extents == walked.extents && nodes == walked.nodes;
+        };
+        const auto write = [&](const std::string& path, const Bytes& bytes) {
+            try {
+                fs.create_file(path, 0644, getuid(), getgid());
+            } catch (const FsError&) {
+            }
+            auto writer = fs.open_write(path, true);
+            REQUIRE(writer->write(0, bytes) == bytes.size());
+            writer->commit();
+        };
+        fs.mkdir(root, 0755, getuid(), getgid());
+        REQUIRE(agrees());
+        const auto small = pattern(extent + extent / 2, 3); // two extents, inline
+        const auto large = pattern(extent * 9 + 17, 5);     // ten, a spine
+        write(root + "/small.bin", small);
+        REQUIRE(agrees());
+        write(root + "/large.bin", large);
+        REQUIRE(fs.getattr(root + "/large.bin").extents.size() > 8);
+        REQUIRE(agrees());
+        // The same content at a second path: the same extents and the same spine.
+        write(root + "/large-copy.bin", large);
+        REQUIRE(agrees());
+        const auto large_id = file_media_id(fs.getattr(root + "/large.bin"));
+        REQUIRE(fs.find_media(large_id).has_value());
+        fs.unlink(root + "/large.bin");
+        REQUIRE(agrees());
+        // The content is still held at its other path.
+        const auto survivor = fs.find_media(large_id);
+        REQUIRE(survivor.has_value());
+        CHECK(survivor->first == root + "/large-copy.bin");
+        const auto still = fs.maintenance_objects_cached();
+        for (const auto& extent : fs.getattr(root + "/large-copy.bin").extents)
+            CHECK(still->referenced_extents.get(extent.id).has_value());
 
-    for (int i = 0; i < 40; ++i)
-        fs.mkdir(root + "/d" + std::to_string(i), 0755, getuid(), getgid());
-    REQUIRE(agrees());
-    write(root + "/d7/inside.bin", pattern(extent * 9, 9));
-    const auto inside_id = file_media_id(fs.getattr(root + "/d7/inside.bin"));
-    REQUIRE(fs.find_media(inside_id).has_value());
-    fs.rename(root + "/d7", root + "/moved", false);
-    REQUIRE(agrees());
-    const auto moved = fs.find_media(inside_id);
-    REQUIRE(moved.has_value());
-    CHECK(moved->first == root + "/moved/inside.bin");
-    write(root + "/small.bin", pattern(extent * 10, 11)); // overwritten, now a spine
-    REQUIRE(agrees());
-    fs.chmod(root + "/large-copy.bin", 0600);
-    REQUIRE(agrees());
-    fs.unlink(root + "/large-copy.bin");
-    fs.unlink(root + "/moved/inside.bin");
-    fs.unlink(root + "/small.bin");
-    REQUIRE(agrees());
-    CHECK(!fs.find_media(large_id).has_value());
-    CHECK(!fs.find_media(inside_id).has_value());
+        for (int i = 0; i < 40; ++i)
+            fs.mkdir(root + "/d" + std::to_string(i), 0755, getuid(), getgid());
+        REQUIRE(agrees());
+        write(root + "/d7/inside.bin", pattern(extent * 9, 9));
+        const auto inside_id = file_media_id(fs.getattr(root + "/d7/inside.bin"));
+        REQUIRE(fs.find_media(inside_id).has_value());
+        fs.rename(root + "/d7", root + "/moved", false);
+        REQUIRE(agrees());
+        const auto moved = fs.find_media(inside_id);
+        REQUIRE(moved.has_value());
+        CHECK(moved->first == root + "/moved/inside.bin");
+        write(root + "/small.bin", pattern(extent * 10, 11)); // overwritten, now a spine
+        REQUIRE(agrees());
+        fs.chmod(root + "/large-copy.bin", 0600);
+        REQUIRE(agrees());
+        fs.unlink(root + "/large-copy.bin");
+        fs.unlink(root + "/moved/inside.bin");
+        fs.unlink(root + "/small.bin");
+        REQUIRE(agrees());
+        CHECK(!fs.find_media(large_id).has_value());
+        CHECK(!fs.find_media(inside_id).has_value());
 
-    // A mount over the same filesystem lists what the filesystem lists,
-    // whatever is changed outside it and mixed with its own operations: on a
-    // tree, by applying what differs between one head and the next.
-    auto fuse = config.fuse;
-    fuse.spool_path = config.state_path / ("fuse-" + root.substr(1));
-    fuse.operation_journal_path = *fuse.spool_path / "operations.log";
-    auto frontend = make_fuse_frontend(fs, service.resources().memory, fuse);
-    const auto names = [](const auto& listing) {
-        std::vector<std::string> out;
-        for (const auto& item : listing)
-            out.push_back(item.first);
-        std::sort(out.begin(), out.end());
-        return out;
-    };
-    const auto mount_agrees = [&](const std::string& directory) {
-        return names(frontend->readdir(directory)) == names(fs.readdir(directory));
-    };
-    const auto outside = root + "/outside";
-    CHECK(mount_agrees(root)); // the first refresh walks
-    fs.mkdir(outside, 0755, getuid(), getgid());
-    fs.mkdir(outside + "/show", 0755, getuid(), getgid());
-    for (const char* name : {"/show/e1.bin", "/show/e2.bin", "/show.nfo"})
-        fs.create_file(outside + name, 0644, getuid(), getgid());
-    CHECK(mount_agrees(outside));
-    CHECK(mount_agrees(outside + "/show"));
-    frontend->mkdir(outside + "/own", 0755, getuid(), getgid());
-    REQUIRE(frontend->wait_for_idle(20s));
-    fs.rename(outside + "/show", outside + "/renamed", false);
-    CHECK(mount_agrees(outside));
-    CHECK(mount_agrees(outside + "/renamed"));
-    CHECK(frontend->getattr(outside + "/renamed/e2.bin").type == EntryType::file);
-    fs.chmod(outside + "/renamed/e1.bin", 0600);
-    CHECK((frontend->getattr(outside + "/renamed/e1.bin").mode & 0777U) == 0600U);
-    fs.unlink(outside + "/renamed/e1.bin");
-    fs.unlink(outside + "/renamed/e2.bin");
-    fs.rmdir(outside + "/renamed");
-    fs.rmdir(outside + "/own");
-    CHECK(mount_agrees(outside));
-    CHECK(mount_agrees(root));
-    CHECK(mount_agrees("/"));
-    frontend->stop();
+        // A mount over the same filesystem lists what the filesystem lists,
+        // whatever is changed outside it and mixed with its own operations: on a
+        // tree, by applying what differs between one head and the next.
+        auto fuse = config.fuse;
+        fuse.spool_path = config.state_path / ("fuse-" + root.substr(1));
+        fuse.operation_journal_path = *fuse.spool_path / "operations.log";
+        auto frontend = make_fuse_frontend(fs, service.resources().memory, fuse);
+        const auto names = [](const auto& listing) {
+            std::vector<std::string> out;
+            for (const auto& item : listing)
+                out.push_back(item.first);
+            std::sort(out.begin(), out.end());
+            return out;
+        };
+        const auto mount_agrees = [&](const std::string& directory) {
+            return names(frontend->readdir(directory)) == names(fs.readdir(directory));
+        };
+        const auto outside = root + "/outside";
+        CHECK(mount_agrees(root)); // the first refresh walks
+        fs.mkdir(outside, 0755, getuid(), getgid());
+        fs.mkdir(outside + "/show", 0755, getuid(), getgid());
+        for (const char* name : {"/show/e1.bin", "/show/e2.bin", "/show.nfo"})
+            fs.create_file(outside + name, 0644, getuid(), getgid());
+        CHECK(mount_agrees(outside));
+        CHECK(mount_agrees(outside + "/show"));
+        frontend->mkdir(outside + "/own", 0755, getuid(), getgid());
+        REQUIRE(frontend->wait_for_idle(20s));
+        fs.rename(outside + "/show", outside + "/renamed", false);
+        CHECK(mount_agrees(outside));
+        CHECK(mount_agrees(outside + "/renamed"));
+        CHECK(frontend->getattr(outside + "/renamed/e2.bin").type == EntryType::file);
+        fs.chmod(outside + "/renamed/e1.bin", 0600);
+        CHECK((frontend->getattr(outside + "/renamed/e1.bin").mode & 0777U) == 0600U);
+        fs.unlink(outside + "/renamed/e1.bin");
+        fs.unlink(outside + "/renamed/e2.bin");
+        fs.rmdir(outside + "/renamed");
+        fs.rmdir(outside + "/own");
+        CHECK(mount_agrees(outside));
+        CHECK(mount_agrees(root));
+        CHECK(mount_agrees("/"));
+        frontend->stop();
     };
     {
         Service service(config, cluster.keys(), test_durability_window);
@@ -395,18 +395,18 @@ MACHA_TEST("namespace_service", test_tombstones_live_in_batches_in_a_tree_backed
     CHECK(decode_snapshot(encode_snapshot_v14(head)).tombstone_batches == head.tombstone_batches);
 
     // Maintenance sees every tombstone, from the batches.
-    REQUIRE(wait_until([&] {
-        const auto objects = fs.maintenance_objects_cached();
-        const auto has = [&](const ObjectId& id) {
-            return std::binary_search(objects->garbage.begin(), objects->garbage.end(),
-                                      GarbageRef{id, 0, {}},
-                                      [](const GarbageRef& a, const GarbageRef& b) {
-                                          return a.id < b.id;
-                                      });
-        };
-        return std::all_of(tree_extents.begin(), tree_extents.end(), has) &&
-               std::all_of(map_extents.begin(), map_extents.end(), has);
-    }, 20s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto objects = fs.maintenance_objects_cached();
+            const auto has = [&](const ObjectId& id) {
+                return std::binary_search(
+                    objects->garbage.begin(), objects->garbage.end(), GarbageRef{id, 0, {}},
+                    [](const GarbageRef& a, const GarbageRef& b) { return a.id < b.id; });
+            };
+            return std::all_of(tree_extents.begin(), tree_extents.end(), has) &&
+                   std::all_of(map_extents.begin(), map_extents.end(), has);
+        },
+        20s));
 
     // Past their grace, maintenance drops the batches whole.
     REQUIRE(wait_until([&] { return metadata.snapshot().tombstone_batches.empty(); }, 60s));
@@ -459,11 +459,9 @@ MACHA_TEST("namespace_service", test_a_stale_tombstone_in_a_batch_is_erased_once
 
     const auto tombstoned = [&](const ObjectId& id) {
         const auto objects = fs.maintenance_objects_cached();
-        return std::binary_search(objects->garbage.begin(), objects->garbage.end(),
-                                  GarbageRef{id, 0, {}},
-                                  [](const GarbageRef& a, const GarbageRef& b) {
-                                      return a.id < b.id;
-                                  });
+        return std::binary_search(
+            objects->garbage.begin(), objects->garbage.end(), GarbageRef{id, 0, {}},
+            [](const GarbageRef& a, const GarbageRef& b) { return a.id < b.id; });
     };
     REQUIRE(wait_until([&] { return !tombstoned(revived); }, 30s));
     // The rest of the batch was written again, not lost.
@@ -475,14 +473,14 @@ MACHA_TEST("namespace_service", test_a_stale_tombstone_in_a_batch_is_erased_once
 
     // With the stale tombstone gone the pass has nothing to say: no commit
     // follows another for as long as it would take the defect to make several.
-    const auto generation = [&] {
-        return service.local_state().replica().committed_generation();
-    };
-    REQUIRE(wait_until([&] {
-        const auto before = generation();
-        std::this_thread::sleep_for(1s);
-        return generation() == before;
-    }, 30s));
+    const auto generation = [&] { return service.local_state().replica().committed_generation(); };
+    REQUIRE(wait_until(
+        [&] {
+            const auto before = generation();
+            std::this_thread::sleep_for(1s);
+            return generation() == before;
+        },
+        30s));
     const auto settled = generation();
     std::this_thread::sleep_for(4s);
     CHECK(generation() == settled);
@@ -519,7 +517,8 @@ MACHA_TEST("namespace_service", test_operations_waiting_on_a_commit_share_the_ne
         std::vector<std::thread> threads;
         for (int i = 0; i <= writers; ++i)
             threads.emplace_back([&, i] {
-                const auto path = i == writers ? root + "/not-there" : root + "/f" + std::to_string(i);
+                const auto path =
+                    i == writers ? root + "/not-there" : root + "/f" + std::to_string(i);
                 FilesystemNamespaceMutation op;
                 op.kind = FilesystemNamespaceMutation::Kind::unlink;
                 op.from = path;
@@ -682,9 +681,9 @@ MACHA_TEST("namespace_service", test_a_tree_backed_delta_reconstructs_its_record
 
     auto successor = parent;
     apply_metadata_delta_in_place(successor, delta,
-                                 [&](const ObjectId& root, const MetadataDelta& d) {
-                                     return apply_delta_to_namespace_tree(root, store, d);
-                                 });
+                                  [&](const ObjectId& root, const MetadataDelta& d) {
+                                      return apply_delta_to_namespace_tree(root, store, d);
+                                  });
     REQUIRE(successor.namespace_root.has_value());
     CHECK(*successor.namespace_root != *parent.namespace_root);
 
@@ -695,7 +694,6 @@ MACHA_TEST("namespace_service", test_a_tree_backed_delta_reconstructs_its_record
     committed.namespace_root = apply_delta_to_namespace_tree(*parent.namespace_root, store, delta);
     CHECK(encode_snapshot_v14(committed) == encode_snapshot_v14(successor));
 }
-
 
 // On a tree, a commit that changes only the catalogue leaves the tree as it
 // is and claims the catalogue it installs.
@@ -728,8 +726,8 @@ MACHA_TEST("namespace_service", test_a_catalogue_change_on_a_tree_leaves_the_tre
     REQUIRE(after.namespace_root.has_value());
     CHECK(*after.namespace_root == *root);
     REQUIRE(after.catalogue_root.has_value());
-    CHECK(service.local_state().retention().retained(RetentionClass::control,
-                                                     *after.catalogue_root));
+    CHECK(
+        service.local_state().retention().retained(RetentionClass::control, *after.catalogue_root));
     CHECK(service.filesystem().getattr("/Movies/film.mkv").size == 256 * 1024);
     service.stop();
 }
@@ -756,12 +754,14 @@ MACHA_HEAVY_TEST("namespace_service", test_the_control_collector_keeps_an_unclai
     }
     const auto film = pattern(256 * 1024, 81);
     const auto converged = [](Service& a, Service& b) {
-        return wait_until([&] {
-            return a.local_state().replica().committed().hash ==
-                       b.local_state().replica().committed().hash &&
-                   a.local_state().replica().accepted_heads().size() == 1 &&
-                   b.local_state().replica().accepted_heads().size() == 1;
-        }, 10s);
+        return wait_until(
+            [&] {
+                return a.local_state().replica().committed().hash ==
+                           b.local_state().replica().committed().hash &&
+                       a.local_state().replica().accepted_heads().size() == 1 &&
+                       b.local_state().replica().accepted_heads().size() == 1;
+            },
+            10s);
     };
 
     // A library big enough for a tree of several leaves under a branch.
@@ -1028,7 +1028,5 @@ MACHA_TEST("namespace_service", test_a_merge_claims_what_it_introduces) {
     CHECK(service.filesystem().getattr("/Films/right").type == EntryType::directory);
     service.stop();
 }
-
-
 
 } // namespace

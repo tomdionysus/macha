@@ -31,7 +31,8 @@ void write_all(int fd, std::span<const uint8_t> bytes) {
 
 void atomic_write(const std::filesystem::path& path, std::span<const uint8_t> bytes) {
     std::filesystem::create_directories(path.parent_path());
-    auto temp = path.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
+    auto temp =
+        path.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
     int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0)
         throw std::runtime_error("cannot create cache metadata: " + std::string(strerror(errno)));
@@ -39,10 +40,12 @@ void atomic_write(const std::filesystem::path& path, std::span<const uint8_t> by
         write_all(fd, bytes);
         // Cache metadata is a hint; startup ignores a torn or missing record.
         if (::close(fd))
-            throw std::runtime_error("cannot close cache metadata: " + std::string(strerror(errno)));
+            throw std::runtime_error("cannot close cache metadata: " +
+                                     std::string(strerror(errno)));
         fd = -1;
         if (::rename(temp.c_str(), path.c_str()))
-            throw std::runtime_error("cannot install cache metadata: " + std::string(strerror(errno)));
+            throw std::runtime_error("cannot install cache metadata: " +
+                                     std::string(strerror(errno)));
     } catch (...) {
         if (fd >= 0)
             ::close(fd);
@@ -67,9 +70,8 @@ void PersistentBlockCache::open_locked() {
     if (config_.path.empty() || !config_.max_blocks)
         return;
     try {
-        store_ = std::make_shared<LocalStore>(config_.path,
-                                              std::numeric_limits<uint64_t>::max(), key_,
-                                              LocalStoreMode::ephemeral, nullptr,
+        store_ = std::make_shared<LocalStore>(config_.path, std::numeric_limits<uint64_t>::max(),
+                                              key_, LocalStoreMode::ephemeral, nullptr,
                                               posix_local_store_files());
         rebuild_lru_locked();
     } catch (const std::exception& error) {
@@ -127,8 +129,7 @@ void PersistentBlockCache::rebuild_lru_locked() {
     block_count_.store(lru_.size(), std::memory_order_relaxed);
 }
 
-void PersistentBlockCache::mark_used(const std::shared_ptr<LocalStore>& store,
-                                     const ObjectId& id) {
+void PersistentBlockCache::mark_used(const std::shared_ptr<LocalStore>& store, const ObjectId& id) {
     Lock lock(state_mutex_);
     if (!store_ || store_ != store)
         return;
@@ -139,8 +140,7 @@ void PersistentBlockCache::mark_used(const std::shared_ptr<LocalStore>& store,
     found->second = std::prev(lru_.end());
 }
 
-void PersistentBlockCache::trim_to_limit(const std::shared_ptr<LocalStore>& store,
-                                         size_t limit) {
+void PersistentBlockCache::trim_to_limit(const std::shared_ptr<LocalStore>& store, size_t limit) {
     if (!store)
         return;
 
@@ -316,8 +316,7 @@ size_t PersistentBlockCache::blocks() const {
 }
 
 PersistentBlockCache::Stats PersistentBlockCache::stats() const {
-    return Stats{hits_.load(std::memory_order_relaxed),
-                 misses_.load(std::memory_order_relaxed),
+    return Stats{hits_.load(std::memory_order_relaxed), misses_.load(std::memory_order_relaxed),
                  evictions_.load(std::memory_order_relaxed),
                  block_count_.load(std::memory_order_relaxed)};
 }

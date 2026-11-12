@@ -16,10 +16,10 @@
 // would overwrite, then replicate away, an edit made underneath it. A first
 // admin created on one node replicates when that node starts. The API never
 // accepts an unauthenticated first create: that would race anyone reaching the port.
+#include "auth/users.hpp"
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "durable_file.hpp"
-#include "auth/users.hpp"
 
 #include <termios.h>
 #include <unistd.h>
@@ -38,9 +38,9 @@ constexpr std::array<uint8_t, 8> magic{'M', 'A', 'C', 'H', 'U', 'S', 'R', '1'};
 
 std::array<uint8_t, 32> seal_key(const ClusterKeys& keys) {
     static constexpr std::string_view label = "macha/users/v1";
-    return hkdf_sha256(keys.master, {},
-                       std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(label.data()),
-                                                label.size()));
+    return hkdf_sha256(
+        keys.master, {},
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(label.data()), label.size()));
 }
 
 std::vector<UserRecord> load(const std::filesystem::path& path,

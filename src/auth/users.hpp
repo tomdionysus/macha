@@ -92,7 +92,7 @@ struct UserRecord {
     uint64_t credential_generation{};
     uint64_t created_unix_ms{};
     uint64_t updated_unix_ms{};
-    uint64_t version{}; // last-write-wins counter
+    uint64_t version{};  // last-write-wins counter
     NodeId updated_by{}; // deterministic tie-break at equal version
     bool tombstone{};
 
@@ -102,7 +102,6 @@ struct UserRecord {
 
 bool user_has_role(const UserRecord&, std::string_view role);
 std::string normalize_username(std::string_view);
-
 
 Bytes encode_users(const std::vector<UserRecord>&);
 std::vector<UserRecord> decode_users(std::span<const uint8_t>);
@@ -167,8 +166,7 @@ class UserStore {
 
     // Sets root's password without the old one. The caller must have verified
     // a recovery key first; this checks nothing.
-    std::optional<UserRecord> reset_root_password(std::string_view new_password,
-                                                  const NodeId& by);
+    std::optional<UserRecord> reset_root_password(std::string_view new_password, const NodeId& by);
     std::optional<RecoveryEnvelope> root_recovery() const;
     // Replaces the envelope, invalidating the previous recovery key.
     bool set_root_recovery(const RecoveryEnvelope&, const NodeId& by);
@@ -243,8 +241,8 @@ inline constexpr size_t min_password_length = 8;
 struct InitialAccounts {
     UserRecord root;
     UserRecord anonymous;
-    std::string password;     // root's; exists only here and in the file below
-    std::string recovery_key; // shown once; Macha keeps only the envelope
+    std::string password;       // root's; exists only here and in the file below
+    std::string recovery_key;   // shown once; Macha keeps only the envelope
     std::filesystem::path path; // where the operator can read both back
 };
 
@@ -253,7 +251,7 @@ struct InitialAccounts {
 // tombstones included. The password goes to `state_path/initial-root-password`
 // (mode 0600), never the log; the caller says where it is.
 std::optional<InitialAccounts> create_initial_accounts(UserStore&, const ClusterKeys&,
-                                               const std::filesystem::path& state_path,
-                                               const NodeId& by);
+                                                       const std::filesystem::path& state_path,
+                                                       const NodeId& by);
 
 } // namespace macha

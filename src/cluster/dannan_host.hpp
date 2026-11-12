@@ -79,8 +79,12 @@ class DannanHost {
     // destroys it and then joins the io threads.
     void stop();
 
-    dannan::Node& node() noexcept { return *node_; }
-    const dannan::Node& node() const noexcept { return *node_; }
+    dannan::Node& node() noexcept {
+        return *node_;
+    }
+    const dannan::Node& node() const noexcept {
+        return *node_;
+    }
 
     // A call to `peer`, or to an endpoint, ending at the latest when `deadline` passes.
     // The future holds the reply (an error reply is a reply), or throws why none came.

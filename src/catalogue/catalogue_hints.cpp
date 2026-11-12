@@ -16,10 +16,13 @@
 namespace macha {
 namespace {
 
-uint64_t now_ms() { return unix_ms(); }
+uint64_t now_ms() {
+    return unix_ms();
+}
 
 std::string hint_id_for_path(std::string_view path) {
-    const auto bytes = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(path.data()), path.size());
+    const auto bytes =
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(path.data()), path.size());
     auto digest = sha256(bytes);
     auto value = hex(digest.bytes);
     value.resize(32);
@@ -52,26 +55,31 @@ Json hint_json(const CatalogueHint& hint) {
     out["error_code"] = hint.error_code;
     out["error"] = hint.error;
     Json::Array ids;
-    for (const auto& id : hint.catalogue_item_ids) ids.emplace_back(id);
+    for (const auto& id : hint.catalogue_item_ids)
+        ids.emplace_back(id);
     out["catalogue_item_ids"] = std::move(ids);
     Json::Array origins;
-    for (const auto& origin : hint.origins) origins.push_back(origin_json(origin));
+    for (const auto& origin : hint.origins)
+        origins.push_back(origin_json(origin));
     out["origins"] = std::move(origins);
     return Json(std::move(out));
 }
 
 std::string json_string(const Json& value, std::string_view key, std::string fallback = {}) {
-    if (const auto* item = value.find(key)) return item->asString();
+    if (const auto* item = value.find(key))
+        return item->asString();
     return fallback;
 }
 
 uint64_t json_u64(const Json& value, std::string_view key, uint64_t fallback = 0) {
-    if (const auto* item = value.find(key)) return item->asUInt64();
+    if (const auto* item = value.find(key))
+        return item->asUInt64();
     return fallback;
 }
 
 std::string scheduling_lane(std::string_view path) {
-    if (!path.empty() && path.front() == '/') path.remove_prefix(1);
+    if (!path.empty() && path.front() == '/')
+        path.remove_prefix(1);
     const auto slash = path.find('/');
     return std::string(path.substr(0, slash));
 }
@@ -81,23 +89,27 @@ bool ephemeral_origin_source(std::string_view source) {
 }
 
 int default_origin_priority(std::string_view source) {
-    if (source == "ingest") return CatalogueHintPriority::ingest;
-    if (source == "manual") return CatalogueHintPriority::manual_rescan;
-    if (source == "namespace") return CatalogueHintPriority::namespace_mutation;
-    if (source == "scanner") return CatalogueHintPriority::periodic_scan;
+    if (source == "ingest")
+        return CatalogueHintPriority::ingest;
+    if (source == "manual")
+        return CatalogueHintPriority::manual_rescan;
+    if (source == "namespace")
+        return CatalogueHintPriority::namespace_mutation;
+    if (source == "scanner")
+        return CatalogueHintPriority::periodic_scan;
     return 0;
 }
 
 void recompute_priority(CatalogueHint& hint) {
     int priority = 0;
-    for (const auto& origin : hint.origins) priority = std::max(priority, origin.priority);
+    for (const auto& origin : hint.origins)
+        priority = std::max(priority, origin.priority);
     hint.priority = priority;
 }
 
 void discard_ephemeral_origins(CatalogueHint& hint) {
-    std::erase_if(hint.origins, [](const auto& origin) {
-        return ephemeral_origin_source(origin.source);
-    });
+    std::erase_if(hint.origins,
+                  [](const auto& origin) { return ephemeral_origin_source(origin.source); });
     recompute_priority(hint);
 }
 
@@ -105,8 +117,10 @@ CatalogueHint parse_hint(const Json& value) {
     CatalogueHint hint;
     hint.id = json_string(value, "id");
     hint.path = normalize_path(json_string(value, "path"));
-    if (const auto* priority = value.find("priority")) hint.priority = static_cast<int>(priority->asInt64());
-    if (auto state = parse_catalogue_hint_state(json_string(value, "state"))) hint.state = *state;
+    if (const auto* priority = value.find("priority"))
+        hint.priority = static_cast<int>(priority->asInt64());
+    if (auto state = parse_catalogue_hint_state(json_string(value, "state")))
+        hint.state = *state;
     hint.attempts = static_cast<unsigned>(json_u64(value, "attempts"));
     hint.failures = static_cast<unsigned>(json_u64(value, "failures"));
     hint.candidate_cursor = static_cast<size_t>(json_u64(value, "candidate_cursor"));
@@ -119,9 +133,11 @@ CatalogueHint parse_hint(const Json& value) {
     hint.error_code = json_string(value, "error_code");
     hint.error = json_string(value, "error");
     // A record with an error but no code gets one: an error never shows without a code.
-    if (!hint.error.empty() && hint.error_code.empty()) hint.error_code = "catalogue_error";
+    if (!hint.error.empty() && hint.error_code.empty())
+        hint.error_code = "catalogue_error";
     if (const auto* ids = value.find("catalogue_item_ids"))
-        for (const auto& id : ids->asArray()) hint.catalogue_item_ids.push_back(id.asString());
+        for (const auto& id : ids->asArray())
+            hint.catalogue_item_ids.push_back(id.asString());
     if (const auto* origins = value.find("origins")) {
         for (const auto& item : origins->asArray()) {
             CatalogueHintOrigin origin;
@@ -131,10 +147,12 @@ CatalogueHint parse_hint(const Json& value) {
                 origin.priority = static_cast<int>(priority->asInt64());
             else
                 origin.priority = default_origin_priority(origin.source);
-            if (!origin.source.empty()) hint.origins.push_back(std::move(origin));
+            if (!origin.source.empty())
+                hint.origins.push_back(std::move(origin));
         }
     }
-    if (!hint.origins.empty()) recompute_priority(hint);
+    if (!hint.origins.empty())
+        recompute_priority(hint);
     return hint;
 }
 
@@ -142,23 +160,35 @@ CatalogueHint parse_hint(const Json& value) {
 
 std::string catalogue_hint_state_name(CatalogueHintState state) {
     switch (state) {
-    case CatalogueHintState::queued: return "queued";
-    case CatalogueHintState::processing: return "processing";
-    case CatalogueHintState::deferred: return "deferred";
-    case CatalogueHintState::catalogued: return "catalogued";
-    case CatalogueHintState::no_match: return "no_match";
-    case CatalogueHintState::failed: return "failed";
+    case CatalogueHintState::queued:
+        return "queued";
+    case CatalogueHintState::processing:
+        return "processing";
+    case CatalogueHintState::deferred:
+        return "deferred";
+    case CatalogueHintState::catalogued:
+        return "catalogued";
+    case CatalogueHintState::no_match:
+        return "no_match";
+    case CatalogueHintState::failed:
+        return "failed";
     }
     return "failed";
 }
 
 std::optional<CatalogueHintState> parse_catalogue_hint_state(std::string_view state) {
-    if (state == "queued") return CatalogueHintState::queued;
-    if (state == "processing") return CatalogueHintState::processing;
-    if (state == "deferred") return CatalogueHintState::deferred;
-    if (state == "catalogued") return CatalogueHintState::catalogued;
-    if (state == "no_match") return CatalogueHintState::no_match;
-    if (state == "failed") return CatalogueHintState::failed;
+    if (state == "queued")
+        return CatalogueHintState::queued;
+    if (state == "processing")
+        return CatalogueHintState::processing;
+    if (state == "deferred")
+        return CatalogueHintState::deferred;
+    if (state == "catalogued")
+        return CatalogueHintState::catalogued;
+    if (state == "no_match")
+        return CatalogueHintState::no_match;
+    if (state == "failed")
+        return CatalogueHintState::failed;
     return {};
 }
 
@@ -189,17 +219,21 @@ CatalogueHintQueue::CatalogueHintQueue(const std::filesystem::path& state_path)
 void CatalogueHintQueue::load_state() {
     Lock lock(mutex_);
     std::ifstream in(state_file_, std::ios::binary);
-    if (!in) return;
+    if (!in)
+        return;
     std::ostringstream text;
     text << in.rdbuf();
     try {
         auto root = Json::parse(text.str());
         const auto* values = root.find("hints");
-        if (!values) return;
+        if (!values)
+            return;
         for (const auto& value : values->asArray()) {
             auto hint = parse_hint(value);
-            if (hint.path.empty()) continue;
-            if (hint.id.empty()) hint.id = hint_id_for_path(hint.path);
+            if (hint.path.empty())
+                continue;
+            if (hint.id.empty())
+                hint.id = hint_id_for_path(hint.path);
             hints_[hint.path] = std::move(hint);
         }
     } catch (const std::exception& e) {
@@ -227,12 +261,12 @@ void CatalogueHintQueue::mark_state_dirty_locked() {
 }
 
 void CatalogueHintQueue::persist_dirty_state_locked(bool force) {
-    if (!state_dirty_) return;
+    if (!state_dirty_)
+        return;
     constexpr size_t max_coalesced_updates = 32;
     constexpr auto max_coalesce_delay = std::chrono::seconds(2);
     const auto now = std::chrono::steady_clock::now();
-    if (!force && dirty_updates_ < max_coalesced_updates &&
-        now - dirty_since_ < max_coalesce_delay)
+    if (!force && dirty_updates_ < max_coalesced_updates && now - dirty_since_ < max_coalesce_delay)
         return;
     save_state_locked();
     state_dirty_ = false;
@@ -245,13 +279,12 @@ CatalogueHintQueue::~CatalogueHintQueue() {
         Lock lock(mutex_);
         persist_dirty_state_locked(true);
     } catch (const std::exception& e) {
-        Log::warn("catalogue hint state flush failed during shutdown: " +
-                  std::string(e.what()));
+        Log::warn("catalogue hint state flush failed during shutdown: " + std::string(e.what()));
     }
 }
 
-std::vector<std::string> CatalogueHintQueue::submit_many(
-    std::vector<CatalogueHintSubmission> submissions) {
+std::vector<std::string>
+CatalogueHintQueue::submit_many(std::vector<CatalogueHintSubmission> submissions) {
     const auto now = now_ms();
     std::vector<std::string> ids;
     ids.reserve(submissions.size());
@@ -259,7 +292,8 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
     bool changed = false;
     for (auto& submission : submissions) {
         auto path = normalize_path(std::move(submission.path));
-        if (path.empty() || path == "/" || submission.source.empty()) continue;
+        if (path.empty() || path == "/" || submission.source.empty())
+            continue;
 
         auto [it, inserted] = hints_.try_emplace(path);
         auto& hint = it->second;
@@ -270,20 +304,20 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
         auto exact_origin = hint.origins.end();
         auto source_origin = hint.origins.end();
         if (!inserted) {
-            exact_origin = std::find_if(hint.origins.begin(), hint.origins.end(),
-                                        [&](const auto& origin) {
-                                            return origin.source == submission.source &&
-                                                   origin.source_ref == submission.source_ref;
-                                        });
-            source_origin = std::find_if(hint.origins.begin(), hint.origins.end(),
-                                         [&](const auto& origin) {
-                                             return origin.source == submission.source;
-                                         });
+            exact_origin =
+                std::find_if(hint.origins.begin(), hint.origins.end(), [&](const auto& origin) {
+                    return origin.source == submission.source &&
+                           origin.source_ref == submission.source_ref;
+                });
+            source_origin =
+                std::find_if(hint.origins.begin(), hint.origins.end(), [&](const auto& origin) {
+                    return origin.source == submission.source;
+                });
         }
         const bool origin_known = exact_origin != hint.origins.end();
         const bool source_known = source_origin != hint.origins.end();
-        const bool source_ref_changed = source_known && !origin_known &&
-                                        source_origin->source_ref != submission.source_ref;
+        const bool source_ref_changed =
+            source_known && !origin_known && source_origin->source_ref != submission.source_ref;
 
         if (inserted) {
             hint.id = hint_id_for_path(path);
@@ -324,7 +358,8 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
             } else if (origin_known) {
                 exact_origin->priority = std::max(exact_origin->priority, submission.priority);
             } else {
-                hint.origins.push_back({submission.source, submission.source_ref, submission.priority});
+                hint.origins.push_back(
+                    {submission.source, submission.source_ref, submission.priority});
             }
             recompute_priority(hint);
         }
@@ -362,11 +397,12 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
     return ids;
 }
 
-std::string CatalogueHintQueue::submit(std::string path, std::string source,
-                                       std::string source_ref, int priority) {
+std::string CatalogueHintQueue::submit(std::string path, std::string source, std::string source_ref,
+                                       int priority) {
     auto ids = submit_many({CatalogueHintSubmission{std::move(path), std::move(source),
-                                                     std::move(source_ref), priority}});
-    if (ids.empty()) throw std::runtime_error("catalogue hint submission is invalid");
+                                                    std::move(source_ref), priority}});
+    if (ids.empty())
+        throw std::runtime_error("catalogue hint submission is invalid");
     return ids.front();
 }
 
@@ -379,7 +415,8 @@ std::optional<CatalogueHint> CatalogueHintQueue::claim_next() {
         auto& hint = it->second;
         if (hint.state != CatalogueHintState::queued && hint.state != CatalogueHintState::deferred)
             continue;
-        if (hint.ready_after_unix_ms > now) continue;
+        if (hint.ready_after_unix_ms > now)
+            continue;
         const auto lane = scheduling_lane(hint.path);
         const auto lane_it = lane_served_.find(lane);
         const auto served = lane_it == lane_served_.end() ? 0 : lane_it->second;
@@ -394,7 +431,8 @@ std::optional<CatalogueHint> CatalogueHintQueue::claim_next() {
             best_lane_served = served;
         }
     }
-    if (best == hints_.end()) return {};
+    if (best == hints_.end())
+        return {};
     best->second.state = CatalogueHintState::processing;
     ++best->second.attempts;
     best->second.updated_unix_ms = now;
@@ -416,7 +454,8 @@ std::optional<std::chrono::milliseconds> CatalogueHintQueue::next_ready_delay() 
         if (!earliest || hint.ready_after_unix_ms < *earliest)
             earliest = hint.ready_after_unix_ms;
     }
-    if (!earliest) return {};
+    if (!earliest)
+        return {};
     return std::chrono::milliseconds(*earliest - now);
 }
 
@@ -442,8 +481,10 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
                                          std::vector<std::string> catalogue_item_ids,
                                          std::string result) {
     Lock lock(mutex_);
-    auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
-    if (it == hints_.end()) return;
+    auto it = std::find_if(hints_.begin(), hints_.end(),
+                           [&](const auto& pair) { return pair.second.id == id; });
+    if (it == hints_.end())
+        return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::catalogued;
     hint.failures = 0;
@@ -457,7 +498,8 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
     discard_ephemeral_origins(hint);
-    if (hint.origins.empty()) hints_.erase(it);
+    if (hint.origins.empty())
+        hints_.erase(it);
     mark_state_dirty_locked();
     persist_dirty_state_locked(false);
     changed_locked();
@@ -466,8 +508,10 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
 void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider,
                                        std::string media_id, std::string result) {
     Lock lock(mutex_);
-    auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
-    if (it == hints_.end()) return;
+    auto it = std::find_if(hints_.begin(), hints_.end(),
+                           [&](const auto& pair) { return pair.second.id == id; });
+    if (it == hints_.end())
+        return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::no_match;
     hint.failures = 0;
@@ -480,7 +524,8 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
     hint.error_code.clear();
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
-    if (hint.origins.empty()) hints_.erase(it);
+    if (hint.origins.empty())
+        hints_.erase(it);
     mark_state_dirty_locked();
     persist_dirty_state_locked(false);
     changed_locked();
@@ -493,7 +538,8 @@ std::string CatalogueHintQueue::put_unmatched(std::string path, std::string medi
     auto& hint = hints_[path];
     hint.id = hint_id_for_path(path);
     hint.path = path;
-    if (!hint.created_unix_ms) hint.created_unix_ms = now;
+    if (!hint.created_unix_ms)
+        hint.created_unix_ms = now;
     hint.state = CatalogueHintState::no_match;
     hint.attempts = 0;
     hint.failures = 0;
@@ -516,8 +562,10 @@ std::string CatalogueHintQueue::put_unmatched(std::string path, std::string medi
 
 void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_cursor) {
     Lock lock(mutex_);
-    auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
-    if (it == hints_.end()) return;
+    auto it = std::find_if(hints_.begin(), hints_.end(),
+                           [&](const auto& pair) { return pair.second.id == id; });
+    if (it == hints_.end())
+        return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::queued;
     hint.attempts = 0;
@@ -535,8 +583,10 @@ void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_curs
 void CatalogueHintQueue::defer(std::string_view id, std::string code, std::string error,
                                uint64_t retry_after_unix_ms) {
     Lock lock(mutex_);
-    auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
-    if (it == hints_.end()) return;
+    auto it = std::find_if(hints_.begin(), hints_.end(),
+                           [&](const auto& pair) { return pair.second.id == id; });
+    if (it == hints_.end())
+        return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::deferred;
     hint.error_code = std::move(code);
@@ -548,9 +598,10 @@ void CatalogueHintQueue::defer(std::string_view id, std::string code, std::strin
     changed_locked();
 }
 
-size_t CatalogueHintQueue::defer_matching(
-    const std::function<bool(const CatalogueHint&)>& predicate,
-    std::string code, std::string error, uint64_t retry_after_unix_ms) {
+size_t
+CatalogueHintQueue::defer_matching(const std::function<bool(const CatalogueHint&)>& predicate,
+                                   std::string code, std::string error,
+                                   uint64_t retry_after_unix_ms) {
     const auto now = now_ms();
     Lock lock(mutex_);
     size_t deferred = 0;
@@ -578,12 +629,12 @@ size_t CatalogueHintQueue::defer_matching(
 }
 
 bool CatalogueHintQueue::record_failure(std::string_view id, std::string code, std::string error,
-                                        uint64_t retry_after_unix_ms,
-                                        unsigned max_failures) {
+                                        uint64_t retry_after_unix_ms, unsigned max_failures) {
     Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(),
                            [&](const auto& pair) { return pair.second.id == id; });
-    if (it == hints_.end()) return false;
+    if (it == hints_.end())
+        return false;
     auto& hint = it->second;
     ++hint.failures;
     hint.error_code = std::move(code);
@@ -595,8 +646,7 @@ bool CatalogueHintQueue::record_failure(std::string_view id, std::string code, s
         hint.candidate_cursor = 0;
         hint.ready_after_unix_ms = 0;
         Log::warn("catalogue hint gave up path=" + hint.path +
-                  " failures=" + std::to_string(hint.failures) +
-                  ": " + hint.error);
+                  " failures=" + std::to_string(hint.failures) + ": " + hint.error);
     } else {
         hint.state = CatalogueHintState::deferred;
         hint.ready_after_unix_ms = retry_after_unix_ms;
@@ -609,8 +659,10 @@ bool CatalogueHintQueue::record_failure(std::string_view id, std::string code, s
 
 void CatalogueHintQueue::fail(std::string_view id, std::string code, std::string error) {
     Lock lock(mutex_);
-    auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
-    if (it == hints_.end()) return;
+    auto it = std::find_if(hints_.begin(), hints_.end(),
+                           [&](const auto& pair) { return pair.second.id == id; });
+    if (it == hints_.end())
+        return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::failed;
     hint.failures = std::max(1u, hint.failures);
@@ -629,7 +681,8 @@ void CatalogueHintQueue::requeue_processing() {
     Lock lock(mutex_);
     bool changed = false;
     for (auto& [_, hint] : hints_) {
-        if (hint.state != CatalogueHintState::processing) continue;
+        if (hint.state != CatalogueHintState::processing)
+            continue;
         hint.state = CatalogueHintState::queued;
         hint.ready_after_unix_ms = 0;
         hint.updated_unix_ms = now_ms();
@@ -646,9 +699,11 @@ std::vector<CatalogueHint> CatalogueHintQueue::list() const {
     Lock lock(mutex_);
     std::vector<CatalogueHint> out;
     out.reserve(hints_.size());
-    for (const auto& [_, hint] : hints_) out.push_back(hint);
+    for (const auto& [_, hint] : hints_)
+        out.push_back(hint);
     std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
-        if (a.priority != b.priority) return a.priority > b.priority;
+        if (a.priority != b.priority)
+            return a.priority > b.priority;
         return a.created_unix_ms < b.created_unix_ms;
     });
     return out;
@@ -656,8 +711,10 @@ std::vector<CatalogueHint> CatalogueHintQueue::list() const {
 
 std::optional<CatalogueHint> CatalogueHintQueue::get(std::string_view id) const {
     Lock lock(mutex_);
-    auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
-    if (it == hints_.end()) return {};
+    auto it = std::find_if(hints_.begin(), hints_.end(),
+                           [&](const auto& pair) { return pair.second.id == id; });
+    if (it == hints_.end())
+        return {};
     return it->second;
 }
 
@@ -667,9 +724,15 @@ CatalogueHintSummary CatalogueHintQueue::summary() const {
     for (const auto& [_, hint] : hints_) {
         ++out.total;
         switch (hint.state) {
-        case CatalogueHintState::catalogued: ++out.catalogued; break;
-        case CatalogueHintState::no_match: ++out.no_match; break;
-        case CatalogueHintState::failed: ++out.failed; break;
+        case CatalogueHintState::catalogued:
+            ++out.catalogued;
+            break;
+        case CatalogueHintState::no_match:
+            ++out.no_match;
+            break;
+        case CatalogueHintState::failed:
+            ++out.failed;
+            break;
         case CatalogueHintState::queued:
             ++out.pending;
             ++out.queued;
@@ -692,13 +755,20 @@ CatalogueHintSummary CatalogueHintQueue::summary(std::string_view source,
     CatalogueHintSummary out;
     Lock lock(mutex_);
     for (const auto& [_, hint] : hints_) {
-        if (!has_origin(hint, source, source_ref)) continue;
+        if (!has_origin(hint, source, source_ref))
+            continue;
         ++out.total;
         out.hints.push_back(hint);
         switch (hint.state) {
-        case CatalogueHintState::catalogued: ++out.catalogued; break;
-        case CatalogueHintState::no_match: ++out.no_match; break;
-        case CatalogueHintState::failed: ++out.failed; break;
+        case CatalogueHintState::catalogued:
+            ++out.catalogued;
+            break;
+        case CatalogueHintState::no_match:
+            ++out.no_match;
+            break;
+        case CatalogueHintState::failed:
+            ++out.failed;
+            break;
         case CatalogueHintState::queued:
             ++out.pending;
             ++out.queued;
@@ -731,8 +801,10 @@ size_t CatalogueHintQueue::erase_origin(std::string_view source, std::string_vie
         // as the record that the file was never catalogued.
         const bool settled = it->second.state == CatalogueHintState::catalogued ||
                              it->second.state == CatalogueHintState::no_match;
-        if (origins.empty() && settled) it = hints_.erase(it);
-        else ++it;
+        if (origins.empty() && settled)
+            it = hints_.erase(it);
+        else
+            ++it;
     }
     if (removed) {
         mark_state_dirty_locked();
@@ -746,7 +818,8 @@ bool CatalogueHintQueue::erase(std::string_view id) {
     Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(),
                            [&](const auto& pair) { return pair.second.id == id; });
-    if (it == hints_.end()) return false;
+    if (it == hints_.end())
+        return false;
     hints_.erase(it);
     mark_state_dirty_locked();
     persist_dirty_state_locked(true);
@@ -779,7 +852,8 @@ size_t CatalogueHintQueue::rename_prefix(std::string_view source_value,
                                          std::string_view destination_value) {
     const auto source = normalize_path(std::string(source_value));
     const auto destination = normalize_path(std::string(destination_value));
-    if (source == destination) return 0;
+    if (source == destination)
+        return 0;
     const auto prefix = source == "/" ? std::string("/") : source + "/";
 
     Lock lock(mutex_);
@@ -804,7 +878,8 @@ size_t CatalogueHintQueue::rename_prefix(std::string_view source_value,
         moved.emplace_back(std::move(new_path), std::move(hint));
         it = hints_.erase(it);
     }
-    if (moved.empty()) return 0;
+    if (moved.empty())
+        return 0;
 
     for (auto& [path, hint] : moved) {
         // Namespace truth wins over a stale hint at the new path; the no-replace

@@ -59,7 +59,9 @@ struct IngestFileProgress {
     // its English message. The job goes on without it.
     std::string error_code;
     std::string error;
-    bool failed() const noexcept { return !error_code.empty(); }
+    bool failed() const noexcept {
+        return !error_code.empty();
+    }
 };
 
 struct IngestJob {
@@ -102,7 +104,9 @@ class IngestError : public std::runtime_error {
   public:
     IngestError(std::string code, const std::string& message)
         : std::runtime_error(message), code_(std::move(code)) {}
-    const std::string& code() const noexcept { return code_; }
+    const std::string& code() const noexcept {
+        return code_;
+    }
 
   private:
     std::string code_;
@@ -169,10 +173,14 @@ class StagingArea {
 
   public:
     explicit StagingArea(IngestConfig);
-    const std::filesystem::path& path() const noexcept { return config_.staging_path; }
+    const std::filesystem::path& path() const noexcept {
+        return config_.staging_path;
+    }
     // Whether the staging directory exists; nothing is staged while it does not.
     bool available() const;
-    uint64_t limit() const noexcept { return limit_.load(std::memory_order_relaxed); }
+    uint64_t limit() const noexcept {
+        return limit_.load(std::memory_order_relaxed);
+    }
     void reconfigure_limit(uint64_t limit);
     bool contains(const std::filesystem::path&) const;
     bool reserve(std::string owner, uint64_t bytes);
@@ -226,8 +234,8 @@ class IngestManager {
         IngestJob job;
         bool delete_source{};
     };
-    std::map<std::string, ClearedWhileActive, std::less<>> cleared_while_active_
-        MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, ClearedWhileActive, std::less<>>
+        cleared_while_active_ MACHA_GUARDED_BY(mutex_);
     // High-water mark of concurrently claimed jobs; shows parallelism without
     // catching it in a sample.
     size_t peak_active_jobs_ MACHA_GUARDED_BY(mutex_){};
@@ -261,8 +269,8 @@ class IngestManager {
     // Held across loading a torrent extent journal from the source directory.
     IoMutex extent_journals_mutex_;
     // By job id; see process_job.
-    std::map<std::string, std::map<std::string, TorrentExtentJournal::File>> extent_journals_
-        MACHA_GUARDED_BY(extent_journals_mutex_);
+    std::map<std::string, std::map<std::string, TorrentExtentJournal::File>>
+        extent_journals_ MACHA_GUARDED_BY(extent_journals_mutex_);
     void refresh_progress(IngestJob&, uint64_t sample_bytes = 0,
                           std::chrono::steady_clock::duration sample_time = {});
     void refresh_catalogue_jobs();
@@ -296,15 +304,15 @@ class IngestManager {
     void request_stop();
     void stop();
     void reconfigure(IngestConfig);
-    bool enabled() const noexcept { return enabled_; }
+    bool enabled() const noexcept {
+        return enabled_;
+    }
 
     std::string submit_path(const std::filesystem::path& source,
-                            std::string source_type = "filesystem",
-                            std::string source_ref = {},
+                            std::string source_type = "filesystem", std::string source_ref = {},
                             std::string display_name = {},
                             std::optional<bool> delete_source_on_clear = {},
-                            bool trusted_internal_source = false,
-                            bool source_owned = false);
+                            bool trusted_internal_source = false, bool source_owned = false);
     std::vector<IngestJob> jobs() const;
     std::optional<IngestJob> job(std::string_view id) const;
     bool pause(std::string_view id);
@@ -326,15 +334,22 @@ class IngestManager {
     bool delete_owned_source_on_clear() const;
     bool delete_external_source_on_clear() const;
     bool delete_owned_source_on_cancel() const;
-    StagingArea& staging() noexcept { return staging_; }
+    StagingArea& staging() noexcept {
+        return staging_;
+    }
     // The store the ingest commits into; the torrent disk backend publishes
     // extents through it.
-    FileSystem& filesystem() noexcept { return fs_; }
-    const StagingArea& staging() const noexcept { return staging_; }
-    size_t max_concurrent_jobs() const noexcept { return max_concurrent_jobs_; }
+    FileSystem& filesystem() noexcept {
+        return fs_;
+    }
+    const StagingArea& staging() const noexcept {
+        return staging_;
+    }
+    size_t max_concurrent_jobs() const noexcept {
+        return max_concurrent_jobs_;
+    }
     size_t active_jobs() const;
     size_t peak_active_jobs() const;
-
 };
 
 } // namespace macha

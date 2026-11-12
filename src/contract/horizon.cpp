@@ -35,7 +35,8 @@ ReferencedSets::Set ReferencedSets::make(std::optional<ObjectTrie::Snapshot> vie
 }
 
 ReferencedSets::ReferencedSets(std::vector<ObjectId> data, std::vector<ObjectId> control)
-    : data_(make(std::nullopt, std::move(data))), control_(make(std::nullopt, std::move(control))) {}
+    : data_(make(std::nullopt, std::move(data))), control_(make(std::nullopt, std::move(control))) {
+}
 
 ReferencedSets::ReferencedSets(Views views, std::vector<ObjectId> data,
                                std::vector<ObjectId> control)
@@ -69,8 +70,8 @@ std::vector<ObjectId> ReferencedSets::next(RetentionClass type,
             viewed.push_back(record.first);
     // A full page of the view says nothing past its last id.
     const bool bounded = viewed.size() == limit;
-    auto from = after ? std::upper_bound(set.others.begin(), set.others.end(), *after)
-                      : set.others.begin();
+    auto from =
+        after ? std::upper_bound(set.others.begin(), set.others.end(), *after) : set.others.begin();
     auto to = bounded ? std::upper_bound(from, set.others.end(), viewed.back()) : set.others.end();
     if (static_cast<size_t>(to - from) > limit)
         to = from + static_cast<std::ptrdiff_t>(limit);
@@ -106,8 +107,9 @@ std::vector<ObjectId> ReferencedSets::not_held(RetentionClass type,
     std::vector<ObjectId> others;
     size_t seen = 0;
     for (const auto& id : set.others) {
-        if (std::none_of(held.begin(), held.end(),
-                         [&](const ObjectTrie::Snapshot& part) { return part.get(id).has_value(); }))
+        if (std::none_of(held.begin(), held.end(), [&](const ObjectTrie::Snapshot& part) {
+                return part.get(id).has_value();
+            }))
             others.push_back(id);
         if (pause && ++seen % 4096 == 0)
             pause();
@@ -119,7 +121,9 @@ std::vector<ObjectId> ReferencedSets::not_held(RetentionClass type,
     return out;
 }
 
-size_t ReferencedSets::size(RetentionClass type) const { return of(type).size; }
+size_t ReferencedSets::size(RetentionClass type) const {
+    return of(type).size;
+}
 
 InventoryHorizon::InventoryHorizon(uint64_t generation, bool catalogue_complete,
                                    std::vector<ObjectId> data, std::vector<ObjectId> control,
@@ -128,12 +132,10 @@ InventoryHorizon::InventoryHorizon(uint64_t generation, bool catalogue_complete,
                        ReferencedSets(std::move(data), std::move(control)), garbage) {}
 
 InventoryHorizon::InventoryHorizon(uint64_t generation, bool catalogue_complete,
-                                   ReferencedSets sets,
-                                   const std::vector<GarbageRef>& garbage,
+                                   ReferencedSets sets, const std::vector<GarbageRef>& garbage,
                                    std::vector<TombstoneBatch> tombstone_batches)
     : ReferencedSets(std::move(sets)), generation_(generation),
-      catalogue_complete_(catalogue_complete),
-      tombstone_batches_(std::move(tombstone_batches)) {
+      catalogue_complete_(catalogue_complete), tombstone_batches_(std::move(tombstone_batches)) {
     garbage_.reserve(garbage.size());
     stale_garbage_.reserve(garbage.size());
     for (const auto& candidate : garbage) {

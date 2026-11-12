@@ -237,8 +237,7 @@ MACHA_FAST_TEST("observation", test_observation_window_rendering) {
     window.histograms["x"] = recorded({3, 3, 5});
     window.counters["moved"] = 4;
     window.counters["still"] = 0;
-    const auto line =
-        render_observation_window(1000, 61000, "0.74.0", window, {{"rss_bytes", 7}});
+    const auto line = render_observation_window(1000, 61000, "0.74.0", window, {{"rss_bytes", 7}});
     CHECK(line ==
           R"({"counters":{"moved":4},"end_ms":61000,"gauges":{"rss_bytes":7},)"
           R"("histograms":{"x":{"buckets":[[3,2],[5,1]],"count":3,"max":5,"p50":3,)"
@@ -247,8 +246,8 @@ MACHA_FAST_TEST("observation", test_observation_window_rendering) {
 }
 
 MACHA_FAST_TEST("observation", test_observation_event_rendering) {
-    const ObservationEvent event{5, "backend_online", {{"elapsed_ms", 12}},
-                                 {{"path", "/mnt/\"d\""}}};
+    const ObservationEvent event{
+        5, "backend_online", {{"elapsed_ms", 12}}, {{"path", "/mnt/\"d\""}}};
     CHECK(render_observation_event(event) ==
           R"({"at_ms":5,"event":"backend_online","fields":{"elapsed_ms":12,)"
           R"("path":"/mnt/\"d\""},"kind":"event"})");
@@ -258,9 +257,9 @@ MACHA_FAST_TEST("observation", test_observation_log_rotates_at_its_bound) {
     TempDir dir;
     const auto path = dir.path() / "nested" / "observations.jsonl";
     ObservationLog log(path, 10);
-    log.append("12345");  // creates the directory and the file (6 bytes)
-    log.append("abc");    // 6 + 4 = 10: fits
-    log.append("more");   // 10 + 5 > 10: rotates first
+    log.append("12345"); // creates the directory and the file (6 bytes)
+    log.append("abc");   // 6 + 4 = 10: fits
+    log.append("more");  // 10 + 5 > 10: rotates first
     CHECK(read_lines(path) == std::vector<std::string>{"more"});
     auto rotated = path;
     rotated += ".1";
@@ -271,7 +270,9 @@ MACHA_FAST_TEST("observation", test_observation_log_rotates_at_its_bound) {
 
     // An existing empty file is appended to, never rotated.
     const auto empty = dir.path() / "empty.jsonl";
-    { std::ofstream touch(empty); }
+    {
+        std::ofstream touch(empty);
+    }
     ObservationLog empty_log(empty, 1);
     empty_log.append("first");
     CHECK(read_lines(empty) == std::vector<std::string>{"first"});
@@ -351,9 +352,8 @@ MACHA_FAST_TEST("observation", test_observation_recorder_writes_windows_and_even
 
     // Only a std::exception from the sampler is absorbed; anything else leaves
     // tick() for the supervised loop to record.
-    ObservationRecorder strange(registry, log, "v", 1h, []() -> std::map<std::string, uint64_t> {
-        throw 42;
-    });
+    ObservationRecorder strange(registry, log, "v", 1h,
+                                []() -> std::map<std::string, uint64_t> { throw 42; });
     bool propagated = false;
     try {
         strange.tick(300);

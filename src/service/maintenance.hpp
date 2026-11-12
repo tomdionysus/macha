@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "metadata/metadata_server.hpp"
 #include "catalogue/catalogue.hpp"
 #include "catalogue/media_information.hpp"
 #include "cluster/cluster.hpp"
@@ -10,11 +9,12 @@
 #include "contract/horizon.hpp"
 #include "contract/horizon_builder.hpp"
 #include "contract/object_ledger.hpp"
-#include "storage/unreferenced_since.hpp"
-#include "service/availability_service.hpp"
 #include "metadata/metadata_manager.hpp"
+#include "metadata/metadata_server.hpp"
+#include "service/availability_service.hpp"
 #include "service/convergence_demand.hpp"
 #include "service/maintenance_clock.hpp"
+#include "storage/unreferenced_since.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -35,8 +35,8 @@ std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfi
 // How much of its byte rate background work keeps under CPU load: 1 while
 // the process's CPU, less the maintenance thread's own, stays within
 // `cpu_target` of a core; otherwise cpu_target over that load.
-double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds,
-                            double wall_seconds, double cpu_target);
+double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds, double wall_seconds,
+                            double cpu_target);
 
 // One decision of the maintenance pass, for the decision trace: `kind` names
 // what was decided (a gate, a claim walked, tombstones erased) and `detail`

@@ -93,15 +93,23 @@ class ScriptedSubsystem final : public Subsystem {
         : journal_(journal), number_(number), fault_in_start_(fault_in_start) {
         journal_.add("create " + std::to_string(number_));
     }
-    ~ScriptedSubsystem() override { journal_.add("destroy " + std::to_string(number_)); }
-    std::string_view name() const noexcept override { return "scripted"; }
-    void attach_fault_sink(FaultSink sink) override { sink_ = std::move(sink); }
+    ~ScriptedSubsystem() override {
+        journal_.add("destroy " + std::to_string(number_));
+    }
+    std::string_view name() const noexcept override {
+        return "scripted";
+    }
+    void attach_fault_sink(FaultSink sink) override {
+        sink_ = std::move(sink);
+    }
     void start() override {
         journal_.add("start " + std::to_string(number_));
         if (fault_in_start_ && sink_)
             sink_("instance " + std::to_string(number_) + " lost its work");
     }
-    void stop() override { journal_.add("stop " + std::to_string(number_)); }
+    void stop() override {
+        journal_.add("stop " + std::to_string(number_));
+    }
 };
 
 } // namespace
@@ -112,12 +120,12 @@ class ScriptedSubsystem final : public Subsystem {
 MACHA_FAST_TEST("subsystem_supervisor", test_plugin_discovery_settles_each_kind_of_file) {
     struct Row {
         const char* what;
-        const char* plugin;      // copied into the directory; null for none
+        const char* plugin; // copied into the directory; null for none
         bool directory_exists;
         std::optional<SubsystemState> settles_on; // nullopt: no Status entry
-        bool retried;            // restart_count beyond the failure budget
-        const char* fault;       // in last_fault; null for none
-        const char* info_log;    // an INFO line naming the plugin; null for none
+        bool retried;                             // restart_count beyond the failure budget
+        const char* fault;                        // in last_fault; null for none
+        const char* info_log;                     // an INFO line naming the plugin; null for none
     };
     const std::vector<Row> rows{
         {"a working plugin runs", MACHA_TEST_PLUGIN_OK, true, SubsystemState::running, false,
@@ -202,19 +210,47 @@ MACHA_FAST_TEST("subsystem_supervisor", test_builtin_lifecycle_settles_each_outc
     const auto always = [](int) { return true; };
     const auto first_only = [](int number) { return number == 1; };
     const std::vector<Row> rows{
-        {"an instance that starts cleanly runs until stopped", Row::Factory::builds, never,
-         SubsystemState::running, 1, 0, nullptr, {"create 1", "start 1", "stop 1", "destroy 1"}},
-        {"a factory that throws is retried, then disabled", Row::Factory::throws, never,
-         SubsystemState::disabled, 3, 3, "journal replay failed", {}},
-        {"a factory that declines is unavailable and never retried", Row::Factory::declines,
-         never, SubsystemState::unavailable, 1, 0, nullptr, {}},
-        {"an instance that faults after starting is rebuilt in place", Row::Factory::builds,
-         first_only, SubsystemState::running, 2, 1, "instance 1 lost its work",
+        {"an instance that starts cleanly runs until stopped",
+         Row::Factory::builds,
+         never,
+         SubsystemState::running,
+         1,
+         0,
+         nullptr,
+         {"create 1", "start 1", "stop 1", "destroy 1"}},
+        {"a factory that throws is retried, then disabled",
+         Row::Factory::throws,
+         never,
+         SubsystemState::disabled,
+         3,
+         3,
+         "journal replay failed",
+         {}},
+        {"a factory that declines is unavailable and never retried",
+         Row::Factory::declines,
+         never,
+         SubsystemState::unavailable,
+         1,
+         0,
+         nullptr,
+         {}},
+        {"an instance that faults after starting is rebuilt in place",
+         Row::Factory::builds,
+         first_only,
+         SubsystemState::running,
+         2,
+         1,
+         "instance 1 lost its work",
          {"create 1", "start 1", "stop 1", "destroy 1", "create 2", "start 2", "stop 2",
           "destroy 2"}},
         // A clean start resets the backoff but keeps the failure window.
-        {"an instance that keeps faulting after starting is disabled", Row::Factory::builds,
-         always, SubsystemState::disabled, 3, 3, "instance 3 lost its work",
+        {"an instance that keeps faulting after starting is disabled",
+         Row::Factory::builds,
+         always,
+         SubsystemState::disabled,
+         3,
+         3,
+         "instance 3 lost its work",
          {"create 1", "start 1", "stop 1", "destroy 1", "create 2", "start 2", "stop 2",
           "destroy 2", "create 3", "start 3", "stop 3", "destroy 3"}},
     };
@@ -260,17 +296,17 @@ MACHA_FAST_TEST("subsystem_supervisor", test_stop_cancels_a_blocked_factory) {
     std::atomic_bool cancelled{};
 
     SubsystemSupervisor supervisor(std::filesystem::path{});
-    supervisor.add_builtin("blocking", [&](const SubsystemContext& context)
-                                           -> std::unique_ptr<Subsystem> {
-        std::mutex mutex;
-        std::condition_variable_any cv;
-        std::unique_lock lock(mutex);
-        entered.set_value();
-        // A cancellable wait that returns only when the token is requested.
-        cv.wait(lock, context.startup_stop, [] { return false; });
-        cancelled.store(true);
-        throw std::runtime_error("construction cancelled");
-    });
+    supervisor.add_builtin("blocking",
+                           [&](const SubsystemContext& context) -> std::unique_ptr<Subsystem> {
+                               std::mutex mutex;
+                               std::condition_variable_any cv;
+                               std::unique_lock lock(mutex);
+                               entered.set_value();
+                               // A cancellable wait that returns only when the token is requested.
+                               cv.wait(lock, context.startup_stop, [] { return false; });
+                               cancelled.store(true);
+                               throw std::runtime_error("construction cancelled");
+                           });
     supervisor.start(SubsystemContext{});
     REQUIRE(entered_future.wait_for(scaled(5s)) == std::future_status::ready);
 
@@ -306,5 +342,6 @@ MACHA_TEST("subsystem_supervisor", test_service_stops_plugins_before_the_store) 
 
     service.stop();
     CHECK(outcome() == "ok");
-    if (outcome() != "ok") std::cerr << "write from stop(): " << outcome() << "\n";
+    if (outcome() != "ok")
+        std::cerr << "write from stop(): " << outcome() << "\n";
 }

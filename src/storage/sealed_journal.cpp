@@ -24,8 +24,7 @@ void write_all(int fd, std::span<const uint8_t> bytes) {
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0)
-            throw std::runtime_error(std::string("journal write failed: ") +
-                                     std::strerror(errno));
+            throw std::runtime_error(std::string("journal write failed: ") + std::strerror(errno));
         done += static_cast<size_t>(n);
     }
 }
@@ -46,7 +45,9 @@ bool pread_all(int fd, std::span<uint8_t> bytes, uint64_t offset) {
 
 void fsync_checked(int fd) {
     int rc;
-    do { rc = ::fsync(fd); } while (rc != 0 && errno == EINTR);
+    do {
+        rc = ::fsync(fd);
+    } while (rc != 0 && errno == EINTR);
     if (rc != 0)
         throw std::runtime_error(std::string("journal sync failed: ") + std::strerror(errno));
 }
@@ -101,12 +102,11 @@ size_t SealedJournal::replay(const std::function<void(std::span<const uint8_t>)>
     const int fd = ::open(path_.c_str(), O_RDWR);
     if (fd < 0)
         throw std::runtime_error("cannot read " + std::string(what) + " " + path_.string());
-    struct stat st {};
+    struct stat st{};
     if (::fstat(fd, &st) != 0) {
         const auto saved = errno;
         ::close(fd);
-        throw std::runtime_error("cannot stat " + std::string(what) + ": " +
-                                 std::strerror(saved));
+        throw std::runtime_error("cannot stat " + std::string(what) + ": " + std::strerror(saved));
     }
     const uint64_t file_size = static_cast<uint64_t>(st.st_size);
     uint64_t offset = 0;

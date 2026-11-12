@@ -70,17 +70,21 @@ ClusterUnmatchedView::ClusterUnmatchedView(NodeRuntime& node, CatalogueHintQueue
     : node_(node), hints_(hints), refresh_interval_(refresh_interval),
       instance_(random_instance()) {}
 
-ClusterUnmatchedView::~ClusterUnmatchedView() { stop(); }
+ClusterUnmatchedView::~ClusterUnmatchedView() {
+    stop();
+}
 
 void ClusterUnmatchedView::start() {
-    if (worker_.joinable()) return;
+    if (worker_.joinable())
+        return;
     worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("cluster-unmatched-view", stop, [this, stop] { loop(stop); });
     });
 }
 
 void ClusterUnmatchedView::stop() {
-    if (!worker_.joinable()) return;
+    if (!worker_.joinable())
+        return;
     worker_.request_stop();
     wake_.notify_all();
     worker_.join();
@@ -100,7 +104,8 @@ void ClusterUnmatchedView::refresh_now() {
     const auto self = node_.node_id();
     const auto telemetry = node_.telemetry().all();
     for (const auto& peer : node_.membership().active())
-        if (peer.id != self && runs_at_least(telemetry, peer.id, first_version)) poll(peer);
+        if (peer.id != self && runs_at_least(telemetry, peer.id, first_version))
+            poll(peer);
 }
 
 void ClusterUnmatchedView::poll(const NodeInfo& info) {
@@ -114,16 +119,20 @@ void ClusterUnmatchedView::poll(const NodeInfo& info) {
     }
     try {
         // Background upkeep of a list the user reads later: loader work.
-        const auto reply = node_.call(info, MessageType::get_unmatched_hints,
-                                      json_bytes(Json(std::move(request))), FrameType::loader, call_deadline::control);
-        if (reply.message.type != MessageType::unmatched_hints_reply) return;
-        const auto parsed = Json::parse(std::string_view(
-            reinterpret_cast<const char*>(reply.message.payload.data()), reply.message.payload.size()));
+        const auto reply =
+            node_.call(info, MessageType::get_unmatched_hints, json_bytes(Json(std::move(request))),
+                       FrameType::loader, call_deadline::control);
+        if (reply.message.type != MessageType::unmatched_hints_reply)
+            return;
+        const auto parsed = Json::parse(
+            std::string_view(reinterpret_cast<const char*>(reply.message.payload.data()),
+                             reply.message.payload.size()));
         Peer fresh;
         fresh.instance = number_field(parsed, "instance");
         fresh.revision = number_field(parsed, "revision");
         const auto* hints = parsed.find("hints");
-        if (!hints || !hints->isArray()) return; // unchanged since the revision asked about
+        if (!hints || !hints->isArray())
+            return; // unchanged since the revision asked about
         for (const auto& value : hints->asArray()) {
             auto hint = parse_wire_hint(value);
             if (!hint.id.empty() && !hint.path.empty() && !hint.media_id.empty())
@@ -143,7 +152,8 @@ std::vector<CatalogueHint> ClusterUnmatchedView::peer_hints() const {
     Lock lock(mutex_);
     for (const auto& [_, peer] : peers_)
         for (const auto& hint : peer.hints)
-            if (seen.insert(hint.id).second) out.push_back(hint);
+            if (seen.insert(hint.id).second)
+                out.push_back(hint);
     return out;
 }
 
@@ -151,7 +161,8 @@ std::optional<CatalogueHint> ClusterUnmatchedView::peer_hint(std::string_view id
     Lock lock(mutex_);
     for (const auto& [_, peer] : peers_)
         for (const auto& hint : peer.hints)
-            if (hint.id == id) return hint;
+            if (hint.id == id)
+                return hint;
     return std::nullopt;
 }
 
@@ -173,7 +184,8 @@ Bytes ClusterUnmatchedView::handle_query(std::span<const uint8_t> payload) const
         return json_bytes(Json(std::move(out)));
     Json::Array hints;
     for (const auto& hint : hints_.list()) {
-        if (!unmatched(hint)) continue;
+        if (!unmatched(hint))
+            continue;
         if (hints.size() == max_reply_hints) {
             Log::debug("cluster unmatched view: reply holds the first " +
                        std::to_string(max_reply_hints) + " unmatched files");

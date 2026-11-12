@@ -130,8 +130,7 @@ HttpResponse UsersApi::create(const HttpRequest& request) {
                           "password must be at least " + std::to_string(min_password_length) +
                               " characters");
     if (reserved_username(username->asString()))
-        return http_error(409, "reserved_username",
-                          "'root' and 'anonymous' are reserved names");
+        return http_error(409, "reserved_username", "'root' and 'anonymous' are reserved names");
     auto roles =
         read_roles(body).value_or(std::vector<std::string>{std::string(role_media_viewer)});
 
@@ -203,7 +202,7 @@ HttpResponse UsersApi::update(const HttpRequest& request, const std::string& use
     // minted against the old one, the caller's included; return a fresh session.
     if (!password.empty() && self) {
         if (auto minted = accounts_.sessions().create(updated->roles, updated->id,
-                                                  updated->credential_generation)) {
+                                                      updated->credential_generation)) {
             accounts_.propagate_session(minted->session);
             payload.asObject()["token"] = minted->bearer_token;
             payload.asObject()["token_type"] = "Bearer";
@@ -249,7 +248,8 @@ HttpResponse UsersApi::handle(const HttpRequest& request) {
         if (request.path == users_root) {
             if (request.method == "GET") {
                 PageQuery page;
-                if (auto bad = read_page_query(request, page)) return *bad;
+                if (auto bad = read_page_query(request, page))
+                    return *bad;
                 Json::Array out;
                 for (const auto& user : accounts_.users().list())
                     out.push_back(user_json(user, mutability(user)));

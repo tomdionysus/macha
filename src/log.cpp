@@ -2,8 +2,8 @@
 #include "log.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
@@ -69,10 +69,9 @@ void ConsoleLogger::log(LogLevel level, const std::string& message) {
 
 Mutex Log::mutex_;
 std::shared_ptr<Logger> Log::logger_ = std::make_shared<ConsoleLogger>(LogLevel::info);
-std::atomic<unsigned int> Log::enabled_mask_{
-    (1U << static_cast<unsigned int>(LogLevel::info)) |
-    (1U << static_cast<unsigned int>(LogLevel::warn)) |
-    (1U << static_cast<unsigned int>(LogLevel::error))};
+std::atomic<unsigned int> Log::enabled_mask_{(1U << static_cast<unsigned int>(LogLevel::info)) |
+                                             (1U << static_cast<unsigned int>(LogLevel::warn)) |
+                                             (1U << static_cast<unsigned int>(LogLevel::error))};
 
 std::shared_ptr<Logger> Log::logger() {
     Lock lock(mutex_);
@@ -84,8 +83,8 @@ void Log::set_logger(std::shared_ptr<Logger> logger) {
         throw std::invalid_argument("logger must not be null");
 
     unsigned int mask = 0;
-    for (auto level : {LogLevel::all, LogLevel::debug, LogLevel::info, LogLevel::warn,
-                       LogLevel::error}) {
+    for (auto level :
+         {LogLevel::all, LogLevel::debug, LogLevel::info, LogLevel::warn, LogLevel::error}) {
         if (logger->enabled(level))
             mask |= 1U << static_cast<unsigned int>(level);
     }

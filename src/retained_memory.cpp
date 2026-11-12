@@ -17,8 +17,7 @@ dannan::sched::MemoryOwner dannan_owner(MemoryOwner owner) noexcept {
         static_cast<uint16_t>(owner));
 }
 
-RetainedMemoryLedger::RetainedMemoryLedger(uint64_t capacity_bytes,
-                                           uint64_t control_reserve_bytes,
+RetainedMemoryLedger::RetainedMemoryLedger(uint64_t capacity_bytes, uint64_t control_reserve_bytes,
                                            uint64_t viewer_reserve_bytes,
                                            uint64_t loader_reserve_bytes,
                                            uint64_t reassembly_reserve_bytes)

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "api/session_api.hpp"
+#include "api/users_api.hpp"
+#include "test_backend_support.hpp"
 #include <future>
 #include <thread>
-#include "api/session_api.hpp"
-#include "test_backend_support.hpp"
-#include "api/users_api.hpp"
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -136,7 +136,8 @@ MACHA_FAST_TEST("users", test_role_policy) {
         {"GET", "/api/v1/manage/providers/search", role_manager},
         {"GET", "/api/v1/manage/providers/artwork", role_manager},
         {"GET",
-         "/api/v1/manage/providers/musicbrainz/releases/0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41/tracks",
+         "/api/v1/manage/providers/musicbrainz/releases/0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41/"
+         "tracks",
          role_manager},
         {"GET", "/api/v1/users", role_manage_users},
         {"DELETE", "/api/v1/users/some-id", role_manage_users},
@@ -287,16 +288,17 @@ MACHA_FAST_TEST("users", test_user_credentials) {
 
     // Anonymous has no credential at all, and the store refuses it one, so no
     // caller can route around the rule; its roles stay editable.
-    auto anonymous = store.create_without_password(
-        anonymous_username, {std::string(role_media_viewer)}, node_id(1));
+    auto anonymous = store.create_without_password(anonymous_username,
+                                                   {std::string(role_media_viewer)}, node_id(1));
     REQUIRE(anonymous.has_value());
     CHECK(anonymous->kdf == 0);
     CHECK(!store.verify(anonymous_username, "").ok);
     CHECK(!store.verify(anonymous_username, "unused-password").ok);
     CHECK(!store.update(anonymous->id, "a-long-enough-password", std::nullopt, node_id(1))
                .has_value());
-    CHECK(store.update(anonymous->id, "",
-                       std::vector<std::string>{std::string(role_importer)}, node_id(1))
+    CHECK(store
+              .update(anonymous->id, "", std::vector<std::string>{std::string(role_importer)},
+                      node_id(1))
               .has_value());
 }
 
@@ -312,8 +314,8 @@ MACHA_FAST_TEST("users", test_a_change_being_written_holds_no_reader_of_the_acco
     std::array<uint8_t, 32> key{};
     key.fill(7);
     UserStore store(16, path, key);
-    const auto carol = store.create("carol", "first-password", {std::string(role_manage_users)},
-                                    node_id(1));
+    const auto carol =
+        store.create("carol", "first-password", {std::string(role_manage_users)}, node_id(1));
     REQUIRE(carol.has_value());
 
     auto& hold = test_support::fsync_hold;
@@ -506,8 +508,8 @@ MACHA_FAST_TEST("users", test_initial_accounts) {
     REQUIRE(store.remove(genesis->anonymous.id, node_id(1)).has_value());
     CHECK(!create_initial_accounts(store, keys, state, node_id(1)).has_value());
     UserStore deleted_only(16);
-    auto gone = deleted_only.create("gone", "long-enough-pw", {std::string(role_media_viewer)},
-                                    node_id(1));
+    auto gone =
+        deleted_only.create("gone", "long-enough-pw", {std::string(role_media_viewer)}, node_id(1));
     REQUIRE(gone.has_value());
     REQUIRE(deleted_only.remove(gone->id, node_id(1)).has_value());
     CHECK(!create_initial_accounts(deleted_only, keys, dir.path() / "deleted-only", node_id(1))
@@ -527,8 +529,8 @@ MACHA_FAST_TEST("users", test_password_validator_outcomes) {
     PasswordCredentialValidator validator(store, open, work);
     PasswordCredentialValidator strict(store, closed, work);
 
-    auto anonymous = store.create_without_password(
-        anonymous_username, {std::string(role_media_viewer)}, node_id(1));
+    auto anonymous = store.create_without_password(anonymous_username,
+                                                   {std::string(role_media_viewer)}, node_id(1));
     REQUIRE(anonymous.has_value());
 
     // An anonymous session is an ordinary bound session, retired by the same
@@ -541,8 +543,9 @@ MACHA_FAST_TEST("users", test_password_validator_outcomes) {
 
     // A visitor's capabilities are the account's roles: an ordinary update,
     // effective on the next mint.
-    REQUIRE(store.update(anonymous->id, "",
-                         std::vector<std::string>{std::string(role_importer)}, node_id(1))
+    REQUIRE(store
+                .update(anonymous->id, "", std::vector<std::string>{std::string(role_importer)},
+                        node_id(1))
                 .has_value());
     auto widened = validator.validate(Json(Json::Object{}));
     REQUIRE(widened.outcome == CredentialOutcome::ok);
@@ -570,8 +573,8 @@ MACHA_FAST_TEST("users", test_password_validator_outcomes) {
     limited_config.failed_login_attempts = 2;
     limited_config.failed_login_lockout = 200ms;
     PasswordCredentialValidator limited(store, limited_config, work);
-    REQUIRE(store.create("erin", "right", {std::string(role_media_viewer)}, node_id(1))
-                .has_value());
+    REQUIRE(
+        store.create("erin", "right", {std::string(role_media_viewer)}, node_id(1)).has_value());
     CHECK(limited.validate(credentials("erin", "wrong")).outcome == CredentialOutcome::rejected);
     CHECK(limited.validate(credentials("erin", "wrong")).outcome == CredentialOutcome::rejected);
     CHECK(limited.validate(credentials("erin", "right")).outcome ==
@@ -641,9 +644,8 @@ MACHA_FAST_TEST("users", test_password_work_is_one_limit_for_sign_in_and_account
     CHECK(!node.users().find_by_username("hank"));
     const auto gail = node.users().find_by_username("gail");
     REQUIRE(gail.has_value());
-    const auto roles_only = users.handle(users_request("PATCH", "/api/v1/users/" + gail->id,
-                                                       admin_identity(),
-                                                       R"({"roles":["manager"]})"));
+    const auto roles_only = users.handle(users_request(
+        "PATCH", "/api/v1/users/" + gail->id, admin_identity(), R"({"roles":["manager"]})"));
     CHECK(roles_only.status == 200);
 
     held.clear();
@@ -661,7 +663,9 @@ MACHA_FAST_TEST("users", test_users_api) {
         create_initial_accounts(node.users(), cluster.keys(), dir.path(), node.node_id());
     REQUIRE(genesis.has_value());
     UsersApi api(node, node.accounts());
-    const auto parse = [](const HttpResponse& response) { return Json::parse(json_body(response)); };
+    const auto parse = [](const HttpResponse& response) {
+        return Json::parse(json_body(response));
+    };
 
     const auto create_body =
         R"({"username":"frank","password":"long-enough-pw","roles":["manager"]})";
@@ -733,8 +737,8 @@ MACHA_FAST_TEST("users", test_users_api) {
         {"GET", "/api/v1/users/me", no_account, "", 404, "no_account"},
     };
     for (const auto& refusal : refusals) {
-        auto response = api.handle(
-            users_request(refusal.method, refusal.path, refusal.identity, refusal.body));
+        auto response =
+            api.handle(users_request(refusal.method, refusal.path, refusal.identity, refusal.body));
         CHECK(response.status == refusal.status);
         if (refusal.code)
             CHECK(json_body(response).find(refusal.code) != std::string::npos);
@@ -753,8 +757,8 @@ MACHA_FAST_TEST("users", test_users_api) {
 
     // The client is told which fields it may offer: anonymous keeps editable
     // roles, but no rename, delete or password.
-    auto anonymous =
-        api.handle(users_request("GET", "/api/v1/users/" + genesis->anonymous.id, admin_identity()));
+    auto anonymous = api.handle(
+        users_request("GET", "/api/v1/users/" + genesis->anonymous.id, admin_identity()));
     REQUIRE(anonymous.status == 200);
     const auto anonymous_body = parse(anonymous);
     const auto* may = anonymous_body.find("mutable");
@@ -791,8 +795,8 @@ MACHA_FAST_TEST("users", test_users_api) {
     CHECK(!user_has_role(*node.users().find(root_id), role_manage_users));
     const auto deputy_id = parse(deputy).find("id")->asString();
     CHECK(node.users().sole_user_manager(deputy_id));
-    auto deputy_demoted = api.handle(users_request("PATCH", "/api/v1/users/" + deputy_id,
-                                                   admin_identity(), R"({"roles":["media_viewer"]})"));
+    auto deputy_demoted = api.handle(users_request(
+        "PATCH", "/api/v1/users/" + deputy_id, admin_identity(), R"({"roles":["media_viewer"]})"));
     CHECK(deputy_demoted.status == 409);
     auto deputy_removed =
         api.handle(users_request("DELETE", "/api/v1/users/" + deputy_id, admin_identity()));
@@ -817,12 +821,12 @@ MACHA_FAST_TEST("users", test_recovery_key_machinery_is_dormant_but_sound) {
     // The stored envelope holds neither the key nor a hash of it.
     const auto raw = unhex(issued.key);
     REQUIRE(raw.has_value());
-    const auto envelope_bytes = Bytes(issued.envelope.ephemeral_public.begin(),
-                                      issued.envelope.ephemeral_public.end());
+    const auto envelope_bytes =
+        Bytes(issued.envelope.ephemeral_public.begin(), issued.envelope.ephemeral_public.end());
     CHECK(std::search(envelope_bytes.begin(), envelope_bytes.end(), raw->begin(), raw->end()) ==
           envelope_bytes.end());
-    const auto ciphertext = Bytes(issued.envelope.ciphertext.begin(),
-                                  issued.envelope.ciphertext.end());
+    const auto ciphertext =
+        Bytes(issued.envelope.ciphertext.begin(), issued.envelope.ciphertext.end());
     CHECK(std::search(ciphertext.begin(), ciphertext.end(), raw->begin(), raw->end()) ==
           ciphertext.end());
     // Nor is the cluster key sitting in the envelope in the clear.
@@ -871,13 +875,12 @@ MACHA_TEST("users", test_accounts_converge_across_nodes) {
 
     BareNode n1(c1, cluster.keys());
     n1.start();
-    auto created = n1.users().create("grace", "long-enough-pw",
-                                     {std::string(role_manage_users)}, n1.node_id());
+    auto created = n1.users().create("grace", "long-enough-pw", {std::string(role_manage_users)},
+                                     n1.node_id());
     REQUIRE(created.has_value());
     // Announced while n2 does not exist: n1 has no peer to tell.
     n1.propagate_users();
-    auto deleted =
-        n1.users().create("heidi", "pw", {std::string(role_media_viewer)}, n1.node_id());
+    auto deleted = n1.users().create("heidi", "pw", {std::string(role_media_viewer)}, n1.node_id());
     REQUIRE(deleted.has_value());
     REQUIRE(n1.users().remove(deleted->id, n1.node_id()).has_value());
 
@@ -887,7 +890,8 @@ MACHA_TEST("users", test_accounts_converge_across_nodes) {
     auto login = api.handle(login_request("grace", "long-enough-pw"));
     CHECK(Clock::now() - started < 2s);
     REQUIRE(login.status == 201);
-    CHECK(n1.sessions().validate(Json::parse(json_body(login)).find("token")->asString())
+    CHECK(n1.sessions()
+              .validate(Json::parse(json_body(login)).find("token")->asString())
               .has_value());
 
     BareNode n2(c2, cluster.keys());
@@ -895,9 +899,9 @@ MACHA_TEST("users", test_accounts_converge_across_nodes) {
     REQUIRE(wait_until([&] {
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
     }));
-    REQUIRE(wait_until([&] {
-        return n2.users().find(created->id).has_value() && n2.users().tombstones() == 1;
-    }, 10s));
+    REQUIRE(wait_until(
+        [&] { return n2.users().find(created->id).has_value() && n2.users().tombstones() == 1; },
+        10s));
     // n2 authenticates the user itself, without reaching n1.
     auto check = n2.users().verify("grace", "long-enough-pw");
     CHECK(check.ok);
