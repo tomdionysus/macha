@@ -5,13 +5,13 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
-#include <thread>
-#include <fcntl.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 #if defined(__linux__)
@@ -27,9 +27,8 @@ namespace macha {
 MountTableProbe probe_macha_mountpoint(const std::string& mount) {
 #if defined(__linux__)
     const auto unescape_mount_field = [](std::string value) {
-        for (const auto& [escaped, plain] :
-             std::array<std::pair<std::string_view, char>, 4>{{{"\\040", ' '}, {"\\011", '\t'},
-                                                               {"\\012", '\n'}, {"\\134", '\\'}}}) {
+        for (const auto& [escaped, plain] : std::array<std::pair<std::string_view, char>, 4>{
+                 {{"\\040", ' '}, {"\\011", '\t'}, {"\\012", '\n'}, {"\\134", '\\'}}}) {
             size_t pos = 0;
             while ((pos = value.find(escaped, pos)) != std::string::npos) {
                 value.replace(pos, escaped.size(), 1, plain);
@@ -48,8 +47,10 @@ MountTableProbe probe_macha_mountpoint(const std::string& mount) {
     while (std::getline(input, line)) {
         std::istringstream fields(line);
         std::string id, parent, device, root, mounted;
-        if (!(fields >> id >> parent >> device >> root >> mounted)) continue;
-        if (unescape_mount_field(mounted) != mount) continue;
+        if (!(fields >> id >> parent >> device >> root >> mounted))
+            continue;
+        if (unescape_mount_field(mounted) != mount)
+            continue;
         const auto separator = line.find(" - ");
         if (separator == std::string::npos)
             return {MountTableState::probe_error, EPROTO};
@@ -193,7 +194,8 @@ void recover_stale_mount(const std::string& mount, const FuseConfig& config) {
         if (after.state == MountTableState::missing)
             return;
         if (after.state == MountTableState::other)
-            throw std::runtime_error("mountpoint changed to a non-Macha filesystem during recovery");
+            throw std::runtime_error(
+                "mountpoint changed to a non-Macha filesystem during recovery");
         if (after.state == MountTableState::probe_error)
             throw std::runtime_error("cannot verify stale FUSE unmount");
         std::this_thread::sleep_for(std::chrono::milliseconds(25));

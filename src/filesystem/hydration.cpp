@@ -35,16 +35,19 @@ std::vector<ObjectId> extent_objects(const FsEntry& entry, size_t first, size_t 
 }
 
 const CatalogueItem* find_current_catalogue_item(const CatalogueView& snapshot,
-                                                  const PlaybackObservation& observation) {
+                                                 const PlaybackObservation& observation) {
     const auto stable = file_media_id(observation.entry);
     const auto path_id = "path:" + observation.path;
     // A file bound to more than one item: the lowest id, whatever the order
     // the catalogue is walked in.
     const CatalogueItem* found = nullptr;
     for (const auto& [_, item] : snapshot.items()) {
-        if ((std::find(item.media_ids.begin(), item.media_ids.end(), stable) != item.media_ids.end() ||
-             std::find(item.media_ids.begin(), item.media_ids.end(), path_id) != item.media_ids.end() ||
-             std::find(item.media_ids.begin(), item.media_ids.end(), observation.path) != item.media_ids.end()) &&
+        if ((std::find(item.media_ids.begin(), item.media_ids.end(), stable) !=
+                 item.media_ids.end() ||
+             std::find(item.media_ids.begin(), item.media_ids.end(), path_id) !=
+                 item.media_ids.end() ||
+             std::find(item.media_ids.begin(), item.media_ids.end(), observation.path) !=
+                 item.media_ids.end()) &&
             (!found || item.id < found->id))
             found = &item;
     }
@@ -170,10 +173,12 @@ uint64_t PlaybackTracker::open(std::string path, const FsEntry& entry) {
     {
         Lock lock(mutex_);
         session = next_session_++;
-        sessions_.emplace(session, PlaybackObservation{session, std::move(path), entry, {}, Clock::now()});
+        sessions_.emplace(session,
+                          PlaybackObservation{session, std::move(path), entry, {}, Clock::now()});
         callback = change_callback_;
     }
-    if (callback) callback();
+    if (callback)
+        callback();
     return session;
 }
 
@@ -188,17 +193,20 @@ void PlaybackTracker::progress(uint64_t session, size_t extent_index) {
         it->second.last_activity = Clock::now();
         callback = change_callback_;
     }
-    if (callback) callback();
+    if (callback)
+        callback();
 }
 
 void PlaybackTracker::close(uint64_t session) {
     std::function<void()> callback;
     {
         Lock lock(mutex_);
-        if (!sessions_.erase(session)) return;
+        if (!sessions_.erase(session))
+            return;
         callback = change_callback_;
     }
-    if (callback) callback();
+    if (callback)
+        callback();
 }
 
 void PlaybackTracker::set_change_callback(std::function<void()> callback) {
@@ -253,14 +261,13 @@ HydrationScheduler::next(const std::vector<HydrationHint>& hints,
                 position = found->second;
             }
             auto& candidate = run.objects[position];
-            candidate.priority = std::min<uint64_t>(
-                std::numeric_limits<uint32_t>::max(), candidate.priority + hint.priority);
+            candidate.priority = std::min<uint64_t>(std::numeric_limits<uint32_t>::max(),
+                                                    candidate.priority + hint.priority);
             if (hint.priority >= candidate.reason_priority) {
                 candidate.reason_priority = hint.priority;
                 candidate.reason = hint.reason;
             }
-            if (frame_type_priority(hint.frame_type) <
-                frame_type_priority(candidate.frame_type))
+            if (frame_type_priority(hint.frame_type) < frame_type_priority(candidate.frame_type))
                 candidate.frame_type = hint.frame_type;
         }
     }
@@ -316,12 +323,9 @@ HydrationScheduler::next(const std::vector<HydrationHint>& hints,
         return a.run_id < b.run_id;
     });
     virtual_finish_[best->run_id] = best->finish;
-    return HydrationRequest{best->run_id,
-                            best->candidate.object,
-                            best->sequence_index,
-                            static_cast<uint32_t>(best->candidate.priority),
-                            best->candidate.reason,
-                            best->candidate.frame_type};
+    return HydrationRequest{best->run_id,           best->candidate.object,
+                            best->sequence_index,   static_cast<uint32_t>(best->candidate.priority),
+                            best->candidate.reason, best->candidate.frame_type};
 }
 
 ReadAheadHintProvider::ReadAheadHintProvider(PlaybackTracker& playback,
@@ -343,8 +347,8 @@ std::vector<HydrationHint> ReadAheadHintProvider::hints() {
     std::vector<HydrationHint> out;
     for (const auto& observation :
          playback_.active(std::chrono::milliseconds(timeout_ms_.load()))) {
-        auto objects = extent_objects(observation.entry, *observation.current_extent + 1,
-                                      window_.load());
+        auto objects =
+            extent_objects(observation.entry, *observation.current_extent + 1, window_.load());
         if (!objects.empty())
             out.push_back({playback_run(observation.session), std::move(objects), priority_.load(),
                            "read_ahead", FrameType::read_ahead});
@@ -435,13 +439,13 @@ std::vector<HydrationHint> CatalogueSequenceHintProvider::hints() {
             auto objects = extent_objects(media->second, 0);
             if (objects.empty())
                 break;
-            const auto effective = std::max<uint32_t>(1, priority_.load() /
-                                                             static_cast<uint32_t>(distance + 1));
-            out.push_back({"catalogue:" + std::to_string(observation.session) + ":" +
-                               selected_media_id,
-                           std::move(objects), effective,
-                           current->kind == CatalogueKind::episode ? "next_episode" : "next_movie",
-                           FrameType::speculative});
+            const auto effective =
+                std::max<uint32_t>(1, priority_.load() / static_cast<uint32_t>(distance + 1));
+            out.push_back(
+                {"catalogue:" + std::to_string(observation.session) + ":" + selected_media_id,
+                 std::move(objects), effective,
+                 current->kind == CatalogueKind::episode ? "next_episode" : "next_movie",
+                 FrameType::speculative});
         }
     }
     return out;
@@ -459,17 +463,18 @@ CacheHydrator::~CacheHydrator() {
         Lock lock(mutex_);
         providers.swap(providers_);
     }
-    for (const auto& provider : providers) provider->set_wake_callback({});
+    for (const auto& provider : providers)
+        provider->set_wake_callback({});
 }
 
 void CacheHydrator::add_provider(std::shared_ptr<HydrationHintProvider> provider) {
-    if (!provider) return;
+    if (!provider)
+        return;
     provider->set_wake_callback([this] { wake(); });
     {
         Lock lock(mutex_);
-        if (std::none_of(providers_.begin(), providers_.end(), [&](const auto& existing) {
-                return existing.get() == provider.get();
-            }))
+        if (std::none_of(providers_.begin(), providers_.end(),
+                         [&](const auto& existing) { return existing.get() == provider.get(); }))
             providers_.push_back(std::move(provider));
     }
     wake();
@@ -486,7 +491,8 @@ void CacheHydrator::remove_provider(const HydrationHintProvider* provider) {
             providers_.erase(found);
         }
     }
-    if (removed) removed->set_wake_callback({});
+    if (removed)
+        removed->set_wake_callback({});
     wake();
 }
 
@@ -517,7 +523,8 @@ void CacheHydrator::start() {
     } catch (...) {
         request_stop();
         for (auto& fetch : fetch_workers_)
-            if (fetch.joinable()) fetch.join();
+            if (fetch.joinable())
+                fetch.join();
         fetch_workers_.clear();
         throw;
     }
@@ -533,7 +540,8 @@ void CacheHydrator::stop() {
     if (worker.joinable())
         worker.join();
     for (auto& fetch : fetch_workers_)
-        if (fetch.joinable()) fetch.join();
+        if (fetch.joinable())
+            fetch.join();
     fetch_workers_.clear();
     Lock lock(fetch_mutex_);
     fetch_queue_.clear();
@@ -543,7 +551,8 @@ void CacheHydrator::stop() {
 void CacheHydrator::request_stop() {
     {
         Lock lock(mutex_);
-        if (worker_.joinable()) worker_.request_stop();
+        if (worker_.joinable())
+            worker_.request_stop();
     }
     std::deque<std::shared_ptr<FetchTask>> cancelled;
     {
@@ -598,9 +607,8 @@ void CacheHydrator::fetch_loop(std::stop_token stop) {
             fetch_queued_.fetch_sub(1, std::memory_order_relaxed);
         }
         try {
-            task->result.set_value(store_.hydrate(task->request.object,
-                                                  task->request.sequence_index,
-                                                  task->request.frame_type));
+            task->result.set_value(store_.hydrate(
+                task->request.object, task->request.sequence_index, task->request.frame_type));
         } catch (...) {
             try {
                 task->result.set_exception(std::current_exception());
@@ -629,8 +637,8 @@ std::optional<std::future<bool>> CacheHydrator::submit(HydrationRequest request)
         fetch_queue_.push_back(std::move(task));
         const auto queued = fetch_queued_.fetch_add(1, std::memory_order_relaxed) + 1;
         auto peak = fetch_peak_queued_.load(std::memory_order_relaxed);
-        while (peak < queued && !fetch_peak_queued_.compare_exchange_weak(
-                                    peak, queued, std::memory_order_relaxed)) {
+        while (peak < queued &&
+               !fetch_peak_queued_.compare_exchange_weak(peak, queued, std::memory_order_relaxed)) {
         }
         fetch_submitted_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -672,8 +680,7 @@ bool CacheHydrator::run_once() {
     auto hints = collect_hints();
     const auto now = Clock::now();
     auto request = scheduler_.next(
-        hints,
-        [&](const ObjectId& id) { return store_.locally_available(id); },
+        hints, [&](const ObjectId& id) { return store_.locally_available(id); },
         [&](const ObjectId& id) {
             Lock lock(mutex_);
             auto it = failed_until_.find(id);
@@ -780,9 +787,9 @@ void CacheHydrator::loop(std::stop_token stop) {
                     [&](const ObjectId& id) {
                         if (store_.locally_available(id))
                             return true;
-                        return std::any_of(pending.begin(), pending.end(), [&](const Pending& item) {
-                            return item.request.object == id;
-                        });
+                        return std::any_of(
+                            pending.begin(), pending.end(),
+                            [&](const Pending& item) { return item.request.object == id; });
                     },
                     [&](const ObjectId& id) {
                         Lock lock(mutex_);
@@ -835,7 +842,8 @@ void CacheHydrator::loop(std::stop_token stop) {
 
         std::optional<Clock::time_point> retry_at;
         for (const auto& [_, deadline] : failed_until_)
-            if (!retry_at || deadline < *retry_at) retry_at = deadline;
+            if (!retry_at || deadline < *retry_at)
+                retry_at = deadline;
         if (retry_at)
             cv_.wait_until(lock.native(), stop, *retry_at, wake_changed);
         else
@@ -855,7 +863,8 @@ HydrationManager::HydrationManager(DistributedStore& store, PlaybackTracker& pla
     : playback_(playback),
       read_ahead_(std::make_shared<ReadAheadHintProvider>(playback, config, read_ahead_extents)),
       current_file_(std::make_shared<CurrentFileHintProvider>(playback, config)),
-      catalogue_sequence_(std::make_shared<CatalogueSequenceHintProvider>(playback, filesystem, catalogue, config)),
+      catalogue_sequence_(
+          std::make_shared<CatalogueSequenceHintProvider>(playback, filesystem, catalogue, config)),
       hydrator_(store, config) {
     playback_.set_change_callback([this] { hydrator_.wake(); });
     hydrator_.add_provider(read_ahead_);

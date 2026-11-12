@@ -11,7 +11,7 @@ namespace {
 constexpr double default_transfer_ms = 100.0;
 constexpr double failure_penalty_ms = 500.0;
 constexpr double ewma_alpha = 0.20;
-}
+} // namespace
 
 double ReplicaSelector::estimate_ms(const State& state) {
     return state.ewma_transfer_ms > 0.0 ? state.ewma_transfer_ms : default_transfer_ms;
@@ -19,8 +19,7 @@ double ReplicaSelector::estimate_ms(const State& state) {
 
 double ReplicaSelector::score(const State& state, ReplicaWorkClass work) {
     const double transfer = estimate_ms(state);
-    const double failures =
-        std::min<uint32_t>(state.consecutive_failures, 8) * failure_penalty_ms;
+    const double failures = std::min<uint32_t>(state.consecutive_failures, 8) * failure_penalty_ms;
 
     if (work == ReplicaWorkClass::foreground) {
         // Optimise completion latency: in-flight foreground work weighs most,
@@ -36,8 +35,7 @@ double ReplicaSelector::score(const State& state, ReplicaWorkClass work) {
     return transfer + transfer * 2.0 * state.speculative_in_flight + failures;
 }
 
-std::vector<NodeInfo> ReplicaSelector::order(const std::vector<NodeInfo>& candidates,
-                                             size_t stripe,
+std::vector<NodeInfo> ReplicaSelector::order(const std::vector<NodeInfo>& candidates, size_t stripe,
                                              ReplicaWorkClass work) const {
     if (candidates.size() < 2)
         return candidates;
@@ -94,10 +92,8 @@ void ReplicaSelector::promoted(const NodeInfo& node) {
 }
 
 void ReplicaSelector::finished(const NodeInfo& node, ReplicaWorkClass work, size_t,
-                               std::chrono::steady_clock::duration elapsed,
-                               bool success) {
-    const double ms = std::max(0.001,
-        std::chrono::duration<double, std::milli>(elapsed).count());
+                               std::chrono::steady_clock::duration elapsed, bool success) {
+    const double ms = std::max(0.001, std::chrono::duration<double, std::milli>(elapsed).count());
 
     Lock lock(mutex_);
     auto& state = states_[node.id];
@@ -126,8 +122,11 @@ ReplicaTransferStats ReplicaSelector::stats(const NodeId& id) const {
     if (it == states_.end())
         return {};
     const auto& state = it->second;
-    return {state.foreground_in_flight, state.speculative_in_flight,
-            state.ewma_transfer_ms, state.successes, state.failures,
+    return {state.foreground_in_flight,
+            state.speculative_in_flight,
+            state.ewma_transfer_ms,
+            state.successes,
+            state.failures,
             state.selections};
 }
 

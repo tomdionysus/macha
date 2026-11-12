@@ -2,23 +2,23 @@
 #pragma once
 #include "cluster/cluster.hpp"
 #include "cluster/control_objects.hpp"
-#include "contract/id_lookup.hpp"
-#include "contract/thread_safety.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/replica_selector.hpp"
+#include "contract/id_lookup.hpp"
+#include "contract/thread_safety.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
 #include <functional>
-#include <thread>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <set>
+#include <span>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace macha {
@@ -132,8 +132,12 @@ class DistributedStore final : public ControlObjectSource {
 
     struct DurabilityBatch {
         std::vector<DurabilityRequirement> requirements;
-        bool empty() const noexcept { return requirements.empty(); }
-        void clear() { requirements.clear(); }
+        bool empty() const noexcept {
+            return requirements.empty();
+        }
+        void clear() {
+            requirements.clear();
+        }
         void add(DurabilityRequirement);
     };
 
@@ -208,7 +212,8 @@ class DistributedStore final : public ControlObjectSource {
     static constexpr size_t repair_retries_max = 4096;
     // Schedules `id` again: first after repair_retry_first, then each time
     // after twice the delay before, up to repair_retry_cap.
-    static void retry_later(std::map<ObjectId, RepairRetry>&, const ObjectId&, Clock::time_point now);
+    static void retry_later(std::map<ObjectId, RepairRetry>&, const ObjectId&,
+                            Clock::time_point now);
     // The push pass over a given list: the last object taken from it, the
     // list's identity (its version when the caller gives one, else its data
     // address), and whether the pass is over a list at all.
@@ -288,16 +293,22 @@ class DistributedStore final : public ControlObjectSource {
         repair_last_credit_.store(static_cast<uint64_t>(std::max(0.0, credit)),
                                   std::memory_order_relaxed);
         // One word, so a reader never pairs a gate with another pass's classes.
-        repair_last_gate_.store(static_cast<uint16_t>(0x100U | (static_cast<unsigned>(gate) << 4) |
-                                                      (paced_by & 0xFU)),
-                                std::memory_order_relaxed);
+        repair_last_gate_.store(
+            static_cast<uint16_t>(0x100U | (static_cast<unsigned>(gate) << 4) | (paced_by & 0xFU)),
+            std::memory_order_relaxed);
         switch (gate) {
-        case RepairGate::ran: repair_gate_ran_.fetch_add(1, std::memory_order_relaxed); break;
-        case RepairGate::share: repair_gate_share_.fetch_add(1, std::memory_order_relaxed); break;
+        case RepairGate::ran:
+            repair_gate_ran_.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case RepairGate::share:
+            repair_gate_share_.fetch_add(1, std::memory_order_relaxed);
+            break;
         case RepairGate::quiescent:
             repair_gate_quiescent_.fetch_add(1, std::memory_order_relaxed);
             break;
-        case RepairGate::credit: repair_gate_credit_.fetch_add(1, std::memory_order_relaxed); break;
+        case RepairGate::credit:
+            repair_gate_credit_.fetch_add(1, std::memory_order_relaxed);
+            break;
         }
     }
 
@@ -333,8 +344,8 @@ class DistributedStore final : public ControlObjectSource {
     // Sends `target` the objects of `ids` (sorted, unique, held here) it
     // lacks; a peer that cannot say is sent all of them. False if any put
     // failed. Counts what was sent into `out`.
-    bool offer_control_on(const NodeInfo& target, const std::vector<ObjectId>& ids,
-                          FrameType frame, ControlOffer& out);
+    bool offer_control_on(const NodeInfo& target, const std::vector<ObjectId>& ids, FrameType frame,
+                          ControlOffer& out);
     // For each object, walks its candidates in preference order collecting up
     // to `floor` present nodes, with presence checked in node-grouped
     // have_objects rounds rather than one RPC per (object, candidate).
@@ -346,8 +357,8 @@ class DistributedStore final : public ControlObjectSource {
     // retention_check_concurrency chunks in flight across all peers.
     std::map<NodeId, std::map<ObjectId, bool>>
     batched_have_objects(const std::map<NodeId, NodeInfo>& node_info,
-                        const std::map<NodeId, std::vector<ObjectId>>& ids_by_node,
-                        FrameType frame_type = FrameType::loader);
+                         const std::map<NodeId, std::vector<ObjectId>>& ids_by_node,
+                         FrameType frame_type = FrameType::loader);
     // Repair's presence round: whether each peer holds a copy that reads back
     // intact, have_valid_objects_max ids per request, all requests concurrent.
     // Peers without have_valid_objects are asked per id via have_object. An
@@ -357,23 +368,21 @@ class DistributedStore final : public ControlObjectSource {
     validated_presence(const std::map<NodeId, NodeInfo>& node_info,
                        const std::map<NodeId, std::vector<ObjectId>>& ids_by_node);
     ObjectData get_from(const NodeInfo&, const ObjectId&, FrameType,
-                        const std::shared_ptr<SharedFetch>&,
-                        Clock::time_point deadline, std::atomic_bool* cancelled,
-                        const std::function<bool()>& abort, FetchAnswer& answer);
+                        const std::shared_ptr<SharedFetch>&, Clock::time_point deadline,
+                        std::atomic_bool* cancelled, const std::function<bool()>& abort,
+                        FetchAnswer& answer);
     // `answer`, when given, says what the fetch came to.
     ObjectData get_remote(const ObjectId&, size_t stripe, FrameType, bool foreground,
                           bool opportunistic_persist, Clock::time_point deadline = {},
                           std::atomic_bool* cancelled = nullptr,
-                          const std::function<bool()>& abort = {},
-                          FetchAnswer* answer = nullptr);
+                          const std::function<bool()>& abort = {}, FetchAnswer* answer = nullptr);
     void note_foreground(uint64_t);
     void note_network(uint64_t, Clock::duration);
 
   public:
     DistributedStore(ClusterNode& n, LocalState& local, ActivityClocks& activity,
-                     DataResourceArbiter& data_resources,
-                     RetainedMemoryLedger& retained_memory, NodeEvents& events,
-                     DistributedStoreOptions options = {});
+                     DataResourceArbiter& data_resources, RetainedMemoryLedger& retained_memory,
+                     NodeEvents& events, DistributedStoreOptions options = {});
     ~DistributedStore();
     // Waits until every local copy queued so far is written or dropped.
     void wait_local_copies_settled();
@@ -409,8 +418,7 @@ class DistributedStore final : public ControlObjectSource {
     bool put_deferred(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&,
                       std::atomic_bool* cancelled = nullptr);
     bool put_deferred(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&, FrameType,
-                      std::atomic_bool* cancelled = nullptr,
-                      const DataWorkContext* work = nullptr);
+                      std::atomic_bool* cancelled = nullptr, const DataWorkContext* work = nullptr);
     // True when every requirement in `batch` has reached its durability floor.
     // A replica whose placement token died with a peer's process or backend
     // incarnation is re-derived by probing and the batch re-stamped in place;
@@ -434,12 +442,13 @@ class DistributedStore final : public ControlObjectSource {
     bool retain_control(const std::vector<ObjectId>&, const RetentionDot&,
                         ClaimScope scope = ClaimScope::everywhere);
     std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true,
-                             Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
+                             Clock::time_point deadline = {},
+                             std::atomic_bool* cancelled = nullptr);
     std::optional<Bytes> get(const ObjectId&, size_t stripe, FrameType,
-                             Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
+                             Clock::time_point deadline = {},
+                             std::atomic_bool* cancelled = nullptr);
     ObjectData get_shared(const ObjectId&, size_t stripe, FrameType,
-                          Clock::time_point deadline = {},
-                          std::atomic_bool* cancelled = nullptr);
+                          Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
     bool has_on(const NodeInfo&, const ObjectId&);
     bool should_own(const ObjectId&) const;
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);
@@ -452,12 +461,17 @@ class DistributedStore final : public ControlObjectSource {
     bool locally_available(const ObjectId&) const;
     bool cache_local(const ObjectId&, std::span<const uint8_t>);
     bool hydration_available() const;
-    bool hydrate(const ObjectId&, size_t stripe = 0,
-                 FrameType frame_type = FrameType::speculative);
+    bool hydrate(const ObjectId&, size_t stripe = 0, FrameType frame_type = FrameType::speculative);
     void erase_all(const ObjectId&);
-    void foreground_activity(uint64_t bytes) { note_foreground(bytes); }
-    void interactive_activity(uint64_t bytes) { activity_.note(FrameType::read_ahead, bytes); }
-    void loader_activity(uint64_t bytes) { activity_.note(FrameType::loader, bytes); }
+    void foreground_activity(uint64_t bytes) {
+        note_foreground(bytes);
+    }
+    void interactive_activity(uint64_t bytes) {
+        activity_.note(FrameType::read_ahead, bytes);
+    }
+    void loader_activity(uint64_t bytes) {
+        activity_.note(FrameType::loader, bytes);
+    }
 
     // Pushes local objects to their owners and pulls live objects this node
     // should own. repair_step() keeps push/pull cursors across calls and never
@@ -484,22 +498,27 @@ class DistributedStore final : public ControlObjectSource {
     // vector in place must not rely on.
     uint64_t repair_once(uint64_t byte_budget = 0,
                          std::optional<std::span<const ObjectId>> live = std::nullopt);
-    RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
-                             std::optional<IdLookup> live = std::nullopt,
-                             const std::function<bool()>& should_yield = {},
-                             uint64_t live_generation = 0,
-                             const std::function<bool(const ObjectId&)>& unavailable = {},
-                             std::optional<std::span<const ObjectId>> pull = std::nullopt,
-                             const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>&
-                                 known_present = {},
-                             std::optional<std::span<const ObjectId>> push = std::nullopt,
-                             uint64_t pull_version = 0, uint64_t push_version = 0);
+    RepairResult repair_step(
+        uint64_t byte_budget, size_t operation_budget, std::optional<IdLookup> live = std::nullopt,
+        const std::function<bool()>& should_yield = {}, uint64_t live_generation = 0,
+        const std::function<bool(const ObjectId&)>& unavailable = {},
+        std::optional<std::span<const ObjectId>> pull = std::nullopt,
+        const std::function<std::optional<bool>(const NodeId&, const ObjectId&)>& known_present =
+            {},
+        std::optional<std::span<const ObjectId>> push = std::nullopt, uint64_t pull_version = 0,
+        uint64_t push_version = 0);
     uint64_t scrub_once(uint64_t byte_budget = 0);
     RepairDiagnostics repair_diagnostics() const;
 
-    uint64_t take_foreground_bytes() { return activity_.take_bytes(FrameType::foreground); }
-    uint64_t take_interactive_bytes() { return activity_.take_bytes(FrameType::read_ahead); }
-    uint64_t take_loader_bytes() { return activity_.take_bytes(FrameType::loader); }
+    uint64_t take_foreground_bytes() {
+        return activity_.take_bytes(FrameType::foreground);
+    }
+    uint64_t take_interactive_bytes() {
+        return activity_.take_bytes(FrameType::read_ahead);
+    }
+    uint64_t take_loader_bytes() {
+        return activity_.take_bytes(FrameType::loader);
+    }
     // Advances when membership changes or a storage backend comes or goes.
     uint64_t reachability_epoch() const noexcept;
     // Since work of `work_class` was last present on this node (24 h when

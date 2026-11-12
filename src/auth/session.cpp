@@ -120,7 +120,8 @@ SessionManager::SessionManager(std::chrono::milliseconds anonymous_ttl, size_t m
         if (!input)
             throw std::runtime_error("cannot open persisted sessions");
         Bytes bytes(static_cast<size_t>(size));
-        if (size && !input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
+        if (size &&
+            !input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
             throw std::runtime_error("cannot read persisted sessions");
         const auto now = unix_ms();
         for (auto& session : decode_sessions(bytes)) {
@@ -164,8 +165,8 @@ std::optional<MintedSession> SessionManager::create(std::vector<std::string> rol
 
     AuthSession session;
     session.id = id;
-    session.token_hash = sha256(
-        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(bearer_token.data()), bearer_token.size()));
+    session.token_hash = sha256(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(bearer_token.data()), bearer_token.size()));
     session.roles = std::move(roles);
     session.user_id = std::move(user_id);
     session.credential_generation = credential_generation;
@@ -222,9 +223,8 @@ std::vector<AuthSession> SessionManager::recent(std::chrono::milliseconds max_ag
         if (now - record.received <= max_age)
             out.push_back(record.session);
     }
-    std::sort(out.begin(), out.end(), [](const AuthSession& a, const AuthSession& b) {
-        return a.version > b.version;
-    });
+    std::sort(out.begin(), out.end(),
+              [](const AuthSession& a, const AuthSession& b) { return a.version > b.version; });
     if (out.size() > max_records)
         out.resize(max_records);
     return out;
@@ -250,7 +250,8 @@ void SessionManager::persist() {
     if (values.size() > max_sessions_)
         values.resize(max_sessions_);
     const auto encoded = encode_sessions(values);
-    const auto contents = std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+    const auto contents =
+        std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size());
     durable_replace_file(persisted_path_, contents);
 }
 

@@ -54,9 +54,9 @@ FfmpegLogLevel parse_ffmpeg_log_level(std::string_view value) {
         return FfmpegLogLevel::debug;
     if (level == "TRACE" || level == "ALL")
         return FfmpegLogLevel::trace;
-    throw std::runtime_error("invalid FFmpeg log level: " + std::string(value) +
-                             " (expected QUIET, PANIC, FATAL, ERROR, WARN, INFO, VERBOSE, DEBUG or TRACE)");
+    throw std::runtime_error(
+        "invalid FFmpeg log level: " + std::string(value) +
+        " (expected QUIET, PANIC, FATAL, ERROR, WARN, INFO, VERBOSE, DEBUG or TRACE)");
 }
-
 
 } // namespace macha

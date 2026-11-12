@@ -17,15 +17,19 @@ namespace {
 class InformationInput final : public MediaInput {
     std::shared_ptr<ReadHandle> handle_;
     uint64_t size_{};
+
   public:
     InformationInput(std::shared_ptr<ReadHandle> handle, uint64_t size)
         : handle_(std::move(handle)), size_(size) {}
-    uint64_t size() const override { return size_; }
-    size_t read(uint64_t offset, std::span<uint8_t> destination,
-                Clock::time_point deadline, std::atomic_bool* cancelled) override {
-        if (offset >= size_) return 0;
-        const auto wanted = static_cast<size_t>(
-            std::min<uint64_t>(destination.size(), size_ - offset));
+    uint64_t size() const override {
+        return size_;
+    }
+    size_t read(uint64_t offset, std::span<uint8_t> destination, Clock::time_point deadline,
+                std::atomic_bool* cancelled) override {
+        if (offset >= size_)
+            return 0;
+        const auto wanted =
+            static_cast<size_t>(std::min<uint64_t>(destination.size(), size_ - offset));
         return handle_->read(offset, destination.first(wanted), deadline, cancelled);
     }
 };
@@ -62,24 +66,25 @@ struct MediaInformationService::Flight {
     std::shared_ptr<std::atomic_bool> cancelled MACHA_GUARDED_BY(mutex);
 };
 
-MediaInformationService::MediaInformationService(
-    FileSystem& fs, CatalogueManager& catalogue, std::shared_ptr<MediaEngine> engine,
-    const std::filesystem::path& state_path, ProfilePublisher profile_publisher)
+MediaInformationService::MediaInformationService(FileSystem& fs, CatalogueManager& catalogue,
+                                                 std::shared_ptr<MediaEngine> engine,
+                                                 const std::filesystem::path& state_path,
+                                                 ProfilePublisher profile_publisher)
     : fs_(fs), catalogue_(catalogue), engine_(std::move(engine)),
-      hints_(state_path / "media-information"),
-      profile_publisher_(std::move(profile_publisher)) {}
+      hints_(state_path / "media-information"), profile_publisher_(std::move(profile_publisher)) {}
 
-MediaInformationService::~MediaInformationService() { stop(); }
+MediaInformationService::~MediaInformationService() {
+    stop();
+}
 
 void MediaInformationService::queue_publication_locked(std::string media_id,
-                                                        MediaProbeResult probe) {
+                                                       MediaProbeResult probe) {
     const auto weight = profile_weight(media_id, probe);
     if (weight > max_pending_publication_bytes_) {
         flights_.erase(media_id);
         return;
     }
-    if (auto found = pending_publications_.find(media_id);
-        found != pending_publications_.end()) {
+    if (auto found = pending_publications_.find(media_id); found != pending_publications_.end()) {
         pending_publication_bytes_ -= profile_weight(found->first, found->second);
         found->second = std::move(probe);
         pending_publication_bytes_ += weight;
@@ -98,7 +103,8 @@ void MediaInformationService::queue_publication_locked(std::string media_id,
 }
 
 void MediaInformationService::start() {
-    if (started_ || !engine_ || !engine_->status().available) return;
+    if (started_ || !engine_ || !engine_->status().available)
+        return;
     worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("media-information", stop, [this, stop] { loop(stop); });
     });
@@ -114,7 +120,8 @@ void MediaInformationService::request_stop() {
 
 void MediaInformationService::stop() {
     request_stop();
-    if (worker_.joinable()) worker_.join();
+    if (worker_.joinable())
+        worker_.join();
     started_ = false;
 }
 
@@ -131,9 +138,10 @@ bool MediaInformationService::media_is_live(std::string_view media_id) const {
     return source_for(media_id).has_value();
 }
 
-size_t MediaInformationService::request(const std::vector<std::string>& media_ids,
-                                        int priority, std::string source) {
-    if (media_ids.empty() || !engine_ || !engine_->status().available) return 0;
+size_t MediaInformationService::request(const std::vector<std::string>& media_ids, int priority,
+                                        std::string source) {
+    if (media_ids.empty() || !engine_ || !engine_->status().available)
+        return 0;
     std::set<std::string> wanted(media_ids.begin(), media_ids.end());
     for (auto it = wanted.begin(); it != wanted.end();) {
         if (catalogue_.media_profile(*it))
@@ -141,13 +149,16 @@ size_t MediaInformationService::request(const std::vector<std::string>& media_id
         else
             ++it;
     }
-    if (wanted.empty()) return 0;
+    if (wanted.empty())
+        return 0;
     auto view = fs_.available_snapshot_view();
-    if (!view) return 0;
+    if (!view)
+        return 0;
 
     const auto existing = hints_.list();
     std::map<std::string, CatalogueHint, std::less<>> by_path;
-    for (const auto& hint : existing) by_path.emplace(hint.path, hint);
+    for (const auto& hint : existing)
+        by_path.emplace(hint.path, hint);
     std::vector<CatalogueHintSubmission> submissions;
     size_t outstanding = 0;
     for (const auto& media_id : wanted) {
@@ -157,11 +168,11 @@ size_t MediaInformationService::request(const std::vector<std::string>& media_id
         const auto& path = source_file->first;
         if (auto found = by_path.find(path); found != by_path.end()) {
             const auto& hint = found->second;
-            const bool same = std::any_of(hint.origins.begin(), hint.origins.end(),
-                                          [&](const auto& origin) {
-                return origin.source.starts_with("media-information") &&
-                       origin.source_ref == media_id;
-            });
+            const bool same =
+                std::any_of(hint.origins.begin(), hint.origins.end(), [&](const auto& origin) {
+                    return origin.source.starts_with("media-information") &&
+                           origin.source_ref == media_id;
+                });
             if (same) {
                 if (pending(hint.state)) {
                     ++outstanding;
@@ -178,27 +189,30 @@ size_t MediaInformationService::request(const std::vector<std::string>& media_id
     return outstanding;
 }
 
-bool MediaInformationService::request_path(std::string path, int priority,
-                                           std::string source) {
+bool MediaInformationService::request_path(std::string path, int priority, std::string source) {
     path = normalize_path(path);
     auto view = fs_.available_snapshot_view();
-    if (!view) return false;
+    if (!view)
+        return false;
     auto nodes = fs_.namespace_nodes();
     auto found = namespace_entry(*view->snapshot, &nodes, path);
     if (!found || found->type != EntryType::file || !found->size)
         return false;
     const auto media_id = file_media_id(*found);
-    if (catalogue_.media_profile(media_id)) return true;
+    if (catalogue_.media_profile(media_id))
+        return true;
     (void)hints_.submit(path, std::move(source), media_id, priority);
     cv_.notify_all();
     return true;
 }
 
-MediaProbeResult MediaInformationService::resolve(
-    std::string media_id, std::string path, FsEntry entry, bool foreground,
-    Clock::time_point deadline) {
-    if (auto stored = catalogue_.media_profile(media_id)) return *stored;
-    if (!engine_ || !engine_->status().available) throw MediaEngineUnavailable();
+MediaProbeResult MediaInformationService::resolve(std::string media_id, std::string path,
+                                                  FsEntry entry, bool foreground,
+                                                  Clock::time_point deadline) {
+    if (auto stored = catalogue_.media_profile(media_id))
+        return *stored;
+    if (!engine_ || !engine_->status().available)
+        throw MediaEngineUnavailable();
 
     std::shared_ptr<Flight> flight;
     {
@@ -212,7 +226,8 @@ MediaProbeResult MediaInformationService::resolve(
         {
             Lock lock(flight->mutex);
             if (flight->complete) {
-                if (flight->error) std::rethrow_exception(flight->error);
+                if (flight->error)
+                    std::rethrow_exception(flight->error);
                 return *flight->result;
             }
             if (!flight->owner) {
@@ -223,25 +238,26 @@ MediaProbeResult MediaInformationService::resolve(
                 owner = true;
             } else if (foreground && !flight->owner_foreground) {
                 flight->foreground_takeover = true;
-                if (flight->cancelled) flight->cancelled->store(true);
-                flight->cv.wait_until(lock.native(), deadline,
-                                      [&]() MACHA_REQUIRES(flight->mutex) {
+                if (flight->cancelled)
+                    flight->cancelled->store(true);
+                flight->cv.wait_until(lock.native(), deadline, [&]() MACHA_REQUIRES(flight->mutex) {
                     return flight->complete || !flight->owner;
                 });
                 if (!flight->complete && flight->owner)
                     throw std::runtime_error("timed out taking over speculative media scan");
                 continue;
             } else {
-                if (!flight->cv.wait_until(lock.native(), deadline,
-                                           [&]() MACHA_REQUIRES(flight->mutex) {
-                                               return flight->complete;
-                                           }))
+                if (!flight->cv.wait_until(
+                        lock.native(), deadline,
+                        [&]() MACHA_REQUIRES(flight->mutex) { return flight->complete; }))
                     throw std::runtime_error("timed out waiting for concurrent media scan");
-                if (flight->error) std::rethrow_exception(flight->error);
+                if (flight->error)
+                    std::rethrow_exception(flight->error);
                 return *flight->result;
             }
         }
-        if (!owner) continue;
+        if (!owner)
+            continue;
 
         try {
             const auto frame = foreground ? FrameType::foreground : FrameType::speculative;
@@ -297,29 +313,32 @@ MediaProbeResult MediaInformationService::resolve(
                 }
             }
             flight->cv.notify_all();
-            if (preempted) throw InformationPreempted();
+            if (preempted)
+                throw InformationPreempted();
             {
                 Lock lock(mutex_);
                 auto it = flights_.find(media_id);
-                if (it != flights_.end() && it->second == flight) flights_.erase(it);
+                if (it != flights_.end() && it->second == flight)
+                    flights_.erase(it);
             }
             throw;
         }
     }
 }
 
-MediaProbeResult MediaInformationService::resolve_playback(
-    std::string media_id, std::string path, FsEntry entry, Clock::time_point deadline) {
+MediaProbeResult MediaInformationService::resolve_playback(std::string media_id, std::string path,
+                                                           FsEntry entry,
+                                                           Clock::time_point deadline) {
     return resolve(std::move(media_id), std::move(path), std::move(entry), true, deadline);
 }
 
-void MediaInformationService::process_hint(const CatalogueHint& hint,
-                                           std::stop_token stop) {
+void MediaInformationService::process_hint(const CatalogueHint& hint, std::stop_token stop) {
     auto origin = std::find_if(hint.origins.begin(), hint.origins.end(), [](const auto& value) {
         return value.source.starts_with("media-information");
     });
     if (origin == hint.origins.end()) {
-        hints_.fail(hint.id, "no_immutable_identity", "media-information hint has no immutable identity");
+        hints_.fail(hint.id, "no_immutable_identity",
+                    "media-information hint has no immutable identity");
         return;
     }
     const auto media_id = origin->source_ref;
@@ -330,8 +349,7 @@ void MediaInformationService::process_hint(const CatalogueHint& hint,
         }
         auto source = source_for(media_id);
         if (!source) {
-            hints_.mark_no_match(hint.id, "media-information", media_id,
-                                 "media_not_live");
+            hints_.mark_no_match(hint.id, "media-information", media_id, "media_not_live");
             request_prune();
             return;
         }
@@ -344,7 +362,8 @@ void MediaInformationService::process_hint(const CatalogueHint& hint,
         } catch (const KeyframeIndexUnsupported&) {
         } catch (const std::exception& e) {
             if (!stop.stop_requested())
-                Log::debug("media keyframe index deferred media=" + media_id + " error=" + e.what());
+                Log::debug("media keyframe index deferred media=" + media_id +
+                           " error=" + e.what());
         }
     } catch (const InformationPreempted&) {
         hints_.defer(hint.id, "yielded_to_playback", "yielded to playback", 0);
@@ -377,7 +396,8 @@ Bytes encode_keyframe_index(std::string_view media_id, const MediaKeyframeIndex&
         Json::Array entries;
         entries.reserve(stream.entries.size());
         for (const auto& [ms, pos] : stream.entries)
-            entries.emplace_back(Json::Array{Json(static_cast<int64_t>(ms)), Json(static_cast<uint64_t>(pos))});
+            entries.emplace_back(
+                Json::Array{Json(static_cast<int64_t>(ms)), Json(static_cast<uint64_t>(pos))});
         streams.emplace_back(Json::Object{{"index", static_cast<int64_t>(stream.index)},
                                           {"type", media_stream_type_name(stream.type)},
                                           {"codec", stream.codec},
@@ -399,24 +419,32 @@ Bytes encode_keyframe_index(std::string_view media_id, const MediaKeyframeIndex&
 
 std::optional<Bytes> MediaInformationService::keyframe_index(const std::string& media_id,
                                                              Clock::time_point deadline) {
-    if (auto stored = catalogue_.media_index(media_id)) return stored;
-    if (!engine_ || !engine_->status().available) return {};
+    if (auto stored = catalogue_.media_index(media_id))
+        return stored;
+    if (!engine_ || !engine_->status().available)
+        return {};
     Lock build(keyframe_index_mutex_);
-    if (auto stored = catalogue_.media_index(media_id)) return stored;
+    if (auto stored = catalogue_.media_index(media_id))
+        return stored;
     auto found = fs_.find_media(media_id);
-    if (!found) return {};
+    if (!found)
+        return {};
     const auto& [path, entry] = *found;
-    MediaSource source{
-        media_id, path, entry.size,
-        [this, entry, path](MediaReadPurpose) -> std::shared_ptr<MediaInput> {
-            return std::make_shared<InformationInput>(
-                fs_.open_read(entry, path, false, FrameType::speculative), entry.size);
-        },
-        {}};
-    auto remaining = std::max(std::chrono::milliseconds(1),
-                              std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()));
+    MediaSource source{media_id,
+                       path,
+                       entry.size,
+                       [this, entry, path](MediaReadPurpose) -> std::shared_ptr<MediaInput> {
+                           return std::make_shared<InformationInput>(
+                               fs_.open_read(entry, path, false, FrameType::speculative),
+                               entry.size);
+                       },
+                       {}};
+    auto remaining =
+        std::max(std::chrono::milliseconds(1),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()));
     auto index = engine_->keyframe_index(source, remaining);
-    if (!index) throw KeyframeIndexUnsupported("this container keeps no byte index");
+    if (!index)
+        throw KeyframeIndexUnsupported("this container keeps no byte index");
     auto bytes = encode_keyframe_index(media_id, *index);
     catalogue_.put_media_index(media_id, bytes);
     return bytes;
@@ -431,7 +459,8 @@ void MediaInformationService::request_prune() {
 }
 
 void MediaInformationService::prune() {
-    if (!fs_.available_snapshot_view()) return;
+    if (!fs_.available_snapshot_view())
+        return;
     // The filesystem's media index names every file's id: no walk.
     const auto ids = fs_.media_ids();
     const std::set<std::string> live(ids.begin(), ids.end());
@@ -454,7 +483,8 @@ void MediaInformationService::loop(std::stop_token stop) {
                 publication = *it;
                 pending_publication_bytes_ -= profile_weight(it->first, it->second);
                 pending_publications_.erase(it);
-                if (pending_publications_.empty()) publication_retry_at_.reset();
+                if (pending_publications_.empty())
+                    publication_retry_at_.reset();
             } else if (prune_requested_) {
                 prune_requested_ = false;
                 do_prune = true;
@@ -477,8 +507,9 @@ void MediaInformationService::loop(std::stop_token stop) {
             continue;
         }
         if (do_prune) {
-            try { prune(); }
-            catch (const std::exception& e) {
+            try {
+                prune();
+            } catch (const std::exception& e) {
                 Log::warn("media information prune deferred: " + std::string(e.what()));
             }
             continue;
@@ -496,11 +527,11 @@ void MediaInformationService::loop(std::stop_token stop) {
         };
         std::optional<std::chrono::milliseconds> wait_delay = ready_delay;
         if (publication_retry_at_) {
-            const auto retry_delay = std::max(
-                std::chrono::milliseconds(0),
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    *publication_retry_at_ - Clock::now()));
-            if (!wait_delay || retry_delay < *wait_delay) wait_delay = retry_delay;
+            const auto retry_delay = std::max(std::chrono::milliseconds(0),
+                                              std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  *publication_retry_at_ - Clock::now()));
+            if (!wait_delay || retry_delay < *wait_delay)
+                wait_delay = retry_delay;
         }
         if (wait_delay)
             cv_.wait_for(lock.native(), stop, *wait_delay, changed);

@@ -28,14 +28,14 @@ GarbageRef garbage(uint8_t n, int64_t retired_at_ns) {
     return out;
 }
 
-std::vector<ObjectId> ids_of(std::span<const ObjectId> span) { return {span.begin(), span.end()}; }
+std::vector<ObjectId> ids_of(std::span<const ObjectId> span) {
+    return {span.begin(), span.end()};
+}
 
 MACHA_FAST_TEST("ledger", test_referenced_sets_are_sorted_unique_and_per_class) {
     const ReferencedSets sets({id(3), id(1), id(3), id(2)}, {id(9), id(9), id(5)});
-    CHECK((ids_of(sets.all(RetentionClass::data)) ==
-           std::vector<ObjectId>{id(1), id(2), id(3)}));
-    CHECK((ids_of(sets.all(RetentionClass::control)) ==
-           std::vector<ObjectId>{id(5), id(9)}));
+    CHECK((ids_of(sets.all(RetentionClass::data)) == std::vector<ObjectId>{id(1), id(2), id(3)}));
+    CHECK((ids_of(sets.all(RetentionClass::control)) == std::vector<ObjectId>{id(5), id(9)}));
     CHECK(sets.size(RetentionClass::data) == 3);
     CHECK(sets.size(RetentionClass::control) == 2);
     for (uint8_t n = 0; n < 12; ++n) {
@@ -61,8 +61,10 @@ MACHA_FAST_TEST("ledger", test_inventory_splits_tombstones_by_whether_data_still
     CHECK(inventory.garbage()[1].id == id(6) && inventory.garbage()[1].retired_at_ns == 30);
     CHECK(inventory.garbage()[2].id == id(1) && inventory.garbage()[2].retired_at_ns == 50);
     CHECK(inventory.stale_garbage().size() == 2);
-    CHECK(inventory.stale_garbage()[0].id == id(4) && inventory.stale_garbage()[0].retired_at_ns == 10);
-    CHECK(inventory.stale_garbage()[1].id == id(2) && inventory.stale_garbage()[1].retired_at_ns == 40);
+    CHECK(inventory.stale_garbage()[0].id == id(4) &&
+          inventory.stale_garbage()[0].retired_at_ns == 10);
+    CHECK(inventory.stale_garbage()[1].id == id(2) &&
+          inventory.stale_garbage()[1].retired_at_ns == 40);
     CHECK(InventoryHorizon(0, true, {}, {}, {}).catalogue_complete());
 }
 
@@ -74,8 +76,7 @@ MACHA_FAST_TEST("ledger", test_release_horizon_carries_its_head_and_clock) {
     const ReleaseHorizon release(head, {{node, 12}}, {id(2), id(1)}, {id(3)});
     CHECK(release.head() == head);
     CHECK(release.clock().at(node) == 12);
-    CHECK((ids_of(release.all(RetentionClass::data)) ==
-           std::vector<ObjectId>{id(1), id(2)}));
+    CHECK((ids_of(release.all(RetentionClass::data)) == std::vector<ObjectId>{id(1), id(2)}));
     CHECK(release.referenced(RetentionClass::control, id(3)));
 }
 
@@ -106,10 +107,16 @@ template <class Check> void over_every_pass(Check&& check) {
     for (unsigned bits = 0; bits < (1U << 6); ++bits)
         for (const auto& inventory : inventories()) {
             const auto bit = [bits](unsigned n) { return ((bits >> n) & 1U) != 0; };
-            Reference ref{bit(0), bit(1), bit(2), bit(3), bit(4), bit(5),
+            Reference ref{bit(0),
+                          bit(1),
+                          bit(2),
+                          bit(3),
+                          bit(4),
+                          bit(5),
                           inventory ? std::optional<uint64_t>(inventory->generation())
                                     : std::nullopt,
-                          inventory ? inventory->catalogue_complete() : true, 5};
+                          inventory ? inventory->catalogue_complete() : true,
+                          5};
             PassFacts facts;
             facts.garbage_due = ref.garbage_due;
             facts.gc_due = ref.gc_due;
@@ -123,42 +130,43 @@ template <class Check> void over_every_pass(Check&& check) {
 }
 
 MACHA_FAST_TEST("ledger", test_tombstone_gate_is_the_pass_condition_over_every_input) {
-    over_every_pass([](const Reference& r, const PassFacts& facts, const InventoryHorizon* inventory) {
+    over_every_pass([](const Reference& r, const PassFacts& facts,
+                       const InventoryHorizon* inventory) {
         const bool expected = r.garbage_due && !r.rebuilt && r.catalogue_complete;
         const auto verdict = tombstone_gate(facts, inventory);
         CHECK(verdict.permitted == expected);
         CHECK(verdict.reason.empty() == expected);
-        CHECK(verdict.conditions ==
-              flag("due", r.garbage_due) + " " + flag("rebuilt", r.rebuilt) + " " +
-                  flag("catalogue_complete", r.catalogue_complete));
+        CHECK(verdict.conditions == flag("due", r.garbage_due) + " " + flag("rebuilt", r.rebuilt) +
+                                        " " + flag("catalogue_complete", r.catalogue_complete));
     });
 }
 
 MACHA_FAST_TEST("ledger", test_control_gate_is_the_pass_condition_over_every_input) {
-    over_every_pass([](const Reference& r, const PassFacts& facts, const InventoryHorizon* inventory) {
+    over_every_pass([](const Reference& r, const PassFacts& facts,
+                       const InventoryHorizon* inventory) {
         const uint64_t generation = r.generation.value_or(0);
         const bool expected = r.gc_due && !r.rebuilt && r.release_view && r.catalogue_complete &&
                               r.generation.has_value() && generation >= r.known;
         const auto verdict = control_gate(facts, inventory);
         CHECK(verdict.permitted == expected);
         CHECK(verdict.reason.empty() == expected);
-        CHECK(verdict.conditions ==
-              flag("due", r.gc_due) + " " + flag("rebuilt", r.rebuilt) + " " +
-                  flag("release_view", r.release_view) + " " +
-                  flag("catalogue_complete", r.catalogue_complete) + " " +
-                  flag("control_live", r.generation.has_value()) + " " +
-                  flag("generation_current", generation >= r.known));
+        CHECK(verdict.conditions == flag("due", r.gc_due) + " " + flag("rebuilt", r.rebuilt) + " " +
+                                        flag("release_view", r.release_view) + " " +
+                                        flag("catalogue_complete", r.catalogue_complete) + " " +
+                                        flag("control_live", r.generation.has_value()) + " " +
+                                        flag("generation_current", generation >= r.known));
     });
 }
 
 MACHA_FAST_TEST("ledger", test_data_gate_is_the_pass_condition_and_reason_over_every_input) {
-    over_every_pass([](const Reference& r, const PassFacts& facts, const InventoryHorizon* inventory) {
+    over_every_pass([](const Reference& r, const PassFacts& facts,
+                       const InventoryHorizon* inventory) {
         const uint64_t generation = r.generation.value_or(0);
         const bool expected = r.gc_due && !r.rebuilt && r.release_view && r.catalogue_complete &&
                               r.generation.has_value() && generation >= r.known;
         std::string reason;
         if (!r.gc_due)
-            reason = r.busy ? "foreground busy"
+            reason = r.busy      ? "foreground busy"
                      : r.waiting ? "complete; waiting for an event"
                                  : "quiet window";
         else if (r.rebuilt)
@@ -175,12 +183,11 @@ MACHA_FAST_TEST("ledger", test_data_gate_is_the_pass_condition_and_reason_over_e
         const auto verdict = data_gate(facts, inventory);
         CHECK(verdict.permitted == expected);
         CHECK(verdict.reason == reason);
-        CHECK(verdict.conditions ==
-              flag("due", r.gc_due) + " " + flag("rebuilt", r.rebuilt) + " " +
-                  flag("release_view", r.release_view) + " " +
-                  flag("catalogue_complete", r.catalogue_complete) + " " +
-                  flag("live", r.generation.has_value()) + " " +
-                  flag("generation_current", generation >= r.known));
+        CHECK(verdict.conditions == flag("due", r.gc_due) + " " + flag("rebuilt", r.rebuilt) + " " +
+                                        flag("release_view", r.release_view) + " " +
+                                        flag("catalogue_complete", r.catalogue_complete) + " " +
+                                        flag("live", r.generation.has_value()) + " " +
+                                        flag("generation_current", generation >= r.known));
     });
 }
 

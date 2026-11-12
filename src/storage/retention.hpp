@@ -8,10 +8,10 @@
 #include "storage/sealed_journal.hpp"
 
 #include <filesystem>
-#include <span>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace macha {
@@ -59,9 +59,10 @@ class RetentionStore final : public ClaimStore {
     void checkpoint_if_due_locked() MACHA_REQUIRES(mutex_);
     // Visits records from after `cursor`, wrapping to the first once, until
     // `visit` returns false, `limit` are visited or it is back where it began.
-    void scan_locked(const ClassLedger&, std::optional<ObjectId>& cursor, size_t limit,
-                     const std::function<bool(const ObjectId&, std::span<const uint8_t>)>& visit)
-        const MACHA_REQUIRES(mutex_);
+    void
+    scan_locked(const ClassLedger&, std::optional<ObjectId>& cursor, size_t limit,
+                const std::function<bool(const ObjectId&, std::span<const uint8_t>)>& visit) const
+        MACHA_REQUIRES(mutex_);
     void migrate_locked() MACHA_REQUIRES(mutex_);
     void load_journal_locked() MACHA_REQUIRES(mutex_);
     void load(size_t cache_bytes);
@@ -83,8 +84,7 @@ class RetentionStore final : public ClaimStore {
     // the local accepted metadata view. `live` must be sorted/unique. The work
     // is bounded and one durable journal frame covers the complete slice.
     size_t release_unreferenced(RetentionClass, const IdLookup& live,
-                                const RetentionClock& observed,
-                                size_t operation_budget) override;
+                                const RetentionClock& observed, size_t operation_budget) override;
 
     size_t claim_objects(RetentionClass) const override;
 

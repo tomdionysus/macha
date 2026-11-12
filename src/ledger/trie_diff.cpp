@@ -74,8 +74,7 @@ TrieDiffCost diff_tries(TrieSource& left, TrieSource& right,
             for (size_t i = 0; i < level.size(); ++i)
                 for (size_t slot = 0; slot < 256; ++slot)
                     if (a[i][slot] != b[i][slot])
-                        place(level[i].child(static_cast<uint8_t>(slot)), a[i][slot],
-                              b[i][slot]);
+                        place(level[i].child(static_cast<uint8_t>(slot)), a[i][slot], b[i][slot]);
         }
         if (pause)
             pause();
@@ -88,8 +87,12 @@ namespace {
 // One trie read forward a page at a time.
 class Cursor {
   public:
-    explicit Cursor(const ObjectTrie::Snapshot& snapshot) : snapshot_(snapshot) { fill(); }
-    const ObjectTrie::Record* peek() const { return at_ < page_.size() ? &page_[at_] : nullptr; }
+    explicit Cursor(const ObjectTrie::Snapshot& snapshot) : snapshot_(snapshot) {
+        fill();
+    }
+    const ObjectTrie::Record* peek() const {
+        return at_ < page_.size() ? &page_[at_] : nullptr;
+    }
     void advance() {
         if (++at_ >= page_.size() && !done_)
             fill();

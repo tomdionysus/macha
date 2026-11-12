@@ -5,9 +5,9 @@
 #include "crypto.hpp"
 #include "ledger/held_ledger.hpp"
 #include "ledger/object_trie.hpp"
+#include "ledger/reference_counts.hpp"
 #include "ledger/trie_diff.hpp"
 #include "ledger/trie_union.hpp"
-#include "ledger/reference_counts.hpp"
 #include "storage/local_store.hpp"
 #include "storage/sealed_journal.hpp"
 #include "test_support.hpp"
@@ -372,8 +372,7 @@ MACHA_FAST_TEST("object_ledger", test_a_subtree_reads_the_same_in_every_trie_hol
     for (size_t i = 0; i < prefixes.size(); ++i) {
         const auto& prefix = prefixes[i];
         const auto mine = below(records, prefix);
-        CHECK(expected_records[i] ==
-              std::vector<ObjectTrie::Record>(mine.begin(), mine.end()));
+        CHECK(expected_records[i] == std::vector<ObjectTrie::Record>(mine.begin(), mine.end()));
         uint64_t counted = 0;
         for (const auto& summary : expected_children[i])
             counted += summary.count;
@@ -397,7 +396,8 @@ MACHA_FAST_TEST("object_ledger", test_a_subtree_reads_the_same_in_every_trie_hol
     }
 }
 
-std::vector<TrieDifference> diff_of(ObjectTrie& left, ObjectTrie& right, TrieDiffCost* cost = nullptr) {
+std::vector<TrieDifference> diff_of(ObjectTrie& left, ObjectTrie& right,
+                                    TrieDiffCost* cost = nullptr) {
     SnapshotSource a(left.snapshot());
     SnapshotSource b(right.snapshot());
     std::vector<TrieDifference> out;
@@ -612,7 +612,8 @@ MACHA_FAST_TEST("object_ledger", test_a_union_of_tries_reads_as_one_trie_of_thei
                 } else {
                     auto victim = held[at].begin();
                     std::advance(victim, static_cast<long>(random() % held[at].size()));
-                    tries[at]->apply(std::vector<ObjectTrie::Change>{{victim->first, std::nullopt}});
+                    tries[at]->apply(
+                        std::vector<ObjectTrie::Change>{{victim->first, std::nullopt}});
                     held[at].erase(victim);
                 }
             }
@@ -729,8 +730,8 @@ MACHA_FAST_TEST("object_ledger", test_a_trie_rewrites_its_node_file_and_stays_bo
     }
     const auto stats = trie.stats();
     CHECK(stats.rewrites > 0);
-    CHECK(stats.node_file_bytes <= 2 * stats.live_bytes + options.rewrite_floor_bytes +
-                                       options.checkpoint_bytes * 4);
+    CHECK(stats.node_file_bytes <=
+          2 * stats.live_bytes + options.rewrite_floor_bytes + options.checkpoint_bytes * 4);
     // Exactly one node file is left.
     size_t node_files = 0;
     for (const auto& entry : std::filesystem::directory_iterator(dir.path()))
@@ -1020,29 +1021,32 @@ MACHA_HEAVY_TEST("object_ledger", test_a_large_trie_opens_within_the_bound) {
         trie.apply(tail);
         REQUIRE(trie.stats().journal_bytes > 900 * 1024);
     }
-    const auto built_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+    const auto built_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
 
     const auto open_started = Clock::now();
     ObjectTrie trie(dir.path(), key_of(13), options);
-    const auto open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - open_started).count();
+    const auto open_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - open_started).count();
 
     const auto cold_started = Clock::now();
     for (const auto& id : sample)
         CHECK(trie.get(id).has_value());
-    const auto cold_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - cold_started).count();
+    const auto cold_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - cold_started).count();
     const auto warm_started = Clock::now();
     for (const auto& id : sample)
         CHECK(trie.get(id).has_value());
-    const auto warm_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - warm_started).count();
+    const auto warm_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - warm_started).count();
     const auto stats = trie.stats();
     Log::info("ledger measure records=" + std::to_string(trie.size()) +
               " built_ms=" + std::to_string(built_ms) + " open_ms=" + std::to_string(open_ms) +
               " cold_lookup_us=" + std::to_string(cold_us / static_cast<long long>(sample.size())) +
               " warm_lookup_us=" + std::to_string(warm_us / static_cast<long long>(sample.size())) +
               " node_file_bytes=" + std::to_string(stats.node_file_bytes) +
-              " live_bytes=" + std::to_string(stats.live_bytes) +
-              " cache_bytes=" + std::to_string(stats.cache_bytes) +
-              " loads=" + std::to_string(stats.loads));
+              " live_bytes=" + std::to_string(stats.live_bytes) + " cache_bytes=" +
+              std::to_string(stats.cache_bytes) + " loads=" + std::to_string(stats.loads));
     CHECK(open_ms < 30000);
     CHECK(stats.cache_bytes <= options.cache_bytes + 64 * 1024);
 }

@@ -24,16 +24,19 @@ Hash256 parse_hash(const std::string& text) {
 
 Bytes read_bytes(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open acceptance file: " + path.string());
+    if (!input)
+        throw std::runtime_error("cannot open acceptance file: " + path.string());
     return Bytes(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
 void write_bytes(const std::filesystem::path& path, std::span<const uint8_t> bytes) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) throw std::runtime_error("cannot create acceptance file: " + path.string());
+    if (!output)
+        throw std::runtime_error("cannot create acceptance file: " + path.string());
     output.write(reinterpret_cast<const char*>(bytes.data()),
                  static_cast<std::streamsize>(bytes.size()));
-    if (!output) throw std::runtime_error("cannot write acceptance file: " + path.string());
+    if (!output)
+        throw std::runtime_error("cannot write acceptance file: " + path.string());
 }
 
 void print_entry(std::string_view label, const FsEntry& entry) {
@@ -76,16 +79,19 @@ void diff_heads(MetadataReplica& replica) {
     }
     if (left_snapshot.catalogue_root != right_snapshot.catalogue_root)
         std::cout << "catalogue_root differs left="
-                  << (left_snapshot.catalogue_root ? to_string(*left_snapshot.catalogue_root) : "none")
+                  << (left_snapshot.catalogue_root ? to_string(*left_snapshot.catalogue_root)
+                                                   : "none")
                   << " right="
-                  << (right_snapshot.catalogue_root ? to_string(*right_snapshot.catalogue_root) : "none")
+                  << (right_snapshot.catalogue_root ? to_string(*right_snapshot.catalogue_root)
+                                                    : "none")
                   << '\n';
     for (const auto& [origin, sequence] : left_snapshot.mutation_sequences) {
         const auto found = right_snapshot.mutation_sequences.find(origin);
         std::cout << "mutation_origin=" << to_string(origin) << " left_sequence=" << sequence
-                  << " right_sequence=" << (found != right_snapshot.mutation_sequences.end()
-                                                ? std::to_string(found->second)
-                                                : "absent")
+                  << " right_sequence="
+                  << (found != right_snapshot.mutation_sequences.end()
+                          ? std::to_string(found->second)
+                          : "absent")
                   << '\n';
     }
 }
@@ -93,26 +99,30 @@ void diff_heads(MetadataReplica& replica) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: macha-metadata-repair STATE_PATH KEY_FILE\n"
-                     "       macha-metadata-repair --export-acceptance STATE_PATH KEY_FILE HASH FILE\n"
-                     "       macha-metadata-repair --import-acceptance STATE_PATH KEY_FILE FILE\n"
-                     "       macha-metadata-repair --diff-heads STATE_PATH KEY_FILE\n";
+        std::cerr
+            << "usage: macha-metadata-repair STATE_PATH KEY_FILE\n"
+               "       macha-metadata-repair --export-acceptance STATE_PATH KEY_FILE HASH FILE\n"
+               "       macha-metadata-repair --import-acceptance STATE_PATH KEY_FILE FILE\n"
+               "       macha-metadata-repair --diff-heads STATE_PATH KEY_FILE\n";
         return 2;
     }
     try {
         const bool command = std::string_view(argv[1]).starts_with("--");
         const auto state_index = command ? 2 : 1;
         const auto key_index = command ? 3 : 2;
-        if (argc <= key_index) throw std::runtime_error("state path and key file are required");
+        if (argc <= key_index)
+            throw std::runtime_error("state path and key file are required");
         const auto keys = load_cluster_keys(argv[key_index]);
         MetadataReplica replica(std::filesystem::path(argv[state_index]), keys.storage);
         if (command) {
             const std::string action = argv[1];
             if (action == "--export-acceptance") {
-                if (argc != 6) throw std::runtime_error("hash and output file are required");
+                if (argc != 6)
+                    throw std::runtime_error("hash and output file are required");
                 const auto hash = parse_hash(argv[4]);
                 const auto acceptance = replica.acceptance(hash);
-                if (!acceptance) throw std::runtime_error("metadata head is not accepted here");
+                if (!acceptance)
+                    throw std::runtime_error("metadata head is not accepted here");
                 write_bytes(argv[5], encode_metadata_acceptance(*acceptance));
                 std::cout << "exported generation=" << acceptance->generation
                           << " hash=" << to_string(acceptance->hash)
@@ -121,12 +131,14 @@ int main(int argc, char** argv) {
                 return 0;
             }
             if (action == "--import-acceptance") {
-                if (argc != 5) throw std::runtime_error("acceptance file is required");
+                if (argc != 5)
+                    throw std::runtime_error("acceptance file is required");
                 const auto acceptance = decode_metadata_acceptance(read_bytes(argv[4]));
                 if (!replica.history_contains(acceptance.hash))
                     throw std::runtime_error("accepted record is absent from local history");
                 if (!replica.accept_commit(acceptance))
-                    throw std::runtime_error("acceptance certificate failed local policy validation");
+                    throw std::runtime_error(
+                        "acceptance certificate failed local policy validation");
                 std::cout << "imported generation=" << acceptance.generation
                           << " hash=" << to_string(acceptance.hash)
                           << " required=" << acceptance.required
@@ -145,15 +157,13 @@ int main(int argc, char** argv) {
                   << " previous=" << to_string(committed.previous) << '\n';
 
         auto heads = replica.accepted_heads();
-        std::sort(heads.begin(), heads.end(), [](const auto& left, const auto& right) {
-            return left.hash < right.hash;
-        });
+        std::sort(heads.begin(), heads.end(),
+                  [](const auto& left, const auto& right) { return left.hash < right.hash; });
         std::cout << "accepted_heads=" << heads.size() << '\n';
         for (const auto& head : heads) {
             const auto certificate = replica.acceptance(head.hash);
             const auto snapshot = decode_snapshot(head.payload);
-            std::cout << "head generation=" << head.generation
-                      << " hash=" << to_string(head.hash)
+            std::cout << "head generation=" << head.generation << " hash=" << to_string(head.hash)
                       << " previous=" << to_string(head.previous)
                       << " required=" << (certificate ? certificate->required : 0)
                       << " witnesses=" << (certificate ? certificate->replicas.size() : 0)
@@ -161,9 +171,8 @@ int main(int argc, char** argv) {
                       << " garbage=" << snapshot.garbage.size()
                       << " mutation_origins=" << snapshot.mutation_sequences.size()
                       << " namespace=" << to_string(metadata_namespace_signature(snapshot))
-                      << " catalogue=" << (snapshot.catalogue_root
-                                                ? to_string(*snapshot.catalogue_root)
-                                                : "none")
+                      << " catalogue="
+                      << (snapshot.catalogue_root ? to_string(*snapshot.catalogue_root) : "none")
                       << '\n';
         }
         for (size_t left = 0; left < heads.size(); ++left) {
@@ -187,17 +196,17 @@ int main(int argc, char** argv) {
                         ++changed;
                 }
                 for (const auto& [path, _] : right_snapshot.entries)
-                    if (!left_snapshot.entries.contains(path)) ++right_only;
-                const auto common = replica.history_common_ancestor(heads[left].hash,
-                                                                    heads[right].hash);
+                    if (!left_snapshot.entries.contains(path))
+                        ++right_only;
+                const auto common =
+                    replica.history_common_ancestor(heads[left].hash, heads[right].hash);
                 std::cout << "common left=" << to_string(heads[left].hash)
                           << " right=" << to_string(heads[right].hash)
                           << " hash=" << (common ? to_string(*common) : "none")
                           << " left_dominates=" << dominates(left_snapshot, right_snapshot)
                           << " right_dominates=" << dominates(right_snapshot, left_snapshot)
                           << " left_only_entries=" << left_only
-                          << " right_only_entries=" << right_only
-                          << " changed_entries=" << changed
+                          << " right_only_entries=" << right_only << " changed_entries=" << changed
                           << " catalogue_equal="
                           << (left_snapshot.catalogue_root == right_snapshot.catalogue_root)
                           << '\n';
@@ -205,12 +214,14 @@ int main(int argc, char** argv) {
         }
 
         std::vector<Hash256> pending;
-        for (const auto& head : heads) pending.push_back(head.hash);
+        for (const auto& head : heads)
+            pending.push_back(head.hash);
         std::set<Hash256> seen;
         while (!pending.empty()) {
             const auto hash = pending.back();
             pending.pop_back();
-            if (!seen.insert(hash).second) continue;
+            if (!seen.insert(hash).second)
+                continue;
             const auto entry = replica.history_entry(hash);
             if (!entry) {
                 std::cout << "missing hash=" << to_string(hash) << '\n';
@@ -219,8 +230,8 @@ int main(int argc, char** argv) {
             std::cout << "history generation=" << entry->generation
                       << " hash=" << to_string(entry->hash)
                       << " previous=" << to_string(entry->previous)
-                      << " previous_known=" << entry->previous_known
-                      << " body=" << (entry->body == MetadataHistoryEntry::Body::full ? "full" : "delta")
+                      << " previous_known=" << entry->previous_known << " body="
+                      << (entry->body == MetadataHistoryEntry::Body::full ? "full" : "delta")
                       << " merge_parents=" << entry->merge_parents.size() << '\n';
             if (entry->previous != Hash256{}) {
                 if (entry->previous_known)

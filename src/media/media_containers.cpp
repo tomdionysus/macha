@@ -13,10 +13,9 @@ namespace {
 enum class Kind : uint8_t { video, audio };
 
 bool same_token(std::string_view left, std::string_view right) {
-    return std::equal(left.begin(), left.end(), right.begin(), right.end(),
-                      [](unsigned char a, unsigned char b) {
-                          return std::tolower(a) == std::tolower(b);
-                      });
+    return std::equal(
+        left.begin(), left.end(), right.begin(), right.end(),
+        [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
 }
 
 // One row per recognised file name: the container it claims and whether it is
@@ -107,8 +106,8 @@ constexpr std::array<CarriageFact, 10> carriage_facts{{
     {"mp2", Kind::audio, false, true},
 }};
 
-constexpr std::array<std::string_view, 6> webvtt_source_codecs{
-    "ass", "mov_text", "ssa", "subrip", "text", "webvtt"};
+constexpr std::array<std::string_view, 6> webvtt_source_codecs{"ass",    "mov_text", "ssa",
+                                                               "subrip", "text",     "webvtt"};
 
 // Content-Type by probed container: one type with a picture, one for sound
 // alone. An empty audio type means the container is not used for sound alone.
@@ -166,19 +165,22 @@ constexpr std::array<BookFact, 8> book_facts{{
 
 const ExtensionFact* extension_fact(std::string_view ext) {
     for (const auto& fact : extension_facts)
-        if (fact.extension == ext) return &fact;
+        if (fact.extension == ext)
+            return &fact;
     return nullptr;
 }
 
 std::string_view container_of_format_token(std::string_view token) {
     for (const auto& fact : format_facts)
-        if (same_token(fact.format, token)) return fact.container;
+        if (same_token(fact.format, token))
+            return fact.container;
     return {};
 }
 
-bool carries(std::string_view codec, Kind kind, bool CarriageFact::*container) {
+bool carries(std::string_view codec, Kind kind, bool CarriageFact::* container) {
     for (const auto& fact : carriage_facts)
-        if (fact.kind == kind && same_token(fact.codec, codec)) return fact.*container;
+        if (fact.kind == kind && same_token(fact.codec, codec))
+            return fact.*container;
     return false;
 }
 
@@ -187,11 +189,11 @@ bool carries(std::string_view codec, Kind kind, bool CarriageFact::*container) {
 std::string path_extension(std::string_view path) {
     const auto slash = path.find_last_of('/');
     const auto dot = path.find_last_of('.');
-    if (dot == std::string_view::npos || (slash != std::string_view::npos && dot < slash)) return {};
+    if (dot == std::string_view::npos || (slash != std::string_view::npos && dot < slash))
+        return {};
     std::string ext(path.substr(dot));
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return ext;
 }
 
@@ -217,29 +219,33 @@ std::string container_for_format(std::string_view format, std::string_view path)
     size_t begin = 0;
     while (begin <= format.size()) {
         const auto end = format.find(',', begin);
-        const auto token = format.substr(begin, end == std::string_view::npos
-                                                    ? format.size() - begin
-                                                    : end - begin);
+        const auto token = format.substr(
+            begin, end == std::string_view::npos ? format.size() - begin : end - begin);
         if (!token.empty()) {
-            if (first_token.empty()) first_token = token;
+            if (first_token.empty())
+                first_token = token;
             if (const auto container = container_of_format_token(token); !container.empty())
                 probed.insert(container);
         }
-        if (end == std::string_view::npos) break;
+        if (end == std::string_view::npos)
+            break;
         begin = end + 1;
     }
     if (!probed.empty()) {
-        if (!by_name.empty() && probed.contains(by_name)) return by_name;
+        if (!by_name.empty() && probed.contains(by_name))
+            return by_name;
         return std::string(*probed.begin());
     }
-    if (!by_name.empty()) return by_name;
+    if (!by_name.empty())
+        return by_name;
     // Unknown to both tables: libav's own name beats silence.
     return std::string(first_token);
 }
 
 std::string direct_mime(std::string_view container, bool picture) {
     for (const auto& fact : container_mimes) {
-        if (fact.container != container) continue;
+        if (fact.container != container)
+            continue;
         const auto preferred = picture ? fact.video : fact.audio;
         const auto other = picture ? fact.audio : fact.video;
         return std::string(preferred.empty() ? other : preferred);
@@ -250,7 +256,8 @@ std::string direct_mime(std::string_view container, bool picture) {
 std::string segment_mime(std::string_view name) {
     const auto ext = path_extension(name);
     for (const auto& fact : generated_facts)
-        if (fact.extension == ext) return std::string(fact.mime);
+        if (fact.extension == ext)
+            return std::string(fact.mime);
     return "application/octet-stream";
 }
 
@@ -260,14 +267,16 @@ bool mobi_extension(std::string_view ext) {
 
 bool book_extension(std::string_view ext) {
     for (const auto& fact : book_facts)
-        if (fact.extension == ext) return true;
+        if (fact.extension == ext)
+            return true;
     return false;
 }
 
 std::string file_mime(std::string_view path) {
     const auto ext = path_extension(path);
     for (const auto& fact : book_facts)
-        if (fact.extension == ext) return std::string(fact.mime);
+        if (fact.extension == ext)
+            return std::string(fact.mime);
     if (const auto* fact = extension_fact(ext); fact && !fact->container.empty())
         return direct_mime(fact->container, fact->kind == Kind::video);
     return "application/octet-stream";

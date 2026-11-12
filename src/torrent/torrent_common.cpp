@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // BitTorrent acquisition's core half, free of libtorrent: job types, API and
 // wire JSON, URI sanitisers and the Torznab client. The engine is in the plugin.
-#include "torrent/torrent.hpp"
 #include "acquisition/catalogue_state.hpp"
+#include "torrent/torrent.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -22,15 +22,19 @@ namespace macha {
 namespace {
 
 std::string trim(std::string value) {
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
+        value.erase(value.begin());
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
+        value.pop_back();
     return value;
 }
 
 std::string read_secret(const std::optional<std::filesystem::path>& path) {
-    if (!path) return {};
+    if (!path)
+        return {};
     std::ifstream in(*path, std::ios::binary);
-    if (!in) throw std::runtime_error("cannot read torrent provider API key file: " + path->string());
+    if (!in)
+        throw std::runtime_error("cannot read torrent provider API key file: " + path->string());
     std::ostringstream out;
     out << in.rdbuf();
     return trim(out.str());
@@ -38,9 +42,12 @@ std::string read_secret(const std::optional<std::filesystem::path>& path) {
 
 std::string url_decode(std::string_view value) {
     auto nibble = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
         return -1;
     };
     std::string out;
@@ -64,8 +71,8 @@ std::string url_encode(std::string_view value) {
     static constexpr char hex[] = "0123456789ABCDEF";
     std::string out;
     for (unsigned char c : value) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
             out.push_back(static_cast<char>(c));
         } else {
             out.push_back('%');
@@ -77,17 +84,22 @@ std::string url_encode(std::string_view value) {
 }
 
 bool safe_tracker_url(std::string_view value) {
-    return value.starts_with("http://") || value.starts_with("https://") || value.starts_with("udp://");
+    return value.starts_with("http://") || value.starts_with("https://") ||
+           value.starts_with("udp://");
 }
 
 std::string sanitize_text(std::string value, size_t limit = 1024) {
     std::erase_if(value, [](unsigned char c) { return c < 0x20 && c != '\t'; });
-    if (value.size() > limit) value.resize(limit);
+    if (value.size() > limit)
+        value.resize(limit);
     return trim(std::move(value));
 }
 
 std::string xml_decode(std::string value) {
-    struct Entity { const char* encoded; const char* decoded; };
+    struct Entity {
+        const char* encoded;
+        const char* decoded;
+    };
     static constexpr Entity entities[] = {
         {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&apos;", "'"}};
     for (const auto& entity : entities) {
@@ -103,13 +115,16 @@ std::string xml_decode(std::string value) {
 std::optional<std::string> xml_tag(std::string_view item, std::string_view tag) {
     const auto open = "<" + std::string(tag);
     auto start = item.find(open);
-    if (start == std::string_view::npos) return {};
+    if (start == std::string_view::npos)
+        return {};
     start = item.find('>', start + open.size());
-    if (start == std::string_view::npos) return {};
+    if (start == std::string_view::npos)
+        return {};
     ++start;
     const auto close = "</" + std::string(tag) + ">";
     const auto end = item.find(close, start);
-    if (end == std::string_view::npos) return {};
+    if (end == std::string_view::npos)
+        return {};
     auto value = std::string(item.substr(start, end - start));
     if (value.starts_with("<![CDATA[") && value.ends_with("]]>") && value.size() >= 12)
         value = value.substr(9, value.size() - 12);
@@ -119,12 +134,15 @@ std::optional<std::string> xml_tag(std::string_view item, std::string_view tag) 
 std::optional<std::string> xml_attribute(std::string_view element, std::string_view name) {
     const auto needle = std::string(name) + "=";
     auto pos = element.find(needle);
-    if (pos == std::string_view::npos) return {};
+    if (pos == std::string_view::npos)
+        return {};
     pos += needle.size();
-    if (pos >= element.size() || (element[pos] != '\'' && element[pos] != '"')) return {};
+    if (pos >= element.size() || (element[pos] != '\'' && element[pos] != '"'))
+        return {};
     const char quote = element[pos++];
     const auto end = element.find(quote, pos);
-    if (end == std::string_view::npos) return {};
+    if (end == std::string_view::npos)
+        return {};
     return xml_decode(std::string(element.substr(pos, end - pos)));
 }
 
@@ -132,10 +150,12 @@ std::optional<std::string> torznab_attr(std::string_view item, std::string_view 
     size_t pos = 0;
     while ((pos = item.find("<torznab:attr", pos)) != std::string_view::npos) {
         const auto end = item.find('>', pos);
-        if (end == std::string_view::npos) break;
+        if (end == std::string_view::npos)
+            break;
         const auto element = item.substr(pos, end - pos + 1);
         auto name = xml_attribute(element, "name");
-        if (name && *name == wanted) return xml_attribute(element, "value");
+        if (name && *name == wanted)
+            return xml_attribute(element, "value");
         pos = end + 1;
     }
     return {};
@@ -146,44 +166,71 @@ std::optional<uint64_t> parse_u64(std::string_view value) {
     const auto* begin = value.data();
     const auto* end = begin + value.size();
     auto [at, ec] = std::from_chars(begin, end, out);
-    if (ec != std::errc{} || at != end) return {};
+    if (ec != std::errc{} || at != end)
+        return {};
     return out;
 }
 } // namespace
 
 std::string torrent_job_state_name(TorrentJobState state) {
     switch (state) {
-    case TorrentJobState::queued: return "queued";
-    case TorrentJobState::metadata: return "metadata";
-    case TorrentJobState::downloading: return "downloading";
-    case TorrentJobState::verify_queued: return "verify_queued";
-    case TorrentJobState::verifying: return "verifying";
-    case TorrentJobState::downloaded: return "downloaded";
-    case TorrentJobState::importing: return "importing";
-    case TorrentJobState::cataloguing: return "cataloguing";
-    case TorrentJobState::paused: return "paused";
-    case TorrentJobState::blocked: return "blocked";
-    case TorrentJobState::completed: return "completed";
-    case TorrentJobState::cancelled: return "cancelled";
-    case TorrentJobState::failed: return "failed";
+    case TorrentJobState::queued:
+        return "queued";
+    case TorrentJobState::metadata:
+        return "metadata";
+    case TorrentJobState::downloading:
+        return "downloading";
+    case TorrentJobState::verify_queued:
+        return "verify_queued";
+    case TorrentJobState::verifying:
+        return "verifying";
+    case TorrentJobState::downloaded:
+        return "downloaded";
+    case TorrentJobState::importing:
+        return "importing";
+    case TorrentJobState::cataloguing:
+        return "cataloguing";
+    case TorrentJobState::paused:
+        return "paused";
+    case TorrentJobState::blocked:
+        return "blocked";
+    case TorrentJobState::completed:
+        return "completed";
+    case TorrentJobState::cancelled:
+        return "cancelled";
+    case TorrentJobState::failed:
+        return "failed";
     }
     return "failed";
 }
 
 std::optional<TorrentJobState> parse_torrent_job_state(std::string_view state) {
-    if (state == "queued") return TorrentJobState::queued;
-    if (state == "metadata") return TorrentJobState::metadata;
-    if (state == "downloading") return TorrentJobState::downloading;
-    if (state == "verify_queued") return TorrentJobState::verify_queued;
-    if (state == "verifying") return TorrentJobState::verifying;
-    if (state == "downloaded") return TorrentJobState::downloaded;
-    if (state == "importing") return TorrentJobState::importing;
-    if (state == "cataloguing") return TorrentJobState::cataloguing;
-    if (state == "paused") return TorrentJobState::paused;
-    if (state == "blocked") return TorrentJobState::blocked;
-    if (state == "completed") return TorrentJobState::completed;
-    if (state == "cancelled") return TorrentJobState::cancelled;
-    if (state == "failed") return TorrentJobState::failed;
+    if (state == "queued")
+        return TorrentJobState::queued;
+    if (state == "metadata")
+        return TorrentJobState::metadata;
+    if (state == "downloading")
+        return TorrentJobState::downloading;
+    if (state == "verify_queued")
+        return TorrentJobState::verify_queued;
+    if (state == "verifying")
+        return TorrentJobState::verifying;
+    if (state == "downloaded")
+        return TorrentJobState::downloaded;
+    if (state == "importing")
+        return TorrentJobState::importing;
+    if (state == "cataloguing")
+        return TorrentJobState::cataloguing;
+    if (state == "paused")
+        return TorrentJobState::paused;
+    if (state == "blocked")
+        return TorrentJobState::blocked;
+    if (state == "completed")
+        return TorrentJobState::completed;
+    if (state == "cancelled")
+        return TorrentJobState::cancelled;
+    if (state == "failed")
+        return TorrentJobState::failed;
     return {};
 }
 
@@ -236,7 +283,8 @@ Json torrent_job_api_json(const TorrentJob& job) {
     out["updated_unix_ms"] = job.updated_unix_ms;
     out["error_code"] = job.error_code.empty() ? Json(nullptr) : Json(job.error_code);
     out["error"] = job.error.empty() ? Json(nullptr) : Json(job.error);
-    out["publication"] = job.publication ? torrent_publication_json(*job.publication) : Json(nullptr);
+    out["publication"] =
+        job.publication ? torrent_publication_json(*job.publication) : Json(nullptr);
     out["waiting_reason"] = job.waiting_reason.empty() ? Json(nullptr) : Json(job.waiting_reason);
     out["swarm"] = job.swarm ? torrent_swarm_json(*job.swarm) : Json(nullptr);
     return Json(std::move(out));
@@ -277,7 +325,8 @@ TorrentJobChange torrent_job_change(const TorrentJob& before, const TorrentJob& 
         o.erase("uploaded_total");
         return json.dump();
     };
-    if (record(before) != record(after)) return TorrentJobChange::record;
+    if (record(before) != record(after))
+        return TorrentJobChange::record;
     if (before.bytes_completed != after.bytes_completed ||
         before.uploaded_total != after.uploaded_total)
         return TorrentJobChange::progress;
@@ -286,29 +335,49 @@ TorrentJobChange torrent_job_change(const TorrentJob& before, const TorrentJob& 
 
 TorrentJob parse_torrent_job(const Json& value) {
     TorrentJob job;
-    if (const auto* v = value.find("id")) job.id = v->asString();
-    if (const auto* v = value.find("name")) job.name = v->asString();
-    if (const auto* v = value.find("source_uri")) job.source_uri = v->asString();
-    if (const auto* v = value.find("info_hash")) job.info_hash = v->asString();
-    if (const auto* v = value.find("save_path")) job.save_path = v->asString();
+    if (const auto* v = value.find("id"))
+        job.id = v->asString();
+    if (const auto* v = value.find("name"))
+        job.name = v->asString();
+    if (const auto* v = value.find("source_uri"))
+        job.source_uri = v->asString();
+    if (const auto* v = value.find("info_hash"))
+        job.info_hash = v->asString();
+    if (const auto* v = value.find("save_path"))
+        job.save_path = v->asString();
     if (const auto* v = value.find("state")) {
-        if (auto state = parse_torrent_job_state(v->asString())) job.state = *state;
+        if (auto state = parse_torrent_job_state(v->asString()))
+            job.state = *state;
     }
-    if (const auto* v = value.find("bytes_total")) job.bytes_total = v->asUInt64();
-    if (const auto* v = value.find("bytes_completed")) job.bytes_completed = v->asUInt64();
-    if (const auto* v = value.find("uploaded_total")) job.uploaded_total = v->asUInt64();
-    if (const auto* v = value.find("catalogue_total")) job.catalogue_total = static_cast<size_t>(v->asUInt64());
-    if (const auto* v = value.find("catalogue_pending")) job.catalogue_pending = static_cast<size_t>(v->asUInt64());
-    if (const auto* v = value.find("catalogue_catalogued")) job.catalogue_catalogued = static_cast<size_t>(v->asUInt64());
-    if (const auto* v = value.find("catalogue_no_match")) job.catalogue_no_match = static_cast<size_t>(v->asUInt64());
-    if (const auto* v = value.find("catalogue_failed")) job.catalogue_failed = static_cast<size_t>(v->asUInt64());
-    if (const auto* v = value.find("ingest_job_id"); v && !v->isNull()) job.ingest_job_id = v->asString();
-    if (const auto* v = value.find("created_unix_ms")) job.created_unix_ms = v->asUInt64();
-    if (const auto* v = value.find("updated_unix_ms")) job.updated_unix_ms = v->asUInt64();
-    if (const auto* v = value.find("error")) job.error = v->asString();
-    if (const auto* v = value.find("error_code")) job.error_code = v->asString();
+    if (const auto* v = value.find("bytes_total"))
+        job.bytes_total = v->asUInt64();
+    if (const auto* v = value.find("bytes_completed"))
+        job.bytes_completed = v->asUInt64();
+    if (const auto* v = value.find("uploaded_total"))
+        job.uploaded_total = v->asUInt64();
+    if (const auto* v = value.find("catalogue_total"))
+        job.catalogue_total = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_pending"))
+        job.catalogue_pending = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_catalogued"))
+        job.catalogue_catalogued = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_no_match"))
+        job.catalogue_no_match = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_failed"))
+        job.catalogue_failed = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("ingest_job_id"); v && !v->isNull())
+        job.ingest_job_id = v->asString();
+    if (const auto* v = value.find("created_unix_ms"))
+        job.created_unix_ms = v->asUInt64();
+    if (const auto* v = value.find("updated_unix_ms"))
+        job.updated_unix_ms = v->asUInt64();
+    if (const auto* v = value.find("error"))
+        job.error = v->asString();
+    if (const auto* v = value.find("error_code"))
+        job.error_code = v->asString();
     // A record with an error but no code gets one: an error never shows without a code.
-    if (!job.error.empty() && job.error_code.empty()) job.error_code = "torrent_failed";
+    if (!job.error.empty() && job.error_code.empty())
+        job.error_code = "torrent_failed";
     return job;
 }
 
@@ -321,7 +390,8 @@ Json torrent_job_wire_json(const TorrentJob& job) {
     out["peers"] = static_cast<uint64_t>(job.peers);
     out["seeds"] = static_cast<uint64_t>(job.seeds);
     out["eta_seconds"] = optional_u64(job.eta_seconds);
-    out["publication"] = job.publication ? torrent_publication_json(*job.publication) : Json(nullptr);
+    out["publication"] =
+        job.publication ? torrent_publication_json(*job.publication) : Json(nullptr);
     out["waiting_reason"] = job.waiting_reason;
     out["swarm"] = job.swarm ? torrent_swarm_json(*job.swarm) : Json(nullptr);
     return out;
@@ -329,11 +399,16 @@ Json torrent_job_wire_json(const TorrentJob& job) {
 
 TorrentJob parse_torrent_job_wire(const Json& value) {
     auto job = parse_torrent_job(value);
-    if (const auto* v = value.find("download_rate")) job.download_rate = v->asUInt64();
-    if (const auto* v = value.find("upload_rate")) job.upload_rate = v->asUInt64();
-    if (const auto* v = value.find("peers")) job.peers = static_cast<unsigned>(v->asUInt64());
-    if (const auto* v = value.find("seeds")) job.seeds = static_cast<unsigned>(v->asUInt64());
-    if (const auto* v = value.find("eta_seconds"); v && !v->isNull()) job.eta_seconds = v->asUInt64();
+    if (const auto* v = value.find("download_rate"))
+        job.download_rate = v->asUInt64();
+    if (const auto* v = value.find("upload_rate"))
+        job.upload_rate = v->asUInt64();
+    if (const auto* v = value.find("peers"))
+        job.peers = static_cast<unsigned>(v->asUInt64());
+    if (const auto* v = value.find("seeds"))
+        job.seeds = static_cast<unsigned>(v->asUInt64());
+    if (const auto* v = value.find("eta_seconds"); v && !v->isNull())
+        job.eta_seconds = v->asUInt64();
     if (const auto* v = value.find("publication"); v && v->isObject()) {
         TorrentJob::Publication p;
         const auto number = [&](const char* key) {
@@ -347,12 +422,16 @@ TorrentJob parse_torrent_job_wire(const Json& value) {
         p.progress_age_ms = number("progress_age_ms");
         job.publication = p;
     }
-    if (const auto* v = value.find("waiting_reason"); v && v->isString()) job.waiting_reason = v->asString();
+    if (const auto* v = value.find("waiting_reason"); v && v->isString())
+        job.waiting_reason = v->asString();
     if (const auto* v = value.find("swarm"); v && v->isObject()) {
         TorrentJob::Swarm swarm;
-        if (const auto* f = v->find("seeds"); f && !f->isNull()) swarm.seeds = f->asUInt64();
-        if (const auto* f = v->find("peers"); f && !f->isNull()) swarm.peers = f->asUInt64();
-        if (const auto* f = v->find("availability"); f && f->isNumber()) swarm.availability = f->asNumber();
+        if (const auto* f = v->find("seeds"); f && !f->isNull())
+            swarm.seeds = f->asUInt64();
+        if (const auto* f = v->find("peers"); f && !f->isNull())
+            swarm.peers = f->asUInt64();
+        if (const auto* f = v->find("availability"); f && f->isNumber())
+            swarm.availability = f->asNumber();
         job.swarm = swarm;
     }
     return job;
@@ -360,25 +439,32 @@ TorrentJob parse_torrent_job_wire(const Json& value) {
 
 std::optional<std::string> http_origin(std::string_view value) {
     const auto scheme_end = value.find("://");
-    if (scheme_end == std::string_view::npos) return {};
+    if (scheme_end == std::string_view::npos)
+        return {};
     const auto scheme = value.substr(0, scheme_end);
-    if (scheme != "http" && scheme != "https") return {};
+    if (scheme != "http" && scheme != "https")
+        return {};
     const auto authority_start = scheme_end + 3;
     auto authority_end = value.find_first_of("/?#", authority_start);
-    if (authority_end == std::string_view::npos) authority_end = value.size();
-    if (authority_end == authority_start) return {};
+    if (authority_end == std::string_view::npos)
+        authority_end = value.size();
+    if (authority_end == authority_start)
+        return {};
     return std::string(value.substr(0, authority_end));
 }
 
-std::optional<std::string> provider_download_url(std::string_view base, std::string_view candidate) {
+std::optional<std::string> provider_download_url(std::string_view base,
+                                                 std::string_view candidate) {
     const auto origin = http_origin(base);
-    if (!origin) return {};
+    if (!origin)
+        return {};
     std::string absolute;
     if (candidate.starts_with("/")) {
         absolute = *origin + std::string(candidate);
     } else {
         const auto candidate_origin = http_origin(candidate);
-        if (!candidate_origin || *candidate_origin != *origin) return {};
+        if (!candidate_origin || *candidate_origin != *origin)
+            return {};
         absolute = std::string(candidate);
     }
     return absolute;
@@ -389,7 +475,8 @@ bool safe_torrent_fetch_url(std::string_view value) {
 }
 
 std::optional<std::string> sanitize_magnet_uri(std::string_view uri) {
-    if (!uri.starts_with("magnet:?")) return {};
+    if (!uri.starts_with("magnet:?"))
+        return {};
     std::vector<std::string> xts;
     std::optional<std::string> dn;
     std::vector<std::string> trackers;
@@ -397,7 +484,8 @@ std::optional<std::string> sanitize_magnet_uri(std::string_view uri) {
     size_t pos = 0;
     while (pos <= query.size()) {
         const auto amp = query.find('&', pos);
-        const auto field = query.substr(pos, amp == std::string_view::npos ? query.size() - pos : amp - pos);
+        const auto field =
+            query.substr(pos, amp == std::string_view::npos ? query.size() - pos : amp - pos);
         const auto equal = field.find('=');
         if (equal != std::string_view::npos) {
             const auto key = field.substr(0, equal);
@@ -407,72 +495,96 @@ std::optional<std::string> sanitize_magnet_uri(std::string_view uri) {
                 xts.push_back(std::move(value));
             } else if (key == "dn" && !dn) {
                 dn = sanitize_text(std::move(value), 512);
-            } else if (key == "tr" && trackers.size() < 32 && value.size() <= 2048 && safe_tracker_url(value)) {
+            } else if (key == "tr" && trackers.size() < 32 && value.size() <= 2048 &&
+                       safe_tracker_url(value)) {
                 trackers.push_back(std::move(value));
             }
         }
-        if (amp == std::string_view::npos) break;
+        if (amp == std::string_view::npos)
+            break;
         pos = amp + 1;
     }
-    if (xts.empty()) return {};
+    if (xts.empty())
+        return {};
     std::string out = "magnet:?";
     bool first = true;
     auto add = [&](std::string_view key, std::string_view value) {
-        if (!first) out += '&';
+        if (!first)
+            out += '&';
         first = false;
         out += key;
         out += '=';
         out += url_encode(value);
     };
-    for (const auto& value : xts) add("xt", value);
-    if (dn && !dn->empty()) add("dn", *dn);
-    for (const auto& value : trackers) add("tr", value);
+    for (const auto& value : xts)
+        add("xt", value);
+    if (dn && !dn->empty())
+        add("dn", *dn);
+    for (const auto& value : trackers)
+        add("tr", value);
     return out;
 }
 
 TorznabSearchProvider::TorznabSearchProvider(TorrentSearchProviderConfig config,
                                              std::unique_ptr<HttpClient> http)
-    : config_(std::move(config)), http_(std::move(http)), api_key_(read_secret(config_.api_key_file)) {
-    if (!http_) http_ = std::make_unique<CurlHttpClient>();
+    : config_(std::move(config)), http_(std::move(http)),
+      api_key_(read_secret(config_.api_key_file)) {
+    if (!http_)
+        http_ = std::make_unique<CurlHttpClient>();
 }
 
 std::vector<TorrentSearchResult> TorznabSearchProvider::search(std::string_view query) {
-    if (query.empty()) return {};
+    if (query.empty())
+        return {};
     std::string url = config_.url;
     url += url.find('?') == std::string::npos ? '?' : '&';
     url += "t=search&q=" + url_encode(query) + "&limit=" + std::to_string(config_.max_results);
-    if (!api_key_.empty()) url += "&apikey=" + url_encode(api_key_);
+    if (!api_key_.empty())
+        url += "&apikey=" + url_encode(api_key_);
     auto response = http_->get(url, {}, 4 * 1024 * 1024);
     if (response.status < 200 || response.status >= 300)
         throw std::runtime_error("Torznab returned HTTP " + std::to_string(response.status));
     std::string xml(reinterpret_cast<const char*>(response.body.data()), response.body.size());
     auto prefix = trim(xml.substr(0, std::min<size_t>(xml.size(), 256)));
-    if (prefix.starts_with("<!DOCTYPE html") || prefix.starts_with("<html") || prefix.starts_with("<HTML"))
+    if (prefix.starts_with("<!DOCTYPE html") || prefix.starts_with("<html") ||
+        prefix.starts_with("<HTML"))
         throw std::runtime_error("Torznab provider returned HTML instead of XML");
 
     std::vector<TorrentSearchResult> out;
     size_t pos = 0;
-    while (out.size() < config_.max_results && (pos = xml.find("<item", pos)) != std::string::npos) {
+    while (out.size() < config_.max_results &&
+           (pos = xml.find("<item", pos)) != std::string::npos) {
         const auto start = xml.find('>', pos);
-        if (start == std::string::npos) break;
+        if (start == std::string::npos)
+            break;
         const auto end = xml.find("</item>", start + 1);
-        if (end == std::string::npos) break;
+        if (end == std::string::npos)
+            break;
         const auto item = std::string_view(xml).substr(start + 1, end - start - 1);
         TorrentSearchResult result;
         result.provider = config_.name;
-        if (auto title = xml_tag(item, "title")) result.title = sanitize_text(*title, 1024);
-        if (auto published = xml_tag(item, "pubDate")) result.published = sanitize_text(*published, 256);
-        if (auto size = xml_tag(item, "size")) result.size_bytes = parse_u64(*size);
+        if (auto title = xml_tag(item, "title"))
+            result.title = sanitize_text(*title, 1024);
+        if (auto published = xml_tag(item, "pubDate"))
+            result.published = sanitize_text(*published, 256);
+        if (auto size = xml_tag(item, "size"))
+            result.size_bytes = parse_u64(*size);
         if (!result.size_bytes) {
-            if (auto size = torznab_attr(item, "size")) result.size_bytes = parse_u64(*size);
+            if (auto size = torznab_attr(item, "size"))
+                result.size_bytes = parse_u64(*size);
         }
-        if (auto seeds = torznab_attr(item, "seeders")) result.seeders = parse_u64(*seeds);
-        if (auto leeches = torznab_attr(item, "peers")) result.leechers = parse_u64(*leeches);
-        if (auto magnet = torznab_attr(item, "magneturl")) result.magnet_uri = sanitize_magnet_uri(*magnet);
+        if (auto seeds = torznab_attr(item, "seeders"))
+            result.seeders = parse_u64(*seeds);
+        if (auto leeches = torznab_attr(item, "peers"))
+            result.leechers = parse_u64(*leeches);
+        if (auto magnet = torznab_attr(item, "magneturl"))
+            result.magnet_uri = sanitize_magnet_uri(*magnet);
         if (!result.magnet_uri) {
             if (auto link = xml_tag(item, "link")) {
-                if (link->starts_with("magnet:?")) result.magnet_uri = sanitize_magnet_uri(*link);
-                else if (auto safe = provider_download_url(config_.url, *link)) result.torrent_url = *safe;
+                if (link->starts_with("magnet:?"))
+                    result.magnet_uri = sanitize_magnet_uri(*link);
+                else if (auto safe = provider_download_url(config_.url, *link))
+                    result.torrent_url = *safe;
             }
         }
         if (!result.torrent_url) {
@@ -482,11 +594,13 @@ std::vector<TorrentSearchResult> TorznabSearchProvider::search(std::string_view 
                 if (enclosure_end != std::string_view::npos) {
                     auto element = item.substr(enclosure, enclosure_end - enclosure + 1);
                     if (auto value = xml_attribute(element, "url"))
-                        if (auto safe = provider_download_url(config_.url, *value)) result.torrent_url = *safe;
+                        if (auto safe = provider_download_url(config_.url, *value))
+                            result.torrent_url = *safe;
                 }
             }
         }
-        if (!result.title.empty() && (result.magnet_uri || result.torrent_url)) out.push_back(std::move(result));
+        if (!result.title.empty() && (result.magnet_uri || result.torrent_url))
+            out.push_back(std::move(result));
         pos = end + 7;
     }
     return out;
@@ -494,8 +608,10 @@ std::vector<TorrentSearchResult> TorznabSearchProvider::search(std::string_view 
 
 TorrentSearchManager::TorrentSearchManager(const TorrentConfig& config) {
     for (const auto& provider : config.search_providers) {
-        if (!provider.enabled) continue;
-        if (provider.type == "torznab") providers_.push_back(std::make_unique<TorznabSearchProvider>(provider));
+        if (!provider.enabled)
+            continue;
+        if (provider.type == "torznab")
+            providers_.push_back(std::make_unique<TorznabSearchProvider>(provider));
     }
 }
 
@@ -515,12 +631,15 @@ TorrentSearchResponse TorrentSearchManager::search(std::string_view query) {
     const auto expires = unix_ms() + 30ULL * 60 * 1000;
     Lock lock(mutex_);
     for (auto it = acquisitions_.begin(); it != acquisitions_.end();) {
-        if (it->second.expires_unix_ms <= unix_ms()) it = acquisitions_.erase(it);
-        else ++it;
+        if (it->second.expires_unix_ms <= unix_ms())
+            it = acquisitions_.erase(it);
+        else
+            ++it;
     }
     for (auto& result : response.results) {
         auto uri = result.magnet_uri ? result.magnet_uri : result.torrent_url;
-        if (!uri) continue;
+        if (!uri)
+            continue;
         while (acquisitions_.size() >= max_acquisitions_) {
             // At capacity, retire the reference nearest expiry, so repeated
             // searches cannot grow memory without bound.
@@ -539,7 +658,8 @@ TorrentSearchResponse TorrentSearchManager::search(std::string_view query) {
 std::optional<std::string> TorrentSearchManager::resolve(std::string_view acquisition_ref) {
     Lock lock(mutex_);
     auto it = acquisitions_.find(std::string(acquisition_ref));
-    if (it == acquisitions_.end()) return {};
+    if (it == acquisitions_.end())
+        return {};
     if (it->second.expires_unix_ms <= unix_ms()) {
         acquisitions_.erase(it);
         return {};
@@ -580,4 +700,3 @@ std::string torrent_listen_interfaces(const TorrentConfig& config, std::string_v
 }
 
 } // namespace macha
-

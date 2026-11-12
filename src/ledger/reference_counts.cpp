@@ -65,9 +65,9 @@ std::optional<std::vector<ObjectTrie::Change>> changes_for(const ObjectTrie& tri
         const auto now = static_cast<int64_t>(value ? decode_count(*value) : 0);
         if (now + by < 0)
             return std::nullopt;
-        changes.push_back({id, now + by == 0 ? std::nullopt
-                                             : std::optional(encode_count(
-                                                   static_cast<uint64_t>(now + by)))});
+        changes.push_back({id, now + by == 0
+                                   ? std::nullopt
+                                   : std::optional(encode_count(static_cast<uint64_t>(now + by)))});
     }
     return changes;
 }
@@ -76,7 +76,8 @@ std::optional<std::vector<ObjectTrie::Change>> changes_for(const ObjectTrie& tri
 
 ReferenceCounts::ReferenceCounts(std::filesystem::path dir, std::array<uint8_t, 32> key,
                                  size_t cache_bytes)
-    : dir_(std::move(dir)), extents_(dir_ / "extents", key, options_for(cache_bytes - cache_bytes / 4)),
+    : dir_(std::move(dir)),
+      extents_(dir_ / "extents", key, options_for(cache_bytes - cache_bytes / 4)),
       nodes_(dir_ / "nodes", key, options_for(cache_bytes / 4)) {
     // A missing, damaged or dirty state leaves no root: the next count walks.
     std::ifstream in(dir_ / "state", std::ios::binary);
@@ -115,9 +116,9 @@ void ReferenceCounts::write_state(bool clean) const {
     writer.u64(totals_.entries);
     writer.u64(totals_.extent_count);
     const auto& bytes = writer.data();
-    durable_replace_file(dir_ / "state",
-                         std::string_view(reinterpret_cast<const char*>(bytes.data()),
-                                          bytes.size()));
+    durable_replace_file(
+        dir_ / "state",
+        std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
 }
 
 void ReferenceCounts::reset(const std::optional<ObjectId>& root, std::vector<ObjectId> extents,

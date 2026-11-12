@@ -75,10 +75,9 @@ struct Child {
 };
 
 bool branch_boundary(const Child& child, uint8_t level, bool keyed, size_t target) {
-    const auto hash = keyed ? boundary_hash("macha/namespace-tree/branch/v1", level,
-                                            key_span(child.first_key))
-                            : boundary_hash("macha/namespace-tree/extent-branch/v1", level,
-                                            child.id.bytes);
+    const auto hash =
+        keyed ? boundary_hash("macha/namespace-tree/branch/v1", level, key_span(child.first_key))
+              : boundary_hash("macha/namespace-tree/extent-branch/v1", level, child.id.bytes);
     return is_boundary(hash, target);
 }
 
@@ -137,11 +136,10 @@ std::vector<Child> build_spine_level(const std::vector<Child>& children, uint8_t
     if (parents.size() >= children.size() && children.size() > 1)
         build_level(true);
     if (parents.size() >= children.size() && children.size() > 1)
-        throw std::logic_error("namespace tree spine made no progress even packed: level=" +
-                               std::to_string(level) + " keyed=" + (keyed ? "1" : "0") +
-                               " children=" + std::to_string(children.size()) +
-                               " parents=" + std::to_string(parents.size()) +
-                               " max=" + std::to_string(maximum));
+        throw std::logic_error(
+            "namespace tree spine made no progress even packed: level=" + std::to_string(level) +
+            " keyed=" + (keyed ? "1" : "0") + " children=" + std::to_string(children.size()) +
+            " parents=" + std::to_string(parents.size()) + " max=" + std::to_string(maximum));
     return parents;
 }
 
@@ -204,7 +202,8 @@ void read_extent_sequence(const ObjectId& root, const NamespaceNodeStore& store,
     const auto magic = reader.fixed<4>();
     if (magic == extent_leaf_magic) {
         const auto count = reader.u32();
-        out.reserve(out.size() + std::min<size_t>(count, reader.remaining() / encoded_extent_bytes));
+        out.reserve(out.size() +
+                    std::min<size_t>(count, reader.remaining() / encoded_extent_bytes));
         for (uint32_t i = 0; i < count; ++i)
             out.push_back(decode_extent(reader));
         reader.finish();
@@ -275,9 +274,8 @@ void encode_leaf_entry(Writer& writer, const std::string& path, const FsEntry& e
 // whose key `want` accepts; the decision follows the key parse, so a reader
 // pays nothing for entries it walks past.
 template <typename Want>
-std::pair<std::string, FsEntry> decode_leaf_entry_when(Reader& reader,
-                                                       const NamespaceNodeStore& store,
-                                                       const Want& want) {
+std::pair<std::string, FsEntry>
+decode_leaf_entry_when(Reader& reader, const NamespaceNodeStore& store, const Want& want) {
     std::pair<std::string, FsEntry> item;
     item.first = reader.string(8192);
     const bool load_extents = want(item.first);
@@ -415,8 +413,8 @@ ObjectId empty_leaf(NamespaceNodeStore& store) {
 }
 } // namespace
 
-ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, NamespaceNodeStore& store,
-                              const NamespaceTreeLimits& limits) {
+ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries,
+                              NamespaceNodeStore& store, const NamespaceTreeLimits& limits) {
     std::vector<EntryRef> ordered;
     ordered.reserve(entries.size());
     for (const auto& [path, entry] : entries)
@@ -612,7 +610,8 @@ void walk_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
     walk_subtree(root, store, visit);
 }
 
-std::map<std::string, FsEntry> read_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
+std::map<std::string, FsEntry> read_namespace_tree(const ObjectId& root,
+                                                   const NamespaceNodeStore& store,
                                                    const NamespaceTreeLimits&) {
     std::map<std::string, FsEntry> out;
     walk_subtree(root, store, [&](const std::string& path, const FsEntry& entry) {
@@ -756,8 +755,8 @@ void read_leaf_records(const ObjectId& id, const NamespaceNodeStore& store,
             throw DecodeError("bad namespace tree extent form");
         }
         const auto end = bytes.size() - reader.remaining();
-        out.push_back({std::move(key), std::span<const uint8_t>(bytes).subspan(start, end - start),
-                       nullptr});
+        out.push_back(
+            {std::move(key), std::span<const uint8_t>(bytes).subspan(start, end - start), nullptr});
     }
     reader.finish();
 }
@@ -1076,8 +1075,7 @@ std::vector<NamespaceTreeChild> namespace_tree_children(std::span<const uint8_t>
 }
 
 void for_each_namespace_entry_with_prefix(const MetadataSnapshot& snapshot,
-                                          const NamespaceNodeStore* store,
-                                          std::string_view prefix,
+                                          const NamespaceNodeStore* store, std::string_view prefix,
                                           const NamespaceVisitor& visit) {
     if (!snapshot.namespace_root) {
         for (auto it = snapshot.entries.lower_bound(std::string(prefix));
@@ -1090,7 +1088,8 @@ void for_each_namespace_entry_with_prefix(const MetadataSnapshot& snapshot,
     }
     if (!store)
         throw DecodeError("namespace is a tree and no node store was supplied");
-    walk_subtree_prefix(*snapshot.namespace_root, *store, prefix, prefix_upper_bound(prefix), visit);
+    walk_subtree_prefix(*snapshot.namespace_root, *store, prefix, prefix_upper_bound(prefix),
+                        visit);
 }
 
 namespace {
@@ -1342,7 +1341,8 @@ namespace {
 void walk_stats(const ObjectId& id, const NamespaceNodeStore& store, NamespaceTreeStats& stats,
                 size_t depth);
 
-void walk_extent_stats(const ObjectId& id, const NamespaceNodeStore& store, NamespaceTreeStats& stats) {
+void walk_extent_stats(const ObjectId& id, const NamespaceNodeStore& store,
+                       NamespaceTreeStats& stats) {
     auto encoded = store.get(id);
     if (!encoded)
         throw DecodeError("namespace tree extent node unavailable: " + to_string(id));
@@ -1475,14 +1475,13 @@ void NamespaceWorkingSet::erase(const std::string& path) {
 
 namespace {
 bool path_under(const std::string& path, const std::string& root) {
-    return path == root ||
-           (path.size() > root.size() && path.compare(0, root.size(), root) == 0 &&
-            path[root.size()] == '/');
+    return path == root || (path.size() > root.size() && path.compare(0, root.size(), root) == 0 &&
+                            path[root.size()] == '/');
 }
 } // namespace
 
-std::optional<std::string> NamespaceWorkingSet::first_path_under(
-    const std::string& directory) const {
+std::optional<std::string>
+NamespaceWorkingSet::first_path_under(const std::string& directory) const {
     // Overlay first: batch-created children count, batch-erased ones do not.
     const auto prefix = directory == "/" ? std::string("/") : directory + "/";
     for (auto it = delta_.upsert_entries.lower_bound(prefix);
@@ -1493,8 +1492,8 @@ std::optional<std::string> NamespaceWorkingSet::first_path_under(
                                       [&](const std::string& path) { return erased(path); });
 }
 
-std::vector<std::pair<std::string, FsEntry>> NamespaceWorkingSet::subtree(
-    const std::string& directory) const {
+std::vector<std::pair<std::string, FsEntry>>
+NamespaceWorkingSet::subtree(const std::string& directory) const {
     std::map<std::string, FsEntry> merged;
     const auto prefix = directory == "/" ? std::string("/") : directory + "/";
     for_each_namespace_entry_with_prefix(snapshot_, nodes_, prefix,
@@ -1542,7 +1541,7 @@ namespace {
 // (first key, id) children, or a leaf's (path, external extent root) entries.
 struct NodeShape {
     bool leaf{};
-    std::vector<std::pair<std::string, ObjectId>> children;      // branch
+    std::vector<std::pair<std::string, ObjectId>> children;               // branch
     std::vector<std::pair<std::string, std::optional<ObjectId>>> entries; // leaf
 };
 
@@ -1720,7 +1719,9 @@ struct DiffStream {
     DiffStream(const NamespaceNodeStore& nodes, const ObjectId& root) : store(nodes) {
         pending.push_back({Child{{}, root, 0}, read_spine_node(root, nodes).level, false});
     }
-    bool buffered() const { return next < records.size(); }
+    bool buffered() const {
+        return next < records.size();
+    }
     // Opens the next node: a branch into its children, a leaf into records.
     void open() {
         auto item = std::move(pending.back());
@@ -1932,8 +1933,8 @@ void diff_namespace_tree_nodes(const ObjectId& before, const ObjectId& after,
 }
 
 NamespaceTreeMerge merge_tree_backed_heads(const MetadataSnapshot& left,
-                                           const MetadataSnapshot& right,
-                                           const Hash256& left_head, const Hash256& right_head,
+                                           const MetadataSnapshot& right, const Hash256& left_head,
+                                           const Hash256& right_head,
                                            const NamespaceNodeStore& store) {
     if (!left.namespace_root || !right.namespace_root)
         throw std::logic_error("a tree merge requires two tree-backed namespaces");
@@ -1981,15 +1982,14 @@ NamespaceTreeMerge merge_tree_backed_heads(const MetadataSnapshot& left,
         }
     }
 
-    out.merged = merge_metadata_heads_over(left, right, left_entries, right_entries, left_head,
-                                           right_head);
+    out.merged =
+        merge_metadata_heads_over(left, right, left_entries, right_entries, left_head, right_head);
     const auto& primary_entries = left_primary ? left_entries : right_entries;
     for (const auto& path : paths) {
         const auto merged = out.merged.snapshot.entries.find(path);
         const auto was = primary_entries.find(path);
         const bool present = merged != out.merged.snapshot.entries.end();
-        if (present != (was != primary_entries.end()) ||
-            (present && merged->second != was->second))
+        if (present != (was != primary_entries.end()) || (present && merged->second != was->second))
             out.changes[path] =
                 present ? std::optional<FsEntry>(merged->second) : std::optional<FsEntry>();
     }

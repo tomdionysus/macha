@@ -21,8 +21,8 @@ int64_t SystemMaintenanceClock::wall_ns() const {
 }
 
 void SystemMaintenanceClock::wait_until(std::condition_variable_any& cv,
-                                        std::unique_lock<std::mutex>& lock,
-                                        std::stop_token stop, Clock::time_point deadline,
+                                        std::unique_lock<std::mutex>& lock, std::stop_token stop,
+                                        Clock::time_point deadline,
                                         const std::function<bool()>& ready) {
     if (deadline == Clock::time_point::max())
         cv.wait(lock, stop, ready);
@@ -48,8 +48,8 @@ int64_t ManualMaintenanceClock::wall_ns() const {
 }
 
 void ManualMaintenanceClock::wait_until(std::condition_variable_any& cv,
-                                        std::unique_lock<std::mutex>& lock,
-                                        std::stop_token stop, Clock::time_point deadline,
+                                        std::unique_lock<std::mutex>& lock, std::stop_token stop,
+                                        Clock::time_point deadline,
                                         const std::function<bool()>& ready) {
     while (!ready() && !stop.stop_requested() && now() < deadline)
         cv.wait_for(lock, stop, poll_, ready);

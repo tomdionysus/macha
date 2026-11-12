@@ -8,9 +8,12 @@ namespace macha {
 
 std::string_view node_phase_name(NodePhase phase) {
     switch (phase) {
-    case NodePhase::starting: return "starting";
-    case NodePhase::recovering: return "recovering";
-    case NodePhase::ready: return "ready";
+    case NodePhase::starting:
+        return "starting";
+    case NodePhase::recovering:
+        return "recovering";
+    case NodePhase::ready:
+        return "ready";
     }
     return "unknown";
 }

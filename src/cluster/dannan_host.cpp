@@ -110,7 +110,8 @@ DannanHost::DannanHost(dannan::NodeConfig config, MessageRoutes& routes, size_t 
                                         dannan::net::Message copy;
                                         copy.type = request.type;
                                         copy.payload = request.payload;
-                                        notice(node_info_from(peer), macha_message(std::move(copy)));
+                                        notice(node_info_from(peer),
+                                               macha_message(std::move(copy)));
                                     }
                                     return dannan::net::Handled::processed();
                                 });
@@ -173,8 +174,7 @@ dannan::membership::NodeRecord DannanHost::record_for(const NodeInfo& peer) cons
     record.port = peer.port;
     record.failure_domain = peer.failure_domain;
     record.seen_unix_ms = peer.seen_unix_ms;
-    record.capabilities =
-        node_inbound_capable(peer) ? dannan::membership::capability_inbound : 0;
+    record.capabilities = node_inbound_capable(peer) ? dannan::membership::capability_inbound : 0;
     return record;
 }
 

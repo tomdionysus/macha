@@ -14,10 +14,11 @@
 namespace macha {
 
 class Json {
-public:
+  public:
     using Array = std::vector<Json>;
     using Object = std::map<std::string, Json, std::less<>>;
-    using Value = std::variant<std::nullptr_t, bool, std::int64_t, std::uint64_t, double, std::string, Array, Object>;
+    using Value = std::variant<std::nullptr_t, bool, std::int64_t, std::uint64_t, double,
+                               std::string, Array, Object>;
 
     Json() : value_(nullptr) {}
     Json(std::nullptr_t) : value_(nullptr) {}
@@ -57,12 +58,12 @@ public:
     [[nodiscard]] Json* find(std::string_view key);
     Json& operator[](std::string key);
 
-private:
+  private:
     Value value_;
 };
 
 class JsonError : public std::runtime_error {
-public:
+  public:
     using std::runtime_error::runtime_error;
 };
 

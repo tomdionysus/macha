@@ -9,14 +9,14 @@
 #include "storage/local_store.hpp"
 #include "storage/unreferenced_since.hpp"
 
+#include "contract/thread_safety.hpp"
 #include <atomic>
-#include <span>
 #include <functional>
 #include <map>
 #include <memory>
-#include "contract/thread_safety.hpp"
 #include <optional>
 #include <set>
+#include <span>
 
 namespace macha {
 
@@ -47,7 +47,9 @@ class StoragePool final : public ObjectStore {
         uint64_t generation{};
         uint64_t backend_instance{};
 
-        bool valid() const noexcept { return domain && backend_instance; }
+        bool valid() const noexcept {
+            return domain && backend_instance;
+        }
     };
 
   private:
@@ -94,7 +96,8 @@ class StoragePool final : public ObjectStore {
 
     void observe_get(size_t, uint64_t) const;
     // A read that did not finish says nothing about the object: it stays.
-    void note_read_failure(const ObjectId&, const std::filesystem::path&, const std::exception&) const;
+    void note_read_failure(const ObjectId&, const std::filesystem::path&,
+                           const std::exception&) const;
 
     std::vector<std::shared_ptr<Backend>> snapshot() const MACHA_EXCLUDES(mutex_);
     std::filesystem::path identity_path(const std::filesystem::path&) const;
@@ -149,7 +152,9 @@ class StoragePool final : public ObjectStore {
     bool valid(const ObjectId&) const;
     bool remove(const ObjectId&);
     std::vector<ObjectId> list() const;
-    uint64_t full_list_scans() const { return full_list_scans_.load(std::memory_order_relaxed); }
+    uint64_t full_list_scans() const {
+        return full_list_scans_.load(std::memory_order_relaxed);
+    }
     std::optional<ObjectId> next_object(Cursor&, bool& pass_complete) const;
     bool older_than(const ObjectId&, std::chrono::milliseconds) const;
 
@@ -164,15 +169,14 @@ class StoragePool final : public ObjectStore {
     // unclaimed for `unreferenced_grace`. `claim_deletion`, when given, makes
     // the final claim check and marks the object while it is deleted, so no
     // claim lands between the check and the delete.
-    MaintenanceResult gc_step(const IdLookup& live,
-                              const std::vector<ObjectId>& protected_ids,
-                              std::chrono::milliseconds orphan_grace,
-                              size_t operation_budget,
-                              const std::function<bool()>& should_yield = {},
-                              const std::function<bool(const ObjectId&)>& is_retained = {},
-                              UnreferencedSince* sightings = nullptr, uint64_t now_unix_ms = 0,
-                              std::chrono::milliseconds unreferenced_grace = {},
-                              const std::function<ClaimDeletion(const ObjectId&)>& claim_deletion = {});
+    MaintenanceResult
+    gc_step(const IdLookup& live, const std::vector<ObjectId>& protected_ids,
+            std::chrono::milliseconds orphan_grace, size_t operation_budget,
+            const std::function<bool()>& should_yield = {},
+            const std::function<bool(const ObjectId&)>& is_retained = {},
+            UnreferencedSince* sightings = nullptr, uint64_t now_unix_ms = 0,
+            std::chrono::milliseconds unreferenced_grace = {},
+            const std::function<ClaimDeletion(const ObjectId&)>& claim_deletion = {});
 
     // A complete pass, for tests and explicit callers; maintenance uses
     // rebalance_step().

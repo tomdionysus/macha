@@ -3,9 +3,9 @@
 #include "fuse/fuse_subsystem.hpp"
 
 #include "filesystem/filesystem.hpp"
+#include "filesystem/hydration.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "fuse/fuse_mountpoint.hpp"
-#include "filesystem/hydration.hpp"
 #include "log.hpp"
 #include "subsystem/subsystem_registry.hpp"
 #include "supervised.hpp"

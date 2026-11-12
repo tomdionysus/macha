@@ -40,8 +40,12 @@ class ClaimWalk {
 
     ClaimWalkStep step(const ObjectLedger&, ClaimRestorer&);
 
-    RetentionClass type() const noexcept { return type_; }
-    const Cursor<ObjectId>& cursor() const noexcept { return cursor_; }
+    RetentionClass type() const noexcept {
+        return type_;
+    }
+    const Cursor<ObjectId>& cursor() const noexcept {
+        return cursor_;
+    }
 
   private:
     RetentionClass type_;

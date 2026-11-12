@@ -24,8 +24,7 @@ namespace macha {
 // the queue alone, so the seed's build never holds a write up. Thread safe.
 class HeldLedger {
   public:
-    HeldLedger(std::filesystem::path dir, std::array<uint8_t, 32> key,
-               ObjectTrie::Options options);
+    HeldLedger(std::filesystem::path dir, std::array<uint8_t, 32> key, ObjectTrie::Options options);
 
     // Whether it holds a complete record: seeded once, kept since.
     bool seeded() const noexcept {
@@ -56,12 +55,16 @@ class HeldLedger {
     };
     View view() const;
     // The removals alone, without the lookup lock.
-    uint64_t removals() const noexcept { return removals_.load(std::memory_order_acquire); }
+    uint64_t removals() const noexcept {
+        return removals_.load(std::memory_order_acquire);
+    }
     ObjectTrie::Stats stats() const;
     uint64_t size() const;
     // The objects/xx/yy directory the store's check against its disk
     // resumes at, kept across restarts. Single owner (that check).
-    uint16_t verify_next() const noexcept { return verify_next_; }
+    uint16_t verify_next() const noexcept {
+        return verify_next_;
+    }
     void set_verify_next(uint16_t);
 
   private:
@@ -79,8 +82,8 @@ class HeldLedger {
     // Journals without the lookup lock: it touches only the trie's journal,
     // never the nodes or cache a lookup reads, and every journal write and
     // install happens under flush_mutex_, in order.
-    void write_journal(std::span<const ObjectTrie::Change>) MACHA_REQUIRES(flush_mutex_)
-        MACHA_NO_THREAD_SAFETY_ANALYSIS;
+    void write_journal(std::span<const ObjectTrie::Change>)
+        MACHA_REQUIRES(flush_mutex_) MACHA_NO_THREAD_SAFETY_ANALYSIS;
     // Journals and installs the queue, whether or not seeded.
     void install_queued() MACHA_REQUIRES(flush_mutex_);
     Mutex queue_mutex_;

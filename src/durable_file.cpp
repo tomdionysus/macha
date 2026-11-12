@@ -15,7 +15,9 @@ namespace {
 
 void fsync_checked(int fd, const char* what) {
     int rc;
-    do { rc = ::fsync(fd); } while (rc != 0 && errno == EINTR);
+    do {
+        rc = ::fsync(fd);
+    } while (rc != 0 && errno == EINTR);
     if (rc != 0)
         throw std::runtime_error(std::string(what) + ": " + std::strerror(errno));
 }
@@ -36,11 +38,11 @@ void write_all(int fd, std::string_view contents) {
 } // namespace
 
 void durable_replace_file(const std::filesystem::path& path, std::string_view contents) {
-    const auto directory = path.parent_path().empty() ? std::filesystem::path(".")
-                                                      : path.parent_path();
+    const auto directory =
+        path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
     std::filesystem::create_directories(directory);
-    const auto temp = path.string() + ".tmp." + std::to_string(getpid()) + "." +
-                      std::to_string(unix_ms());
+    const auto temp =
+        path.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
     int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0)
         throw std::runtime_error("cannot create durable state " + temp + ": " +
@@ -58,8 +60,8 @@ void durable_replace_file(const std::filesystem::path& path, std::string_view co
 
         const int dir = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
         if (dir < 0)
-            throw std::runtime_error("cannot open durable state directory " +
-                                     directory.string() + ": " + std::strerror(errno));
+            throw std::runtime_error("cannot open durable state directory " + directory.string() +
+                                     ": " + std::strerror(errno));
         try {
             fsync_checked(dir, "cannot sync durable state directory");
         } catch (...) {

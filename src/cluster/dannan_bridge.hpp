@@ -14,9 +14,9 @@
 
 #include <dannan/identity/cluster_key.h>
 #include <dannan/membership/node_record.h>
-#include <dannan/node.h>
 #include <dannan/net/message.h>
 #include <dannan/net/routes.h>
+#include <dannan/node.h>
 #include <dannan/sched/work.h>
 #include <dannan/status/log.h>
 

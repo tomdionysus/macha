@@ -25,18 +25,23 @@ namespace macha {
 // while it is made and when asked about a subtree several parts share.
 class TrieUnion {
   public:
-    explicit TrieUnion(std::vector<ObjectTrie::Snapshot> parts,
-                       const TrieUnion* hint = nullptr);
+    explicit TrieUnion(std::vector<ObjectTrie::Snapshot> parts, const TrieUnion* hint = nullptr);
 
     ObjectTrie::Summary root() const noexcept;
-    uint64_t size() const noexcept { return root().count; }
-    Hash256 root_hash() const noexcept { return root().hash; }
+    uint64_t size() const noexcept {
+        return root().count;
+    }
+    Hash256 root_hash() const noexcept {
+        return root().hash;
+    }
     std::optional<Bytes> get(const ObjectId&) const;
     // As ObjectTrie::Snapshot's.
     std::vector<ObjectTrie::Children> children(std::span<const ObjectTrie::Prefix>) const;
     std::vector<std::vector<ObjectTrie::Record>> records(std::span<const ObjectTrie::Prefix>,
                                                          uint64_t most = UINT64_MAX) const;
-    const std::vector<ObjectTrie::Snapshot>& parts() const noexcept { return parts_; }
+    const std::vector<ObjectTrie::Snapshot>& parts() const noexcept {
+        return parts_;
+    }
 
   private:
     struct Node;
@@ -46,15 +51,16 @@ class TrieUnion {
     std::shared_ptr<const Node> merge(const ObjectTrie::Prefix&,
                                       std::vector<ObjectTrie::Summary> inputs,
                                       const std::shared_ptr<const Node>& hint) const;
-    std::vector<ObjectTrie::Record> merged_records(const ObjectTrie::Prefix&,
-                                                   uint64_t most) const;
+    std::vector<ObjectTrie::Record> merged_records(const ObjectTrie::Prefix&, uint64_t most) const;
 };
 
 // A union as a source.
 class UnionSource final : public TrieSource {
   public:
     explicit UnionSource(std::shared_ptr<const TrieUnion> trie) : trie_(std::move(trie)) {}
-    ObjectTrie::Summary root() override { return trie_->root(); }
+    ObjectTrie::Summary root() override {
+        return trie_->root();
+    }
     std::vector<ObjectTrie::Children> children(std::span<const ObjectTrie::Prefix> p) override {
         return trie_->children(p);
     }

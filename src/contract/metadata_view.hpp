@@ -88,8 +88,7 @@ class MetadataView {
     // The snapshot at the newest generation known: the cache when current,
     // else read from the replicas. With a work context, the wait guard
     // refuses work that may not wait on the network.
-    static constexpr Waits converged_waits =
-        Waits::state_device | Waits::network | Waits::locks;
+    static constexpr Waits converged_waits = Waits::state_device | Waits::network | Waits::locks;
     virtual MetadataSnapshotView converged() = 0;
     virtual MetadataSnapshotView converged(const WorkContext&) = 0;
 
@@ -127,9 +126,9 @@ class MetadataView {
     // short of their floor.
     static constexpr Waits mutate_waits =
         Waits::state_device | Waits::data_device | Waits::network | Waits::locks;
-    virtual MetadataRecord mutate_delta(
-        const std::function<void(MetadataSnapshot&, MetadataDelta&)>&, size_t retries = 8,
-        std::optional<MetadataMutationIdentity> identity = {}) = 0;
+    virtual MetadataRecord
+    mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>&, size_t retries = 8,
+                 std::optional<MetadataMutationIdentity> identity = {}) = 0;
 
     // Resolves a standing conflict by choosing one side; a commit.
     static constexpr Waits resolve_conflict_waits = mutate_waits;
@@ -154,7 +153,6 @@ class MetadataView {
         Waits::state_device | Waits::locks;
     virtual std::optional<std::optional<ObjectId>>
     common_ancestor_catalogue_root(const Hash256& left, const Hash256& right) const = 0;
-
 };
 
 // The metadata component's upkeep of its own replicas, kept off the view so
@@ -166,8 +164,7 @@ class MetadataMaintenance {
     static constexpr ThreadSafety safety = ThreadSafety::single_owner;
 
     // One repair step: converge the replicas toward the accepted heads.
-    static constexpr Waits repair_step_waits =
-        Waits::state_device | Waits::network | Waits::locks;
+    static constexpr Waits repair_step_waits = Waits::state_device | Waits::network | Waits::locks;
     virtual void repair_step() = 0;
     // Records whether the last replica-set validation succeeded, and why
     // not; Status reads it. Takes the membership lock, which membership holds
@@ -176,8 +173,7 @@ class MetadataMaintenance {
     virtual void note_replica_validation(bool available, std::string_view reason = {}) = 0;
     // Repairs accepted heads the local replica cannot reconstruct, from
     // peers; returns how many.
-    static constexpr Waits repair_heads_waits =
-        Waits::state_device | Waits::network | Waits::locks;
+    static constexpr Waits repair_heads_waits = Waits::state_device | Waits::network | Waits::locks;
     virtual size_t repair_unreconstructable_heads(FrameType frame_type = FrameType::control) = 0;
     // Re-roots this node's own history at its head once it holds one head
     // and the history has passed the thresholds, and drops any head set

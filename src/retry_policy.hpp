@@ -73,15 +73,31 @@ class RetryState {
     bool due(Clock::time_point now = Clock::now()) const noexcept {
         return now >= due_;
     }
-    Clock::time_point due_at() const noexcept { return due_; }
-    size_t consecutive_failures() const noexcept { return consecutive_; }
-    size_t total_failures() const noexcept { return total_; }
-    size_t failures_in_window() const noexcept { return recent_.size(); }
-    Clock::time_point first_failure() const noexcept { return first_failure_; }
-    Clock::time_point last_failure() const noexcept { return last_failure_; }
+    Clock::time_point due_at() const noexcept {
+        return due_;
+    }
+    size_t consecutive_failures() const noexcept {
+        return consecutive_;
+    }
+    size_t total_failures() const noexcept {
+        return total_;
+    }
+    size_t failures_in_window() const noexcept {
+        return recent_.size();
+    }
+    Clock::time_point first_failure() const noexcept {
+        return first_failure_;
+    }
+    Clock::time_point last_failure() const noexcept {
+        return last_failure_;
+    }
     // Start of the current unbroken run of failures; unset when not failing.
-    Clock::time_point failing_since() const noexcept { return failing_since_; }
-    std::chrono::milliseconds current_backoff() const noexcept { return backoff_; }
+    Clock::time_point failing_since() const noexcept {
+        return failing_since_;
+    }
+    std::chrono::milliseconds current_backoff() const noexcept {
+        return backoff_;
+    }
 
   private:
     std::deque<Clock::time_point> recent_;

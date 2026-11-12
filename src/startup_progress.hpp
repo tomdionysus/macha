@@ -53,8 +53,12 @@ class StartupStallGate {
             return most;
         return std::clamp(no_progress_ / 4, std::chrono::milliseconds{1}, most);
     }
-    Clock::time_point started() const { return started_; }
-    Clock::time_point last_progress_at() const { return last_progress_at_; }
+    Clock::time_point started() const {
+        return started_;
+    }
+    Clock::time_point last_progress_at() const {
+        return last_progress_at_;
+    }
 
   private:
     const std::chrono::milliseconds no_progress_;

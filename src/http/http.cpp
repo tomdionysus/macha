@@ -8,7 +8,6 @@
 #include "observation.hpp"
 #include "supervised.hpp"
 
-#include <map>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -19,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <map>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -33,28 +33,37 @@ namespace macha {
 
 std::optional<ByteRange> parse_range(const HttpRequest& request, uint64_t size) {
     auto it = request.headers.find("range");
-    if (it == request.headers.end()) return ByteRange{0, size, false};
+    if (it == request.headers.end())
+        return ByteRange{0, size, false};
     auto value = it->second;
-    if (!value.starts_with("bytes=") || value.find(',') != std::string::npos || !size) return {};
+    if (!value.starts_with("bytes=") || value.find(',') != std::string::npos || !size)
+        return {};
     value.erase(0, 6);
     auto dash = value.find('-');
-    if (dash == std::string::npos) return {};
+    if (dash == std::string::npos)
+        return {};
     auto left = value.substr(0, dash);
     auto right = value.substr(dash + 1);
     uint64_t start = 0, end = size - 1;
     auto parse = [](const std::string& text, uint64_t& out) {
-        if (text.empty()) return false;
+        if (text.empty())
+            return false;
         auto [finish, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
         return ec == std::errc{} && finish == text.data() + text.size();
     };
     if (left.empty()) {
         uint64_t suffix = 0;
-        if (!parse(right, suffix) || !suffix) return {};
-        if (suffix >= size) start = 0;
-        else start = size - suffix;
+        if (!parse(right, suffix) || !suffix)
+            return {};
+        if (suffix >= size)
+            start = 0;
+        else
+            start = size - suffix;
     } else {
-        if (!parse(left, start) || start >= size) return {};
-        if (!right.empty() && (!parse(right, end) || end < start)) return {};
+        if (!parse(left, start) || start >= size)
+            return {};
+        if (!right.empty() && (!parse(right, end) || end < start))
+            return {};
         end = std::min(end, size - 1);
     }
     return ByteRange{start, end - start + 1, true};
@@ -116,7 +125,8 @@ std::map<std::string, std::string, std::less<>> parse_query(std::string_view que
     return out;
 }
 
-std::map<std::string, std::vector<std::string>, std::less<>> parse_query_all(std::string_view query) {
+std::map<std::string, std::vector<std::string>, std::less<>>
+parse_query_all(std::string_view query) {
     std::map<std::string, std::vector<std::string>, std::less<>> out;
     size_t pos = 0;
     while (pos <= query.size()) {
@@ -377,7 +387,8 @@ struct Lane {
             Job job;
             {
                 Lock lock(mutex);
-                cv.wait(lock.native(), stop, [this]() MACHA_REQUIRES(mutex) { return !queue.empty(); });
+                cv.wait(lock.native(), stop,
+                        [this]() MACHA_REQUIRES(mutex) { return !queue.empty(); });
                 if (stop.stop_requested())
                     break;
                 job = std::move(queue.front());
@@ -464,10 +475,14 @@ HttpResponse http_error(int status, std::string_view code, std::string_view mess
 
 const char* failure_scope_name(FailureScope scope) noexcept {
     switch (scope) {
-    case FailureScope::content: return "content";
-    case FailureScope::node: return "node";
-    case FailureScope::request: return "request";
-    case FailureScope::cluster: return "cluster";
+    case FailureScope::content:
+        return "content";
+    case FailureScope::node:
+        return "node";
+    case FailureScope::request:
+        return "request";
+    case FailureScope::cluster:
+        return "cluster";
     }
     return "node";
 }
@@ -493,11 +508,13 @@ HttpResponse http_error(int status, std::string_view code, std::string_view mess
 bool http_json_object_has_key(std::string_view json, std::string_view key) {
     size_t i = 0;
     auto skip_space = [&] {
-        while (i < json.size() && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t'))
+        while (i < json.size() &&
+               (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t'))
             ++i;
     };
     skip_space();
-    if (i >= json.size() || json[i] != '{') return false;
+    if (i >= json.size() || json[i] != '{')
+        return false;
     ++i;
     int depth = 1;
     bool expect_key = true;
@@ -505,9 +522,12 @@ bool http_json_object_has_key(std::string_view json, std::string_view key) {
         const char c = json[i];
         if (c == '"') {
             const size_t start = ++i;
-            while (i < json.size() && json[i] != '"') i += json[i] == '\\' ? 2 : 1;
-            if (depth == 1 && expect_key && json.substr(start, i - start) == key) return true;
-            if (depth == 1 && expect_key) expect_key = false;
+            while (i < json.size() && json[i] != '"')
+                i += json[i] == '\\' ? 2 : 1;
+            if (depth == 1 && expect_key && json.substr(start, i - start) == key)
+                return true;
+            if (depth == 1 && expect_key)
+                expect_key = false;
             ++i;
             continue;
         }
@@ -524,25 +544,31 @@ bool http_json_object_has_key(std::string_view json, std::string_view key) {
 }
 
 void http_stamp_status(HttpResponse& response) {
-    if (response.defer || response.stream || response.body.empty()) return;
-    if (response.status == 204 || response.status == 304) return;
-    if (!response.content_type.starts_with("application/json")) return;
-    const std::string_view body(reinterpret_cast<const char*>(response.body.data()), response.body.size());
+    if (response.defer || response.stream || response.body.empty())
+        return;
+    if (response.status == 204 || response.status == 304)
+        return;
+    if (!response.content_type.starts_with("application/json"))
+        return;
+    const std::string_view body(reinterpret_cast<const char*>(response.body.data()),
+                                response.body.size());
     size_t open = 0;
-    while (open < body.size() && (body[open] == ' ' || body[open] == '\n' || body[open] == '\r' ||
-                                  body[open] == '\t'))
+    while (open < body.size() &&
+           (body[open] == ' ' || body[open] == '\n' || body[open] == '\r' || body[open] == '\t'))
         ++open;
-    if (open >= body.size() || body[open] != '{') return;
-    if (http_json_object_has_key(body, "status")) return;
+    if (open >= body.size() || body[open] != '{')
+        return;
+    if (http_json_object_has_key(body, "status"))
+        return;
     size_t next = open + 1;
-    while (next < body.size() && (body[next] == ' ' || body[next] == '\n' || body[next] == '\r' ||
-                                  body[next] == '\t'))
+    while (next < body.size() &&
+           (body[next] == ' ' || body[next] == '\n' || body[next] == '\r' || body[next] == '\t'))
         ++next;
     const bool empty = next < body.size() && body[next] == '}';
-    const std::string field = std::string("\"status\":\"") + (response.status >= 400 ? "error" : "ok") +
-                              "\"" + (empty ? "" : ",");
-    response.body.insert(response.body.begin() + static_cast<std::ptrdiff_t>(open + 1), field.begin(),
-                         field.end());
+    const std::string field = std::string("\"status\":\"") +
+                              (response.status >= 400 ? "error" : "ok") + "\"" + (empty ? "" : ",");
+    response.body.insert(response.body.begin() + static_cast<std::ptrdiff_t>(open + 1),
+                         field.begin(), field.end());
 }
 
 std::string http_url_decode(std::string_view value) {
@@ -681,7 +707,9 @@ struct HttpServer::Impl {
     WorkClass request_class(std::string_view path) const {
         return classify ? classify(path) : WorkClass::viewer;
     }
-    bool control_route(std::string_view path) const { return request_class(path) == WorkClass::control; }
+    bool control_route(std::string_view path) const {
+        return request_class(path) == WorkClass::control;
+    }
 
     size_t chunk_bytes() const noexcept {
         return std::max<size_t>(16 * 1024, config.stream_chunk_bytes);
@@ -1550,8 +1578,9 @@ void HttpServer::start() {
         run_supervised_once("http-reactor", [this, stop] { impl_->reactor_loop(stop); });
     });
     Lock lock(impl_->startup_mutex);
-    impl_->startup_cv.wait(lock.native(),
-                           [this]() MACHA_REQUIRES(impl_->startup_mutex) { return impl_->startup_complete; });
+    impl_->startup_cv.wait(lock.native(), [this]() MACHA_REQUIRES(impl_->startup_mutex) {
+        return impl_->startup_complete;
+    });
     if (!impl_->startup_error.empty()) {
         const auto error = impl_->startup_error;
         lock.unlock();

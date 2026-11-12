@@ -126,13 +126,13 @@ MACHA_TEST("dannan_bridge", test_dannan_takes_the_table_and_refuses_the_retired_
         REQUIRE(table.is_ordered(dannan_type(entry.type)) == entry.registration.ordered);
     }
     // The transport's own types are Dannan's core types at the numbers Macha now uses.
-    for (const auto type : {MessageType::ping, MessageType::members, MessageType::session_retire,
-                            MessageType::promote_read_ahead, MessageType::promote_foreground,
-                            MessageType::cancel_transfer, MessageType::telemetry,
-                            MessageType::identity_resets, MessageType::dial_request,
-                            MessageType::dial_back_probe, MessageType::ok, MessageType::error,
-                            MessageType::members_reply, MessageType::telemetry_reply,
-                            MessageType::identity_resets_reply, MessageType::dial_back_probe_reply}) {
+    for (const auto type :
+         {MessageType::ping, MessageType::members, MessageType::session_retire,
+          MessageType::promote_read_ahead, MessageType::promote_foreground,
+          MessageType::cancel_transfer, MessageType::telemetry, MessageType::identity_resets,
+          MessageType::dial_request, MessageType::dial_back_probe, MessageType::ok,
+          MessageType::error, MessageType::members_reply, MessageType::telemetry_reply,
+          MessageType::identity_resets_reply, MessageType::dial_back_probe_reply}) {
         REQUIRE(table.is_core(dannan_type(type)));
         REQUIRE(table.find(dannan_type(type)) != nullptr);
     }
@@ -307,7 +307,8 @@ MACHA_TEST("dannan_bridge", test_telemetry_goes_into_the_record_and_back) {
     hosted.cache.hits = 5;
     hosted.cache.evictions = 9;
     for (uint32_t i = 0; i < 300; ++i)
-        hosted.playback.transcode_rates.push_back(TranscodeRate{"video", "hevc", 10, 2160, i, 1, 1});
+        hosted.playback.transcode_rates.push_back(
+            TranscodeRate{"video", "hevc", 10, 2160, i, 1, 1});
     write_hosted_telemetry(record, hosted);
     // Zero values are not written: cache_used, cache_misses and the rest.
     REQUIRE(!record.get(hosted_field::cache_used).has_value());
@@ -446,18 +447,18 @@ MACHA_TEST("dannan_bridge", test_hosts_extents_is_the_adverts_presence) {
 // presence, control objects, retention, deletes and telemetry as speculative; the rest
 // as control. And the frame classes by the names Status and the journal use.
 MACHA_TEST("dannan_bridge", test_a_call_without_a_frame_takes_its_types_default) {
-    for (const auto type : {MessageType::get_object, MessageType::put_object,
-                            MessageType::put_object_deferred,
-                            MessageType::object_durability_barrier})
+    for (const auto type :
+         {MessageType::get_object, MessageType::put_object, MessageType::put_object_deferred,
+          MessageType::object_durability_barrier})
         REQUIRE(default_frame_type(type) == FrameType::foreground);
     for (const auto type :
          {MessageType::get_control_object, MessageType::put_control_object, MessageType::telemetry,
           MessageType::have_object, MessageType::have_objects, MessageType::have_valid_objects,
           MessageType::trie_diff, MessageType::retain_objects, MessageType::delete_object})
         REQUIRE(default_frame_type(type) == FrameType::speculative);
-    for (const auto type : {MessageType::get_metadata, MessageType::put_metadata_commit,
-                            MessageType::get_ingest_jobs, MessageType::session_sync,
-                            MessageType::members, MessageType::ping})
+    for (const auto type :
+         {MessageType::get_metadata, MessageType::put_metadata_commit, MessageType::get_ingest_jobs,
+          MessageType::session_sync, MessageType::members, MessageType::ping})
         REQUIRE(default_frame_type(type) == FrameType::control);
     REQUIRE(std::string(frame_type_name(FrameType::control)) == "control");
     REQUIRE(std::string(frame_type_name(FrameType::foreground)) == "foreground");
@@ -466,7 +467,8 @@ MACHA_TEST("dannan_bridge", test_a_call_without_a_frame_takes_its_types_default)
     REQUIRE(std::string(frame_type_name(FrameType::speculative)) == "speculative");
     // The laws' order: control, viewer, read-ahead, loader, speculative.
     REQUIRE(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
-    REQUIRE(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
+    REQUIRE(frame_type_priority(FrameType::foreground) <
+            frame_type_priority(FrameType::read_ahead));
     REQUIRE(frame_type_priority(FrameType::read_ahead) < frame_type_priority(FrameType::loader));
     REQUIRE(frame_type_priority(FrameType::loader) < frame_type_priority(FrameType::speculative));
 }

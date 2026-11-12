@@ -3,9 +3,9 @@
 // A subsystem that starts cleanly, then faults once from its own thread through
 // the fault sink (the shape of a lost FUSE mount). The supervisor is driven
 // through faulted -> restarting -> running for as many cycles as retry allows.
+#include "macha_version.hpp"
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"
-#include "macha_version.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -19,11 +19,17 @@ class FaultingAfterStartSubsystem final : public macha::Subsystem {
     std::thread worker_;
 
   public:
-    ~FaultingAfterStartSubsystem() override { stop(); }
+    ~FaultingAfterStartSubsystem() override {
+        stop();
+    }
 
-    std::string_view name() const noexcept override { return "test-plugin-faulting-after-start"; }
+    std::string_view name() const noexcept override {
+        return "test-plugin-faulting-after-start";
+    }
 
-    void attach_fault_sink(FaultSink sink) override { sink_ = std::move(sink); }
+    void attach_fault_sink(FaultSink sink) override {
+        sink_ = std::move(sink);
+    }
 
     void start() override {
         worker_ = std::thread([this] {

@@ -67,7 +67,8 @@ MACHA_FAST_TEST("session", test_session_create_and_validate) {
     auto identity = session_identity(*validated);
     auto introspected = api.handle(session_request("GET", identity));
     REQUIRE(introspected.status == 200);
-    auto introspected_body = Json::parse(std::string(introspected.body.begin(), introspected.body.end()));
+    auto introspected_body =
+        Json::parse(std::string(introspected.body.begin(), introspected.body.end()));
     CHECK(introspected_body.find("id")->asString() == id);
     CHECK(introspected_body.find("token") == nullptr);
 }
@@ -140,7 +141,8 @@ std::optional<AuthSession> stored(const SessionManager& manager, const Hash256& 
     // find()/validate() hide revoked records, so read the raw record via
     // recent(), which applies no liveness filter.
     for (auto& session : manager.recent(1min))
-        if (session.token_hash == token_hash) return session;
+        if (session.token_hash == token_hash)
+            return session;
     return std::nullopt;
 }
 
@@ -231,7 +233,8 @@ MACHA_TEST("session", test_session_cluster_propagation) {
     auto& minted = *minted_opt;
     n1.propagate_session(minted.session);
 
-    REQUIRE(wait_until([&] { return n2.sessions().validate(minted.bearer_token).has_value(); }, 2s));
+    REQUIRE(
+        wait_until([&] { return n2.sessions().validate(minted.bearer_token).has_value(); }, 2s));
 
     n2.stop();
     n1.stop();
@@ -260,13 +263,15 @@ MACHA_TEST("session", test_session_revoke_propagates_cluster_wide) {
     REQUIRE(minted_opt.has_value());
     auto& minted = *minted_opt;
     n1.propagate_session(minted.session);
-    REQUIRE(wait_until([&] { return n2.sessions().validate(minted.bearer_token).has_value(); }, 2s));
+    REQUIRE(
+        wait_until([&] { return n2.sessions().validate(minted.bearer_token).has_value(); }, 2s));
 
     auto revoked = n1.sessions().revoke(minted.session.token_hash);
     REQUIRE(revoked.has_value());
     n1.propagate_session(*revoked);
 
-    REQUIRE(wait_until([&] { return !n2.sessions().validate(minted.bearer_token).has_value(); }, 2s));
+    REQUIRE(
+        wait_until([&] { return !n2.sessions().validate(minted.bearer_token).has_value(); }, 2s));
 
     n2.stop();
     n1.stop();
@@ -283,12 +288,14 @@ MACHA_TEST("session", test_http_server_gate_uses_session_authenticator) {
     HttpServer server(
         config,
         [&](const HttpRequest& request) {
-            if (request.session) observed_session_id = request.session->id;
+            if (request.session)
+                observed_session_id = request.session->id;
             return http_json(200, "{\"ok\":true}");
         },
         [](const HttpRequest& request) { return request.path == "/exempt"; },
         [](std::string_view token) -> std::optional<SessionIdentity> {
-            if (token != "good-token") return std::nullopt;
+            if (token != "good-token")
+                return std::nullopt;
             return SessionIdentity{"the-session-id", Hash256{}, {"anonymous"}, {}};
         });
     server.start();
@@ -303,15 +310,16 @@ MACHA_TEST("session", test_http_server_gate_uses_session_authenticator) {
     {
         const int fd = connect_idle(config.port);
         auto response = raw_http_exchange(
-            fd, "GET /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong\r\n\r\n");
+            fd,
+            "GET /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong\r\n\r\n");
         CHECK(response.status == 401);
         ::close(fd);
     }
     {
         const int fd = connect_idle(config.port);
-        auto response = raw_http_exchange(
-            fd,
-            "GET /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer good-token\r\n\r\n");
+        auto response =
+            raw_http_exchange(fd, "GET /protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: "
+                                  "Bearer good-token\r\n\r\n");
         CHECK(response.status == 200);
         ::close(fd);
     }

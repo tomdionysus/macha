@@ -110,11 +110,15 @@ class AvailabilityService {
     // there is neither. A pointer copy.
     static constexpr Waits snapshot_waits = Waits::none;
     static constexpr ThreadSafety snapshot_safety = ThreadSafety::thread_safe;
-    std::shared_ptr<const AvailabilitySnapshot> snapshot() const { return snapshot_.handle(); }
+    std::shared_ptr<const AvailabilitySnapshot> snapshot() const {
+        return snapshot_.handle();
+    }
 
     // When refresh() next has something to do without a new event: a survey
     // its duty cycle deferred, or a peer to ask again. The pass wakes for it.
-    std::optional<Clock::time_point> due() const noexcept { return due_; }
+    std::optional<Clock::time_point> due() const noexcept {
+        return due_;
+    }
 
     // What is referenced that this node lacked at the last survey, sorted;
     // null before the first. Repair pulls from this rather than walking every
@@ -138,7 +142,9 @@ class AvailabilityService {
     };
     static constexpr Waits peer_lacks_waits = Waits::none;
     static constexpr ThreadSafety peer_lacks_safety = ThreadSafety::thread_safe;
-    std::shared_ptr<const PeerLacks> peer_lacks() const { return peer_lacks_.handle(); }
+    std::shared_ptr<const PeerLacks> peer_lacks() const {
+        return peer_lacks_.handle();
+    }
 
     // Whether the last survey found no reachable node holding the extent.
     bool unavailable(const ObjectId& id) const {

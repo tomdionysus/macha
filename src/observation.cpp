@@ -115,8 +115,8 @@ ObservationSnapshot ObservationSnapshot::since(const ObservationSnapshot& earlie
     }
     for (const auto& [name, value] : counters) {
         const auto before = earlier.counters.find(name);
-        window.counters.emplace(name,
-                                minus(value, before == earlier.counters.end() ? 0 : before->second));
+        window.counters.emplace(
+            name, minus(value, before == earlier.counters.end() ? 0 : before->second));
     }
     return window;
 }
@@ -218,8 +218,7 @@ std::string observation_route_label(std::string_view method, std::string_view pa
 }
 
 std::string render_observation_window(uint64_t start_unix_ms, uint64_t end_unix_ms,
-                                      std::string_view version,
-                                      const ObservationSnapshot& window,
+                                      std::string_view version, const ObservationSnapshot& window,
                                       const std::map<std::string, uint64_t>& gauges) {
     Json::Object histograms;
     for (const auto& [name, histogram] : window.histograms) {
@@ -230,13 +229,11 @@ std::string render_observation_window(uint64_t start_unix_ms, uint64_t end_unix_
             if (histogram.buckets[bucket])
                 buckets.push_back(Json::Array{Json(static_cast<uint64_t>(bucket)),
                                               Json(histogram.buckets[bucket])});
-        histograms[name] = Json::Object{{"count", histogram.count},
-                                        {"sum", histogram.sum},
-                                        {"max", histogram.max},
-                                        {"p50", histogram.quantile(0.5)},
-                                        {"p90", histogram.quantile(0.9)},
-                                        {"p99", histogram.quantile(0.99)},
-                                        {"buckets", std::move(buckets)}};
+        histograms[name] =
+            Json::Object{{"count", histogram.count},       {"sum", histogram.sum},
+                         {"max", histogram.max},           {"p50", histogram.quantile(0.5)},
+                         {"p90", histogram.quantile(0.9)}, {"p99", histogram.quantile(0.99)},
+                         {"buckets", std::move(buckets)}};
     }
     Json::Object counters;
     for (const auto& [name, value] : window.counters)

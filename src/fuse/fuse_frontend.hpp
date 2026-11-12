@@ -13,8 +13,8 @@
 #include <cstdint>
 #include <functional>
 #include <future>
-#include <memory>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -93,8 +93,7 @@ class WeightedLoaderService {
 
   public:
     explicit WeightedLoaderService(size_t viewer_weight = 95, size_t loader_weight = 5,
-                                   std::chrono::milliseconds slice =
-                                       std::chrono::milliseconds(25))
+                                   std::chrono::milliseconds slice = std::chrono::milliseconds(25))
         : viewer_weight_(viewer_weight), loader_weight_(loader_weight), slice_(slice) {
         if (!viewer_weight_ || !loader_weight_)
             throw std::invalid_argument("weighted loader service weights must be at least 1");
@@ -168,12 +167,12 @@ class WeightedLoaderService {
             return {};
         auto active = std::chrono::duration_cast<std::chrono::milliseconds>(now - *burst_started_);
         active = std::max(active, std::chrono::milliseconds(1));
-        const auto ratio = static_cast<long double>(viewer_weight_) /
-                           static_cast<long double>(loader_weight_);
+        const auto ratio =
+            static_cast<long double>(viewer_weight_) / static_cast<long double>(loader_weight_);
         const auto raw = static_cast<long double>(active.count()) * ratio;
-        const auto capped = std::min<long double>(
-            raw, static_cast<long double>(std::chrono::hours(24).count()) * 60.0L * 60.0L *
-                     1000.0L);
+        const auto capped =
+            std::min<long double>(raw, static_cast<long double>(std::chrono::hours(24).count()) *
+                                           60.0L * 60.0L * 1000.0L);
         const auto cooldown = std::chrono::milliseconds(static_cast<int64_t>(capped));
         not_before_ = now + cooldown;
         burst_started_.reset();
@@ -261,7 +260,9 @@ class ViewerWeightedAdmission final : public LoaderAdmission {
     ViewerWeightedAdmission(FileSystem&, const FuseConfig&);
 
     bool can_start(TimePoint now) override;
-    bool namespace_can_start(TimePoint) override { return true; }
+    bool namespace_can_start(TimePoint) override {
+        return true;
+    }
     void started(TimePoint now, bool begin_service) override;
     void service_started(TimePoint now) override;
     bool should_yield(TimePoint now) override;

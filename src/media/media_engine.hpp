@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "config.hpp"
 #include "contract/time_source.hpp"
 #include "http/http.hpp"
-#include "config.hpp"
 #include "retained_memory.hpp"
 #include "types.hpp"
 
@@ -91,7 +91,9 @@ class MediaError : public std::runtime_error {
   public:
     MediaError(MediaFailure failure, const std::string& message)
         : std::runtime_error(message), failure_(failure) {}
-    MediaFailure failure() const noexcept { return failure_; }
+    MediaFailure failure() const noexcept {
+        return failure_;
+    }
 };
 
 // A seekable immutable media view. libav sees only this interface and never
@@ -101,8 +103,7 @@ class MediaInput {
     virtual ~MediaInput() = default;
     virtual uint64_t size() const = 0;
     virtual size_t read(uint64_t offset, std::span<uint8_t> destination,
-                        Clock::time_point deadline = {},
-                        std::atomic_bool* cancelled = nullptr) = 0;
+                        Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr) = 0;
 };
 
 struct MediaSource {
@@ -212,7 +213,8 @@ class MediaSegmentStore {
     // Waits until the named init or segment object is published, the
     // generation ends, or the timeout expires (zero waits indefinitely). Any
     // other name is an immediate lookup.
-    std::optional<Bytes> wait_object(std::string_view name, std::chrono::milliseconds timeout) const;
+    std::optional<Bytes> wait_object(std::string_view name,
+                                     std::chrono::milliseconds timeout) const;
     // Non-blocking wait_object. Returns the object if present; `ended` if it
     // never will be; otherwise registers `wake` under the store lock (no lost
     // publication) to fire once on the next publication or ending. Spurious
@@ -257,14 +259,18 @@ struct MediaStartProgress {
     std::atomic_int64_t preroll_decoded_us{};
     // Media time past the origin that has reached the muxer.
     std::atomic_int64_t output_media_us{};
-    void moved() noexcept { seq.fetch_add(1, std::memory_order_relaxed); }
+    void moved() noexcept {
+        seq.fetch_add(1, std::memory_order_relaxed);
+    }
 };
 
 class MediaEngineSession {
   public:
     virtual ~MediaEngineSession() = default;
     // Null when the engine does not report start progress.
-    virtual const MediaStartProgress* start_progress() const { return nullptr; }
+    virtual const MediaStartProgress* start_progress() const {
+        return nullptr;
+    }
     virtual bool running() const = 0;
     virtual std::optional<int> exit_code() const = 0;
     virtual std::string diagnostics() const = 0;
@@ -297,25 +303,26 @@ class MediaEngine {
     virtual ~MediaEngine() = default;
     // Empty unless the container is MP4 or Matroska. Throws MediaError when
     // the source cannot be read.
-    virtual std::optional<MediaKeyframeIndex> keyframe_index(const MediaSource&,
-                                                             std::chrono::milliseconds timeout = {}) {
+    virtual std::optional<MediaKeyframeIndex>
+    keyframe_index(const MediaSource&, std::chrono::milliseconds timeout = {}) {
         (void)timeout;
         return std::nullopt;
     }
     virtual MediaEngineStatus status() const = 0;
-    virtual MediaProbeResult probe(const MediaSource&,
-                                   std::chrono::milliseconds timeout = {}) = 0;
-    virtual HlsVodPlan prepare_hls_vod(
-        const MediaSource&, const PlaybackPlan&, double source_duration_seconds,
-        std::chrono::milliseconds segment_duration, bool allow_video_transcode_fallback,
-        std::chrono::milliseconds timeout = {}) = 0;
-    virtual std::unique_ptr<MediaEngineSession> start_hls(
-        const MediaSource&, const HlsVodPlan&, std::chrono::milliseconds segment_duration,
-        size_t max_ahead_segments, uint64_t segment_memory_bytes,
-        const std::filesystem::path& spill_directory) = 0;
-    virtual std::string extract_webvtt_segment(
-        const MediaSource&, int subtitle_stream, std::chrono::milliseconds range_start,
-        std::chrono::milliseconds range_end, std::chrono::milliseconds timeline_origin = {}) = 0;
+    virtual MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds timeout = {}) = 0;
+    virtual HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan&,
+                                       double source_duration_seconds,
+                                       std::chrono::milliseconds segment_duration,
+                                       bool allow_video_transcode_fallback,
+                                       std::chrono::milliseconds timeout = {}) = 0;
+    virtual std::unique_ptr<MediaEngineSession>
+    start_hls(const MediaSource&, const HlsVodPlan&, std::chrono::milliseconds segment_duration,
+              size_t max_ahead_segments, uint64_t segment_memory_bytes,
+              const std::filesystem::path& spill_directory) = 0;
+    virtual std::string extract_webvtt_segment(const MediaSource&, int subtitle_stream,
+                                               std::chrono::milliseconds range_start,
+                                               std::chrono::milliseconds range_end,
+                                               std::chrono::milliseconds timeline_origin = {}) = 0;
 };
 
 // macha_core is FFmpeg-free; the FFmpeg engine (media_engine.cpp, linked only
@@ -335,7 +342,8 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan&,
 std::string playback_mode_name(PlaybackMode);
 // RFC 6381 codec string for one stream ("avc1.640029", "mp4a.40.2", ...);
 // `transcoded` describes the libx264/AAC output instead of the source.
-std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stream, bool transcoded);
+std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stream,
+                             bool transcoded);
 // Master-playlist EXT-X-STREAM-INF (BANDWIDTH, CODECS, RESOLUTION), so the
 // player builds source buffers from what the segments really carry.
 std::string hls_variant_stream_inf(const PlaybackPlan& plan, const MediaStreamInfo* video,

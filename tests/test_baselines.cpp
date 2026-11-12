@@ -5,10 +5,10 @@
 // "BENCH name=<name> ns_per_op=<n> ops=<n>"; run with
 // `--filter baseline --verbose`. They assert only that the timed operation
 // did its work.
+#include "ledger/retention_ledger.hpp"
 #include "observation.hpp"
 #include "service/claim_walk.hpp"
 #include "storage/retention.hpp"
-#include "ledger/retention_ledger.hpp"
 #include "storage/storage_pool.hpp"
 #include "test_backend_support.hpp"
 
@@ -34,8 +34,9 @@ Bytes numbered(uint64_t n) {
 
 void report(std::string_view name, Clock::duration elapsed, uint64_t ops) {
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
-    std::cout << "BENCH name=" << name << " ns_per_op=" << (ops ? ns / static_cast<int64_t>(ops) : 0)
-              << " ops=" << ops << '\n';
+    std::cout << "BENCH name=" << name
+              << " ns_per_op=" << (ops ? ns / static_cast<int64_t>(ops) : 0) << " ops=" << ops
+              << '\n';
 }
 
 // A one-backend DATA pool holding object_count small objects, and the ids of

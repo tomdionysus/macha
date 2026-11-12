@@ -122,8 +122,7 @@ std::vector<ObjectTrie::Record> TrieUnion::merged_records(const ObjectTrie::Pref
 namespace {
 
 // The worked-out node a prefix falls in, and how deep it sits.
-template <typename NodePtr>
-NodePtr find_node(NodePtr node, const ObjectTrie::Prefix& prefix) {
+template <typename NodePtr> NodePtr find_node(NodePtr node, const ObjectTrie::Prefix& prefix) {
     for (uint8_t depth = 0; node && node->below.size() == 256 && depth < prefix.length; ++depth)
         node = node->below[prefix.bytes[depth]];
     return node;

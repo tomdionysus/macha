@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "storage/local_store.hpp"
-#include "write_behind.hpp"
 #include "codec.hpp"
 #include "log.hpp"
 #include "startup_progress.hpp"
 #include "supervised.hpp"
+#include "write_behind.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -26,8 +26,12 @@ class MACHA_SCOPED_CAPABILITY Unlocked {
     Lock& lock_;
 
   public:
-    Unlocked(Lock& lock, [[maybe_unused]] Mutex& mutex) MACHA_RELEASE(mutex) : lock_(lock) { lock_.unlock(); }
-    ~Unlocked() MACHA_RELEASE() { lock_.lock(); }
+    Unlocked(Lock& lock, [[maybe_unused]] Mutex& mutex) MACHA_RELEASE(mutex) : lock_(lock) {
+        lock_.unlock();
+    }
+    ~Unlocked() MACHA_RELEASE() {
+        lock_.lock();
+    }
     Unlocked(const Unlocked&) = delete;
     Unlocked& operator=(const Unlocked&) = delete;
 };
@@ -67,10 +71,11 @@ struct PackHeader {
 void pwa_exact(int fd, std::span<const uint8_t> data, uint64_t offset) {
     size_t done = 0;
     while (done < data.size()) {
-        auto n = ::pwrite(fd, data.data() + done, data.size() - done,
-                          static_cast<off_t>(offset + done));
+        auto n =
+            ::pwrite(fd, data.data() + done, data.size() - done, static_cast<off_t>(offset + done));
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             throw std::runtime_error("cannot write storage state: " + std::string(strerror(errno)));
         }
         done += static_cast<size_t>(n);
@@ -81,13 +86,15 @@ std::optional<Bytes> pra_exact(int fd, size_t size, uint64_t offset) {
     Bytes out(size);
     size_t done = 0;
     while (done < out.size()) {
-        auto n = ::pread(fd, out.data() + done, out.size() - done,
-                         static_cast<off_t>(offset + done));
+        auto n =
+            ::pread(fd, out.data() + done, out.size() - done, static_cast<off_t>(offset + done));
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             return {};
         }
-        if (n == 0) return {};
+        if (n == 0)
+            return {};
         done += static_cast<size_t>(n);
     }
     return out;
@@ -101,7 +108,8 @@ Bytes encode_accounting(const AccountingRecord& record) {
     body.u8(record.operation);
     body.u64(record.size);
     body.fixed(record.id.bytes);
-    while (body.data().size() < accounting_body_size) body.u8(0);
+    while (body.data().size() < accounting_body_size)
+        body.u8(0);
     if (body.data().size() != accounting_body_size)
         throw std::runtime_error("internal accounting record size error");
     auto hash = sha256(body.data());
@@ -112,7 +120,8 @@ Bytes encode_accounting(const AccountingRecord& record) {
 }
 
 std::optional<AccountingRecord> decode_accounting(std::span<const uint8_t> bytes) {
-    if (bytes.size() != accounting_slot_size) return {};
+    if (bytes.size() != accounting_slot_size)
+        return {};
     auto body = bytes.first(accounting_body_size);
     auto expected = sha256(body);
     if (!std::equal(expected.bytes.begin(), expected.bytes.end(),
@@ -121,7 +130,8 @@ std::optional<AccountingRecord> decode_accounting(std::span<const uint8_t> bytes
     try {
         Reader reader(body);
         auto magic = reader.raw(A.size());
-        if (!std::equal(magic.begin(), magic.end(), A.begin())) return {};
+        if (!std::equal(magic.begin(), magic.end(), A.begin()))
+            return {};
         AccountingRecord record;
         record.sequence = reader.u64();
         record.used = reader.u64();
@@ -156,7 +166,8 @@ Bytes encode_pack_header(const PackHeader& header) {
 }
 
 std::optional<PackHeader> decode_pack_header(std::span<const uint8_t> bytes) {
-    if (bytes.size() != pack_header_size) return {};
+    if (bytes.size() != pack_header_size)
+        return {};
     const auto prefix = bytes.first(pack_header_prefix_size);
     const auto checksum = sha256(prefix);
     if (!std::equal(checksum.bytes.begin(), checksum.bytes.end(),
@@ -165,7 +176,8 @@ std::optional<PackHeader> decode_pack_header(std::span<const uint8_t> bytes) {
     try {
         Reader r(prefix);
         auto magic = r.raw(P.size());
-        if (!std::equal(magic.begin(), magic.end(), P.begin())) return {};
+        if (!std::equal(magic.begin(), magic.end(), P.begin()))
+            return {};
         PackHeader h;
         h.type = r.u8();
         h.touched_ms = r.u64();
@@ -175,7 +187,8 @@ std::optional<PackHeader> decode_pack_header(std::span<const uint8_t> bytes) {
         h.nonce = r.fixed<12>();
         h.tag = r.fixed<16>();
         r.finish();
-        if (h.type < pack_put || h.type > pack_touch) return {};
+        if (h.type < pack_put || h.type > pack_touch)
+            return {};
         if (h.type == pack_put) {
             if (!h.payload_size || h.payload_size > pack_payload_safety_limit ||
                 h.plain_size != h.payload_size)
@@ -231,7 +244,8 @@ void wa(int fd, std::span<const uint8_t> bytes) {
     while (done < bytes.size()) {
         auto n = ::write(fd, bytes.data() + done, bytes.size() - done);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             throw std::runtime_error(strerror(errno));
         }
         done += static_cast<size_t>(n);
@@ -242,7 +256,9 @@ void syncdir(const std::filesystem::path& p) {
     int fd = ::open(p.c_str(), O_RDONLY | O_DIRECTORY);
     if (fd >= 0) {
         int rc;
-        do { rc = ::fsync(fd); } while (rc != 0 && errno == EINTR);
+        do {
+            rc = ::fsync(fd);
+        } while (rc != 0 && errno == EINTR);
         ::close(fd);
     }
 }
@@ -259,7 +275,8 @@ std::optional<uint64_t> pack_sequence(std::string_view name) {
     try {
         size_t used = 0;
         auto value = std::stoull(std::string(name.substr(5, 20)), &used, 10);
-        if (used != 20 || !value) return {};
+        if (used != 20 || !value)
+            return {};
         return value;
     } catch (...) {
         return {};
@@ -274,8 +291,7 @@ std::filesystem::file_time_type file_time_from_unix_ms(uint64_t value) {
 
 } // namespace
 
-void PosixLocalStoreFiles::install(const std::filesystem::path& path,
-                                   std::span<const uint8_t> head,
+void PosixLocalStoreFiles::install(const std::filesystem::path& path, std::span<const uint8_t> head,
                                    std::span<const uint8_t> body) {
     std::filesystem::create_directories(path.parent_path());
     std::string temp =
@@ -283,7 +299,8 @@ void PosixLocalStoreFiles::install(const std::filesystem::path& path,
     int fd = -1;
     try {
         fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (fd < 0) throw std::runtime_error(strerror(errno));
+        if (fd < 0)
+            throw std::runtime_error(strerror(errno));
         wa(fd, head);
         wa(fd, body);
         // An ephemeral store (the cache) is never synced; nothing it writes
@@ -291,11 +308,13 @@ void PosixLocalStoreFiles::install(const std::filesystem::path& path,
         start_writeback(fd);
         const int close_rc = ::close(fd);
         fd = -1;
-        if (close_rc != 0) throw std::runtime_error(strerror(errno));
+        if (close_rc != 0)
+            throw std::runtime_error(strerror(errno));
         if (::rename(temp.c_str(), path.c_str()) != 0)
             throw std::runtime_error(strerror(errno));
     } catch (...) {
-        if (fd >= 0) ::close(fd);
+        if (fd >= 0)
+            ::close(fd);
         std::error_code remove_error;
         std::filesystem::remove(temp, remove_error);
         throw;
@@ -317,7 +336,8 @@ Bytes PosixLocalStoreFiles::read(const std::filesystem::path& path) {
     while (done < out.size()) {
         auto n = ::read(fd, out.data() + done, out.size() - done);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             const auto error = std::string(strerror(errno));
             close(fd);
             throw std::runtime_error("cannot read object: " + error);
@@ -343,7 +363,8 @@ std::optional<Bytes> PosixLocalStoreFiles::read_at(const std::filesystem::path& 
     while (done < size) {
         auto n = ::pread(fd, out->data() + done, size - done, static_cast<off_t>(offset + done));
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             const auto error = std::string(strerror(errno));
             ::close(fd);
             throw std::runtime_error("cannot read pack: " + error);
@@ -359,8 +380,7 @@ std::optional<Bytes> PosixLocalStoreFiles::read_at(const std::filesystem::path& 
     return out;
 }
 
-void PosixLocalStoreFiles::append(const std::filesystem::path& path,
-                                  std::span<const uint8_t> head,
+void PosixLocalStoreFiles::append(const std::filesystem::path& path, std::span<const uint8_t> head,
                                   std::span<const uint8_t> body) {
     int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0)
@@ -378,7 +398,8 @@ void PosixLocalStoreFiles::append(const std::filesystem::path& path,
 
 bool PosixLocalStoreFiles::truncate(const std::filesystem::path& path, uint64_t size) {
     int fd = ::open(path.c_str(), O_WRONLY);
-    if (fd < 0) return false;
+    if (fd < 0)
+        return false;
     const bool cut = ::ftruncate(fd, static_cast<off_t>(size)) == 0;
     ::close(fd);
     return cut;
@@ -389,8 +410,10 @@ PosixLocalStoreFiles::list(const std::filesystem::path& dir) {
     std::vector<std::pair<std::filesystem::path, uint64_t>> files;
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
-        if (error) break;
-        if (!entry.is_regular_file()) continue;
+        if (error)
+            break;
+        if (!entry.is_regular_file())
+            continue;
         std::error_code size_error;
         const auto size = entry.file_size(size_error);
         if (size_error)
@@ -431,14 +454,14 @@ StorageLock::~StorageLock() {
 
 LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
                        std::array<uint8_t, 32> key, LocalStoreMode mode,
-                       std::shared_ptr<DurabilityDomain> durability_domain,
-                       LocalStoreFiles& files)
+                       std::shared_ptr<DurabilityDomain> durability_domain, LocalStoreFiles& files)
     : root_(std::move(root)), objects_(root_ / "objects"), packs_(root_ / "packs"),
       accounting_path_(root_ / ".macha.accounting"), limit_(options.limit),
       reserve_free_(options.reserve_free), pack_threshold_(options.pack_threshold),
       pack_target_size_(options.pack_target_size), key_(key), mode_(mode), files_(files),
       durability_domain_(std::move(durability_domain)) {
-    if (!limit_) throw std::runtime_error("local store limit must be non-zero");
+    if (!limit_)
+        throw std::runtime_error("local store limit must be non-zero");
     if ((pack_threshold_ == 0) != (pack_target_size_ == 0))
         throw std::runtime_error("pack threshold and target size must both be zero or non-zero");
     if (pack_threshold_ && pack_target_size_ < pack_threshold_)
@@ -576,16 +599,15 @@ void LocalStore::seed_ledger() {
         presence_ = PresenceIndex{};
         presence_.warmed();
     }
-    Log::info("storage held ledger seeded path=" + root_.string() +
-              " objects=" + std::to_string(ledger_->size()) + " elapsed_ms=" +
-              std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 Clock::now() - started)
-                                 .count()));
+    Log::info(
+        "storage held ledger seeded path=" + root_.string() +
+        " objects=" + std::to_string(ledger_->size()) + " elapsed_ms=" +
+        std::to_string(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count()));
 }
 
-LocalStore::LocalStore(std::filesystem::path root, uint64_t limit,
-                       std::array<uint8_t, 32> key, LocalStoreMode mode,
-                       std::shared_ptr<DurabilityDomain> durability_domain,
+LocalStore::LocalStore(std::filesystem::path root, uint64_t limit, std::array<uint8_t, 32> key,
+                       LocalStoreMode mode, std::shared_ptr<DurabilityDomain> durability_domain,
                        LocalStoreFiles& files)
     : LocalStore(std::move(root), LocalStoreOptions{limit, 0, 0, 0}, key, mode,
                  std::move(durability_domain), files) {}
@@ -605,15 +627,18 @@ LocalStore::~LocalStore() {
             try {
                 durability_domain_->await_durable(last_mutation_generation_,
                                                   DurabilityUrgency::immediate);
-            } catch (...) { can_checkpoint = false; }
+            } catch (...) {
+                can_checkpoint = false;
+            }
         }
         // Every other thread has stopped: no lock is needed.
         if (can_checkpoint && mode_ != LocalStoreMode::ephemeral && accounting_dirty_) {
             try {
                 ObjectId none{};
-                persist_accounting(used_.load(std::memory_order_relaxed), accounting_none, none,
-                                   0, true);
-            } catch (...) {}
+                persist_accounting(used_.load(std::memory_order_relaxed), accounting_none, none, 0,
+                                   true);
+            } catch (...) {
+            }
         }
         close(accounting_fd_);
         accounting_fd_ = -1;
@@ -640,15 +665,18 @@ bool LocalStore::restore_accounting(bool* clean) {
     unsigned best_slot = 0;
     for (unsigned slot = 0; slot < 2; ++slot) {
         auto bytes = pra_exact(accounting_fd_, accounting_slot_size, slot * accounting_slot_size);
-        if (!bytes) continue;
+        if (!bytes)
+            continue;
         auto decoded = decode_accounting(*bytes);
-        if (!decoded) continue;
+        if (!decoded)
+            continue;
         if (!best || decoded->sequence > best->sequence) {
             best = *decoded;
             best_slot = slot;
         }
     }
-    if (!best) return false;
+    if (!best)
+        return false;
     accounting_sequence_ = best->sequence;
     accounting_slot_ = best_slot;
     used_.store(best->used, std::memory_order_relaxed);
@@ -658,11 +686,12 @@ bool LocalStore::restore_accounting(bool* clean) {
 }
 
 void LocalStore::ensure_accounting_dirty(Lock& lock) {
-    if (mode_ == LocalStoreMode::ephemeral || accounting_dirty_) return;
-    accounting_state_cv_.wait(lock.native(), [this]() MACHA_REQUIRES(m_) {
-        return !accounting_dirty_in_progress_;
-    });
-    if (accounting_dirty_) return;
+    if (mode_ == LocalStoreMode::ephemeral || accounting_dirty_)
+        return;
+    accounting_state_cv_.wait(
+        lock.native(), [this]() MACHA_REQUIRES(m_) { return !accounting_dirty_in_progress_; });
+    if (accounting_dirty_)
+        return;
     accounting_dirty_in_progress_ = true;
     const auto used = used_.load(std::memory_order_relaxed);
     try {
@@ -711,30 +740,29 @@ bool LocalStore::filesystem_space_available_for_reservations() const {
     }
     std::error_code error;
     const auto space = std::filesystem::space(root_, error);
-    if (error) return false;
+    if (error)
+        return false;
     if (reserved > space.available)
         return false;
     return reserve_free_ <= space.available - reserved;
 }
 
-std::optional<LocalStore::LooseStamp>
-LocalStore::loose_stamp(const std::filesystem::path& path) {
-    struct stat value {};
+std::optional<LocalStore::LooseStamp> LocalStore::loose_stamp(const std::filesystem::path& path) {
+    struct stat value{};
     if (::stat(path.c_str(), &value) != 0 || value.st_size < 0)
         return {};
 #if defined(__APPLE__)
-    const auto modified = static_cast<int64_t>(value.st_mtimespec.tv_sec) * 1000000000LL +
-                          value.st_mtimespec.tv_nsec;
-    const auto changed = static_cast<int64_t>(value.st_ctimespec.tv_sec) * 1000000000LL +
-                         value.st_ctimespec.tv_nsec;
+    const auto modified =
+        static_cast<int64_t>(value.st_mtimespec.tv_sec) * 1000000000LL + value.st_mtimespec.tv_nsec;
+    const auto changed =
+        static_cast<int64_t>(value.st_ctimespec.tv_sec) * 1000000000LL + value.st_ctimespec.tv_nsec;
 #else
-    const auto modified = static_cast<int64_t>(value.st_mtim.tv_sec) * 1000000000LL +
-                          value.st_mtim.tv_nsec;
-    const auto changed = static_cast<int64_t>(value.st_ctim.tv_sec) * 1000000000LL +
-                         value.st_ctim.tv_nsec;
+    const auto modified =
+        static_cast<int64_t>(value.st_mtim.tv_sec) * 1000000000LL + value.st_mtim.tv_nsec;
+    const auto changed =
+        static_cast<int64_t>(value.st_ctim.tv_sec) * 1000000000LL + value.st_ctim.tv_nsec;
 #endif
-    return LooseStamp{static_cast<uint64_t>(value.st_dev),
-                      static_cast<uint64_t>(value.st_ino),
+    return LooseStamp{static_cast<uint64_t>(value.st_dev), static_cast<uint64_t>(value.st_ino),
                       static_cast<uint64_t>(value.st_size), modified, changed};
 }
 
@@ -753,8 +781,7 @@ std::shared_ptr<IoMutex> LocalStore::object_mutex(const ObjectId& id) const {
     return created;
 }
 
-void LocalStore::remember_verified_loose_locked(const ObjectId& id,
-                                                const LooseStamp& stamp) const {
+void LocalStore::remember_verified_loose_locked(const ObjectId& id, const LooseStamp& stamp) const {
     const auto sequence = ++verified_loose_sequence_;
     verified_loose_[id] = {stamp, sequence};
     verified_loose_order_.push_back({sequence, id});
@@ -799,7 +826,8 @@ bool LocalStore::prune_empty_loose(const ObjectId& id, const std::filesystem::pa
 }
 
 void LocalStore::select_active_pack_locked(uint64_t next_record_size) {
-    if (!pack_threshold_) throw std::runtime_error("packing is disabled");
+    if (!pack_threshold_)
+        throw std::runtime_error("packing is disabled");
     if (active_pack_.empty() ||
         (active_pack_size_ && active_pack_size_ + next_record_size > pack_target_size_)) {
         active_pack_ = packs_ / pack_name(next_pack_sequence_++);
@@ -875,13 +903,15 @@ bool LocalStore::append_pack_record_locked(uint8_t type, const ObjectId& id,
         entry->nonce = h.nonce;
         entry->tag = h.tag;
     }
-    if (record_size) *record_size = total;
+    if (record_size)
+        *record_size = total;
     return true;
 }
 
 std::optional<Bytes> LocalStore::get_packed_locked(const ObjectId& id, Lock& lock) const {
     auto found = packed_.find(id);
-    if (found == packed_.end()) return {};
+    if (found == packed_.end())
+        return {};
     const auto entry = found->second;
     ++active_pack_readers_[entry.file];
 
@@ -928,8 +958,10 @@ void LocalStore::rebuild_pack_index(bool truncate_incomplete_tail) {
     std::vector<std::pair<uint64_t, std::filesystem::path>> files;
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(packs_, error)) {
-        if (error) break;
-        if (!entry.is_regular_file()) continue;
+        if (error)
+            break;
+        if (!entry.is_regular_file())
+            continue;
         const auto name = entry.path().filename().string();
         if (name.find(".tmp") != std::string::npos || name.starts_with(".compact-")) {
             std::error_code remove_error;
@@ -939,7 +971,8 @@ void LocalStore::rebuild_pack_index(bool truncate_incomplete_tail) {
         if (auto seq = pack_sequence(name))
             files.push_back({*seq, entry.path()});
     }
-    if (error) throw std::runtime_error("cannot enumerate packs: " + error.message());
+    if (error)
+        throw std::runtime_error("cannot enumerate packs: " + error.message());
     std::sort(files.begin(), files.end());
 
     for (const auto& [sequence, file] : files) {
@@ -976,8 +1009,8 @@ void LocalStore::rebuild_pack_index(bool truncate_incomplete_tail) {
                 // is inside the pack: the span is skipped as dead bytes and its
                 // objects repaired from replicas. Neither takes the backend
                 // offline.
-                const bool zero_header = std::all_of(bytes->begin(), bytes->end(),
-                                                     [](uint8_t b) { return b == 0; });
+                const bool zero_header =
+                    std::all_of(bytes->begin(), bytes->end(), [](uint8_t b) { return b == 0; });
                 const auto next = find_next_pack_header(fd, offset + 1, file_size);
                 if (!next) {
                     const auto discarded = file_size - offset;
@@ -985,10 +1018,9 @@ void LocalStore::rebuild_pack_index(bool truncate_incomplete_tail) {
                         if (::ftruncate(fd, static_cast<off_t>(offset)) != 0) {
                             const auto saved = errno;
                             ::close(fd);
-                            throw std::runtime_error("cannot truncate torn pack tail at " +
-                                                     file.string() + " offset=" +
-                                                     std::to_string(offset) + ": " +
-                                                     strerror(saved));
+                            throw std::runtime_error(
+                                "cannot truncate torn pack tail at " + file.string() +
+                                " offset=" + std::to_string(offset) + ": " + strerror(saved));
                         }
                         Log::warn("truncated undecodable pack tail path=" + file.string() +
                                   " offset=" + std::to_string(offset) +
@@ -999,9 +1031,8 @@ void LocalStore::rebuild_pack_index(bool truncate_incomplete_tail) {
                     break;
                 }
                 const auto skipped = *next - offset;
-                Log::error("skipped unreadable pack region path=" + file.string() +
-                           " offset=" + std::to_string(offset) +
-                           " bytes=" + std::to_string(skipped) +
+                Log::error("skipped unreadable pack region path=" + file.string() + " offset=" +
+                           std::to_string(offset) + " bytes=" + std::to_string(skipped) +
                            " zero_header=" + std::to_string(zero_header ? 1 : 0) +
                            " (objects recorded there are absent from this backend)");
                 pack_dead_bytes_ += skipped;
@@ -1062,7 +1093,8 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
     // install under the object's lock only.
     constexpr uint64_t loose_header_size = M.size() + sizeof(uint64_t) + 12 + 16;
     const uint64_t need = loose_header_size + data.size();
-    if (!physical_space_available_locked(need)) return false;
+    if (!physical_space_available_locked(need))
+        return false;
     const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
     reserved_write_bytes_ += need;
     bool space = false;
@@ -1132,7 +1164,8 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
 bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> data,
                                    uint64_t& generation, Lock& lock) {
     const uint64_t need = pack_header_size + data.size();
-    if (!physical_space_available_locked(need)) return false;
+    if (!physical_space_available_locked(need))
+        return false;
     const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
     reserved_write_bytes_ += need;
     bool space = false;
@@ -1185,7 +1218,8 @@ bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> 
 
 bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                           StoreWriteDurability durability, uint64_t* deferred_generation) {
-    if (object_id(data) != id) throw std::runtime_error("object hash mismatch");
+    if (object_id(data) != id)
+        throw std::runtime_error("object hash mismatch");
     await_accounting();
     ObjectLock object_guard(object_mutex(id));
     Lock lock(m_);
@@ -1203,7 +1237,8 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
             // A compact touch record makes the re-affirmation age crash-recoverable.
             uint64_t record_size = 0;
             PackEntry record;
-            if (mode_ != LocalStoreMode::ephemeral) ensure_accounting_dirty(lock);
+            if (mode_ != LocalStoreMode::ephemeral)
+                ensure_accounting_dirty(lock);
             const auto touched = unix_ms();
             append_pack_record_locked(pack_touch, id, {}, touched, &record, &record_size, lock);
             packed_.at(id).touched_unix_ms = touched;
@@ -1216,7 +1251,8 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                 provisional_generations_[id] = generation;
                 provisional_order_.push_back({generation, id});
             }
-            if (deferred_generation) *deferred_generation = generation;
+            if (deferred_generation)
+                *deferred_generation = generation;
             if (durability == StoreWriteDurability::immediate && generation) {
                 lock.unlock();
                 durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
@@ -1238,8 +1274,7 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
             std::optional<Bytes> existing;
             lock.unlock();
             const auto current_stamp = loose_stamp(loose_path);
-            const bool verified_fast =
-                remembered && current_stamp && *remembered == *current_stamp;
+            const bool verified_fast = remembered && current_stamp && *remembered == *current_stamp;
             if (verified_fast) {
                 loose_reaffirmation_fast_paths_.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -1262,13 +1297,11 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                     existing.reset();
                 }
             }
-            if (verified_fast ||
-                (existing && existing->size() == data.size() &&
-                 std::equal(existing->begin(), existing->end(), data.begin()))) {
+            if (verified_fast || (existing && existing->size() == data.size() &&
+                                  std::equal(existing->begin(), existing->end(), data.begin()))) {
                 std::error_code touch_error;
-                std::filesystem::last_write_time(loose_path,
-                                                 std::filesystem::file_time_type::clock::now(),
-                                                 touch_error);
+                std::filesystem::last_write_time(
+                    loose_path, std::filesystem::file_time_type::clock::now(), touch_error);
                 const auto touched_stamp = loose_stamp(loose_path);
                 lock.lock();
                 if (touched_stamp)
@@ -1280,7 +1313,8 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                 if (auto found = provisional_generations_.find(id);
                     found != provisional_generations_.end())
                     generation = found->second;
-                if (deferred_generation) *deferred_generation = generation;
+                if (deferred_generation)
+                    *deferred_generation = generation;
                 if (durability == StoreWriteDurability::immediate && durability_domain_ &&
                     generation > durability_domain_->durable_generation()) {
                     lock.unlock();
@@ -1307,8 +1341,10 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
     uint64_t generation = 0;
     const bool stored = pack ? put_packed_locked(id, data, generation, lock)
                              : put_loose_locked(id, data, generation, lock);
-    if (!stored) return false;
-    if (deferred_generation) *deferred_generation = generation;
+    if (!stored)
+        return false;
+    if (deferred_generation)
+        *deferred_generation = generation;
     if (durability == StoreWriteDurability::immediate && generation) {
         lock.unlock();
         durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
@@ -1323,9 +1359,11 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
         return get_packed_locked(id, lock);
     const auto p = path(id);
     lock.unlock();
-    if (!std::filesystem::exists(p)) return {};
+    if (!std::filesystem::exists(p))
+        return {};
     auto encoded = files_.read(p);
-    if (encoded.empty() && prune_empty_loose(id, p)) return {};
+    if (encoded.empty() && prune_empty_loose(id, p))
+        return {};
     Bytes plain;
     try {
         Reader r(encoded);
@@ -1389,8 +1427,7 @@ bool LocalStore::has(const ObjectId& id) const noexcept {
         ObjectLock object_guard(object_mutex(id));
         {
             Lock lock(m_);
-            if (packed_.contains(id) ||
-                presence_.answer(id) == PresenceIndex::Answer::present)
+            if (packed_.contains(id) || presence_.answer(id) == PresenceIndex::Answer::present)
                 return true;
         }
         std::error_code error;
@@ -1410,13 +1447,18 @@ bool LocalStore::has(const ObjectId& id) const noexcept {
 }
 
 bool LocalStore::valid(const ObjectId& id) const noexcept {
-    try { return get(id).has_value(); } catch (...) { return false; }
+    try {
+        return get(id).has_value();
+    } catch (...) {
+        return false;
+    }
 }
 
 bool LocalStore::remove_locked(const ObjectId& id, Lock& lock) {
     forget_verified_loose_locked(id);
     if (auto found = packed_.find(id); found != packed_.end()) {
-        if (mode_ != LocalStoreMode::ephemeral) ensure_accounting_dirty(lock);
+        if (mode_ != LocalStoreMode::ephemeral)
+            ensure_accounting_dirty(lock);
         uint64_t tomb_size = 0;
         PackEntry tomb;
         append_pack_record_locked(pack_remove, id, {}, unix_ms(), &tomb, &tomb_size, lock);
@@ -1441,8 +1483,10 @@ bool LocalStore::remove_locked(const ObjectId& id, Lock& lock) {
         Unlocked unlocked(lock, m_);
         size = std::filesystem::file_size(p, error);
     }
-    if (error) return false;
-    if (mode_ != LocalStoreMode::ephemeral) ensure_accounting_dirty(lock);
+    if (error)
+        return false;
+    if (mode_ != LocalStoreMode::ephemeral)
+        ensure_accounting_dirty(lock);
     bool removed = false;
     uint64_t generation = 0;
     {
@@ -1451,7 +1495,8 @@ bool LocalStore::remove_locked(const ObjectId& id, Lock& lock) {
         if (removed && !error && mode_ != LocalStoreMode::ephemeral && durability_domain_)
             generation = durability_domain_->complete_mutation({}, p.parent_path());
     }
-    if (error || !removed) return false;
+    if (error || !removed)
+        return false;
     if (ledger_)
         ledger_->record(id, false);
     losses_.fetch_add(1, std::memory_order_release);
@@ -1478,17 +1523,20 @@ std::optional<uint64_t> LocalStore::put_deferred(const ObjectId& id,
     uint64_t generation = 0;
     const auto stored = put_impl(id, data, StoreWriteDurability::deferred, &generation);
     flush_ledger();
-    if (!stored) return {};
+    if (!stored)
+        return {};
     return generation;
 }
 
 void LocalStore::durability_barrier(uint64_t required_generation, DurabilityUrgency urgency) {
-    if (mode_ == LocalStoreMode::ephemeral || !durability_domain_ || !required_generation) return;
+    if (mode_ == LocalStoreMode::ephemeral || !durability_domain_ || !required_generation)
+        return;
     durability_domain_->await_durable(required_generation, urgency);
 }
 
 void LocalStore::durability_barrier() {
-    if (mode_ == LocalStoreMode::ephemeral || !durability_domain_) return;
+    if (mode_ == LocalStoreMode::ephemeral || !durability_domain_)
+        return;
     uint64_t generation = 0;
     {
         Lock lock(m_);
@@ -1533,7 +1581,8 @@ bool LocalStore::remove_if_older_than(const ObjectId& id, std::chrono::milliseco
         lock.unlock();
         std::error_code error;
         const auto modified = std::filesystem::last_write_time(path(id), error);
-        if (error || std::filesystem::file_time_type::clock::now() - modified < age) return false;
+        if (error || std::filesystem::file_time_type::clock::now() - modified < age)
+            return false;
         lock.lock();
         return remove_locked(id, lock);
     }();
@@ -1546,7 +1595,8 @@ std::vector<ObjectId> LocalStore::list() const {
     Cursor cursor;
     bool exhausted = false;
     while (!exhausted) {
-        if (auto id = next_object(cursor, exhausted)) out.push_back(*id);
+        if (auto id = next_object(cursor, exhausted))
+            out.push_back(*id);
     }
     return out;
 }
@@ -1584,11 +1634,14 @@ std::optional<ObjectId> LocalStore::next_object(Cursor& cursor, bool& exhausted)
             return {};
         }
         std::error_code type_error;
-        if (!entry.is_regular_file(type_error) || type_error) continue;
+        if (!entry.is_regular_file(type_error) || type_error)
+            continue;
         auto name = entry.path().filename().string();
-        if (name.size() != 68 || name.compare(64, 4, ".obj") != 0) continue;
+        if (name.size() != 68 || name.compare(64, 4, ".obj") != 0)
+            continue;
         auto bytes = unhex(name.substr(0, 64));
-        if (!bytes || bytes->size() != 32) continue;
+        if (!bytes || bytes->size() != 32)
+            continue;
         ObjectId id;
         std::copy(bytes->begin(), bytes->end(), id.bytes.begin());
         return id;
@@ -1600,7 +1653,8 @@ std::optional<ObjectId> LocalStore::next_object(Cursor& cursor, bool& exhausted)
 
 std::filesystem::path LocalStore::object_path(const ObjectId& id) const {
     Lock lock(m_);
-    if (auto found = packed_.find(id); found != packed_.end()) return found->second.file;
+    if (auto found = packed_.find(id); found != packed_.end())
+        return found->second.file;
     return path(id);
 }
 
@@ -1635,7 +1689,8 @@ void LocalStore::touch(const ObjectId& id) {
         uint64_t record_size = 0;
         PackEntry record;
         const auto touched = unix_ms();
-        if (mode_ != LocalStoreMode::ephemeral) ensure_accounting_dirty(lock);
+        if (mode_ != LocalStoreMode::ephemeral)
+            ensure_accounting_dirty(lock);
         append_pack_record_locked(pack_touch, id, {}, touched, &record, &record_size, lock);
         found->second.touched_unix_ms = touched;
         pack_dead_bytes_ += record_size;
@@ -1648,7 +1703,8 @@ void LocalStore::touch(const ObjectId& id) {
     }
     lock.unlock();
     std::error_code error;
-    std::filesystem::last_write_time(path(id), std::filesystem::file_time_type::clock::now(), error);
+    std::filesystem::last_write_time(path(id), std::filesystem::file_time_type::clock::now(),
+                                     error);
 }
 
 bool LocalStore::older_than(const ObjectId& id, std::chrono::milliseconds age) const {
@@ -1663,7 +1719,8 @@ bool LocalStore::older_than(const ObjectId& id, std::chrono::milliseconds age) c
     }
     std::error_code error;
     auto time = std::filesystem::last_write_time(path(id), error);
-    if (error) return false;
+    if (error)
+        return false;
     return std::filesystem::file_time_type::clock::now() - time > age;
 }
 
@@ -1715,12 +1772,12 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
 
         // The cached counter is only an admission hint; recompute from the index
         // so an interrupted compaction cannot leave dead bytes hidden.
-        auto most_dead = std::max_element(packs.begin(), packs.end(), [](const PackUsage& a,
-                                                                         const PackUsage& b) {
-            if (a.dead != b.dead)
-                return a.dead < b.dead;
-            return a.size < b.size;
-        });
+        auto most_dead = std::max_element(packs.begin(), packs.end(),
+                                          [](const PackUsage& a, const PackUsage& b) {
+                                              if (a.dead != b.dead)
+                                                  return a.dead < b.dead;
+                                              return a.size < b.size;
+                                          });
         if (most_dead != packs.end() && most_dead->dead != 0) {
             victim = *most_dead;
             // At most one source pack per call, so temporary space is bounded by
@@ -1870,7 +1927,8 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
 bool LocalStore::compact_packs(std::stop_token stop) {
     Lock pack_io_lock(pack_io_mutex_);
     Lock lock(m_);
-    if (!wait_for_accounting(lock, stop, true)) return false;
+    if (!wait_for_accounting(lock, stop, true))
+        return false;
     return compact_packs_locked(lock);
 }
 
@@ -1898,7 +1956,8 @@ bool LocalStore::wait_for_accounting(Lock& lock, std::stop_token stop, bool exac
         return scan_complete_.load(std::memory_order_acquire) ||
                scan_failed_.load(std::memory_order_acquire);
     });
-    if (stop.stop_requested()) return false;
+    if (stop.stop_requested())
+        return false;
     if (scan_failed_.load(std::memory_order_acquire))
         throw std::runtime_error("storage accounting reconciliation failed");
     return true;
@@ -1907,17 +1966,22 @@ bool LocalStore::wait_for_accounting(Lock& lock, std::stop_token stop, bool exac
 namespace {
 // "<64 hex>.obj" -> id; nullopt for anything else in the object tree.
 std::optional<ObjectId> object_id_from_file_name(std::string_view name) {
-    if (name.size() != 64 + 4 || !name.ends_with(".obj")) return std::nullopt;
+    if (name.size() != 64 + 4 || !name.ends_with(".obj"))
+        return std::nullopt;
     ObjectId id;
     for (size_t i = 0; i < 32; ++i) {
         unsigned value = 0;
         for (size_t nibble = 0; nibble < 2; ++nibble) {
             const char c = name[i * 2 + nibble];
             unsigned digit = 0;
-            if (c >= '0' && c <= '9') digit = static_cast<unsigned>(c - '0');
-            else if (c >= 'a' && c <= 'f') digit = static_cast<unsigned>(c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') digit = static_cast<unsigned>(c - 'A' + 10);
-            else return std::nullopt;
+            if (c >= '0' && c <= '9')
+                digit = static_cast<unsigned>(c - '0');
+            else if (c >= 'a' && c <= 'f')
+                digit = static_cast<unsigned>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F')
+                digit = static_cast<unsigned>(c - 'A' + 10);
+            else
+                return std::nullopt;
             value = (value << 4) | digit;
         }
         id.bytes[i] = static_cast<uint8_t>(value);
@@ -1994,9 +2058,8 @@ LocalStore::VerifyResult LocalStore::verify_step(size_t directories) {
     flush_ledger();
     ledger_->set_verify_next(static_cast<uint16_t>(next));
     if (result.recorded || result.lost)
-        Log::warn("storage held ledger corrected path=" + root_.string() +
-                  " recorded=" + std::to_string(result.recorded) +
-                  " lost=" + std::to_string(result.lost));
+        Log::warn("storage held ledger corrected path=" + root_.string() + " recorded=" +
+                  std::to_string(result.recorded) + " lost=" + std::to_string(result.lost));
     return result;
 }
 
@@ -2011,7 +2074,8 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
         batch.reserve(4096);
         uint64_t entries = 0;
         const auto flush = [&] {
-            if (batch.empty()) return;
+            if (batch.empty())
+                return;
             Lock lock(m_);
             presence_.listed(batch);
             entries += batch.size();
@@ -2021,25 +2085,27 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
         // stats an object. The scan (when it runs) does the same as it walks.
         for (auto it = std::filesystem::recursive_directory_iterator(objects_, error);
              !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
-            if (stop.stop_requested()) return;
-            if (it.depth() < 2) continue;
+            if (stop.stop_requested())
+                return;
+            if (it.depth() < 2)
+                continue;
             if (auto id = object_id_from_file_name(it->path().filename().string())) {
                 batch.push_back(*id);
-                if (batch.size() >= 4096) flush();
+                if (batch.size() >= 4096)
+                    flush();
             }
         }
         flush();
         presence_index_entries_.store(entries, std::memory_order_relaxed);
-        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    Clock::now() - started).count();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
         if (!error) {
             {
                 Lock lock(m_);
                 presence_.warmed();
             }
-            Log::debug("storage presence index warmed path=" + root_.string() +
-                       " objects=" + std::to_string(entries) +
-                       " elapsed_ms=" + std::to_string(elapsed_ms));
+            Log::debug("storage presence index warmed path=" + root_.string() + " objects=" +
+                       std::to_string(entries) + " elapsed_ms=" + std::to_string(elapsed_ms));
             if (ledger_)
                 seed_ledger();
             return;
@@ -2062,9 +2128,11 @@ void LocalStore::scan(std::stop_token stop) {
     for (const auto& root : {objects_, packs_}) {
         for (auto it = std::filesystem::recursive_directory_iterator(root, error);
              !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
-            if (stop.stop_requested()) return;
+            if (stop.stop_requested())
+                return;
             note_startup_progress(); // an 80 s scan of a big store is progress, not a stall.
-            if (!it->is_regular_file()) continue;
+            if (!it->is_regular_file())
+                continue;
             auto name = it->path().filename().string();
             if (name.find(".tmp") != std::string::npos || name.starts_with(".compact-")) {
                 std::error_code remove_error;
@@ -2073,7 +2141,8 @@ void LocalStore::scan(std::stop_token stop) {
             }
             std::error_code size_error;
             const auto size = it->file_size(size_error);
-            if (!size_error) total += size;
+            if (!size_error)
+                total += size;
             if (root == objects_) {
                 if (auto id = object_id_from_file_name(name)) {
                     if (!size_error && size == 0) {
@@ -2095,7 +2164,8 @@ void LocalStore::scan(std::stop_token stop) {
                 }
             }
         }
-        if (error) break;
+        if (error)
+            break;
     }
     if (error) {
         mark_scan_failed();
@@ -2125,7 +2195,7 @@ void LocalStore::scan(std::stop_token stop) {
         // the safe direction, and bounded by what was written meanwhile).
         const auto running = used_.load(std::memory_order_relaxed);
         used_.store(accounting_estimate_.load(std::memory_order_acquire) ? std::max(total, running)
-                                                                          : total,
+                                                                         : total,
                     std::memory_order_relaxed);
         accounting_estimate_.store(false, std::memory_order_release);
         accounting_trusted_.store(true, std::memory_order_release);
@@ -2183,7 +2253,8 @@ NodeId load_or_create_node_id(const std::filesystem::path& state) {
     auto tmp = file.string() + ".tmp";
     {
         int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd < 0) throw std::runtime_error(strerror(errno));
+        if (fd < 0)
+            throw std::runtime_error(strerror(errno));
         auto text = to_string(id) + "\n";
         wa(fd, {reinterpret_cast<const uint8_t*>(text.data()), text.size()});
         (void)fsync(fd);

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "config.hpp"
 #include "acquisition/ingest.hpp"
 #include "catalogue/media_catalogue.hpp"
+#include "config.hpp"
 #include "contract/thread_safety.hpp"
 
 #include <filesystem>
@@ -152,9 +152,10 @@ class TorznabSearchProvider final : public TorrentSearchProvider {
     std::string api_key_;
 
   public:
-    explicit TorznabSearchProvider(TorrentSearchProviderConfig,
-                                   std::unique_ptr<HttpClient> = {});
-    std::string_view name() const noexcept override { return config_.name; }
+    explicit TorznabSearchProvider(TorrentSearchProviderConfig, std::unique_ptr<HttpClient> = {});
+    std::string_view name() const noexcept override {
+        return config_.name;
+    }
     std::vector<TorrentSearchResult> search(std::string_view query) override;
 };
 
@@ -170,7 +171,9 @@ class TorrentSearchManager {
 
   public:
     explicit TorrentSearchManager(const TorrentConfig&);
-    bool enabled() const noexcept { return !providers_.empty(); }
+    bool enabled() const noexcept {
+        return !providers_.empty();
+    }
     TorrentSearchResponse search(std::string_view query);
     std::optional<std::string> resolve(std::string_view acquisition_ref);
 };

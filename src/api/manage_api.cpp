@@ -7,8 +7,8 @@
 #include "log.hpp"
 
 #include <algorithm>
-#include <cerrno>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <limits>
 #include <set>
@@ -20,27 +20,32 @@ namespace {
 
 Json parse_body(const HttpRequest& request) {
     const std::string text(reinterpret_cast<const char*>(request.body.data()), request.body.size());
-    if (text.empty()) return Json(Json::Object{});
+    if (text.empty())
+        return Json(Json::Object{});
     auto root = Json::parse(text);
-    if (!root.isObject()) throw std::runtime_error("request body must be a JSON object");
+    if (!root.isObject())
+        throw std::runtime_error("request body must be a JSON object");
     return root;
 }
 
 std::string string_value(const Json& root, std::string_view key, std::string fallback = {}) {
     const auto* value = root.find(key);
-    if (!value || value->isNull()) return fallback;
+    if (!value || value->isNull())
+        return fallback;
     return value->asString();
 }
 
 std::string required_string(const Json& root, std::string_view key) {
     auto value = string_value(root, key);
-    if (value.empty()) throw std::runtime_error(std::string(key) + " is required");
+    if (value.empty())
+        throw std::runtime_error(std::string(key) + " is required");
     return value;
 }
 
 std::optional<int32_t> optional_i32(const Json& root, std::string_view key) {
     const auto* value = root.find(key);
-    if (!value || value->isNull()) return {};
+    if (!value || value->isNull())
+        return {};
     const auto number = value->asInt64();
     if (number < INT32_MIN || number > INT32_MAX)
         throw std::runtime_error(std::string(key) + " is out of range");
@@ -69,18 +74,25 @@ Json catalogue_item_json(const CatalogueItem& item) {
     out["synopsis"] = item.synopsis;
     out["parent_id"] = item.parent_id ? Json(*item.parent_id) : Json(nullptr);
     out["year"] = item.year ? Json(static_cast<int64_t>(*item.year)) : Json(nullptr);
-    out["season_number"] = item.season_number ? Json(static_cast<int64_t>(*item.season_number)) : Json(nullptr);
-    out["episode_number"] = item.episode_number ? Json(static_cast<int64_t>(*item.episode_number)) : Json(nullptr);
-    out["disc_number"] = item.disc_number ? Json(static_cast<int64_t>(*item.disc_number)) : Json(nullptr);
-    out["track_number"] = item.track_number ? Json(static_cast<int64_t>(*item.track_number)) : Json(nullptr);
+    out["season_number"] =
+        item.season_number ? Json(static_cast<int64_t>(*item.season_number)) : Json(nullptr);
+    out["episode_number"] =
+        item.episode_number ? Json(static_cast<int64_t>(*item.episode_number)) : Json(nullptr);
+    out["disc_number"] =
+        item.disc_number ? Json(static_cast<int64_t>(*item.disc_number)) : Json(nullptr);
+    out["track_number"] =
+        item.track_number ? Json(static_cast<int64_t>(*item.track_number)) : Json(nullptr);
     Json::Array media;
-    for (const auto& id : item.media_ids) media.emplace_back(id);
+    for (const auto& id : item.media_ids)
+        media.emplace_back(id);
     out["media_ids"] = std::move(media);
     Json::Array artwork;
-    for (const auto& art : item.artwork) artwork.push_back(artwork_json(art));
+    for (const auto& art : item.artwork)
+        artwork.push_back(artwork_json(art));
     out["artwork"] = std::move(artwork);
     Json::Array authors;
-    for (const auto& id : item.author_ids) authors.emplace_back(id);
+    for (const auto& id : item.author_ids)
+        authors.emplace_back(id);
     out["author_ids"] = std::move(authors);
     Json::Array series;
     for (const auto& ref : item.series) {
@@ -99,7 +111,8 @@ Json catalogue_item_json(const CatalogueItem& item) {
 }
 
 std::string entry_path(std::string_view parent, std::string_view name) {
-    if (parent == "/") return normalize_path("/" + std::string(name));
+    if (parent == "/")
+        return normalize_path("/" + std::string(name));
     return normalize_path(std::string(parent) + "/" + std::string(name));
 }
 
@@ -117,7 +130,8 @@ Json fs_entry_json(std::string path, std::string name, const FsEntry& entry,
         out["media_id"] = media_id;
         Json::Array ids;
         if (auto found = bindings.find(media_id); found != bindings.end())
-            for (const auto& id : found->second) ids.emplace_back(id);
+            for (const auto& id : found->second)
+                ids.emplace_back(id);
         out["catalogue_item_ids"] = std::move(ids);
     } else {
         out["media_id"] = Json(nullptr);
@@ -126,13 +140,15 @@ Json fs_entry_json(std::string path, std::string name, const FsEntry& entry,
     return Json(std::move(out));
 }
 
-std::optional<std::pair<FsEntry, std::string>> current_hint_file(
-    FileSystem& fs, const CatalogueHint& hint) {
+std::optional<std::pair<FsEntry, std::string>> current_hint_file(FileSystem& fs,
+                                                                 const CatalogueHint& hint) {
     try {
         auto entry = fs.getattr(hint.path);
-        if (entry.type != EntryType::file || entry.size == 0) return {};
+        if (entry.type != EntryType::file || entry.size == 0)
+            return {};
         auto media_id = file_media_id(entry);
-        if (!hint.media_id.empty() && hint.media_id != media_id) return {};
+        if (!hint.media_id.empty() && hint.media_id != media_id)
+            return {};
         return std::pair<FsEntry, std::string>{std::move(entry), std::move(media_id)};
     } catch (const FsError&) {
         return {};
@@ -179,16 +195,18 @@ Json hint_json(FileSystem& fs, const CatalogueHint& hint) {
 Json probe_json(const MediaProbeCandidate& candidate) {
     Json::Object out;
     const auto& probe = candidate.probe;
-    out["kind"] = probe.kind == MediaProbeKind::movie ? "movie" :
-                  probe.kind == MediaProbeKind::episode ? "episode" :
-                  probe.kind == MediaProbeKind::book ? "book" : "track";
+    out["kind"] = probe.kind == MediaProbeKind::movie     ? "movie"
+                  : probe.kind == MediaProbeKind::episode ? "episode"
+                  : probe.kind == MediaProbeKind::book    ? "book"
+                                                          : "track";
     out["score"] = static_cast<int64_t>(candidate.score);
     out["generator"] = candidate.generator;
     out["title"] = probe.title;
     out["year"] = probe.year ? Json(static_cast<int64_t>(*probe.year)) : Json(nullptr);
     out["series"] = probe.series;
     out["season_number"] = probe.season ? Json(static_cast<int64_t>(*probe.season)) : Json(nullptr);
-    out["episode_number"] = probe.episode ? Json(static_cast<int64_t>(*probe.episode)) : Json(nullptr);
+    out["episode_number"] =
+        probe.episode ? Json(static_cast<int64_t>(*probe.episode)) : Json(nullptr);
     out["artist"] = probe.artist;
     out["album"] = probe.album;
     out["disc_number"] = probe.disc ? Json(static_cast<int64_t>(*probe.disc)) : Json(nullptr);
@@ -196,7 +214,8 @@ Json probe_json(const MediaProbeCandidate& candidate) {
     // A book's: its authors in credited order, the first for display, and
     // its first series.
     Json::Array authors;
-    for (const auto& author : probe.authors) authors.emplace_back(author);
+    for (const auto& author : probe.authors)
+        authors.emplace_back(author);
     out["authors"] = std::move(authors);
     out["author"] = probe.authors.empty() ? std::string{} : probe.authors.front();
     out["series_name"] = probe.book_series.empty() ? std::string{} : probe.book_series.front().name;
@@ -206,7 +225,8 @@ Json probe_json(const MediaProbeCandidate& candidate) {
     out["isbn"] = probe.isbn ? Json(*probe.isbn) : Json(nullptr);
     out["language"] = probe.language ? Json(*probe.language) : Json(nullptr);
     Json::Array evidence;
-    for (const auto& value : candidate.evidence) evidence.emplace_back(value);
+    for (const auto& value : candidate.evidence)
+        evidence.emplace_back(value);
     out["evidence"] = std::move(evidence);
     return Json(std::move(out));
 }
@@ -214,9 +234,11 @@ Json probe_json(const MediaProbeCandidate& candidate) {
 std::string filename_query(std::string_view path) {
     auto slash = path.find_last_of('/');
     auto name = std::string(path.substr(slash == std::string_view::npos ? 0 : slash + 1));
-    if (auto dot = name.find_last_of('.'); dot != std::string::npos) name.resize(dot);
+    if (auto dot = name.find_last_of('.'); dot != std::string::npos)
+        name.resize(dot);
     for (auto& c : name)
-        if (c == '.' || c == '_' || c == '-') c = ' ';
+        if (c == '.' || c == '_' || c == '-')
+            c = ' ';
     return name;
 }
 
@@ -224,35 +246,48 @@ std::optional<CatalogueKind> leaf_kind(const std::vector<MediaProbeCandidate>& p
                                        std::string_view provider) {
     if (!probes.empty()) {
         switch (probes.front().probe.kind) {
-        case MediaProbeKind::movie: return CatalogueKind::movie;
-        case MediaProbeKind::episode: return CatalogueKind::episode;
-        case MediaProbeKind::track: return CatalogueKind::track;
-        case MediaProbeKind::book: return CatalogueKind::book;
+        case MediaProbeKind::movie:
+            return CatalogueKind::movie;
+        case MediaProbeKind::episode:
+            return CatalogueKind::episode;
+        case MediaProbeKind::track:
+            return CatalogueKind::track;
+        case MediaProbeKind::book:
+            return CatalogueKind::book;
         }
     }
-    if (provider == "movies") return CatalogueKind::movie;
-    if (provider == "tv") return CatalogueKind::episode;
-    if (provider == "music") return CatalogueKind::track;
-    if (provider == "books") return CatalogueKind::book;
+    if (provider == "movies")
+        return CatalogueKind::movie;
+    if (provider == "tv")
+        return CatalogueKind::episode;
+    if (provider == "music")
+        return CatalogueKind::track;
+    if (provider == "books")
+        return CatalogueKind::book;
     return {};
 }
 
 std::string suggested_query(const std::vector<MediaProbeCandidate>& probes, std::string_view path) {
     if (!probes.empty()) {
         const auto& probe = probes.front().probe;
-        if (probe.kind == MediaProbeKind::episode && !probe.series.empty()) return probe.series;
+        if (probe.kind == MediaProbeKind::episode && !probe.series.empty())
+            return probe.series;
         if (probe.kind == MediaProbeKind::track) {
-            if (!probe.title.empty()) return probe.title;
-            if (!probe.album.empty()) return probe.album;
+            if (!probe.title.empty())
+                return probe.title;
+            if (!probe.album.empty())
+                return probe.album;
         }
-        if (!probe.title.empty()) return probe.title;
+        if (!probe.title.empty())
+            return probe.title;
     }
     return filename_query(path);
 }
 
 std::string manual_id(std::string_view kind, std::string_view identity) {
     std::string seed = "manual|" + std::string(kind) + "|" + std::string(identity);
-    const auto bytes = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(seed.data()), seed.size());
+    const auto bytes =
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(seed.data()), seed.size());
     auto value = hex(sha256(bytes).bytes);
     value.resize(32);
     return "manual:" + std::string(kind) + ":" + value;
@@ -260,17 +295,25 @@ std::string manual_id(std::string_view kind, std::string_view identity) {
 
 void preserve_existing(CatalogueManager& catalogue, CatalogueItem& item) {
     auto existing = catalogue.get(item.id);
-    if (!existing) return;
-    if (item.sort_title.empty()) item.sort_title = existing->sort_title;
-    if (item.synopsis.empty()) item.synopsis = existing->synopsis;
-    if (!item.year) item.year = existing->year;
-    if (item.aliases.empty()) item.aliases = existing->aliases;
-    if (item.artwork.empty()) item.artwork = existing->artwork;
+    if (!existing)
+        return;
+    if (item.sort_title.empty())
+        item.sort_title = existing->sort_title;
+    if (item.synopsis.empty())
+        item.synopsis = existing->synopsis;
+    if (!item.year)
+        item.year = existing->year;
+    if (item.aliases.empty())
+        item.aliases = existing->aliases;
+    if (item.artwork.empty())
+        item.artwork = existing->artwork;
     for (const auto& media_id : existing->media_ids)
-        if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) == item.media_ids.end())
+        if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) ==
+            item.media_ids.end())
             item.media_ids.push_back(media_id);
     for (const auto& [key, value] : existing->external_ids)
-        if (!item.external_ids.contains(key)) item.external_ids[key] = value;
+        if (!item.external_ids.contains(key))
+            item.external_ids[key] = value;
 }
 
 CatalogueItem manual_base(CatalogueKind kind, std::string id, std::string title,
@@ -326,7 +369,8 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
         const auto title = required_string(root, "title");
         const auto year = optional_i32(root, "year");
         auto identity = title + "|" + (year ? std::to_string(*year) : "");
-        auto item = manual_base(CatalogueKind::movie, manual_id("movie", identity), title, synopsis);
+        auto item =
+            manual_base(CatalogueKind::movie, manual_id("movie", identity), title, synopsis);
         item.year = year;
         item.media_ids.emplace_back(media_id);
         preserve_existing(catalogue, item);
@@ -343,12 +387,13 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
         std::optional<CatalogueItem> existing_season;
         if (!season_id.empty()) {
             existing_season = require_parent(catalogue, season_id, CatalogueKind::season);
-            if (existing_season->season_number) season_number = existing_season->season_number;
+            if (existing_season->season_number)
+                season_number = existing_season->season_number;
         }
         if (!season_number || !episode_number)
             throw std::runtime_error("season_number and episode_number are required");
-        const auto episode_title = string_value(root, "title",
-            "Episode " + std::to_string(*episode_number));
+        const auto episode_title =
+            string_value(root, "title", "Episode " + std::to_string(*episode_number));
 
         // An existing season or show named by id: the episode joins the
         // scanner's (or anyone's) hierarchy instead of a duplicate by name.
@@ -361,11 +406,15 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
                 const auto show = require_parent(catalogue, series_id, CatalogueKind::show);
                 std::optional<CatalogueItem> found;
                 for (const auto& candidate : catalogue.list(CatalogueKind::season, show.id))
-                    if (candidate.season_number == season_number) { found = candidate; break; }
+                    if (candidate.season_number == season_number) {
+                        found = candidate;
+                        break;
+                    }
                 if (found) {
                     season = *found;
                 } else {
-                    season = manual_base(CatalogueKind::season,
+                    season = manual_base(
+                        CatalogueKind::season,
                         manual_id("season", show.id + "|" + std::to_string(*season_number)),
                         "Season " + std::to_string(*season_number));
                     season.parent_id = show.id;
@@ -374,9 +423,10 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
                     written.push_back(season);
                 }
             }
-            auto episode = manual_base(CatalogueKind::episode,
-                manual_id("episode", season.id + "|" + std::to_string(*episode_number)),
-                episode_title, synopsis);
+            auto episode =
+                manual_base(CatalogueKind::episode,
+                            manual_id("episode", season.id + "|" + std::to_string(*episode_number)),
+                            episode_title, synopsis);
             episode.parent_id = season.id;
             episode.season_number = season_number;
             episode.episode_number = episode_number;
@@ -391,23 +441,26 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
         const auto series_title = required_string(root, "series");
         const auto series_year = optional_i32(root, "series_year");
 
-        const auto show_identity = series_title + "|" +
-            (series_year ? std::to_string(*series_year) : "");
-        auto show = manual_base(CatalogueKind::show, manual_id("show", show_identity), series_title);
+        const auto show_identity =
+            series_title + "|" + (series_year ? std::to_string(*series_year) : "");
+        auto show =
+            manual_base(CatalogueKind::show, manual_id("show", show_identity), series_title);
         show.year = series_year;
         preserve_existing(catalogue, show);
 
-        auto season = manual_base(CatalogueKind::season,
-            manual_id("season", show.id + "|" + std::to_string(*season_number)),
-            "Season " + std::to_string(*season_number));
+        auto season =
+            manual_base(CatalogueKind::season,
+                        manual_id("season", show.id + "|" + std::to_string(*season_number)),
+                        "Season " + std::to_string(*season_number));
         season.parent_id = show.id;
         season.season_number = season_number;
         preserve_existing(catalogue, season);
 
-        auto episode = manual_base(CatalogueKind::episode,
-            manual_id("episode", show.id + "|" + std::to_string(*season_number) + "|" +
-                                 std::to_string(*episode_number)),
-            episode_title, synopsis);
+        auto episode =
+            manual_base(CatalogueKind::episode,
+                        manual_id("episode", show.id + "|" + std::to_string(*season_number) + "|" +
+                                                 std::to_string(*episode_number)),
+                        episode_title, synopsis);
         episode.parent_id = season.id;
         episode.season_number = season_number;
         episode.episode_number = episode_number;
@@ -446,9 +499,9 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
                     album = *found;
                 } else {
                     album = manual_base(CatalogueKind::album,
-                        manual_id("album", artist.id + "|" + album_title + "|" +
-                                               (year ? std::to_string(*year) : "")),
-                        album_title);
+                                        manual_id("album", artist.id + "|" + album_title + "|" +
+                                                               (year ? std::to_string(*year) : "")),
+                                        album_title);
                     album.parent_id = artist.id;
                     album.year = year;
                     preserve_existing(catalogue, album);
@@ -456,7 +509,8 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
                 }
             }
             const auto track_identity = album.id + "|" + (disc ? std::to_string(*disc) : "") + "|" +
-                (track_number ? std::to_string(*track_number) : "") + "|" + track_title;
+                                        (track_number ? std::to_string(*track_number) : "") + "|" +
+                                        track_title;
             auto track = manual_base(CatalogueKind::track, manual_id("track", track_identity),
                                      track_title, synopsis);
             track.parent_id = album.id;
@@ -473,20 +527,23 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
         const auto artist_title = required_string(root, "artist");
         const auto album_title = required_string(root, "album");
 
-        auto artist = manual_base(CatalogueKind::artist,
-            manual_id("artist", artist_title), artist_title);
+        auto artist =
+            manual_base(CatalogueKind::artist, manual_id("artist", artist_title), artist_title);
         preserve_existing(catalogue, artist);
 
-        const auto album_identity = artist.id + "|" + album_title + "|" +
-            (year ? std::to_string(*year) : "");
-        auto album = manual_base(CatalogueKind::album, manual_id("album", album_identity), album_title);
+        const auto album_identity =
+            artist.id + "|" + album_title + "|" + (year ? std::to_string(*year) : "");
+        auto album =
+            manual_base(CatalogueKind::album, manual_id("album", album_identity), album_title);
         album.parent_id = artist.id;
         album.year = year;
         preserve_existing(catalogue, album);
 
         const auto track_identity = album.id + "|" + (disc ? std::to_string(*disc) : "") + "|" +
-            (track_number ? std::to_string(*track_number) : "") + "|" + track_title;
-        auto track = manual_base(CatalogueKind::track, manual_id("track", track_identity), track_title, synopsis);
+                                    (track_number ? std::to_string(*track_number) : "") + "|" +
+                                    track_title;
+        auto track = manual_base(CatalogueKind::track, manual_id("track", track_identity),
+                                 track_title, synopsis);
         track.parent_id = album.id;
         track.disc_number = disc;
         track.track_number = track_number;
@@ -520,13 +577,13 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
             throw std::runtime_error("a book needs authors or author_id");
 
         std::vector<CatalogueItem> written;
-        CatalogueItem book = manual_base(CatalogueKind::book,
-                                         manual_id("book", title + "|" +
-                                                               (year ? std::to_string(*year) : "")),
-                                         title, synopsis);
+        CatalogueItem book = manual_base(
+            CatalogueKind::book,
+            manual_id("book", title + "|" + (year ? std::to_string(*year) : "")), title, synopsis);
         book.year = year;
         if (!author_id.empty()) {
-            book.author_ids.push_back(require_parent(catalogue, author_id, CatalogueKind::author).id);
+            book.author_ids.push_back(
+                require_parent(catalogue, author_id, CatalogueKind::author).id);
         }
         for (const auto& name : author_names) {
             auto author = manual_base(CatalogueKind::author, manual_id("author", name), name);
@@ -537,11 +594,11 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
             written.push_back(std::move(author));
         }
         if (!series_id.empty()) {
-            book.series.push_back({require_parent(catalogue, series_id, CatalogueKind::series).id,
-                                   series_index});
+            book.series.push_back(
+                {require_parent(catalogue, series_id, CatalogueKind::series).id, series_index});
         } else if (!series_title.empty()) {
-            auto series = manual_base(CatalogueKind::series, manual_id("series", series_title),
-                                      series_title);
+            auto series =
+                manual_base(CatalogueKind::series, manual_id("series", series_title), series_title);
             preserve_existing(catalogue, series);
             book.series.push_back({series.id, series_index});
             written.push_back(std::move(series));
@@ -559,24 +616,29 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
 
 std::optional<CatalogueHint> actionable_hint(CatalogueHintQueue& hints, std::string_view id) {
     auto hint = hints.get(id);
-    if (!hint || hint->state != CatalogueHintState::no_match || hint->media_id.empty()) return {};
+    if (!hint || hint->state != CatalogueHintState::no_match || hint->media_id.empty())
+        return {};
     return hint;
 }
 
 std::string route_id(std::string_view path, std::string_view prefix, std::string_view suffix = {}) {
-    if (!path.starts_with(prefix)) return {};
+    if (!path.starts_with(prefix))
+        return {};
     auto rest = path.substr(prefix.size());
     if (!suffix.empty()) {
-        if (!rest.ends_with(suffix) || rest.size() <= suffix.size()) return {};
+        if (!rest.ends_with(suffix) || rest.size() <= suffix.size())
+            return {};
         rest.remove_suffix(suffix.size());
     }
-    if (rest.empty() || rest.find('/') != std::string_view::npos) return {};
+    if (rest.empty() || rest.find('/') != std::string_view::npos)
+        return {};
     return std::string(rest);
 }
 
 std::optional<NodeId> parse_node_id(std::string_view text) {
     auto raw = unhex(std::string(text));
-    if (!raw || raw->size() != 16) return {};
+    if (!raw || raw->size() != 16)
+        return {};
     NodeId id;
     std::copy(raw->begin(), raw->end(), id.bytes.begin());
     return id;
@@ -587,9 +649,8 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
     out["scope"] = identity_reset_key(reset.host, reset.port);
     out["host"] = reset.host;
     out["port"] = reset.port ? Json(static_cast<uint64_t>(reset.port)) : Json(nullptr);
-    out["stale_node_id"] = reset.stale_node_id == NodeId{}
-                               ? Json(nullptr)
-                               : Json(to_string(reset.stale_node_id));
+    out["stale_node_id"] =
+        reset.stale_node_id == NodeId{} ? Json(nullptr) : Json(to_string(reset.stale_node_id));
     out["epoch"] = reset.epoch;
     out["reset_at_unix_ms"] = reset.reset_unix_ms;
     out["reset_by_node_id"] = to_string(reset.reset_by);
@@ -604,13 +665,13 @@ ManageApi::ManageApi(NodeRuntime& node, MetadataView& metadata, FileSystem& fs,
                      CatalogueScanner& scanner, const ClusterUnmatchedView* peers_unmatched)
     : node_(node), metadata_(metadata), fs_(fs), catalogue_(catalogue), hints_(hints),
       scanner_(scanner), peers_unmatched_(peers_unmatched),
-      identity_audit_worker_([this](std::stop_token stop) {
-          identity_reset_audit_loop(stop);
-      }) {}
+      identity_audit_worker_([this](std::stop_token stop) { identity_reset_audit_loop(stop); }) {}
 
 std::optional<CatalogueHint> ManageApi::unmatched_hint(std::string_view id) const {
-    if (auto hint = actionable_hint(hints_, id)) return hint;
-    if (peers_unmatched_) return peers_unmatched_->peer_hint(id);
+    if (auto hint = actionable_hint(hints_, id))
+        return hint;
+    if (peers_unmatched_)
+        return peers_unmatched_->peer_hint(id);
     return std::nullopt;
 }
 
@@ -645,9 +706,10 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
         IdentityAssociationReset reset;
         {
             Lock lock(identity_audit_mutex_);
-            identity_audit_cv_.wait(lock.native(), stop, [&]() MACHA_REQUIRES(identity_audit_mutex_) {
-                return !identity_audit_pending_.empty();
-            });
+            identity_audit_cv_.wait(lock.native(), stop,
+                                    [&]() MACHA_REQUIRES(identity_audit_mutex_) {
+                                        return !identity_audit_pending_.empty();
+                                    });
             if (stop.stop_requested())
                 break;
             auto found = identity_audit_pending_.begin();
@@ -660,18 +722,17 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
             // The locally durable tombstone is the commit; peer propagation and the
             // cluster-metadata audit converge it outside the request.
             node_.propagate_identity_reset(reset);
-            const auto committed = metadata_.mutate_delta(
-                [&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-                    if (auto found = snapshot.identity_resets.find(key);
-                        found != snapshot.identity_resets.end() &&
-                        found->second.epoch >= reset.epoch) {
-                        if (found->second.epoch == std::numeric_limits<uint64_t>::max())
-                            throw std::runtime_error("identity association reset epoch exhausted");
-                        reset.epoch = found->second.epoch + 1;
-                    }
-                    snapshot.identity_resets[key] = reset;
-                    delta.upsert_identity_resets[key] = reset;
-                });
+            const auto committed = metadata_.mutate_delta([&](MetadataSnapshot& snapshot,
+                                                              MetadataDelta& delta) {
+                if (auto found = snapshot.identity_resets.find(key);
+                    found != snapshot.identity_resets.end() && found->second.epoch >= reset.epoch) {
+                    if (found->second.epoch == std::numeric_limits<uint64_t>::max())
+                        throw std::runtime_error("identity association reset epoch exhausted");
+                    reset.epoch = found->second.epoch + 1;
+                }
+                snapshot.identity_resets[key] = reset;
+                delta.upsert_identity_resets[key] = reset;
+            });
             node_.propagate_identity_reset(reset);
             Log::info("management identity reset audit completed scope=" + key +
                       " epoch=" + std::to_string(reset.epoch) +
@@ -697,8 +758,7 @@ std::optional<std::pair<std::string, std::string>> unmatch_target(std::string_vi
         return {};
     const auto rest = path.substr(items_prefix.size());
     const auto infix = rest.rfind(media_infix);
-    if (infix == std::string_view::npos || infix == 0 ||
-        infix + media_infix.size() == rest.size())
+    if (infix == std::string_view::npos || infix == 0 || infix + media_infix.size() == rest.size())
         return {};
     const auto media = rest.substr(infix + media_infix.size());
     if (media.find('/') != std::string_view::npos)
@@ -725,7 +785,8 @@ std::optional<uint64_t> if_match_revision(const HttpRequest& request) {
         return {};
     auto value = it->second;
     value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
-    if (value.starts_with("rev-")) value.erase(0, 4);
+    if (value.starts_with("rev-"))
+        value.erase(0, 4);
     uint64_t revision{};
     auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), revision);
     if (ec != std::errc{} || end != value.data() + value.size())
@@ -735,7 +796,8 @@ std::optional<uint64_t> if_match_revision(const HttpRequest& request) {
 
 Json string_array(const std::vector<std::string>& values) {
     Json::Array out;
-    for (const auto& value : values) out.emplace_back(value);
+    for (const auto& value : values)
+        out.emplace_back(value);
     return Json(std::move(out));
 }
 
@@ -773,8 +835,8 @@ HttpResponse ManageApi::title_files(const HttpRequest& request) {
 
     if (const auto target = unmatch_target(request.path)) {
         const auto& [item_id, media_id] = *target;
-        const auto result =
-            catalogue_.unbind_media(std::string_view(item_id), media_id, if_match_revision(request));
+        const auto result = catalogue_.unbind_media(std::string_view(item_id), media_id,
+                                                    if_match_revision(request));
         if (!result.found)
             return http_error(404, "not_found", "catalogue item not found");
         if (!result.bound)
@@ -841,12 +903,12 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
     // A write that was refused, and any request that failed here or
     // upstream, says why in the journal: the answer's code and message.
     if (response.status >= 500 || (response.status >= 400 && request.method != "GET")) {
-        const auto text = "manage API " + request.method + " " + request.path + " status=" +
-                          std::to_string(response.status) + " " +
-                          std::string(response.body.begin(),
-                                      response.body.begin() +
-                                          static_cast<std::ptrdiff_t>(
-                                              std::min<size_t>(response.body.size(), 300)));
+        const auto text =
+            "manage API " + request.method + " " + request.path +
+            " status=" + std::to_string(response.status) + " " +
+            std::string(response.body.begin(),
+                        response.body.begin() + static_cast<std::ptrdiff_t>(
+                                                    std::min<size_t>(response.body.size(), 300)));
         if (response.status >= 500)
             Log::warn(text);
         else
@@ -867,8 +929,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             resources["unmatched"] = "/api/v1/manage/unmatched";
             resources["filesystem"] = "/api/v1/manage/filesystem";
             Json::Object actions;
-            actions["identity_association_reset"] =
-                "/api/v1/manage/identity-associations/reset";
+            actions["identity_association_reset"] = "/api/v1/manage/identity-associations/reset";
             actions["node_identity_association_reset"] =
                 "/api/v1/manage/nodes/{node_id}/identity-association/reset";
             Json::Object out;
@@ -887,7 +948,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
 
             IdentityAssociationReset reset;
             reset.host = std::move(host);
-            reset.port = port; // 0 deliberately means every port on this host.
+            reset.port = port;              // 0 deliberately means every port on this host.
             reset.stale_node_id = stale_id; // zero deliberately means unknown/any stale identity.
             reset.reset_by = node_.node_id();
             reset.reset_unix_ms = unix_ms();
@@ -914,11 +975,9 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             node_.apply_identity_reset(reset);
             queue_identity_reset_audit(reset);
 
-            Log::info("management identity reset accepted scope=" + key +
-                      " stale_node_id=" +
+            Log::info("management identity reset accepted scope=" + key + " stale_node_id=" +
                       (stale_id == NodeId{} ? std::string("<any>") : to_string(stale_id)) +
-                      " epoch=" + std::to_string(reset.epoch) +
-                      " audit=queued" +
+                      " epoch=" + std::to_string(reset.epoch) + " audit=queued" +
                       (reset.reason.empty() ? std::string{} : " reason=" + reset.reason));
 
             Json::Object out;
@@ -962,8 +1021,8 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
         // Node-scoped route, used by Status node detail.
         constexpr std::string_view node_manage_prefix = "/api/v1/manage/nodes/";
         if (request.method == "POST" && request.path.starts_with(node_manage_prefix)) {
-            const auto id_text = route_id(request.path, node_manage_prefix,
-                                          "/identity-association/reset");
+            const auto id_text =
+                route_id(request.path, node_manage_prefix, "/identity-association/reset");
             if (!id_text.empty()) {
                 const auto stale_id = parse_node_id(id_text);
                 if (!stale_id)
@@ -1011,14 +1070,16 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
 
         if (request.method == "GET" && request.path == "/api/v1/manage/unmatched") {
             PageQuery page;
-            if (auto bad = read_page_query(request, page)) return *bad;
+            if (auto bad = read_page_query(request, page))
+                return *bad;
             std::map<std::string, std::vector<const CatalogueItem*>> bound;
-            const auto snapshot = catalogue_.snapshot_view(
-                WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/manage/unmatched", local_waits));
+            const auto snapshot = catalogue_.snapshot_view(WorkContext(
+                FrameType::foreground, {}, nullptr, "GET /api/v1/manage/unmatched", local_waits));
             for (const auto& [_, item] : snapshot->items()) {
                 if (!catalogue_leaf_kind(item.kind))
                     continue;
-                for (const auto& media : item.media_ids) bound[media].push_back(&item);
+                for (const auto& media : item.media_ids)
+                    bound[media].push_back(&item);
             }
             // Every node's unmatched files, this node's first. A file matched
             // since (on any node) or no longer there is not listed.
@@ -1032,9 +1093,11 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             std::set<std::string, std::less<>> listed;
             Json::Array items;
             for (const auto& hint : unmatched) {
-                if (bound.contains(hint.media_id) || listed.contains(hint.id)) continue;
+                if (bound.contains(hint.media_id) || listed.contains(hint.id))
+                    continue;
                 const auto current = current_hint_stat(fs_, hint);
-                if (!current) continue;
+                if (!current)
+                    continue;
                 listed.insert(hint.id);
                 items.push_back(hint_json(hint, current));
             }
@@ -1043,17 +1106,22 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             // of one season.
             Json::Array conflicts;
             for (auto& [media, holders] : bound) {
-                if (holders.size() < 2) continue;
+                if (holders.size() < 2)
+                    continue;
                 std::sort(holders.begin(), holders.end(),
                           [](const auto* a, const auto* b) { return a->id < b->id; });
-                const bool one_season = std::all_of(holders.begin(), holders.end(), [&](const auto* item) {
-                    return item->kind == CatalogueKind::episode && item->parent_id &&
-                           item->parent_id == holders.front()->parent_id;
-                });
-                if (one_season) continue;
+                const bool one_season =
+                    std::all_of(holders.begin(), holders.end(), [&](const auto* item) {
+                        return item->kind == CatalogueKind::episode && item->parent_id &&
+                               item->parent_id == holders.front()->parent_id;
+                    });
+                if (one_season)
+                    continue;
                 Json::Array ids;
-                for (const auto* item : holders) ids.emplace_back(item->id);
-                conflicts.push_back(Json(Json::Object{{"media_id", media}, {"item_ids", Json(std::move(ids))}}));
+                for (const auto* item : holders)
+                    ids.emplace_back(item->id);
+                conflicts.push_back(
+                    Json(Json::Object{{"media_id", media}, {"item_ids", Json(std::move(ids))}}));
             }
             Json::Object out;
             out["count"] = static_cast<uint64_t>(items.size());
@@ -1065,19 +1133,27 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
 
         if (request.method == "GET" && request.path == "/api/v1/manage/providers/search") {
             ProviderSearchQuery query;
-            if (auto it = request.query.find("q"); it != request.query.end()) query.text = it->second;
-            if (query.text.empty()) return http_error(400, "bad_query", "q is required");
-            if (auto it = request.query.find("kind"); it != request.query.end()) query.kind = it->second;
-            if (auto it = request.query.find("artist"); it != request.query.end()) query.artist = it->second;
-            if (auto it = request.query.find("year"); it != request.query.end() && !it->second.empty()) {
+            if (auto it = request.query.find("q"); it != request.query.end())
+                query.text = it->second;
+            if (query.text.empty())
+                return http_error(400, "bad_query", "q is required");
+            if (auto it = request.query.find("kind"); it != request.query.end())
+                query.kind = it->second;
+            if (auto it = request.query.find("artist"); it != request.query.end())
+                query.artist = it->second;
+            if (auto it = request.query.find("year");
+                it != request.query.end() && !it->second.empty()) {
                 int32_t year = 0;
-                auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), year);
+                auto [end, ec] =
+                    std::from_chars(it->second.data(), it->second.data() + it->second.size(), year);
                 if (ec != std::errc{} || end != it->second.data() + it->second.size())
                     return http_error(400, "bad_year", "year must be a number");
                 query.year = year;
             }
-            if (auto it = request.query.find("limit"); it != request.query.end() && !it->second.empty()) {
-                auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), query.limit);
+            if (auto it = request.query.find("limit");
+                it != request.query.end() && !it->second.empty()) {
+                auto [end, ec] = std::from_chars(
+                    it->second.data(), it->second.data() + it->second.size(), query.limit);
                 if (ec != std::errc{} || end != it->second.data() + it->second.size() ||
                     query.limit == 0 || query.limit > 50)
                     return http_error(400, "bad_limit", "limit must be 1..50");
@@ -1089,11 +1165,15 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 item["provider"] = result.provider;
                 item["kind"] = result.kind;
                 item["title"] = result.title;
-                item["year"] = result.year ? Json(static_cast<int64_t>(*result.year)) : Json(nullptr);
+                item["year"] =
+                    result.year ? Json(static_cast<int64_t>(*result.year)) : Json(nullptr);
                 item["overview"] = result.overview;
-                if (result.kind == "album") item["artist"] = result.artist;
-                if (result.kind == "book") item["author"] = result.artist;
-                if (!result.catalogue_id.empty()) item["catalogue_item_id"] = result.catalogue_id;
+                if (result.kind == "album")
+                    item["artist"] = result.artist;
+                if (result.kind == "book")
+                    item["author"] = result.artist;
+                if (!result.catalogue_id.empty())
+                    item["catalogue_item_id"] = result.catalogue_id;
                 results.push_back(Json(std::move(item)));
             }
             Json::Object out;
@@ -1105,15 +1185,20 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
         if (request.method == "GET" && request.path == "/api/v1/manage/providers/artwork") {
             auto query_i32 = [&](std::string_view name) -> std::optional<int32_t> {
                 auto it = request.query.find(name);
-                if (it == request.query.end() || it->second.empty()) return {};
+                if (it == request.query.end() || it->second.empty())
+                    return {};
                 int32_t value = 0;
-                auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), value);
+                auto [end, ec] = std::from_chars(it->second.data(),
+                                                 it->second.data() + it->second.size(), value);
                 if (ec != std::errc{} || end != it->second.data() + it->second.size())
-                    throw ProviderRequestError(400, "bad_number", std::string(name) + " must be a number");
+                    throw ProviderRequestError(400, "bad_number",
+                                               std::string(name) + " must be a number");
                 return value;
             };
-            const auto ref = request.query.contains("ref") ? request.query.at("ref") : std::string{};
-            const auto role = request.query.contains("role") ? request.query.at("role") : std::string{};
+            const auto ref =
+                request.query.contains("ref") ? request.query.at("ref") : std::string{};
+            const auto role =
+                request.query.contains("role") ? request.query.at("role") : std::string{};
             ProviderRefNumbers numbers;
             numbers.season = query_i32("season_number");
             numbers.episode = query_i32("episode_number");
@@ -1122,8 +1207,10 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 Json::Object item;
                 item["option_id"] = option.option_id;
                 item["role"] = option.role;
-                item["width"] = option.width ? Json(static_cast<int64_t>(*option.width)) : Json(nullptr);
-                item["height"] = option.height ? Json(static_cast<int64_t>(*option.height)) : Json(nullptr);
+                item["width"] =
+                    option.width ? Json(static_cast<int64_t>(*option.width)) : Json(nullptr);
+                item["height"] =
+                    option.height ? Json(static_cast<int64_t>(*option.height)) : Json(nullptr);
                 item["language"] = option.language.empty() ? Json(nullptr) : Json(option.language);
                 item["preview_url"] = option.preview_url;
                 options.push_back(Json(std::move(item)));
@@ -1134,8 +1221,8 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             return http_json(200, Json(std::move(out)).dump());
         }
 
-        if (auto id = route_id(request.path, "/api/v1/manage/providers/musicbrainz/releases/",
-                               "/tracks");
+        if (auto id =
+                route_id(request.path, "/api/v1/manage/providers/musicbrainz/releases/", "/tracks");
             !id.empty() && request.method == "GET") {
             const auto number = [](const auto& value) {
                 return value ? Json(static_cast<int64_t>(*value)) : Json(nullptr);
@@ -1160,12 +1247,14 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
         if (request.method == "POST" && request.path == "/api/v1/manage/providers/artwork/choose") {
             const auto body = parse_body(request);
             std::optional<std::string> ref;
-            if (auto value = string_value(body, "ref"); !value.empty()) ref = std::move(value);
+            if (auto value = string_value(body, "ref"); !value.empty())
+                ref = std::move(value);
             ProviderRefNumbers numbers;
             numbers.season = optional_i32(body, "season_number");
             numbers.episode = optional_i32(body, "episode_number");
             bool lock = true;
-            if (const auto* value = body.find("lock")) lock = value->asBool();
+            if (const auto* value = body.find("lock"))
+                lock = value->asBool();
             auto item = scanner_.choose_artwork(required_string(body, "item_id"),
                                                 required_string(body, "role"),
                                                 required_string(body, "option_id"), std::move(ref),
@@ -1178,26 +1267,35 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
 
         constexpr std::string_view unmatched_prefix = "/api/v1/manage/unmatched/";
         if (request.path.starts_with(unmatched_prefix)) {
-            if (auto id = route_id(request.path, unmatched_prefix, "/matches"); !id.empty() &&
-                request.method == "GET") {
+            if (auto id = route_id(request.path, unmatched_prefix, "/matches");
+                !id.empty() && request.method == "GET") {
                 auto hint = unmatched_hint(id);
-                if (!hint) return http_error(404, "not_found", "unmatched file not found");
+                if (!hint)
+                    return http_error(404, "not_found", "unmatched file not found");
                 auto current = current_hint_file(fs_, *hint);
-                if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
+                if (!current)
+                    return http_error(409, "stale_unmatched",
+                                      "file changed or moved since matching failed");
                 auto probes = scanner_.probe_unmatched(*hint);
-                auto query = request.query.contains("q") ? request.query.at("q") : suggested_query(probes, hint->path);
+                auto query = request.query.contains("q") ? request.query.at("q")
+                                                         : suggested_query(probes, hint->path);
                 size_t limit = 12;
-                if (auto it = request.query.find("limit"); it != request.query.end() && !it->second.empty()) {
-                    auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), limit);
-                    if (ec != std::errc{} || end != it->second.data() + it->second.size() || limit > 50)
+                if (auto it = request.query.find("limit");
+                    it != request.query.end() && !it->second.empty()) {
+                    auto [end, ec] = std::from_chars(it->second.data(),
+                                                     it->second.data() + it->second.size(), limit);
+                    if (ec != std::errc{} || end != it->second.data() + it->second.size() ||
+                        limit > 50)
                         return http_error(400, "bad_limit", "limit must be 0..50");
                 }
                 const auto wanted_kind = leaf_kind(probes, hint->provider);
                 Json::Array matches;
                 for (const auto& item : catalogue_.search(query, std::max<size_t>(limit * 4, 20))) {
-                    if (wanted_kind && item.kind != *wanted_kind) continue;
+                    if (wanted_kind && item.kind != *wanted_kind)
+                        continue;
                     matches.push_back(catalogue_item_json(item));
-                    if (matches.size() >= limit) break;
+                    if (matches.size() >= limit)
+                        break;
                 }
                 Json::Object out;
                 out["query"] = query;
@@ -1205,22 +1303,29 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 return http_json(200, Json(std::move(out)).dump());
             }
 
-            if (auto id = route_id(request.path, unmatched_prefix, "/retry"); !id.empty() &&
-                request.method == "POST") {
+            if (auto id = route_id(request.path, unmatched_prefix, "/retry");
+                !id.empty() && request.method == "POST") {
                 auto hint = unmatched_hint(id);
-                if (!hint) return http_error(404, "not_found", "unmatched file not found");
+                if (!hint)
+                    return http_error(404, "not_found", "unmatched file not found");
                 auto current = current_hint_file(fs_, *hint);
-                if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
-                hints_.submit(hint->path, "manual", current->second, CatalogueHintPriority::manual_rescan);
+                if (!current)
+                    return http_error(409, "stale_unmatched",
+                                      "file changed or moved since matching failed");
+                hints_.submit(hint->path, "manual", current->second,
+                              CatalogueHintPriority::manual_rescan);
                 return http_json(202, "{\"state\":\"queued\"}");
             }
 
-            if (auto id = route_id(request.path, unmatched_prefix, "/match"); !id.empty() &&
-                request.method == "POST") {
+            if (auto id = route_id(request.path, unmatched_prefix, "/match");
+                !id.empty() && request.method == "POST") {
                 auto hint = unmatched_hint(id);
-                if (!hint) return http_error(404, "not_found", "unmatched file not found");
+                if (!hint)
+                    return http_error(404, "not_found", "unmatched file not found");
                 auto current = current_hint_file(fs_, *hint);
-                if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
+                if (!current)
+                    return http_error(409, "stale_unmatched",
+                                      "file changed or moved since matching failed");
                 const auto root = parse_body(request);
                 if (const auto ref = string_value(root, "ref"); !ref.empty()) {
                     ProviderRefNumbers numbers;
@@ -1232,7 +1337,8 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                         scanner_.match_unmatched_ref(*hint, ref, numbers, frame_for(request.work));
                     Json::Array items;
                     for (const auto& item_id : matched.item_ids)
-                        if (auto item = catalogue_.get(item_id)) items.push_back(catalogue_item_json(*item));
+                        if (auto item = catalogue_.get(item_id))
+                            items.push_back(catalogue_item_json(*item));
                     Json::Object out;
                     out["status"] = "matched";
                     out["leaf_item_id"] = matched.leaf_id;
@@ -1241,11 +1347,14 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 }
                 const auto item_id = required_string(root, "catalogue_item_id");
                 auto item = catalogue_.get(item_id);
-                if (!item) return http_error(404, "catalogue_item_not_found", "catalogue item not found");
+                if (!item)
+                    return http_error(404, "catalogue_item_not_found", "catalogue item not found");
                 if (!catalogue_leaf_kind(item->kind))
-                    return http_error(400, "not_playable_item",
-                                      "files may be matched only to movies, episodes, tracks or books");
-                if (std::find(item->media_ids.begin(), item->media_ids.end(), current->second) == item->media_ids.end())
+                    return http_error(
+                        400, "not_playable_item",
+                        "files may be matched only to movies, episodes, tracks or books");
+                if (std::find(item->media_ids.begin(), item->media_ids.end(), current->second) ==
+                    item->media_ids.end())
                     item->media_ids.push_back(current->second);
                 auto saved = catalogue_.upsert(*item, item->revision, frame_for(request.work));
                 hints_.mark_catalogued(hint->id, "manual", current->second, {saved.id},
@@ -1255,18 +1364,22 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 return http_json(200, Json(std::move(out)).dump());
             }
 
-            if (auto id = route_id(request.path, unmatched_prefix, "/manual"); !id.empty() &&
-                request.method == "POST") {
+            if (auto id = route_id(request.path, unmatched_prefix, "/manual");
+                !id.empty() && request.method == "POST") {
                 auto hint = unmatched_hint(id);
-                if (!hint) return http_error(404, "not_found", "unmatched file not found");
+                if (!hint)
+                    return http_error(404, "not_found", "unmatched file not found");
                 auto current = current_hint_file(fs_, *hint);
-                if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
+                if (!current)
+                    return http_error(409, "stale_unmatched",
+                                      "file changed or moved since matching failed");
                 const auto body = parse_body(request);
                 auto manual = build_manual_items(catalogue_, body, current->second);
                 // Hand-entered metadata is locked against the scanner unless
                 // the request says otherwise.
                 bool lock = true;
-                if (const auto* value = body.find("lock")) lock = value->asBool();
+                if (const auto* value = body.find("lock"))
+                    lock = value->asBool();
                 for (auto& item : manual.items) {
                     if (lock)
                         item.external_ids["macha_metadata_locked"] = "1";
@@ -1277,7 +1390,8 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 hints_.mark_catalogued(hint->id, "manual", current->second, {manual.leaf_id},
                                        "manual_metadata");
                 Json::Array items;
-                for (const auto& item : saved) items.push_back(catalogue_item_json(item));
+                for (const auto& item : saved)
+                    items.push_back(catalogue_item_json(item));
                 Json::Object out;
                 out["leaf_item_id"] = manual.leaf_id;
                 out["items"] = std::move(items);
@@ -1287,21 +1401,27 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             if (auto id = route_id(request.path, unmatched_prefix); !id.empty()) {
                 if (request.method == "GET") {
                     auto hint = unmatched_hint(id);
-                    if (!hint) return http_error(404, "not_found", "unmatched file not found");
+                    if (!hint)
+                        return http_error(404, "not_found", "unmatched file not found");
                     auto current = current_hint_file(fs_, *hint);
-                    if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
+                    if (!current)
+                        return http_error(409, "stale_unmatched",
+                                          "file changed or moved since matching failed");
                     Json::Object out;
                     out["item"] = hint_json(fs_, *hint);
                     Json::Array probes;
-                    for (const auto& probe : scanner_.probe_unmatched(*hint)) probes.push_back(probe_json(probe));
+                    for (const auto& probe : scanner_.probe_unmatched(*hint))
+                        probes.push_back(probe_json(probe));
                     out["probes"] = std::move(probes);
                     return http_json(200, Json(std::move(out)).dump());
                 }
                 if (request.method == "DELETE") {
                     auto hint = unmatched_hint(id);
-                    if (!hint) return http_error(404, "not_found", "unmatched file not found");
+                    if (!hint)
+                        return http_error(404, "not_found", "unmatched file not found");
                     if (!current_hint_file(fs_, *hint))
-                        return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
+                        return http_error(409, "stale_unmatched",
+                                          "file changed or moved since matching failed");
                     fs_.unlink(hint->path);
                     hints_.erase(hint->id);
                     return {204, "application/json; charset=utf-8", {}, {}};
@@ -1311,15 +1431,18 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
 
         if (request.method == "GET" && request.path == "/api/v1/manage/filesystem") {
             PageQuery page;
-            if (auto bad = read_page_query(request, page)) return *bad;
-            const auto path = normalize_path(request.query.contains("path") ? request.query.at("path") : "/");
+            if (auto bad = read_page_query(request, page))
+                return *bad;
+            const auto path =
+                normalize_path(request.query.contains("path") ? request.query.at("path") : "/");
             auto directory = fs_.getattr(path);
             if (directory.type != EntryType::directory)
                 return http_error(400, "not_directory", "path is not a directory");
             std::map<std::string, std::vector<std::string>, std::less<>> bindings;
             try {
-                (void)catalogue_.snapshot_view(
-                    WorkContext(FrameType::foreground, {}, nullptr, "GET /api/v1/manage/filesystem", local_waits));
+                (void)catalogue_.snapshot_view(WorkContext(FrameType::foreground, {}, nullptr,
+                                                           "GET /api/v1/manage/filesystem",
+                                                           local_waits));
                 bindings = catalogue_.indexes()->media_bindings;
             } catch (const std::exception& e) {
                 // MachaDFS browsing does not depend on the catalogue; binding annotations are
@@ -1362,10 +1485,13 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             if (it == request.query.end() || it->second.empty())
                 return http_error(400, "missing_path", "path is required");
             const auto path = normalize_path(it->second);
-            if (path == "/") return http_error(400, "root_delete", "MachaDFS root cannot be deleted");
+            if (path == "/")
+                return http_error(400, "root_delete", "MachaDFS root cannot be deleted");
             const auto entry = fs_.getattr(path);
-            if (entry.type == EntryType::directory) fs_.rmdir(path);
-            else fs_.unlink(path);
+            if (entry.type == EntryType::directory)
+                fs_.rmdir(path);
+            else
+                fs_.unlink(path);
             hints_.erase_prefix(path);
             return {204, "application/json; charset=utf-8", {}, {}};
         }
@@ -1373,8 +1499,10 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
         return http_error(404, "not_found", "management route not found");
     } catch (const FsError& e) {
         int status = 400;
-        if (e.code() == ENOENT) status = 404;
-        else if (e.code() == EEXIST || e.code() == ENOTEMPTY) status = 409;
+        if (e.code() == ENOENT)
+            status = 404;
+        else if (e.code() == EEXIST || e.code() == ENOTEMPTY)
+            status = 409;
         return http_error(status, "filesystem_error", e.what());
     } catch (const CatalogueConflict& e) {
         return http_error(409, "catalogue_conflict", e.what());
@@ -1387,17 +1515,18 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             // Retry-After.
             Json::Object root;
             root["status"] = e.code;
-            root["error"] = Json::Object{{"code", e.code},
-                                         {"message", std::string(e.what())},
-                                         {"retry_after_ms", static_cast<uint64_t>(e.retry_after->count())}};
+            root["error"] =
+                Json::Object{{"code", e.code},
+                             {"message", std::string(e.what())},
+                             {"retry_after_ms", static_cast<uint64_t>(e.retry_after->count())}};
             response = http_json(e.status, Json(std::move(root)).dump());
-            response.headers["Retry-After"] =
-                std::to_string((e.retry_after->count() + 999) / 1000);
+            response.headers["Retry-After"] = std::to_string((e.retry_after->count() + 999) / 1000);
         }
         return response;
     } catch (const ManualParentError& e) {
         Json::Object error{{"code", e.code}, {"message", std::string(e.what())}};
-        for (const auto& [name, value] : e.fields) error[name] = value;
+        for (const auto& [name, value] : e.fields)
+            error[name] = value;
         Json::Object root;
         root["status"] = e.code;
         root["error"] = std::move(error);

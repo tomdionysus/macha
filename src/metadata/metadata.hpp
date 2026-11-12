@@ -3,10 +3,10 @@
 #include "contract/thread_safety.hpp"
 #include "crypto.hpp"
 #include "torrent/torrent_request.hpp"
-#include <istream>
 #include <atomic>
 #include <filesystem>
 #include <functional>
+#include <istream>
 #include <map>
 #include <memory>
 #include <set>
@@ -32,7 +32,9 @@ class Reader;
 struct MetadataDot {
     NodeId author{};
     uint64_t sequence{};
-    explicit operator bool() const noexcept { return sequence != 0; }
+    explicit operator bool() const noexcept {
+        return sequence != 0;
+    }
     auto operator<=>(const MetadataDot&) const = default;
 };
 // Whether a head with this clock has incorporated the mutation.
@@ -51,7 +53,9 @@ struct EntryProvenance {
     MetadataDot content;
     // When it came to be at this path, by creation or rename.
     MetadataDot name;
-    bool empty() const noexcept { return file_id == NodeId{} && !content && !name; }
+    bool empty() const noexcept {
+        return file_id == NodeId{} && !content && !name;
+    }
     auto operator<=>(const EntryProvenance&) const = default;
 };
 
@@ -278,8 +282,7 @@ struct MetadataHistoryEntry {
 
 // The ancestry links a body needs in order to be materialized (a subset of
 // all its links).
-std::vector<Hash256> metadata_history_materialization_dependencies(
-    const MetadataHistoryEntry&);
+std::vector<Hash256> metadata_history_materialization_dependencies(const MetadataHistoryEntry&);
 
 // The one succession rule for a delta body over its primary parent, shared by
 // every writer and reader; writers and readers must agree or a written commit
@@ -322,8 +325,7 @@ struct MetadataDelta {
     // DLT5. DLT6 replaces both or neither; DLT7 flags each, so only the set
     // that changed is sent.
     std::optional<std::vector<Hash256>> replace_merge_parents;
-    std::optional<std::map<std::string, MetadataConflict, std::less<>>>
-        replace_conflicts;
+    std::optional<std::map<std::string, MetadataConflict, std::less<>>> replace_conflicts;
     // DLT7: sort tombstones by ObjectId after the edits, so a merge over an
     // append-ordered parent still encodes as a delta.
     bool canonical_garbage{};
@@ -462,8 +464,7 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
                                               const MetadataSnapshot& right,
                                               const NamespaceEntries& left_entries,
                                               const NamespaceEntries& right_entries,
-                                              const Hash256& left_head,
-                                              const Hash256& right_head);
+                                              const Hash256& left_head, const Hash256& right_head);
 // Reachability roots held by unresolved conflicts, which GC must protect.
 std::set<ObjectId> metadata_conflict_extent_roots(const MetadataSnapshot&);
 std::set<ObjectId> metadata_catalogue_root_set(const MetadataSnapshot&);
@@ -576,7 +577,9 @@ class MetadataReplica {
     struct HeadsRevisionBump {
         std::atomic_uint64_t& revision;
         explicit HeadsRevisionBump(std::atomic_uint64_t& r) : revision(r) {}
-        ~HeadsRevisionBump() { revision.fetch_add(1, std::memory_order_release); }
+        ~HeadsRevisionBump() {
+            revision.fetch_add(1, std::memory_order_release);
+        }
     };
     void note_set_aside_locked() MACHA_REQUIRES(m_);
     // Per-hash retry cooldown for an accepted head that fails to reconstruct,

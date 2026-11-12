@@ -15,9 +15,9 @@
 #include "storage/local_store.hpp"
 
 #include <algorithm>
-#include <set>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 
@@ -80,13 +80,15 @@ class RemoteTrie final : public TrieSource {
         uint64_t bytes{};
         Clock::duration waited{};
     };
-    const Spent& spent() const noexcept { return spent_; }
+    const Spent& spent() const noexcept {
+        return spent_;
+    }
 
   private:
     Bytes ask(const TrieQuestion& question) {
         const auto started = Clock::now();
-        const auto reply = node_.call(peer_, MessageType::trie_diff,
-                                      encode_trie_question(question), FrameType::speculative, call_deadline::presence_probe);
+        const auto reply = node_.call(peer_, MessageType::trie_diff, encode_trie_question(question),
+                                      FrameType::speculative, call_deadline::presence_probe);
         ++spent_.questions;
         spent_.bytes += reply.message.payload.size();
         spent_.waited += Clock::now() - started;
@@ -143,10 +145,9 @@ PathAvailability file_facts(const FsEntry& entry, const AvailabilitySurvey& surv
                 if (const auto was = last_known->paths.find(known->second);
                     was != last_known->paths.end() && was->second.hash == facts.hash &&
                     was->second.extents == facts.extents && !was->second.extents_unknown) {
-                    facts.extents_unavailable =
-                        std::max(facts.extents_unavailable,
-                                 std::min(was->second.extents_unavailable,
-                                          facts.extents - facts.extents_local));
+                    facts.extents_unavailable = std::max(
+                        facts.extents_unavailable, std::min(was->second.extents_unavailable,
+                                                            facts.extents - facts.extents_local));
                     facts.extents_unknown = 0;
                 }
     }
@@ -292,8 +293,7 @@ AvailabilitySnapshot decode_availability_paths(std::span<const uint8_t> bytes) {
         facts.hash = in.string();
         if (facts.extents_local > facts.extents ||
             facts.extents_unavailable > facts.extents - facts.extents_local ||
-            facts.extents_unknown >
-                facts.extents - facts.extents_local - facts.extents_unavailable)
+            facts.extents_unknown > facts.extents - facts.extents_local - facts.extents_unavailable)
             throw DecodeError("availability counts exceed the extents");
         if (!facts.directory)
             snapshot.by_hash.emplace(facts.hash, path);
@@ -308,8 +308,8 @@ AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
                                          DistributedStore& store, const ObjectLedger& ledger,
                                          const NodeEvents& events, MessageRoutes& routes,
                                          std::filesystem::path persisted)
-    : node_(node), local_(local), store_(store), ledger_(ledger), events_(events),
-      routes_(routes), persisted_(std::move(persisted)) {
+    : node_(node), local_(local), store_(store), ledger_(ledger), events_(events), routes_(routes),
+      persisted_(std::move(persisted)) {
     if (!persisted_.empty()) {
         std::ifstream in(persisted_, std::ios::binary);
         if (in) {
@@ -361,7 +361,8 @@ RpcMessage AvailabilityService::answer_trie(const RpcMessage& request) const {
             }
     }
     if (!trie)
-        return error_reply(410, "snapshot_gone", "the trie snapshot asked about is no longer pinned");
+        return error_reply(410, "snapshot_gone",
+                           "the trie snapshot asked about is no longer pinned");
     if (question.kind == TrieQuestionKind::children)
         return {MessageType::trie_diff_reply,
                 encode_trie_children(trie->children(question.prefixes))};
@@ -419,8 +420,8 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     // What must be asked of the peers again, whatever it costs.
     const bool must_ask = !surveyed_ || topology_events != surveyed_topology_events_ ||
                           !same_peers || shrank || retry;
-    const bool missing = surveyed_ && (!previous->survey.unavailable.empty() ||
-                                      !previous->survey.unknown.empty());
+    const bool missing =
+        surveyed_ && (!previous->survey.unavailable.empty() || !previous->survey.unknown.empty());
     // What the inventory or this node's holdings changed, or a peer holding
     // more (which could hold something missing, but a peer that is importing
     // grows all the time), waits for the duty cycle.
@@ -440,8 +441,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     const auto started = Clock::now();
     if (changed) {
         const auto joined = Clock::now();
-        missing_.publish(
-            inventory->not_held(RetentionClass::data, view.trie->parts(), pause));
+        missing_.publish(inventory->not_held(RetentionClass::data, view.trie->parts(), pause));
         joined_inventory_ = inventory;
         joined_identity_ = view.identity;
         observations().record("availability.join_us", elapsed_us(joined));
@@ -467,27 +467,26 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
             sources.push_back(&tries.emplace_back(node_, host, supported.back()));
         }
         std::vector<PeerDiff> diffs;
-        next.survey = survey_by_diff(view.trie, *missing_here,
-                                     inventory->lookup(RetentionClass::data), sources, diffs,
-                                     pause);
+        next.survey =
+            survey_by_diff(view.trie, *missing_here, inventory->lookup(RetentionClass::data),
+                           sources, diffs, pause);
         const auto elapsed = Clock::now() - started;
-        observations().record("availability.diff_us",
-                              static_cast<uint64_t>(std::chrono::duration_cast<
-                                  std::chrono::microseconds>(elapsed).count()));
+        observations().record(
+            "availability.diff_us",
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
         PeerLacks lacks;
         lacks.generation = inventory->generation();
         lacks.complete = true;
         for (size_t i = 0; i < hosts.size(); ++i) {
             const auto& spent = tries[i].spent();
-            Log::debug("availability diff " +
-                       std::string(diffs[i].answered ? "done" : "failed") +
-                       " peer=" + to_string(hosts[i].id).substr(0, 12) +
-                       " questions=" + std::to_string(spent.questions) +
-                       " reply_bytes=" + std::to_string(spent.bytes) +
-                       " waited_ms=" +
-                       std::to_string(
-                           std::chrono::duration_cast<std::chrono::milliseconds>(spent.waited)
-                               .count()));
+            Log::debug(
+                "availability diff " + std::string(diffs[i].answered ? "done" : "failed") +
+                " peer=" + to_string(hosts[i].id).substr(0, 12) +
+                " questions=" + std::to_string(spent.questions) +
+                " reply_bytes=" + std::to_string(spent.bytes) + " waited_ms=" +
+                std::to_string(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(spent.waited).count()));
             if (!diffs[i].answered) {
                 lacks.complete = false;
                 // A peer too old to answer is asked again when the membership
@@ -558,14 +557,14 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                " peers=" + std::to_string(next.survey.peers_asked) +
                " peers_failed=" + std::to_string(next.survey.peers_failed) +
                " rounds=" + std::to_string(next.survey.rounds) +
-               " prefixes_asked=" + std::to_string(next.survey.nodes_asked) +
-               " table=" + table + " method=" + (ask ? "diff" : "gained"));
+               " prefixes_asked=" + std::to_string(next.survey.nodes_asked) + " table=" + table +
+               " method=" + (ask ? "diff" : "gained"));
     if (table_changed && !persisted_.empty()) {
         try {
             const auto bytes = encode_availability_paths(next);
-            durable_replace_file(persisted_,
-                                 std::string_view(reinterpret_cast<const char*>(bytes.data()),
-                                                  bytes.size()));
+            durable_replace_file(
+                persisted_,
+                std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
         } catch (const std::exception& error) {
             Log::warn(std::string("availability: cannot keep the survey: ") + error.what());
         }
@@ -574,7 +573,8 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     if (!ask)
         return false;
     if (retry_needed) {
-        retry_backoff_ = std::clamp<Clock::duration>(retry_backoff_ * 2, retry_floor, retry_ceiling);
+        retry_backoff_ =
+            std::clamp<Clock::duration>(retry_backoff_ * 2, retry_floor, retry_ceiling);
         retry_at_ = now + retry_backoff_;
         due_ = due_ ? std::min(*due_, *retry_at_) : *retry_at_;
     } else {

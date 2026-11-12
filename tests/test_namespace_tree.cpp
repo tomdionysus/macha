@@ -7,8 +7,8 @@
 #include <algorithm>
 #include <iostream>
 #include <set>
-#include <vector>
 #include <string>
+#include <vector>
 
 using namespace macha;
 using namespace macha::test_support;
@@ -156,7 +156,8 @@ MACHA_TEST("namespace_tree", test_the_root_is_a_function_of_the_entry_set_and_no
     CHECK(build_namespace_tree(detour, elsewhere) == direct_root);
 }
 
-MACHA_TEST("namespace_tree", test_changing_one_file_rewrites_a_path_to_the_root_and_not_the_library) {
+MACHA_TEST("namespace_tree",
+           test_changing_one_file_rewrites_a_path_to_the_root_and_not_the_library) {
     auto entries = library(40, 12);
     MemoryNamespaceNodeStore store;
     const auto before_root = build_namespace_tree(entries, store);
@@ -432,10 +433,10 @@ MACHA_TEST("namespace_tree", test_an_sm14_record_points_at_the_namespace_instead
 MACHA_TEST("namespace_tree", test_the_record_stops_growing_with_the_library) {
     // Two libraries an order of magnitude apart encode to one payload size.
     MemoryNamespaceNodeStore small_store, large_store;
-    const auto small = encode_snapshot_v14(
-        detach_namespace(populated_snapshot(library(2, 4)), small_store));
-    const auto large = encode_snapshot_v14(
-        detach_namespace(populated_snapshot(library(40, 20)), large_store));
+    const auto small =
+        encode_snapshot_v14(detach_namespace(populated_snapshot(library(2, 4)), small_store));
+    const auto large =
+        encode_snapshot_v14(detach_namespace(populated_snapshot(library(40, 20)), large_store));
 
     CHECK(small.size() == large.size());
     // They differ only in the root's content address.
@@ -493,7 +494,8 @@ MACHA_TEST("namespace_tree", test_a_snapshot_never_carries_its_namespace_in_two_
     CHECK(refused);
 }
 
-MACHA_TEST("namespace_tree", test_a_stat_against_a_decoded_record_never_materialises_the_namespace) {
+MACHA_TEST("namespace_tree",
+           test_a_stat_against_a_decoded_record_never_materialises_the_namespace) {
     // A getattr answered from a decoded record without materialising the map.
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
@@ -518,7 +520,8 @@ MACHA_TEST("namespace_tree", test_a_damaged_record_is_refused_rather_than_truste
     // The record arrives from the network: a bit flipped at every position must
     // be refused or survived, never crash or hang.
     MemoryNamespaceNodeStore store;
-    const auto payload = encode_snapshot_v14(detach_namespace(populated_snapshot(library(2, 2)), store));
+    const auto payload =
+        encode_snapshot_v14(detach_namespace(populated_snapshot(library(2, 2)), store));
 
     size_t refused = 0, accepted = 0;
     for (size_t at = 0; at < payload.size(); ++at) {
@@ -572,19 +575,17 @@ MACHA_TEST("namespace_tree", test_a_reader_sees_the_same_namespace_in_either_for
     const auto detached = detach_namespace(attached, store);
 
     std::map<std::string, FsEntry> from_map, from_tree;
-    for_each_namespace_entry(attached, nullptr, [&](const std::string& path, const FsEntry& e) {
-        from_map[path] = e;
-    });
-    for_each_namespace_entry(detached, &store, [&](const std::string& path, const FsEntry& e) {
-        from_tree[path] = e;
-    });
+    for_each_namespace_entry(
+        attached, nullptr, [&](const std::string& path, const FsEntry& e) { from_map[path] = e; });
+    for_each_namespace_entry(
+        detached, &store, [&](const std::string& path, const FsEntry& e) { from_tree[path] = e; });
     CHECK(from_map == entries);
     CHECK(from_tree == entries);
 
     // Visited in path order in both forms, which is what a prefix scan needs.
     std::vector<std::string> order;
-    for_each_namespace_entry(detached, &store,
-                             [&](const std::string& path, const FsEntry&) { order.push_back(path); });
+    for_each_namespace_entry(
+        detached, &store, [&](const std::string& path, const FsEntry&) { order.push_back(path); });
     CHECK(std::is_sorted(order.begin(), order.end()));
 
     // The point lookup agrees in both forms, including for an absent path.
@@ -600,7 +601,8 @@ MACHA_TEST("namespace_tree", test_a_reader_sees_the_same_namespace_in_either_for
     CHECK(!namespace_entry(detached, &store, "/nothing/here.mkv").has_value());
 }
 
-MACHA_TEST("namespace_tree", test_a_detached_namespace_without_a_store_refuses_rather_than_reporting_empty) {
+MACHA_TEST("namespace_tree",
+           test_a_detached_namespace_without_a_store_refuses_rather_than_reporting_empty) {
     // A walk over a detached snapshot with no store must fail with a named
     // error, not report an empty (all-dead) library.
     MemoryNamespaceNodeStore store;
@@ -877,15 +879,13 @@ MACHA_TEST("namespace_tree", test_a_prefix_scan_descends_rather_than_walking_the
 
     // Same answer from both forms, and the same answer as filtering a full walk.
     std::map<std::string, FsEntry> from_map, from_tree;
-    for_each_namespace_entry_with_prefix(attached, nullptr, prefix,
-                                         [&](const std::string& p, const FsEntry& e) {
-                                             from_map[p] = e;
-                                         });
+    for_each_namespace_entry_with_prefix(
+        attached, nullptr, prefix,
+        [&](const std::string& p, const FsEntry& e) { from_map[p] = e; });
     store.forget_reads();
-    for_each_namespace_entry_with_prefix(detached, &store, prefix,
-                                         [&](const std::string& p, const FsEntry& e) {
-                                             from_tree[p] = e;
-                                         });
+    for_each_namespace_entry_with_prefix(
+        detached, &store, prefix,
+        [&](const std::string& p, const FsEntry& e) { from_tree[p] = e; });
     const auto prefix_reads = store.reads();
     CHECK(from_map == expected);
     CHECK(from_tree == expected);
@@ -941,15 +941,14 @@ MACHA_TEST("namespace_tree", test_a_listing_reads_the_directory_not_its_descenda
     const auto children_of = [&](const MetadataSnapshot& snapshot, const NamespaceNodeStore* nodes,
                                  const std::string& directory) {
         std::vector<std::pair<std::string, std::string>> out;
-        for_each_namespace_child(snapshot, nodes, directory,
-                                 [&](const std::string& name, const std::string& path,
-                                     const FsEntry& stat) {
-                                     CHECK(stat.type == entries.at(path).type);
-                                     CHECK(stat.size == entries.at(path).size);
-                                     CHECK(stat.extents.empty() ||
-                                           stat.extents == entries.at(path).extents);
-                                     out.emplace_back(name, path);
-                                 });
+        for_each_namespace_child(
+            snapshot, nodes, directory,
+            [&](const std::string& name, const std::string& path, const FsEntry& stat) {
+                CHECK(stat.type == entries.at(path).type);
+                CHECK(stat.size == entries.at(path).size);
+                CHECK(stat.extents.empty() || stat.extents == entries.at(path).extents);
+                out.emplace_back(name, path);
+            });
         return out;
     };
 
@@ -1200,7 +1199,8 @@ MACHA_TEST("namespace_tree", test_a_commit_claims_the_nodes_it_introduced_and_pr
     auto changed = entries.at("/TV/Show 4/Season 1/Episode 4.mkv");
     changed.mtime_ns += 999;
     store.forget_written();
-    const auto after = update_namespace_tree(before, store, {{"/TV/Show 4/Season 1/Episode 4.mkv", changed}});
+    const auto after =
+        update_namespace_tree(before, store, {{"/TV/Show 4/Season 1/Episode 4.mkv", changed}});
     auto written = store.written();
     std::sort(written.begin(), written.end());
     REQUIRE(!written.empty());
@@ -1288,7 +1288,9 @@ struct Lineage {
     uint64_t created{};
     MetadataSnapshot head;
 
-    explicit Lineage(uint8_t tag) { author.bytes[0] = tag; }
+    explicit Lineage(uint8_t tag) {
+        author.bytes[0] = tag;
+    }
 
     MetadataDot next() {
         if (!head.legacy_clock)
@@ -1342,7 +1344,9 @@ struct Lineage {
         head.entries[to] = std::move(entry);
     }
     // Takes the namespace another lineage reached, keeping its own identity.
-    void adopt(const MetadataSnapshot& other) { head = other; }
+    void adopt(const MetadataSnapshot& other) {
+        head = other;
+    }
 };
 
 // A lineage's mutations between two merges. Targets come from a small pool as
@@ -1397,12 +1401,10 @@ void mutate(Lineage& lineage, Random& random, size_t edits) {
 // root, the conflicts and every other field of the record. Its delta, applied
 // to the primary parent as a replica would, gives that record byte for byte.
 // Returns the encoded sizes of the delta and of the record.
-std::pair<uint64_t, uint64_t> check_tree_merge(const MetadataMergeResult& expected,
-                                               const NamespaceTreeMerge& merge,
-                                               const ObjectId& root,
-                                               const MetadataSnapshot& primary,
-                                               const Hash256& secondary_head,
-                                               MemoryNamespaceNodeStore& store) {
+std::pair<uint64_t, uint64_t>
+check_tree_merge(const MetadataMergeResult& expected, const NamespaceTreeMerge& merge,
+                 const ObjectId& root, const MetadataSnapshot& primary,
+                 const Hash256& secondary_head, MemoryNamespaceNodeStore& store) {
     MemoryNamespaceNodeStore fresh;
     const auto expected_root = build_namespace_tree(expected.snapshot.entries, fresh);
     CHECK(root == expected_root);
@@ -1433,7 +1435,8 @@ std::pair<uint64_t, uint64_t> check_tree_merge(const MetadataMergeResult& expect
 
 } // namespace
 
-MACHA_FAST_TEST("namespace_tree", test_a_diff_is_the_paths_that_differ_and_reads_only_their_leaves) {
+MACHA_FAST_TEST("namespace_tree",
+                test_a_diff_is_the_paths_that_differ_and_reads_only_their_leaves) {
     MemoryNamespaceNodeStore store;
     auto before = library(200, 20);
     const auto root_before = build_namespace_tree(before, store);
@@ -1674,9 +1677,8 @@ MACHA_HEAVY_TEST("baseline", test_baseline_reconcile_materialised_against_tree) 
     };
 
     auto started = Clock::now();
-    const auto materialised = merge_metadata_heads(attach_namespace(left, store),
-                                                   attach_namespace(right, store), left_head,
-                                                   right_head);
+    const auto materialised = merge_metadata_heads(
+        attach_namespace(left, store), attach_namespace(right, store), left_head, right_head);
     const auto rebuilt = detach_namespace(materialised.snapshot, store);
     report("reconcile.materialised", Clock::now() - started);
 

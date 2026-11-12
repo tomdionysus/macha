@@ -68,13 +68,12 @@ Bytes build_zip(const std::vector<Member>& members, const ZipOptions& options = 
     };
     std::vector<Written> written;
     for (const auto& member : members) {
-        const auto payload = member.deflate
-                                 ? raw_deflate(member.data)
-                                 : Bytes(member.data.begin(), member.data.end());
+        const auto payload = member.deflate ? raw_deflate(member.data)
+                                            : Bytes(member.data.begin(), member.data.end());
         Written record{};
-        record.crc = static_cast<uint32_t>(
-            crc32(0, reinterpret_cast<const Bytef*>(member.data.data()),
-                  static_cast<uInt>(member.data.size())));
+        record.crc =
+            static_cast<uint32_t>(crc32(0, reinterpret_cast<const Bytef*>(member.data.data()),
+                                        static_cast<uInt>(member.data.size())));
         record.compressed = static_cast<uint32_t>(payload.size()) + member.extra_declared;
         record.uncompressed = static_cast<uint32_t>(member.data.size()) + member.extra_declared;
         record.offset = static_cast<uint32_t>(out.size());
@@ -193,7 +192,8 @@ const std::string epub2_opf =
     " unique-identifier=\"BookId\" version=\"2.0\">\n"
     "  <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n"
     "    <dc:title>Guards!\n      Guards!</dc:title>\n"
-    "    <dc:creator opf:role=\"aut\" opf:file-as=\"Pratchett, Terry\">Terry Pratchett</dc:creator>\n"
+    "    <dc:creator opf:role=\"aut\" opf:file-as=\"Pratchett, Terry\">Terry "
+    "Pratchett</dc:creator>\n"
     "    <dc:identifier id=\"BookId\" opf:scheme=\"ISBN\">0-552-13462-7</dc:identifier>\n"
     "    <dc:language>en-GB</dc:language>\n"
     "    <dc:publisher>Corgi</dc:publisher>\n"
@@ -234,8 +234,10 @@ const std::string epub3_opf =
     "    <meta refines=\"#c3\" property=\"collection-type\">set</meta>\n"
     "  </metadata>\n"
     "  <manifest>\n"
-    "    <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n"
-    "    <item id=\"cover\" href=\"cover.png\" media-type=\"image/png\" properties=\"scripted cover-image\"/>\n"
+    "    <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" "
+    "properties=\"nav\"/>\n"
+    "    <item id=\"cover\" href=\"cover.png\" media-type=\"image/png\" properties=\"scripted "
+    "cover-image\"/>\n"
     "  </manifest>\n"
     "</package>\n";
 
@@ -251,8 +253,8 @@ std::string simple_opf(const std::string& metadata, const std::string& manifest 
 
 MACHA_FAST_TEST("epub_metadata", test_epub2_role_file_as_meta_cover_and_calibre_series) {
     const auto cover = jpeg_bytes(300);
-    const auto zip = epub("OEBPS/content.opf", epub2_opf,
-                          {{"OEBPS/images/cover.jpg", cover, false, false, 0}});
+    const auto zip =
+        epub("OEBPS/content.opf", epub2_opf, {{"OEBPS/images/cover.jpg", cover, false, false, 0}});
     const auto metadata = read_bytes(zip);
     CHECK(metadata.title == "Guards! Guards!");
     REQUIRE(metadata.creators.size() == 1);
@@ -317,11 +319,11 @@ MACHA_FAST_TEST("epub_metadata", test_two_creators_one_an_editor_in_epub2_attrib
 }
 
 MACHA_FAST_TEST("epub_metadata", test_series_deduplicated_across_calibre_and_collections) {
-    const auto opf = simple_opf(
-        "<dc:title>Feet of Clay</dc:title>\n"
-        "<meta name=\"calibre:series\" content=\"Discworld\"/>\n"
-        "<meta property=\"belongs-to-collection\" id=\"c1\">Discworld</meta>\n"
-        "<meta refines=\"#c1\" property=\"group-position\">19</meta>\n");
+    const auto opf =
+        simple_opf("<dc:title>Feet of Clay</dc:title>\n"
+                   "<meta name=\"calibre:series\" content=\"Discworld\"/>\n"
+                   "<meta property=\"belongs-to-collection\" id=\"c1\">Discworld</meta>\n"
+                   "<meta refines=\"#c1\" property=\"group-position\">19</meta>\n");
     const auto metadata = read_bytes(epub("book.opf", opf));
     REQUIRE(metadata.series.size() == 1);
     CHECK(metadata.series[0].name == "Discworld");
@@ -331,12 +333,13 @@ MACHA_FAST_TEST("epub_metadata", test_series_deduplicated_across_calibre_and_col
 
 MACHA_FAST_TEST("epub_metadata", test_identifiers_and_isbn_detection) {
     // A UUID first, an ISBN-10 with hyphens, a urn, a bad check digit.
-    auto metadata = read_bytes(epub(
-        "book.opf",
-        simple_opf("<dc:identifier id=\"uid\">urn:uuid:7f3b2c10-4f9e-4a7b-9a2f-5e1c8d2b1a00</dc:identifier>\n"
-                   "<dc:identifier>0-306-40615-3</dc:identifier>\n"
-                   "<dc:identifier> 0-306-40615-2 </dc:identifier>\n"
-                   "<dc:identifier>urn:isbn:9783161484100</dc:identifier>\n")));
+    auto metadata = read_bytes(
+        epub("book.opf",
+             simple_opf("<dc:identifier "
+                        "id=\"uid\">urn:uuid:7f3b2c10-4f9e-4a7b-9a2f-5e1c8d2b1a00</dc:identifier>\n"
+                        "<dc:identifier>0-306-40615-3</dc:identifier>\n"
+                        "<dc:identifier> 0-306-40615-2 </dc:identifier>\n"
+                        "<dc:identifier>urn:isbn:9783161484100</dc:identifier>\n")));
     REQUIRE(metadata.identifiers.size() == 4);
     CHECK(metadata.identifiers[0] == "urn:uuid:7f3b2c10-4f9e-4a7b-9a2f-5e1c8d2b1a00");
     CHECK(metadata.identifiers[1] == "0-306-40615-3");
@@ -346,15 +349,16 @@ MACHA_FAST_TEST("epub_metadata", test_identifiers_and_isbn_detection) {
     CHECK(metadata.isbn13 == "9780306406157");
 
     // An identifier declared as an ISBN beats an earlier one found by shape.
-    metadata = read_bytes(epub("book.opf",
-                               simple_opf("<dc:identifier>urn:isbn:9780306406157</dc:identifier>\n"
-                                          "<dc:identifier opf:scheme=\"ISBN\">978-3-16-148410-0</dc:identifier>\n")));
+    metadata = read_bytes(
+        epub("book.opf",
+             simple_opf("<dc:identifier>urn:isbn:9780306406157</dc:identifier>\n"
+                        "<dc:identifier opf:scheme=\"ISBN\">978-3-16-148410-0</dc:identifier>\n")));
     CHECK(metadata.isbn13 == "9783161484100");
 
     // Nothing ISBN-shaped: no ISBN.
-    metadata = read_bytes(epub("book.opf",
-                               simple_opf("<dc:identifier>urn:uuid:abc</dc:identifier>\n"
-                                          "<dc:identifier>0-306-40615-3</dc:identifier>\n")));
+    metadata =
+        read_bytes(epub("book.opf", simple_opf("<dc:identifier>urn:uuid:abc</dc:identifier>\n"
+                                               "<dc:identifier>0-306-40615-3</dc:identifier>\n")));
     CHECK(!metadata.isbn13.has_value());
     CHECK(metadata.identifiers.size() == 2);
 }
@@ -362,21 +366,23 @@ MACHA_FAST_TEST("epub_metadata", test_identifiers_and_isbn_detection) {
 MACHA_FAST_TEST("epub_metadata", test_description_with_markup_and_entities) {
     auto metadata = read_bytes(epub(
         "book.opf",
-        simple_opf("<dc:title>T</dc:title>\n"
-                   "<dc:description>&lt;p&gt;A &lt;b&gt;bold&lt;/b&gt; tale &amp;amp; more.&lt;/p&gt;\n\n"
-                   "   second   line&lt;br/&gt;</dc:description>\n")));
+        simple_opf(
+            "<dc:title>T</dc:title>\n"
+            "<dc:description>&lt;p&gt;A &lt;b&gt;bold&lt;/b&gt; tale &amp;amp; more.&lt;/p&gt;\n\n"
+            "   second   line&lt;br/&gt;</dc:description>\n")));
     CHECK(metadata.description == "A bold tale & more. second line");
 
     // Markup arriving in CDATA is markup all the same; the plain case keeps
     // its angle-free text and decoded entities.
-    metadata = read_bytes(epub(
-        "book.opf",
-        simple_opf("<dc:description><![CDATA[<p>Raw &amp; <i>markup</i></p>]]></dc:description>\n")));
+    metadata = read_bytes(
+        epub("book.opf",
+             simple_opf(
+                 "<dc:description><![CDATA[<p>Raw &amp; <i>markup</i></p>]]></dc:description>\n")));
     CHECK(metadata.description == "Raw & markup");
 
-    metadata = read_bytes(epub(
-        "book.opf",
-        simple_opf("<dc:description>  Caf&#233; &#x2019;quoted&#x2019; 3 &gt; 2 &amp; 1 &lt; 2  </dc:description>\n")));
+    metadata =
+        read_bytes(epub("book.opf", simple_opf("<dc:description>  Caf&#233; &#x2019;quoted&#x2019; "
+                                               "3 &gt; 2 &amp; 1 &lt; 2  </dc:description>\n")));
     CHECK(metadata.description == "Caf\xC3\xA9 \xE2\x80\x99quoted\xE2\x80\x99 3 > 2 & 1 < 2");
 }
 
@@ -402,7 +408,8 @@ MACHA_FAST_TEST("epub_metadata", test_bom_and_crlf) {
 MACHA_FAST_TEST("epub_metadata", test_prefixed_and_default_namespace_opf_read_alike) {
     const std::string prefixed =
         "<?xml version='1.0' encoding='utf-8'?>\n"
-        "<opf:package xmlns:opf='http://www.idpf.org/2007/opf' xmlns:dc='http://purl.org/dc/elements/1.1/' version='2.0'>\n"
+        "<opf:package xmlns:opf='http://www.idpf.org/2007/opf' "
+        "xmlns:dc='http://purl.org/dc/elements/1.1/' version='2.0'>\n"
         "<opf:metadata>\n"
         "<dc:title>Prefixed</dc:title>\n"
         "<dc:creator opf:role='ill' opf:file-as='Kidby, Paul'>Paul Kidby</dc:creator>\n"
@@ -426,7 +433,8 @@ MACHA_FAST_TEST("epub_metadata", test_prefixed_and_default_namespace_opf_read_al
         "</manifest>\n"
         "</package>\n";
     for (const auto& opf : {prefixed, plain}) {
-        const auto metadata = read_bytes(epub("x.opf", opf, {{"c.gif", "GIF89a..", false, false, 0}}));
+        const auto metadata =
+            read_bytes(epub("x.opf", opf, {{"c.gif", "GIF89a..", false, false, 0}}));
         CHECK(metadata.title == "Prefixed");
         REQUIRE(metadata.creators.size() == 1);
         CHECK(metadata.creators[0].role == "ill");
@@ -438,31 +446,35 @@ MACHA_FAST_TEST("epub_metadata", test_prefixed_and_default_namespace_opf_read_al
     }
 }
 
-MACHA_FAST_TEST("epub_metadata", test_opf_in_subdirectory_resolves_relative_and_percent_encoded_hrefs) {
+MACHA_FAST_TEST("epub_metadata",
+                test_opf_in_subdirectory_resolves_relative_and_percent_encoded_hrefs) {
     const auto opf = simple_opf(
         "<dc:title>Deep</dc:title>\n",
         "<item id=\"cover\" href=\"../Images/My%20Cover%21.jpg\" properties=\"cover-image\"/>\n");
-    auto metadata = read_bytes(epub("OEBPS/text/content.opf", opf,
-                                    {{"OEBPS/Images/My Cover!.jpg", jpeg_bytes(64), false, false, 0}}));
+    auto metadata =
+        read_bytes(epub("OEBPS/text/content.opf", opf,
+                        {{"OEBPS/Images/My Cover!.jpg", jpeg_bytes(64), false, false, 0}}));
     REQUIRE(metadata.cover.has_value());
     // No media-type on the item: the extension names it.
     CHECK(metadata.cover->mime_type == "image/jpeg");
     CHECK(metadata.cover->bytes.size() == 64);
 
     // A sibling href, and an absolute one from the zip root.
-    metadata = read_bytes(epub(
-        "OEBPS/content.opf",
-        simple_opf("<dc:title>Deep</dc:title>\n",
-                   "<item id=\"cover\" href=\"./art/cover.webp\" media-type=\"image/webp\" properties=\"cover-image\"/>\n"),
-        {{"OEBPS/art/cover.webp", "RIFF....WEBP", false, false, 0}}));
+    metadata =
+        read_bytes(epub("OEBPS/content.opf",
+                        simple_opf("<dc:title>Deep</dc:title>\n",
+                                   "<item id=\"cover\" href=\"./art/cover.webp\" "
+                                   "media-type=\"image/webp\" properties=\"cover-image\"/>\n"),
+                        {{"OEBPS/art/cover.webp", "RIFF....WEBP", false, false, 0}}));
     REQUIRE(metadata.cover.has_value());
     CHECK(metadata.cover->mime_type == "image/webp");
 
-    metadata = read_bytes(epub(
-        "OEBPS/content.opf",
-        simple_opf("<dc:title>Deep</dc:title>\n",
-                   "<item id=\"cover\" href=\"/cover.svg\" media-type=\"image/svg+xml\" properties=\"cover-image\"/>\n"),
-        {{"cover.svg", "<svg/>", false, false, 0}}));
+    metadata =
+        read_bytes(epub("OEBPS/content.opf",
+                        simple_opf("<dc:title>Deep</dc:title>\n",
+                                   "<item id=\"cover\" href=\"/cover.svg\" "
+                                   "media-type=\"image/svg+xml\" properties=\"cover-image\"/>\n"),
+                        {{"cover.svg", "<svg/>", false, false, 0}}));
     REQUIRE(metadata.cover.has_value());
     CHECK(metadata.cover->mime_type == "image/svg+xml");
 }
@@ -474,34 +486,37 @@ MACHA_FAST_TEST("epub_metadata", test_no_cover_is_not_an_error) {
     CHECK(!metadata.cover.has_value());
 
     // Declared, but the manifest has no such item.
-    metadata = read_bytes(epub("book.opf", simple_opf("<dc:title>Bare</dc:title>\n"
-                                                      "<meta name=\"cover\" content=\"nope\"/>\n")));
+    metadata =
+        read_bytes(epub("book.opf", simple_opf("<dc:title>Bare</dc:title>\n"
+                                               "<meta name=\"cover\" content=\"nope\"/>\n")));
     CHECK(!metadata.cover.has_value());
 
     // Declared and in the manifest, but not in the zip.
-    metadata = read_bytes(epub("book.opf",
-                               simple_opf("<dc:title>Bare</dc:title>\n",
-                                          "<item id=\"c\" href=\"gone.png\" media-type=\"image/png\" properties=\"cover-image\"/>\n")));
+    metadata = read_bytes(
+        epub("book.opf", simple_opf("<dc:title>Bare</dc:title>\n",
+                                    "<item id=\"c\" href=\"gone.png\" media-type=\"image/png\" "
+                                    "properties=\"cover-image\"/>\n")));
     CHECK(!metadata.cover.has_value());
 
     // An EPUB 2 meta naming the href rather than the id still finds it.
-    metadata = read_bytes(epub("book.opf",
-                               simple_opf("<dc:title>Bare</dc:title>\n"
-                                          "<meta name=\"cover\" content=\"cover.png\"/>\n",
-                                          "<item id=\"c\" href=\"cover.png\" media-type=\"image/png\"/>\n"),
-                               {{"cover.png", "PNG", false, false, 0}}));
+    metadata = read_bytes(
+        epub("book.opf",
+             simple_opf("<dc:title>Bare</dc:title>\n"
+                        "<meta name=\"cover\" content=\"cover.png\"/>\n",
+                        "<item id=\"c\" href=\"cover.png\" media-type=\"image/png\"/>\n"),
+             {{"cover.png", "PNG", false, false, 0}}));
     REQUIRE(metadata.cover.has_value());
     CHECK(metadata.cover->bytes.size() == 3);
 }
 
 MACHA_FAST_TEST("epub_metadata", test_oversized_or_unreadable_cover_is_skipped) {
-    const auto opf = simple_opf(
-        "<dc:title>Big</dc:title>\n",
-        "<item id=\"c\" href=\"cover.jpg\" media-type=\"image/jpeg\" properties=\"cover-image\"/>\n");
+    const auto opf = simple_opf("<dc:title>Big</dc:title>\n",
+                                "<item id=\"c\" href=\"cover.jpg\" media-type=\"image/jpeg\" "
+                                "properties=\"cover-image\"/>\n");
     EpubReadLimits limits;
     limits.max_cover_bytes = 100;
-    auto metadata = read_bytes(epub("book.opf", opf, {{"cover.jpg", jpeg_bytes(200), false, false, 0}}),
-                               limits);
+    auto metadata = read_bytes(
+        epub("book.opf", opf, {{"cover.jpg", jpeg_bytes(200), false, false, 0}}), limits);
     CHECK(metadata.title == "Big");
     CHECK(!metadata.cover.has_value());
 
@@ -516,7 +531,8 @@ MACHA_FAST_TEST("epub_metadata", test_oversized_or_unreadable_cover_is_skipped) 
     // An encrypted or truncated cover is skipped, not fatal.
     metadata = read_bytes(epub("book.opf", opf, {{"cover.jpg", jpeg_bytes(50), false, true, 0}}));
     CHECK(!metadata.cover.has_value());
-    metadata = read_bytes(epub("book.opf", opf, {{"cover.jpg", jpeg_bytes(50), false, false, 100000}}));
+    metadata =
+        read_bytes(epub("book.opf", opf, {{"cover.jpg", jpeg_bytes(50), false, false, 100000}}));
     CHECK(metadata.title == "Big");
     CHECK(!metadata.cover.has_value());
 }
@@ -544,8 +560,9 @@ MACHA_FAST_TEST("epub_metadata", test_truncated_zip_throws) {
     CHECK(read_throws({}));
     CHECK(read_throws(Bytes(100, 0)));
     // A member whose declared bytes run past the end of the file.
-    std::vector<Member> members{{"META-INF/container.xml", container_xml("book.opf"), false, false, 0},
-                                {"book.opf", epub2_opf, false, false, 100000}};
+    std::vector<Member> members{
+        {"META-INF/container.xml", container_xml("book.opf"), false, false, 0},
+        {"book.opf", epub2_opf, false, false, 100000}};
     CHECK(read_throws(build_zip(members)));
     // A deflated member whose stream is cut short of its declared size.
     members = {{"META-INF/container.xml", container_xml("book.opf"), false, false, 0},
@@ -562,8 +579,9 @@ MACHA_FAST_TEST("epub_metadata", test_truncated_zip_throws) {
 }
 
 MACHA_FAST_TEST("epub_metadata", test_encrypted_member_throws) {
-    std::vector<Member> members{{"META-INF/container.xml", container_xml("book.opf"), false, true, 0},
-                                {"book.opf", epub2_opf, false, false, 0}};
+    std::vector<Member> members{
+        {"META-INF/container.xml", container_xml("book.opf"), false, true, 0},
+        {"book.opf", epub2_opf, false, false, 0}};
     CHECK(read_throws(build_zip(members)));
     members[0].encrypted = false;
     members[1].encrypted = true;
@@ -571,8 +589,9 @@ MACHA_FAST_TEST("epub_metadata", test_encrypted_member_throws) {
 }
 
 MACHA_FAST_TEST("epub_metadata", test_zip64_throws) {
-    const std::vector<Member> members{{"META-INF/container.xml", container_xml("book.opf"), false, false, 0},
-                                      {"book.opf", epub2_opf, false, false, 0}};
+    const std::vector<Member> members{
+        {"META-INF/container.xml", container_xml("book.opf"), false, false, 0},
+        {"book.opf", epub2_opf, false, false, 0}};
     CHECK(!read_throws(build_zip(members)));
     CHECK(read_throws(build_zip(members, {true, false})));
     CHECK(read_throws(build_zip(members, {false, true})));
@@ -592,11 +611,13 @@ MACHA_FAST_TEST("epub_metadata", test_unsupported_method_throws) {
 
 MACHA_FAST_TEST("epub_metadata", test_missing_container_rootfile_package_or_metadata_throws) {
     CHECK(read_throws(build_zip({{"book.opf", epub2_opf, false, false, 0}})));
-    CHECK(read_throws(build_zip({{"META-INF/container.xml", "<container><rootfiles/></container>", false, false, 0},
-                                 {"book.opf", epub2_opf, false, false, 0}})));
+    CHECK(read_throws(build_zip(
+        {{"META-INF/container.xml", "<container><rootfiles/></container>", false, false, 0},
+         {"book.opf", epub2_opf, false, false, 0}})));
     // The rootfile names a member that is not there.
-    CHECK(read_throws(build_zip({{"META-INF/container.xml", container_xml("other.opf"), false, false, 0},
-                                 {"book.opf", epub2_opf, false, false, 0}})));
+    CHECK(read_throws(
+        build_zip({{"META-INF/container.xml", container_xml("other.opf"), false, false, 0},
+                   {"book.opf", epub2_opf, false, false, 0}})));
     CHECK(read_throws(epub("book.opf", "<?xml version=\"1.0\"?><html><body/></html>")));
     CHECK(read_throws(epub("book.opf", "<package version=\"3.0\"><manifest/></package>")));
     CHECK(read_throws(epub("book.opf", "")));
@@ -617,9 +638,11 @@ MACHA_FAST_TEST("epub_metadata", test_deflated_members_read) {
 }
 
 MACHA_FAST_TEST("epub_metadata", test_member_names_are_normalised) {
-    for (const std::string name : {"./OEBPS/content.opf", "/OEBPS/content.opf", "OEBPS\\content.opf"}) {
-        const auto zip = build_zip({{"META-INF\\container.xml", container_xml("./OEBPS/content.opf"), false, false, 0},
-                                    {name, epub2_opf, false, false, 0}});
+    for (const std::string name :
+         {"./OEBPS/content.opf", "/OEBPS/content.opf", "OEBPS\\content.opf"}) {
+        const auto zip = build_zip(
+            {{"META-INF\\container.xml", container_xml("./OEBPS/content.opf"), false, false, 0},
+             {name, epub2_opf, false, false, 0}});
         CHECK(read_bytes(zip).title == "Guards! Guards!");
     }
 }
@@ -633,7 +656,8 @@ MACHA_FAST_TEST("epub_metadata", test_xml_reader_tolerates_what_an_opf_may_conta
         "<?processing instruction?>\n"
         "<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n"
         "<dc:title>Spaced&#x20;<![CDATA[& <raw>]]> Title</dc:title>\n"
-        "<dc:creator opf:role='aut' opf:file-as=\"O'Brien, Flann\">Flann O&apos;Brien</dc:creator>\n"
+        "<dc:creator opf:role='aut' opf:file-as=\"O'Brien, Flann\">Flann "
+        "O&apos;Brien</dc:creator>\n"
         "<dc:publisher\n   >Dalkey\n</dc:publisher>\n"
         "<dc:language>ga</dc:language>\n"
         "<meta name=\"cover\" content=\"c\" />\n"
@@ -656,9 +680,10 @@ MACHA_FAST_TEST("epub_metadata", test_reader_fetches_only_what_it_needs) {
     std::string chapter;
     while (chapter.size() < 300 * 1024)
         chapter += "<p>Lorem ipsum dolor sit amet.</p>\n";
-    const auto zip = build_zip({{"META-INF/container.xml", container_xml("book.opf"), false, false, 0},
-                                {"chapter.xhtml", chapter, false, false, 0},
-                                {"book.opf", epub2_opf, false, false, 0}});
+    const auto zip =
+        build_zip({{"META-INF/container.xml", container_xml("book.opf"), false, false, 0},
+                   {"chapter.xhtml", chapter, false, false, 0},
+                   {"book.opf", epub2_opf, false, false, 0}});
     size_t total_read = 0;
     const std::function<size_t(uint64_t, std::span<uint8_t>)> read =
         [&](uint64_t offset, std::span<uint8_t> destination) -> size_t {
@@ -683,7 +708,8 @@ MACHA_FAST_TEST("epub_metadata", test_host_file_overload) {
                           {{"OEBPS/images/cover.jpg", cover, true, false, 0}}, true);
     {
         std::ofstream file(path, std::ios::binary);
-        file.write(reinterpret_cast<const char*>(zip.data()), static_cast<std::streamsize>(zip.size()));
+        file.write(reinterpret_cast<const char*>(zip.data()),
+                   static_cast<std::streamsize>(zip.size()));
     }
     const auto metadata = read_epub_metadata(path);
     CHECK(metadata.title == "Guards! Guards!");

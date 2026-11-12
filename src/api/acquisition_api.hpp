@@ -2,11 +2,11 @@
 #pragma once
 
 #include "acquisition/cluster_jobs.hpp"
-#include "torrent/torrent_coordinator.hpp"
-#include "http/http.hpp"
 #include "acquisition/ingest.hpp"
+#include "http/http.hpp"
 #include "subsystem/subsystem_registry.hpp"
 #include "torrent/torrent.hpp"
+#include "torrent/torrent_coordinator.hpp"
 
 namespace macha {
 
@@ -32,7 +32,8 @@ class AcquisitionApi {
   public:
     AcquisitionApi(IngestManager& ingest, SubsystemRegistry& subsystems,
                    TorrentSearchManager& search, ClusterJobView& jobs, TorrentCoordinator& torrents)
-        : ingest_(ingest), subsystems_(subsystems), search_(search), jobs_(jobs), torrents_(torrents) {}
+        : ingest_(ingest), subsystems_(subsystems), search_(search), jobs_(jobs),
+          torrents_(torrents) {}
 
     HttpResponse handle(const HttpRequest&);
 };

@@ -89,15 +89,30 @@ class ConfigNode {
             out.emplace_back(node_[i], path_ + "[" + std::to_string(i) + "]", read_);
         return out;
     }
-    explicit operator bool() const { return static_cast<bool>(node_); }
-    operator const YAML::Node&() const { return node_; }
-    bool IsMap() const { return node_.IsMap(); }
-    bool IsSequence() const { return node_.IsSequence(); }
-    bool IsScalar() const { return node_.IsScalar(); }
-    bool IsNull() const { return node_.IsNull(); }
-    size_t size() const { return node_.size(); }
-    template <typename T>
-    T as() const { return node_.template as<T>(); }
+    explicit operator bool() const {
+        return static_cast<bool>(node_);
+    }
+    operator const YAML::Node&() const {
+        return node_;
+    }
+    bool IsMap() const {
+        return node_.IsMap();
+    }
+    bool IsSequence() const {
+        return node_.IsSequence();
+    }
+    bool IsScalar() const {
+        return node_.IsScalar();
+    }
+    bool IsNull() const {
+        return node_.IsNull();
+    }
+    size_t size() const {
+        return node_.size();
+    }
+    template <typename T> T as() const {
+        return node_.template as<T>();
+    }
 
   private:
     YAML::Node node_;
@@ -156,8 +171,7 @@ void parse_network(const ConfigNode& root, Config& c) {
         c.control_stall_notice =
             milliseconds(n["control_stall_notice_ms"], "control_stall_notice_ms");
     if (n["data_stall_notice_ms"])
-        c.data_stall_notice =
-            milliseconds(n["data_stall_notice_ms"], "data_stall_notice_ms");
+        c.data_stall_notice = milliseconds(n["data_stall_notice_ms"], "data_stall_notice_ms");
 
     if (auto u = n["upnp"]) {
         if (u["enabled"])
@@ -174,15 +188,14 @@ void parse_network(const ConfigNode& root, Config& c) {
         if (e["enabled"])
             c.external_ip.enabled = e["enabled"].as<bool>();
         if (e["timeout_ms"])
-            c.external_ip.timeout =
-                milliseconds(e["timeout_ms"], "network.external_ip.timeout_ms");
+            c.external_ip.timeout = milliseconds(e["timeout_ms"], "network.external_ip.timeout_ms");
     }
     if (auto check = n["connectivity_check"]) {
         if (check["enabled"])
             c.connectivity_check.enabled = check["enabled"].as<bool>();
         if (check["timeout_ms"])
-            c.connectivity_check.timeout = milliseconds(
-                check["timeout_ms"], "network.connectivity_check.timeout_ms");
+            c.connectivity_check.timeout =
+                milliseconds(check["timeout_ms"], "network.connectivity_check.timeout_ms");
     }
 }
 
@@ -207,8 +220,8 @@ void parse_dht(const ConfigNode& root, Config& c) {
     if (d["data_inflight_bytes"])
         c.data_inflight_bytes = yaml_size(d["data_inflight_bytes"]);
     if (d["data_credit_no_progress_deadline_ms"])
-        c.data_credit_no_progress_deadline = milliseconds(d["data_credit_no_progress_deadline_ms"],
-                                                          "dht.data_credit_no_progress_deadline_ms");
+        c.data_credit_no_progress_deadline = milliseconds(
+            d["data_credit_no_progress_deadline_ms"], "dht.data_credit_no_progress_deadline_ms");
     if (d["data_viewer_reserve_bytes"])
         c.data_viewer_reserve_bytes = yaml_size(d["data_viewer_reserve_bytes"]);
     if (d["io_pressure_overhead_ms"])
@@ -290,66 +303,88 @@ void parse_filesystem(const ConfigNode& root, Config& c) {
         c.filesystem.root_mode = parse_mode(f["root_mode"], "filesystem.root_mode");
 
     // Legacy FUSE keys under filesystem.
-    if (f["allow_other"]) c.fuse.allow_other = f["allow_other"].as<bool>();
-    if (f["entry_timeout_ms"]) c.fuse.entry_timeout = milliseconds(f["entry_timeout_ms"], "filesystem.entry_timeout_ms");
-    if (f["attr_timeout_ms"]) c.fuse.attr_timeout = milliseconds(f["attr_timeout_ms"], "filesystem.attr_timeout_ms");
-    if (f["negative_timeout_ms"]) c.fuse.negative_timeout = milliseconds(f["negative_timeout_ms"], "filesystem.negative_timeout_ms");
+    if (f["allow_other"])
+        c.fuse.allow_other = f["allow_other"].as<bool>();
+    if (f["entry_timeout_ms"])
+        c.fuse.entry_timeout = milliseconds(f["entry_timeout_ms"], "filesystem.entry_timeout_ms");
+    if (f["attr_timeout_ms"])
+        c.fuse.attr_timeout = milliseconds(f["attr_timeout_ms"], "filesystem.attr_timeout_ms");
+    if (f["negative_timeout_ms"])
+        c.fuse.negative_timeout =
+            milliseconds(f["negative_timeout_ms"], "filesystem.negative_timeout_ms");
 }
 
 void parse_fuse(const ConfigNode& root, Config& c) {
     auto f = root["fuse"];
-    if (!f) return;
-    if (f["mount_path"]) c.fuse.mount_path = std::filesystem::path(f["mount_path"].as<std::string>());
-    if (f["allow_other"]) c.fuse.allow_other = f["allow_other"].as<bool>();
+    if (!f)
+        return;
+    if (f["mount_path"])
+        c.fuse.mount_path = std::filesystem::path(f["mount_path"].as<std::string>());
+    if (f["allow_other"])
+        c.fuse.allow_other = f["allow_other"].as<bool>();
     if (f["spool_path"])
         c.fuse.spool_path = std::filesystem::path(f["spool_path"].as<std::string>());
     if (f["operation_journal_path"])
         c.fuse.operation_journal_path =
             std::filesystem::path(f["operation_journal_path"].as<std::string>());
-    if (f["entry_timeout_ms"]) c.fuse.entry_timeout = milliseconds(f["entry_timeout_ms"], "fuse.entry_timeout_ms");
-    if (f["attr_timeout_ms"]) c.fuse.attr_timeout = milliseconds(f["attr_timeout_ms"], "fuse.attr_timeout_ms");
-    if (f["negative_timeout_ms"]) c.fuse.negative_timeout = milliseconds(f["negative_timeout_ms"], "fuse.negative_timeout_ms");
-    if (f["absolute_request_timeout_ms"]) c.fuse.absolute_request_timeout = milliseconds(f["absolute_request_timeout_ms"], "fuse.absolute_request_timeout_ms");
-    if (f["request_workers"]) c.fuse.request_workers = f["request_workers"].as<size_t>();
-    if (f["max_pending_requests"]) c.fuse.max_pending_requests = f["max_pending_requests"].as<size_t>();
+    if (f["entry_timeout_ms"])
+        c.fuse.entry_timeout = milliseconds(f["entry_timeout_ms"], "fuse.entry_timeout_ms");
+    if (f["attr_timeout_ms"])
+        c.fuse.attr_timeout = milliseconds(f["attr_timeout_ms"], "fuse.attr_timeout_ms");
+    if (f["negative_timeout_ms"])
+        c.fuse.negative_timeout =
+            milliseconds(f["negative_timeout_ms"], "fuse.negative_timeout_ms");
+    if (f["absolute_request_timeout_ms"])
+        c.fuse.absolute_request_timeout =
+            milliseconds(f["absolute_request_timeout_ms"], "fuse.absolute_request_timeout_ms");
+    if (f["request_workers"])
+        c.fuse.request_workers = f["request_workers"].as<size_t>();
+    if (f["max_pending_requests"])
+        c.fuse.max_pending_requests = f["max_pending_requests"].as<size_t>();
     if (f["max_pending_write_bytes"])
         c.fuse.max_pending_write_bytes = yaml_size(f["max_pending_write_bytes"]);
-    if (f["commit_workers"]) c.fuse.commit_workers = f["commit_workers"].as<size_t>();
-    if (f["publication_quiet_ms"]) c.fuse.publication_quiet = milliseconds(f["publication_quiet_ms"], "fuse.publication_quiet_ms");
+    if (f["commit_workers"])
+        c.fuse.commit_workers = f["commit_workers"].as<size_t>();
+    if (f["publication_quiet_ms"])
+        c.fuse.publication_quiet =
+            milliseconds(f["publication_quiet_ms"], "fuse.publication_quiet_ms");
     if (f["publication_no_progress_deadline_ms"])
-        c.fuse.publication_no_progress_deadline =
-            milliseconds(f["publication_no_progress_deadline_ms"],
-                         "fuse.publication_no_progress_deadline_ms");
+        c.fuse.publication_no_progress_deadline = milliseconds(
+            f["publication_no_progress_deadline_ms"], "fuse.publication_no_progress_deadline_ms");
     if (f["publication_retry_initial_backoff_ms"])
-        c.fuse.publication_retry.initial_backoff =
-            milliseconds(f["publication_retry_initial_backoff_ms"], "fuse.publication_retry_initial_backoff_ms");
+        c.fuse.publication_retry.initial_backoff = milliseconds(
+            f["publication_retry_initial_backoff_ms"], "fuse.publication_retry_initial_backoff_ms");
     if (f["publication_retry_max_backoff_ms"])
-        c.fuse.publication_retry.max_backoff =
-            milliseconds(f["publication_retry_max_backoff_ms"], "fuse.publication_retry_max_backoff_ms");
+        c.fuse.publication_retry.max_backoff = milliseconds(
+            f["publication_retry_max_backoff_ms"], "fuse.publication_retry_max_backoff_ms");
     if (f["publication_retry_window_ms"])
         c.fuse.publication_retry.failure_window =
             milliseconds(f["publication_retry_window_ms"], "fuse.publication_retry_window_ms");
     if (f["publication_retry_max_failures"])
-        c.fuse.publication_retry.max_failures_in_window = f["publication_retry_max_failures"].as<size_t>();
+        c.fuse.publication_retry.max_failures_in_window =
+            f["publication_retry_max_failures"].as<size_t>();
     if (f["publication_retry_max_failing_ms"])
-        c.fuse.publication_retry.max_failing_duration =
-            milliseconds(f["publication_retry_max_failing_ms"], "fuse.publication_retry_max_failing_ms");
+        c.fuse.publication_retry.max_failing_duration = milliseconds(
+            f["publication_retry_max_failing_ms"], "fuse.publication_retry_max_failing_ms");
     if (f["namespace_retry_initial_backoff_ms"])
-        c.fuse.namespace_retry.initial_backoff =
-            milliseconds(f["namespace_retry_initial_backoff_ms"], "fuse.namespace_retry_initial_backoff_ms");
+        c.fuse.namespace_retry.initial_backoff = milliseconds(
+            f["namespace_retry_initial_backoff_ms"], "fuse.namespace_retry_initial_backoff_ms");
     if (f["namespace_retry_max_backoff_ms"])
-        c.fuse.namespace_retry.max_backoff =
-            milliseconds(f["namespace_retry_max_backoff_ms"], "fuse.namespace_retry_max_backoff_ms");
+        c.fuse.namespace_retry.max_backoff = milliseconds(f["namespace_retry_max_backoff_ms"],
+                                                          "fuse.namespace_retry_max_backoff_ms");
     if (f["namespace_retry_window_ms"])
         c.fuse.namespace_retry.failure_window =
             milliseconds(f["namespace_retry_window_ms"], "fuse.namespace_retry_window_ms");
     if (f["namespace_retry_max_failures"])
-        c.fuse.namespace_retry.max_failures_in_window = f["namespace_retry_max_failures"].as<size_t>();
+        c.fuse.namespace_retry.max_failures_in_window =
+            f["namespace_retry_max_failures"].as<size_t>();
     if (f["namespace_retry_max_failing_ms"])
-        c.fuse.namespace_retry.max_failing_duration =
-            milliseconds(f["namespace_retry_max_failing_ms"], "fuse.namespace_retry_max_failing_ms");
-    if (f["viewer_weight"]) c.fuse.viewer_weight = f["viewer_weight"].as<size_t>();
-    if (f["loader_weight"]) c.fuse.loader_weight = f["loader_weight"].as<size_t>();
+        c.fuse.namespace_retry.max_failing_duration = milliseconds(
+            f["namespace_retry_max_failing_ms"], "fuse.namespace_retry_max_failing_ms");
+    if (f["viewer_weight"])
+        c.fuse.viewer_weight = f["viewer_weight"].as<size_t>();
+    if (f["loader_weight"])
+        c.fuse.loader_weight = f["loader_weight"].as<size_t>();
     if (f["publication_quantum_bytes"])
         c.fuse.publication_quantum_bytes = yaml_size(f["publication_quantum_bytes"]);
     if (f["publication_inflight_bytes"])
@@ -358,32 +393,55 @@ void parse_fuse(const ConfigNode& root, Config& c) {
         c.fuse.publication_pipeline_bytes = yaml_size(f["publication_pipeline_bytes"]);
     if (f["publication_max_open_writers"])
         c.fuse.publication_max_open_writers = f["publication_max_open_writers"].as<size_t>();
-    if (f["max_pending_operations"]) c.fuse.max_pending_operations = f["max_pending_operations"].as<size_t>();
+    if (f["max_pending_operations"])
+        c.fuse.max_pending_operations = f["max_pending_operations"].as<size_t>();
     if (f["max_operation_metadata_bytes"])
         c.fuse.max_operation_metadata_bytes = yaml_size(f["max_operation_metadata_bytes"]);
     if (f["namespace_batch_operations"])
         c.fuse.namespace_batch_operations = f["namespace_batch_operations"].as<size_t>();
     if (f["namespace_batch_bytes"])
         c.fuse.namespace_batch_bytes = yaml_size(f["namespace_batch_bytes"]);
-    if (f["max_spool_bytes"]) c.fuse.max_spool_bytes = yaml_size(f["max_spool_bytes"]);
-    if (f["spool_reserve_free"]) c.fuse.spool_reserve_free = yaml_size(f["spool_reserve_free"]);
-    if (f["max_orphan_bytes"]) c.fuse.max_orphan_bytes = yaml_size(f["max_orphan_bytes"]);
-    if (f["max_operation_journal_bytes"]) c.fuse.max_operation_journal_bytes = yaml_size(f["max_operation_journal_bytes"]);
-    if (f["hydration_priority"]) c.fuse.hydration_priority = f["hydration_priority"].as<uint32_t>();
-    if (f["read_ahead_extents"]) c.fuse.read_ahead_extents = f["read_ahead_extents"].as<size_t>();
-    if (f["hint_lifetime_ms"]) c.fuse.hint_lifetime = milliseconds(f["hint_lifetime_ms"], "fuse.hint_lifetime_ms");
-    if (f["write_through_cache"]) c.fuse.write_through_cache = f["write_through_cache"].as<bool>();
-    if (f["fail_closed_mountpoint"]) c.fuse.fail_closed_mountpoint = f["fail_closed_mountpoint"].as<bool>();
-    if (f["unmount_if_mounted"]) c.fuse.unmount_if_mounted = f["unmount_if_mounted"].as<bool>();
-    if (f["watchdog_interval_ms"]) c.fuse.watchdog_interval = milliseconds(f["watchdog_interval_ms"], "fuse.watchdog_interval_ms");
-    if (f["initial_namespace_timeout_ms"]) c.fuse.initial_namespace_timeout = milliseconds(f["initial_namespace_timeout_ms"], "fuse.initial_namespace_timeout_ms");
+    if (f["max_spool_bytes"])
+        c.fuse.max_spool_bytes = yaml_size(f["max_spool_bytes"]);
+    if (f["spool_reserve_free"])
+        c.fuse.spool_reserve_free = yaml_size(f["spool_reserve_free"]);
+    if (f["max_orphan_bytes"])
+        c.fuse.max_orphan_bytes = yaml_size(f["max_orphan_bytes"]);
+    if (f["max_operation_journal_bytes"])
+        c.fuse.max_operation_journal_bytes = yaml_size(f["max_operation_journal_bytes"]);
+    if (f["hydration_priority"])
+        c.fuse.hydration_priority = f["hydration_priority"].as<uint32_t>();
+    if (f["read_ahead_extents"])
+        c.fuse.read_ahead_extents = f["read_ahead_extents"].as<size_t>();
+    if (f["hint_lifetime_ms"])
+        c.fuse.hint_lifetime = milliseconds(f["hint_lifetime_ms"], "fuse.hint_lifetime_ms");
+    if (f["write_through_cache"])
+        c.fuse.write_through_cache = f["write_through_cache"].as<bool>();
+    if (f["fail_closed_mountpoint"])
+        c.fuse.fail_closed_mountpoint = f["fail_closed_mountpoint"].as<bool>();
+    if (f["unmount_if_mounted"])
+        c.fuse.unmount_if_mounted = f["unmount_if_mounted"].as<bool>();
+    if (f["watchdog_interval_ms"])
+        c.fuse.watchdog_interval =
+            milliseconds(f["watchdog_interval_ms"], "fuse.watchdog_interval_ms");
+    if (f["initial_namespace_timeout_ms"])
+        c.fuse.initial_namespace_timeout =
+            milliseconds(f["initial_namespace_timeout_ms"], "fuse.initial_namespace_timeout_ms");
     if (auto t = f["timeouts"]) {
-        if (t["lookup_ms"]) c.fuse.timeouts.lookup = milliseconds(t["lookup_ms"], "fuse.timeouts.lookup_ms");
-        if (t["namespace_ms"]) c.fuse.timeouts.namespace_mutation = milliseconds(t["namespace_ms"], "fuse.timeouts.namespace_ms");
-        if (t["read_ms"]) c.fuse.timeouts.read = milliseconds(t["read_ms"], "fuse.timeouts.read_ms");
-        if (t["write_ms"]) c.fuse.timeouts.write = milliseconds(t["write_ms"], "fuse.timeouts.write_ms");
-        if (t["sync_ms"]) c.fuse.timeouts.sync = milliseconds(t["sync_ms"], "fuse.timeouts.sync_ms");
-        if (t["lifecycle_ms"]) c.fuse.timeouts.lifecycle = milliseconds(t["lifecycle_ms"], "fuse.timeouts.lifecycle_ms");
+        if (t["lookup_ms"])
+            c.fuse.timeouts.lookup = milliseconds(t["lookup_ms"], "fuse.timeouts.lookup_ms");
+        if (t["namespace_ms"])
+            c.fuse.timeouts.namespace_mutation =
+                milliseconds(t["namespace_ms"], "fuse.timeouts.namespace_ms");
+        if (t["read_ms"])
+            c.fuse.timeouts.read = milliseconds(t["read_ms"], "fuse.timeouts.read_ms");
+        if (t["write_ms"])
+            c.fuse.timeouts.write = milliseconds(t["write_ms"], "fuse.timeouts.write_ms");
+        if (t["sync_ms"])
+            c.fuse.timeouts.sync = milliseconds(t["sync_ms"], "fuse.timeouts.sync_ms");
+        if (t["lifecycle_ms"])
+            c.fuse.timeouts.lifecycle =
+                milliseconds(t["lifecycle_ms"], "fuse.timeouts.lifecycle_ms");
     }
 }
 
@@ -466,20 +524,21 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
         if (api["keep_alive_max_requests"])
             c.catalogue.api.keep_alive_max_requests = api["keep_alive_max_requests"].as<size_t>();
         if (api["keep_alive_idle_timeout_ms"])
-            c.catalogue.api.keep_alive_idle_timeout =
-                milliseconds(api["keep_alive_idle_timeout_ms"], "catalogue.api.keep_alive_idle_timeout_ms");
+            c.catalogue.api.keep_alive_idle_timeout = milliseconds(
+                api["keep_alive_idle_timeout_ms"], "catalogue.api.keep_alive_idle_timeout_ms");
         if (api["artwork_capability_ttl_ms"])
-            c.catalogue.api.artwork_capability_ttl =
-                milliseconds(api["artwork_capability_ttl_ms"], "catalogue.api.artwork_capability_ttl_ms");
+            c.catalogue.api.artwork_capability_ttl = milliseconds(
+                api["artwork_capability_ttl_ms"], "catalogue.api.artwork_capability_ttl_ms");
     }
     if (auto scanner = catalogue["scanner"]) {
         if (scanner["enabled"])
             c.catalogue.scanner.enabled = scanner["enabled"].as<bool>();
         if (scanner["interval_ms"])
-            c.catalogue.scanner.interval = milliseconds(scanner["interval_ms"], "catalogue.scanner.interval_ms");
+            c.catalogue.scanner.interval =
+                milliseconds(scanner["interval_ms"], "catalogue.scanner.interval_ms");
         if (scanner["rescan_debounce_ms"])
-            c.catalogue.scanner.rescan_debounce = milliseconds(
-                scanner["rescan_debounce_ms"], "catalogue.scanner.rescan_debounce_ms");
+            c.catalogue.scanner.rescan_debounce =
+                milliseconds(scanner["rescan_debounce_ms"], "catalogue.scanner.rescan_debounce_ms");
         if (scanner["rescan_max_delay_ms"])
             c.catalogue.scanner.rescan_max_delay = milliseconds(
                 scanner["rescan_max_delay_ms"], "catalogue.scanner.rescan_max_delay_ms");
@@ -498,64 +557,84 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
             for (const auto& term : terms.elements()) {
                 auto value = term.as<std::string>();
                 if (value.empty())
-                    throw std::runtime_error("catalogue.scanner.ignore_terms must not contain an empty term");
+                    throw std::runtime_error(
+                        "catalogue.scanner.ignore_terms must not contain an empty term");
                 c.catalogue.scanner.ignore_terms.push_back(std::move(value));
             }
         }
         if (auto providers = scanner["providers"]) {
-            const auto parse_roots = [](const ConfigNode& provider,
-                                        std::vector<std::string>& roots,
+            const auto parse_roots = [](const ConfigNode& provider, std::vector<std::string>& roots,
                                         std::string_view name) {
                 auto configured = provider["roots"];
-                if (!configured) return;
+                if (!configured)
+                    return;
                 if (!configured.IsSequence())
-                    throw std::runtime_error("catalogue.scanner.providers." +
-                                             std::string(name) + ".roots must be a sequence");
+                    throw std::runtime_error("catalogue.scanner.providers." + std::string(name) +
+                                             ".roots must be a sequence");
                 roots.clear();
                 for (const auto& root : configured.elements())
                     roots.push_back(root.as<std::string>());
             };
             const auto parse_tmdb = [](const ConfigNode& tmdb, CatalogueTmdbConfig& config) {
-                if (!tmdb) return;
-                if (tmdb["enabled"]) config.enabled = tmdb["enabled"].as<bool>();
+                if (!tmdb)
+                    return;
+                if (tmdb["enabled"])
+                    config.enabled = tmdb["enabled"].as<bool>();
                 if (tmdb["token_file"])
                     config.token_file = std::filesystem::path(tmdb["token_file"].as<std::string>());
-                if (tmdb["language"]) config.language = tmdb["language"].as<std::string>();
-                if (tmdb["image_size"]) config.image_size = tmdb["image_size"].as<std::string>();
+                if (tmdb["language"])
+                    config.language = tmdb["language"].as<std::string>();
+                if (tmdb["image_size"])
+                    config.image_size = tmdb["image_size"].as<std::string>();
             };
 
             if (auto movies = providers["movies"]) {
-                if (movies["enabled"]) c.catalogue.scanner.movies.enabled = movies["enabled"].as<bool>();
+                if (movies["enabled"])
+                    c.catalogue.scanner.movies.enabled = movies["enabled"].as<bool>();
                 parse_roots(movies, c.catalogue.scanner.movies.roots, "movies");
                 parse_tmdb(movies["tmdb"], c.catalogue.scanner.movies.tmdb);
             }
             if (auto tv = providers["tv"]) {
-                if (tv["enabled"]) c.catalogue.scanner.tv.enabled = tv["enabled"].as<bool>();
+                if (tv["enabled"])
+                    c.catalogue.scanner.tv.enabled = tv["enabled"].as<bool>();
                 parse_roots(tv, c.catalogue.scanner.tv.roots, "tv");
                 parse_tmdb(tv["tmdb"], c.catalogue.scanner.tv.tmdb);
             }
             if (auto music = providers["music"]) {
-                if (music["enabled"]) c.catalogue.scanner.music.enabled = music["enabled"].as<bool>();
+                if (music["enabled"])
+                    c.catalogue.scanner.music.enabled = music["enabled"].as<bool>();
                 parse_roots(music, c.catalogue.scanner.music.roots, "music");
                 if (auto mb = music["musicbrainz"]) {
-                    if (mb["enabled"]) c.catalogue.scanner.music.musicbrainz.enabled = mb["enabled"].as<bool>();
-                    if (mb["contact"]) c.catalogue.scanner.music.musicbrainz.contact = mb["contact"].as<std::string>();
-                    if (mb["cover_size"]) c.catalogue.scanner.music.musicbrainz.cover_size = mb["cover_size"].as<std::string>();
+                    if (mb["enabled"])
+                        c.catalogue.scanner.music.musicbrainz.enabled = mb["enabled"].as<bool>();
+                    if (mb["contact"])
+                        c.catalogue.scanner.music.musicbrainz.contact =
+                            mb["contact"].as<std::string>();
+                    if (mb["cover_size"])
+                        c.catalogue.scanner.music.musicbrainz.cover_size =
+                            mb["cover_size"].as<std::string>();
                 }
                 if (auto discogs = music["discogs"]) {
-                    if (discogs["enabled"]) c.catalogue.scanner.music.discogs.enabled = discogs["enabled"].as<bool>();
+                    if (discogs["enabled"])
+                        c.catalogue.scanner.music.discogs.enabled = discogs["enabled"].as<bool>();
                     if (discogs["token_file"])
                         c.catalogue.scanner.music.discogs.token_file =
                             std::filesystem::path(discogs["token_file"].as<std::string>());
                 }
             }
             if (auto books = providers["books"]) {
-                if (books["enabled"]) c.catalogue.scanner.books.enabled = books["enabled"].as<bool>();
+                if (books["enabled"])
+                    c.catalogue.scanner.books.enabled = books["enabled"].as<bool>();
                 parse_roots(books, c.catalogue.scanner.books.roots, "books");
                 if (auto ol = books["openlibrary"]) {
-                    if (ol["enabled"]) c.catalogue.scanner.books.openlibrary.enabled = ol["enabled"].as<bool>();
-                    if (ol["contact"]) c.catalogue.scanner.books.openlibrary.contact = ol["contact"].as<std::string>();
-                    if (ol["cover_size"]) c.catalogue.scanner.books.openlibrary.cover_size = ol["cover_size"].as<std::string>();
+                    if (ol["enabled"])
+                        c.catalogue.scanner.books.openlibrary.enabled = ol["enabled"].as<bool>();
+                    if (ol["contact"])
+                        c.catalogue.scanner.books.openlibrary.contact =
+                            ol["contact"].as<std::string>();
+                    if (ol["cover_size"])
+                        c.catalogue.scanner.books.openlibrary.cover_size =
+                            ol["cover_size"].as<std::string>();
                 }
             }
         }
@@ -564,27 +643,37 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
 
 void parse_ingest(const ConfigNode& root, Config& c) {
     auto ingest = root["ingest"];
-    if (!ingest) return;
-    if (ingest["enabled"]) c.ingest.enabled = ingest["enabled"].as<bool>();
+    if (!ingest)
+        return;
+    if (ingest["enabled"])
+        c.ingest.enabled = ingest["enabled"].as<bool>();
     if (ingest["staging_path"])
         c.ingest.staging_path = std::filesystem::path(ingest["staging_path"].as<std::string>());
-    if (ingest["staging_limit"]) c.ingest.staging_limit = yaml_size(ingest["staging_limit"]);
-    if (ingest["copy_chunk_bytes"]) c.ingest.copy_chunk_bytes = yaml_size(ingest["copy_chunk_bytes"]);
-    if (ingest["checkpoint_bytes"]) c.ingest.checkpoint_bytes = yaml_size(ingest["checkpoint_bytes"]);
+    if (ingest["staging_limit"])
+        c.ingest.staging_limit = yaml_size(ingest["staging_limit"]);
+    if (ingest["copy_chunk_bytes"])
+        c.ingest.copy_chunk_bytes = yaml_size(ingest["copy_chunk_bytes"]);
+    if (ingest["checkpoint_bytes"])
+        c.ingest.checkpoint_bytes = yaml_size(ingest["checkpoint_bytes"]);
     if (ingest["blocked_retry_ms"])
-        c.ingest.blocked_retry = milliseconds(ingest["blocked_retry_ms"], "ingest.blocked_retry_ms");
+        c.ingest.blocked_retry =
+            milliseconds(ingest["blocked_retry_ms"], "ingest.blocked_retry_ms");
     if (ingest["max_concurrent_jobs"])
         c.ingest.max_concurrent_jobs = ingest["max_concurrent_jobs"].as<size_t>();
     if (auto cleanup = ingest["cleanup"]) {
         if (cleanup["delete_owned_source_on_clear"])
-            c.ingest.delete_owned_source_on_clear = cleanup["delete_owned_source_on_clear"].as<bool>();
+            c.ingest.delete_owned_source_on_clear =
+                cleanup["delete_owned_source_on_clear"].as<bool>();
         if (cleanup["delete_external_source_on_clear"])
-            c.ingest.delete_external_source_on_clear = cleanup["delete_external_source_on_clear"].as<bool>();
+            c.ingest.delete_external_source_on_clear =
+                cleanup["delete_external_source_on_clear"].as<bool>();
         if (cleanup["delete_owned_source_on_cancel"])
-            c.ingest.delete_owned_source_on_cancel = cleanup["delete_owned_source_on_cancel"].as<bool>();
+            c.ingest.delete_owned_source_on_cancel =
+                cleanup["delete_owned_source_on_cancel"].as<bool>();
     }
     if (auto roots = ingest["source_roots"]) {
-        if (!roots.IsSequence()) throw std::runtime_error("ingest.source_roots must be a sequence");
+        if (!roots.IsSequence())
+            throw std::runtime_error("ingest.source_roots must be a sequence");
         c.ingest.source_roots.clear();
         for (const auto& value : roots.elements())
             c.ingest.source_roots.emplace_back(value.as<std::string>());
@@ -593,14 +682,20 @@ void parse_ingest(const ConfigNode& root, Config& c) {
 
 void parse_books(const ConfigNode& root, Config& c) {
     auto books = root["books"];
-    if (!books) return;
-    if (books["enabled"]) c.books.enabled = books["enabled"].as<bool>();
+    if (!books)
+        return;
+    if (books["enabled"])
+        c.books.enabled = books["enabled"].as<bool>();
     if (auto conversion = books["conversion"]) {
         auto& out = c.books.conversion;
-        if (conversion["enabled"]) out.enabled = conversion["enabled"].as<bool>();
-        if (conversion["mobitool"]) out.mobitool = conversion["mobitool"].as<std::string>();
-        if (conversion["cache_path"]) out.cache_path = conversion["cache_path"].as<std::string>();
-        if (conversion["cache_limit"]) out.cache_limit = yaml_size(conversion["cache_limit"]);
+        if (conversion["enabled"])
+            out.enabled = conversion["enabled"].as<bool>();
+        if (conversion["mobitool"])
+            out.mobitool = conversion["mobitool"].as<std::string>();
+        if (conversion["cache_path"])
+            out.cache_path = conversion["cache_path"].as<std::string>();
+        if (conversion["cache_limit"])
+            out.cache_limit = yaml_size(conversion["cache_limit"]);
         if (conversion["timeout_ms"])
             out.timeout = milliseconds(conversion["timeout_ms"], "books.conversion.timeout_ms");
         if (conversion["max_concurrent"])
@@ -612,30 +707,44 @@ void parse_books(const ConfigNode& root, Config& c) {
 
 void parse_torrent(const ConfigNode& root, Config& c) {
     auto torrent = root["torrent"];
-    if (!torrent) return;
-    if (torrent["enabled"]) c.torrent.enabled = torrent["enabled"].as<bool>();
-    if (torrent["max_active"]) c.torrent.max_active = torrent["max_active"].as<size_t>();
+    if (!torrent)
+        return;
+    if (torrent["enabled"])
+        c.torrent.enabled = torrent["enabled"].as<bool>();
+    if (torrent["max_active"])
+        c.torrent.max_active = torrent["max_active"].as<size_t>();
     if (torrent["listen_interfaces"])
         c.torrent.listen_interfaces = torrent["listen_interfaces"].as<std::string>();
-    if (torrent["listen_port"]) c.torrent.listen_port = torrent["listen_port"].as<uint16_t>();
-    if (torrent["max_download_rate"]) c.torrent.max_download_rate = yaml_size(torrent["max_download_rate"]);
-    if (torrent["max_upload_rate"]) c.torrent.max_upload_rate = yaml_size(torrent["max_upload_rate"]);
+    if (torrent["listen_port"])
+        c.torrent.listen_port = torrent["listen_port"].as<uint16_t>();
+    if (torrent["max_download_rate"])
+        c.torrent.max_download_rate = yaml_size(torrent["max_download_rate"]);
+    if (torrent["max_upload_rate"])
+        c.torrent.max_upload_rate = yaml_size(torrent["max_upload_rate"]);
     if (torrent["disk_threads"]) {
         c.torrent.disk_threads = torrent["disk_threads"].as<size_t>();
-        if (c.torrent.disk_threads == 0) throw std::runtime_error("torrent.disk_threads must be at least 1");
+        if (c.torrent.disk_threads == 0)
+            throw std::runtime_error("torrent.disk_threads must be at least 1");
     }
     if (torrent["log_level"])
         c.torrent.log_level = parse_log_level(torrent["log_level"].as<std::string>());
-    if (torrent["dht"]) c.torrent.dht = torrent["dht"].as<bool>();
-    if (torrent["pex"]) c.torrent.pex = torrent["pex"].as<bool>();
-    if (torrent["lsd"]) c.torrent.lsd = torrent["lsd"].as<bool>();
-    if (torrent["upnp"]) c.torrent.upnp = torrent["upnp"].as<bool>();
-    if (torrent["natpmp"]) c.torrent.natpmp = torrent["natpmp"].as<bool>();
-    if (torrent["accept_new_jobs"]) c.torrent.accept_new_jobs = torrent["accept_new_jobs"].as<bool>();
+    if (torrent["dht"])
+        c.torrent.dht = torrent["dht"].as<bool>();
+    if (torrent["pex"])
+        c.torrent.pex = torrent["pex"].as<bool>();
+    if (torrent["lsd"])
+        c.torrent.lsd = torrent["lsd"].as<bool>();
+    if (torrent["upnp"])
+        c.torrent.upnp = torrent["upnp"].as<bool>();
+    if (torrent["natpmp"])
+        c.torrent.natpmp = torrent["natpmp"].as<bool>();
+    if (torrent["accept_new_jobs"])
+        c.torrent.accept_new_jobs = torrent["accept_new_jobs"].as<bool>();
     if (auto after = torrent["remove_on_complete_after_ms"]; after && !after.IsNull()) {
         const auto value = milliseconds(after, "torrent.remove_on_complete_after_ms");
         if (value > std::chrono::hours(24))
-            throw std::runtime_error("torrent.remove_on_complete_after_ms must be at most 86400000 (24 h)");
+            throw std::runtime_error(
+                "torrent.remove_on_complete_after_ms must be at most 86400000 (24 h)");
         c.torrent.remove_on_complete_after = value;
     }
     if (auto search = torrent["search"]) {
@@ -647,13 +756,19 @@ void parse_torrent(const ConfigNode& root, Config& c) {
                 c.torrent.search_providers.clear();
                 for (const auto& value : providers.elements()) {
                     TorrentSearchProviderConfig provider;
-                    if (value["enabled"]) provider.enabled = value["enabled"].as<bool>();
-                    if (value["name"]) provider.name = value["name"].as<std::string>();
-                    if (value["type"]) provider.type = value["type"].as<std::string>();
-                    if (value["url"]) provider.url = value["url"].as<std::string>();
+                    if (value["enabled"])
+                        provider.enabled = value["enabled"].as<bool>();
+                    if (value["name"])
+                        provider.name = value["name"].as<std::string>();
+                    if (value["type"])
+                        provider.type = value["type"].as<std::string>();
+                    if (value["url"])
+                        provider.url = value["url"].as<std::string>();
                     if (value["api_key_file"])
-                        provider.api_key_file = std::filesystem::path(value["api_key_file"].as<std::string>());
-                    if (value["max_results"]) provider.max_results = value["max_results"].as<size_t>();
+                        provider.api_key_file =
+                            std::filesystem::path(value["api_key_file"].as<std::string>());
+                    if (value["max_results"])
+                        provider.max_results = value["max_results"].as<size_t>();
                     c.torrent.search_providers.push_back(std::move(provider));
                 }
             }
@@ -673,8 +788,7 @@ void parse_streaming(const ConfigNode& root, Config& c) {
     if (streaming["max_sessions"])
         c.streaming.max_sessions = streaming["max_sessions"].as<size_t>();
     if (streaming["max_sessions_per_account"])
-        c.streaming.max_sessions_per_account =
-            streaming["max_sessions_per_account"].as<size_t>();
+        c.streaming.max_sessions_per_account = streaming["max_sessions_per_account"].as<size_t>();
     if (streaming["max_transcodes_per_account"])
         c.streaming.max_transcodes_per_account =
             streaming["max_transcodes_per_account"].as<size_t>();
@@ -687,28 +801,32 @@ void parse_streaming(const ConfigNode& root, Config& c) {
     if (streaming["video_encoder_threads"])
         c.streaming.video_encoder_threads = streaming["video_encoder_threads"].as<size_t>();
     if (streaming["session_idle_ms"])
-        c.streaming.session_idle = milliseconds(streaming["session_idle_ms"], "streaming.session_idle_ms");
+        c.streaming.session_idle =
+            milliseconds(streaming["session_idle_ms"], "streaming.session_idle_ms");
     if (streaming["session_unused_idle_ms"])
         c.streaming.session_unused_idle =
             milliseconds(streaming["session_unused_idle_ms"], "streaming.session_unused_idle_ms");
     if (streaming["pipeline_idle_ms"])
-        c.streaming.pipeline_idle = milliseconds(streaming["pipeline_idle_ms"], "streaming.pipeline_idle_ms");
+        c.streaming.pipeline_idle =
+            milliseconds(streaming["pipeline_idle_ms"], "streaming.pipeline_idle_ms");
     if (streaming["transcode_entitlement_idle_ms"])
-        c.streaming.transcode_entitlement_idle =
-            milliseconds(streaming["transcode_entitlement_idle_ms"],
-                         "streaming.transcode_entitlement_idle_ms");
+        c.streaming.transcode_entitlement_idle = milliseconds(
+            streaming["transcode_entitlement_idle_ms"], "streaming.transcode_entitlement_idle_ms");
     if (streaming["startup_timeout_ms"])
-        c.streaming.startup_timeout = milliseconds(streaming["startup_timeout_ms"], "streaming.startup_timeout_ms");
+        c.streaming.startup_timeout =
+            milliseconds(streaming["startup_timeout_ms"], "streaming.startup_timeout_ms");
     if (streaming["startup_no_progress_ms"])
         c.streaming.startup_no_progress =
             milliseconds(streaming["startup_no_progress_ms"], "streaming.startup_no_progress_ms");
     if (streaming["start_wait_max_ms"])
-        c.streaming.start_wait_max = milliseconds(streaming["start_wait_max_ms"], "streaming.start_wait_max_ms");
+        c.streaming.start_wait_max =
+            milliseconds(streaming["start_wait_max_ms"], "streaming.start_wait_max_ms");
     if (streaming["start_failed_retention_ms"])
-        c.streaming.start_failed_retention =
-            milliseconds(streaming["start_failed_retention_ms"], "streaming.start_failed_retention_ms");
+        c.streaming.start_failed_retention = milliseconds(streaming["start_failed_retention_ms"],
+                                                          "streaming.start_failed_retention_ms");
     if (streaming["segment_duration_ms"])
-        c.streaming.segment_duration = milliseconds(streaming["segment_duration_ms"], "streaming.segment_duration_ms");
+        c.streaming.segment_duration =
+            milliseconds(streaming["segment_duration_ms"], "streaming.segment_duration_ms");
     if (streaming["max_ahead_segments"])
         c.streaming.max_ahead_segments = streaming["max_ahead_segments"].as<size_t>();
     if (streaming["segment_memory_bytes"])
@@ -725,8 +843,8 @@ void parse_streaming(const ConfigNode& root, Config& c) {
     if (streaming["probe_bytes"])
         c.streaming.probe_bytes = yaml_size(streaming["probe_bytes"]);
     if (streaming["probe_analyze_duration_ms"])
-        c.streaming.probe_analyze_duration =
-            milliseconds(streaming["probe_analyze_duration_ms"], "streaming.probe_analyze_duration_ms");
+        c.streaming.probe_analyze_duration = milliseconds(streaming["probe_analyze_duration_ms"],
+                                                          "streaming.probe_analyze_duration_ms");
     if (streaming["probe_timeout_ms"])
         c.streaming.probe_timeout =
             milliseconds(streaming["probe_timeout_ms"], "streaming.probe_timeout_ms");
@@ -746,14 +864,11 @@ void parse_runtime(const ConfigNode& root, Config& c) {
         c.runtime.reassembly_memory_reserve_bytes =
             yaml_size(runtime["reassembly_memory_reserve_bytes"]);
     if (runtime["control_memory_reserve_bytes"])
-        c.runtime.control_memory_reserve_bytes =
-            yaml_size(runtime["control_memory_reserve_bytes"]);
+        c.runtime.control_memory_reserve_bytes = yaml_size(runtime["control_memory_reserve_bytes"]);
     if (runtime["viewer_memory_reserve_bytes"])
-        c.runtime.viewer_memory_reserve_bytes =
-            yaml_size(runtime["viewer_memory_reserve_bytes"]);
+        c.runtime.viewer_memory_reserve_bytes = yaml_size(runtime["viewer_memory_reserve_bytes"]);
     if (runtime["loader_memory_reserve_bytes"])
-        c.runtime.loader_memory_reserve_bytes =
-            yaml_size(runtime["loader_memory_reserve_bytes"]);
+        c.runtime.loader_memory_reserve_bytes = yaml_size(runtime["loader_memory_reserve_bytes"]);
 }
 
 void parse_web(const ConfigNode& root, Config& c) {
@@ -777,7 +892,8 @@ void parse_session(const ConfigNode& root, Config& c) {
     if (!session)
         return;
     if (session["anonymous_ttl_ms"])
-        c.session.anonymous_ttl = milliseconds(session["anonymous_ttl_ms"], "session.anonymous_ttl_ms");
+        c.session.anonymous_ttl =
+            milliseconds(session["anonymous_ttl_ms"], "session.anonymous_ttl_ms");
     if (session["max_sessions"])
         c.session.max_sessions = session["max_sessions"].as<size_t>();
     if (session["allow_anonymous"])
@@ -891,7 +1007,8 @@ Config load_yaml_config(const std::filesystem::path& path) {
             if (packing["threshold"])
                 c.storage_packing.threshold = static_cast<size_t>(yaml_size(packing["threshold"]));
             if (packing["target_size"])
-                c.storage_packing.target_size = static_cast<size_t>(yaml_size(packing["target_size"]));
+                c.storage_packing.target_size =
+                    static_cast<size_t>(yaml_size(packing["target_size"]));
         }
     }
     if (storage["ledger_cache"])
@@ -905,9 +1022,11 @@ Config load_yaml_config(const std::filesystem::path& path) {
             c.metadata_store.limit = yaml_size(metadata["limit"]);
         if (auto packing = metadata["packing"]) {
             if (packing["threshold"])
-                c.metadata_store.packing.threshold = static_cast<size_t>(yaml_size(packing["threshold"]));
+                c.metadata_store.packing.threshold =
+                    static_cast<size_t>(yaml_size(packing["threshold"]));
             if (packing["target_size"])
-                c.metadata_store.packing.target_size = static_cast<size_t>(yaml_size(packing["target_size"]));
+                c.metadata_store.packing.target_size =
+                    static_cast<size_t>(yaml_size(packing["target_size"]));
         }
     }
 
@@ -938,9 +1057,12 @@ Config load_yaml_config(const std::filesystem::path& path) {
         if (auto catalogue = root["catalogue"])
             if (auto scanner = catalogue["scanner"])
                 if (auto providers = scanner["providers"])
-                    if (auto books = providers["books"]) stated = static_cast<bool>(books["enabled"]);
-        if (!c.books.enabled) c.catalogue.scanner.books.enabled = false;
-        else if (!stated) c.catalogue.scanner.books.enabled = true;
+                    if (auto books = providers["books"])
+                        stated = static_cast<bool>(books["enabled"]);
+        if (!c.books.enabled)
+            c.catalogue.scanner.books.enabled = false;
+        else if (!stated)
+            c.catalogue.scanner.books.enabled = true;
     }
     parse_streaming(root, c);
     parse_hydration(root, c);
@@ -978,7 +1100,8 @@ void print_usage(const char* executable) {
         << "--read-ahead N  --mount PATH  --state-path PATH  --cache-path PATH --cache-blocks N\n"
         << "--plugin-path PATH\n"
         << "--log-level LEVEL  (ALL|DEBUG|INFO|WARN|ERROR; default INFO)\n"
-        << "--ffmpeg-log-level LEVEL  (QUIET|PANIC|FATAL|ERROR|WARN|INFO|VERBOSE|DEBUG|TRACE; default ERROR)  --help\n";
+        << "--ffmpeg-log-level LEVEL  (QUIET|PANIC|FATAL|ERROR|WARN|INFO|VERBOSE|DEBUG|TRACE; "
+           "default ERROR)  --help\n";
 }
 
 Config parse_config(int argc, char** argv) {
@@ -1039,14 +1162,13 @@ Config parse_config(int argc, char** argv) {
         } else if (option == "--replicas") {
             config.replication = parse_unsigned(need(i, "--replicas"), "replica count");
         } else if (option == "--metadata-write-copies") {
-            config.metadata_write_copies = parse_unsigned(
-                need(i, option.c_str()), "metadata write copies");
+            config.metadata_write_copies =
+                parse_unsigned(need(i, option.c_str()), "metadata write copies");
         } else if (option == "--write-copies") {
-            config.write_copies =
-                parse_unsigned(need(i, "--write-copies"), "write copies");
+            config.write_copies = parse_unsigned(need(i, "--write-copies"), "write copies");
         } else if (option == "--write-stall") {
-            config.write_stall = std::chrono::milliseconds(
-                parse_unsigned(need(i, "--write-stall"), "write stall"));
+            config.write_stall =
+                std::chrono::milliseconds(parse_unsigned(need(i, "--write-stall"), "write stall"));
         } else if (option == "--extent-size") {
             config.extent_size = parse_size(need(i, "--extent-size"));
         } else if (option == "--read-ahead") {
@@ -1057,8 +1179,8 @@ Config parse_config(int argc, char** argv) {
         } else if (option == "--max-frame-size") {
             config.max_frame_size = parse_size(need(i, "--max-frame-size"));
         } else if (option == "--control-stall-notice") {
-            config.control_stall_notice = std::chrono::milliseconds(parse_unsigned(
-                need(i, option.c_str()), "control stall notice"));
+            config.control_stall_notice = std::chrono::milliseconds(
+                parse_unsigned(need(i, option.c_str()), "control stall notice"));
         } else if (option == "--data-stall-notice") {
             config.data_stall_notice = std::chrono::milliseconds(
                 parse_unsigned(need(i, option.c_str()), "data stall notice"));

@@ -37,9 +37,15 @@ struct FetchBench {
     explicit FetchBench(const std::function<void(Config&)>& tune = {}) : bench(tune) {
         Log::set_logger(log);
     }
-    ~FetchBench() { Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info)); }
-    ControlObjectFetch& fetch() { return bench.local.control_fetch(); }
-    LocalStore& control() { return bench.local.control(); }
+    ~FetchBench() {
+        Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
+    }
+    ControlObjectFetch& fetch() {
+        return bench.local.control_fetch();
+    }
+    LocalStore& control() {
+        return bench.local.control();
+    }
 };
 
 // A peer's answer is stored only when it is the object asked for: the right
@@ -63,18 +69,23 @@ MACHA_FAST_TEST("root_parts", test_control_fetch_stores_only_the_object_it_asked
         std::string failure;
     };
     const std::vector<Case> cases{
-        {"another reply type", [](MessageType, const Bytes&, FrameType) {
-             return RpcMessage{MessageType::ok, {}};
-         }, ": ok"},
-        {"another object's id", [&](MessageType, const Bytes&, FrameType) {
+        {"another reply type",
+         [](MessageType, const Bytes&, FrameType) { return RpcMessage{MessageType::ok, {}}; },
+         ": ok"},
+        {"another object's id",
+         [&](MessageType, const Bytes&, FrameType) {
              return control_reply(object_id(other), other);
-         }, ": integrity failure"},
-        {"bytes that do not hash to the id", [&](MessageType, const Bytes&, FrameType) {
-             return control_reply(id, other);
-         }, ": integrity failure"},
-        {"a truncated reply", [&](MessageType, const Bytes&, FrameType) {
-             return RpcMessage{MessageType::control_object_reply, Bytes(id.bytes.begin(), id.bytes.end())};
-         }, ": "},
+         },
+         ": integrity failure"},
+        {"bytes that do not hash to the id",
+         [&](MessageType, const Bytes&, FrameType) { return control_reply(id, other); },
+         ": integrity failure"},
+        {"a truncated reply",
+         [&](MessageType, const Bytes&, FrameType) {
+             return RpcMessage{MessageType::control_object_reply,
+                               Bytes(id.bytes.begin(), id.bytes.end())};
+         },
+         ": "},
     };
     for (const auto& c : cases) {
         FetchBench f;
@@ -88,7 +99,8 @@ MACHA_FAST_TEST("root_parts", test_control_fetch_stores_only_the_object_it_asked
         CHECK(observed == 0);
         CHECK(!f.control().valid(id));
         const auto line = unavailable_line(*f.log);
-        CHECK(line.find("peers_asked=1 last_failure=" + peer.host + c.failure) != std::string::npos);
+        CHECK(line.find("peers_asked=1 last_failure=" + peer.host + c.failure) !=
+              std::string::npos);
         // Asked once, on the control lane at speculative priority.
         const auto calls = f.bench.node.calls();
         REQUIRE(calls.size() == 1);
@@ -112,8 +124,8 @@ MACHA_FAST_TEST("root_parts", test_control_fetch_passes_over_a_failing_peer) {
         // Through the interface namespace replay holds: no observer.
         ControlObjectSource& failing = only_dead.fetch();
         CHECK(!failing.ensure_control_local(id));
-        CHECK(unavailable_line(*only_dead.log).find(unreachable.host + ": RPC to " +
-                                                     unreachable.host + " cannot be placed") !=
+        CHECK(unavailable_line(*only_dead.log)
+                  .find(unreachable.host + ": RPC to " + unreachable.host + " cannot be placed") !=
               std::string::npos);
     }
 
@@ -162,9 +174,8 @@ MACHA_FAST_TEST("root_parts", test_control_fetch_fails_when_the_store_cannot_tak
     const auto id = object_id(bytes);
     FetchBench f([](Config& c) { c.metadata_store.limit = 64 * 1024; });
     const auto holder = StoreBench::peer();
-    f.bench.node.add_peer(holder, [&](MessageType, const Bytes&, FrameType) {
-        return control_reply(id, bytes);
-    });
+    f.bench.node.add_peer(
+        holder, [&](MessageType, const Bytes&, FrameType) { return control_reply(id, bytes); });
     size_t observed = 0;
     CHECK(!f.fetch().pull(id, [&](uint64_t, Clock::duration) { ++observed; }));
     // It arrived, so the transfer is observed; it is not local.
@@ -181,7 +192,8 @@ DataWorkContext loader_work() {
 // Law 3 as the resources wire it: under device pressure the loader yields
 // only while a viewer has been active within maintenance.foreground_quiet,
 // read from the node's activity clocks on the clock the root hands in.
-MACHA_FAST_TEST("root_parts", test_node_resources_yield_the_loader_to_a_recent_viewer_under_pressure) {
+MACHA_FAST_TEST("root_parts",
+                test_node_resources_yield_the_loader_to_a_recent_viewer_under_pressure) {
     TestCluster cluster(ConfigProfile::isolated);
     auto config = cluster.node_config("resources");
     config.maintenance.foreground_quiet = 2s;
@@ -226,7 +238,8 @@ MACHA_FAST_TEST("root_parts", test_node_resources_yield_the_loader_to_a_recent_v
 
 // Recovery progress keeps the first failure and wakes a waiter on failure as
 // on completion.
-MACHA_FAST_TEST("root_parts", test_recovery_progress_keeps_the_first_failure_and_wakes_its_waiters) {
+MACHA_FAST_TEST("root_parts",
+                test_recovery_progress_keeps_the_first_failure_and_wakes_its_waiters) {
     {
         RecoveryProgress progress;
         CHECK(!progress.has(RecoveryProgress::cache));

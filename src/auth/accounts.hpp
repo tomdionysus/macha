@@ -42,11 +42,21 @@ class Accounts {
     // Stops the gossip; call before stopping the node. Idempotent.
     void stop();
 
-    UserStore& users() noexcept { return users_; }
-    const UserStore& users() const noexcept { return users_; }
-    SessionManager& sessions() noexcept { return sessions_; }
-    const SessionManager& sessions() const noexcept { return sessions_; }
-    PasswordWork& password_work() noexcept { return password_work_; }
+    UserStore& users() noexcept {
+        return users_;
+    }
+    const UserStore& users() const noexcept {
+        return users_;
+    }
+    SessionManager& sessions() noexcept {
+        return sessions_;
+    }
+    const SessionManager& sessions() const noexcept {
+        return sessions_;
+    }
+    PasswordWork& password_work() noexcept {
+        return password_work_;
+    }
 
     bool apply_session(const AuthSession&);
     // Applies locally, then notifies peers without waiting on them. A peer

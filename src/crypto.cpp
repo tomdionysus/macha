@@ -38,8 +38,7 @@ Sha256Hasher& Sha256Hasher::operator=(Sha256Hasher&&) noexcept = default;
 void Sha256Hasher::update(std::span<const uint8_t> data) {
     if (!state_ || state_->finished)
         throw std::runtime_error("SHA256 context already finished");
-    if (!data.empty() &&
-        EVP_DigestUpdate(state_->context.get(), data.data(), data.size()) != 1)
+    if (!data.empty() && EVP_DigestUpdate(state_->context.get(), data.data(), data.size()) != 1)
         throw std::runtime_error("SHA256 update failed");
 }
 
@@ -142,8 +141,8 @@ SealedData aes_gcm_seal(std::span<const uint8_t, 32> k, std::span<const uint8_t>
         total = produced;
     }
     std::array<uint8_t, 16> final_buffer{};
-    uint8_t* final_output = o.ciphertext.empty() ? final_buffer.data()
-                                                  : o.ciphertext.data() + total;
+    uint8_t* final_output =
+        o.ciphertext.empty() ? final_buffer.data() : o.ciphertext.data() + total;
     if (EVP_EncryptFinal_ex(c.get(), final_output, &produced) != 1)
         throw std::runtime_error("AES-GCM final failed");
     total += produced;

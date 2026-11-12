@@ -103,8 +103,8 @@ void UnreferencedSince::save() {
     const auto bytes = encode_unreferenced_since(sightings);
     try {
         std::filesystem::create_directories(path_.parent_path());
-        durable_replace_file(path_, std::string_view(reinterpret_cast<const char*>(bytes.data()),
-                                                     bytes.size()));
+        durable_replace_file(
+            path_, std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
     } catch (const std::exception& error) {
         Log::warn("unreferenced-since: cannot write " + path_.string() + ": " + error.what());
         Lock lock(mutex_);

@@ -16,12 +16,12 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <utility>
-#include <vector>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 namespace macha::test {
 namespace {
@@ -56,7 +56,8 @@ struct Options {
 
 unsigned default_slots() {
     const auto detected = std::thread::hardware_concurrency();
-    if (detected <= 2) return 2;
+    if (detected <= 2)
+        return 2;
     return std::min(12u, detected);
 }
 
@@ -82,7 +83,8 @@ unsigned default_timeout_scale() {
 }
 
 unsigned parse_unsigned(std::string_view value, const char* what) {
-    if (value.empty()) throw std::runtime_error(std::string("missing ") + what);
+    if (value.empty())
+        throw std::runtime_error(std::string("missing ") + what);
     const std::string text(value);
     char* end = nullptr;
     errno = 0;
@@ -110,22 +112,26 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--serial") {
             options.slots = 1;
         } else if (arg == "--jobs") {
-            if (++i >= argc) throw std::runtime_error("--jobs requires a value");
+            if (++i >= argc)
+                throw std::runtime_error("--jobs requires a value");
             options.slots = parse_unsigned(argv[i], "--jobs");
         } else if (arg.starts_with("--jobs=")) {
             options.slots = parse_unsigned(arg.substr(7), "--jobs");
         } else if (arg == "--filter") {
-            if (++i >= argc) throw std::runtime_error("--filter requires a value");
+            if (++i >= argc)
+                throw std::runtime_error("--filter requires a value");
             options.filter = argv[i];
         } else if (arg.starts_with("--filter=")) {
             options.filter = std::string(arg.substr(9));
         } else if (arg == "--timeout-scale") {
-            if (++i >= argc) throw std::runtime_error("--timeout-scale requires a value");
+            if (++i >= argc)
+                throw std::runtime_error("--timeout-scale requires a value");
             options.timeout_scale = parse_unsigned(argv[i], "--timeout-scale");
         } else if (arg.starts_with("--timeout-scale=")) {
             options.timeout_scale = parse_unsigned(arg.substr(16), "--timeout-scale");
         } else if (arg == "--repeat") {
-            if (++i >= argc) throw std::runtime_error("--repeat requires a value");
+            if (++i >= argc)
+                throw std::runtime_error("--repeat requires a value");
             options.repeat = parse_unsigned(argv[i], "--repeat");
         } else if (arg.starts_with("--repeat=")) {
             options.repeat = parse_unsigned(arg.substr(9), "--repeat");
@@ -160,7 +166,8 @@ std::string full_name(const TestCase& test) {
 }
 
 bool selected(const TestCase& test, const Options& options) {
-    if (options.filter.empty()) return true;
+    if (options.filter.empty())
+        return true;
     return full_name(test).find(options.filter) != std::string::npos;
 }
 
@@ -176,8 +183,8 @@ struct RunningCase {
 };
 
 int create_capture_file() {
-    std::string pattern = (std::filesystem::temp_directory_path() /
-                           "macha-test-output-XXXXXX").string();
+    std::string pattern =
+        (std::filesystem::temp_directory_path() / "macha-test-output-XXXXXX").string();
     std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
     mutable_pattern.push_back('\0');
     const int fd = ::mkstemp(mutable_pattern.data());
@@ -189,13 +196,16 @@ int create_capture_file() {
 }
 
 std::string read_capture(int fd) {
-    if (::lseek(fd, 0, SEEK_SET) < 0) return {};
+    if (::lseek(fd, 0, SEEK_SET) < 0)
+        return {};
     std::string output;
     char buffer[8192];
     while (true) {
         const auto n = ::read(fd, buffer, sizeof(buffer));
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
         output.append(buffer, static_cast<std::size_t>(n));
     }
     return output;
@@ -226,8 +236,12 @@ void coverage_dump() {
 #elif defined(__GNUC__)
 extern "C" void __gcov_reset(void);
 extern "C" void __gcov_dump(void);
-void coverage_reset() { __gcov_reset(); }
-void coverage_dump() { __gcov_dump(); }
+void coverage_reset() {
+    __gcov_reset();
+}
+void coverage_dump() {
+    __gcov_dump();
+}
 #else
 void coverage_reset() {}
 void coverage_dump() {}
@@ -240,7 +254,8 @@ void coverage_dump() {}
 [[noreturn]] void child_run(const TestCase& test, std::size_t selection_index, int capture_fd) {
     if (::dup2(capture_fd, STDOUT_FILENO) < 0 || ::dup2(capture_fd, STDERR_FILENO) < 0)
         std::_Exit(125);
-    if (capture_fd > STDERR_FILENO) ::close(capture_fd);
+    if (capture_fd > STDERR_FILENO)
+        ::close(capture_fd);
 
     coverage_reset();
     child_failures.store(0, std::memory_order_relaxed);
@@ -289,8 +304,9 @@ RunningCase launch(const TestCase& test, std::size_t selection_index,
         ::close(capture_fd);
         throw std::runtime_error("fork failed: " + std::string(std::strerror(errno)));
     }
-    if (pid == 0) child_run(test, selection_index, capture_fd);
-    return RunningCase{selection_index, &test,           pid,     capture_fd,
+    if (pid == 0)
+        child_run(test, selection_index, capture_fd);
+    return RunningCase{selection_index,      &test,   pid,     capture_fd,
                        slots_for(test.cost), started, deadline};
 }
 
@@ -309,11 +325,14 @@ struct Result {
 std::optional<Result> poll_finished(RunningCase& running) {
     int status = 0;
     pid_t waited = -1;
-    do { waited = ::waitpid(running.pid, &status, WNOHANG); } while (waited < 0 && errno == EINTR);
+    do {
+        waited = ::waitpid(running.pid, &status, WNOHANG);
+    } while (waited < 0 && errno == EINTR);
     if (waited < 0)
         throw std::runtime_error("waitpid failed: " + std::string(std::strerror(errno)));
     const auto now = Clock::now();
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - running.started);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - running.started);
 
     if (waited == 0 && now - running.started < running.deadline)
         return std::nullopt;
@@ -327,7 +346,9 @@ std::optional<Result> poll_finished(RunningCase& running) {
     if (waited == 0) {
         result.timed_out = true;
         (void)::kill(running.pid, SIGKILL);
-        do { waited = ::waitpid(running.pid, &status, 0); } while (waited < 0 && errno == EINTR);
+        do {
+            waited = ::waitpid(running.pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
     }
 
     if (!result.timed_out) {
@@ -348,7 +369,8 @@ void print_result(const Result& result, bool verbose) {
     const auto name = full_name(*result.test);
     if (result.passed) {
         std::cout << "[PASS] " << name << " " << result.elapsed.count() << "ms\n";
-        if (verbose && !result.output.empty()) std::cout << result.output;
+        if (verbose && !result.output.empty())
+            std::cout << result.output;
         return;
     }
 
@@ -361,9 +383,9 @@ void print_result(const Result& result, bool verbose) {
         std::cerr << " exit=" << result.exit_code;
     std::cerr << '\n';
     if (!result.output.empty()) {
-        std::cerr << "----- " << name << " output -----\n"
-                  << result.output;
-        if (result.output.back() != '\n') std::cerr << '\n';
+        std::cerr << "----- " << name << " output -----\n" << result.output;
+        if (result.output.back() != '\n')
+            std::cerr << '\n';
         std::cerr << "----- end output -----\n";
     }
 }
@@ -376,7 +398,8 @@ Registrar::Registrar(std::string_view group, std::string_view name, TestFunction
 }
 
 void check(bool passed, std::string_view expression, const char* file, int line) {
-    if (passed) return;
+    if (passed)
+        return;
     std::cerr << file << ':' << line << ": CHECK failed: " << expression << '\n';
     child_failures.fetch_add(1, std::memory_order_relaxed);
 }
@@ -386,8 +409,12 @@ void check(bool passed, std::string_view expression, const char* file, int line)
                              ": REQUIRE failed: " + std::string(expression));
 }
 
-void set_case_index(std::size_t index) noexcept { current_case_index = index; }
-std::size_t case_index() noexcept { return current_case_index; }
+void set_case_index(std::size_t index) noexcept {
+    current_case_index = index;
+}
+std::size_t case_index() noexcept {
+    return current_case_index;
+}
 
 int run_all(int argc, char** argv) {
     Options options;
@@ -400,14 +427,16 @@ int run_all(int argc, char** argv) {
 
     auto tests = registry();
     std::stable_sort(tests.begin(), tests.end(), [](const auto& a, const auto& b) {
-        if (a.group != b.group) return a.group < b.group;
+        if (a.group != b.group)
+            return a.group < b.group;
         return a.name < b.name;
     });
 
     std::vector<const TestCase*> selected_tests;
     selected_tests.reserve(tests.size());
     for (const auto& test : tests)
-        if (selected(test, options)) selected_tests.push_back(&test);
+        if (selected(test, options))
+            selected_tests.push_back(&test);
     const auto distinct_cases = selected_tests.size();
     // Repetitions are further selections of the same cases, so repeats spread
     // across the run beside unrelated work.
@@ -441,10 +470,10 @@ int run_all(int argc, char** argv) {
     ::setenv("MACHA_TEST_TIMEOUT_SCALE", std::to_string(options.timeout_scale).c_str(), 1);
 
     if (!std::getenv("MACHA_TEST_PORT_SALT")) {
-        const auto salt = static_cast<unsigned>(
-            (static_cast<unsigned long>(::getpid()) * 2654435761UL) ^
-            static_cast<unsigned long>(
-                std::chrono::steady_clock::now().time_since_epoch().count()));
+        const auto salt =
+            static_cast<unsigned>((static_cast<unsigned long>(::getpid()) * 2654435761UL) ^
+                                  static_cast<unsigned long>(
+                                      std::chrono::steady_clock::now().time_since_epoch().count()));
         ::setenv("MACHA_TEST_PORT_SALT", std::to_string(salt % 1000003u).c_str(), 1);
     }
 
@@ -454,13 +483,16 @@ int run_all(int argc, char** argv) {
     results.reserve(selected_tests.size());
     std::vector<std::size_t> pending;
     pending.reserve(selected_tests.size());
-    for (std::size_t i = 0; i < selected_tests.size(); ++i) pending.push_back(i);
+    for (std::size_t i = 0; i < selected_tests.size(); ++i)
+        pending.push_back(i);
     unsigned occupied = 0;
 
     std::cout << "Running " << distinct_cases << " tests with " << options.slots
               << " parallel slots (process isolated)";
-    if (options.repeat != 1) std::cout << ", x" << options.repeat << " repeats";
-    if (options.timeout_scale != 1) std::cout << ", deadlines x" << options.timeout_scale;
+    if (options.repeat != 1)
+        std::cout << ", x" << options.repeat << " repeats";
+    if (options.timeout_scale != 1)
+        std::cout << ", deadlines x" << options.timeout_scale;
     std::cout << '\n' << std::flush;
 
     while (results.size() < selected_tests.size()) {
@@ -470,7 +502,8 @@ int run_all(int argc, char** argv) {
             const auto candidate = std::find_if(pending.begin(), pending.end(), [&](std::size_t i) {
                 return effective_slots(*selected_tests[i]) <= available;
             });
-            if (candidate == pending.end()) break;
+            if (candidate == pending.end())
+                break;
 
             const auto selection_index = *candidate;
             const auto& test = *selected_tests[selection_index];
@@ -503,12 +536,13 @@ int run_all(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds{2});
     }
 
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - suite_started);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - suite_started);
     const auto failed = static_cast<std::size_t>(std::count_if(
         results.begin(), results.end(), [](const auto& result) { return !result.passed; }));
     std::chrono::milliseconds serial_time{};
-    for (const auto& result : results) serial_time += result.elapsed;
+    for (const auto& result : results)
+        serial_time += result.elapsed;
 
     if (failed) {
         std::cerr << failed << '/' << results.size() << " tests failed; wall=" << elapsed.count()
@@ -523,7 +557,8 @@ int run_all(int argc, char** argv) {
             std::cerr << "Failed cases (failures/" << options.repeat << " runs):\n";
             std::vector<std::pair<const TestCase*, unsigned>> tally;
             for (const auto& result : results) {
-                if (result.passed) continue;
+                if (result.passed)
+                    continue;
                 auto found = std::find_if(tally.begin(), tally.end(), [&](const auto& item) {
                     return item.first == result.test;
                 });
@@ -544,7 +579,8 @@ int run_all(int argc, char** argv) {
               << "ms case-sum=" << serial_time.count() << "ms";
     if (elapsed.count() > 0)
         std::cout << " effective_parallelism="
-                  << static_cast<double>(serial_time.count()) / static_cast<double>(elapsed.count());
+                  << static_cast<double>(serial_time.count()) /
+                         static_cast<double>(elapsed.count());
     std::cout << '\n';
     return 0;
 }

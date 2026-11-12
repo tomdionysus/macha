@@ -45,12 +45,12 @@ PageRange page_range(const std::vector<T>& sorted, KeyOf key_of, const PageQuery
     PageRange range;
     range.end = sorted.size();
     if (query.after)
-        range.begin = static_cast<size_t>(
-            std::upper_bound(sorted.begin(), sorted.end(), *query.after,
-                             [&](const std::string& after, const T& entry) {
-                                 return after < std::string_view(key_of(entry));
-                             }) -
-            sorted.begin());
+        range.begin =
+            static_cast<size_t>(std::upper_bound(sorted.begin(), sorted.end(), *query.after,
+                                                 [&](const std::string& after, const T& entry) {
+                                                     return after < std::string_view(key_of(entry));
+                                                 }) -
+                                sorted.begin());
     if (query.limit && sorted.size() - range.begin > *query.limit) {
         range.end = range.begin + *query.limit;
         range.next_cursor = page_cursor(key_of(sorted[range.end - 1]));
