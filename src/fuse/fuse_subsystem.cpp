@@ -21,6 +21,13 @@ FuseMountDriverFactory& mount_driver_factory_storage() {
     return factory;
 }
 
+// Configuration loading settles the mount path before the subsystem is built.
+const std::filesystem::path& configured_mount_path(const FuseConfig& fuse) {
+    if (!fuse.mount_path)
+        throw std::invalid_argument("fuse.mount_path is not set");
+    return *fuse.mount_path;
+}
+
 } // namespace
 
 void set_fuse_mount_driver_factory(FuseMountDriverFactory factory) {
@@ -35,7 +42,7 @@ FuseSubsystem::FuseSubsystem(const SubsystemContext& context,
                              std::unique_ptr<FuseMountDriver> driver)
     : registry_(*context.registry), hydration_(*context.hydration),
       filesystem_(*context.filesystem), config_(context.config->fuse),
-      mount_path_(context.config->fuse.mount_path.value()), driver_(std::move(driver)) {
+      mount_path_(configured_mount_path(context.config->fuse)), driver_(std::move(driver)) {
     // Per attempt, not per process: a remount after mount loss needs the
     // stale-mount recovery and the fail-closed guard on the covered directory.
     prepare_fuse_mountpoint(mount_path_, config_);

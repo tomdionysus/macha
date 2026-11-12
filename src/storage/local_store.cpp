@@ -1929,10 +1929,10 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
     return !remove_error && removed;
 }
 
-bool LocalStore::compact_packs(std::stop_token stop) {
+bool LocalStore::compact_packs(const std::stop_token& stop) {
     Lock pack_io_lock(pack_io_mutex_);
     Lock lock(m_);
-    if (!wait_for_accounting(lock, std::move(stop), true))
+    if (!wait_for_accounting(lock, stop, true))
         return false;
     return compact_packs_locked(lock);
 }

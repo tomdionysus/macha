@@ -127,7 +127,7 @@ void collect_unknown_keys(const YAML::Node& node, const std::string& path,
     if (node.IsMap()) {
         for (const auto& entry : node) {
             const auto key = entry.first.as<std::string>();
-            const auto child = path.empty() ? key : path + "." + key;
+            const auto child = path.empty() ? key : std::string(path).append(".").append(key);
             if (!read.contains(child))
                 unknown.push_back(child);
             else

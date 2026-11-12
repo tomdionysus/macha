@@ -77,9 +77,8 @@ class Subsystem {
     // subsystem's threads, including inside start(); the first reason wins and
     // calls once stopping has begun are ignored. Subsystems that only fail in
     // construction or start() may ignore it.
-    virtual void attach_fault_sink(FaultSink sink) {
-        (void)sink;
-    }
+    // NOLINTNEXTLINE(performance-unnecessary-value-param): overrides take ownership
+    virtual void attach_fault_sink(FaultSink /*sink*/) {}
 };
 
 } // namespace macha

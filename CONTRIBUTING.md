@@ -53,14 +53,22 @@ are left alone rather than rewritten.
 ## Build and test
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMACHA_WARNINGS_AS_ERRORS=ON
-cmake --build build --parallel
+cmake --preset default
+cmake --build --preset default --parallel
 ./run-tests.sh build
 ```
 
-`-DMACHA_SANITIZE=address,undefined` (or `=thread`, separately) builds the
-whole tree under a sanitizer; see `tests/TESTING.md`. Changes to threading,
-lock ordering or ownership should be run under both before submitting.
+The presets are `default` (release with debug info, warnings as errors), `asan` (ASan and
+UBSan, in `build-asan`) and `coverage` (in `build-coverage`, with a `coverage`
+target that writes an lcov report). `-DMACHA_SANITIZE=thread` builds the tree
+under TSan; see `tests/TESTING.md`. Changes to threading, lock ordering or
+ownership should be run under ASan and TSan before submitting.
+
+`tools/ci.sh` is the merge gate GitHub Actions runs: the format and SPDX
+checks, the default build with every test binary, clang-tidy 19 over `src` and
+`tools` with every warning an error, the ASan and UBSan suites, and coverage.
+Run it before pushing; `--remote HOST` runs it on a Linux host over SSH. The
+CI image is Debian trixie with Dannan built from its release tag.
 
 Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics need a regression or fault-injection test. Do not weaken the metadata write floor, object integrity, crash durability or foreground I/O behaviour to simplify an error path.
 
@@ -71,7 +79,10 @@ Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics n
 - Keep ownership and thread boundaries explicit.
 - Avoid frameworks, DI containers and new dependencies without a concrete reason.
 - Build with `MACHA_WARNINGS_AS_ERRORS=ON` before submitting changes.
-- Use `.clang-format`.
+- Format with clang-format 19 and `.clang-format`; `tools/check-format.sh` checks the tree.
+- Every source file starts with an SPDX licence line; `tools/check-spdx.sh` checks it.
+- clang-tidy reports nothing under `.clang-tidy`. A suppression is a
+  `NOLINTNEXTLINE(check)` with the reason beside it.
 - Version and document public, wire and on-disk format changes.
 
 ## Dependencies

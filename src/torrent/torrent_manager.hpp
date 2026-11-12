@@ -148,7 +148,7 @@ class TorrentManager final : public TorrentService {
     // A failed job whose ingest was resumed follows it back rather than stay
     // failed with its staging held.
     bool linked_ingest_revived(const TorrentJob&) const;
-    std::string add_impl(std::string uri, bool allow_fetch);
+    std::string add_impl(const std::string& uri, bool allow_fetch);
     // A parsed add: libtorrent's params and the canonical magnet to persist.
     // Defined in the .cpp, which alone sees libtorrent's types.
     struct ParsedAdd;

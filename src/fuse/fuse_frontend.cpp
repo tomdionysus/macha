@@ -4935,7 +4935,7 @@ struct FuseFrontend::State {
                 return false;
 
             const auto target = inode->unconfirmed_data_sequence;
-            const auto expected = *unconfirmed_entry;
+            const auto& expected = *unconfirmed_entry;
             const auto path = inode->published_path;
             const auto retired = static_cast<size_t>(
                 std::count_if(inode->data_ops.begin(), inode->data_ops.end(),

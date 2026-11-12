@@ -669,7 +669,7 @@ ManageApi::ManageApi(NodeRuntime& node, MetadataView& metadata, FileSystem& fs,
     : node_(node), metadata_(metadata), fs_(fs), catalogue_(catalogue), hints_(hints),
       scanner_(scanner), peers_unmatched_(peers_unmatched),
       identity_audit_worker_(
-          [this](std::stop_token stop) { identity_reset_audit_loop(std::move(stop)); }) {}
+          [this](const std::stop_token& stop) { identity_reset_audit_loop(stop); }) {}
 
 std::optional<CatalogueHint> ManageApi::unmatched_hint(std::string_view id) const {
     if (auto hint = actionable_hint(hints_, id))

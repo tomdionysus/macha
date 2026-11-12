@@ -96,8 +96,8 @@ class MediaInformationService {
                    const std::string& source = "media-information");
     bool request_path(std::string path, int priority = MediaInformationPriority::background,
                       std::string source = "media-information-ingest");
-    MediaProbeResult resolve_playback(std::string media_id, std::string path, FsEntry entry,
-                                      Clock::time_point deadline);
+    MediaProbeResult resolve_playback(const std::string& media_id, const std::string& path,
+                                      const FsEntry& entry, Clock::time_point deadline);
     void request_prune();
     // A media's keyframe byte index: stored, or built, stored and returned.
     // Empty when the media is not in the namespace. Throws MediaError when the

@@ -33,7 +33,7 @@ class PlaybackManager {
     // measured by.
     PlaybackManager(
         FileSystem&, TranscodeRateBook&, RetainedMemoryLedger&, CatalogueManager&,
-        CatalogueApiConfig, StreamingConfig, std::shared_ptr<MediaEngine> = {},
+        const CatalogueApiConfig&, StreamingConfig, std::shared_ptr<MediaEngine> = {},
         std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
         MediaInformationService* media_information = nullptr, MediaFacts media_facts = {},
         const TimeSource& time = steady_time_source());
