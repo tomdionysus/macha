@@ -76,7 +76,7 @@ Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics n
 
 ## Dependencies
 
-The dependency-light core/test set (`macha_core`, `macha-tests`) is C++20, OpenSSL, libcurl and zlib. Building the server and runtime-adapter tests additionally requires yaml-cpp and the FFmpeg 6 or later libavformat, libavcodec, libavutil, libswscale and libswresample development libraries. FUSE3/macFUSE builds the mount plugin. libtorrent-rasterbar >= 2.0 builds the optional BitTorrent acquisition plugin and `macha-tests-torrent`; generic filesystem ingest remains available without it. miniupnpc, when found, enables UPnP port mapping. The FFmpeg command-line tools are not invoked by Macha. Boost is not otherwise required by Macha.
+The dependency-light core/test set (`macha_core`, `macha-tests`) is C++20, OpenSSL, libcurl, zlib and Dannan 0.5.3 (the cluster transport, with its Boost Asio headers). Building the server and runtime-adapter tests additionally requires yaml-cpp and the FFmpeg 6 or later libavformat, libavcodec, libavutil, libswscale and libswresample development libraries. FUSE3/macFUSE builds the mount plugin. libtorrent-rasterbar >= 2.0 builds the optional BitTorrent acquisition plugin and `macha-tests-torrent`; generic filesystem ingest remains available without it. UPnP port mapping is Dannan's. The FFmpeg command-line tools are not invoked by Macha. Boost beyond Dannan's Asio headers is not otherwise required by Macha.
 
 ## Security
 

@@ -4,7 +4,7 @@ This creates a disposable two-node cluster on one machine. It is intended to dem
 
 ## Build
 
-Install CMake, a C++20 compiler, OpenSSL, curl, zlib, yaml-cpp, FUSE/macFUSE and the FFmpeg 6+ development libraries. Pick the line for your system:
+Install CMake, a C++20 compiler, OpenSSL, curl, zlib, yaml-cpp, Boost 1.83+, FUSE/macFUSE and the FFmpeg 6+ development libraries. Pick the line for your system:
 
 ```bash
 # Debian 13+ / Ubuntu 24.04+ (on Ubuntu, enable universe first)
@@ -13,26 +13,31 @@ sudo apt update && sudo apt install build-essential cmake pkg-config \
   fuse3 libfuse3-dev \
   libavformat-dev libavcodec-dev libavutil-dev \
   libswscale-dev libswresample-dev \
-  libtorrent-rasterbar-dev libminiupnpc-dev
+  libboost-dev libtorrent-rasterbar-dev
 
 # Fedora
 sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
   openssl-devel libcurl-devel yaml-cpp-devel zlib-devel \
   fuse3 fuse3-devel ffmpeg-free-devel \
-  rb_libtorrent-devel miniupnpc-devel
+  boost-devel rb_libtorrent-devel
 
 # macOS (Homebrew)
 xcode-select --install
 brew update && brew install cmake pkgconf openssl@3 curl yaml-cpp \
-  ffmpeg@7 libtorrent-rasterbar miniupnpc
+  boost ffmpeg@7 libtorrent-rasterbar
 brew install --cask macfuse
 ```
 
-libtorrent-rasterbar (2.0 or later) and miniupnpc are optional: without them the BitTorrent acquisition plugin and UPnP port mapping are simply not built. FUSE 3 or macFUSE builds the mount plugin; without it the node runs with no mount. Everything else is required. Do not install a second Boost alongside the one your libtorrent-rasterbar was built with: the torrent plugin compiled against mismatched Boost headers can crash at runtime. Debian 12 and Ubuntu 22.04 ship FFmpeg versions that are too old. For Arch, MacPorts, the FFmpeg version check and the full installation procedure, see [install-linux.md](install-linux.md) and [install-macos.md](install-macos.md).
+libtorrent-rasterbar (2.0 or later) is optional: without it the BitTorrent acquisition plugin is simply not built. FUSE 3 or macFUSE builds the mount plugin; without it the node runs with no mount. Everything else is required. Do not install a second Boost alongside the one your libtorrent-rasterbar was built with: the torrent plugin compiled against mismatched Boost headers can crash at runtime. Debian 12 and Ubuntu 22.04 ship FFmpeg versions that are too old. For Arch, MacPorts, the FFmpeg version check and the full installation procedure, see [install-linux.md](install-linux.md) and [install-macos.md](install-macos.md).
 
-Then:
+Then build and install [Dannan](https://github.com/tomdionysus/dannan) 0.5.3, the cluster transport (UPnP port mapping comes with it), and Macha against it:
 
 ```bash
+git clone --branch 0.5.3 https://github.com/tomdionysus/dannan.git
+cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release
+cmake --build dannan/build --parallel
+sudo cmake --install dannan/build --prefix /usr/local
+
 cmake -S . -B build
 cmake --build build --parallel
 ./run-tests.sh build

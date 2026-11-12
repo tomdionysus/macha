@@ -7,6 +7,7 @@
 #include "cluster/dannan_host.hpp"
 #include "cluster/rpc_refusal.hpp"
 #include "cluster/telemetry_bridge.hpp"
+#include "stand_in_peer.hpp"
 #include "test_framework.hpp"
 #include "test_support.hpp"
 
@@ -102,7 +103,7 @@ MACHA_TEST("dannan_host", test_a_call_reaches_the_peers_route_and_answers) {
 }
 
 // Membership following Dannan's roster: the peer that bootstrapped is active and directly
-// reachable, this node's own entry is Membership's with its figures, and gossip handed to
+// reachable, this node's own entry is Membership's with its figures, and a peer handed to
 // observe() changes nothing, the roster being the node's.
 MACHA_TEST("dannan_host", test_membership_follows_the_nodes_roster) {
     TempDir dir;
@@ -140,7 +141,6 @@ MACHA_TEST("dannan_host", test_membership_follows_the_nodes_roster) {
     stranger.seen_unix_ms = unix_ms();
     members.observe(stranger, true);
     REQUIRE(members.all().size() == 2);
-    REQUIRE(members.forget_unseen() == 0);
 
     b.stop();
     a.stop();
@@ -172,8 +172,7 @@ MACHA_TEST("dannan_host", test_telemetry_follows_the_nodes_records) {
     a.start();
     b.start();
 
-    TelemetryStore store(macha_id(a.node().nodes().self().id));
-    store.follow(std::make_shared<DannanTelemetry>(a.node().telemetry()));
+    TelemetryStore store(std::make_shared<DannanTelemetry>(a.node().telemetry()));
     const auto peer_b = macha_id(b.node().nodes().self().id);
     std::optional<NodeTelemetry> seen;
     REQUIRE(wait_until([&] {
@@ -257,4 +256,38 @@ MACHA_TEST("dannan_host", test_status_reads_the_nodes_threads_and_canonical_rout
         const auto local = a.telemetry().local();
         return local && local->rpc_connections_canonical > 0;
     }, 15s));
+}
+
+// Job traffic keeps its class from Macha's caller to the peer's handler: polls travel
+// as loader and actions as foreground, as Macha's registrations admit them.
+MACHA_TEST("dannan_host", test_job_traffic_travels_as_its_own_class) {
+    TestCluster cluster;
+    std::mutex seen_mutex;
+    std::vector<FrameType> seen;
+    StandInPeer peer(cluster, "jobs-peer", {});
+    const auto record = [&](FrameType frame) {
+        std::lock_guard lock(seen_mutex);
+        seen.push_back(frame);
+    };
+    peer.routes.bind(MessageType::get_torrent_jobs, [&](const NodeInfo&, FrameType frame, const RpcMessage&) {
+        record(frame);
+        return RpcMessage{MessageType::torrent_jobs_reply, {}};
+    });
+    peer.routes.bind(MessageType::ingest_job_action, [&](const NodeInfo&, FrameType frame, const RpcMessage&) {
+        record(frame);
+        return RpcMessage{MessageType::ingest_job_action_reply, {}};
+    });
+    peer.start();
+    BareNode node(cluster.node_config("jobs-caller"), cluster.keys());
+    node.start();
+
+    const auto polled = node.call(peer.endpoint(), MessageType::get_torrent_jobs, {}, FrameType::loader,
+                                  call_deadline::control);
+    REQUIRE(polled.message.type == MessageType::torrent_jobs_reply);
+    const Bytes action{'{', '}'};
+    const auto acted = node.call(peer.endpoint(), MessageType::ingest_job_action, action,
+                                 FrameType::foreground, call_deadline::control);
+    REQUIRE(acted.message.type == MessageType::ingest_job_action_reply);
+    std::lock_guard lock(seen_mutex);
+    REQUIRE(seen == std::vector<FrameType>({FrameType::loader, FrameType::foreground}));
 }

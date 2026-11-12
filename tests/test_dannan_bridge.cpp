@@ -441,3 +441,32 @@ MACHA_TEST("dannan_bridge", test_hosts_extents_is_the_adverts_presence) {
     record.adverts[advert::hosts_extents] = dannan::net::Bytes{};
     REQUIRE(node_hosts_extents(node_info_from(record)));
 }
+
+// The frame a call takes when its caller names none: object transfers as foreground;
+// presence, control objects, retention, deletes and telemetry as speculative; the rest
+// as control. And the frame classes by the names Status and the journal use.
+MACHA_TEST("dannan_bridge", test_a_call_without_a_frame_takes_its_types_default) {
+    for (const auto type : {MessageType::get_object, MessageType::put_object,
+                            MessageType::put_object_deferred,
+                            MessageType::object_durability_barrier})
+        REQUIRE(default_frame_type(type) == FrameType::foreground);
+    for (const auto type :
+         {MessageType::get_control_object, MessageType::put_control_object, MessageType::telemetry,
+          MessageType::have_object, MessageType::have_objects, MessageType::have_valid_objects,
+          MessageType::trie_diff, MessageType::retain_objects, MessageType::delete_object})
+        REQUIRE(default_frame_type(type) == FrameType::speculative);
+    for (const auto type : {MessageType::get_metadata, MessageType::put_metadata_commit,
+                            MessageType::get_ingest_jobs, MessageType::session_sync,
+                            MessageType::members, MessageType::ping})
+        REQUIRE(default_frame_type(type) == FrameType::control);
+    REQUIRE(std::string(frame_type_name(FrameType::control)) == "control");
+    REQUIRE(std::string(frame_type_name(FrameType::foreground)) == "foreground");
+    REQUIRE(std::string(frame_type_name(FrameType::read_ahead)) == "read-ahead");
+    REQUIRE(std::string(frame_type_name(FrameType::loader)) == "loader");
+    REQUIRE(std::string(frame_type_name(FrameType::speculative)) == "speculative");
+    // The laws' order: control, viewer, read-ahead, loader, speculative.
+    REQUIRE(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
+    REQUIRE(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
+    REQUIRE(frame_type_priority(FrameType::read_ahead) < frame_type_priority(FrameType::loader));
+    REQUIRE(frame_type_priority(FrameType::loader) < frame_type_priority(FrameType::speculative));
+}

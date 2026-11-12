@@ -2450,48 +2450,6 @@ MACHA_TEST("invariants", test_a_failed_read_keeps_the_object_and_a_bad_record_is
     CHECK(failures.load() >= before + 2);
 }
 
-MACHA_TEST("invariants", test_rpc_pre_auth_admission_is_bounded) {
-#if defined(__linux__)
-    TempDir t;
-    const auto keyfile = t.path() / "cluster.key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-    const auto port = free_port();
-    NodeInfo server_info{random_node_id(), "127.0.0.1", "test", port};
-    RpcServer server(
-        "127.0.0.1", port, keys, server_info,
-        [](const NodeInfo&, FrameType, const RpcMessage&) {
-            return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {});
-    server.start();
-
-    const auto thread_count = [] {
-        size_t count = 0;
-        for (const auto& ignored : std::filesystem::directory_iterator("/proc/self/task")) {
-            (void)ignored;
-            ++count;
-        }
-        return count;
-    };
-    const auto before = thread_count();
-    std::vector<int> sockets;
-    for (int i = 0; i < 32; ++i)
-        sockets.push_back(connect_idle(port));
-    std::this_thread::sleep_for(100ms);
-    const auto after = thread_count();
-
-    // Unauthenticated sockets cost bounded resources, not a thread each.
-    CHECK(after <= before + 8);
-
-    for (auto fd : sockets)
-        close(fd);
-    server.stop();
-#else
-    std::cout << "[ARCH-REGRESSION] pre-auth admission check requires /proc/self/task; skipped\n";
-#endif
-}
-
 MACHA_TEST("invariants", test_a_durability_barrier_is_timed_per_filesystem) {
     // Each barrier's time is recorded under the directory its domain was made
     // for, so control's commits and a DATA disk's are told apart.
@@ -3380,52 +3338,6 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
 #else
     std::cout << "[ARCH-REGRESSION] RPC generation reuse check is Linux-only; skipped\n";
 #endif
-}
-
-MACHA_TEST("invariants", test_authenticated_receiver_enforces_transport_lane) {
-    TempDir t;
-    const auto keyfile = t.path() / "cluster.key";
-    write_key(keyfile);
-    const auto keys = load_cluster_keys(keyfile);
-    const auto port = free_port();
-    NodeInfo server_info{random_node_id(), "127.0.0.1", "server", port};
-    std::atomic_bool object_dispatched{false};
-    RpcServer server(
-        "127.0.0.1", port, keys, server_info,
-        [&](const NodeInfo&, FrameType, const RpcMessage& message) {
-            if (message.type == MessageType::get_object)
-                object_dispatched = true;
-            return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {});
-    server.start();
-
-    int fd = connect_idle(port);
-    NodeInfo client_info{random_node_id(), "127.0.0.1", "client", free_port()};
-    SecureChannel channel(fd, keys, client_info, 64 * 1024);
-    (void)channel.client_handshake(TransportLane::control);
-    // The receiver rejects the frame on its header and closes the session, so
-    // the rest of this send may fail: that is the rejection, seen from here.
-    try {
-        channel.send_fragment(1, FrameType::foreground, MessageType::get_object, true, true, {});
-    } catch (const std::runtime_error&) {
-    }
-
-    // The session ends without a reply; after that nothing can be dispatched.
-    timeval timeout{5, 0};
-    REQUIRE(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-    uint8_t byte = 0;
-    const auto received = ::recv(fd, &byte, 1, 0);
-    const bool timed_out = received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
-    CHECK(received <= 0);
-    CHECK(!timed_out);
-
-    // The receiver, not the sender's lane choice, enforces that object traffic
-    // never dispatches on a CONTROL channel.
-    CHECK(!object_dispatched.load());
-
-    channel.shutdown();
-    server.stop();
 }
 
 } // namespace

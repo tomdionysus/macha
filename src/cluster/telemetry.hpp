@@ -1,19 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "contract/thread_safety.hpp"
-
 #include "types.hpp"
 
 #include <array>
 #include <chrono>
-#include <filesystem>
-#include <functional>
-#include <ctime>
-#include <map>
-#include <mutex>
+#include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -172,13 +165,7 @@ std::optional<ReleaseVersion> parse_release_version(std::string_view);
 // Whether `peer`'s last telemetry names `first` or later. No telemetry: no.
 bool runs_at_least(const std::vector<NodeTelemetry>&, const NodeId& peer, ReleaseVersion first);
 
-Bytes encode_node_telemetry(const NodeTelemetry&);
-NodeTelemetry decode_node_telemetry(std::span<const uint8_t>);
-Bytes encode_telemetry_set(const std::vector<NodeTelemetry>&);
-std::vector<NodeTelemetry> decode_telemetry_set(std::span<const uint8_t>);
-
-// Every node's telemetry as the node beneath Macha holds it. While a TelemetryStore
-// follows one, its records are the source's.
+// Every node's telemetry as the node beneath Macha holds it, read as Macha's.
 class TelemetrySource {
   public:
     virtual ~TelemetrySource() = default;
@@ -189,62 +176,17 @@ class TelemetrySource {
     virtual std::vector<TelemetryView> views(std::chrono::milliseconds fresh_for) const = 0;
 };
 
+// Every node's latest telemetry, this node's included, as Status and the scheduling
+// that reads peers' traffic see it: the node's records, read through `source`.
 class TelemetryStore {
-  public:
-    // The steady time a record's age is measured by; empty reads Clock::now().
-    using Now = std::function<Clock::time_point()>;
-
-  private:
-    struct Record {
-        NodeTelemetry telemetry;
-        Clock::time_point received;
-    };
-
-    Now now_;
-    mutable Mutex mutex_;
-    std::map<NodeId, Record> records_ MACHA_GUARDED_BY(mutex_);
-    std::map<NodeId, NodeTelemetry> persisted_ MACHA_GUARDED_BY(mutex_);
-    std::map<std::string, IdentityAssociationReset, std::less<>> identity_resets_ MACHA_GUARDED_BY(mutex_);
-    // Fixed at construction.
-    NodeId self_{};
-    NodeId boot_id_{};
-    Clock::time_point started_{Clock::now()};
-    std::filesystem::path persisted_path_;
-    // The telemetry thread's own, written by refresh_local alone.
-    Clock::time_point previous_cpu_wall_{Clock::now()};
-    std::clock_t previous_cpu_{std::clock()};
-    uint64_t sequence_{};
-    std::string node_name_ MACHA_GUARDED_BY(mutex_);
-    std::optional<TrafficTotals> previous_traffic_ MACHA_GUARDED_BY(mutex_);
-    Clock::time_point previous_traffic_at_ MACHA_GUARDED_BY(mutex_){};
-    std::shared_ptr<TelemetrySource> source_ MACHA_GUARDED_BY(mutex_);
-
-    std::shared_ptr<TelemetrySource> source() const;
+    std::shared_ptr<TelemetrySource> source_;
 
   public:
-    // From here every record is the source's. Set before the node starts.
-    void follow(std::shared_ptr<TelemetrySource>);
-    // Takes effect from the next sample.
-    void set_node_name(std::string name) {
-        Lock lock(mutex_);
-        node_name_ = std::move(name);
-    }
-    TelemetryStore(NodeId self, std::filesystem::path persisted_path = {}, Now now = {});
-    NodeId boot_id() const { return boot_id_; }
-    NodeTelemetry refresh_local(const NodeInfo&, std::string version, uint64_t cache_capacity,
-                                uint64_t cache_used, uint32_t storage_backends_online,
-                                uint32_t peers_known, uint32_t peers_active,
-                                uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
-                                uint64_t rpc_connections_canonical, NodePhase phase,
-                                std::string api_endpoint, PlaybackBudgets playback = {},
-                                CacheActivity cache = {},
-                                std::optional<TrafficTotals> traffic = {});
-    void observe(NodeTelemetry, bool direct = false);
-    void apply_identity_reset(const IdentityAssociationReset&);
+    explicit TelemetryStore(std::shared_ptr<TelemetrySource> source);
     std::optional<NodeTelemetry> local() const;
     std::vector<NodeTelemetry> all() const;
-    std::vector<NodeTelemetry> recent(std::chrono::milliseconds max_age, size_t max_records = 64) const;
     std::vector<NodeTelemetry> persisted() const;
+    // Writes the newest record per node; waits on the file.
     void persist();
     std::vector<TelemetryView> views(std::chrono::milliseconds fresh_for) const;
 };
