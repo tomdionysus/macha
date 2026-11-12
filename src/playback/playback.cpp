@@ -849,7 +849,13 @@ struct PlaybackManager::Impl {
         std::optional<Json> error MACHA_GUARDED_BY(mutex);
         std::vector<std::shared_ptr<HttpWaker>> waiters MACHA_GUARDED_BY(mutex);
         std::atomic_bool cancelled{};
-        std::shared_ptr<Session> candidate; // set before the start is shared
+        // Owned until the start worker finishes; the live session keeps its
+        // start, so holding the candidate past that would be a cycle.
+        std::shared_ptr<Session> candidate MACHA_GUARDED_BY(mutex);
+        std::shared_ptr<Session> current_candidate() MACHA_EXCLUDES(mutex) {
+            Lock lock(mutex);
+            return candidate;
+        }
         bool finished() const MACHA_REQUIRES(mutex) {
             return stage == "ready" || stage == "failed";
         }
@@ -1137,7 +1143,8 @@ struct PlaybackManager::Impl {
         if (!taken)
             return;
         taken->start->cancelled.store(true);
-        stop_pipeline(*taken->start->candidate);
+        if (const auto candidate = taken->start->current_candidate())
+            stop_pipeline(*candidate);
         Lock done(taken->done_mutex);
         taken->done_cv.wait(done.native(),
                             [&]() MACHA_REQUIRES(taken->done_mutex) { return taken->done; });
@@ -1307,7 +1314,7 @@ struct PlaybackManager::Impl {
     // everything.
     void run_start(const std::shared_ptr<Session>& placeholder,
                    const std::shared_ptr<StartState>& start, const std::string& trace) {
-        auto candidate = start->candidate;
+        auto candidate = start->current_candidate();
         std::string stalled = "planning";
         try {
             prepare_transformed_vod(*candidate, trace);
@@ -1398,6 +1405,10 @@ struct PlaybackManager::Impl {
                           " stage=" + stalled + " error=" + message);
             }
         }
+        {
+            Lock start_lock(start->mutex);
+            start->candidate.reset();
+        }
         Lock lock(mutex);
         --start_workers;
         start_workers_cv.notify_all();
@@ -1409,7 +1420,7 @@ struct PlaybackManager::Impl {
                          const std::shared_ptr<PendingReplacement>& pending,
                          const std::string& trace) {
         auto start = pending->start;
-        auto replacement = start->candidate;
+        auto replacement = start->current_candidate();
         std::string stalled = "planning";
         bool swapped = false;
         try {
@@ -3223,8 +3234,12 @@ struct PlaybackManager::Impl {
                 // start runs beside it. Direct play has no pipeline to wait for.
                 resource_reservation = reserve_resources(*session);
                 auto start = std::make_shared<StartState>();
-                start->candidate = copy_for_start(*session);
-                start->candidate->start = start;
+                auto built = copy_for_start(*session);
+                built->start = start;
+                {
+                    Lock start_lock(start->mutex);
+                    start->candidate = std::move(built);
+                }
                 session->start = start;
                 {
                     Lock lock(mutex);
@@ -3243,6 +3258,10 @@ struct PlaybackManager::Impl {
                                             [&] { run_start(session, start, trace); });
                     }).detach();
                 } catch (...) {
+                    {
+                        Lock start_lock(start->mutex);
+                        start->candidate.reset();
+                    }
                     Lock lock(mutex);
                     sessions.erase(session->id);
                     --start_workers;
@@ -3571,7 +3590,10 @@ struct PlaybackManager::Impl {
             pending->reservation =
                 std::make_shared<ResourceReservation>(reserve_resources(*replacement, old->id));
             pending->start = std::make_shared<StartState>();
-            pending->start->candidate = replacement;
+            {
+                Lock start_lock(pending->start->mutex);
+                pending->start->candidate = replacement;
+            }
             {
                 Lock lock(mutex);
                 auto it = sessions.find(std::string(id));
@@ -3716,8 +3738,9 @@ struct PlaybackManager::Impl {
         // A start running beside a placeholder stops now, freeing its slot.
         if (removed->start) {
             removed->start->cancelled.store(true);
-            if (removed->start->candidate && removed->start->candidate != removed)
-                stop_pipeline(*removed->start->candidate);
+            if (const auto candidate = removed->start->current_candidate();
+                candidate && candidate != removed)
+                stop_pipeline(*candidate);
         }
         cancel_pending(*removed);
         stop_pipeline(*removed);
@@ -4186,8 +4209,8 @@ void PlaybackManager::stop() {
     }
     for (auto& start : starts) {
         start->cancelled.store(true);
-        if (start->candidate)
-            impl_->stop_pipeline(*start->candidate);
+        if (const auto candidate = start->current_candidate())
+            impl_->stop_pipeline(*candidate);
     }
     {
         Lock lock(impl_->mutex);
