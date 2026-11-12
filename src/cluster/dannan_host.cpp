@@ -214,7 +214,7 @@ AsyncRpc DannanHost::call_async(const NodeInfo& peer, MessageType type,
         record_for(peer), dannan_type(type), dannan::net::Bytes(payload.begin(), payload.end()),
         dannan_frame(frame), deadline, io_.get_executor(),
         [promise](dannan::net::CallOutcome outcome) { settle(*promise, std::move(outcome)); });
-    return wrap(std::move(promise), std::move(handle));
+    return wrap(promise, handle);
 }
 
 AsyncRpc DannanHost::call_async(const Endpoint& endpoint, MessageType type,
@@ -226,7 +226,7 @@ AsyncRpc DannanHost::call_async(const Endpoint& endpoint, MessageType type,
         dannan::net::Bytes(payload.begin(), payload.end()), dannan_frame(frame), deadline,
         io_.get_executor(),
         [promise](dannan::net::CallOutcome outcome) { settle(*promise, std::move(outcome)); });
-    return wrap(std::move(promise), std::move(handle));
+    return wrap(promise, handle);
 }
 
 } // namespace macha

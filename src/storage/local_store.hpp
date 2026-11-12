@@ -365,7 +365,7 @@ class LocalStore final : public ObjectStore {
     std::filesystem::file_time_type last_write(const ObjectId&) const;
     void touch(const ObjectId&);
     bool is_packed(const ObjectId&) const;
-    bool compact_packs(std::stop_token = {});
+    bool compact_packs(const std::stop_token& = {});
 
     uint64_t used() const {
         return used_.load(std::memory_order_relaxed);

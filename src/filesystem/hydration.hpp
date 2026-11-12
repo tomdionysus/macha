@@ -73,9 +73,8 @@ class HydrationHintProvider {
     virtual std::vector<HydrationHint> hints() = 0;
     // Optional: wakes a blocked hydrator when the hint set changes. Hints stay
     // authoritative.
-    virtual void set_wake_callback(std::function<void()> callback) {
-        (void)callback;
-    }
+    // NOLINTNEXTLINE(performance-unnecessary-value-param): overrides take ownership
+    virtual void set_wake_callback(std::function<void()> /*callback*/) {}
 };
 
 // Weighted fair scheduler for ordered runs. Hints for the same run merge and

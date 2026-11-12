@@ -2399,8 +2399,12 @@ void IngestManager::resolve_duplicate_destinations(IngestJob& job) {
                 throw;
             }
         }
-        Log::info("ingest destination shared within job id=" + job.id + " path=" + base +
-                  "; planned " + candidate + " instead");
+        Log::info(("ingest destination shared within job id=" + job.id)
+                      .append(" path=")
+                      .append(base)
+                      .append("; planned ")
+                      .append(candidate)
+                      .append(" instead"));
         file.destination_path = candidate;
         file.temporary_path = candidate + ".macha-ingest-" + job.id.substr(0, 12) + ".part";
         file.copied = 0;

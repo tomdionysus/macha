@@ -1543,8 +1543,9 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
             }
             if (foreground && !shared->foreground) {
                 shared->foreground = true;
-                if (shared->active_peer && shared->active_class == ReplicaWorkClass::speculative) {
-                    replica_selector_.promoted(*shared->active_peer);
+                if (const auto peer = shared->active_peer;
+                    peer && shared->active_class == ReplicaWorkClass::speculative) {
+                    replica_selector_.promoted(*peer);
                     shared->active_class = ReplicaWorkClass::foreground;
                 }
             }

@@ -56,7 +56,7 @@ MetadataManager::MetadataManager(NodeRuntime& node, LocalState& local,
     : node_(node), local_(local), metadata_server_(metadata_server),
       namespace_store_(namespace_store), time_(time),
       publication_retention_(std::move(publication_retention)),
-      replicator_([this](std::stop_token stop) { replication_loop(std::move(stop)); }) {}
+      replicator_([this](const std::stop_token& stop) { replication_loop(stop); }) {}
 
 MetadataManager::~MetadataManager() {
     stop_replication();

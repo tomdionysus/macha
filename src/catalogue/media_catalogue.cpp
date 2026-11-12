@@ -611,7 +611,7 @@ std::string title_for_movie_year(std::string core, const YearPosition& year) {
     } else {
         core.resize(year.pos);
     }
-    core = strip_collection_ordinal(std::move(core));
+    core = strip_collection_ordinal(core);
     return clean_title(core);
 }
 
@@ -4178,7 +4178,8 @@ MediaProbeFile BookScanProvider::probe_file(FileSystem& fs, std::string_view roo
         for (const auto& [name, sibling] : siblings) {
             if (sibling.type != EntryType::file || !sibling.size)
                 continue;
-            const auto sibling_path = directory == "/" ? "/" + name : directory + "/" + name;
+            auto sibling_path = directory == "/" ? std::string() : directory;
+            sibling_path.append("/").append(name);
             const auto lowered = lower(name);
             if (lowered == "metadata.opf" && sibling.size <= uint64_t{1024} * 1024) {
                 try {

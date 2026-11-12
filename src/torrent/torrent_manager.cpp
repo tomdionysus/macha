@@ -705,11 +705,11 @@ std::string TorrentManager::adopt(std::string_view id, std::string_view magnet, 
     return add_parsed(std::string(id), parsed, held);
 }
 
-std::string TorrentManager::add_impl(std::string uri, bool allow_fetch) {
+std::string TorrentManager::add_impl(const std::string& uri, bool allow_fetch) {
     if (!enabled_)
         throw std::runtime_error("torrent support is disabled");
     ParsedAdd parsed;
-    parse_add_uri(std::move(uri), allow_fetch, parsed);
+    parse_add_uri(uri, allow_fetch, parsed);
     return add_parsed(to_string(random_node_id()), parsed, false);
 }
 
@@ -789,11 +789,11 @@ std::string TorrentManager::add_parsed(std::string id, ParsedAdd& parsed, bool h
 }
 
 std::string TorrentManager::add(std::string magnet_uri) {
-    return add_impl(std::move(magnet_uri), false);
+    return add_impl(magnet_uri, false);
 }
 
 std::string TorrentManager::add_search_result(std::string acquisition_uri) {
-    return add_impl(std::move(acquisition_uri), true);
+    return add_impl(acquisition_uri, true);
 }
 
 std::vector<TorrentJob> TorrentManager::jobs() const {
