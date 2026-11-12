@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cstddef>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -190,8 +191,8 @@ Bytes TorrentManager::handle_jobs_query(std::span<const uint8_t> request_payload
             auto request = Json::parse(text);
             if (const auto* id = request.find("job_id"); id && id->isString())
                 job_id = id->asString();
+            // NOLINTNEXTLINE(bugprone-empty-catch): a malformed request lists all jobs
         } catch (const std::exception&) {
-            // A malformed request lists all rather than failing the peer.
         }
     }
     Json::Array out_jobs;
@@ -227,6 +228,7 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
             job_id = id->asString();
         if (const auto* act = request.find("action"); act && act->isString())
             action = act->asString();
+        // NOLINTNEXTLINE(bugprone-empty-catch): a malformed request is an unknown action
     } catch (const std::exception&) {
     }
     // For a node without the plugin: a .torrent's canonical magnet and info hash.
@@ -267,6 +269,7 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
                 uri = u->asString();
             if (const auto* s = request.find("search_result"); s && s->isBool())
                 search_result = s->asBool();
+            // NOLINTNEXTLINE(bugprone-empty-catch): a malformed request is answered as missing_uri
         } catch (const std::exception&) {
         }
         Json::Object added;
@@ -404,6 +407,7 @@ void TorrentManager::load_state() {
             if (job.info_hash.empty() && !job.source_uri.empty()) {
                 try {
                     job.info_hash = info_hash_hex(lt::parse_magnet_uri(job.source_uri).info_hashes);
+                    // NOLINTNEXTLINE(bugprone-empty-catch): no hash from a bad magnet
                 } catch (const std::exception&) {
                 }
             }
@@ -440,7 +444,7 @@ void TorrentManager::start() {
     if (!enabled_ || worker_.joinable())
         return;
     restore_jobs();
-    worker_ = std::jthread([this](std::stop_token stop) {
+    worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_escalating(
             "torrent", [this, stop] { loop(stop); },
             [this](std::string reason) {
@@ -646,13 +650,13 @@ struct TorrentManager::ParsedAdd {
     std::string source_uri;
 };
 
-void TorrentManager::parse_add_uri(std::string uri, bool allow_fetch, ParsedAdd& parsed) {
+void TorrentManager::parse_add_uri(const std::string& uri, bool allow_fetch, ParsedAdd& parsed) {
     auto& atp = parsed.params;
     if (auto magnet = sanitize_magnet_uri(uri)) {
         parsed.source_uri = *magnet;
         atp = lt::parse_magnet_uri(*magnet);
     } else if (allow_fetch && safe_torrent_fetch_url(uri)) {
-        auto fetched = impl_->http.get(uri, {}, 4 * 1024 * 1024);
+        auto fetched = impl_->http.get(uri, {}, size_t{4} * 1024 * 1024);
         if (fetched.status < 200 || fetched.status >= 300)
             throw std::runtime_error("torrent URL returned HTTP " + std::to_string(fetched.status));
         std::vector<char> buffer(fetched.body.begin(), fetched.body.end());
@@ -795,6 +799,7 @@ std::string TorrentManager::add_search_result(std::string acquisition_uri) {
 std::vector<TorrentJob> TorrentManager::jobs() const {
     Lock lock(mutex_);
     std::vector<TorrentJob> out;
+    out.reserve(jobs_.size());
     for (const auto& [_, job] : jobs_)
         out.push_back(job);
     std::sort(out.begin(), out.end(),
@@ -819,7 +824,8 @@ bool TorrentManager::pause(std::string_view id) {
         it->second.state == TorrentJobState::cancelled ||
         it->second.state == TorrentJobState::failed)
         return false;
-    if (it->second.ingest_job_id && !ingest_.pause(*it->second.ingest_job_id))
+    if (const auto& ingest_job_id = it->second.ingest_job_id;
+        ingest_job_id && !ingest_.pause(*ingest_job_id))
         return false;
     if (!it->second.ingest_job_id)
         if (auto h = impl_->handles.find(it->first); h != impl_->handles.end()) {
@@ -842,8 +848,8 @@ bool TorrentManager::resume(std::string_view id) {
         return false;
     if (it->second.state != TorrentJobState::paused && it->second.state != TorrentJobState::blocked)
         return false;
-    if (it->second.ingest_job_id) {
-        if (!ingest_.resume(*it->second.ingest_job_id))
+    if (const auto& ingest_job_id = it->second.ingest_job_id) {
+        if (!ingest_.resume(*ingest_job_id))
             return false;
     } else if (auto h = impl_->handles.find(it->first); h != impl_->handles.end())
         release_torrent(h->second);
@@ -911,8 +917,8 @@ bool TorrentManager::cancel(std::string_view id) {
     if (it->second.state == TorrentJobState::completed ||
         it->second.state == TorrentJobState::cancelled)
         return false;
-    if (it->second.ingest_job_id)
-        (void)ingest_.cancel(*it->second.ingest_job_id);
+    if (const auto& ingest_job_id = it->second.ingest_job_id)
+        (void)ingest_.cancel(*ingest_job_id);
     const bool delete_payload = ingest_.delete_owned_source_on_cancel();
     retire_torrent_locked(it->first, delete_payload);
     ingest_.staging().release(it->first);
@@ -1165,7 +1171,7 @@ void TorrentManager::drain_alerts() {
     }
 
     // Only loopback sockets reach no peer: a configuration fault, said once.
-    if (listen_unsettled() && time_.now() - *first_listen_ >= listen_settle) {
+    if (listen_unsettled() && first_listen_ && time_.now() - *first_listen_ >= listen_settle) {
         warned_loopback_only_ = true;
         Log::warn("torrent session bound no routable interface (loopback only): no peer or "
                   "DHT traffic is possible. Set torrent.listen_interfaces, or check that "
@@ -1326,7 +1332,7 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
     return hooks;
 }
 
-void TorrentManager::loop(std::stop_token stop) {
+void TorrentManager::loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         drain_alerts();
         // Piece alerts are a hint, the bitfield the record: re-reporting held

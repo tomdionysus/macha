@@ -83,7 +83,7 @@ class TorrentCoordinator {
         uint64_t changed_unix_ms{};
     };
 
-    void loop(std::stop_token);
+    void loop(const std::stop_token&);
     void pass();
     Outcome write_desired(const TorrentRequest&, TorrentDesired);
     Outcome apply_intent_locally(const std::string& id, TorrentDesired, uint64_t changed_unix_ms);

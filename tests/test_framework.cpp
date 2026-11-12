@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_framework.hpp"
 #include "coverage.hpp"
+#include "errno_text.hpp"
 #include "log.hpp"
 
 #include <algorithm>
@@ -190,7 +191,7 @@ int create_capture_file() {
     const int fd = ::mkstemp(mutable_pattern.data());
     if (fd < 0)
         throw std::runtime_error("mkstemp for test output failed: " +
-                                 std::string(std::strerror(errno)));
+                                 std::string(errno_text(errno)));
     (void)::unlink(mutable_pattern.data());
     return fd;
 }
@@ -302,7 +303,7 @@ RunningCase launch(const TestCase& test, std::size_t selection_index,
     const pid_t pid = ::fork();
     if (pid < 0) {
         ::close(capture_fd);
-        throw std::runtime_error("fork failed: " + std::string(std::strerror(errno)));
+        throw std::runtime_error("fork failed: " + std::string(errno_text(errno)));
     }
     if (pid == 0)
         child_run(test, selection_index, capture_fd);
@@ -329,7 +330,7 @@ std::optional<Result> poll_finished(RunningCase& running) {
         waited = ::waitpid(running.pid, &status, WNOHANG);
     } while (waited < 0 && errno == EINTR);
     if (waited < 0)
-        throw std::runtime_error("waitpid failed: " + std::string(std::strerror(errno)));
+        throw std::runtime_error("waitpid failed: " + std::string(errno_text(errno)));
     const auto now = Clock::now();
     const auto elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - running.started);

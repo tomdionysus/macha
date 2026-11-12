@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "storage/durability_domain.hpp"
 #include "diagnostics.hpp"
+#include "errno_text.hpp"
 #include "observation.hpp"
 #include "supervised.hpp"
 
@@ -23,7 +24,7 @@ void sync_file(const std::filesystem::path& path) {
     if (fd < 0) {
         if (errno == ENOENT)
             return;
-        throw std::runtime_error("cannot open durability file: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot open durability file: " + std::string(errno_text(errno)));
     }
     int rc;
     do {
@@ -32,7 +33,7 @@ void sync_file(const std::filesystem::path& path) {
     const int saved = errno;
     ::close(fd);
     if (rc != 0)
-        throw std::runtime_error("cannot sync durability file: " + std::string(strerror(saved)));
+        throw std::runtime_error("cannot sync durability file: " + std::string(errno_text(saved)));
 }
 
 void sync_directory(const std::filesystem::path& path) {
@@ -43,7 +44,7 @@ void sync_directory(const std::filesystem::path& path) {
         if (errno == ENOENT)
             return;
         throw std::runtime_error("cannot open durability directory: " +
-                                 std::string(strerror(errno)));
+                                 std::string(errno_text(errno)));
     }
     int rc;
     do {
@@ -53,7 +54,7 @@ void sync_directory(const std::filesystem::path& path) {
     ::close(fd);
     if (rc != 0)
         throw std::runtime_error("cannot sync durability directory: " +
-                                 std::string(strerror(saved)));
+                                 std::string(errno_text(saved)));
 }
 #endif
 
@@ -70,7 +71,7 @@ DurabilityDomain::DurabilityDomain(uint64_t id, std::filesystem::path representa
     // DATA backend's.
     barrier_series_ = "durability.barrier_us." + representative.filename().string();
     add_representative(std::move(representative));
-    worker_ = std::jthread([this](std::stop_token stop) {
+    worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("durability-domain", stop, [this, stop] { loop(stop); });
     });
 }
@@ -91,8 +92,9 @@ void DurabilityDomain::add_representative(std::filesystem::path path) {
         representatives_.push_back(std::move(path));
 }
 
-DurabilityDomain::Generation DurabilityDomain::complete_mutation(std::filesystem::path file,
-                                                                 std::filesystem::path directory) {
+DurabilityDomain::Generation
+DurabilityDomain::complete_mutation(const std::filesystem::path& file,
+                                    const std::filesystem::path& directory) {
     Lock lock(mutex_);
     if (failure_)
         std::rethrow_exception(failure_);
@@ -157,7 +159,8 @@ bool DurabilityDomain::failed() const {
     return failure_ != nullptr;
 }
 
-void DurabilityDomain::perform_barrier(Generation cut, std::vector<PortableMutation> portable) {
+void DurabilityDomain::perform_barrier(Generation cut,
+                                       const std::vector<PortableMutation>& portable) {
     const auto started = Clock::now();
 #if defined(__linux__)
     (void)cut;
@@ -188,7 +191,7 @@ void DurabilityDomain::perform_barrier(Generation cut, std::vector<PortableMutat
     }
     if (!synced)
         throw std::runtime_error("cannot sync durability domain: " +
-                                 std::string(strerror(last_error)));
+                                 std::string(errno_text(last_error)));
 #else
     std::vector<std::filesystem::path> files;
     std::vector<std::filesystem::path> directories;

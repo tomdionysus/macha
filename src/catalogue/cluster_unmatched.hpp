@@ -58,7 +58,7 @@ class ClusterUnmatchedView {
         std::vector<CatalogueHint> hints;
     };
 
-    void loop(std::stop_token);
+    void loop(const std::stop_token&);
     void poll(const NodeInfo&);
 
     NodeRuntime& node_;

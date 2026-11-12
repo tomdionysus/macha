@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "config.hpp"
 #include "crypto.hpp"
+#include "errno_text.hpp"
 #include "fuse/fuse_mountpoint.hpp"
 #include "log.hpp"
 #include "media/ffmpeg_log.hpp"
@@ -44,7 +45,7 @@ int main(int argc, char** argv) {
         const int blocked = pthread_sigmask(SIG_BLOCK, &service_signals, nullptr);
         if (blocked != 0)
             throw std::runtime_error("cannot block service signals: " +
-                                     std::string(std::strerror(blocked)));
+                                     std::string(macha::errno_text(blocked)));
 
         // How long a DATA commit that asks for durability waits so that others
         // share its physical sync.
@@ -57,7 +58,7 @@ int main(int argc, char** argv) {
             const int waited = sigwait(&service_signals, &signal);
             if (waited != 0)
                 throw std::runtime_error("cannot wait for service signal: " +
-                                         std::string(std::strerror(waited)));
+                                         std::string(macha::errno_text(waited)));
 #ifdef SIGHUP
             if (signal == SIGHUP) {
                 try {

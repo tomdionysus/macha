@@ -72,7 +72,7 @@ void Accounts::start() {
     }
     if (gossip_.joinable())
         return;
-    gossip_ = std::jthread([this](std::stop_token stop) {
+    gossip_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("accounts-gossip", stop, [this, stop] { gossip_loop(stop); });
     });
 }
@@ -164,7 +164,7 @@ std::set<NodeId> Accounts::active_peers() const {
     return peers;
 }
 
-void Accounts::gossip_loop(std::stop_token stop) {
+void Accounts::gossip_loop(const std::stop_token& stop) {
     // `network.telemetry_interval_ms`, floored so a mis-set value cannot spin.
     const auto interval = std::max(cfg_.telemetry_interval, std::chrono::milliseconds(250));
     while (!stop.stop_requested()) {

@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
 #include <fcntl.h>
 #include <fstream>
 #include <sys/resource.h>
@@ -62,6 +63,7 @@ bool encrypted_mobi(const std::filesystem::path& path) {
 // The pid, or -1.
 pid_t spawn(const std::vector<std::string>& argv, const std::filesystem::path& log) {
     std::vector<char*> args;
+    args.reserve(argv.size());
     for (const auto& arg : argv)
         args.push_back(const_cast<char*>(arg.c_str()));
     args.push_back(nullptr);
@@ -241,7 +243,7 @@ bool BookConversions::erase(const std::string& media_id, const std::string& form
     }
 }
 
-void BookConversions::work(std::stop_token stop) {
+void BookConversions::work(const std::stop_token& stop) {
     for (;;) {
         Job job;
         {
@@ -279,7 +281,7 @@ ConversionState BookConversions::convert(const Job& job) {
     // The source, copied whole first: the child reads a plain file.
     {
         std::ofstream out(input, std::ios::binary | std::ios::trunc);
-        std::vector<uint8_t> buffer(1024 * 1024);
+        std::vector<uint8_t> buffer(size_t{1024} * 1024);
         uint64_t done = 0;
         try {
             while (done < job.source.size) {

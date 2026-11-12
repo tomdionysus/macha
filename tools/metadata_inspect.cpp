@@ -214,6 +214,7 @@ int main(int argc, char** argv) {
         }
 
         std::vector<Hash256> pending;
+        pending.reserve(heads.size());
         for (const auto& head : heads)
             pending.push_back(head.hash);
         std::set<Hash256> seen;

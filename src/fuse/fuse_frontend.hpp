@@ -584,6 +584,7 @@ class FuseFrontend final : public HydrationHintProvider {
                     try {
                         promise->set_exception(std::make_exception_ptr(
                             FsError(ETIMEDOUT, "FUSE request deadline exceeded before execution")));
+                        // NOLINTNEXTLINE(bugprone-empty-catch): promise already satisfied
                     } catch (...) {
                     }
                 }
@@ -611,6 +612,7 @@ class FuseFrontend final : public HydrationHintProvider {
                 request_state->store(FuseRequestState::complete, std::memory_order_release);
                 try {
                     promise->set_exception(std::current_exception());
+                    // NOLINTNEXTLINE(bugprone-empty-catch): promise already satisfied
                 } catch (...) {
                 }
             }

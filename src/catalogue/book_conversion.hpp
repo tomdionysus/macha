@@ -44,7 +44,7 @@ class BookConversions final : public MediaConversions {
     std::vector<std::jthread> workers_;
 
     std::filesystem::path output_path(const Key&) const;
-    void work(std::stop_token);
+    void work(const std::stop_token&);
     ConversionState convert(const Job&);
     void evict();
 

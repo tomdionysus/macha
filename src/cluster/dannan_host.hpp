@@ -97,8 +97,8 @@ class DannanHost {
   private:
     // The peer's record as the roster knows it, else one made from what Macha holds.
     dannan::membership::NodeRecord record_for(const NodeInfo& peer) const;
-    AsyncRpc wrap(std::shared_ptr<std::promise<RpcReply>> promise,
-                  std::shared_ptr<dannan::net::CallHandle> handle);
+    AsyncRpc wrap(const std::shared_ptr<std::promise<RpcReply>>& promise,
+                  const std::shared_ptr<dannan::net::CallHandle>& handle);
 
     boost::asio::io_context io_;
     boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work_;

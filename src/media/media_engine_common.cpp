@@ -56,14 +56,8 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
     const double requested_seconds = requested_ms / 1000.0;
     result.playback.seek_requested = std::chrono::milliseconds(requested_ms);
 
-    if (prepared.playback.mode == PlaybackMode::transcode) {
-        // The encoder starts exactly at the request, offset zero, and lays down its
-        // own GOP via fixed_vod_durations, so no keyframe or density check applies.
-        result.playback.seek = std::chrono::milliseconds(requested_ms);
-        result.playback.seek_offset = {};
-        result.segment_durations = fixed_vod_durations(
-            prepared.source_duration_seconds, requested_seconds, prepared.seek_segment_seconds);
-    } else if (!prepared.video_random_access_points.empty()) {
+    if (prepared.playback.mode != PlaybackMode::transcode &&
+        !prepared.video_random_access_points.empty()) {
         auto indexed = media_vod::indexed_plan(prepared.video_random_access_points,
                                                prepared.source_duration_seconds, requested_ms,
                                                prepared.seek_segment_seconds);
@@ -75,6 +69,9 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
         result.playback.seek_offset = std::chrono::milliseconds(indexed->seek_offset_ms);
         result.segment_durations = std::move(indexed->segment_durations);
     } else {
+        // A transcode's encoder starts exactly at the request, offset zero, and lays
+        // down its own GOP via fixed_vod_durations, so no keyframe or density check
+        // applies. Without a keyframe index other modes take the same plan.
         result.playback.seek = std::chrono::milliseconds(requested_ms);
         result.playback.seek_offset = {};
         result.segment_durations = fixed_vod_durations(

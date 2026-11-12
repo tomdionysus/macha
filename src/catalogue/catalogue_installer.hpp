@@ -17,7 +17,7 @@ class CatalogueInstaller {
     NodeEvents& events_;
     std::jthread worker_;
 
-    void loop(std::stop_token);
+    void loop(const std::stop_token&);
 
   public:
     CatalogueInstaller(CatalogueManager& catalogue, NodeEvents& events) noexcept

@@ -28,7 +28,7 @@ struct AvioContextDeleter {
             return;
         // avio_alloc_context() does not own the av_malloc() buffer; release both as
         // one scoped allocation.
-        av_freep(&value->buffer);
+        av_freep(static_cast<void*>(&value->buffer));
         avio_context_free(&value);
     }
 };

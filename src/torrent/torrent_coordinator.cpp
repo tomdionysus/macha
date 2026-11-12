@@ -176,7 +176,7 @@ TorrentCoordinator::~TorrentCoordinator() {
 void TorrentCoordinator::start() {
     if (worker_.joinable())
         return;
-    worker_ = std::jthread([this](std::stop_token stop) {
+    worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("torrent-coordinator", stop, [this, stop] { loop(stop); });
     });
 }
@@ -189,7 +189,7 @@ void TorrentCoordinator::stop() {
     worker_.join();
 }
 
-void TorrentCoordinator::loop(std::stop_token stop) {
+void TorrentCoordinator::loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         pass_now();
         Mutex wait_mutex; // guards nothing: the wait's own lock
@@ -342,6 +342,7 @@ TorrentCoordinator::add(std::string_view uri, bool search_result, std::optional<
                 }
             put(snapshot, delta, request);
         });
+        // NOLINTNEXTLINE(bugprone-empty-catch): sentinel, nothing to write
     } catch (const Unchanged&) {
     } catch (const std::exception& e) {
         out.status = 503;
@@ -516,6 +517,7 @@ TorrentCoordinator::Outcome TorrentCoordinator::act(std::string_view id, std::st
                 put(snapshot, delta, updated);
                 cleared = updated;
             });
+            // NOLINTNEXTLINE(bugprone-empty-catch): sentinel, nothing to write
         } catch (const Unchanged&) {
         } catch (const std::exception& e) {
             out.status = 503;
@@ -621,6 +623,7 @@ TorrentCoordinator::Outcome TorrentCoordinator::write_desired(const TorrentReque
             put(snapshot, delta, updated);
             written = updated;
         });
+        // NOLINTNEXTLINE(bugprone-empty-catch): sentinel, nothing to write
     } catch (const Unchanged&) {
     } catch (const std::exception& e) {
         out.status = 503;
@@ -690,6 +693,7 @@ TorrentCoordinator::patch(std::string_view id, std::optional<std::optional<uint6
             put(snapshot, delta, updated);
             written = updated;
         });
+        // NOLINTNEXTLINE(bugprone-empty-catch): sentinel, nothing to write
     } catch (const Unchanged&) {
     } catch (const std::exception& e) {
         out.status = 503;
@@ -810,6 +814,7 @@ void TorrentCoordinator::publish_intents() {
             if (!any)
                 throw Unchanged{};
         });
+        // NOLINTNEXTLINE(bugprone-empty-catch): sentinel, nothing to write
     } catch (const Unchanged&) {
     } catch (const std::exception& e) {
         Log::debug("torrent intents not published yet: " + std::string(e.what()));

@@ -63,13 +63,14 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
     // The namespace tree's own nodes: omitting them would let the collector
     // delete the namespace, so an unreadable node marks the whole set
     // incomplete and nothing is released against it.
-    if (!counted && head.snapshot->namespace_root) {
+    const auto& namespace_root = head.snapshot->namespace_root;
+    if (!counted && namespace_root) {
         try {
-            collect_namespace_tree_nodes(*head.snapshot->namespace_root, nodes, control);
+            collect_namespace_tree_nodes(*namespace_root, nodes, control);
         } catch (const std::exception& error) {
             complete = false;
             Log::warn("retention release horizon namespace tree unavailable root=" +
-                      to_string(*head.snapshot->namespace_root) + " error=" + error.what());
+                      to_string(*namespace_root) + " error=" + error.what());
         }
     }
     for (const auto& batch : head.snapshot->tombstone_batches)

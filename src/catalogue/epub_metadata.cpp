@@ -1075,8 +1075,8 @@ EpubMetadata read_epub_metadata(uint64_t size,
                     read_member(source, cover_member->second, limits.max_cover_bytes, budget);
                 cover.mime_type = std::move(parsed.cover->mime_type);
                 parsed.metadata.cover = std::move(cover);
+                // NOLINTNEXTLINE(bugprone-empty-catch): a bad cover does not make a bad book
             } catch (const EpubError&) {
-                // A bad cover does not make a bad book.
             }
         }
     }

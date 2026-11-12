@@ -66,7 +66,7 @@ Json sources_json(const std::vector<ClusterJobView::Source>& sources) {
         item["local"] = source.local;
         item["reachable"] = source.reachable;
         item["as_of_unix_ms"] = source.as_of_unix_ms ? Json(source.as_of_unix_ms) : Json(nullptr);
-        out.push_back(std::move(item));
+        out.emplace_back(std::move(item));
     }
     return Json(std::move(out));
 }
@@ -387,7 +387,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 item["active_jobs"] = static_cast<uint64_t>(node.offer.active_jobs);
                 item["staging"] =
                     node.staging ? staging_capacity_json(*node.staging) : Json(nullptr);
-                nodes.push_back(std::move(item));
+                nodes.emplace_back(std::move(item));
             }
             Json::Object out;
             out["nodes"] = std::move(nodes);
@@ -448,13 +448,14 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 root["node_id"] = outcome.node ? Json(to_string(*outcome.node)) : Json(nullptr);
                 return http_json(409, Json(std::move(root)).dump());
             }
-            if (outcome.status != 202)
+            if (outcome.status != 202 || !outcome.request)
                 return outcome_error(outcome);
+            const auto& job = *outcome.request;
             Json::Object out;
-            out["id"] = outcome.request->id;
-            out["info_hash"] = outcome.request->info_hash;
+            out["id"] = job.id;
+            out["info_hash"] = job.info_hash;
             out["node_id"] = pin ? Json(to_string(*pin)) : Json(nullptr);
-            out["job"] = request_json(*outcome.request, {});
+            out["job"] = request_json(job, {});
             return http_json(202, Json(std::move(out)).dump());
         }
 
@@ -505,13 +506,12 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                     auto parsed = parse_node_id(*node, error);
                     if (!parsed)
                         return http_error(400, "bad_request", error);
-                    pin = *parsed == NodeId{} ? std::optional<NodeId>{}
-                                              : std::optional<NodeId>{*parsed};
+                    pin = *parsed == NodeId{} ? std::optional<NodeId>{} : parsed;
                 }
                 if (!remove_after && !pin)
                     return http_error(400, "bad_request", "remove_after_ms or node_id is required");
                 const auto outcome = torrents_.patch(target->first, remove_after, pin);
-                if (outcome.status != 200)
+                if (outcome.status != 200 || !outcome.request)
                     return outcome_error(outcome);
                 return http_json(200, request_json(*outcome.request, live_ages()).dump());
             }

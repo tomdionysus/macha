@@ -50,7 +50,7 @@ class ClusterStatusService {
     Mutex wait_mutex_;
     std::condition_variable_any wait_cv_;
 
-    void persistence_loop(std::stop_token);
+    void persistence_loop(const std::stop_token&);
     void persist_local_status();
     // `nodes_page`: the nodes as a paged list (GET /api/v1/status/nodes).
     HttpResponse status_response(const StatusSources&, const std::optional<NodeId>& only = {},

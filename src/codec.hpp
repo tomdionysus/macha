@@ -3,6 +3,7 @@
 
 #include "types.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -56,13 +57,13 @@ class Reader {
         return static_cast<int64_t>(u64());
     }
     Bytes raw(size_t);
-    Bytes bytes(size_t maximum = 256 * 1024 * 1024);
+    Bytes bytes(size_t maximum = size_t{256} * 1024 * 1024);
     std::string string(size_t maximum = 65536);
 
     // Zero-copy reads: the span borrows the caller's buffer and must not outlive
     // the decode. raw()/bytes() copy, for results handed onwards.
     std::span<const uint8_t> view(size_t);
-    std::span<const uint8_t> view_bytes(size_t maximum = 256 * 1024 * 1024);
+    std::span<const uint8_t> view_bytes(size_t maximum = size_t{256} * 1024 * 1024);
 
     template <size_t N> std::array<uint8_t, N> fixed() {
         need(N);

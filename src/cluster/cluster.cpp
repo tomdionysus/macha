@@ -260,9 +260,9 @@ void NodeRuntime::start() {
     auto& node = host_.node();
     // Every change from the first: a joined for each node active now, then each one.
     if (!roster_watch_)
-        roster_watch_ =
-            node.nodes().watch(boost::asio::make_strand(node.time().executor()),
-                               [this](dannan::RosterChange change) { on_roster_change(change); });
+        roster_watch_ = node.nodes().watch(
+            boost::asio::make_strand(node.time().executor()),
+            [this](const dannan::RosterChange& change) { on_roster_change(change); });
 
     // Control plane before any expensive backend recovery: peers can
     // authenticate this node at once and Status can tell reachability from
@@ -274,7 +274,7 @@ void NodeRuntime::start() {
               std::to_string(node.port()) + " domain=" + members_.self().failure_domain +
               " state=recovering");
 
-    runtime_ = std::jthread([this](std::stop_token stop) {
+    runtime_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("cluster-runtime", stop, [this, stop] { runtime_loop(stop); });
     });
 }
@@ -501,7 +501,7 @@ void NodeRuntime::wake_runtime() {
     runtime_wait_cv_.notify_all();
 }
 
-void NodeRuntime::runtime_loop(std::stop_token stop) {
+void NodeRuntime::runtime_loop(const std::stop_token& stop) {
     ThreadCpuReporter cpu_reporter("macha-node", std::chrono::seconds(5), true);
     while (!stop.stop_requested()) {
         const auto demand = runtime_demand_.load(std::memory_order_acquire);

@@ -35,7 +35,7 @@ FuseSubsystem::FuseSubsystem(const SubsystemContext& context,
                              std::unique_ptr<FuseMountDriver> driver)
     : registry_(*context.registry), hydration_(*context.hydration),
       filesystem_(*context.filesystem), config_(context.config->fuse),
-      mount_path_(*context.config->fuse.mount_path), driver_(std::move(driver)) {
+      mount_path_(context.config->fuse.mount_path.value()), driver_(std::move(driver)) {
     // Per attempt, not per process: a remount after mount loss needs the
     // stale-mount recovery and the fail-closed guard on the covered directory.
     prepare_fuse_mountpoint(mount_path_, config_);
@@ -66,12 +66,12 @@ void FuseSubsystem::attach_fault_sink(FaultSink sink) {
 void FuseSubsystem::start() {
     if (mount_.joinable())
         return;
-    mount_ = std::jthread([this](std::stop_token stop) {
+    mount_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_once("fuse-mount", [this, stop] { run_mount(stop); });
     });
 }
 
-void FuseSubsystem::run_mount(std::stop_token stop) {
+void FuseSubsystem::run_mount(const std::stop_token& stop) {
     FuseMountContext context;
     context.frontend = frontend_.get();
     context.filesystem = &filesystem_;

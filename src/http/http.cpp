@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "http/http.hpp"
 #include "diagnostics.hpp"
+#include "errno_text.hpp"
 #include "http/http_compression.hpp"
 
 #include "json.hpp"
@@ -15,6 +16,7 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
@@ -95,9 +97,9 @@ namespace {
 
 using namespace std::chrono_literals;
 
-constexpr size_t max_header_bytes = 64 * 1024;
-constexpr size_t recv_buffer_bytes = 16 * 1024;
-constexpr size_t recv_per_pass_bytes = 64 * 1024;
+constexpr size_t max_header_bytes = size_t{64} * 1024;
+constexpr size_t recv_buffer_bytes = size_t{16} * 1024;
+constexpr size_t recv_per_pass_bytes = size_t{64} * 1024;
 // Input a connection may buffer while not being read (pipelining ahead);
 // past this the reactor stops polling for POLLIN until the response is done.
 constexpr size_t parked_input_bytes = max_header_bytes;
@@ -261,7 +263,7 @@ class Inbox {
         int fds[2] = {-1, -1};
         if (::pipe(fds) != 0)
             throw std::runtime_error("cannot create HTTP reactor wake pipe: " +
-                                     std::string(std::strerror(errno)));
+                                     std::string(errno_text(errno)));
         wake_read_ = fds[0];
         wake_write_ = fds[1];
         set_non_blocking(wake_read_);
@@ -338,7 +340,7 @@ struct Lane {
     void start(size_t workers) {
         threads.reserve(workers);
         for (size_t i = 0; i < workers; ++i)
-            threads.emplace_back([this](std::stop_token stop) {
+            threads.emplace_back([this](const std::stop_token& stop) {
                 run_supervised_loop(name, stop, [this, stop] { loop(stop); });
             });
     }
@@ -381,7 +383,7 @@ struct Lane {
         return queue.size();
     }
 
-    void loop(std::stop_token stop) {
+    void loop(const std::stop_token& stop) {
         set_thread_name(thread_name);
         while (!stop.stop_requested()) {
             Job job;
@@ -404,6 +406,7 @@ struct Lane {
                 job.run();
             } catch (const std::exception& e) {
                 Log::debug("HTTP " + std::string(name) + " lane job: " + e.what());
+                // NOLINTNEXTLINE(bugprone-empty-catch): non-standard exception, nothing to report
             } catch (...) {
             }
             busy.fetch_sub(1, std::memory_order_relaxed);
@@ -610,15 +613,15 @@ void HttpWaker::fire() {
 }
 
 void HttpWaker::arm(std::function<void()> wake) {
-    bool now = false;
     {
         Lock lock(mutex_);
-        if (fired_)
-            now = true;
-        else
+        if (!fired_) {
             wake_ = std::move(wake);
+            return;
+        }
     }
-    if (now && wake)
+    // Already fired: the wake is due now, outside the lock.
+    if (wake)
         wake();
 }
 
@@ -712,7 +715,7 @@ struct HttpServer::Impl {
     }
 
     size_t chunk_bytes() const noexcept {
-        return std::max<size_t>(16 * 1024, config.stream_chunk_bytes);
+        return std::max<size_t>(size_t{16} * 1024, config.stream_chunk_bytes);
     }
 
     size_t staging_chunks() const noexcept {
@@ -923,7 +926,7 @@ struct HttpServer::Impl {
         return listen_fd;
     }
 
-    void reactor_loop(std::stop_token stop) {
+    void reactor_loop(const std::stop_token& stop) {
         set_thread_name("macha-http-io");
         int listen_fd = -1;
         try {
@@ -953,7 +956,7 @@ struct HttpServer::Impl {
             if (ready < 0) {
                 if (errno == EINTR)
                     continue;
-                Log::error("HTTP API poll failed: " + std::string(std::strerror(errno)));
+                Log::error("HTTP API poll failed: " + std::string(errno_text(errno)));
                 break;
             }
             const auto pass_started = Clock::now();
@@ -1069,7 +1072,7 @@ struct HttpServer::Impl {
                     const auto now = Clock::now();
                     if (now - last_accept_warning > 5s) {
                         last_accept_warning = now;
-                        Log::warn("HTTP API cannot accept: " + std::string(std::strerror(errno)));
+                        Log::warn("HTTP API cannot accept: " + std::string(errno_text(errno)));
                     }
                 }
                 return;
@@ -1574,7 +1577,7 @@ void HttpServer::start() {
     impl_->data.max_queued = impl_->config.max_queued_requests;
     impl_->control.start(std::max<size_t>(1, impl_->config.control_workers));
     impl_->data.start(std::max<size_t>(1, impl_->config.workers));
-    impl_->reactor = std::jthread([this](std::stop_token stop) {
+    impl_->reactor = std::jthread([this](const std::stop_token& stop) {
         run_supervised_once("http-reactor", [this, stop] { impl_->reactor_loop(stop); });
     });
     Lock lock(impl_->startup_mutex);

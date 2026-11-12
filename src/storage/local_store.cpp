@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "storage/local_store.hpp"
 #include "codec.hpp"
+#include "errno_text.hpp"
 #include "log.hpp"
 #include "startup_progress.hpp"
 #include "supervised.hpp"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -18,6 +20,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 namespace macha {
 namespace {
 // Releases a held Mutex through the caller's Lock for its scope and retakes
@@ -76,7 +79,8 @@ void pwa_exact(int fd, std::span<const uint8_t> data, uint64_t offset) {
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            throw std::runtime_error("cannot write storage state: " + std::string(strerror(errno)));
+            throw std::runtime_error("cannot write storage state: " +
+                                     std::string(errno_text(errno)));
         }
         done += static_cast<size_t>(n);
     }
@@ -208,7 +212,7 @@ std::optional<PackHeader> decode_pack_header(std::span<const uint8_t> bytes) {
 // plus valid SHA-256 inside one is not a realistic false positive. Reads in
 // bounded chunks; hashes only where the magic matches.
 std::optional<uint64_t> find_next_pack_header(int fd, uint64_t from, uint64_t file_size) {
-    constexpr size_t chunk = 1024 * 1024;
+    constexpr size_t chunk = size_t{1024} * 1024;
     static_assert(chunk > 2 * pack_header_size);
     uint64_t position = from;
     while (position + pack_header_size <= file_size) {
@@ -246,7 +250,7 @@ void wa(int fd, std::span<const uint8_t> bytes) {
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            throw std::runtime_error(strerror(errno));
+            throw std::runtime_error(errno_text(errno));
         }
         done += static_cast<size_t>(n);
     }
@@ -300,7 +304,7 @@ void PosixLocalStoreFiles::install(const std::filesystem::path& path, std::span<
     try {
         fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
         if (fd < 0)
-            throw std::runtime_error(strerror(errno));
+            throw std::runtime_error(errno_text(errno));
         wa(fd, head);
         wa(fd, body);
         // An ephemeral store (the cache) is never synced; nothing it writes
@@ -309,9 +313,9 @@ void PosixLocalStoreFiles::install(const std::filesystem::path& path, std::span<
         const int close_rc = ::close(fd);
         fd = -1;
         if (close_rc != 0)
-            throw std::runtime_error(strerror(errno));
+            throw std::runtime_error(errno_text(errno));
         if (::rename(temp.c_str(), path.c_str()) != 0)
-            throw std::runtime_error(strerror(errno));
+            throw std::runtime_error(errno_text(errno));
     } catch (...) {
         if (fd >= 0)
             ::close(fd);
@@ -324,10 +328,10 @@ void PosixLocalStoreFiles::install(const std::filesystem::path& path, std::span<
 Bytes PosixLocalStoreFiles::read(const std::filesystem::path& path) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0)
-        throw std::runtime_error("cannot open object: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot open object: " + std::string(errno_text(errno)));
     struct stat st{};
     if (fstat(fd, &st) != 0 || st.st_size < 0) {
-        const auto error = std::string(strerror(errno));
+        const auto error = std::string(errno_text(errno));
         close(fd);
         throw std::runtime_error("cannot stat object: " + error);
     }
@@ -338,7 +342,7 @@ Bytes PosixLocalStoreFiles::read(const std::filesystem::path& path) {
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            const auto error = std::string(strerror(errno));
+            const auto error = std::string(errno_text(errno));
             close(fd);
             throw std::runtime_error("cannot read object: " + error);
         }
@@ -349,7 +353,7 @@ Bytes PosixLocalStoreFiles::read(const std::filesystem::path& path) {
         done += static_cast<size_t>(n);
     }
     if (close(fd) != 0)
-        throw std::runtime_error("cannot close object: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot close object: " + std::string(errno_text(errno)));
     return out;
 }
 
@@ -357,7 +361,7 @@ std::optional<Bytes> PosixLocalStoreFiles::read_at(const std::filesystem::path& 
                                                    uint64_t offset, size_t size) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0)
-        throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot open pack: " + std::string(errno_text(errno)));
     std::optional<Bytes> out(std::in_place, size);
     size_t done = 0;
     while (done < size) {
@@ -365,7 +369,7 @@ std::optional<Bytes> PosixLocalStoreFiles::read_at(const std::filesystem::path& 
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            const auto error = std::string(strerror(errno));
+            const auto error = std::string(errno_text(errno));
             ::close(fd);
             throw std::runtime_error("cannot read pack: " + error);
         }
@@ -376,7 +380,7 @@ std::optional<Bytes> PosixLocalStoreFiles::read_at(const std::filesystem::path& 
         done += static_cast<size_t>(n);
     }
     if (::close(fd) != 0)
-        throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot close pack: " + std::string(errno_text(errno)));
     return out;
 }
 
@@ -384,7 +388,7 @@ void PosixLocalStoreFiles::append(const std::filesystem::path& path, std::span<c
                                   std::span<const uint8_t> body) {
     int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0)
-        throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot open pack: " + std::string(errno_text(errno)));
     try {
         wa(fd, head);
         wa(fd, body);
@@ -393,7 +397,7 @@ void PosixLocalStoreFiles::append(const std::filesystem::path& path, std::span<c
         throw;
     }
     if (::close(fd) != 0)
-        throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot close pack: " + std::string(errno_text(errno)));
 }
 
 bool PosixLocalStoreFiles::truncate(const std::filesystem::path& path, uint64_t size) {
@@ -419,7 +423,7 @@ PosixLocalStoreFiles::list(const std::filesystem::path& dir) {
         if (size_error)
             throw std::runtime_error("cannot size " + entry.path().string() + ": " +
                                      size_error.message());
-        files.push_back({entry.path(), size});
+        files.emplace_back(entry.path(), size);
     }
     if (error)
         throw std::runtime_error("cannot list " + dir.string() + ": " + error.message());
@@ -436,9 +440,9 @@ StorageLock::StorageLock(const std::filesystem::path& root) {
     auto path = root / ".macha.lock";
     fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0600);
     if (fd_ < 0)
-        throw std::runtime_error("cannot open storage lock: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot open storage lock: " + std::string(errno_text(errno)));
     if (flock(fd_, LOCK_EX | LOCK_NB) != 0) {
-        auto error = std::string(strerror(errno));
+        auto error = std::string(errno_text(errno));
         close(fd_);
         fd_ = -1;
         throw std::runtime_error("storage path is already in use: " + error);
@@ -452,7 +456,7 @@ StorageLock::~StorageLock() {
     }
 }
 
-LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
+LocalStore::LocalStore(std::filesystem::path root, const LocalStoreOptions& options,
                        std::array<uint8_t, 32> key, LocalStoreMode mode,
                        std::shared_ptr<DurabilityDomain> durability_domain, LocalStoreFiles& files)
     : root_(std::move(root)), objects_(root_ / "objects"), packs_(root_ / "packs"),
@@ -481,7 +485,7 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
         durability_domain_ = std::make_shared<DurabilityDomain>(1, root_);
     accounting_fd_ = ::open(accounting_path_.c_str(), O_RDWR | O_CREAT, 0600);
     if (accounting_fd_ < 0)
-        throw std::runtime_error("cannot open accounting state: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot open accounting state: " + std::string(errno_text(errno)));
 
     // The ledger exists before any walk starts: the walk records into it.
     if (!options.ledger_dir.empty() && mode_ == LocalStoreMode::authoritative) {
@@ -527,13 +531,13 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
         presence_index_entries_.store(ledger_->size(), std::memory_order_relaxed);
         return;
     }
-    presence_thread_ = std::jthread([this](std::stop_token stop) {
+    presence_thread_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_once("local-store-presence", [this, stop] { warm_presence_index(stop); });
     });
 }
 
 void LocalStore::start_scan() {
-    scan_thread_ = std::jthread([this](std::stop_token stop) {
+    scan_thread_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_once("local-store-scan", [this, stop] {
             try {
                 scan(stop);
@@ -637,6 +641,7 @@ LocalStore::~LocalStore() {
                 ObjectId none{};
                 persist_accounting(used_.load(std::memory_order_relaxed), accounting_none, none, 0,
                                    true);
+                // NOLINTNEXTLINE(bugprone-empty-catch): best-effort checkpoint in a destructor
             } catch (...) {
             }
         }
@@ -657,7 +662,7 @@ void LocalStore::persist_accounting(uint64_t used, uint8_t operation, const Obje
     auto encoded = encode_accounting(record);
     pwa_exact(accounting_fd_, encoded, accounting_slot_ * accounting_slot_size);
     if (durable && fsync(accounting_fd_) != 0)
-        throw std::runtime_error("cannot sync accounting state: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot sync accounting state: " + std::string(errno_text(errno)));
 }
 
 bool LocalStore::restore_accounting(bool* clean) {
@@ -784,7 +789,7 @@ std::shared_ptr<IoMutex> LocalStore::object_mutex(const ObjectId& id) const {
 void LocalStore::remember_verified_loose_locked(const ObjectId& id, const LooseStamp& stamp) const {
     const auto sequence = ++verified_loose_sequence_;
     verified_loose_[id] = {stamp, sequence};
-    verified_loose_order_.push_back({sequence, id});
+    verified_loose_order_.emplace_back(sequence, id);
     while (verified_loose_.size() > verified_loose_limit && !verified_loose_order_.empty()) {
         const auto [candidate_sequence, candidate] = verified_loose_order_.front();
         verified_loose_order_.pop_front();
@@ -795,7 +800,7 @@ void LocalStore::remember_verified_loose_locked(const ObjectId& id, const LooseS
     if (verified_loose_order_.size() > verified_loose_limit * 4) {
         verified_loose_order_.clear();
         for (const auto& [candidate, verified] : verified_loose_)
-            verified_loose_order_.push_back({verified.sequence, candidate});
+            verified_loose_order_.emplace_back(verified.sequence, candidate);
         std::sort(verified_loose_order_.begin(), verified_loose_order_.end());
     }
 }
@@ -969,7 +974,7 @@ void LocalStore::rebuild_pack_index(bool truncate_incomplete_tail) {
             continue;
         }
         if (auto seq = pack_sequence(name))
-            files.push_back({*seq, entry.path()});
+            files.emplace_back(*seq, entry.path());
     }
     if (error)
         throw std::runtime_error("cannot enumerate packs: " + error.message());
@@ -980,13 +985,13 @@ void LocalStore::rebuild_pack_index(bool truncate_incomplete_tail) {
         int fd = ::open(file.c_str(), truncate_incomplete_tail ? O_RDWR : O_RDONLY);
         if (fd < 0)
             throw std::runtime_error("cannot open pack during recovery: " +
-                                     std::string(strerror(errno)));
+                                     std::string(errno_text(errno)));
         struct stat st{};
         if (::fstat(fd, &st) != 0 || st.st_size < 0) {
             const auto saved = errno;
             ::close(fd);
             throw std::runtime_error("cannot stat pack during recovery: " +
-                                     std::string(strerror(saved)));
+                                     std::string(errno_text(saved)));
         }
         const uint64_t file_size = static_cast<uint64_t>(st.st_size);
         uint64_t offset = 0;
@@ -1020,7 +1025,7 @@ void LocalStore::rebuild_pack_index(bool truncate_incomplete_tail) {
                             ::close(fd);
                             throw std::runtime_error(
                                 "cannot truncate torn pack tail at " + file.string() +
-                                " offset=" + std::to_string(offset) + ": " + strerror(saved));
+                                " offset=" + std::to_string(offset) + ": " + errno_text(saved));
                         }
                         Log::warn("truncated undecodable pack tail path=" + file.string() +
                                   " offset=" + std::to_string(offset) +
@@ -1147,7 +1152,7 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
             generation = durability_domain_->complete_mutation(p, p.parent_path());
             last_mutation_generation_ = std::max(last_mutation_generation_, generation);
             provisional_generations_[id] = generation;
-            provisional_order_.push_back({generation, id});
+            provisional_order_.emplace_back(generation, id);
             reap_durable_generations_locked();
         }
         return true;
@@ -1210,7 +1215,7 @@ bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> 
         generation = durability_domain_->complete_mutation(entry.file, packs_);
         last_mutation_generation_ = std::max(last_mutation_generation_, generation);
         provisional_generations_[id] = generation;
-        provisional_order_.push_back({generation, id});
+        provisional_order_.emplace_back(generation, id);
         reap_durable_generations_locked();
     }
     return true;
@@ -1249,7 +1254,7 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                 generation = durability_domain_->complete_mutation(record.file, packs_);
                 last_mutation_generation_ = std::max(last_mutation_generation_, generation);
                 provisional_generations_[id] = generation;
-                provisional_order_.push_back({generation, id});
+                provisional_order_.emplace_back(generation, id);
             }
             if (deferred_generation)
                 *deferred_generation = generation;
@@ -1801,7 +1806,7 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
     std::vector<std::pair<ObjectId, PackEntry>> victim_entries;
     for (const auto& [id, entry] : packed_snapshot)
         if (entry.file == victim->file)
-            victim_entries.push_back({id, entry});
+            victim_entries.emplace_back(id, entry);
 
     std::filesystem::path replacement;
     uint64_t replacement_size = 0;
@@ -1818,7 +1823,7 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
             fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
             if (fd < 0)
                 throw std::runtime_error("cannot create compacted pack: " +
-                                         std::string(strerror(errno)));
+                                         std::string(errno_text(errno)));
 
             for (const auto& [id, old_entry] : victim_entries) {
                 if (old_entry.payload_offset < pack_header_size)
@@ -1839,16 +1844,16 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
 
             if (::fsync(fd) != 0)
                 throw std::runtime_error("cannot sync compacted pack: " +
-                                         std::string(strerror(errno)));
+                                         std::string(errno_text(errno)));
             if (::close(fd) != 0) {
                 fd = -1;
                 throw std::runtime_error("cannot close compacted pack: " +
-                                         std::string(strerror(errno)));
+                                         std::string(errno_text(errno)));
             }
             fd = -1;
             if (::rename(temp.c_str(), replacement.c_str()) != 0)
                 throw std::runtime_error("cannot install compacted pack: " +
-                                         std::string(strerror(errno)));
+                                         std::string(errno_text(errno)));
             temp.clear();
             syncdir(packs_);
         } catch (...) {
@@ -1927,7 +1932,7 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
 bool LocalStore::compact_packs(std::stop_token stop) {
     Lock pack_io_lock(pack_io_mutex_);
     Lock lock(m_);
-    if (!wait_for_accounting(lock, stop, true))
+    if (!wait_for_accounting(lock, std::move(stop), true))
         return false;
     return compact_packs_locked(lock);
 }
@@ -1944,7 +1949,7 @@ void LocalStore::await_accounting() const {
     wait_for_accounting(lock);
 }
 
-bool LocalStore::wait_for_accounting(Lock& lock, std::stop_token stop, bool exact) const {
+bool LocalStore::wait_for_accounting(Lock& lock, const std::stop_token& stop, bool exact) const {
     // Ordinary puts/removes proceed on a checkpoint estimate; only callers
     // that need the reconciled figure (compaction) wait for the walk.
     if (!exact && accounting_estimate_.load(std::memory_order_acquire) &&
@@ -2063,7 +2068,7 @@ LocalStore::VerifyResult LocalStore::verify_step(size_t directories) {
     return result;
 }
 
-void LocalStore::warm_presence_index(std::stop_token stop) {
+void LocalStore::warm_presence_index(const std::stop_token& stop) {
     // Until a walk completes, has() asks the device on a miss; a failed walk
     // is retried, backing off to five minutes, so that stays temporary.
     auto backoff = std::chrono::seconds(1);
@@ -2121,7 +2126,7 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
     }
 }
 
-void LocalStore::scan(std::stop_token stop) {
+void LocalStore::scan(const std::stop_token& stop) {
     Log::debug("storage accounting scan begin path=" + root_.string());
     uint64_t total = 0;
     std::error_code error;
@@ -2254,14 +2259,14 @@ NodeId load_or_create_node_id(const std::filesystem::path& state) {
     {
         int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd < 0)
-            throw std::runtime_error(strerror(errno));
+            throw std::runtime_error(errno_text(errno));
         auto text = to_string(id) + "\n";
         wa(fd, {reinterpret_cast<const uint8_t*>(text.data()), text.size()});
         (void)fsync(fd);
         close(fd);
     }
     if (::rename(tmp.c_str(), file.c_str()) != 0)
-        throw std::runtime_error(strerror(errno));
+        throw std::runtime_error(errno_text(errno));
     syncdir(state);
     return id;
 }

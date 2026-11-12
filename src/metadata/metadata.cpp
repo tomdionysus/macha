@@ -2,12 +2,14 @@
 #include "metadata/metadata.hpp"
 #include "codec.hpp"
 #include "durable_file.hpp"
+#include "errno_text.hpp"
 #include "log.hpp"
 #include "observation.hpp"
 #include "resident_bytes.hpp"
 #include "startup_progress.hpp"
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -462,22 +464,22 @@ void truncate_durable(const std::filesystem::path& path, size_t size) {
     int fd = open(path.c_str(), O_WRONLY);
     if (fd < 0)
         throw std::runtime_error("cannot open metadata journal for truncation " + path.string() +
-                                 ": " + strerror(errno));
+                                 ": " + errno_text(errno));
     if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
         const auto error = errno;
         close(fd);
         throw std::runtime_error("cannot truncate metadata journal " + path.string() + ": " +
-                                 strerror(error));
+                                 errno_text(error));
     }
     if (fsync(fd) != 0) {
         const auto error = errno;
         close(fd);
         throw std::runtime_error("cannot sync truncated metadata journal " + path.string() + ": " +
-                                 strerror(error));
+                                 errno_text(error));
     }
     if (close(fd) != 0)
         throw std::runtime_error("cannot close truncated metadata journal " + path.string() + ": " +
-                                 strerror(errno));
+                                 errno_text(errno));
 }
 
 std::filesystem::path quarantine_journal_tail(const std::filesystem::path& path,
@@ -494,26 +496,26 @@ void sync_directory(const std::filesystem::path& path) {
     int fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY);
     if (fd < 0)
         throw std::runtime_error("cannot open metadata directory " + directory.string() + ": " +
-                                 strerror(errno));
+                                 errno_text(errno));
     if (fsync(fd) != 0) {
         const auto error = errno;
         close(fd);
         throw std::runtime_error("cannot sync metadata directory " + directory.string() + ": " +
-                                 strerror(error));
+                                 errno_text(error));
     }
     if (close(fd) != 0)
         throw std::runtime_error("cannot close metadata directory " + directory.string() + ": " +
-                                 strerror(errno));
+                                 errno_text(errno));
 }
 
 std::optional<std::filesystem::path> quarantine_metadata_file(const std::filesystem::path& path,
                                                               const std::string& suffix) {
     if (!std::filesystem::exists(path))
         return {};
-    const auto quarantine = std::filesystem::path(path.string() + suffix);
+    auto quarantine = std::filesystem::path(path.string() + suffix);
     if (rename(path.c_str(), quarantine.c_str()) != 0)
         throw std::runtime_error("cannot quarantine metadata file " + path.string() + ": " +
-                                 strerror(errno));
+                                 errno_text(errno));
     sync_directory(path);
     return quarantine;
 }
@@ -618,6 +620,7 @@ tombstones_of(const MetadataSnapshot& snapshot,
         try {
             if (const auto bytes = read_batch(batch.id))
                 content = decode_tombstone_batch(*bytes);
+            // NOLINTNEXTLINE(bugprone-empty-catch): an unreadable batch is counted below
         } catch (const std::exception&) {
         }
         if (!content || content->ids.size() != batch.count ||
@@ -722,7 +725,7 @@ size_t prune_superseded_conflicts(MetadataSnapshot& snapshot, const NamespaceLoo
     }
     return pruned;
 }
-void encode_torrent_requests(Writer& w, const MetadataSnapshot& s) {
+static void encode_torrent_requests(Writer& w, const MetadataSnapshot& s) {
     if (s.torrent_requests.size() > max_torrent_requests)
         throw std::runtime_error("too many torrent requests");
     w.u32(static_cast<uint32_t>(s.torrent_requests.size()));
@@ -733,7 +736,7 @@ void encode_torrent_requests(Writer& w, const MetadataSnapshot& s) {
     }
 }
 
-void decode_torrent_requests(Reader& r, MetadataSnapshot& s) {
+static void decode_torrent_requests(Reader& r, MetadataSnapshot& s) {
     const auto count = r.u32();
     if (count > max_torrent_requests)
         throw DecodeError("too many torrent requests");
@@ -1943,7 +1946,7 @@ std::string metadata_conflict_id(const MetadataConflict& conflict) {
     return to_string(sha256(writer.data()));
 }
 
-MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32> k,
+MetadataReplica::MetadataReplica(const std::filesystem::path& r, std::array<uint8_t, 32> k,
                                  std::optional<MetadataRecord> recovery_seed,
                                  bool accept_pristine_genesis_authority,
                                  uint64_t materialization_cache_limit_bytes,
@@ -2494,7 +2497,7 @@ void MetadataReplica::write_history_frame(std::span<const uint8_t> bytes) const 
     int fd = open(history_p_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0)
         throw std::runtime_error("cannot open metadata history " + history_p_.string() + ": " +
-                                 strerror(errno));
+                                 errno_text(errno));
     size_t offset = 0;
     while (offset < bytes.size()) {
         auto count = write(fd, bytes.data() + offset, bytes.size() - offset);
@@ -2504,7 +2507,7 @@ void MetadataReplica::write_history_frame(std::span<const uint8_t> bytes) const 
             const auto error = errno;
             close(fd);
             throw std::runtime_error("cannot write metadata history " + history_p_.string() + ": " +
-                                     strerror(error));
+                                     errno_text(error));
         }
         offset += static_cast<size_t>(count);
     }
@@ -2513,12 +2516,12 @@ void MetadataReplica::write_history_frame(std::span<const uint8_t> bytes) const 
         const auto error = errno;
         close(fd);
         throw std::runtime_error("cannot sync metadata history " + history_p_.string() + ": " +
-                                 strerror(error));
+                                 errno_text(error));
     }
     observations().record("metadata.history_sync_us", elapsed_us(sync_started));
     if (close(fd) != 0)
         throw std::runtime_error("cannot close metadata history " + history_p_.string() + ": " +
-                                 strerror(errno));
+                                 errno_text(errno));
 }
 
 std::optional<uint64_t>
@@ -2527,7 +2530,7 @@ next_history_frame(std::istream& file, uint64_t from, uint64_t file_size, uint64
                    bool& read_failed) {
     constexpr uint64_t envelope_bytes = 12 + 16 + 4;
     constexpr uint64_t header_bytes = 4 + envelope_bytes;
-    constexpr uint64_t window = 1024 * 1024;
+    constexpr uint64_t window = uint64_t{1024} * 1024;
     Bytes buffer(window);
     uint64_t at = from;
     while (at + header_bytes <= file_size) {
