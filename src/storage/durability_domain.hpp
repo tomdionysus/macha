@@ -58,7 +58,7 @@ class DurabilityDomain {
     std::atomic_uint64_t physical_barriers_{};
 
     void loop(std::stop_token);
-    void perform_barrier(Generation cut, std::vector<PortableMutation> portable);
+    void perform_barrier(Generation cut, const std::vector<PortableMutation>& portable);
 
   public:
     DurabilityDomain(uint64_t id, std::filesystem::path representative,
@@ -75,8 +75,8 @@ class DurabilityDomain {
     // Called only after the mutation's write/rename/unlink syscalls have
     // completed. A barrier cut taken before this call cannot claim the mutation;
     // a cut taken after it can. That ordering is the core generation invariant.
-    Generation complete_mutation(std::filesystem::path file = {},
-                                 std::filesystem::path directory = {});
+    Generation complete_mutation(const std::filesystem::path& file = {},
+                                 const std::filesystem::path& directory = {});
 
     void await_durable(Generation, DurabilityUrgency = DurabilityUrgency::batchable);
     void flush();

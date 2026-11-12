@@ -321,7 +321,7 @@ class DistributedStore final : public ControlObjectSource {
     void note_repair_unsourceable(const ObjectId&);
     void note_repair_local_unreadable(const ObjectId&);
     void queue_prompt_replication(const ObjectId&);
-    void prompt_replication_loop(std::stop_token);
+    void prompt_replication_loop(const std::stop_token&);
     void enqueue_local_copy(const ObjectId&, std::span<const uint8_t>, bool promote);
     void local_writer_loop(std::stop_token);
     // Held while taking a SharedFetch's mutex, which waiters hold across their
@@ -383,7 +383,7 @@ class DistributedStore final : public ControlObjectSource {
     DistributedStore(ClusterNode& n, LocalState& local, ActivityClocks& activity,
                      DataResourceArbiter& data_resources, RetainedMemoryLedger& retained_memory,
                      NodeEvents& events, DistributedStoreOptions options = {});
-    ~DistributedStore();
+    ~DistributedStore() override;
     // Waits until every local copy queued so far is written or dropped.
     void wait_local_copies_settled();
     struct PromptReplicationStats {

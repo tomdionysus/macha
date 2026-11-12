@@ -190,8 +190,8 @@ class CacheHydrator {
     HydrationStatus status_ MACHA_GUARDED_BY(mutex_);
 
     std::vector<HydrationHint> collect_hints();
-    void loop(std::stop_token);
-    void fetch_loop(std::stop_token);
+    void loop(const std::stop_token&);
+    void fetch_loop(const std::stop_token&);
     std::optional<std::future<bool>> submit(HydrationRequest);
 
   public:

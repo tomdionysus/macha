@@ -27,7 +27,7 @@ Json parse_body(const HttpRequest& request) {
 Json user_json(const UserRecord& user, const UserMutability& mutability) {
     Json::Array roles;
     for (const auto& role : user.roles)
-        roles.push_back(role);
+        roles.emplace_back(role);
     Json::Object out;
     out["id"] = user.id;
     out["username"] = user.username;
@@ -46,7 +46,7 @@ Json user_json(const UserRecord& user, const UserMutability& mutability) {
     may["set_roles"] = mutability.set_roles;
     Json::Array required;
     for (const auto& role : mutability.required_roles)
-        required.push_back(role);
+        required.emplace_back(role);
     may["required_roles"] = std::move(required);
     if (mutability.last_user_manager)
         may["required_roles_reason"] = std::string("last_user_manager");

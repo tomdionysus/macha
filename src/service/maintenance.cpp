@@ -107,7 +107,7 @@ Maintenance::~Maintenance() {
 }
 
 void Maintenance::start() {
-    thread_ = std::jthread([this](std::stop_token maintenance_stop) {
+    thread_ = std::jthread([this](const std::stop_token& maintenance_stop) {
         run_supervised_loop("service-maintenance", maintenance_stop,
                             [this, maintenance_stop] { run(maintenance_stop); });
     });
@@ -262,7 +262,7 @@ void Maintenance::run(std::stop_token stop) {
     auto last_own_cpu_ns = thread_cpu_time_ns();
     uint64_t last_metadata_remote_epoch = node_.remote_metadata_epoch();
     std::vector<NodeId> last_active_nodes;
-    bool metadata_dirty = port_.metadata_convergence.pending();
+    bool metadata_dirty = false;
     bool catalogue_dirty = true;
     auto metadata_retry_due = Clock::time_point{};
     auto metadata_retry_backoff = maintenance_background_interval(policy);
@@ -889,6 +889,7 @@ void Maintenance::run(std::stop_token stop) {
                     if (!erase.empty()) {
                         const auto ids = [](const std::vector<GarbageRef>& refs) {
                             std::vector<std::string> hex;
+                            hex.reserve(refs.size());
                             for (const auto& ref : refs)
                                 hex.push_back(to_string(ref.id));
                             std::sort(hex.begin(), hex.end());
@@ -1223,9 +1224,10 @@ void Maintenance::run(std::stop_token stop) {
                     }
                 }
             }
-
+            // NOLINTNEXTLINE(bugprone-empty-catch): stop request, handled by the loop
         } catch (const MaintenanceStopping&) {
             // Asked to stop inside a long walk: the loop's condition ends it.
+            // NOLINTNEXTLINE(bugprone-empty-catch): normal state, already published
         } catch (const MetadataNotReady&) {
             // Normal startup/recovery state. MetadataManager has already
             // published any availability transition; do not duplicate it on
@@ -1413,7 +1415,7 @@ bool Maintenance::absorb_events() {
     return wake;
 }
 
-void Maintenance::wait_for_events(std::stop_token stop, Clock::time_point deadline) {
+void Maintenance::wait_for_events(const std::stop_token& stop, Clock::time_point deadline) {
     // The predicate only compares counts: absorbing reads the metadata
     // replica, which must not happen under the lock notify() takes.
     while (!stop.stop_requested()) {
@@ -1441,7 +1443,7 @@ std::optional<Clock::time_point> Maintenance::retry_trigger_due() const {
     if (!retry_trigger_first_)
         return std::nullopt;
     if (!convergence_failed_)
-        return *retry_trigger_first_;
+        return retry_trigger_first_;
     const auto& policy = node_.config().maintenance;
     return std::min(*retry_trigger_first_ + policy.convergence_max_delay,
                     retry_trigger_last_ + policy.convergence_settle);

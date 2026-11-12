@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -90,7 +91,7 @@ class DiskServiceMonitor {
             ;
 
         // What this operation should have cost on a coping device, given its size.
-        constexpr uint64_t mib = 1024 * 1024;
+        constexpr uint64_t mib = uint64_t{1024} * 1024;
         const auto expected_us =
             static_cast<uint64_t>(thresholds_.overhead.count()) * 1000 +
             (bytes * static_cast<uint64_t>(thresholds_.per_mib.count()) * 1000) / mib;
@@ -152,8 +153,8 @@ class DiskServiceMonitor {
             Log::info(std::string(what) + " slowdown_percent=" + std::to_string(slowdown) +
                       " last_percent=" + std::to_string(ratio) + " last_us=" +
                       std::to_string(micros) + " last_bytes=" + std::to_string(bytes));
+            // NOLINTNEXTLINE(bugprone-empty-catch): a log line never fails the I/O it logs
         } catch (...) {
-            // A log line must never fail the I/O it describes.
         }
     }
 

@@ -13,6 +13,7 @@
 #include <mutex>
 #include <system_error>
 #include <thread>
+#include <utility>
 
 namespace macha {
 namespace {
@@ -72,7 +73,7 @@ SubsystemSupervisor::~SubsystemSupervisor() {
 }
 
 void SubsystemSupervisor::start(SubsystemContext context) {
-    context_ = context;
+    context_ = std::move(context);
     discover_plugins();
 
     for (auto& entry : entries_) {
@@ -82,7 +83,7 @@ void SubsystemSupervisor::start(SubsystemContext context) {
                 continue; // failed to load
         }
         Entry* raw = entry.get();
-        raw->lifecycle = std::jthread([this, raw](std::stop_token stop) {
+        raw->lifecycle = std::jthread([this, raw](const std::stop_token& stop) {
             run_supervised_loop(raw->name, stop, [this, raw, stop] { run_entry(*raw, stop); });
         });
     }
@@ -111,6 +112,7 @@ void SubsystemSupervisor::discover_plugins() {
         entry->handle = ::dlopen(candidate.path().c_str(), RTLD_NOW | RTLD_LOCAL);
         if (!entry->handle) {
             Log::error("subsystem plugin '" + entry->name +
+                       // NOLINTNEXTLINE(concurrency-mt-unsafe): plugins load on one thread
                        "' failed to load: " + std::string(::dlerror()));
             {
                 Lock lock(entry->mutex);
@@ -120,8 +122,10 @@ void SubsystemSupervisor::discover_plugins() {
             continue;
         }
 
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): plugins load on one thread
         ::dlerror(); // clear any pending error, per dlsym(3)
         auto* raw_symbol = ::dlsym(entry->handle, kSubsystemEntrySymbol);
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): plugins load on one thread
         if (const char* symbol_error = ::dlerror(); symbol_error || !raw_symbol) {
             // Not a plugin: the default plugin_path is the executable's
             // directory, which may hold unrelated .so files (/usr/bin/ld.so).
@@ -164,7 +168,7 @@ void SubsystemSupervisor::discover_plugins() {
     }
 }
 
-void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
+void SubsystemSupervisor::run_entry(Entry& entry, const std::stop_token& stop) {
     RetryState retry;
 
     while (!stop.stop_requested()) {

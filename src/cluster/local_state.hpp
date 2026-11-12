@@ -148,9 +148,9 @@ class LocalState {
 
   private:
     void recover_data(const Config&, const NodeIdentity&, RecoveryProgress&, const StageHook&,
-                      std::stop_token, std::chrono::milliseconds durability_batch_window);
+                      const std::stop_token&, std::chrono::milliseconds durability_batch_window);
     void recover_state(const Config&, const NodeIdentity&, ClusterNode&, RecoveryProgress&,
-                       const StageHook&, std::stop_token);
+                       const StageHook&, const std::stop_token&);
 
     // The replica is declared after the cache it reads, so destroyed first.
     std::unique_ptr<StoragePool> data_;

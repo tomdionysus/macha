@@ -74,8 +74,9 @@ Tristate yaml_tristate(const YAML::Node& node, const char* what) {
 // a file carrying a key nothing read.
 class ConfigNode {
   public:
-    ConfigNode(YAML::Node node, std::string path, std::shared_ptr<std::set<std::string>> read)
-        : node_(std::move(node)), path_(std::move(path)), read_(std::move(read)) {}
+    ConfigNode(const YAML::Node& node, std::string path,
+               std::shared_ptr<std::set<std::string>> read)
+        : node_(node), path_(std::move(path)), read_(std::move(read)) {}
 
     ConfigNode operator[](std::string_view key) const {
         auto child = path_.empty() ? std::string(key) : path_ + "." + std::string(key);
@@ -85,6 +86,7 @@ class ConfigNode {
     }
     std::vector<ConfigNode> elements() const {
         std::vector<ConfigNode> out;
+        out.reserve(node_.size());
         for (size_t i = 0; i < node_.size(); ++i)
             out.emplace_back(node_[i], path_ + "[" + std::to_string(i) + "]", read_);
         return out;
@@ -1110,6 +1112,7 @@ Config parse_config(int argc, char** argv) {
         const std::string option = argv[i];
         if (option == "--help" || option == "-h") {
             print_usage(argv[0]);
+            // NOLINTNEXTLINE(concurrency-mt-unsafe): option parsing, before any thread starts
             std::exit(0);
         }
         if (option == "--config") {
@@ -1193,6 +1196,7 @@ Config parse_config(int argc, char** argv) {
             config.ffmpeg_log_level = parse_ffmpeg_log_level(need(i, "--ffmpeg-log-level"));
         } else if (option == "--help" || option == "-h") {
             print_usage(argv[0]);
+            // NOLINTNEXTLINE(concurrency-mt-unsafe): option parsing, before any thread starts
             std::exit(0);
         } else {
             throw std::runtime_error("unknown option: " + option);

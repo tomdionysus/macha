@@ -213,7 +213,7 @@ std::string container_for_extension(std::string_view path) {
 }
 
 std::string container_for_format(std::string_view format, std::string_view path) {
-    const auto by_name = container_for_extension(path);
+    auto by_name = container_for_extension(path);
     std::set<std::string_view> probed;
     std::string_view first_token;
     size_t begin = 0;

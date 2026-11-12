@@ -27,7 +27,7 @@ std::string advertised_failure_domain(const Config& config, const std::string& h
 dannan::NodeConfig dannan_node_config(const Config& config, dannan::identity::ClusterKey key) {
     dannan::NodeConfig out;
     out.state_path = config.state_path;
-    out.key = std::move(key);
+    out.key = key;
     out.node_name = config.node_name;
     out.listen_host = config.listen_host;
     out.advertise_host = advertised_host(config);

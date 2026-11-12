@@ -77,7 +77,7 @@ void print(const Frame& frame, const std::string& note = {}) {
 
 // Reads the root directory from the tree and reports the cost: a stat is one
 // path from the root, not the whole namespace.
-void nodes_read_probe(const NamespaceNodeStore& nodes, const ObjectId& root) {
+static void nodes_read_probe(const NamespaceNodeStore& nodes, const ObjectId& root) {
     const auto started = std::chrono::steady_clock::now();
     const auto entry = namespace_tree_lookup(root, "/", nodes, false);
     const auto elapsed =
@@ -129,7 +129,8 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; ++i) {
         if (std::string(argv[i]) == "--all")
             all = true;
-        else if (std::string(argv[i]) == "--stats")
+        else if (std::string(argv[i]) == "--stats" || std::string(argv[i]) == "--tree")
+            // --tree implies --stats, which materialises the head.
             stats = true;
         else if (std::string(argv[i]) == "--replay-write") {
             replay_write = true;
@@ -144,9 +145,6 @@ int main(int argc, char** argv) {
             merge_deltas = true;
         } else if (std::string(argv[i]) == "--entries-check") {
             entries_check = true;
-            stats = true;
-        } else if (std::string(argv[i]) == "--tree") {
-            // Implies --stats, which materialises the head.
             stats = true;
         } else
             heads_path = argv[i];

@@ -101,7 +101,7 @@ class TorrentManager final : public TorrentService {
     void load_state();
     void save_state_locked() const MACHA_REQUIRES(mutex_);
     void restore_jobs();
-    void loop(std::stop_token);
+    void loop(const std::stop_token&);
     // The disk backend's admission and measurement: loader-class DATA credit,
     // and the DATA device's service monitor when staging shares its device.
     TorrentDiskHooks disk_hooks() const;
@@ -152,7 +152,7 @@ class TorrentManager final : public TorrentService {
     // A parsed add: libtorrent's params and the canonical magnet to persist.
     // Defined in the .cpp, which alone sees libtorrent's types.
     struct ParsedAdd;
-    void parse_add_uri(std::string uri, bool allow_fetch, ParsedAdd& out);
+    void parse_add_uri(const std::string& uri, bool allow_fetch, ParsedAdd& out);
     std::string add_parsed(std::string id, ParsedAdd& parsed, bool held);
 
   public:

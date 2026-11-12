@@ -23,7 +23,7 @@ namespace macha {
 // lasted longer than the ceiling), until `stop`. A body that returns normally
 // has finished and is not restarted. The body must hold no state across a
 // restart that its own start does not rebuild.
-void run_supervised_loop(std::string_view name, std::stop_token stop,
+void run_supervised_loop(std::string_view name, const std::stop_token& stop,
                          const std::function<void()>& body) noexcept;
 
 // A task that runs once -- a connection, a transcode, a start-up phase, a

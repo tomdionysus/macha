@@ -248,20 +248,20 @@ class IngestManager {
 
     void load_state();
     void save_state_locked() const MACHA_REQUIRES(mutex_);
-    void loop(std::stop_token);
+    void loop(const std::stop_token&);
     void catalogue_loop(std::stop_token);
     // Picks the next job no worker holds, or empty. Caller must hold mutex_.
     std::string select_job_locked() const MACHA_REQUIRES(mutex_);
-    void process_job(const std::string&, std::stop_token);
-    bool plan_job(IngestJob&, std::stop_token);
-    bool import_job(IngestJob&, std::stop_token);
+    void process_job(const std::string&, const std::stop_token&);
+    bool plan_job(IngestJob&, const std::stop_token&);
+    bool import_job(IngestJob&, const std::stop_token&);
     // Stores the worker's copy of the job. False if the job is gone, or was
     // paused or cancelled meanwhile: it is then stored under that state.
     bool record_progress(IngestJob&) MACHA_EXCLUDES(mutex_);
     // Gives every unfinished file of a planned job a destination no other
     // file of the job uses.
     void resolve_duplicate_destinations(IngestJob&);
-    bool copy_file(IngestJob&, IngestFileProgress&, std::stop_token);
+    bool copy_file(IngestJob&, IngestFileProgress&, const std::stop_token&);
     // The manifest of a torrent-sourced file whose every extent the torrent
     // disk backend has published, from the job's TorrentExtentJournal.
     std::optional<std::vector<ExtentRef>> published_extents(const IngestJob&,

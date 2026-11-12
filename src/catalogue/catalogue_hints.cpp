@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <system_error>
+#include <utility>
 
 namespace macha {
 namespace {
@@ -291,7 +292,7 @@ CatalogueHintQueue::submit_many(std::vector<CatalogueHintSubmission> submissions
     Lock lock(mutex_);
     bool changed = false;
     for (auto& submission : submissions) {
-        auto path = normalize_path(std::move(submission.path));
+        auto path = normalize_path(submission.path);
         if (path.empty() || path == "/" || submission.source.empty())
             continue;
 
@@ -330,11 +331,9 @@ CatalogueHintQueue::submit_many(std::vector<CatalogueHintSubmission> submissions
         // id, so a changed file at the same path reopens it.
         bool reopen_terminal = false;
         if (was_terminal) {
-            if (submission.source == "manual") {
-                reopen_terminal = true;
-            } else if (submission.source == "media-profile") {
-                // Made only after a catalogue miss: always reopen, or a
-                // cleared, rejected or incomplete profile could stay pending.
+            if (submission.source == "manual" || submission.source == "media-profile") {
+                // A media-profile hint is made only after a catalogue miss: always
+                // reopen, or a cleared, rejected or incomplete profile could stay pending.
                 reopen_terminal = true;
             } else if (submission.source == "scanner" || submission.source == "namespace") {
                 if (!hint.media_id.empty() && !submission.source_ref.empty())
@@ -471,9 +470,9 @@ bool CatalogueHintQueue::wait_for_change(std::stop_token stop, uint64_t observed
     // while active, so a dirty queue persists within two seconds; a crash
     // replays at most that window.
     persist_dirty_state_locked(false);
-    return change_cv_.wait_for(lock.native(), stop, timeout, [&]() MACHA_REQUIRES(mutex_) {
-        return revision_ != observed_revision;
-    });
+    return change_cv_.wait_for(
+        lock.native(), std::move(stop), timeout,
+        [&]() MACHA_REQUIRES(mutex_) { return revision_ != observed_revision; });
 }
 
 void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provider,
@@ -532,7 +531,7 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
 }
 
 std::string CatalogueHintQueue::put_unmatched(std::string path, std::string media_id) {
-    path = normalize_path(std::move(path));
+    path = normalize_path(path);
     const auto now = now_ms();
     Lock lock(mutex_);
     auto& hint = hints_[path];
@@ -600,7 +599,7 @@ void CatalogueHintQueue::defer(std::string_view id, std::string code, std::strin
 
 size_t
 CatalogueHintQueue::defer_matching(const std::function<bool(const CatalogueHint&)>& predicate,
-                                   std::string code, std::string error,
+                                   const std::string& code, const std::string& error,
                                    uint64_t retry_after_unix_ms) {
     const auto now = now_ms();
     Lock lock(mutex_);

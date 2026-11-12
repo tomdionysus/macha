@@ -42,7 +42,6 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
 } // namespace
 
 NodeIdentity::NodeIdentity(const std::filesystem::path& state_path, ClusterKeys cluster_keys)
-    : keys(std::move(cluster_keys)), id(load_v18_node_id(state_path)),
-      durability_epoch(random_node_id()) {}
+    : keys(cluster_keys), id(load_v18_node_id(state_path)), durability_epoch(random_node_id()) {}
 
 } // namespace macha

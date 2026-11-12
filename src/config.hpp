@@ -6,6 +6,7 @@
 #include "retry_policy.hpp"
 #include "types.hpp"
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <vector>
@@ -32,9 +33,9 @@ struct StorageBackendConfig {
 struct StoragePackingConfig {
     // Immutable DATA objects at or below this size go into append-only packs
     // (a local physical representation only).
-    size_t threshold{1024 * 1024};
+    size_t threshold{size_t{1024} * 1024};
     // Approximate; one record may push the final pack slightly over.
-    size_t target_size{64 * 1024 * 1024};
+    size_t target_size{size_t{64} * 1024 * 1024};
 };
 
 struct MetadataObjectStoreConfig {
@@ -174,7 +175,7 @@ struct FuseConfig {
     // Hard bounds on namespace operations batched into one metadata
     // publication; a single operation is always admitted.
     size_t namespace_batch_operations{256};
-    size_t namespace_batch_bytes{256 * 1024};
+    size_t namespace_batch_bytes{size_t{256} * 1024};
 
     // Aggregate write-back admission. Below half the ceiling writes burst at
     // disk speed; above it writers are paced against measured drain rate.
@@ -221,7 +222,7 @@ struct HttpCompressionConfig {
     int level{6};
     // Largest web asset compressed on demand when no precompressed .gz sibling
     // exists; larger files are streamed uncompressed.
-    size_t max_asset_bytes{4 * 1024 * 1024};
+    size_t max_asset_bytes{size_t{4} * 1024 * 1024};
 };
 
 struct CatalogueApiConfig {
@@ -233,7 +234,7 @@ struct CatalogueApiConfig {
     // e.g. behind a TLS proxy. Empty = http://<RPC advertise address>:`port`.
     std::string advertised_endpoint;
     std::optional<std::filesystem::path> token_file;
-    size_t max_request_bytes{8 * 1024 * 1024};
+    size_t max_request_bytes{size_t{8} * 1024 * 1024};
     // One non-waiting reactor owns every socket; two pools compute. `workers`
     // is the data lane (catalogue, playback, web assets, blocking reads);
     // `control_workers` the control lane (health, status, session, users), so
@@ -246,7 +247,7 @@ struct CatalogueApiConfig {
     size_t max_queued_requests{256};
     // Checked by the reactor, not a socket option.
     std::chrono::milliseconds client_io_timeout{30000};
-    size_t stream_chunk_bytes{256 * 1024};
+    size_t stream_chunk_bytes{size_t{256} * 1024};
     // Chunks a stream may hold ahead of the client; worst-case streaming memory
     // is connections x staging_chunks x stream_chunk_bytes.
     size_t staging_chunks{2};
@@ -330,7 +331,7 @@ struct CatalogueScannerConfig {
     // continuation.
     size_t max_provider_requests_per_scan{32};
     std::chrono::milliseconds provider_batch_delay{30000};
-    size_t max_artwork_bytes{16 * 1024 * 1024};
+    size_t max_artwork_bytes{size_t{16} * 1024 * 1024};
     // A file is not catalogued when a word of its path below the scanner root
     // equals one of these, ignoring case. Words are the runs of letters and
     // digits, so "sample" matches `Sample/film.mkv` and `film-sample.mkv` but
@@ -354,7 +355,7 @@ struct IngestConfig {
     std::filesystem::path staging_path;
     uint64_t staging_limit{100ULL * 1024 * 1024 * 1024};
     std::vector<std::filesystem::path> source_roots;
-    size_t copy_chunk_bytes{1024 * 1024};
+    size_t copy_chunk_bytes{size_t{1024} * 1024};
     uint64_t checkpoint_bytes{64ULL * 1024 * 1024};
     std::chrono::milliseconds blocked_retry{5000};
     // Concurrent imports. Each holds a WriteHandle, so this also bounds
@@ -651,7 +652,7 @@ struct Config {
     size_t retention_check_batch_size{2000};
     size_t retention_check_concurrency{8};
     std::chrono::milliseconds write_stall{2500};
-    size_t extent_size{16 * 1024 * 1024};
+    size_t extent_size{size_t{16} * 1024 * 1024};
     // DATA admission; lower classes may use only the non-viewer-reserved part.
     uint64_t data_inflight_bytes{128ULL * 1024 * 1024};
     uint64_t data_viewer_reserve_bytes{32ULL * 1024 * 1024};
@@ -679,7 +680,7 @@ struct Config {
     std::chrono::milliseconds telemetry_interval{10000};
     std::chrono::milliseconds dead_after{30000};
     std::chrono::milliseconds connect_timeout{2500};
-    size_t max_frame_size{256 * 1024};
+    size_t max_frame_size{size_t{256} * 1024};
     // Stalled-request DEBUG thresholds only; 0 disables.
     std::chrono::milliseconds control_stall_notice{5000};
     std::chrono::milliseconds data_stall_notice{120000};

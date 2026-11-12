@@ -683,7 +683,7 @@ class MetadataReplica {
     void recover_from_seed(const MetadataRecord&, const std::string&) MACHA_REQUIRES(m_);
 
   public:
-    MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>,
+    MetadataReplica(const std::filesystem::path&, std::array<uint8_t, 32>,
                     std::optional<MetadataRecord> recovery_seed = {},
                     bool accept_pristine_genesis_authority = true,
                     uint64_t materialization_cache_limit_bytes = 128ULL * 1024ULL * 1024ULL,

@@ -139,7 +139,8 @@ class CatalogueView {
                     const auto& shard = (*shards_)[slot_];
                     if (shard && at_ != ((*shard).*Member).end())
                         return;
-                    if (++slot_ < catalogue_shard_count && (*shards_)[slot_])
+                    ++slot_;
+                    if (slot_ < catalogue_shard_count && (*shards_)[slot_])
                         at_ = ((*(*shards_)[slot_]).*Member).begin();
                 }
             }
@@ -473,7 +474,7 @@ class CatalogueManager {
     std::optional<CatalogueItem> get(std::string_view id);
     std::optional<MediaProbeResult> media_profile(std::string_view media_id);
     ResolvedMediaProfile resolve_media_profile(std::string media_id, Clock::time_point deadline,
-                                               std::function<MediaProbeResult()> generate);
+                                               const std::function<MediaProbeResult()>& generate);
     void put_media_profile(std::string media_id, MediaProbeResult profile);
     void put_media_profiles(std::map<std::string, MediaProbeResult, std::less<>> profiles);
     size_t prune_media_profiles(const std::set<std::string>& live_media_ids);

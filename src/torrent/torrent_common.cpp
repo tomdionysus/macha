@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -437,7 +438,7 @@ TorrentJob parse_torrent_job_wire(const Json& value) {
     return job;
 }
 
-std::optional<std::string> http_origin(std::string_view value) {
+static std::optional<std::string> http_origin(std::string_view value) {
     const auto scheme_end = value.find("://");
     if (scheme_end == std::string_view::npos)
         return {};
@@ -453,8 +454,8 @@ std::optional<std::string> http_origin(std::string_view value) {
     return std::string(value.substr(0, authority_end));
 }
 
-std::optional<std::string> provider_download_url(std::string_view base,
-                                                 std::string_view candidate) {
+static std::optional<std::string> provider_download_url(std::string_view base,
+                                                        std::string_view candidate) {
     const auto origin = http_origin(base);
     if (!origin)
         return {};
@@ -541,7 +542,7 @@ std::vector<TorrentSearchResult> TorznabSearchProvider::search(std::string_view 
     url += "t=search&q=" + url_encode(query) + "&limit=" + std::to_string(config_.max_results);
     if (!api_key_.empty())
         url += "&apikey=" + url_encode(api_key_);
-    auto response = http_->get(url, {}, 4 * 1024 * 1024);
+    auto response = http_->get(url, {}, size_t{4} * 1024 * 1024);
     if (response.status < 200 || response.status >= 300)
         throw std::runtime_error("Torznab returned HTTP " + std::to_string(response.status));
     std::string xml(reinterpret_cast<const char*>(response.body.data()), response.body.size());
@@ -667,7 +668,7 @@ std::optional<std::string> TorrentSearchManager::resolve(std::string_view acquis
     return it->second.uri;
 }
 
-bool advertise_is_ip_literal(std::string_view advertise) {
+static bool advertise_is_ip_literal(std::string_view advertise) {
     // listen_interfaces takes an IP literal or device name; a hostname matches
     // no device and silently binds nothing.
     if (advertise.find(':') != std::string_view::npos) {
@@ -682,7 +683,7 @@ std::string torrent_listen_interfaces(const TorrentConfig& config, std::string_v
     if (!config.listen_interfaces.empty())
         return config.listen_interfaces;
     const auto port = ":" + std::to_string(config.listen_port);
-    const auto wildcard = "0.0.0.0" + port + ",[::]" + port;
+    auto wildcard = "0.0.0.0" + port + ",[::]" + port;
     // No usable advertised address: bind every interface.
     if (advertise.empty() || advertise == "0.0.0.0" || advertise == "::")
         return wildcard;

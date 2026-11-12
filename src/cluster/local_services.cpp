@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/local_services.hpp"
 
+#include <utility>
+
 #include "cluster/cluster.hpp"
 #include "metadata/metadata.hpp"
 #include "storage/storage_pool.hpp"
@@ -13,7 +15,7 @@ LocalServices::LocalServices(const Config& cfg, const NodeIdentity& identity,
                              MessageRoutes& routes,
                              std::chrono::milliseconds durability_batch_window)
     : resources_(resources),
-      state_(cfg, identity, node, progress, hook, stop, durability_batch_window),
+      state_(cfg, identity, node, progress, hook, std::move(stop), durability_batch_window),
       metadata_(node, state_.replica(), state_.cache(), routes, cfg.heartbeat),
       storage_(node, identity,
                StorageServer::Stores{state_.data(), state_.control(), state_.retention(),

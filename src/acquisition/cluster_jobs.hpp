@@ -119,7 +119,7 @@ class ClusterJobView {
         std::vector<IngestJob> ingests;
     };
 
-    void loop(std::stop_token);
+    void loop(const std::stop_token&);
     void poll(const NodeInfo&);
     std::optional<NodeInfo> active_peer(const NodeId&) const;
 

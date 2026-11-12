@@ -46,8 +46,8 @@ struct MobiMetadata {
 
 struct MobiReadLimits {
     // Record 0 (PalmDOC, MOBI and EXTH headers and the full name).
-    size_t max_header_bytes{1024 * 1024};
-    size_t max_cover_bytes{16 * 1024 * 1024};
+    size_t max_header_bytes{size_t{1024} * 1024};
+    size_t max_cover_bytes{size_t{16} * 1024 * 1024};
 };
 
 // Anything that is not a readable MOBI: not a BOOKMOBI database, a truncated

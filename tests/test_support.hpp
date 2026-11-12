@@ -6,6 +6,7 @@
 #include "cluster/distributed_store.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
+#include "errno_text.hpp"
 #include "filesystem/filesystem.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "ledger/retention_ledger.hpp"
@@ -239,7 +240,7 @@ inline uint16_t free_port() {
     }
     if (last_bind_error != EADDRINUSE)
         throw std::runtime_error("cannot probe loopback test port: " +
-                                 std::string(std::strerror(last_bind_error)));
+                                 std::string(errno_text(last_bind_error)));
     throw std::runtime_error("no free port remains in this test case's port namespace");
 }
 

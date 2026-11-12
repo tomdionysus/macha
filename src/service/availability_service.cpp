@@ -98,6 +98,7 @@ class RemoteTrie final : public TrieSource {
                 try {
                     Reader why(reply.message.payload);
                     reason = why.string();
+                    // NOLINTNEXTLINE(bugprone-empty-catch): reason stays unknown
                 } catch (const std::exception&) {
                 }
             }

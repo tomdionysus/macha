@@ -263,6 +263,7 @@ UserCredentialCheck UserStore::verify(std::string_view username, std::string_vie
         static constexpr std::array<uint8_t, 16> dummy_salt{};
         try {
             (void)scrypt_hash(password, dummy_salt, default_kdf_n, default_kdf_r, default_kdf_p);
+            // NOLINTNEXTLINE(bugprone-empty-catch): timing only; the login fails either way
         } catch (const std::exception&) {
         }
         return {};
@@ -715,7 +716,7 @@ std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const C
     }
 
     return InitialAccounts{std::move(*root), std::move(anonymous.value()), std::move(password),
-                           std::move(recovery_key), path};
+                           recovery_key, path};
 }
 
 void UserStore::persist() const {

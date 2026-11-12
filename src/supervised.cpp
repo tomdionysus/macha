@@ -43,6 +43,7 @@ void entered(std::string_view name) noexcept {
         auto& r = registry();
         Lock lock(r.mutex);
         ++r.entry_locked(name).running;
+        // NOLINTNEXTLINE(bugprone-empty-catch): status bookkeeping only, nothing may escape
     } catch (...) {
     }
 }
@@ -54,6 +55,7 @@ void left(std::string_view name) noexcept {
         auto& entry = r.entry_locked(name);
         if (entry.running)
             --entry.running;
+        // NOLINTNEXTLINE(bugprone-empty-catch): status bookkeeping only, nothing may escape
     } catch (...) {
     }
 }
@@ -67,6 +69,7 @@ void set_restarting(std::string_view name, bool waiting) noexcept {
             ++entry.restarting;
         else if (entry.restarting)
             --entry.restarting;
+        // NOLINTNEXTLINE(bugprone-empty-catch): status bookkeeping only, nothing may escape
     } catch (...) {
     }
 }
@@ -89,9 +92,8 @@ void record(std::string_view name, const Fault& fault, std::string_view outcome)
         }
         Log::error("thread '" + std::string(name) + "' faulted (" + fault.code +
                    "): " + fault.message + "; " + std::string(outcome));
+        // NOLINTNEXTLINE(bugprone-empty-catch): recording itself failed, nothing may escape
     } catch (...) {
-        // Recording itself failed (e.g. allocation failure building the
-        // message). Still must not let anything escape a thread entry point.
     }
 }
 
@@ -127,7 +129,7 @@ std::chrono::milliseconds supervised_restart_delay(size_t consecutive) noexcept 
     return std::min<std::chrono::milliseconds>(delay, restart_ceiling);
 }
 
-void run_supervised_loop(std::string_view name, std::stop_token stop,
+void run_supervised_loop(std::string_view name, const std::stop_token& stop,
                          const std::function<void()>& body) noexcept {
     size_t consecutive = 0;
     while (true) {
@@ -151,6 +153,7 @@ void run_supervised_loop(std::string_view name, std::stop_token stop,
             std::condition_variable_any wake;
             Lock lock(mutex);
             wake.wait_for(lock.native(), stop, delay, [] { return false; });
+            // NOLINTNEXTLINE(bugprone-empty-catch): backoff only, a failed wait restarts sooner
         } catch (...) {
         }
         set_restarting(name, false);
@@ -173,6 +176,14 @@ void run_supervised_escalating(std::string_view name, const std::function<void()
     try {
         if (escalate)
             escalate("thread '" + std::string(name) + "' faulted: " + fault->message);
+    } catch (const std::exception& error) {
+        try {
+            Log::debug("escalating thread '" + std::string(name) +
+                       "': " + std::string(error.what()));
+            // NOLINTNEXTLINE(bugprone-empty-catch): logging failed, nothing may escape
+        } catch (...) {
+        }
+        // NOLINTNEXTLINE(bugprone-empty-catch): fault already recorded, nothing may escape
     } catch (...) {
     }
 }

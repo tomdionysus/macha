@@ -71,13 +71,13 @@ class MediaInformationService {
 
     std::optional<std::pair<std::string, FsEntry>> source_for(std::string_view media_id) const;
     bool media_is_live(std::string_view media_id) const;
-    MediaProbeResult resolve(std::string media_id, std::string path, FsEntry entry, bool foreground,
-                             Clock::time_point deadline);
-    void process_hint(const CatalogueHint&, std::stop_token);
+    MediaProbeResult resolve(const std::string& media_id, const std::string& path,
+                             const FsEntry& entry, bool foreground, Clock::time_point deadline);
+    void process_hint(const CatalogueHint&, const std::stop_token&);
     void queue_publication_locked(std::string media_id, MediaProbeResult) MACHA_REQUIRES(mutex_);
-    void publish_one(std::string media_id, MediaProbeResult);
+    void publish_one(const std::string& media_id, MediaProbeResult);
     void prune();
-    void loop(std::stop_token);
+    void loop(const std::stop_token&);
 
   public:
     using ProfilePublisher = std::function<void(std::string, MediaProbeResult)>;
@@ -93,7 +93,7 @@ class MediaInformationService {
 
     size_t request(const std::vector<std::string>& media_ids,
                    int priority = MediaInformationPriority::background,
-                   std::string source = "media-information");
+                   const std::string& source = "media-information");
     bool request_path(std::string path, int priority = MediaInformationPriority::background,
                       std::string source = "media-information-ingest");
     MediaProbeResult resolve_playback(std::string media_id, std::string path, FsEntry entry,

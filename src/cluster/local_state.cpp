@@ -19,7 +19,7 @@
 namespace macha {
 namespace {
 
-void stage(const LocalState::StageHook& hook, std::string_view name, std::stop_token stop) {
+void stage(const LocalState::StageHook& hook, std::string_view name, const std::stop_token& stop) {
     if (hook)
         hook(name);
     if (stop.stop_requested())
@@ -57,7 +57,7 @@ LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, ClusterN
     // The DATA pool and the control-side chain are independent; recover them
     // side by side, as a large pool can take a while.
     std::exception_ptr data_failure;
-    std::jthread data_recovery([&](std::stop_token) {
+    std::jthread data_recovery([&](const std::stop_token&) {
         run_supervised_once("cluster-storage-recovery", [&] {
             try {
                 recover_data(cfg, identity, progress, hook, stop, durability_batch_window);
@@ -82,7 +82,7 @@ LocalState::~LocalState() = default;
 
 void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
                               RecoveryProgress& progress, const StageHook& hook,
-                              std::stop_token stop,
+                              const std::stop_token& stop,
                               std::chrono::milliseconds durability_batch_window) {
     try {
         stage(hook, "data-storage", stop);
@@ -132,7 +132,7 @@ void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
 
 void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity, ClusterNode& node,
                                RecoveryProgress& progress, const StageHook& hook,
-                               std::stop_token stop) {
+                               const std::stop_token& stop) {
     try {
         stage(hook, "control-storage", stop);
         LocalStoreOptions control_options{cfg.metadata_store.limit, 0,

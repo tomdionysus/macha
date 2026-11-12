@@ -136,7 +136,8 @@ class CatalogueHintQueue {
     void defer(std::string_view id, std::string code, std::string error,
                uint64_t retry_after_unix_ms);
     size_t defer_matching(const std::function<bool(const CatalogueHint&)>& predicate,
-                          std::string code, std::string error, uint64_t retry_after_unix_ms);
+                          const std::string& code, const std::string& error,
+                          uint64_t retry_after_unix_ms);
     bool record_failure(std::string_view id, std::string code, std::string error,
                         uint64_t retry_after_unix_ms, unsigned max_failures);
     void fail(std::string_view id, std::string code, std::string error);

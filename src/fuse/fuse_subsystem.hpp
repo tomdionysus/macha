@@ -82,7 +82,7 @@ class FuseSubsystem final : public Subsystem {
     }
 
   private:
-    void run_mount(std::stop_token);
+    void run_mount(const std::stop_token&);
     void report_fault(std::string reason);
 
     SubsystemRegistry& registry_;

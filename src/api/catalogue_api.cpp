@@ -885,7 +885,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 // named: leaving media_ids out must not unbind every file.
                 CatalogueItem item;
                 if (request.method == "PATCH") {
-                    item = *existing;
+                    item = existing.value();
                 } else {
                     item.id = id;
                     if (existing) {

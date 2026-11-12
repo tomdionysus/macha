@@ -24,7 +24,8 @@
 
 namespace macha {
 
-Service::Service(Config config, ClusterKeys keys, std::chrono::milliseconds durability_batch_window,
+Service::Service(const Config& config, ClusterKeys keys,
+                 std::chrono::milliseconds durability_batch_window,
                  NodeRuntime::StartupStageHook startup_stage_hook,
                  MaintenanceStageHook maintenance_stage_hook,
                  StartupStallHandler startup_stall_handler, ServiceInstruments instruments)
@@ -308,7 +309,7 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
                 item["left"] = describe_root(conflict.left_catalogue_root);
                 item["right"] = describe_root(conflict.right_catalogue_root);
             }
-            items.push_back(Json(std::move(item)));
+            items.emplace_back(std::move(item));
         }
         return http_json(200, Json(Json::Object{{"generation", view->generation},
                                                 {"conflicts", std::move(items)}})
@@ -344,7 +345,7 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
             return http_error(405, "method", "GET required");
         Json::Array items;
         for (const auto& parked : parked_publications()) {
-            items.push_back(Json(
+            items.emplace_back(
                 Json::Object{{"inode", parked.inode},
                              {"path", parked.path},
                              {"error_code", parked.error_code},
@@ -352,7 +353,7 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
                              {"attempts", static_cast<uint64_t>(parked.attempts)},
                              {"failing_for_ms", static_cast<uint64_t>(parked.failing_for.count())},
                              {"parked_for_ms", static_cast<uint64_t>(parked.parked_for.count())},
-                             {"pending_bytes", parked.pending_bytes}}));
+                             {"pending_bytes", parked.pending_bytes}});
         }
         return http_json(200, Json(Json::Object{{"parked", std::move(items)}}).dump());
     }
@@ -507,7 +508,7 @@ void Service::wait_services_ready() {
     std::_Exit(1);
 }
 
-void Service::initialise_services(std::stop_token stop) {
+void Service::initialise_services(const std::stop_token& stop) {
     try {
         try {
             local_ = std::make_unique<LocalServices>(node_.config(), identity_, progress_,
@@ -579,7 +580,7 @@ void Service::start() {
     node_.start();
     accounts_.start();
     note_lifecycle("start startup");
-    startup_ = std::jthread([this](std::stop_token stop) {
+    startup_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_once("service-startup", [this, stop] { initialise_services(stop); });
     });
 }
