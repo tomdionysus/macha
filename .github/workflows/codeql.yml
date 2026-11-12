@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# CodeQL security analysis of Macha's C++, built as in CI with Dannan from its
+# tag; the tests are not built here.
+name: CodeQL
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  schedule:
+    - cron: "41 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  DANNAN_VERSION: "0.5.3"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: debian:trixie
+    steps:
+      - name: Install packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config git ca-certificates \
+            libssl-dev libcurl4-openssl-dev libyaml-cpp-dev zlib1g-dev libboost-dev \
+            fuse3 libfuse3-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+            libtorrent-rasterbar-dev
+
+      - name: Build and install Dannan
+        run: |
+          git clone --depth 1 --branch "$DANNAN_VERSION" https://github.com/tomdionysus/dannan.git /opt/dannan-src
+          cmake -S /opt/dannan-src -B /opt/dannan-build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /opt/dannan-build -j "$(nproc)"
+          cmake --install /opt/dannan-build --prefix /usr/local
+          ldconfig
+
+      - uses: actions/checkout@v4
+
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMACHA_BUILD_TESTS=OFF
+          cmake --build build -j "$(nproc)"
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:c-cpp"
