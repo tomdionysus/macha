@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "durable_file.hpp"
+#include "errno_text.hpp"
 
 #include "types.hpp"
 
@@ -19,7 +20,7 @@ void fsync_checked(int fd, const char* what) {
         rc = ::fsync(fd);
     } while (rc != 0 && errno == EINTR);
     if (rc != 0)
-        throw std::runtime_error(std::string(what) + ": " + std::strerror(errno));
+        throw std::runtime_error(std::string(what) + ": " + errno_text(errno));
 }
 
 void write_all(int fd, std::string_view contents) {
@@ -30,7 +31,7 @@ void write_all(int fd, std::string_view contents) {
             continue;
         if (n <= 0)
             throw std::runtime_error(std::string("durable state write failed: ") +
-                                     std::strerror(errno));
+                                     errno_text(errno));
         done += static_cast<size_t>(n);
     }
 }
@@ -45,23 +46,22 @@ void durable_replace_file(const std::filesystem::path& path, std::string_view co
         path.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
     int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0)
-        throw std::runtime_error("cannot create durable state " + temp + ": " +
-                                 std::strerror(errno));
+        throw std::runtime_error("cannot create durable state " + temp + ": " + errno_text(errno));
     try {
         write_all(fd, contents);
         fsync_checked(fd, "cannot sync durable state");
         if (::close(fd) != 0)
             throw std::runtime_error("cannot close durable state: " +
-                                     std::string(std::strerror(errno)));
+                                     std::string(errno_text(errno)));
         fd = -1;
         if (::rename(temp.c_str(), path.c_str()) != 0)
             throw std::runtime_error("cannot replace durable state " + path.string() + ": " +
-                                     std::strerror(errno));
+                                     errno_text(errno));
 
         const int dir = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
         if (dir < 0)
             throw std::runtime_error("cannot open durable state directory " + directory.string() +
-                                     ": " + std::strerror(errno));
+                                     ": " + errno_text(errno));
         try {
             fsync_checked(dir, "cannot sync durable state directory");
         } catch (...) {
@@ -70,7 +70,7 @@ void durable_replace_file(const std::filesystem::path& path, std::string_view co
         }
         if (::close(dir) != 0)
             throw std::runtime_error("cannot close durable state directory: " +
-                                     std::string(std::strerror(errno)));
+                                     std::string(errno_text(errno)));
     } catch (...) {
         if (fd >= 0)
             ::close(fd);

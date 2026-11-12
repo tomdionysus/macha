@@ -69,7 +69,7 @@ class Accounts {
 
   private:
     void bind_routes();
-    void gossip_loop(std::stop_token);
+    void gossip_loop(const std::stop_token&);
     void gossip_sessions();
     void gossip_users_if_changed();
     void request_gossip();

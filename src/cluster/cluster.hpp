@@ -153,7 +153,7 @@ class NodeRuntime : public ClusterNode {
     void on_roster_change(const dannan::RosterChange&);
     // Each heartbeat or wake: the readiness planes, the advertised endpoint, the
     // inbound answer, and the generation heard of.
-    void runtime_loop(std::stop_token);
+    void runtime_loop(const std::stop_token&);
     void mirror_readiness();
     void follow_self();
     void follow_inbound();

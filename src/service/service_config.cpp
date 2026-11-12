@@ -8,11 +8,12 @@ namespace macha {
 
 void Service::reload_config() {
     wait_services_ready();
-    if (!node_.config().config_file) {
+    const auto& config_file = node_.config().config_file;
+    if (!config_file) {
         Log::warn("configuration reload requested but this node was not started with --config");
         return;
     }
-    auto updated = load_yaml_config(*node_.config().config_file);
+    auto updated = load_yaml_config(*config_file);
     if (updated.state_path != node_.config().state_path ||
         updated.key_file != node_.config().key_file)
         throw std::runtime_error("state_path/key_file cannot be changed by live reload");

@@ -655,13 +655,13 @@ void ObjectTrie::collect(const Child& child, const std::optional<ObjectId>& afte
         for (const auto& record : node->records) {
             if (out.size() >= limit)
                 return;
-            if (bounded && !(*after < record.first))
+            if (bounded && after && !(*after < record.first))
                 continue;
             out.push_back(record);
         }
         return;
     }
-    const size_t start = bounded ? after->bytes[node->depth] : 0;
+    const size_t start = bounded && after ? after->bytes[node->depth] : 0;
     for (size_t i = start; i < 256 && out.size() < limit; ++i)
         collect(node->children[i], after, bounded && i == start, limit, out, load);
 }

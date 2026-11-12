@@ -19,6 +19,7 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <utility>
 
 namespace macha {
 namespace {
@@ -55,7 +56,7 @@ MetadataManager::MetadataManager(NodeRuntime& node, LocalState& local,
     : node_(node), local_(local), metadata_server_(metadata_server),
       namespace_store_(namespace_store), time_(time),
       publication_retention_(std::move(publication_retention)),
-      replicator_([this](std::stop_token stop) { replication_loop(stop); }) {}
+      replicator_([this](std::stop_token stop) { replication_loop(std::move(stop)); }) {}
 
 MetadataManager::~MetadataManager() {
     stop_replication();
@@ -107,7 +108,7 @@ void MetadataManager::owe(MetadataRecord head, std::optional<OwedClaims> claims)
     owed_changed_.notify_all();
 }
 
-void MetadataManager::replication_loop(std::stop_token stop) {
+void MetadataManager::replication_loop(const std::stop_token& stop) {
     for (;;) {
         std::deque<OwedClaims> claims;
         std::optional<MetadataRecord> newest;
@@ -578,6 +579,7 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
             auto reply = node_.call(owner, MessageType::has_metadata_history_entry, request.take(),
                                     frame_type, call_deadline::metadata);
             present = bool_reply(reply);
+            // NOLINTNEXTLINE(bugprone-empty-catch): probe, an unanswered owner counts as absent
         } catch (...) {
         }
         remote_presence.emplace(hash, present);
@@ -1008,7 +1010,8 @@ MetadataRecord MetadataManager::own_head(const std::vector<MetadataRecord>& head
                 sequences.push_back(found == snapshot.mutation_sequences.end() ? 0 : found->second);
             }
             ranked.emplace_back(std::move(sequences), &head);
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+            Log::debug("ranking a metadata head: " + std::string(error.what()));
         }
     }
     if (ranked.empty())
@@ -1126,7 +1129,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         });
 
         if (heads.size() == 1) {
-            auto selected = heads.front();
+            const auto& selected = heads.front();
             auto materialized = local_.replica().materialized(selected.hash);
             if (!materialized)
                 throw MetadataNotReady("selected metadata head cannot be materialized");

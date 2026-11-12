@@ -43,6 +43,7 @@ void set_thread_name(std::string_view name) noexcept {
 #else
         (void)copy;
 #endif
+        // NOLINTNEXTLINE(bugprone-empty-catch): a thread name is cosmetic; noexcept
     } catch (...) {
     }
 }
@@ -172,6 +173,7 @@ DiagnosticLock::~DiagnosticLock() noexcept {
         if (held_ms >= threshold_.count())
             Log::trace("DIAG lock-held lock=" + std::string(name_) + " held_ms=" +
                        std::to_string(held_ms) + " wait_ms=" + std::to_string(wait_ms_));
+        // NOLINTNEXTLINE(bugprone-empty-catch): trace logging in a destructor, best effort
     } catch (...) {
     }
 }

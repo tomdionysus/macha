@@ -119,7 +119,7 @@ class Maintenance final {
     bool absorb_events();
     // Waits until absorb_events() calls for a pass, `deadline`, the retry
     // triggers fall due, or `stop`.
-    void wait_for_events(std::stop_token, Clock::time_point deadline);
+    void wait_for_events(const std::stop_token&, Clock::time_point deadline);
     // When the retry triggers bring a scheduled convergence run forward: at
     // the first unless the last run failed, else `convergence_settle` after
     // the last, at most `convergence_max_delay` after the first. Nullopt

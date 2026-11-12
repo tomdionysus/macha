@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "fuse/fuse_mountpoint.hpp"
+#include "errno_text.hpp"
 #include "log.hpp"
 
 #include <array>
@@ -119,17 +120,17 @@ MountpointPreparation guard_covered_mountpoint(const std::filesystem::path& moun
     if (fail_closed) {
         const int fd = ::open(mount_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd < 0) {
-            out.immutable_error = std::strerror(errno);
+            out.immutable_error = errno_text(errno);
         } else {
             int flags = 0;
             if (::ioctl(fd, FS_IOC_GETFLAGS, &flags) != 0) {
-                out.immutable_error = std::strerror(errno);
+                out.immutable_error = errno_text(errno);
             } else if (flags & FS_IMMUTABLE_FL) {
                 out.immutable = true;
             } else {
                 flags |= FS_IMMUTABLE_FL;
                 if (::ioctl(fd, FS_IOC_SETFLAGS, &flags) != 0)
-                    out.immutable_error = std::strerror(errno);
+                    out.immutable_error = errno_text(errno);
                 else
                     out.immutable = true;
             }
@@ -169,7 +170,7 @@ void recover_stale_mount(const std::string& mount, const FuseConfig& config) {
         return;
     if (probe.state == MountTableState::probe_error)
         throw std::runtime_error("cannot inspect FUSE mountpoint " + mount + ": " +
-                                 std::string(std::strerror(probe.error)));
+                                 std::string(errno_text(probe.error)));
     if (probe.state == MountTableState::other)
         throw std::runtime_error("refusing to unmount non-Macha filesystem at " + mount);
     if (!config.unmount_if_mounted)
@@ -180,11 +181,11 @@ void recover_stale_mount(const std::string& mount, const FuseConfig& config) {
 #if defined(__linux__)
     if (::umount2(mount.c_str(), MNT_DETACH) != 0)
         throw std::runtime_error("cannot unmount stale Macha FUSE mount " + mount + ": " +
-                                 std::string(std::strerror(errno)));
+                                 std::string(errno_text(errno)));
 #elif defined(__APPLE__)
     if (::unmount(mount.c_str(), MNT_FORCE) != 0)
         throw std::runtime_error("cannot unmount stale Macha FUSE mount " + mount + ": " +
-                                 std::string(std::strerror(errno)));
+                                 std::string(errno_text(errno)));
 #else
     throw std::runtime_error("stale FUSE unmount is unsupported on this platform");
 #endif

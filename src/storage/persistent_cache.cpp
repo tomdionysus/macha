@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "storage/persistent_cache.hpp"
+#include "errno_text.hpp"
 
 #include "codec.hpp"
 #include "log.hpp"
@@ -23,7 +24,7 @@ void write_all(int fd, std::span<const uint8_t> bytes) {
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            throw std::runtime_error(strerror(errno));
+            throw std::runtime_error(errno_text(errno));
         }
         offset += static_cast<size_t>(n);
     }
@@ -35,17 +36,17 @@ void atomic_write(const std::filesystem::path& path, std::span<const uint8_t> by
         path.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
     int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0)
-        throw std::runtime_error("cannot create cache metadata: " + std::string(strerror(errno)));
+        throw std::runtime_error("cannot create cache metadata: " + std::string(errno_text(errno)));
     try {
         write_all(fd, bytes);
         // Cache metadata is a hint; startup ignores a torn or missing record.
         if (::close(fd))
             throw std::runtime_error("cannot close cache metadata: " +
-                                     std::string(strerror(errno)));
+                                     std::string(errno_text(errno)));
         fd = -1;
         if (::rename(temp.c_str(), path.c_str()))
             throw std::runtime_error("cannot install cache metadata: " +
-                                     std::string(strerror(errno)));
+                                     std::string(errno_text(errno)));
     } catch (...) {
         if (fd >= 0)
             ::close(fd);

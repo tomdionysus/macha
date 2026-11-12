@@ -75,7 +75,7 @@ class ClaimDeletion {
   public:
     ClaimDeletion() = default;
     ClaimDeletion(ClaimDeletion&& other) noexcept
-        : locks_(other.locks_), marked_(std::move(other.marked_)), claimed_(other.claimed_) {
+        : locks_(other.locks_), marked_(other.marked_), claimed_(other.claimed_) {
         other.locks_ = nullptr;
         other.marked_.reset();
     }
@@ -83,7 +83,7 @@ class ClaimDeletion {
         if (this != &other) {
             release();
             locks_ = other.locks_;
-            marked_ = std::move(other.marked_);
+            marked_ = other.marked_;
             claimed_ = other.claimed_;
             other.locks_ = nullptr;
             other.marked_.reset();

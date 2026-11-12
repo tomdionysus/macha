@@ -73,7 +73,8 @@ struct StoragePool::Backend {
 };
 
 StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
-                         std::vector<StorageBackendConfig> configs, std::array<uint8_t, 32> key,
+                         const std::vector<StorageBackendConfig>& configs,
+                         std::array<uint8_t, 32> key,
                          std::chrono::milliseconds durability_batch_window,
                          StoragePackingConfig packing, uint64_t ledger_cache,
                          LocalStoreFiles& files)
@@ -379,7 +380,7 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const Obj
         node.id = token;
         node.capacity = capacity;
         placement_nodes.push_back(node);
-        lookup.push_back({token, backend});
+        lookup.emplace_back(token, backend);
     }
 
     auto order = capacity_placement_nodes(id.bytes, placement_nodes, 1);
@@ -607,7 +608,10 @@ std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
                       ": " + error.what());
             try {
                 (void)store->remove(id);
+            } catch (const std::exception& remove_error) {
+                Log::debug("removing corrupt local object: " + std::string(remove_error.what()));
             } catch (...) {
+                Log::debug("removing corrupt local object: unknown error");
             }
         } catch (const std::exception& error) {
             note_read_failure(id, path, error);
@@ -629,6 +633,7 @@ bool StoragePool::has(const ObjectId& id) const {
         try {
             if (store->has(id))
                 return true;
+            // NOLINTNEXTLINE(bugprone-empty-catch): a backend that cannot answer does not hold it
         } catch (...) {
         }
     }
@@ -741,7 +746,10 @@ bool StoragePool::remove(const ObjectId& id) {
             continue;
         try {
             removed = store->remove(id) || removed;
+        } catch (const std::exception& error) {
+            Log::debug("removing local object: " + std::string(error.what()));
         } catch (...) {
+            Log::debug("removing local object: unknown error");
         }
     }
     return removed;
@@ -762,7 +770,10 @@ std::vector<ObjectId> StoragePool::list() const {
         try {
             auto ids = store->list();
             unique.insert(ids.begin(), ids.end());
+        } catch (const std::exception& error) {
+            Log::debug("listing local objects: " + std::string(error.what()));
         } catch (...) {
+            Log::debug("listing local objects: unknown error");
         }
     }
     return {unique.begin(), unique.end()};
@@ -839,6 +850,7 @@ bool StoragePool::older_than(const ObjectId& id, std::chrono::milliseconds age) 
         try {
             if (store->has(id) && store->older_than(id, age))
                 return true;
+            // NOLINTNEXTLINE(bugprone-empty-catch): a backend that cannot answer has no old copy
         } catch (...) {
         }
     }
@@ -902,6 +914,7 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
                     holders.push_back({backend, store});
                     estimated = std::max(estimated, store->stored_size(id));
                 }
+                // NOLINTNEXTLINE(bugprone-empty-catch): an unreadable copy is not a holder
             } catch (...) {
             }
         }
@@ -926,6 +939,7 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
                     timer.note_bytes(data ? data->size() : 0);
                     if (data)
                         break;
+                    // NOLINTNEXTLINE(bugprone-empty-catch): the next holder is tried
                 } catch (...) {
                 }
             }
@@ -948,7 +962,10 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
                         holders.push_back({preferred, preferred_store});
                         preferred_has = true;
                     }
+                } catch (const std::exception& error) {
+                    Log::debug("rebalancing to preferred backend: " + std::string(error.what()));
                 } catch (...) {
+                    Log::debug("rebalancing to preferred backend: unknown error");
                 }
             }
         }
@@ -959,7 +976,10 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
                     continue;
                 try {
                     (void)holder.store->remove(id);
+                } catch (const std::exception& error) {
+                    Log::debug("removing rebalanced duplicate: " + std::string(error.what()));
                 } catch (...) {
+                    Log::debug("removing rebalanced duplicate: unknown error");
                 }
             }
         }
@@ -1000,7 +1020,10 @@ StoragePool::MaintenanceResult StoragePool::scrub_step(uint64_t budget_bytes,
                       item->path.string() + ": " + error.what());
             try {
                 (void)item->store->remove(item->id);
+            } catch (const std::exception& remove_error) {
+                Log::debug("removing corrupt local object: " + std::string(remove_error.what()));
             } catch (...) {
+                Log::debug("removing corrupt local object: unknown error");
             }
         } catch (const std::exception& error) {
             note_read_failure(item->id, item->path, error);
@@ -1112,7 +1135,7 @@ LocalStore::VerifyResult StoragePool::verify_step(size_t directories) {
     return total;
 }
 
-size_t StoragePool::compact_packs(std::stop_token stop) {
+size_t StoragePool::compact_packs(const std::stop_token& stop) {
     size_t visited = 0;
     for (const auto& backend : snapshot()) {
         if (stop.stop_requested())

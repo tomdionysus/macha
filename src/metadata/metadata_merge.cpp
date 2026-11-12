@@ -176,6 +176,8 @@ MetadataMergeResult merge_metadata_heads_over(const MetadataSnapshot& left,
             continue;
         }
         // On one side only: removed by the other, or never seen by it.
+        if (!a && !b)
+            continue;
         const auto& present = a ? *a : *b;
         const auto& owner = a ? l : r;
         const auto& other = a ? r : l;

@@ -44,7 +44,7 @@ class PlaybackManager {
     void start();
     void request_stop();
     void stop();
-    void reconfigure(StreamingConfig);
+    void reconfigure(const StreamingConfig&);
     HttpResponse handle(const HttpRequest&);
     bool capability_request(const HttpRequest&) const;
 };

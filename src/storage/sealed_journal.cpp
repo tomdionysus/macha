@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "storage/sealed_journal.hpp"
+#include "errno_text.hpp"
 
 #include "crypto.hpp"
 #include "durable_file.hpp"
@@ -24,7 +25,7 @@ void write_all(int fd, std::span<const uint8_t> bytes) {
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0)
-            throw std::runtime_error(std::string("journal write failed: ") + std::strerror(errno));
+            throw std::runtime_error(std::string("journal write failed: ") + errno_text(errno));
         done += static_cast<size_t>(n);
     }
 }
@@ -49,7 +50,7 @@ void fsync_checked(int fd) {
         rc = ::fsync(fd);
     } while (rc != 0 && errno == EINTR);
     if (rc != 0)
-        throw std::runtime_error(std::string("journal sync failed: ") + std::strerror(errno));
+        throw std::runtime_error(std::string("journal sync failed: ") + errno_text(errno));
 }
 
 uint32_t read_be32(const uint8_t* p) {
@@ -80,7 +81,7 @@ int SealedJournal::fd() const {
         fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
         if (fd_ < 0)
             throw std::runtime_error("cannot open journal " + path_.string() + ": " +
-                                     std::strerror(errno));
+                                     errno_text(errno));
     }
     return fd_;
 }
@@ -106,7 +107,7 @@ size_t SealedJournal::replay(const std::function<void(std::span<const uint8_t>)>
     if (::fstat(fd, &st) != 0) {
         const auto saved = errno;
         ::close(fd);
-        throw std::runtime_error("cannot stat " + std::string(what) + ": " + std::strerror(saved));
+        throw std::runtime_error("cannot stat " + std::string(what) + ": " + errno_text(saved));
     }
     const uint64_t file_size = static_cast<uint64_t>(st.st_size);
     uint64_t offset = 0;
@@ -144,7 +145,7 @@ size_t SealedJournal::replay(const std::function<void(std::span<const uint8_t>)>
             const auto error = errno;
             ::close(fd);
             throw std::runtime_error("cannot truncate " + std::string(what) + ": " +
-                                     std::strerror(error));
+                                     errno_text(error));
         }
         fsync_checked(fd);
     }
@@ -235,7 +236,7 @@ std::shared_ptr<const SealedJournal::FrameReader> SealedJournal::reader() const 
     const int copy = ::fcntl(fd(), F_DUPFD_CLOEXEC, 0);
     if (copy < 0)
         throw std::runtime_error("cannot duplicate journal " + path_.string() + ": " +
-                                 std::strerror(errno));
+                                 errno_text(errno));
     return std::shared_ptr<const FrameReader>(
         new FrameReader(copy, key_, aad_, max_frame_, bytes_));
 }

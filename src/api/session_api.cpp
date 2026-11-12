@@ -19,7 +19,7 @@ Json parse_body(const HttpRequest& request) {
 Json session_json(const AuthSession& session, const UserStore& users, std::string_view token = {}) {
     Json::Array roles;
     for (const auto& role : session.roles)
-        roles.push_back(role);
+        roles.emplace_back(role);
     Json::Object out;
     out["id"] = session.id;
     out["roles"] = std::move(roles);
@@ -48,7 +48,7 @@ Json session_json(const AuthSession& session, const UserStore& users, std::strin
 PasswordCredentialValidator::PasswordCredentialValidator(const UserStore& users,
                                                          SessionConfig config,
                                                          PasswordWork& password_work)
-    : users_(users), config_(std::move(config)), password_work_(password_work) {}
+    : users_(users), config_(config), password_work_(password_work) {}
 
 bool PasswordCredentialValidator::locked_out(const std::string& username) const {
     Lock lock(mutex_);

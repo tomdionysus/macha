@@ -6,6 +6,7 @@
 #include "fuse/fuse_adapter.hpp"
 #include "crypto.hpp"
 #include "diagnostics.hpp"
+#include "errno_text.hpp"
 #include "filesystem/macos_unicode.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "fuse/fuse_mountpoint.hpp"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <fcntl.h>
 #if defined(__APPLE__) && defined(__clang__)
@@ -59,6 +61,7 @@ struct Handle {
 };
 
 Handle* handle(fuse_file_info* fi) {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr): fh is FUSE's integer slot for this pointer
     return fi && fi->fh ? reinterpret_cast<Handle*>(fi->fh) : nullptr;
 }
 
@@ -122,6 +125,7 @@ struct FuseLatency {
             if (ms >= threshold_ms)
                 Log::debug(std::string("DIAG slow-fuse op=") + op + " path=" +
                            (path ? path : "<null>") + " elapsed_ms=" + std::to_string(ms));
+            // NOLINTNEXTLINE(bugprone-empty-catch): best-effort diagnostic in a destructor
         } catch (...) {
         }
     }
@@ -168,7 +172,7 @@ void fill_stat(const FuseEntryAttributes& e, struct stat& st) {
     st.st_uid = e.uid;
     st.st_gid = e.gid;
     st.st_size = static_cast<off_t>(e.size);
-    st.st_blksize = 128 * 1024;
+    st.st_blksize = blksize_t{128} * 1024;
     st.st_blocks = static_cast<blkcnt_t>((e.size + 511) / 512);
     set_time(st, e.mtime_ns);
 }
@@ -485,7 +489,7 @@ class CoveredMountpointGuard {
             ::close(fd_);
             fd_ = -1;
             throw std::runtime_error("cannot stat FUSE mountpoint: " +
-                                     std::string(std::strerror(error)));
+                                     std::string(errno_text(error)));
         }
         // The mode from before any guard: after a mount loss the directory is
         // left non-writable, and restoring that would make it permanent.
@@ -567,6 +571,7 @@ class LibfuseMountDriver final : public FuseMountDriver {
 
         std::vector<std::string> fuse_arg_storage{"macha", "-o", options};
         std::vector<char*> fuse_argv;
+        fuse_argv.reserve(fuse_arg_storage.size());
         for (auto& arg : fuse_arg_storage)
             fuse_argv.push_back(arg.data());
         struct fuse_args args =
@@ -633,7 +638,7 @@ class LibfuseMountDriver final : public FuseMountDriver {
                         if (consecutive_probe_errors == 1 || consecutive_probe_errors % 30 == 0) {
                             Log::warn(
                                 "FUSE mount-table watchdog probe failed mount=" + mount +
-                                " error=" + std::string(std::strerror(probe.error)) +
+                                " error=" + std::string(errno_text(probe.error)) +
                                 " consecutive_errors=" + std::to_string(consecutive_probe_errors) +
                                 "; retaining previous mount state");
                         }

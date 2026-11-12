@@ -121,7 +121,7 @@ class Service {
     std::atomic_bool observation_stopping_{};
     std::map<std::string, uint64_t> observation_gauges();
 
-    void initialise_services(std::stop_token);
+    void initialise_services(const std::stop_token&);
     void wait_services_ready();
     std::string describe_readiness_stall() const;
     HttpResponse handle_http(const HttpRequest&);
@@ -134,7 +134,7 @@ class Service {
     // The role a request needs, or empty when a valid session is enough.
     static std::string_view required_role(const HttpRequest&);
     // `durability_batch_window`: see LocalState.
-    Service(Config, ClusterKeys, std::chrono::milliseconds durability_batch_window,
+    Service(const Config&, ClusterKeys, std::chrono::milliseconds durability_batch_window,
             NodeRuntime::StartupStageHook startup_stage_hook = {},
             MaintenanceStageHook maintenance_stage_hook = {},
             StartupStallHandler startup_stall_handler = {}, ServiceInstruments instruments = {});

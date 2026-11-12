@@ -44,6 +44,7 @@ inline std::optional<RpcRefusal> rpc_refusal(const RpcMessage& message) {
             return out;
         out.status = reader.u16();
         out.code = reader.string();
+        // NOLINTNEXTLINE(bugprone-empty-catch): a truncated refusal keeps what was read
     } catch (const std::exception&) {
     }
     return out;

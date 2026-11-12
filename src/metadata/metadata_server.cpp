@@ -35,7 +35,7 @@ MetadataServer::MetadataServer(NodeRuntime& node, MetadataReplica& replica,
         Log::debug("cannot preload identity reset tombstones: " + std::string(error.what()));
     }
     bind_routes();
-    refresher_ = std::jthread([this](std::stop_token stop) {
+    refresher_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("metadata-refresh", stop, [this, stop] { refresh_loop(stop); });
     });
 }
@@ -51,7 +51,7 @@ MetadataServer::~MetadataServer() {
     }
 }
 
-void MetadataServer::refresh_loop(std::stop_token stop) {
+void MetadataServer::refresh_loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         {
             Lock lock(refresh_mutex_);

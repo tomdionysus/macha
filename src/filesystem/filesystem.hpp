@@ -443,7 +443,7 @@ class FileSystem final : public PublicationTarget {
     // failing node re-arms every no-progress deadline and never parks.
     std::atomic_uint64_t write_progress_{};
     std::vector<std::jthread> extent_workers_ MACHA_GUARDED_BY(extent_tasks_mutex_);
-    void extent_worker(std::stop_token);
+    void extent_worker(const std::stop_token&);
     std::future<WriteHandle::StagedExtentResult>
         submit_extent_task(std::function<WriteHandle::StagedExtentResult()>);
     // A path as the namespace stores it. `ambiguous` when two stored names

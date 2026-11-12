@@ -84,8 +84,11 @@ const CatalogueItem* next_episode(const CatalogueView& snapshot, const Catalogue
     std::sort(same_season.begin(), same_season.end(), episode_order);
     auto here = std::find_if(same_season.begin(), same_season.end(),
                              [&](const auto* item) { return item->id == current.id; });
-    if (here != same_season.end() && ++here != same_season.end())
-        return *here;
+    if (here != same_season.end()) {
+        ++here;
+        if (here != same_season.end())
+            return *here;
+    }
 
     if (!season || !season->parent_id)
         return nullptr;
@@ -151,8 +154,11 @@ const CatalogueItem* next_movie(const CatalogueView& snapshot, const CatalogueIt
     });
     auto here = std::find_if(movies.begin(), movies.end(),
                              [&](const auto* item) { return item->id == current.id; });
-    if (here != movies.end() && ++here != movies.end())
-        return *here;
+    if (here != movies.end()) {
+        ++here;
+        if (here != movies.end())
+            return *here;
+    }
     return nullptr;
 }
 
@@ -347,6 +353,8 @@ std::vector<HydrationHint> ReadAheadHintProvider::hints() {
     std::vector<HydrationHint> out;
     for (const auto& observation :
          playback_.active(std::chrono::milliseconds(timeout_ms_.load()))) {
+        if (!observation.current_extent)
+            continue;
         auto objects =
             extent_objects(observation.entry, *observation.current_extent + 1, window_.load());
         if (!objects.empty())
@@ -374,6 +382,8 @@ std::vector<HydrationHint> CurrentFileHintProvider::hints() {
     std::vector<HydrationHint> out;
     for (const auto& observation :
          playback_.active(std::chrono::milliseconds(timeout_ms_.load()))) {
+        if (!observation.current_extent)
+            continue;
         auto objects = extent_objects(observation.entry, *observation.current_extent + 1);
         if (!objects.empty())
             out.push_back({playback_run(observation.session), std::move(objects), priority_.load(),
@@ -452,7 +462,7 @@ std::vector<HydrationHint> CatalogueSequenceHintProvider::hints() {
 }
 
 CacheHydrator::CacheHydrator(DistributedStore& store, HydrationConfig config)
-    : store_(store), config_(std::move(config)) {
+    : store_(store), config_(config) {
     status_.enabled = config_.enabled;
 }
 
@@ -513,11 +523,11 @@ void CacheHydrator::start() {
     fetch_workers_.reserve(workers);
     try {
         for (size_t i = 0; i < workers; ++i)
-            fetch_workers_.emplace_back([this](std::stop_token stop) {
+            fetch_workers_.emplace_back([this](const std::stop_token& stop) {
                 run_supervised_loop("hydration-fetch", stop, [this, stop] { fetch_loop(stop); });
             });
         Lock lock(mutex_);
-        worker_ = std::jthread([this](std::stop_token stop) {
+        worker_ = std::jthread([this](const std::stop_token& stop) {
             run_supervised_loop("hydration", stop, [this, stop] { loop(stop); });
         });
     } catch (...) {
@@ -566,6 +576,7 @@ void CacheHydrator::request_stop() {
     for (auto& task : cancelled) {
         try {
             task->result.set_value(false);
+            // NOLINTNEXTLINE(bugprone-empty-catch): the promise is already satisfied
         } catch (...) {
         }
     }
@@ -584,7 +595,7 @@ void CacheHydrator::reconfigure(HydrationConfig config) {
         stop();
     {
         Lock lock(mutex_);
-        config_ = std::move(config);
+        config_ = config;
         status_.enabled = config_.enabled;
     }
     if (restart)
@@ -592,7 +603,7 @@ void CacheHydrator::reconfigure(HydrationConfig config) {
     wake();
 }
 
-void CacheHydrator::fetch_loop(std::stop_token stop) {
+void CacheHydrator::fetch_loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         std::shared_ptr<FetchTask> task;
         {
@@ -612,6 +623,7 @@ void CacheHydrator::fetch_loop(std::stop_token stop) {
         } catch (...) {
             try {
                 task->result.set_exception(std::current_exception());
+                // NOLINTNEXTLINE(bugprone-empty-catch): the promise is already satisfied
             } catch (...) {
             }
         }
@@ -729,7 +741,7 @@ void CacheHydrator::wake() {
     cv_.notify_all();
 }
 
-void CacheHydrator::loop(std::stop_token stop) {
+void CacheHydrator::loop(const std::stop_token& stop) {
     ThreadCpuReporter cpu_reporter("macha-hydrator", std::chrono::seconds(5), true);
     uint64_t observed_wake_revision = wake_revision_.load(std::memory_order_acquire);
     struct Pending {
@@ -893,7 +905,7 @@ void HydrationManager::reconfigure(HydrationConfig config, size_t read_ahead_ext
     read_ahead_->reconfigure(config, read_ahead_extents);
     current_file_->reconfigure(config);
     catalogue_sequence_->reconfigure(config);
-    hydrator_.reconfigure(std::move(config));
+    hydrator_.reconfigure(config);
 }
 
 } // namespace macha

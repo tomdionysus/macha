@@ -217,10 +217,10 @@ class PlaybackStageError final : public std::runtime_error {
     std::optional<MediaFailure> failure_;
 
   public:
-    PlaybackStageError(std::string trace, std::string stage, std::string message,
+    PlaybackStageError(std::string trace, std::string stage, const std::string& message,
                        std::optional<MediaFailure> failure = std::nullopt)
-        : std::runtime_error(std::move(message)), trace_(std::move(trace)),
-          stage_(std::move(stage)), failure_(failure) {}
+        : std::runtime_error(message), trace_(std::move(trace)), stage_(std::move(stage)),
+          failure_(failure) {}
     const std::string& trace() const noexcept {
         return trace_;
     }
@@ -308,10 +308,12 @@ std::optional<int> optional_int(const Json* value) {
         return {};
     try {
         return static_cast<int>(value->asInt64());
+        // NOLINTNEXTLINE(bugprone-empty-catch): probe, failure means try the next form
     } catch (...) {
     }
     try {
         return static_cast<int>(value->asUInt64());
+        // NOLINTNEXTLINE(bugprone-empty-catch): probe, failure means not an integer
     } catch (...) {
     }
     return {};
@@ -322,12 +324,14 @@ std::optional<uint64_t> optional_u64(const Json* value) {
         return {};
     try {
         return value->asUInt64();
+        // NOLINTNEXTLINE(bugprone-empty-catch): probe, failure means try the next form
     } catch (...) {
     }
     try {
         auto n = value->asInt64();
         if (n >= 0)
             return static_cast<uint64_t>(n);
+        // NOLINTNEXTLINE(bugprone-empty-catch): probe, failure means not an integer
     } catch (...) {
     }
     return {};
@@ -531,7 +535,7 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
 
     // A quality instruction is a re-encode by definition.
     if (video && prefs.max_height && video->height > *prefs.max_height) {
-        plan.target_height = *prefs.max_height;
+        plan.target_height = prefs.max_height;
         if (video_copy && prefs.video && *prefs.video == "copy")
             throw std::invalid_argument(
                 "preferences.video=copy cannot be combined with preferences.max_height below the "
@@ -539,7 +543,7 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
         video_copy = false;
     }
     if (video && prefs.max_bitrate) {
-        plan.target_video_bitrate = *prefs.max_bitrate;
+        plan.target_video_bitrate = prefs.max_bitrate;
         if (video_copy && prefs.video && *prefs.video == "copy")
             throw std::invalid_argument(
                 "preferences.video=copy cannot be combined with preferences.max_bitrate");
@@ -1021,7 +1025,7 @@ struct PlaybackManager::Impl {
     std::condition_variable_any start_workers_cv;
 
     Impl(FileSystem& filesystem, TranscodeRateBook& rates, RetainedMemoryLedger& memory,
-         CatalogueManager& cat, CatalogueApiConfig api, StreamingConfig streaming,
+         CatalogueManager& cat, const CatalogueApiConfig& api, StreamingConfig streaming,
          std::shared_ptr<MediaEngine> media_engine,
          std::function<size_t(const std::vector<std::string>&)> request_profiles,
          MediaInformationService* information, const TimeSource& time_source)
@@ -1206,7 +1210,7 @@ struct PlaybackManager::Impl {
 
     static Json start_error_json(std::exception_ptr error, const std::string& stalled) {
         try {
-            std::rethrow_exception(error);
+            std::rethrow_exception(std::move(error));
         } catch (const PlaybackStageError& e) {
             Json::Object out{{"code", "playback_" + e.stage() + "_failed"},
                              {"message", std::string(e.what())},
@@ -1294,8 +1298,8 @@ struct PlaybackManager::Impl {
     // Start worker: plan, start, wait for the first fragment, then swap the
     // built session in for the placeholder, or record the failure and release
     // everything.
-    void run_start(std::shared_ptr<Session> placeholder, std::shared_ptr<StartState> start,
-                   std::string trace) {
+    void run_start(const std::shared_ptr<Session>& placeholder,
+                   const std::shared_ptr<StartState>& start, const std::string& trace) {
         auto candidate = start->candidate;
         std::string stalled = "planning";
         try {
@@ -1305,9 +1309,10 @@ struct PlaybackManager::Impl {
             std::vector<std::shared_ptr<HttpWaker>> waiters;
             {
                 Lock lock(start->mutex);
-                if (candidate->vod_plan && !candidate->vod_plan->segment_durations.empty())
+                const auto& plan = candidate->vod_plan;
+                if (plan && !plan->segment_durations.empty())
                     start->first_fragment_ms =
-                        std::llround(candidate->vod_plan->segment_durations.front() * 1000.0);
+                        std::llround(plan->segment_durations.front() * 1000.0);
                 start->stage = "encoding";
                 stalled = "encoding";
                 waiters = start->changed_locked();
@@ -1379,6 +1384,7 @@ struct PlaybackManager::Impl {
                     std::rethrow_exception(error);
                 } catch (const std::exception& e) {
                     message = e.what();
+                    // NOLINTNEXTLINE(bugprone-empty-catch): message stays unknown
                 } catch (...) {
                 }
                 Log::warn("playback[" + trace + "] async start failed id=" + placeholder->id +
@@ -1392,8 +1398,9 @@ struct PlaybackManager::Impl {
 
     // Async PATCH worker: builds the replacement beside the playing generation
     // and swaps it in once its first fragment exists.
-    void run_replacement(std::shared_ptr<Session> old, std::shared_ptr<PendingReplacement> pending,
-                         std::string trace) {
+    void run_replacement(const std::shared_ptr<Session>& old,
+                         const std::shared_ptr<PendingReplacement>& pending,
+                         const std::string& trace) {
         auto start = pending->start;
         auto replacement = start->candidate;
         std::string stalled = "planning";
@@ -1406,9 +1413,10 @@ struct PlaybackManager::Impl {
             std::vector<std::shared_ptr<HttpWaker>> waiters;
             {
                 Lock lock(start->mutex);
-                if (replacement->vod_plan && !replacement->vod_plan->segment_durations.empty())
+                const auto& plan = replacement->vod_plan;
+                if (plan && !plan->segment_durations.empty())
                     start->first_fragment_ms =
-                        std::llround(replacement->vod_plan->segment_durations.front() * 1000.0);
+                        std::llround(plan->segment_durations.front() * 1000.0);
                 start->stage = "encoding";
                 stalled = "encoding";
                 waiters = start->changed_locked();
@@ -1480,6 +1488,7 @@ struct PlaybackManager::Impl {
                     std::rethrow_exception(error);
                 } catch (const std::exception& e) {
                     message = e.what();
+                    // NOLINTNEXTLINE(bugprone-empty-catch): message stays unknown
                 } catch (...) {
                 }
                 Log::warn("playback[" + trace + "] async update failed id=" + old->id + " stage=" +
@@ -1749,7 +1758,8 @@ struct PlaybackManager::Impl {
                       lease.media_id + " wait_ms=" + std::to_string(elapsed));
             if (flight->error)
                 std::rethrow_exception(flight->error);
-            return *flight->result;
+            // Every flight completed without an error carries a result.
+            return flight->result.value();
         }
 
         auto complete_flight = [&](std::optional<MediaProbeResult> result,
@@ -1757,7 +1767,7 @@ struct PlaybackManager::Impl {
             {
                 Lock flight_lock(flight->mutex);
                 flight->result = std::move(result);
-                flight->error = error;
+                flight->error = std::move(error);
                 flight->complete = true;
             }
             flight->cv.notify_all();
@@ -1805,7 +1815,7 @@ struct PlaybackManager::Impl {
         return probed;
     }
 
-    void publish_profiles(std::stop_token stop) {
+    void publish_profiles(const std::stop_token& stop) {
         set_thread_name("macha-prof-pub");
         while (!stop.stop_requested()) {
             std::pair<std::string, MediaProbeResult> pending;
@@ -2083,9 +2093,11 @@ struct PlaybackManager::Impl {
             --reserved_audio_transcodes;
         if (reservation.account_slot) {
             auto reserved = reserved_account_transcodes.find(reservation.account);
-            if (reserved != reserved_account_transcodes.end() && reserved->second &&
-                --reserved->second == 0)
-                reserved_account_transcodes.erase(reserved);
+            if (reserved != reserved_account_transcodes.end() && reserved->second) {
+                --reserved->second;
+                if (reserved->second == 0)
+                    reserved_account_transcodes.erase(reserved);
+            }
         }
     }
 
@@ -2265,7 +2277,7 @@ struct PlaybackManager::Impl {
                 // baseline: a remux generation starts at the keyframe before the
                 // request, so a matching baseline would publish a wrong offset.
                 auto reseeked = requested_seek == cached->playback.seek_requested
-                                    ? std::optional<HlsVodPlan>(*cached)
+                                    ? cached
                                     : reseek_hls_vod(*cached, requested_seek);
                 if (reseeked) {
                     session.plan = reseeked->playback;
@@ -2316,7 +2328,7 @@ struct PlaybackManager::Impl {
         session.stream_touched = time.now();
         ++session.generation;
         session.generation_dir =
-            *settings.temp_path / session.id / std::to_string(session.generation);
+            settings.temp_path.value() / session.id / std::to_string(session.generation);
         std::error_code ec;
         std::filesystem::remove_all(session.generation_dir, ec);
         session.subtitle_cache = std::make_shared<Session::SubtitleCache>();
@@ -2432,6 +2444,7 @@ struct PlaybackManager::Impl {
         session->source = old.source;
         session->source_entry = old.source_entry;
         session->probe = old.probe;
+        const auto segments = reseeked->segment_durations.size();
         session->plan = reseeked->playback;
         session->vod_plan = std::move(*reseeked);
         session->generation = old.generation;
@@ -2444,7 +2457,7 @@ struct PlaybackManager::Impl {
                   " requested_ms=" + std::to_string(requested_seek.count()) +
                   " seek_ms=" + std::to_string(session->plan.seek.count()) +
                   " seek_offset_ms=" + std::to_string(session->plan.seek_offset.count()) +
-                  " segments=" + std::to_string(session->vod_plan->segment_durations.size()));
+                  " segments=" + std::to_string(segments));
         return session;
     }
 
@@ -2499,7 +2512,8 @@ struct PlaybackManager::Impl {
 
     // Whether some instruction built from `preferences`, trying every candidate
     // for each open choice, would be carried out. For reporting only.
-    bool some_plan_supported(const MediaProbeResult& probe, PlaybackPreferences preferences) const {
+    bool some_plan_supported(const MediaProbeResult& probe,
+                             const PlaybackPreferences& preferences) const {
         const auto each = [&](MediaStreamType type, const std::optional<int>& named) {
             std::vector<std::optional<int>> out;
             if (named)
@@ -2528,6 +2542,7 @@ struct PlaybackManager::Impl {
                     try {
                         if (plan_supported(plan_for(probe, candidate)))
                             return true;
+                        // NOLINTNEXTLINE(bugprone-empty-catch): illegal plan, unsupported
                     } catch (...) {
                     }
                 }
@@ -2558,6 +2573,7 @@ struct PlaybackManager::Impl {
             try {
                 if (some_plan_supported(session.probe, preferences))
                     modes.emplace_back(candidate);
+                // NOLINTNEXTLINE(bugprone-empty-catch): probe, failure means not offered
             } catch (...) {
             }
         }
@@ -2575,6 +2591,7 @@ struct PlaybackManager::Impl {
                 try {
                     if (some_plan_supported(session.probe, preferences))
                         quality_heights.emplace_back(height);
+                    // NOLINTNEXTLINE(bugprone-empty-catch): probe, failure means not offered
                 } catch (...) {
                 }
             }
@@ -2588,6 +2605,7 @@ struct PlaybackManager::Impl {
                 try {
                     if (some_plan_supported(session.probe, preferences))
                         audio_streams.emplace_back(stream_json(stream));
+                    // NOLINTNEXTLINE(bugprone-empty-catch): probe, failure means not offered
                 } catch (...) {
                 }
             }
@@ -2598,6 +2616,7 @@ struct PlaybackManager::Impl {
                 try {
                     if (some_plan_supported(session.probe, preferences))
                         subtitle_streams.emplace_back(stream_json(stream));
+                    // NOLINTNEXTLINE(bugprone-empty-catch): probe, failure means not offered
                 } catch (...) {
                 }
             }
@@ -3084,6 +3103,7 @@ struct PlaybackManager::Impl {
                 auto value = seek->asInt64();
                 if (value >= 0)
                     seek_ms = value;
+                // NOLINTNEXTLINE(bugprone-empty-catch): seek_ms stays empty, refused below
             } catch (...) {
             }
             if (!seek_ms)
@@ -3269,15 +3289,14 @@ struct PlaybackManager::Impl {
                 .count();
         observations().record("playback.create_us", elapsed_us(request_started));
         // The negotiated transforms and codecs, for diagnosis.
-        Log::info("playback[" + trace + "] session create complete id=" + session->id +
-                  " mode=" + playback_mode_name(session->plan.mode) +
-                  " video=" + transform_name(session->plan.video) + "/" +
-                  session->plan.video_codec + " audio=" + transform_name(session->plan.audio) +
-                  "/" + session->plan.audio_codec +
-                  (session->plan.target_height
-                       ? " target_height=" + std::to_string(*session->plan.target_height)
-                       : std::string{}) +
-                  " elapsed_ms=" + std::to_string(elapsed));
+        const auto& target_height = session->plan.target_height;
+        Log::info(
+            "playback[" + trace + "] session create complete id=" + session->id +
+            " mode=" + playback_mode_name(session->plan.mode) +
+            " video=" + transform_name(session->plan.video) + "/" + session->plan.video_codec +
+            " audio=" + transform_name(session->plan.audio) + "/" + session->plan.audio_codec +
+            (target_height ? " target_height=" + std::to_string(*target_height) : std::string{}) +
+            " elapsed_ms=" + std::to_string(elapsed));
         return creation_response(*session, trace, idempotent ? "created" : "");
     }
 
@@ -3472,6 +3491,7 @@ struct PlaybackManager::Impl {
                 auto value = seek->asInt64();
                 if (value >= 0)
                     seek_ms = value;
+                // NOLINTNEXTLINE(bugprone-empty-catch): seek_ms stays empty, refused below
             } catch (...) {
             }
             if (!seek_ms)
@@ -3667,7 +3687,7 @@ struct PlaybackManager::Impl {
 
     // Removes an already-authorised session and releases everything it holds.
     // False when it was removed meanwhile.
-    bool tear_down_session(std::string_view id, std::shared_ptr<Session> session) {
+    bool tear_down_session(std::string_view id, const std::shared_ptr<Session>& session) {
         std::shared_ptr<Session> removed;
         Lock logical_operation(session->logical_session->operation_mutex);
         {
@@ -3693,7 +3713,7 @@ struct PlaybackManager::Impl {
         cancel_pending(*removed);
         stop_pipeline(*removed);
         std::error_code ec;
-        std::filesystem::remove_all(*current_config().temp_path / removed->id, ec);
+        std::filesystem::remove_all(current_config().temp_path.value() / removed->id, ec);
         return true;
     }
 
@@ -3958,7 +3978,7 @@ struct PlaybackManager::Impl {
         cleanup_cv.notify_all();
     }
 
-    void cleanup(std::stop_token stop) {
+    void cleanup(const std::stop_token& stop) {
         set_thread_name("macha-play-gc");
         while (!stop.stop_requested()) {
             std::vector<std::shared_ptr<Session>> expired;
@@ -4116,16 +4136,16 @@ void PlaybackManager::start() {
     const auto config = impl_->current_config();
     if (impl_->started || !config.enabled)
         return;
-    std::filesystem::create_directories(*config.temp_path);
+    std::filesystem::create_directories(config.temp_path.value());
     if (!impl_->engine)
         throw std::runtime_error("streaming media engine is unavailable");
     auto status = impl_->engine->status();
     if (!status.available)
         throw std::runtime_error("streaming media engine is unavailable");
-    impl_->cleanup_thread = std::jthread([this](std::stop_token stop) {
+    impl_->cleanup_thread = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("playback-cleanup", stop, [this, stop] { impl_->cleanup(stop); });
     });
-    impl_->profile_publish_thread = std::jthread([this](std::stop_token stop) {
+    impl_->profile_publish_thread = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("playback-profile-publish", stop,
                             [this, stop] { impl_->publish_profiles(stop); });
     });
@@ -4193,7 +4213,7 @@ void PlaybackManager::request_stop() {
     }
 }
 
-void PlaybackManager::reconfigure(StreamingConfig config) {
+void PlaybackManager::reconfigure(const StreamingConfig& config) {
     Lock lock(impl_->mutex);
     // Policy limits and timing apply at once; backend, probe, buffering and
     // temp-path changes need a restart.

@@ -7,6 +7,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cstddef>
 #include <limits>
 #include <stdexcept>
 
@@ -148,7 +149,7 @@ void validate(Config& config) {
     if (config.connectivity_check.timeout < std::chrono::milliseconds(100) ||
         config.connectivity_check.timeout > std::chrono::seconds(30))
         throw std::runtime_error("network.connectivity_check.timeout_ms must be 100..30000");
-    if (config.max_frame_size < 4 * 1024 || config.max_frame_size > 4ULL * 1024 * 1024)
+    if (config.max_frame_size < size_t{4} * 1024 || config.max_frame_size > 4ULL * 1024 * 1024)
         throw std::runtime_error("network.max_frame_size must be 4K..4M");
     if (config.heartbeat.count() <= 0 || config.dead_after.count() <= 0)
         throw std::runtime_error("network heartbeat and dead_after must be > 0");
@@ -252,7 +253,7 @@ void validate(Config& config) {
         throw std::runtime_error("fuse.read_ahead_extents must be <= 64");
     if (config.fuse.watchdog_interval < std::chrono::milliseconds(50))
         throw std::runtime_error("fuse.watchdog_interval_ms must be >= 50ms");
-    if (config.extent_size < 1024 * 1024 || config.extent_size > 64ULL * 1024 * 1024)
+    if (config.extent_size < size_t{1024} * 1024 || config.extent_size > 64ULL * 1024 * 1024)
         throw std::runtime_error("extent size must be 1M..64M");
     if (config.catalogue.api.enabled && !config.catalogue.api.port)
         throw std::runtime_error("catalogue.api.port must be nonzero");
@@ -276,7 +277,7 @@ void validate(Config& config) {
     if (config.catalogue.api.client_io_timeout < std::chrono::seconds(1) ||
         config.catalogue.api.client_io_timeout > std::chrono::minutes(5))
         throw std::runtime_error("catalogue.api.client_io_timeout_ms must be 1000..300000");
-    if (config.catalogue.api.stream_chunk_bytes < 16 * 1024 ||
+    if (config.catalogue.api.stream_chunk_bytes < size_t{16} * 1024 ||
         config.catalogue.api.stream_chunk_bytes > 4ULL * 1024 * 1024)
         throw std::runtime_error("catalogue.api.stream_chunk_bytes must be 16K..4M");
     if (config.catalogue.api.compression.level < 1 || config.catalogue.api.compression.level > 9)
@@ -503,7 +504,7 @@ void validate(Config& config) {
             throw std::runtime_error(
                 "catalogue.scanner.providers.books.openlibrary.cover_size must be S, M or L");
     }
-    if (config.catalogue.scanner.max_artwork_bytes < 64 * 1024 ||
+    if (config.catalogue.scanner.max_artwork_bytes < size_t{64} * 1024 ||
         config.catalogue.scanner.max_artwork_bytes > 128ULL * 1024 * 1024)
         throw std::runtime_error("catalogue.scanner.max_artwork_bytes must be 64K..128M");
     if (config.catalogue.scanner.music.enabled &&

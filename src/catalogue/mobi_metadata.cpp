@@ -468,8 +468,8 @@ std::optional<EpubCover> read_cover(const Source& source, const Database& databa
             if (!mime)
                 continue;
             return EpubCover{std::move(bytes), std::move(*mime)};
+            // NOLINTNEXTLINE(bugprone-empty-catch): a bad cover does not make a bad book
         } catch (const MobiError&) {
-            // A bad cover does not make a bad book.
         }
     }
     return std::nullopt;

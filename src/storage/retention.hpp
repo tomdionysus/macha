@@ -69,7 +69,7 @@ class RetentionStore final : public ClaimStore {
 
   public:
     // `cache_bytes` is shared by the two tries, three quarters to the data one.
-    RetentionStore(std::filesystem::path state_path, std::array<uint8_t, 32> key,
+    RetentionStore(const std::filesystem::path& state_path, std::array<uint8_t, 32> key,
                    size_t cache_bytes = 8ULL * 1024 * 1024);
 
     void retain(RetentionClass, const ObjectId&, const RetentionDot&) override;

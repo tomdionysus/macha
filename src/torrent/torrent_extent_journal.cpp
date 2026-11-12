@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "torrent/torrent_extent_journal.hpp"
+#include "errno_text.hpp"
 
 #include <cerrno>
 #include <charconv>
@@ -94,13 +95,13 @@ std::optional<std::vector<ExtentRef>> TorrentExtentJournal::manifest(const File&
     return out;
 }
 
-TorrentExtentJournal::TorrentExtentJournal(std::filesystem::path save_path)
+TorrentExtentJournal::TorrentExtentJournal(const std::filesystem::path& save_path)
     : path_(path_for(save_path)) {
     std::filesystem::create_directories(save_path);
     fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd_ < 0)
         throw std::runtime_error("cannot open torrent extent journal " + path_.string() + ": " +
-                                 std::strerror(errno));
+                                 errno_text(errno));
 }
 
 TorrentExtentJournal::~TorrentExtentJournal() {
@@ -124,13 +125,13 @@ void TorrentExtentJournal::append(const std::string& relative_path, uint64_t fil
             continue;
         if (wrote <= 0)
             throw std::runtime_error("torrent extent journal write failed: " +
-                                     std::string(std::strerror(errno)));
+                                     std::string(errno_text(errno)));
         done += static_cast<size_t>(wrote);
     }
     while (::fsync(fd_) != 0) {
         if (errno != EINTR)
             throw std::runtime_error("torrent extent journal fsync failed: " +
-                                     std::string(std::strerror(errno)));
+                                     std::string(errno_text(errno)));
     }
 }
 

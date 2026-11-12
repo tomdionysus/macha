@@ -44,6 +44,7 @@ extern "C" {
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace macha {
 namespace {
@@ -293,7 +294,7 @@ class InputContext {
         if (format_)
             avformat_close_input(&format_);
         if (io_) {
-            av_freep(&io_->buffer);
+            av_freep(static_cast<void*>(&io_->buffer));
             avio_context_free(&io_);
         }
     }
@@ -762,7 +763,7 @@ class OutputIo {
     }
     ~OutputIo() {
         if (io_) {
-            av_freep(&io_->buffer);
+            av_freep(static_cast<void*>(&io_->buffer));
             avio_context_free(&io_);
         }
     }
@@ -1451,7 +1452,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         if (pipelines.empty())
             throw std::runtime_error("playback plan contains no output streams");
 
-        FragmentWriter writer(store, segment_duration, vod_plan.segment_durations);
+        FragmentWriter writer(std::move(store), segment_duration, vod_plan.segment_durations);
         FragmentCuts cuts(vod_plan.segment_durations);
         OutputIo output_io(writer);
         out->pb = output_io.get();
@@ -1650,7 +1651,7 @@ class LibavSession final : public MediaEngineSession {
     std::string diagnostics_ MACHA_GUARDED_BY(diagnostics_mutex_);
     MediaStartProgress progress_;
 
-    void run(std::stop_token stop) {
+    void run(const std::stop_token& stop) {
         try {
             if (stop.stop_requested())
                 cancelled_.store(true);
@@ -1702,7 +1703,7 @@ class LibavSession final : public MediaEngineSession {
           store_(std::make_shared<MediaSegmentStore>(
               max_ahead_segments, memory_limit, std::move(spill_directory), segment_duration,
               vod_plan_.segment_durations, vod_plan_.playback.container)) {
-        worker_ = std::jthread([this](std::stop_token stop) {
+        worker_ = std::jthread([this](const std::stop_token& stop) {
             run_supervised_once("media-engine-session", [this, stop] { run(stop); });
         });
     }
@@ -2125,8 +2126,7 @@ class LibavMediaEngine final : public MediaEngine {
             auto packet = make_av_packet();
             uint64_t cue = 0;
             int rc = 0;
-            bool past_range = false;
-            while (!past_range && (rc = av_read_frame(format, packet.get())) >= 0) {
+            while ((rc = av_read_frame(format, packet.get())) >= 0) {
                 // A/V packets bound the timeline cursor across long gaps between cues, so an
                 // empty subtitle segment does not scan to the next cue; the grace allows for
                 // interleave.
@@ -2140,7 +2140,6 @@ class LibavMediaEngine final : public MediaEngine {
                                                         AVRational{1, 1000});
                     if (packet_ms >= range_end.count() + 1500) {
                         av_packet_unref(packet.get());
-                        past_range = true;
                         break;
                     }
                 }
@@ -2177,10 +2176,8 @@ class LibavMediaEngine final : public MediaEngine {
 
                 // A cue belongs to the segment it starts in. The web client keeps the
                 // preceding segment mounted, so cues may span a boundary without duplication.
-                if (begin_source >= range_end.count()) {
-                    past_range = true;
+                if (begin_source >= range_end.count())
                     break;
-                }
                 if (begin_source >= range_start.count()) {
                     std::string text;
                     for (unsigned i = 0; i < subtitle.num_rects; ++i) {

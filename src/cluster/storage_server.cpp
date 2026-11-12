@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/storage_server.hpp"
 
+#include <cstddef>
+
 #include "cluster/cluster.hpp"
 #include "codec.hpp"
 #include "diagnostics.hpp"
@@ -22,7 +24,7 @@ StorageServer::StorageServer(NodeRuntime& node, const NodeIdentity& identity, St
       cache_max_blocks_(cache_max_blocks), refresh_interval_(refresh_interval) {
     refresh();
     bind_routes();
-    refresher_ = std::jthread([this](std::stop_token stop) {
+    refresher_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("storage-refresh", stop, [this, stop] { refresh_loop(stop); });
     });
 }
@@ -63,7 +65,7 @@ void StorageServer::refresh() {
                           CacheActivity{stats.hits, stats.misses, stats.evictions});
 }
 
-void StorageServer::refresh_loop(std::stop_token stop) {
+void StorageServer::refresh_loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         {
             Lock lock(refresh_mutex_);
@@ -235,7 +237,7 @@ void StorageServer::bind_routes() {
                    [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
-            auto data = reader.bytes(128 * 1024 * 1024);
+            auto data = reader.bytes(size_t{128} * 1024 * 1024);
             reader.finish();
             if (data.size() > extent_size_)
                 return error_reply(413, "too_large", "DATA object exceeds configured extent size");
@@ -274,7 +276,7 @@ void StorageServer::bind_routes() {
                  [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
               Reader reader(request.payload);
               ObjectId id{reader.fixed<32>()};
-              auto data = reader.bytes(128 * 1024 * 1024);
+              auto data = reader.bytes(size_t{128} * 1024 * 1024);
               reader.finish();
               if (!control_.put(id, data))
                   return error_reply(507, "storage_full", "control storage limit reached");

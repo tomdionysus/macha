@@ -105,7 +105,7 @@ void MediaInformationService::queue_publication_locked(std::string media_id,
 void MediaInformationService::start() {
     if (started_ || !engine_ || !engine_->status().available)
         return;
-    worker_ = std::jthread([this](std::stop_token stop) {
+    worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("media-information", stop, [this, stop] { loop(stop); });
     });
     started_ = true;
@@ -139,7 +139,7 @@ bool MediaInformationService::media_is_live(std::string_view media_id) const {
 }
 
 size_t MediaInformationService::request(const std::vector<std::string>& media_ids, int priority,
-                                        std::string source) {
+                                        const std::string& source) {
     if (media_ids.empty() || !engine_ || !engine_->status().available)
         return 0;
     std::set<std::string> wanted(media_ids.begin(), media_ids.end());
@@ -206,9 +206,9 @@ bool MediaInformationService::request_path(std::string path, int priority, std::
     return true;
 }
 
-MediaProbeResult MediaInformationService::resolve(std::string media_id, std::string path,
-                                                  FsEntry entry, bool foreground,
-                                                  Clock::time_point deadline) {
+MediaProbeResult MediaInformationService::resolve(const std::string& media_id,
+                                                  const std::string& path, const FsEntry& entry,
+                                                  bool foreground, Clock::time_point deadline) {
     if (auto stored = catalogue_.media_profile(media_id))
         return *stored;
     if (!engine_ || !engine_->status().available)
@@ -228,7 +228,10 @@ MediaProbeResult MediaInformationService::resolve(std::string media_id, std::str
             if (flight->complete) {
                 if (flight->error)
                     std::rethrow_exception(flight->error);
-                return *flight->result;
+                auto result = flight->result;
+                if (!result)
+                    throw std::logic_error("media scan completed without a result");
+                return std::move(*result);
             }
             if (!flight->owner) {
                 flight->owner = true;
@@ -253,7 +256,10 @@ MediaProbeResult MediaInformationService::resolve(std::string media_id, std::str
                     throw std::runtime_error("timed out waiting for concurrent media scan");
                 if (flight->error)
                     std::rethrow_exception(flight->error);
-                return *flight->result;
+                auto result = flight->result;
+                if (!result)
+                    throw std::logic_error("media scan completed without a result");
+                return std::move(*result);
             }
         }
         if (!owner)
@@ -332,7 +338,7 @@ MediaProbeResult MediaInformationService::resolve_playback(std::string media_id,
     return resolve(std::move(media_id), std::move(path), std::move(entry), true, deadline);
 }
 
-void MediaInformationService::process_hint(const CatalogueHint& hint, std::stop_token stop) {
+void MediaInformationService::process_hint(const CatalogueHint& hint, const std::stop_token& stop) {
     auto origin = std::find_if(hint.origins.begin(), hint.origins.end(), [](const auto& value) {
         return value.source.starts_with("media-information");
     });
@@ -359,6 +365,7 @@ void MediaInformationService::process_hint(const CatalogueHint& hint, std::stop_
         // Prebuild the keyframe index; on failure the route builds it on demand.
         try {
             (void)keyframe_index(media_id, Clock::now() + std::chrono::seconds(30));
+            // NOLINTNEXTLINE(bugprone-empty-catch): no index for this media, nothing to build
         } catch (const KeyframeIndexUnsupported&) {
         } catch (const std::exception& e) {
             if (!stop.stop_requested())
@@ -373,7 +380,7 @@ void MediaInformationService::process_hint(const CatalogueHint& hint, std::stop_
     }
 }
 
-void MediaInformationService::publish_one(std::string media_id, MediaProbeResult probe) {
+void MediaInformationService::publish_one(const std::string& media_id, MediaProbeResult probe) {
     if (!media_is_live(media_id)) {
         request_prune();
         Lock lock(mutex_);
@@ -469,7 +476,7 @@ void MediaInformationService::prune() {
         Log::debug("media information pruned profiles=" + std::to_string(removed));
 }
 
-void MediaInformationService::loop(std::stop_token stop) {
+void MediaInformationService::loop(const std::stop_token& stop) {
     set_thread_name("macha-media-info");
     while (!stop.stop_requested()) {
         std::optional<std::pair<std::string, MediaProbeResult>> publication;

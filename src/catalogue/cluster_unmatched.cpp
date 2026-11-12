@@ -77,7 +77,7 @@ ClusterUnmatchedView::~ClusterUnmatchedView() {
 void ClusterUnmatchedView::start() {
     if (worker_.joinable())
         return;
-    worker_ = std::jthread([this](std::stop_token stop) {
+    worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("cluster-unmatched-view", stop, [this, stop] { loop(stop); });
     });
 }
@@ -90,7 +90,7 @@ void ClusterUnmatchedView::stop() {
     worker_.join();
 }
 
-void ClusterUnmatchedView::loop(std::stop_token stop) {
+void ClusterUnmatchedView::loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         refresh_now();
         Mutex wait_mutex; // guards nothing: the wait's own lock

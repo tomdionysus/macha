@@ -45,7 +45,7 @@ class MetadataServer {
   private:
     void route(MessageType, MessageRoutes::Handler);
     void bind_routes();
-    void refresh_loop(std::stop_token);
+    void refresh_loop(const std::stop_token&);
 
     NodeRuntime& node_;
     MetadataReplica& replica_;

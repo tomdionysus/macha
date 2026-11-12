@@ -483,6 +483,7 @@ std::string reply_error_text(const RpcReply& reply) {
         try {
             Reader reader(reply.message.payload);
             return reader.string();
+            // NOLINTNEXTLINE(bugprone-empty-catch): an unreadable payload is reported by type
         } catch (...) {
         }
     }
@@ -1142,11 +1143,11 @@ DistributedStore::DistributedStore(ClusterNode& n, LocalState& local, ActivityCl
         if (in >> settled && settled)
             repair_push_resume_ = settled;
     }
-    prompt_thread_ = std::jthread([this](std::stop_token stop) {
+    prompt_thread_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("prompt-replication", stop,
                             [this, stop] { prompt_replication_loop(stop); });
     });
-    local_writer_ = std::jthread([this](std::stop_token stop) {
+    local_writer_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("local-copy-writer", stop, [this, stop] { local_writer_loop(stop); });
     });
 }
@@ -1204,7 +1205,7 @@ void DistributedStore::queue_prompt_replication(const ObjectId& id) {
     prompt_cv_.notify_one();
 }
 
-void DistributedStore::prompt_replication_loop(std::stop_token stop) {
+void DistributedStore::prompt_replication_loop(const std::stop_token& stop) {
     // One object at a time: the local copy is pushed to the first placement
     // owner that lacks it, as speculative DATA work (behind viewers and
     // loaders, counted against the background ceiling). Copies beyond the
@@ -1470,7 +1471,7 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
                 auto ordered = replica_selector_.order(candidates, stripe + attempt, work);
                 if (ordered.empty())
                     break;
-                const auto target = ordered.front();
+                const auto& target = ordered.front();
                 auto found =
                     std::find_if(candidates.begin(), candidates.end(),
                                  [&](const NodeInfo& node) { return node.id == target.id; });
@@ -1631,7 +1632,7 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
             auto ordered = replica_selector_.order(candidates, stripe + attempt, work);
             if (ordered.empty())
                 break;
-            const auto target = ordered.front();
+            const auto& target = ordered.front();
             auto found = std::find_if(candidates.begin(), candidates.end(),
                                       [&](const NodeInfo& n) { return n.id == target.id; });
             if (found != candidates.end())
@@ -2873,6 +2874,7 @@ DistributedStore::RepairResult DistributedStore::repair_step(
                 if (send.rpc) {
                     try {
                         ok = send.rpc->get().message.type == MessageType::ok;
+                        // NOLINTNEXTLINE(bugprone-empty-catch): a failed call is traced as failed
                     } catch (...) {
                     }
                 }

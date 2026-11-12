@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/control_objects.hpp"
+
 #include "cluster/call_deadline.hpp"
+#include <cstddef>
 
 #include "cluster/cluster.hpp"
 #include "codec.hpp"
@@ -38,7 +40,7 @@ bool ControlObjectFetch::pull(const ObjectId& id, const Observer& observe) {
 
             Reader reader(reply.message.payload);
             ObjectId returned{reader.fixed<32>()};
-            auto data = reader.bytes(128 * 1024 * 1024);
+            auto data = reader.bytes(size_t{128} * 1024 * 1024);
             reader.finish();
             if (returned != id || object_id(data) != id) {
                 Log::debug("control object read " + target.host + ": integrity failure");

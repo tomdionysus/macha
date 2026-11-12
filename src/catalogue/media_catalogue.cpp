@@ -21,6 +21,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
@@ -539,7 +540,7 @@ std::optional<int32_t> season_directory_number(std::string_view value) {
     return std::stoi(match[1].str());
 }
 
-std::string strip_collection_ordinal(std::string value) {
+std::string strip_collection_ordinal(const std::string& value) {
     static const std::regex ordinal(R"(^\s*0[0-9]{1,2}[ ._-]+)");
     return std::regex_replace(value, ordinal, "");
 }
@@ -653,7 +654,7 @@ class SemanticMovieCandidateGenerator final : public MediaProbeCandidateGenerato
                                               year.pos == 0 ? "leading release year"
                                                             : "title/year boundary"};
             if (edition)
-                evidence.push_back("edition metadata separated from title");
+                evidence.emplace_back("edition metadata separated from title");
             out.push_back({std::move(probe), score, std::string(name()), std::move(evidence)});
         }
 
@@ -666,7 +667,7 @@ class SemanticMovieCandidateGenerator final : public MediaProbeCandidateGenerato
                 int score = 175;
                 std::vector<std::string> evidence{"technical release boundary"};
                 if (edition)
-                    evidence.push_back("edition metadata separated from title");
+                    evidence.emplace_back("edition metadata separated from title");
                 out.push_back({std::move(probe), score, std::string(name()), std::move(evidence)});
             }
         }
@@ -778,7 +779,7 @@ class FilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenera
             if (auto parent_season = season_directory_number(parts[parts.size() - 2])) {
                 if (*parent_season == pattern->season) {
                     score += 35;
-                    evidence.push_back("season directory agrees with filename");
+                    evidence.emplace_back("season directory agrees with filename");
                 }
                 const auto& raw_series_dir = parts[parts.size() - 3];
                 const auto dir_series = clean_series_name(raw_series_dir);
@@ -786,7 +787,7 @@ class FilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenera
                     probe.year = year_from(raw_series_dir);
                     if (probe.year) {
                         score += 25;
-                        evidence.push_back("series directory supplies matching year");
+                        evidence.emplace_back("series directory supplies matching year");
                     }
                 }
             }
@@ -809,7 +810,8 @@ class YearlessFilenameEpisodeCandidateGenerator final : public MediaProbeCandida
         candidate.probe.year.reset();
         candidate.score -= 45;
         candidate.generator = std::string(name());
-        candidate.evidence.push_back("yearless provider fallback for ambiguous TV premiere year");
+        candidate.evidence.emplace_back(
+            "yearless provider fallback for ambiguous TV premiere year");
         return {std::move(candidate)};
     }
 };
@@ -839,11 +841,11 @@ class DirectoryEpisodeCandidateGenerator final : public MediaProbeCandidateGener
                 series_index = parts.size() - 3;
                 if (*directory_season == pattern->season) {
                     score += 45;
-                    evidence.push_back("season directory agrees with filename");
+                    evidence.emplace_back("season directory agrees with filename");
                 }
             }
         }
-        const auto raw_series = parts[series_index];
+        const auto& raw_series = parts[series_index];
         auto series = clean_series_name(raw_series);
         if (series.empty())
             return {};
@@ -856,7 +858,7 @@ class DirectoryEpisodeCandidateGenerator final : public MediaProbeCandidateGener
         probe.title = clean_episode_title(pattern->suffix);
         if (probe.year) {
             score += 20;
-            evidence.push_back("series directory contains year");
+            evidence.emplace_back("series directory contains year");
         }
         return {{std::move(probe), score, std::string(name()), std::move(evidence)}};
     }
@@ -976,7 +978,8 @@ class RecordingFirstStructuredMusicCandidateGenerator final : public MediaProbeC
             candidate.probe.lookup_strategy = MediaProbeLookupStrategy::music_recording_first;
             candidate.score -= 20;
             candidate.generator = std::string(name());
-            candidate.evidence.push_back("recording-first fallback for structured path metadata");
+            candidate.evidence.emplace_back(
+                "recording-first fallback for structured path metadata");
             out.push_back(std::move(candidate));
         }
         return out;
@@ -1198,16 +1201,15 @@ std::vector<std::string> split_authors(std::string_view value) {
                 break;
             from = comma + 1;
         }
-        if (pieces.size() < 2) {
-            add(part);
-        } else if (std::all_of(pieces.begin(), pieces.end(), words)) {
+        if (pieces.size() >= 2 && std::all_of(pieces.begin(), pieces.end(), words)) {
             // Full names in a list. Two pieces that are both full names are
             // a list too ("Ian Stewart, Jack Cohen").
             for (const auto& piece : pieces)
                 add(piece);
         } else if (pieces.size() == 2) {
             add(pieces[1] + " " + pieces[0]);
-        } else if (pieces.size() % 2 == 0 && std::none_of(pieces.begin(), pieces.end(), words)) {
+        } else if (pieces.size() > 2 && pieces.size() % 2 == 0 &&
+                   std::none_of(pieces.begin(), pieces.end(), words)) {
             // "Pratchett, Terry, Baxter, Stephen": surname-first pairs.
             for (size_t i = 0; i < pieces.size(); i += 2)
                 add(pieces[i + 1] + " " + pieces[i]);
@@ -1493,11 +1495,11 @@ class StructuredBookCandidateGenerator final : public MediaProbeCandidateGenerat
             if (const auto numbered = series_numbered_title(file_stem)) {
                 probe.book_series.push_back({clean_title(folder), numbered->first});
                 probe.title = numbered->second;
-                evidence.push_back("series folder and numbered file name");
+                evidence.emplace_back("series folder and numbered file name");
             } else {
                 probe.authors = split_authors(folder);
                 std::tie(probe.title, probe.year) = book_title_and_year(file_stem);
-                evidence.push_back("author folder and file name");
+                evidence.emplace_back("author folder and file name");
             }
         } else if (relative == 3) {
             // Author/Title (Year)/file, or Author/Series/NN Title.epub.
@@ -1507,10 +1509,10 @@ class StructuredBookCandidateGenerator final : public MediaProbeCandidateGenerat
             if (const auto numbered = series_numbered_title(file_stem)) {
                 probe.book_series.push_back({clean_title(title_folder), numbered->first});
                 probe.title = numbered->second;
-                evidence.push_back("author folder, series folder and numbered file name");
+                evidence.emplace_back("author folder, series folder and numbered file name");
             } else {
                 std::tie(probe.title, probe.year) = book_title_and_year(title_folder);
-                evidence.push_back("author folder and title folder");
+                evidence.emplace_back("author folder and title folder");
             }
         } else {
             // Author/Series/NN Title/file.
@@ -1524,7 +1526,7 @@ class StructuredBookCandidateGenerator final : public MediaProbeCandidateGenerat
             } else {
                 std::tie(probe.title, probe.year) = book_title_and_year(title_folder);
             }
-            evidence.push_back("author, series and title folders");
+            evidence.emplace_back("author, series and title folders");
         }
         if (probe.title.empty())
             return {};
@@ -1895,10 +1897,9 @@ class ProviderTemporarilyUnavailable final : public std::runtime_error {
     std::chrono::milliseconds retry_after_;
 
   public:
-    ProviderTemporarilyUnavailable(std::string provider, std::string message,
+    ProviderTemporarilyUnavailable(std::string provider, const std::string& message,
                                    std::chrono::milliseconds retry_after = std::chrono::seconds(60))
-        : std::runtime_error(std::move(message)), provider_(std::move(provider)),
-          retry_after_(retry_after) {}
+        : std::runtime_error(message), provider_(std::move(provider)), retry_after_(retry_after) {}
     const std::string& provider() const noexcept {
         return provider_;
     }
@@ -1968,17 +1969,13 @@ std::vector<MediaProbeCandidate> probe_media_candidates(const MediaProbeContext&
             bool valid = false;
             switch (candidate.probe.kind) {
             case MediaProbeKind::movie:
+            case MediaProbeKind::track:
+            case MediaProbeKind::book:
                 valid = !candidate.probe.title.empty();
                 break;
             case MediaProbeKind::episode:
                 valid = !candidate.probe.series.empty() && candidate.probe.season &&
                         candidate.probe.episode;
-                break;
-            case MediaProbeKind::track:
-                valid = !candidate.probe.title.empty();
-                break;
-            case MediaProbeKind::book:
-                valid = !candidate.probe.title.empty();
                 break;
             }
             if (!valid)
@@ -2099,12 +2096,12 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url,
     std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_guard(nullptr,
                                                                              curl_slist_free_all);
     for (const auto& header : headers) {
-        auto* appended = curl_slist_append(header_guard.get(), header.c_str());
+        // curl_slist_append returns the possibly new head owning the chain.
+        auto* head = header_guard.release();
+        auto* appended = curl_slist_append(head, header.c_str());
+        header_guard.reset(appended ? appended : head);
         if (!appended)
             throw std::bad_alloc();
-        // curl_slist_append returns the possibly new head owning the chain.
-        (void)header_guard.release();
-        header_guard.reset(appended);
     }
     if (header_guard)
         curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_guard.get());
@@ -2678,7 +2675,7 @@ std::optional<Json> MusicBrainzProvider::find_release(const MediaProbe& probe) {
 // Filename decorations the provider title lacks ("(feat. X)", "(Live)",
 // "(Radio Edit)"), which make a search find nothing. The decorated form is
 // tried first: a live or remix version is a distinct recording.
-std::string music_title_without_decorations(const std::string& title) {
+static std::string music_title_without_decorations(const std::string& title) {
     static const std::regex decoration(
         R"(\s*[(\[]\s*(?:feat\.?|ft\.?|featuring|with)\b[^)\]]*[)\]]|)"
         R"(\s*[(\[][^)\]]*\b(?:live|acoustic|instrumental|explicit|clean|remaster(?:ed)?|)"
@@ -2698,7 +2695,7 @@ std::string music_title_without_decorations(const std::string& title) {
 
 // MusicBrainz credits guests in the artist ("Avicii feat. Sandro Cavazza");
 // compare on the primary artist the path carries.
-std::string primary_artist_credit(const std::string& credit) {
+static std::string primary_artist_credit(const std::string& credit) {
     static const std::regex secondary(R"(\s+(?:feat\.?|ft\.?|featuring|with|&|vs\.?|x)\s+.*$)",
                                       std::regex::icase);
     return std::regex_replace(credit, secondary, "");
@@ -2780,7 +2777,7 @@ std::optional<Json> MusicBrainzProvider::cover_art(std::string_view release_id) 
     if (auto it = cover_art_cache_.find(key); it != cover_art_cache_.end())
         return it->second;
     auto response = http_.get("https://coverartarchive.org/release/" + key,
-                              {"Accept: application/json"}, 2 * 1024 * 1024);
+                              {"Accept: application/json"}, size_t{2} * 1024 * 1024);
     std::optional<Json> listing;
     // The Cover Art Archive answers 404 for a release with no art.
     if (response.status == 200)
@@ -3604,7 +3601,7 @@ std::string openlibrary_language(std::string_view key) {
         {"swe", "sv"}, {"nor", "no"}, {"dan", "da"}, {"fin", "fi"}, {"pol", "pl"},
         {"lat", "la"}, {"gre", "el"}, {"ara", "ar"}, {"heb", "he"}, {"kor", "ko"},
     };
-    const auto id = openlibrary_key_id(key);
+    auto id = openlibrary_key_id(key);
     for (const auto& [from, to] : tags)
         if (id == from)
             return std::string(to);
@@ -4183,7 +4180,7 @@ MediaProbeFile BookScanProvider::probe_file(FileSystem& fs, std::string_view roo
                 continue;
             const auto sibling_path = directory == "/" ? "/" + name : directory + "/" + name;
             const auto lowered = lower(name);
-            if (lowered == "metadata.opf" && sibling.size <= 1024 * 1024) {
+            if (lowered == "metadata.opf" && sibling.size <= uint64_t{1024} * 1024) {
                 try {
                     const auto bytes = read_namespace_file(fs, sibling_path, sibling);
                     auto opf = probe_from_epub(read_opf_metadata(std::string_view(
@@ -4327,7 +4324,7 @@ void CatalogueScanner::start() {
         return;
     http_->reset_stop();
     hints_.requeue_processing();
-    worker_ = std::jthread([this](std::stop_token stop) {
+    worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("catalogue-scanner", stop, [this, stop] { loop(stop); });
     });
 }
@@ -4797,8 +4794,8 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(const CatalogueHint& hint
                                            std::string(scan_provider));
         try {
             match = metadata->lookup(probe);
+            // NOLINTNEXTLINE(bugprone-empty-catch): no match is answered as provider_not_found
         } catch (const ProviderRecordNotFound&) {
-            // No match: answered below as provider_not_found.
         } catch (const std::exception& e) {
             throw provider_unavailable(parsed->provider, e);
         }
@@ -4971,8 +4968,8 @@ CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::st
             numbers.episode = item->episode_number;
     }
     if (!ref) {
-        const auto is_tmdb_show = [](const std::optional<CatalogueItem>& candidate) {
-            return candidate && candidate->id.starts_with("tmdb:tv:");
+        const auto is_tmdb_show = [](const CatalogueItem& candidate) {
+            return candidate.id.starts_with("tmdb:tv:");
         };
         switch (item->kind) {
         case CatalogueKind::movie:
@@ -4986,7 +4983,7 @@ CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::st
         case CatalogueKind::season:
             if (item->parent_id) {
                 auto show = catalogue_.get(*item->parent_id);
-                if (is_tmdb_show(show))
+                if (show && is_tmdb_show(*show))
                     ref = show->id;
             }
             break;
@@ -4995,7 +4992,7 @@ CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::st
                 auto season = catalogue_.get(*item->parent_id);
                 if (season && season->parent_id) {
                     auto show = catalogue_.get(*season->parent_id);
-                    if (is_tmdb_show(show))
+                    if (show && is_tmdb_show(*show))
                         ref = show->id;
                 }
             }
@@ -5074,9 +5071,11 @@ bool stale_scanner_book(const CatalogueItem& item) {
 
 } // namespace
 
-std::optional<CatalogueScanner::PreparedHintMatch> CatalogueScanner::prepare_hint(
-    const CatalogueHint& hint, std::stop_token stop, const MetadataSnapshot& namespace_snapshot,
-    uint64_t snapshot_taken_unix_ms, DistributedStore::DurabilityBatch& artwork_batch) {
+std::optional<CatalogueScanner::PreparedHintMatch>
+CatalogueScanner::prepare_hint(const CatalogueHint& hint, const std::stop_token& stop,
+                               const MetadataSnapshot& namespace_snapshot,
+                               uint64_t snapshot_taken_unix_ms,
+                               DistributedStore::DurabilityBatch& artwork_batch) {
     if (stop.stop_requested())
         return {};
     CatalogueScannerConfig config;
@@ -5343,7 +5342,7 @@ std::optional<CatalogueScanner::PreparedHintMatch> CatalogueScanner::prepare_hin
     return prepared;
 }
 
-CatalogueScanner::HintBatchResult CatalogueScanner::process_hint_batch(std::stop_token stop,
+CatalogueScanner::HintBatchResult CatalogueScanner::process_hint_batch(const std::stop_token& stop,
                                                                        size_t max_hints) {
     CatalogueScannerConfig config;
     {
@@ -5403,7 +5402,7 @@ CatalogueScanner::HintBatchResult CatalogueScanner::process_hint_batch(std::stop
                         try {
                             const auto media_id = match->media_id;
                             const auto path = normalize_path(hint->path);
-                            const auto source_entry = *entry;
+                            const auto& source_entry = *entry;
                             const auto deadline =
                                 Clock::now() + node_.config().streaming.probe_timeout;
                             auto resolved =
@@ -5527,8 +5526,9 @@ size_t CatalogueScanner::scan_once() {
     return process_hint_batch({}, max_hint_batch).catalogued;
 }
 
-size_t CatalogueScanner::scan_once(std::stop_token stop, bool force, std::string_view hint_source,
-                                   int hint_priority, bool unique_source_ref) {
+size_t CatalogueScanner::scan_once(const std::stop_token& stop, bool force,
+                                   std::string_view hint_source, int hint_priority,
+                                   bool unique_source_ref) {
     CatalogueScannerConfig config;
     std::vector<CatalogueScanProvider*> providers;
     {
@@ -5650,7 +5650,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force, std::string
     return ids.size();
 }
 
-void CatalogueScanner::loop(std::stop_token stop) {
+void CatalogueScanner::loop(const std::stop_token& stop) {
     ThreadCpuReporter cpu_reporter("macha-catalogue", diagnostic_interval_, true);
     CatalogueScannerConfig initial_config;
     {

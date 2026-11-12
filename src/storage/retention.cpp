@@ -251,7 +251,7 @@ std::vector<ObjectId> sorted_unique(std::vector<ObjectId> ids) {
 
 } // namespace
 
-RetentionStore::RetentionStore(std::filesystem::path state_path, std::array<uint8_t, 32> key,
+RetentionStore::RetentionStore(const std::filesystem::path& state_path, std::array<uint8_t, 32> key,
                                size_t cache_bytes)
     : root_(state_path / "retention"), key_(key),
       journal_(state_path / "retention" / "claims.log", key, journal_aad, max_journal_frame) {

@@ -227,8 +227,8 @@ std::string render_observation_window(uint64_t start_unix_ms, uint64_t end_unix_
         Json::Array buckets;
         for (size_t bucket = 0; bucket < histogram.buckets.size(); ++bucket)
             if (histogram.buckets[bucket])
-                buckets.push_back(Json::Array{Json(static_cast<uint64_t>(bucket)),
-                                              Json(histogram.buckets[bucket])});
+                buckets.emplace_back(Json::Array{Json(static_cast<uint64_t>(bucket)),
+                                                 Json(histogram.buckets[bucket])});
         histograms[name] =
             Json::Object{{"count", histogram.count},       {"sum", histogram.sum},
                          {"max", histogram.max},           {"p50", histogram.quantile(0.5)},
@@ -305,7 +305,7 @@ void ObservationRecorder::start() {
         Lock lock(tick_mutex_);
         previous_unix_ms_ = unix_ms();
     }
-    thread_ = std::jthread([this](std::stop_token stop) {
+    thread_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("observation", stop, [this, stop] {
             while (true) {
                 {

@@ -245,7 +245,8 @@ class LocalStore final : public ObjectStore {
 
     std::filesystem::path path(const ObjectId&) const;
     void wait_for_accounting(Lock&) const MACHA_REQUIRES(m_);
-    bool wait_for_accounting(Lock&, std::stop_token, bool exact = false) const MACHA_REQUIRES(m_);
+    bool wait_for_accounting(Lock&, const std::stop_token&, bool exact = false) const
+        MACHA_REQUIRES(m_);
     // Waits for the scan under m_ alone, before a writer takes an object lock.
     void await_accounting() const MACHA_EXCLUDES(m_);
     void start_scan();
@@ -264,8 +265,8 @@ class LocalStore final : public ObjectStore {
         MACHA_REQUIRES(m_) MACHA_EXCLUDES(pack_io_mutex_);
     bool put_packed_locked(const ObjectId&, std::span<const uint8_t>, uint64_t& generation, Lock&)
         MACHA_REQUIRES(m_) MACHA_EXCLUDES(pack_io_mutex_);
-    void scan(std::stop_token) MACHA_EXCLUDES(m_);
-    void warm_presence_index(std::stop_token) MACHA_EXCLUDES(m_);
+    void scan(const std::stop_token&) MACHA_EXCLUDES(m_);
+    void warm_presence_index(const std::stop_token&) MACHA_EXCLUDES(m_);
     // Constructor only, before any other thread exists, so it takes no lock.
     void rebuild_pack_index(bool truncate_incomplete_tail) MACHA_NO_THREAD_SAFETY_ANALYSIS;
     // Releases m_ across the read.
@@ -298,7 +299,7 @@ class LocalStore final : public ObjectStore {
         MACHA_EXCLUDES(object_mutex_map_mutex_);
 
   public:
-    LocalStore(std::filesystem::path, LocalStoreOptions, std::array<uint8_t, 32>,
+    LocalStore(std::filesystem::path, const LocalStoreOptions&, std::array<uint8_t, 32>,
                LocalStoreMode = LocalStoreMode::authoritative,
                std::shared_ptr<DurabilityDomain> = {},
                LocalStoreFiles& = posix_local_store_files());
@@ -308,7 +309,7 @@ class LocalStore final : public ObjectStore {
                LocalStoreMode = LocalStoreMode::authoritative,
                std::shared_ptr<DurabilityDomain> = {},
                LocalStoreFiles& = posix_local_store_files());
-    ~LocalStore();
+    ~LocalStore() override;
     bool put(const ObjectId&, std::span<const uint8_t>);
     std::optional<uint64_t> put_deferred(const ObjectId&, std::span<const uint8_t>);
     void durability_barrier(uint64_t required_generation,

@@ -131,9 +131,10 @@ void ReferenceCounts::reset(const std::optional<ObjectId>& root, std::vector<Obj
     write_state(true);
 }
 
-bool ReferenceCounts::change(const ObjectId& root, std::vector<ObjectId> extents_in,
-                             std::vector<ObjectId> extents_out, std::vector<ObjectId> nodes_in,
-                             std::vector<ObjectId> nodes_out, Totals totals) {
+bool ReferenceCounts::change(const ObjectId& root, const std::vector<ObjectId>& extents_in,
+                             const std::vector<ObjectId>& extents_out,
+                             const std::vector<ObjectId>& nodes_in,
+                             const std::vector<ObjectId>& nodes_out, Totals totals) {
     // Checked whole before anything is written, so a refusal changes nothing.
     auto extent_changes = changes_for(extents_, extents_in, extents_out);
     auto node_changes = changes_for(nodes_, nodes_in, nodes_out);

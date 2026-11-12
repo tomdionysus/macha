@@ -94,6 +94,7 @@ struct MediaSegmentStore::Impl {
             for (auto& wake : list) {
                 try {
                     wake();
+                    // NOLINTNEXTLINE(bugprone-empty-catch): the rest still fire
                 } catch (...) {
                 }
             }
@@ -428,6 +429,13 @@ void MediaSegmentStore::note_requested(uint64_t index) {
 
 MediaSegmentStore::Snapshot MediaSegmentStore::snapshot() const {
     Lock lock(impl_->mutex);
+    const auto produced_since = impl_->produced_since;
+    const uint64_t producing_for =
+        produced_since
+            ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        impl_->time->now() - *produced_since)
+                                        .count())
+            : 0;
     return {
         static_cast<bool>(impl_->init),
         impl_->finished,
@@ -443,11 +451,7 @@ MediaSegmentStore::Snapshot MediaSegmentStore::snapshot() const {
             std::chrono::duration_cast<std::chrono::milliseconds>(impl_->produced_media).count()),
         static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(impl_->producing).count()),
-        impl_->produced_since
-            ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        impl_->time->now() - *impl_->produced_since)
-                                        .count())
-            : 0,
+        producing_for,
         impl_->segments.size() > impl_->highest_requested + impl_->max_ahead};
 }
 

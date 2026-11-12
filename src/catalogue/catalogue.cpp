@@ -10,8 +10,10 @@
 #include <bit>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <tuple>
+#include <utility>
 
 namespace macha {
 namespace {
@@ -49,7 +51,7 @@ std::vector<std::string> string_vector(Reader& r, uint32_t maximum = 1000000) {
     std::vector<std::string> out;
     out.reserve(count);
     for (uint32_t i = 0; i < count; ++i)
-        out.push_back(r.string(16 * 1024 * 1024));
+        out.push_back(r.string(size_t{16} * 1024 * 1024));
     return out;
 }
 
@@ -221,7 +223,7 @@ void optional_string(Writer& w, const std::optional<std::string>& value) {
 std::optional<std::string> optional_string(Reader& r) {
     if (!r.u8())
         return {};
-    return r.string(1024 * 1024);
+    return r.string(size_t{1024} * 1024);
 }
 
 // A double as its bit pattern; the series index is the only one stored.
@@ -281,7 +283,7 @@ CatalogueSnapshot::MediaProfile decode_media_profile(Reader& r) {
     CatalogueSnapshot::MediaProfile profile;
     profile.schema_version = r.u32();
     profile.complete = r.u8();
-    profile.probe.format = r.string(1024 * 1024);
+    profile.probe.format = r.string(size_t{1024} * 1024);
     profile.probe.duration_seconds = std::bit_cast<double>(r.u64());
     profile.probe.bitrate = r.u64();
     const auto count = r.u32();
@@ -295,9 +297,9 @@ CatalogueSnapshot::MediaProfile decode_media_profile(Reader& r) {
         if (!valid_stream_type(type))
             throw DecodeError("bad media stream type");
         stream.type = static_cast<MediaStreamType>(type);
-        stream.codec = r.string(1024 * 1024);
-        stream.profile = r.string(1024 * 1024);
-        stream.language = r.string(1024 * 1024);
+        stream.codec = r.string(size_t{1024} * 1024);
+        stream.profile = r.string(size_t{1024} * 1024);
+        stream.language = r.string(size_t{1024} * 1024);
         stream.width = static_cast<int32_t>(r.u32());
         stream.height = static_cast<int32_t>(r.u32());
         stream.channels = static_cast<int32_t>(r.u32());
@@ -330,8 +332,7 @@ size_t catalogue_shard(std::string_view id) {
     return value % catalogue_shard_count;
 }
 
-CatalogueView::CatalogueView(Shards shards, ShardIds ids)
-    : shards_(std::move(shards)), ids_(std::move(ids)) {
+CatalogueView::CatalogueView(Shards shards, ShardIds ids) : shards_(std::move(shards)), ids_(ids) {
     for (const auto& shard : shards_)
         if (shard)
             item_count_ += shard->items.size();
@@ -490,7 +491,10 @@ class CatalogueDraft {
     }
     // The written shard, none if the write left it empty.
     std::shared_ptr<const CatalogueSnapshot> take(size_t slot) {
-        auto& shard = *written_[slot];
+        auto& entry = written_[slot];
+        if (!entry)
+            throw std::logic_error("catalogue draft shard taken before it was written");
+        auto& shard = *entry;
         if (shard.items.empty() && shard.media_profiles.empty() && shard.media_indexes.empty())
             return nullptr;
         return std::make_shared<const CatalogueSnapshot>(std::move(shard));
@@ -498,16 +502,17 @@ class CatalogueDraft {
 
   private:
     const CatalogueSnapshot* read(size_t slot) const {
-        if (written_[slot])
-            return &*written_[slot];
+        if (const auto& shard = written_[slot])
+            return &*shard;
         return base_ ? base_->shards()[slot].get() : nullptr;
     }
     CatalogueSnapshot& write(size_t slot) {
-        if (!written_[slot]) {
+        auto& shard = written_[slot];
+        if (!shard) {
             const auto* base = base_ ? base_->shards()[slot].get() : nullptr;
-            written_[slot] = base ? *base : CatalogueSnapshot{};
+            shard = base ? *base : CatalogueSnapshot{};
         }
-        return *written_[slot];
+        return *shard;
     }
 
     std::shared_ptr<const CatalogueView> base_;
@@ -613,16 +618,16 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
     CatalogueSnapshot snapshot;
     for (uint32_t i = 0; i < count; ++i) {
         CatalogueItem item;
-        item.id = r.string(1024 * 1024);
+        item.id = r.string(size_t{1024} * 1024);
         auto kind = r.u8();
         if (!valid_kind(kind))
             throw DecodeError("bad catalogue kind");
         item.kind = static_cast<CatalogueKind>(kind);
-        item.title = r.string(16 * 1024 * 1024);
-        item.sort_title = r.string(16 * 1024 * 1024);
-        item.synopsis = r.string(64 * 1024 * 1024);
+        item.title = r.string(size_t{16} * 1024 * 1024);
+        item.sort_title = r.string(size_t{16} * 1024 * 1024);
+        item.synopsis = r.string(size_t{64} * 1024 * 1024);
         if (r.u8())
-            item.parent_id = r.string(1024 * 1024);
+            item.parent_id = r.string(size_t{1024} * 1024);
         item.year = optional_i32(r);
         item.season_number = optional_i32(r);
         item.episode_number = optional_i32(r);
@@ -633,8 +638,8 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
         if (external_count > 100000)
             throw DecodeError("too many external ids");
         for (uint32_t j = 0; j < external_count; ++j) {
-            auto provider = r.string(1024 * 1024);
-            auto external_id = r.string(1024 * 1024);
+            auto provider = r.string(size_t{1024} * 1024);
+            auto external_id = r.string(size_t{1024} * 1024);
             item.external_ids.emplace(std::move(provider), std::move(external_id));
         }
         item.media_ids = string_vector(r);
@@ -644,9 +649,9 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
         item.artwork.reserve(artwork_count);
         for (uint32_t j = 0; j < artwork_count; ++j) {
             CatalogueArtwork art;
-            art.role = r.string(1024 * 1024);
+            art.role = r.string(size_t{1024} * 1024);
             art.id.bytes = r.fixed<32>();
-            art.mime_type = r.string(1024 * 1024);
+            art.mime_type = r.string(size_t{1024} * 1024);
             item.artwork.push_back(std::move(art));
         }
         item.revision = r.u64();
@@ -659,7 +664,7 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
             item.series.reserve(series_count);
             for (uint32_t j = 0; j < series_count; ++j) {
                 CatalogueSeriesRef ref;
-                ref.series_id = r.string(1024 * 1024);
+                ref.series_id = r.string(size_t{1024} * 1024);
                 ref.index = optional_f64(r);
                 item.series.push_back(std::move(ref));
             }
@@ -675,7 +680,7 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
         if (profile_count > 1000000)
             throw DecodeError("too many media profiles");
         for (uint32_t i = 0; i < profile_count; ++i) {
-            auto media_id = r.string(1024 * 1024);
+            auto media_id = r.string(size_t{1024} * 1024);
             auto profile = decode_media_profile(r);
             if (media_id.empty() ||
                 !snapshot.media_profiles.emplace(std::move(media_id), std::move(profile)).second)
@@ -687,7 +692,7 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
         if (index_count > 1000000)
             throw DecodeError("too many media indexes");
         for (uint32_t i = 0; i < index_count; ++i) {
-            auto media_id = r.string(1024 * 1024);
+            auto media_id = r.string(size_t{1024} * 1024);
             ObjectId index{r.fixed<32>()};
             if (media_id.empty() ||
                 !snapshot.media_indexes.emplace(std::move(media_id), index).second)
@@ -719,12 +724,10 @@ std::optional<CatalogueSnapshot> merge_catalogue_snapshots(const CatalogueSnapsh
         const auto l = find_item(left.items, id);
         const auto r = find_item(right.items, id);
         std::optional<CatalogueItem> selected;
-        if (l == r)
+        if (l == r || r == b)
             selected = l;
         else if (l == b)
             selected = r;
-        else if (r == b)
-            selected = l;
         else
             return {};
         if (selected)
@@ -744,12 +747,10 @@ std::optional<CatalogueSnapshot> merge_catalogue_snapshots(const CatalogueSnapsh
         const auto b = find(base.media_profiles), l = find(left.media_profiles),
                    r = find(right.media_profiles);
         std::optional<CatalogueSnapshot::MediaProfile> selected;
-        if (l == r)
+        if (l == r || r == b)
             selected = l;
         else if (l == b)
             selected = r;
-        else if (r == b)
-            selected = l;
         else
             return {};
         if (selected)
@@ -768,12 +769,10 @@ std::optional<CatalogueSnapshot> merge_catalogue_snapshots(const CatalogueSnapsh
         const auto b = find(base.media_indexes), l = find(left.media_indexes),
                    r = find(right.media_indexes);
         std::optional<ObjectId> selected;
-        if (l == r)
+        if (l == r || r == b)
             selected = l;
         else if (l == b)
             selected = r;
-        else if (r == b)
-            selected = l;
         else
             return {};
         if (selected)
@@ -1442,7 +1441,7 @@ std::optional<MediaProbeResult> CatalogueManager::media_profile(std::string_view
 
 ResolvedMediaProfile
 CatalogueManager::resolve_media_profile(std::string media_id, Clock::time_point deadline,
-                                        std::function<MediaProbeResult()> generate) {
+                                        const std::function<MediaProbeResult()>& generate) {
     try {
         if (auto persisted = media_profile(media_id))
             return {*persisted, false, false};
@@ -1471,14 +1470,17 @@ CatalogueManager::resolve_media_profile(std::string media_id, Clock::time_point 
             throw std::runtime_error("timed out waiting for concurrent immutable media profiling");
         if (flight->error)
             std::rethrow_exception(flight->error);
-        return {*flight->result, false, true};
+        auto result = flight->result;
+        if (!result)
+            throw std::logic_error("concurrent media profiling completed without a result");
+        return {std::move(*result), false, true};
     }
 
     auto finish = [&](std::optional<MediaProbeResult> result, std::exception_ptr error = {}) {
         {
             Lock lock(flight->mutex);
             flight->result = result;
-            flight->error = error;
+            flight->error = std::move(error);
             flight->complete = true;
         }
         if (result) {
@@ -1822,7 +1824,7 @@ void CatalogueManager::publish(
         const auto id = object_id(encoded);
         manifest.shards[i] = id;
         if (old_manifest.shards[i] != id)
-            changed_control.push_back({id, std::move(encoded)});
+            changed_control.emplace_back(id, std::move(encoded));
     }
     auto staged =
         std::make_shared<const CatalogueView>(std::move(prepared.shards), manifest.shards);
@@ -2287,7 +2289,9 @@ void CatalogueManager::reconcile_scanner(
         std::set<std::string> discovered_ids;
         for (const auto& item : discovered)
             discovered_ids.insert(item.id);
-        for (const auto& [id, files] : superseded) {
+        for (const auto& superseded_entry : superseded) {
+            const auto& id = superseded_entry.first;
+            const auto& files = superseded_entry.second;
             if (discovered_ids.contains(id))
                 continue;
             const auto* found = current.item(id);

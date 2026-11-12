@@ -112,7 +112,7 @@ class StoragePool final : public ObjectStore {
     // Each backend keeps a held ledger under <state_path>/ledger/, the
     // backends sharing `ledger_cache` bytes of page cache. `files` is the device
     // work of every backend's store, and outlives the pool.
-    StoragePool(std::filesystem::path state_path, NodeId, std::vector<StorageBackendConfig>,
+    StoragePool(std::filesystem::path state_path, NodeId, const std::vector<StorageBackendConfig>&,
                 std::array<uint8_t, 32> key,
                 std::chrono::milliseconds durability_batch_window = std::chrono::milliseconds(500),
                 StoragePackingConfig packing = StoragePackingConfig{0, 0},
@@ -184,7 +184,7 @@ class StoragePool final : public ObjectStore {
 
     // Reclaims dead pack records incrementally; at most one pack per
     // LocalStore per call, bounding temporary disk use.
-    size_t compact_packs(std::stop_token = {});
+    size_t compact_packs(const std::stop_token& = {});
 
     // LocalStore::verify_step() on every online backend, summed; complete
     // once every backend's pass is.

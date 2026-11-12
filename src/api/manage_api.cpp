@@ -14,6 +14,7 @@
 #include <set>
 #include <sstream>
 #include <unistd.h>
+#include <utility>
 
 namespace macha {
 namespace {
@@ -99,7 +100,7 @@ Json catalogue_item_json(const CatalogueItem& item) {
         Json::Object value;
         value["series_id"] = ref.series_id;
         value["index"] = ref.index ? Json(*ref.index) : Json(nullptr);
-        series.push_back(Json(std::move(value)));
+        series.emplace_back(std::move(value));
     }
     out["series"] = std::move(series);
     out["language"] = item.language ? Json(*item.language) : Json(nullptr);
@@ -219,9 +220,11 @@ Json probe_json(const MediaProbeCandidate& candidate) {
     out["authors"] = std::move(authors);
     out["author"] = probe.authors.empty() ? std::string{} : probe.authors.front();
     out["series_name"] = probe.book_series.empty() ? std::string{} : probe.book_series.front().name;
-    out["series_index"] = !probe.book_series.empty() && probe.book_series.front().index
-                              ? Json(*probe.book_series.front().index)
-                              : Json(nullptr);
+    Json series_index(nullptr);
+    if (!probe.book_series.empty())
+        if (const auto& index = probe.book_series.front().index)
+            series_index = Json(*index);
+    out["series_index"] = std::move(series_index);
     out["isbn"] = probe.isbn ? Json(*probe.isbn) : Json(nullptr);
     out["language"] = probe.language ? Json(*probe.language) : Json(nullptr);
     Json::Array evidence;
@@ -665,7 +668,8 @@ ManageApi::ManageApi(NodeRuntime& node, MetadataView& metadata, FileSystem& fs,
                      CatalogueScanner& scanner, const ClusterUnmatchedView* peers_unmatched)
     : node_(node), metadata_(metadata), fs_(fs), catalogue_(catalogue), hints_(hints),
       scanner_(scanner), peers_unmatched_(peers_unmatched),
-      identity_audit_worker_([this](std::stop_token stop) { identity_reset_audit_loop(stop); }) {}
+      identity_audit_worker_(
+          [this](std::stop_token stop) { identity_reset_audit_loop(std::move(stop)); }) {}
 
 std::optional<CatalogueHint> ManageApi::unmatched_hint(std::string_view id) const {
     if (auto hint = actionable_hint(hints_, id))
@@ -701,7 +705,7 @@ void ManageApi::queue_identity_reset_audit(IdentityAssociationReset reset) {
     identity_audit_cv_.notify_one();
 }
 
-void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
+void ManageApi::identity_reset_audit_loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         IdentityAssociationReset reset;
         {
@@ -1120,8 +1124,8 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 Json::Array ids;
                 for (const auto* item : holders)
                     ids.emplace_back(item->id);
-                conflicts.push_back(
-                    Json(Json::Object{{"media_id", media}, {"item_ids", Json(std::move(ids))}}));
+                conflicts.emplace_back(
+                    Json::Object{{"media_id", media}, {"item_ids", Json(std::move(ids))}});
             }
             Json::Object out;
             out["count"] = static_cast<uint64_t>(items.size());
@@ -1174,7 +1178,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                     item["author"] = result.artist;
                 if (!result.catalogue_id.empty())
                     item["catalogue_item_id"] = result.catalogue_id;
-                results.push_back(Json(std::move(item)));
+                results.emplace_back(std::move(item));
             }
             Json::Object out;
             out["status"] = "ok";
@@ -1213,7 +1217,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                     option.height ? Json(static_cast<int64_t>(*option.height)) : Json(nullptr);
                 item["language"] = option.language.empty() ? Json(nullptr) : Json(option.language);
                 item["preview_url"] = option.preview_url;
-                options.push_back(Json(std::move(item)));
+                options.emplace_back(std::move(item));
             }
             Json::Object out;
             out["status"] = "ok";
@@ -1236,7 +1240,7 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 item["length_ms"] = number(track.length_ms);
                 item["recording_id"] =
                     track.recording_id.empty() ? Json(nullptr) : Json(track.recording_id);
-                tracks.push_back(Json(std::move(item)));
+                tracks.emplace_back(std::move(item));
             }
             Json::Object out;
             out["status"] = "ok";

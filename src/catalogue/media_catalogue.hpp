@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <memory>
@@ -146,7 +147,7 @@ class HttpClient {
     }
     virtual RemoteHttpResponse get(std::string_view url,
                                    const std::vector<std::string>& headers = {},
-                                   size_t maximum_bytes = 16 * 1024 * 1024) = 0;
+                                   size_t maximum_bytes = size_t{16} * 1024 * 1024) = 0;
 };
 
 class CurlHttpClient final : public HttpClient {
@@ -549,7 +550,7 @@ class MusicScanProvider final : public CatalogueScanProvider {
 
   public:
     MusicScanProvider(HttpClient&, CatalogueMusicProviderConfig,
-                      size_t max_artwork_bytes = 16 * 1024 * 1024,
+                      size_t max_artwork_bytes = size_t{16} * 1024 * 1024,
                       std::shared_ptr<ProviderGate> musicbrainz_gate = {},
                       bool interactive = false);
     std::string_view name() const noexcept override {
@@ -575,7 +576,7 @@ class BookScanProvider final : public CatalogueScanProvider {
 
   public:
     BookScanProvider(HttpClient&, CatalogueBookProviderConfig,
-                     size_t max_artwork_bytes = 16 * 1024 * 1024,
+                     size_t max_artwork_bytes = size_t{16} * 1024 * 1024,
                      std::shared_ptr<ProviderGate> openlibrary_gate = {}, bool interactive = false);
     std::string_view name() const noexcept override {
         return "books";
@@ -664,9 +665,9 @@ class CatalogueScanner {
 
     void configure_providers() MACHA_REQUIRES(config_mutex_);
     bool coordinator() const;
-    void loop(std::stop_token);
-    size_t scan_once(std::stop_token, bool force, std::string_view hint_source, int hint_priority,
-                     bool unique_source_ref = false);
+    void loop(const std::stop_token&);
+    size_t scan_once(const std::stop_token&, bool force, std::string_view hint_source,
+                     int hint_priority, bool unique_source_ref = false);
     struct PreparedHintMatch {
         std::string hint_id;
         std::string provider;
@@ -684,7 +685,7 @@ class CatalogueScanner {
         size_t catalogued{};
     };
 
-    HintBatchResult process_hint_batch(std::stop_token, size_t max_hints);
+    HintBatchResult process_hint_batch(const std::stop_token&, size_t max_hints);
     CatalogueScanProvider* provider_for_path(std::string_view path, std::string& root) const
         MACHA_REQUIRES(config_mutex_);
     // Fetch and stage the provider artwork `match` names onto its items. An
@@ -704,7 +705,7 @@ class CatalogueScanner {
     // One hint against one namespace snapshot. A hint created after
     // `snapshot_taken_unix_ms` may name a file the snapshot lacks, and is
     // deferred rather than failed.
-    std::optional<PreparedHintMatch> prepare_hint(const CatalogueHint&, std::stop_token,
+    std::optional<PreparedHintMatch> prepare_hint(const CatalogueHint&, const std::stop_token&,
                                                   const MetadataSnapshot& namespace_snapshot,
                                                   uint64_t snapshot_taken_unix_ms,
                                                   DistributedStore::DurabilityBatch& artwork_batch);

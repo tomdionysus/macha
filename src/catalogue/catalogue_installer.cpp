@@ -9,7 +9,7 @@ namespace macha {
 void CatalogueInstaller::start() {
     if (worker_.joinable())
         return;
-    worker_ = std::jthread([this](std::stop_token stop) {
+    worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("catalogue-installer", stop, [this, stop] { loop(stop); });
     });
 }
@@ -30,7 +30,7 @@ void CatalogueInstaller::stop() {
         worker_.join();
 }
 
-void CatalogueInstaller::loop(std::stop_token stop) {
+void CatalogueInstaller::loop(const std::stop_token& stop) {
     const auto retry_events = [this] {
         return events_.count(NodeEvent::topology) + events_.count(NodeEvent::storage);
     };

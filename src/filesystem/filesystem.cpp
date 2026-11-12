@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "filesystem/filesystem.hpp"
 #include "contract/stopping.hpp"
+#include "errno_text.hpp"
 
 #include "cluster/placement.hpp"
 #include "codec.hpp"
@@ -38,7 +39,7 @@ void pwa(int f, std::span<const uint8_t> b, uint64_t o) {
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            fail(EIO, strerror(errno));
+            fail(EIO, errno_text(errno));
         }
         p += n;
     }
@@ -50,7 +51,7 @@ size_t pra(int f, std::span<uint8_t> b, uint64_t o) {
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            fail(EIO, strerror(errno));
+            fail(EIO, errno_text(errno));
         }
         if (!n)
             break;
@@ -291,10 +292,11 @@ void WriteHandle::ensure_buffer_memory() {
 WriteHandle::~WriteHandle() {
     try {
         Lock lock(m_);
-        (void)drain_staging_locked();
-    } catch (...) {
         // Provisional puts must be joined before the handle releases what
         // those tasks captured, even for a failed generation.
+        (void)drain_staging_locked();
+        // NOLINTNEXTLINE(bugprone-empty-catch): best-effort drain in a destructor
+    } catch (...) {
     }
     cleanup();
 }
@@ -1375,7 +1377,7 @@ FileSystem::FileSystem(const Config& config, NodeId node_id, const Membership& m
     extent_workers_.reserve(extent_worker_limit_);
 }
 
-void FileSystem::extent_worker(std::stop_token stop) {
+void FileSystem::extent_worker(const std::stop_token& stop) {
     while (true) {
         std::shared_ptr<ExtentTask> task;
         {
@@ -1410,7 +1412,8 @@ FileSystem::submit_extent_task(std::function<WriteHandle::StagedExtentResult()> 
         Lock lock(extent_tasks_mutex_);
         if (extent_workers_.empty()) {
             for (size_t i = 0; i < extent_worker_limit_; ++i)
-                extent_workers_.emplace_back([this](std::stop_token stop) { extent_worker(stop); });
+                extent_workers_.emplace_back(
+                    [this](const std::stop_token& stop) { extent_worker(stop); });
         }
         extent_tasks_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(extent_tasks_mutex_) {
             return io_cancellation_requested() || extent_tasks_.size() < extent_task_limit_;
@@ -1513,7 +1516,7 @@ std::optional<std::string> FileSystem::resolve_existing_path(const std::string& 
 }
 
 std::string FileSystem::resolve_new_path(const std::string& p) {
-    const auto q = normalize_path(p);
+    auto q = normalize_path(p);
     const auto view = m_.local();
     auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     const auto existing = resolve_in(*view.snapshot, nodes, q);
@@ -1909,7 +1912,7 @@ FsEntry FileSystem::create_file(const std::string& p, uint32_t mode, uint32_t ui
     const FilesystemNamespaceMutation op{
         FilesystemNamespaceMutation::Kind::create, q, {}, false, mode, uid, gid};
     auto result = apply_namespace_batch({&op, 1});
-    return *result.entries.front();
+    return result.entries.front().value();
 }
 
 void FileSystem::unlink(const std::string& p) {
@@ -1972,7 +1975,7 @@ void FileSystem::truncate_file(const std::string& p, uint64_t z) {
     auto resolved = resolve_existing_path(p);
     if (!resolved)
         fail(ENOENT, "missing");
-    auto q = *resolved;
+    const auto& q = *resolved;
     auto e = getattr(q);
     if (e.type != EntryType::file)
         fail(EISDIR, "directory");
@@ -2140,6 +2143,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
             auto entry = getattr(path);
             if (entry.type == EntryType::file)
                 return std::pair{normalize_path(path), entry};
+            // NOLINTNEXTLINE(bugprone-empty-catch): a path that cannot be read is not media
         } catch (...) {
         }
         return {};
@@ -2149,6 +2153,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
             auto entry = getattr(std::string(id));
             if (entry.type == EntryType::file)
                 return std::pair{normalize_path(std::string(id)), entry};
+            // NOLINTNEXTLINE(bugprone-empty-catch): a path that cannot be read is not media
         } catch (...) {
         }
         return {};
@@ -2197,7 +2202,7 @@ std::shared_ptr<PublicationWriter> FileSystem::open_publication(const std::strin
                                                                 uint64_t pipeline_bytes,
                                                                 DataWorkContext work_context) {
     return open_write(path, false, cache_puts, WriteDurability::publication_generation,
-                      pipeline_bytes, std::move(work_context));
+                      pipeline_bytes, work_context);
 }
 
 std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc,

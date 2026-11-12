@@ -67,10 +67,10 @@ struct EpubMetadata {
 
 struct EpubReadLimits {
     // Any one of container.xml or the OPF, uncompressed.
-    size_t max_member_bytes{1024 * 1024};
-    size_t max_cover_bytes{16 * 1024 * 1024};
+    size_t max_member_bytes{size_t{1024} * 1024};
+    size_t max_cover_bytes{size_t{16} * 1024 * 1024};
     // Everything inflated by one call.
-    size_t max_total_bytes{32 * 1024 * 1024};
+    size_t max_total_bytes{size_t{32} * 1024 * 1024};
 };
 
 // Anything that is not a readable EPUB: no zip signature, zip64, an encrypted

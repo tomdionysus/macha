@@ -37,7 +37,7 @@ class ManageApi {
     std::jthread identity_audit_worker_;
 
     void queue_identity_reset_audit(IdentityAssociationReset);
-    void identity_reset_audit_loop(std::stop_token);
+    void identity_reset_audit_loop(const std::stop_token&);
     HttpResponse dispatch(const HttpRequest&);
     HttpResponse title_files(const HttpRequest&);
     // An unmatched file by hint id, from this node's hints or a peer's.

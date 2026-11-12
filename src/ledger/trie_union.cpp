@@ -140,8 +140,8 @@ TrieUnion::children(std::span<const ObjectTrie::Prefix> prefixes) const {
         const auto node = find_node(root_, prefix);
         if (!node)
             continue;
-        if (node->whole) {
-            out[i] = parts_[*node->whole].children(std::span(&prefix, 1)).front();
+        if (const auto& whole = node->whole) {
+            out[i] = parts_[*whole].children(std::span(&prefix, 1)).front();
             continue;
         }
         if (node->below.size() == 256) {
@@ -173,8 +173,8 @@ TrieUnion::records(std::span<const ObjectTrie::Prefix> prefixes, uint64_t most) 
         const auto node = find_node(root_, prefix);
         if (!node)
             continue;
-        if (node->whole) {
-            out[i] = std::move(parts_[*node->whole].records(std::span(&prefix, 1), most).front());
+        if (const auto& whole = node->whole) {
+            out[i] = std::move(parts_[*whole].records(std::span(&prefix, 1), most).front());
             continue;
         }
         if (node->below.size() == 256 && node->summary.count > most)

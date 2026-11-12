@@ -42,7 +42,7 @@ class TorrentExtentJournal {
     // [0, size) exactly, contiguously and without overlap; otherwise nothing.
     static std::optional<std::vector<ExtentRef>> manifest(const File&, uint64_t size);
 
-    explicit TorrentExtentJournal(std::filesystem::path save_path);
+    explicit TorrentExtentJournal(const std::filesystem::path& save_path);
     ~TorrentExtentJournal();
     TorrentExtentJournal(const TorrentExtentJournal&) = delete;
     TorrentExtentJournal& operator=(const TorrentExtentJournal&) = delete;

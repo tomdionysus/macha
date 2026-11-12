@@ -943,8 +943,8 @@ ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
                 }
                 if (record != window.end() && record->key == applied->first)
                     ++record;
-                if (applied->second)
-                    merged.push_back({applied->first, {}, &*applied->second});
+                if (const auto& value = applied->second)
+                    merged.push_back({applied->first, {}, &*value});
                 ++applied;
             }
             bool open = false;
@@ -1651,6 +1651,7 @@ void collect_changed(const ObjectId& after, const std::optional<ObjectId>& befor
                     for (const auto& [_, extent_root] : old.entries)
                         if (extent_root)
                             named.insert(*extent_root);
+                // NOLINTNEXTLINE(bugprone-empty-catch): unreadable counterpart, collect every spine
             } catch (const std::exception&) {
             }
         }
@@ -1665,8 +1666,8 @@ void collect_changed(const ObjectId& after, const std::optional<ObjectId>& befor
             auto shape_before = read_shape(*before, store);
             if (!shape_before.leaf)
                 old = std::move(shape_before);
+            // NOLINTNEXTLINE(bugprone-empty-catch): unreadable old node, prune nothing
         } catch (const std::exception&) {
-            // Unreadable old node: prune nothing, over-collect.
         }
     }
     for (size_t i = 0; i < shape.children.size(); ++i) {
@@ -1907,15 +1908,13 @@ void diff_namespace_tree_nodes(const ObjectId& before, const ObjectId& after,
         if (a.level == b.level && a.child.id == b.child.id) {
             old_side.pending.pop_back();
             new_side.pending.pop_back();
-        } else if (a.level > b.level) {
-            open(old_side);
-        } else if (b.level > a.level) {
-            open(new_side);
-        } else if (a.level > 0) {
+        } else if (a.level == b.level && a.level > 0) {
             open(old_side);
             open(new_side);
-        } else if (a.child.first_key <= b.child.first_key) {
-            // Two different leaves: the one that starts first is passed.
+        } else if (a.level > b.level ||
+                   (a.level == b.level && a.child.first_key <= b.child.first_key)) {
+            // The higher side opens first; of two different leaves, the one
+            // that starts first is passed.
             open(old_side);
         } else {
             open(new_side);
@@ -1969,10 +1968,12 @@ NamespaceTreeMerge merge_tree_backed_heads(const MetadataSnapshot& left,
     for (const auto& path : paths) {
         const auto found = differing.find(path);
         if (found != differing.end()) {
-            if (found->second.before)
-                left_entries.emplace(path, *found->second.before);
-            if (found->second.after)
-                right_entries.emplace(path, *found->second.after);
+            const auto& before = found->second.before;
+            const auto& after = found->second.after;
+            if (before)
+                left_entries.emplace(path, *before);
+            if (after)
+                right_entries.emplace(path, *after);
             continue;
         }
         // Not a difference: both heads hold the same entry, or neither.

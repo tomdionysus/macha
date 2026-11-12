@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "fuse/fuse_frontend.hpp"
+#include "errno_text.hpp"
 #include "observation.hpp"
 
 #include "codec.hpp"
@@ -15,6 +16,7 @@
 #include <array>
 #include <cerrno>
 #include <condition_variable>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
@@ -314,7 +316,7 @@ class ScopedFd {
 };
 
 struct FuseFrontend::State {
-    static constexpr size_t spool_checksum_chunk_size = 256 * 1024;
+    static constexpr size_t spool_checksum_chunk_size = size_t{256} * 1024;
 
     struct DataOp {
         enum class Kind : uint8_t { write, truncate };
@@ -1660,6 +1662,7 @@ struct FuseFrontend::State {
                 try {
                     fsync_fd(journal_fd, "cannot sync rolled-back FUSE operation journal");
                     rolled_back = true;
+                    // NOLINTNEXTLINE(bugprone-empty-catch): failure poisons the journal below
                 } catch (...) {
                 }
             }
@@ -1707,8 +1710,8 @@ struct FuseFrontend::State {
         payload.u64(inode->id);
         payload.string(inode->current_path);
         payload.u8(inode->published_path ? 1 : 0);
-        if (inode->published_path)
-            payload.string(*inode->published_path);
+        if (const auto published = inode->published_path)
+            payload.string(*published);
         encode_fuse_entry(payload, inode->base);
         encode_fuse_entry(payload, inode->visible);
         payload.u64(inode->namespace_sequence);
@@ -2149,7 +2152,7 @@ struct FuseFrontend::State {
                 ScopedFd target(::open(quarantine.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600));
                 if (target.get() < 0)
                     throw FsError(errno, "cannot quarantine corrupt FUSE operation journal tail");
-                Bytes buffer(256 * 1024);
+                Bytes buffer(size_t{256} * 1024);
                 for (uint64_t offset = *corrupt_at; offset < file_size;) {
                     const auto chunk =
                         static_cast<size_t>(std::min<uint64_t>(buffer.size(), file_size - offset));
@@ -2220,8 +2223,8 @@ struct FuseFrontend::State {
                 check_deadline(deadline, cancelled);
             }
         }
-        if (inode->backend_error)
-            throw FsError(*inode->backend_error, "FUSE inode durability error");
+        if (const auto error = inode->backend_error)
+            throw FsError(*error, "FUSE inode durability error");
         check_deadline(deadline, cancelled);
     }
 
@@ -2238,8 +2241,8 @@ struct FuseFrontend::State {
         while (true) {
             {
                 Lock inode_lock(inode->mutex);
-                if (inode->backend_error)
-                    throw FsError(*inode->backend_error, "FUSE inode publication error");
+                if (const auto error = inode->backend_error)
+                    throw FsError(*error, "FUSE inode publication error");
                 // Advanced only after PublicationWriter::commit(): cluster-durable at
                 // this watermark even if local confirmation lags.
                 if (inode->published_data_sequence >= target)
@@ -2276,6 +2279,7 @@ struct FuseFrontend::State {
                 std::rethrow_exception(error);
         } catch (const FsError& e) {
             return e.code();
+            // NOLINTNEXTLINE(bugprone-empty-catch): any other error maps to EIO
         } catch (...) {
         }
         return EIO;
@@ -2801,7 +2805,7 @@ struct FuseFrontend::State {
         const auto retired_bytes = inode.spool_end;
         if (::unlink(retired_path.c_str()) != 0 && errno != ENOENT) {
             Log::warn("cannot unlink retired FUSE spool inode=" + std::to_string(inode.id) +
-                      " error=" + std::strerror(errno));
+                      " error=" + errno_text(errno));
             return false;
         }
         inode.spool_end = 0;
@@ -2921,9 +2925,10 @@ struct FuseFrontend::State {
         size_t readmitted = 0;
         for (const auto& inode : candidates) {
             Lock inode_lock(inode->mutex);
-            if (!inode->parked || inode->parked->reachability_epoch == epoch)
+            auto& parked = inode->parked;
+            if (!parked || parked->reachability_epoch == epoch)
                 continue;
-            inode->parked.reset();
+            parked.reset();
             inode->publication_retry.reset();
             inode->data_deferred = true;
             ++readmitted;
@@ -3042,10 +3047,9 @@ struct FuseFrontend::State {
                 if (found == inodes.end())
                     continue;
                 Lock inode_lock(found->second->mutex);
-                if (found->second->published_path &&
-                    under_path(*found->second->published_path, op.from))
-                    found->second->published_path =
-                        op.to + found->second->published_path->substr(op.from.size());
+                auto& published = found->second->published_path;
+                if (published && under_path(*published, op.from))
+                    published = op.to + published->substr(op.from.size());
             }
         } else if (op.kind == NamespaceOp::Kind::unlink || op.kind == NamespaceOp::Kind::rmdir) {
             for (auto id : op.affected) {
@@ -3070,7 +3074,7 @@ struct FuseFrontend::State {
         }
     }
 
-    void namespace_loop(std::stop_token stop) {
+    void namespace_loop(const std::stop_token& stop) {
         while (!stop.stop_requested() && !stopping.load()) {
             std::vector<NamespaceOp> batch;
             {
@@ -3375,7 +3379,7 @@ struct FuseFrontend::State {
         return admission->should_yield(Clock::now());
     }
 
-    void wait_for_loader_admission(std::stop_token stop) {
+    void wait_for_loader_admission(const std::stop_token& stop) {
         for (;;) {
             if (stop.stop_requested() || stopping.load(std::memory_order_relaxed))
                 throw FsError(EINTR, "FUSE publication stopping");
@@ -3399,7 +3403,7 @@ struct FuseFrontend::State {
         }
     }
 
-    void wait_for_namespace_admission(std::stop_token stop) {
+    void wait_for_namespace_admission(const std::stop_token& stop) {
         Lock lock(namespace_queue_mutex);
         namespace_cv.wait(lock.native(), stop, [&]() MACHA_REQUIRES(namespace_queue_mutex) {
             return stopping.load(std::memory_order_relaxed) ||
@@ -3524,9 +3528,8 @@ struct FuseFrontend::State {
             {
                 Lock lock(inode->mutex);
                 snapshot.published_path = inode->published_path;
-                if (inode->backend_error)
-                    throw FsError(*inode->backend_error,
-                                  "FUSE inode has asynchronous backend error");
+                if (const auto error = inode->backend_error)
+                    throw FsError(*error, "FUSE inode has asynchronous backend error");
             }
             if (!snapshot.published_path) {
                 const auto retired = snapshot.operations.size();
@@ -3870,7 +3873,7 @@ struct FuseFrontend::State {
         return runnable_data_locked() != data_queue.end();
     }
 
-    void data_loop(std::stop_token stop) {
+    void data_loop(const std::stop_token& stop) {
         while (!stop.stop_requested() && !stopping.load()) {
             std::shared_ptr<Inode> inode;
             bool recovered = false;
@@ -4189,7 +4192,7 @@ struct FuseFrontend::State {
         }
     }
 
-    void broker_loop(size_t index, std::stop_token stop) {
+    void broker_loop(size_t index, const std::stop_token& stop) {
         auto& queue = broker[index];
         while (!stop.stop_requested() && !stopping.load()) {
             BrokerTask task;
@@ -4373,7 +4376,7 @@ struct FuseFrontend::State {
         if (target.get() < 0)
             throw FsError(errno, "cannot preserve orphaned FUSE spool bytes");
         try {
-            Bytes buffer(256 * 1024);
+            Bytes buffer(size_t{256} * 1024);
             uint64_t offset = keep;
             while (offset < size) {
                 const auto chunk =
@@ -4927,11 +4930,12 @@ struct FuseFrontend::State {
             // Held across journal_data_done() so concurrent confirmers cannot
             // both retire the same prefix.
             Lock lock(inode->mutex);
-            if (!inode->unconfirmed_data_entry || !inode->unconfirmed_data_sequence)
+            const auto unconfirmed_entry = inode->unconfirmed_data_entry;
+            if (!unconfirmed_entry || !inode->unconfirmed_data_sequence)
                 return false;
 
             const auto target = inode->unconfirmed_data_sequence;
-            const auto expected = *inode->unconfirmed_data_entry;
+            const auto expected = *unconfirmed_entry;
             const auto path = inode->published_path;
             const auto retired = static_cast<size_t>(
                 std::count_if(inode->data_ops.begin(), inode->data_ops.end(),
@@ -5155,7 +5159,8 @@ struct FuseFrontend::State {
                     {
                         // The name stands for another spelling of it.
                         Lock inode_lock(it->second->mutex);
-                        if (it->second->published_path && *it->second->published_path != path)
+                        const auto published = it->second->published_path;
+                        if (published && *published != path)
                             continue;
                     }
                     // A canonically-equivalent spelling may remain under the
@@ -5203,7 +5208,7 @@ struct FuseFrontend::State {
         initialise_namespace(std::move(recovery));
 
         // Must run before broker workers accept writes.
-        durability_worker = std::jthread([this](std::stop_token stop) {
+        durability_worker = std::jthread([this](const std::stop_token& stop) {
             run_supervised_loop("fuse-durability", stop, [this, stop] { durability_loop(stop); });
         });
 
@@ -5213,21 +5218,21 @@ struct FuseFrontend::State {
         size_t workers = 0;
         for (size_t i = 0; i < broker.size() && workers < config.request_workers; ++i, ++workers)
             broker[i].workers.emplace_back(
-                [this, i](std::stop_token stop) { broker_loop(i, stop); });
+                [this, i](const std::stop_token& stop) { broker_loop(i, stop); });
         size_t preference_index = 0;
         while (workers < config.request_workers) {
             const auto index = preference[preference_index++ % preference.size()];
             broker[index].workers.emplace_back(
-                [this, index](std::stop_token stop) { broker_loop(index, stop); });
+                [this, index](const std::stop_token& stop) { broker_loop(index, stop); });
             ++workers;
         }
 
-        namespace_worker = std::jthread([this](std::stop_token stop) {
+        namespace_worker = std::jthread([this](const std::stop_token& stop) {
             run_supervised_loop("fuse-namespace", stop, [this, stop] { namespace_loop(stop); });
         });
         data_workers.reserve(config.commit_workers);
         for (size_t i = 0; i < config.commit_workers; ++i)
-            data_workers.emplace_back([this](std::stop_token stop) {
+            data_workers.emplace_back([this](const std::stop_token& stop) {
                 run_supervised_loop("fuse-data", stop, [this, stop] { data_loop(stop); });
             });
         // For comparison with runtime.loader_memory_reserve_bytes.
@@ -6599,9 +6604,10 @@ bool FuseFrontend::wait_for_idle(std::chrono::milliseconds timeout) {
 
 std::optional<BlockedNamespaceOperation> FuseFrontend::blocked_namespace_operation() const {
     Lock lock(state_->namespace_queue_mutex);
-    if (!state_->namespace_blocked_op)
+    const auto blocked = state_->namespace_blocked_op;
+    if (!blocked)
         return std::nullopt;
-    const auto& op = *state_->namespace_blocked_op;
+    const auto& op = *blocked;
     BlockedNamespaceOperation out;
     out.sequence = op.sequence;
     out.kind = std::string(State::namespace_op_kind_name(op.kind));
@@ -6616,7 +6622,8 @@ std::optional<BlockedNamespaceOperation> FuseFrontend::blocked_namespace_operati
 
 bool FuseFrontend::skip_blocked_namespace_operation(uint64_t sequence) {
     Lock lock(state_->namespace_queue_mutex);
-    if (!state_->namespace_blocked_op || state_->namespace_blocked_op->sequence != sequence)
+    const auto blocked = state_->namespace_blocked_op;
+    if (!blocked || blocked->sequence != sequence)
         return false;
     state_->namespace_skip_requested_sequence = sequence;
     state_->namespace_cv.notify_all();
@@ -6629,18 +6636,19 @@ std::vector<ParkedPublication> FuseFrontend::parked_publications() const {
     Lock lock(state_->namespace_mutex);
     for (const auto& [id, inode] : state_->inodes) {
         Lock inode_lock(inode->mutex);
-        if (!inode->parked)
+        const auto parked_state = inode->parked;
+        if (!parked_state)
             continue;
+        const auto& parked = *parked_state;
         ParkedPublication item;
         item.inode = id;
         item.path = inode->current_path;
-        item.error_code = inode->parked->error_code;
-        item.error_message = inode->parked->error_message;
+        item.error_code = parked.error_code;
+        item.error_message = parked.error_message;
         item.attempts = inode->publication_retry.total_failures();
         item.failing_for = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - inode->publication_retry.first_failure());
-        item.parked_for =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - inode->parked->since);
+        item.parked_for = std::chrono::duration_cast<std::chrono::milliseconds>(now - parked.since);
         for (const auto& op : inode->data_ops)
             if (op.kind == State::DataOp::Kind::write &&
                 op.sequence > inode->published_data_sequence)

@@ -39,9 +39,9 @@ class ReferenceCounts {
                std::vector<ObjectId> nodes, Totals);
     // One added for each item in, one taken for each item out. False, and
     // nothing changed, when something to take out is not counted.
-    bool change(const ObjectId& root, std::vector<ObjectId> extents_in,
-                std::vector<ObjectId> extents_out, std::vector<ObjectId> nodes_in,
-                std::vector<ObjectId> nodes_out, Totals);
+    bool change(const ObjectId& root, const std::vector<ObjectId>& extents_in,
+                const std::vector<ObjectId>& extents_out, const std::vector<ObjectId>& nodes_in,
+                const std::vector<ObjectId>& nodes_out, Totals);
 
     // Frozen views of the ids counted now (a record's value is its count).
     struct Views {

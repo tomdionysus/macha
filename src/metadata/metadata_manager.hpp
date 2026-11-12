@@ -214,7 +214,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     bool replicating_ MACHA_GUARDED_BY(owed_mutex_){};
     std::atomic_uint64_t owed_dropped_{};
     void owe(MetadataRecord head, std::optional<OwedClaims> claims);
-    void replication_loop(std::stop_token);
+    void replication_loop(const std::stop_token&);
     // Accepts a commit on this node alone.
     void accept_locally(const MetadataRecord&, std::span<const uint8_t> delta, FrameType);
     void publish_replica_state(bool validated, std::string_view reason = {});
@@ -233,7 +233,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     MetadataManager(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore& namespace_store,
                     PublicationRetention publication_retention = {},
                     const TimeSource& time = steady_time_source());
-    ~MetadataManager();
+    ~MetadataManager() override;
 
     // Ends the replicator. What is still owed stays owed: the commits are
     // accepted here and repair delivers them after a restart. Called before

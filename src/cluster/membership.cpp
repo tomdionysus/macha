@@ -183,8 +183,10 @@ bool Membership::directly_reachable(const NodeId& id) const {
     if (id == self_.id)
         return true;
     const auto found = nodes_.find(id);
-    return found != nodes_.end() && found->second.direct_seen &&
-           Clock::now() - *found->second.direct_seen <= dead_;
+    if (found == nodes_.end())
+        return false;
+    const auto& direct_seen = found->second.direct_seen;
+    return direct_seen && Clock::now() - *direct_seen <= dead_;
 }
 
 bool Membership::all_known_reachable() const {

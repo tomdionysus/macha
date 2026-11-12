@@ -20,7 +20,7 @@ Json parse_payload(const RpcReply& reply) {
     return Json::parse(text);
 }
 
-Bytes json_bytes(Json value) {
+Bytes json_bytes(const Json& value) {
     const auto text = value.dump();
     return Bytes(text.begin(), text.end());
 }
@@ -66,7 +66,7 @@ ClusterJobView::~ClusterJobView() {
 void ClusterJobView::start() {
     if (worker_.joinable())
         return;
-    worker_ = std::jthread([this](std::stop_token stop) {
+    worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("cluster-job-view", stop, [this, stop] { loop(stop); });
     });
 }
@@ -79,7 +79,7 @@ void ClusterJobView::stop() {
     worker_.join();
 }
 
-void ClusterJobView::loop(std::stop_token stop) {
+void ClusterJobView::loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         refresh_now();
         Mutex wait_mutex; // guards nothing: the wait's own lock
@@ -98,10 +98,12 @@ void ClusterJobView::refresh_now() {
     {
         // A node that left membership keeps its last jobs, marked unreachable.
         Lock lock(mutex_);
-        for (auto& [id, peer] : peers_)
+        for (auto& entry : peers_) {
+            const auto& id = entry.first;
             if (std::none_of(peers.begin(), peers.end(),
-                             [&](const NodeInfo& p) { return p.id == id; }))
-                peer.reachable = false;
+                             [&id](const NodeInfo& p) { return p.id == id; }))
+                entry.second.reachable = false;
+        }
     }
     for (const auto& peer : peers)
         poll(peer);
@@ -110,11 +112,12 @@ void ClusterJobView::refresh_now() {
 void ClusterJobView::poll(const NodeInfo& info) {
     Peer fresh;
     fresh.host = info.host;
-    bool reached = false;
+    bool torrent_reached = false;
+    bool ingest_reached = false;
     try {
         auto reply = node_.call(info, MessageType::get_torrent_jobs, {}, FrameType::loader,
                                 call_deadline::control);
-        reached = true;
+        torrent_reached = true;
         if (reply.message.type == MessageType::torrent_jobs_reply) {
             auto parsed = parse_payload(reply);
             fresh.torrent_known = fresh.torrent_capable = true;
@@ -146,7 +149,7 @@ void ClusterJobView::poll(const NodeInfo& info) {
     try {
         auto reply = node_.call(info, MessageType::get_ingest_jobs, {}, FrameType::loader,
                                 call_deadline::control);
-        reached = true;
+        ingest_reached = true;
         if (reply.message.type == MessageType::ingest_jobs_reply) {
             auto parsed = parse_payload(reply);
             fresh.ingest_known = true;
@@ -161,7 +164,7 @@ void ClusterJobView::poll(const NodeInfo& info) {
     Lock lock(mutex_);
     auto& peer = peers_[info.id];
     peer.host = info.host;
-    if (!reached) {
+    if (!torrent_reached && !ingest_reached) {
         peer.reachable = false; // keep what it last said
         return;
     }

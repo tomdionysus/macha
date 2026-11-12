@@ -5,6 +5,7 @@
 #include "types.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -78,7 +79,7 @@ class ObjectTrie {
         uint64_t rewrite_floor_bytes = 16ULL * 1024 * 1024;
     };
     static constexpr size_t leaf_max = 128;
-    static constexpr size_t value_max = 16 * 1024;
+    static constexpr size_t value_max = size_t{16} * 1024;
 
     // A record set to `value`, or erased when it has none.
     struct Change {

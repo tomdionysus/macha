@@ -22,6 +22,7 @@
 #include <set>
 #include <sstream>
 #include <system_error>
+#include <utility>
 
 namespace macha {
 namespace {
@@ -143,7 +144,7 @@ std::string join_namespace(std::string_view root, const std::vector<std::string>
     return normalize_path(out.empty() ? "/" : out);
 }
 
-std::string append_collision_suffix(std::string path, unsigned suffix) {
+std::string append_collision_suffix(const std::string& path, unsigned suffix) {
     std::filesystem::path p(path);
     const auto parent = p.parent_path().generic_string();
     const auto ext = p.extension().string();
@@ -213,9 +214,10 @@ uint64_t json_u64(const Json& object, std::string_view key, uint64_t fallback = 
     return value ? value->asUInt64() : fallback;
 }
 
-std::string json_string(const Json& object, std::string_view key, std::string fallback = {}) {
+std::string json_string(const Json& object, std::string_view key,
+                        const std::string& fallback = {}) {
     const auto* value = object.find(key);
-    return value ? value->asString() : std::move(fallback);
+    return value ? value->asString() : fallback;
 }
 
 bool json_bool(const Json& object, std::string_view key, bool fallback = false) {
@@ -630,7 +632,7 @@ size_t StagingArea::empty_trash() {
 
 void StagingArea::wait_for_trash(std::stop_token stop, std::chrono::milliseconds interval) {
     Lock lock(trash_mutex_);
-    trash_cv_.wait_for(lock.native(), stop, interval,
+    trash_cv_.wait_for(lock.native(), std::move(stop), interval,
                        [this]() MACHA_REQUIRES(trash_mutex_) { return trash_pending_; });
     trash_pending_ = false;
 }
@@ -686,8 +688,8 @@ Bytes IngestManager::handle_jobs_query(std::span<const uint8_t> request_payload)
             auto request = Json::parse(text);
             if (const auto* id = request.find("job_id"); id && id->isString())
                 job_id = id->asString();
+            // NOLINTNEXTLINE(bugprone-empty-catch): a malformed request lists all jobs
         } catch (const std::exception&) {
-            // A malformed request lists all rather than failing the peer.
         }
     }
     Json::Array out_jobs;
@@ -719,7 +721,8 @@ Bytes IngestManager::handle_job_action(std::span<const uint8_t> request_payload)
             action = act->asString();
         if (const auto* index = request.find("file"); index && index->isNumber())
             file = static_cast<size_t>(index->asUInt64());
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
+        Log::debug("ingest job action request unreadable: " + std::string(error.what()));
     }
     Json::Object out;
     bool exists = job(job_id).has_value();
@@ -840,16 +843,16 @@ void IngestManager::start() {
     const size_t count = std::max<size_t>(1, max_concurrent_jobs_);
     workers_.reserve(count);
     for (size_t i = 0; i < count; ++i) {
-        workers_.emplace_back([this](std::stop_token stop) {
+        workers_.emplace_back([this](const std::stop_token& stop) {
             run_supervised_loop("ingest", stop, [this, stop] { loop(stop); });
         });
     }
-    catalogue_worker_ = std::jthread([this](std::stop_token stop) {
+    catalogue_worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("ingest-catalogue", stop, [this, stop] { catalogue_loop(stop); });
     });
     // Deletes discarded payloads off the request path, including any a
     // previous run left in the trash.
-    trash_worker_ = std::jthread([this](std::stop_token stop) {
+    trash_worker_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("staging-trash", stop, [this, stop] {
             while (!stop.stop_requested()) {
                 if (const auto removed = staging_.empty_trash())
@@ -1418,7 +1421,7 @@ std::string IngestManager::select_job_locked() const {
     return {};
 }
 
-void IngestManager::loop(std::stop_token stop) {
+void IngestManager::loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         std::string selected;
         {
@@ -1518,7 +1521,7 @@ void IngestManager::catalogue_loop(std::stop_token stop) {
     }
 }
 
-void IngestManager::process_job(const std::string& id, std::stop_token stop) {
+void IngestManager::process_job(const std::string& id, const std::stop_token& stop) {
     // The job's extent journal is cached only for the life of this call.
     struct ForgetExtentJournal {
         IngestManager& self;
@@ -1592,6 +1595,10 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
                 it->second = job;
                 try {
                     save_state_locked();
+                } catch (const std::exception& error) {
+                    Log::debug("ingest could not save state while stopping: " +
+                               std::string(error.what()));
+                    // NOLINTNEXTLINE(bugprone-empty-catch): stopping, nothing more to do
                 } catch (...) {
                 }
             }
@@ -1653,7 +1660,7 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
     }
 }
 
-bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
+bool IngestManager::plan_job(IngestJob& job, const std::stop_token& stop) {
     std::error_code ec;
     if (staging_.contains(job.source_path) && !staging_.available()) {
         set_blocked(job, "staging_unavailable",
@@ -2014,7 +2021,8 @@ void IngestManager::ensure_namespace_parents(std::string_view path) {
     }
 }
 
-bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::stop_token stop) {
+bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file,
+                              const std::stop_token& stop) {
     if (file.completed)
         return true;
     const std::filesystem::path source(file.source_path);
@@ -2101,7 +2109,9 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
                           "; copying instead: " + e.what());
                 try {
                     fs_.truncate_file(file.temporary_path, 0);
-                } catch (const std::exception&) {
+                } catch (const std::exception& truncate_error) {
+                    Log::debug("ingest could not truncate path=" + file.temporary_path + ": " +
+                               std::string(truncate_error.what()));
                 }
             }
         }
@@ -2398,7 +2408,7 @@ void IngestManager::resolve_duplicate_destinations(IngestJob& job) {
     }
 }
 
-bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
+bool IngestManager::import_job(IngestJob& job, const std::stop_token& stop) {
     resolve_duplicate_destinations(job);
     job.state = IngestJobState::importing;
     job.error.clear();

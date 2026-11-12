@@ -380,14 +380,14 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
             }
             if (!name)
                 continue;
-            classes.push_back(Json(Json::Object{
+            classes.emplace_back(Json::Object{
                 {"class", name},
                 {"in_bytes", entry.in_bytes},
                 {"out_bytes", entry.out_bytes},
                 {"in_bytes_per_s",
                  rated ? Json(static_cast<uint64_t>(entry.in_bytes_per_s)) : Json(nullptr)},
                 {"out_bytes_per_s",
-                 rated ? Json(static_cast<uint64_t>(entry.out_bytes_per_s)) : Json(nullptr)}}));
+                 rated ? Json(static_cast<uint64_t>(entry.out_bytes_per_s)) : Json(nullptr)}});
         }
         node["traffic"] = Json(
             Json::Object{{"as_of_unix_ms", live->observed_unix_ms},
@@ -457,7 +457,7 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
                     entry["bit_depth"] = static_cast<uint64_t>(rate.bit_depth);
                     entry["height_class"] = static_cast<uint64_t>(rate.height_class);
                 }
-                rates.push_back(Json(std::move(entry)));
+                rates.emplace_back(std::move(entry));
             }
             playback["transcode_rates"] = std::move(rates);
         }
@@ -493,7 +493,7 @@ ClusterStatusService::~ClusterStatusService() {
 void ClusterStatusService::start() {
     if (persistence_.joinable())
         return;
-    persistence_ = std::jthread([this](std::stop_token stop) {
+    persistence_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("status-persistence", stop, [this, stop] { persistence_loop(stop); });
     });
 }
@@ -523,7 +523,7 @@ void ClusterStatusService::persist_local_status() {
     accounts_.sessions().persist();
 }
 
-void ClusterStatusService::persistence_loop(std::stop_token stop) {
+void ClusterStatusService::persistence_loop(const std::stop_token& stop) {
     // After a short startup head start, keep one coalesced durable observation
     // per node. A failed checkpoint is retried; no telemetry backlog is replayed.
     auto delay = std::chrono::seconds(10);
@@ -879,7 +879,7 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
             entry["restart_count"] = static_cast<uint64_t>(status.restart_count);
             entry["last_fault"] =
                 status.last_fault.empty() ? Json(nullptr) : Json(status.last_fault);
-            subsystems.push_back(std::move(entry));
+            subsystems.emplace_back(std::move(entry));
         }
     }
     root["subsystems"] = std::move(subsystems);
@@ -897,7 +897,7 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
         entry["last_fault"] = status.last_fault.empty() ? Json(nullptr) : Json(status.last_fault);
         entry["last_fault_unix_ms"] =
             status.last_fault_unix_ms ? Json(status.last_fault_unix_ms) : Json(nullptr);
-        threads.push_back(std::move(entry));
+        threads.emplace_back(std::move(entry));
     }
     root["threads"] = std::move(threads);
     // Named so a client that finds `diagnostics` absent is told where it went.
@@ -1318,7 +1318,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             repair_diagnostics["local_unreadable_objects"] = values.local_unreadable;
             Json::Array sample;
             for (const auto& id : values.unsourceable_sample)
-                sample.push_back(to_string(id));
+                sample.emplace_back(to_string(id));
             repair_diagnostics["unsourceable_sample"] = std::move(sample);
             // Is repair moving, and where is it? push walks this node's store,
             // then pull walks the live set; only the pull finds and counts
@@ -1341,11 +1341,11 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             Json::Array paced_by;
             if (values.last_gate) {
                 if (values.paced_by & DistributedStore::paced_by_viewer)
-                    paced_by.push_back("viewer");
+                    paced_by.emplace_back("viewer");
                 if (values.paced_by & DistributedStore::paced_by_loader)
-                    paced_by.push_back("loader");
+                    paced_by.emplace_back("loader");
                 if (values.paced_by & DistributedStore::paced_by_peer_viewer)
-                    paced_by.push_back("peer_viewer");
+                    paced_by.emplace_back("peer_viewer");
             }
             const char* pace = "unknown";
             if (!paced_by.empty()) {
@@ -1434,7 +1434,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     Json::Array anonymous_roles;
     if (auto anonymous = accounts_.users().find_by_username(anonymous_username))
         for (const auto& role : anonymous->roles)
-            anonymous_roles.push_back(role);
+            anonymous_roles.emplace_back(role);
     auth_diagnostics["anonymous_roles"] = std::move(anonymous_roles);
     diagnostics["auth"] = std::move(auth_diagnostics);
 
@@ -1514,9 +1514,9 @@ HttpResponse ClusterStatusService::handle(const HttpRequest& request,
         if (!id)
             return http_error(400, "bad_node_id", "node id must be a 32-character hexadecimal id");
         if (request.method == "GET" && !connectivity)
-            return status_response(sources, *id);
+            return status_response(sources, id);
         if (request.method == "POST" && connectivity)
-            return connectivity_check(*id);
+            return connectivity_check(id);
     }
     return http_error(404, "not_found", "status route not found");
 }

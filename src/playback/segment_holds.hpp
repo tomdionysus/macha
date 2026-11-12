@@ -107,8 +107,11 @@ class SegmentHoldArbiter {
     void release(const std::string& session) {
         Lock lock(mutex_);
         auto it = per_session_.find(session);
-        if (it != per_session_.end() && it->second > 0 && --it->second == 0)
-            per_session_.erase(it);
+        if (it != per_session_.end() && it->second > 0) {
+            --it->second;
+            if (it->second == 0)
+                per_session_.erase(it);
+        }
         if (total_ > 0)
             --total_;
     }

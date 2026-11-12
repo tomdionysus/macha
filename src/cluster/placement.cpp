@@ -365,6 +365,7 @@ std::vector<NodeInfo> capacity_placement_nodes(std::span<const uint8_t> key,
         std::sort(remaining.begin(), remaining.end(),
                   [](const auto& a, const auto& b) { return a.id < b.id; });
         std::vector<uint64_t> capacities;
+        capacities.reserve(remaining.size());
         for (const auto& node : remaining)
             capacities.push_back(node.capacity);
 

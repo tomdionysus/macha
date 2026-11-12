@@ -94,31 +94,28 @@ DannanHost::DannanHost(dannan::NodeConfig config, MessageRoutes& routes, size_t 
     // A handler that throws unwinds run(); the fault is recorded and run() resumes after
     // the backoff. Once the context is stopped run() returns and the thread ends.
     for (size_t i = 0; i < io_threads; ++i)
-        io_threads_.emplace_back([this](std::stop_token stop) {
+        io_threads_.emplace_back([this](const std::stop_token& stop) {
             run_supervised_loop("cluster-io", stop, [this] { io_.run(); });
         });
     try {
         node_ = std::make_unique<dannan::Node>(io_, std::move(config));
         auto& node_routes = node_->routes();
-        for (const auto& entry : macha_registrations()) {
-            if (entry.type == MessageType::metadata_notice) {
-                node_routes.add(dannan_type(entry.type), entry.registration,
-                                [notice = std::move(metadata_notice)](
-                                    const dannan::membership::NodeRecord& peer,
-                                    dannan::sched::FrameType, const dannan::net::Message& request) {
-                                    if (notice) {
-                                        dannan::net::Message copy;
-                                        copy.type = request.type;
-                                        copy.payload = request.payload;
-                                        notice(node_info_from(peer),
-                                               macha_message(std::move(copy)));
-                                    }
-                                    return dannan::net::Handled::processed();
-                                });
-                continue;
-            }
-            node_routes.add(dannan_type(entry.type), entry.registration, dispatch_to(routes));
-        }
+        dannan::net::RequestHandler on_notice =
+            [notice = std::move(metadata_notice)](const dannan::membership::NodeRecord& peer,
+                                                  dannan::sched::FrameType,
+                                                  const dannan::net::Message& request) {
+                if (notice) {
+                    dannan::net::Message copy;
+                    copy.type = request.type;
+                    copy.payload = request.payload;
+                    notice(node_info_from(peer), macha_message(std::move(copy)));
+                }
+                return dannan::net::Handled::processed();
+            };
+        for (const auto& entry : macha_registrations())
+            node_routes.add(dannan_type(entry.type), entry.registration,
+                            entry.type == MessageType::metadata_notice ? on_notice
+                                                                       : dispatch_to(routes));
         for (const auto type : macha_retired_types())
             node_routes.retire(type);
     } catch (...) {
@@ -178,8 +175,8 @@ dannan::membership::NodeRecord DannanHost::record_for(const NodeInfo& peer) cons
     return record;
 }
 
-AsyncRpc DannanHost::wrap(std::shared_ptr<std::promise<RpcReply>> promise,
-                          std::shared_ptr<dannan::net::CallHandle> handle) {
+AsyncRpc DannanHost::wrap(const std::shared_ptr<std::promise<RpcReply>>& promise,
+                          const std::shared_ptr<dannan::net::CallHandle>& handle) {
     auto future = promise->get_future();
     // Dannan reads max() while the call is not yet placed (its dial runs); Macha's
     // callers read idleness from when the call was made, so a dial counts against

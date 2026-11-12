@@ -57,7 +57,7 @@ class SubsystemSupervisor {
   private:
     struct Entry;
     void discover_plugins();
-    void run_entry(Entry&, std::stop_token);
+    void run_entry(Entry&, const std::stop_token&);
 
     std::filesystem::path plugin_dir_;
     SubsystemContext context_;

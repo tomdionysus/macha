@@ -29,6 +29,7 @@ ProcessAllocatorPolicy configure_process_allocator(size_t arena_max) {
     if (!arena_max || arena_max > static_cast<size_t>(std::numeric_limits<int>::max()))
         throw std::invalid_argument("allocator arena limit is out of range");
 #if defined(MACHA_HAS_GLIBC_MALLOPT) && !defined(MACHA_SANITIZER_ALLOCATOR)
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): set once at startup, before any thread
     if (::mallopt(M_ARENA_MAX, static_cast<int>(arena_max)) == 0)
         throw std::runtime_error("cannot apply glibc allocator arena limit");
     return {true, arena_max};
