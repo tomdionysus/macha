@@ -1,6 +1,31 @@
 # Completed and tested
 
-Last updated: 2026-10-14
+Last updated: 2026-11-12
+
+## 2026-11-12 -- 0.94.0: the cluster transport is Dannan's
+
+- The first of the port's two cutovers. `NodeRuntime` is a facade over `dannan::Node` (0.5.3); Macha's `RpcClient`,
+  `RpcServer`, `SecureChannel`, `MessageAssembler`, `PublicConnectivity`, the roster file and the TEL3 codec are
+  gone; every call names its deadline; one retained-memory ledger, the node's; `dannan-import-macha` converts the
+  state files and keeps `*.macha` for rollback. 56 tests retired, each against named Dannan 0.5.3 cases
+  (`2026-11-08-port.md`, the retirement table).
+- macnessa gate at `28ef6db`: 713 + 20 (GCC, arm64, warnings as errors). Deployed 2026-11-12, inverbeg 10:59Z,
+  macnessa 11:00Z; met over Dannan's control lane at 11:00:35, `replicas=2/2` writable, repair into inverbeg 6.0 MB/s
+  with no viewer (0.93.6: 3.3 to 3.9), zero WARN or ERROR in the first minutes.
+- Then (same branch): the CI kit (`ba173f3`), the whole tree under clang-format 19 (`08d7aa4`), clang-tidy clean
+  (`ffc908c`, `0fefebe`); its ASan stage found the playback start leak (ACTIVE).
+
+## 2026-11-10 -- 0.93.5 and 0.93.6, on develop before the port
+
+- 0.93.5: a damaged `history.log` frame loses only itself (`9153011`); a failed read cuts nothing (`98b816d`).
+- 0.93.6: a repair step that yielded to a viewer wakes the loop again (it had slept up to 31 h). macnessa gate
+  755 + 20 + 21; live on both nodes from 2026-11-10 20:18Z until 0.94.0.
+
+## 2026-11-05 -- 0.91.1 to 0.93.4, the two-node cluster
+
+- The second node (inverbeg, site-b) joined 2026-11-03; ebooks (0.92.2), the trace P0 (0.92.4), the removal of
+  the inline-namespace migration code (0.93.4, tagged). Each in `CHANGELOG.md`; the handovers of the time are in
+  `archive/2026-11-05-ACTIVE-before-rationalisation.md` and `archive/2026-11-08-ACTIVE-before-rationalisation.md`.
 
 ## 2026-10-14 -- 0.91.0: a single node, complete
 

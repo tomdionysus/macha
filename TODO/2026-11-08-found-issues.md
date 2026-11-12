@@ -53,7 +53,8 @@ Ordered by what they cost a user.
 7. **Replay compares exception text** (read, Dagda): `metadata.cpp:2302`, `:2627`. Against "never match English
    text". (0.93.5 removed the one in `load_history`.)
 8. **`accept_loop` spins on a persistent accept error** such as EMFILE (read): `net.cpp:4168-4176`, on its own
-   thread.
+   thread. **Closed by 0.94.0**: `net.cpp` is gone; the acceptor is Dannan's, whose accept-fault pause was reviewed
+   for 0.5.1.
 9. **The TV import filed real episodes under `/Movies`** (read from the job's plan): about 430 episodes probe as
    films (`House MD Season 6 Episode 06`, `S01 - E15`, Star Trek TNG); 1,286 such files are already in `/Movies`.
    Movie folder names such as `Blade Runner ( (1982)` (`media_catalogue.cpp:587`).
@@ -72,7 +73,8 @@ Ordered by what they cost a user.
     reads; rpc:3212 can flake to a third run; two weak cases in `test_namespace_tree.cpp` (lines 218, 746).
     `storage_v18/test_retain_data_batches_a_large_publication_within_bounded_time` exceeds its 120 s bound with
     its temporary directory on macnessa's USB disk.
-14. **Lost wakeups** (read: every notify site in `src/` audited 2026-11-08, after Dannan's `7b8b35f` found one in
+14. **Lost wakeups** (read: every notify site in `src/` audited 2026-11-08; the `net.cpp` entries below are closed by
+    0.94.0, which removed that file, after Dannan's `7b8b35f` found one in
     its `Node`; each notifier and waiter below read by this session unless marked *agent*). The defect: a waiter
     tests its predicate under mutex M and blocks; the notifier changes what the predicate reads without M and does
     not take M between the change and the notify, so a change landing between test and block is missed. The fix
@@ -129,6 +131,11 @@ Ordered by what they cost a user.
 17. **Seen, not looked into:** `ls /mnt/machamedia` timed out twice shortly after a restart, then answered in ms;
     remux `playback_pipeline_start_failed` ("timed out waiting for first fragmented-MP4 segment") 3 of 13 attempts
     on inverbeg, 1 of 13 on macnessa, during the baselines.
+
+18. **The async playback start leaks its candidate session** (run: the CI gate's ASan stage, 2026-11-12). A
+    `shared_ptr` cycle between the start and its candidate, `playback.cpp` `create`, since `63642c8` (2026-09-28):
+    one session and all it holds per async transcode start, on both nodes since. Defect, checked plan and
+    verification: `2026-11-12-playback-start-leak.md`. Waiting on the operator's go; fixed in Macha before 0.94.1.
 
 ## The live cluster
 
