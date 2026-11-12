@@ -23,7 +23,8 @@ std::string plain_ass_subtitle_text(std::string text) {
             break;
         }
     }
-    if (commas == 8) text.erase(0, pos);
+    if (commas == 8)
+        text.erase(0, pos);
 
     std::string out;
     out.reserve(text.size());
@@ -37,7 +38,8 @@ std::string plain_ass_subtitle_text(std::string text) {
             tag = false;
             continue;
         }
-        if (tag) continue;
+        if (tag)
+            continue;
         if (text[i] == '\\' && i + 1 < text.size() && (text[i + 1] == 'N' || text[i + 1] == 'n')) {
             out.push_back('\n');
             ++i;

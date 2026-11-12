@@ -2,9 +2,9 @@
 //
 // A plugin whose factory declines to produce an instance (as torrent does when
 // disabled). The supervisor must report `unavailable`, not enter backoff/retry.
+#include "macha_version.hpp"
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"
-#include "macha_version.hpp"
 
 namespace {
 

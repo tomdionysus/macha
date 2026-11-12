@@ -51,8 +51,8 @@ class TorrentCoordinator {
     // The answer to an API call: an HTTP status, a code, and the request.
     struct Outcome {
         int status{200};
-        std::string code;    // "ok" or an error code
-        std::string reason;  // error.reason, when there is one
+        std::string code;   // "ok" or an error code
+        std::string reason; // error.reason, when there is one
         std::string message;
         std::optional<TorrentRequest> request;
         std::optional<NodeId> node; // torrent_already_added: the holder's owner
@@ -91,8 +91,8 @@ class TorrentCoordinator {
     void publish_intents();
     void load_intents();
     void save_intents_locked() const MACHA_REQUIRES(mutex_);
-    std::optional<std::pair<std::string, std::string>> resolve_remote(std::string_view uri, bool search_result,
-                                                                      std::string& error);
+    std::optional<std::pair<std::string, std::string>>
+    resolve_remote(std::string_view uri, bool search_result, std::string& error);
     bool write_available() const;
     std::optional<MetadataSnapshotView> current_view() const;
     std::optional<MetadataSnapshotView> served_view() const;

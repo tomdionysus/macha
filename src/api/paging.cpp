@@ -40,8 +40,10 @@ std::optional<std::string> page_cursor_key(std::string_view cursor) {
     if (cursor.size() % 2)
         return {};
     const auto nibble = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
         return -1;
     };
     std::string key;

@@ -32,7 +32,9 @@ class Recorded final : public TrieSource {
     records(std::span<const ObjectTrie::Prefix> p) override {
         return source_.records(p);
     }
-    const Hash256& root_hash() const noexcept { return root_; }
+    const Hash256& root_hash() const noexcept {
+        return root_;
+    }
 
   private:
     TrieSource& source_;
@@ -105,10 +107,9 @@ AvailabilitySurvey survey_by_diff(const std::shared_ptr<const TrieUnion>& mine,
         held_elsewhere.insert(held_elsewhere.end(), holds.begin(), holds.end());
     }
     sort_unique(held_elsewhere);
-    std::set_difference(missing_here.begin(), missing_here.end(), held_elsewhere.begin(),
-                        held_elsewhere.end(),
-                        std::back_inserter(survey.peers_failed ? survey.unknown
-                                                               : survey.unavailable));
+    std::set_difference(
+        missing_here.begin(), missing_here.end(), held_elsewhere.begin(), held_elsewhere.end(),
+        std::back_inserter(survey.peers_failed ? survey.unknown : survey.unavailable));
     return survey;
 }
 

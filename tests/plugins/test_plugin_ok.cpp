@@ -2,15 +2,17 @@
 //
 // Minimal plugin that starts and stops cleanly, exercising the real
 // dlopen -> version check -> construct -> start -> stop path.
+#include "macha_version.hpp"
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"
-#include "macha_version.hpp"
 
 namespace {
 
 class OkSubsystem final : public macha::Subsystem {
   public:
-    std::string_view name() const noexcept override { return "test-plugin-ok"; }
+    std::string_view name() const noexcept override {
+        return "test-plugin-ok";
+    }
     void start() override {}
     void stop() override {}
 };

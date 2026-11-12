@@ -110,14 +110,12 @@ void MetadataServer::bind_routes() {
     route(MessageType::get_metadata,
           [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
                  [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              return {MessageType::metadata_reply,
-                      encode_metadata_record(replica_.current())};
+              return {MessageType::metadata_reply, encode_metadata_record(replica_.current())};
           });
     route(MessageType::get_committed_metadata,
           [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
                  [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              return {MessageType::metadata_reply,
-                      encode_metadata_record(replica_.committed())};
+              return {MessageType::metadata_reply, encode_metadata_record(replica_.committed())};
           });
     route(MessageType::get_metadata_identity,
           [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
@@ -174,13 +172,12 @@ void MetadataServer::bind_routes() {
           });
     route(MessageType::get_metadata_heads,
           [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-             [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              return {MessageType::metadata_heads_reply,
-                      encode_metadata_acceptance_set(heads())};
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              return {MessageType::metadata_heads_reply, encode_metadata_acceptance_set(heads())};
           });
     route(MessageType::put_metadata_commit,
           [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-             [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
               auto entry = decode_metadata_history_entry(request.payload);
               Writer writer;
               writer.u8(replica_.import_history(entry));

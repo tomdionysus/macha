@@ -17,9 +17,9 @@ enum class SubsystemState {
     unavailable, // no plugin for this capability, or not enabled on this node
     starting,
     running,
-    faulted,     // most recent attempt threw/crashed; may retry
+    faulted, // most recent attempt threw/crashed; may retry
     restarting,
-    disabled,    // too many failures in the configured window; needs an operator
+    disabled, // too many failures in the configured window; needs an operator
 };
 
 std::string_view subsystem_state_name(SubsystemState) noexcept;
@@ -77,7 +77,9 @@ class Subsystem {
     // subsystem's threads, including inside start(); the first reason wins and
     // calls once stopping has begun are ignored. Subsystems that only fail in
     // construction or start() may ignore it.
-    virtual void attach_fault_sink(FaultSink sink) { (void)sink; }
+    virtual void attach_fault_sink(FaultSink sink) {
+        (void)sink;
+    }
 };
 
 } // namespace macha

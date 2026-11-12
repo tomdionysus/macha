@@ -44,21 +44,22 @@ int run_all(int argc, char** argv);
 
 #define MACHA_TEST_CONCAT_INNER(a, b) a##b
 #define MACHA_TEST_CONCAT(a, b) MACHA_TEST_CONCAT_INNER(a, b)
-#define MACHA_TEST_IMPL(group_name, test_name, cost_name, timeout_seconds)                           \
-    static void test_name();                                                                        \
-    static const ::macha::test::Registrar MACHA_TEST_CONCAT(test_registrar_, __LINE__)(             \
-        group_name, #test_name, &test_name, cost_name, std::chrono::seconds{timeout_seconds});       \
+#define MACHA_TEST_IMPL(group_name, test_name, cost_name, timeout_seconds)                         \
+    static void test_name();                                                                       \
+    static const ::macha::test::Registrar MACHA_TEST_CONCAT(test_registrar_, __LINE__)(            \
+        group_name, #test_name, &test_name, cost_name, std::chrono::seconds{timeout_seconds});     \
     static void test_name()
 
-#define MACHA_TEST(group_name, test_name)                                                            \
+#define MACHA_TEST(group_name, test_name)                                                          \
     MACHA_TEST_IMPL(group_name, test_name, ::macha::test::TestCost::integration, 60)
-#define MACHA_FAST_TEST(group_name, test_name)                                                       \
+#define MACHA_FAST_TEST(group_name, test_name)                                                     \
     MACHA_TEST_IMPL(group_name, test_name, ::macha::test::TestCost::fast, 30)
-#define MACHA_HEAVY_TEST(group_name, test_name)                                                      \
+#define MACHA_HEAVY_TEST(group_name, test_name)                                                    \
     MACHA_TEST_IMPL(group_name, test_name, ::macha::test::TestCost::heavy, 120)
 
 #define CHECK(expr) ::macha::test::check(static_cast<bool>(expr), #expr, __FILE__, __LINE__)
-#define REQUIRE(expr)                                                                               \
-    do {                                                                                            \
-        if (!(expr)) ::macha::test::require_failed(#expr, __FILE__, __LINE__);                      \
+#define REQUIRE(expr)                                                                              \
+    do {                                                                                           \
+        if (!(expr))                                                                               \
+            ::macha::test::require_failed(#expr, __FILE__, __LINE__);                              \
     } while (0)

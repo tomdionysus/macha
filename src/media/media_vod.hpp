@@ -32,8 +32,7 @@ int64_t clamp_seek_ms(int64_t requested_seek_ms, double duration_seconds);
 // before the request, or none when the keyframes are too sparse for roughly
 // target-sized segments.
 std::optional<IndexedPlan> indexed_plan(std::span<const double> keyframe_seconds,
-                                        double duration_seconds,
-                                        int64_t requested_seek_ms,
+                                        double duration_seconds, int64_t requested_seek_ms,
                                         double target_segment_seconds);
 
 // Matroska/WebM defers Cues parsing until a seek; materialise the index before

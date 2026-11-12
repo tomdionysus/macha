@@ -29,7 +29,7 @@ struct TranscodeRate {
     uint32_t height_class{}; // video only: 576, 720, 1080, 1440, 2160, 4320
     uint32_t rate_milli{};   // median rate x1000
     uint32_t observations{};
-    uint32_t concurrent{};   // median transcodes running on the node when observed
+    uint32_t concurrent{}; // median transcodes running on the node when observed
     auto operator<=>(const TranscodeRate&) const = default;
 };
 

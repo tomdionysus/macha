@@ -22,18 +22,17 @@ RpcReply wait_for_reply(AsyncRpc& async, std::string_view peer, MessageType type
         const auto idle = async.idle_for();
         if (no_progress_deadline.count() > 0 && idle >= no_progress_deadline) {
             async.cancel();
-            const auto text = std::string("RPC made no progress for ") +
-                              std::to_string(idle.count()) + " ms (" + frame_type_name(frame_type) +
-                              ") peer=" + std::string(peer) + " message=" +
-                              message_type_name(type) +
-                              " age_ms=" + std::to_string(elapsed_ms(call_started)) +
-                              "; cancelled for retry";
+            const auto text =
+                std::string("RPC made no progress for ") + std::to_string(idle.count()) + " ms (" +
+                frame_type_name(frame_type) + ") peer=" + std::string(peer) +
+                " message=" + message_type_name(type) +
+                " age_ms=" + std::to_string(elapsed_ms(call_started)) + "; cancelled for retry";
             Log::debug(text);
             throw std::runtime_error(text);
         }
         if (stall_notice.count() > 0 && idle >= stall_notice) {
-            Log::debug(std::string("RPC stalled (") + frame_type_name(frame_type) + ") peer=" +
-                       std::string(peer) + " message=" + message_type_name(type) +
+            Log::debug(std::string("RPC stalled (") + frame_type_name(frame_type) +
+                       ") peer=" + std::string(peer) + " message=" + message_type_name(type) +
                        " age_ms=" + std::to_string(elapsed_ms(call_started)) +
                        " no_progress_ms=" + std::to_string(idle.count()) +
                        (no_progress_deadline.count() > 0

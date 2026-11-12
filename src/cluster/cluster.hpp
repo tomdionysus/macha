@@ -1,31 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "config.hpp"
-#include "contract/thread_safety.hpp"
+#include "auth/session.hpp"
+#include "auth/users.hpp"
 #include "cluster/activity_clocks.hpp"
 #include "cluster/cluster_node.hpp"
 #include "cluster/dannan_host.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/inbound_resolution.hpp"
-#include "cluster/message_routes.hpp"
-#include "cluster/node_events.hpp"
 #include "cluster/local_state.hpp"
-#include "cluster/node_identity.hpp"
-#include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
-#include "metadata/metadata.hpp"
+#include "cluster/message_routes.hpp"
 #include "cluster/net.hpp"
-#include "storage/persistent_cache.hpp"
+#include "cluster/node_events.hpp"
+#include "cluster/node_identity.hpp"
 #include "cluster/public_connectivity.hpp"
-#include "storage/retention.hpp"
-#include "retained_memory.hpp"
-#include "auth/session.hpp"
-#include "auth/users.hpp"
-#include "storage/storage_pool.hpp"
 #include "cluster/telemetry.hpp"
-#include "supervised.hpp"
 #include "cluster/transcode_rates.hpp"
+#include "config.hpp"
+#include "contract/thread_safety.hpp"
+#include "metadata/metadata.hpp"
+#include "retained_memory.hpp"
+#include "storage/local_store.hpp"
+#include "storage/persistent_cache.hpp"
+#include "storage/retention.hpp"
+#include "storage/storage_pool.hpp"
+#include "supervised.hpp"
 
 #include <boost/asio/strand.hpp>
 
@@ -168,8 +168,8 @@ class NodeRuntime : public ClusterNode {
 
   public:
     // The caller holds state_path's StorageLock for this node's life.
-    NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, TranscodeRateBook&,
-                MessageRoutes&, NodeEvents&, StartupStageHook startup_stage_hook);
+    NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, TranscodeRateBook&, MessageRoutes&,
+                NodeEvents&, StartupStageHook startup_stage_hook);
     ~NodeRuntime() override;
     // Before start().
     void set_call_fault(CallFault fault) {

@@ -47,20 +47,20 @@ class CatalogueApi {
     HttpResponse media_content(const HttpRequest&, const std::string& media_id);
     HttpResponse media_conversion(const HttpRequest&, const std::string& media_id,
                                   std::string_view rest);
+
   public:
     using AvailabilitySource = std::function<std::shared_ptr<const AvailabilitySnapshot>()>;
-    CatalogueApi(
-        CatalogueManager& catalogue, CatalogueHintQueue& hints,
-        std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
-        std::function<std::optional<MediaProbeResult>(const std::string&)> resolve_media_profile = {},
-        std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24 * 30),
-        std::function<std::optional<uint64_t>(const std::string&)> media_size = {},
-        std::function<std::optional<Bytes>(const std::string&)> keyframe_index = {},
-        AvailabilitySource availability = {}, MediaContent media_content = {},
-        MediaConversions* conversions = nullptr)
+    CatalogueApi(CatalogueManager& catalogue, CatalogueHintQueue& hints,
+                 std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
+                 std::function<std::optional<MediaProbeResult>(const std::string&)>
+                     resolve_media_profile = {},
+                 std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24 * 30),
+                 std::function<std::optional<uint64_t>(const std::string&)> media_size = {},
+                 std::function<std::optional<Bytes>(const std::string&)> keyframe_index = {},
+                 AvailabilitySource availability = {}, MediaContent media_content = {},
+                 MediaConversions* conversions = nullptr)
         : catalogue_(catalogue), hints_(hints), media_content_(std::move(media_content)),
-          conversions_(conversions),
-          request_media_profiles_(std::move(request_media_profiles)),
+          conversions_(conversions), request_media_profiles_(std::move(request_media_profiles)),
           resolve_media_profile_(std::move(resolve_media_profile)),
           artwork_capability_ttl_(artwork_capability_ttl), media_size_(std::move(media_size)),
           keyframe_index_(std::move(keyframe_index)), availability_(std::move(availability)) {}

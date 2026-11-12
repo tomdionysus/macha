@@ -2,9 +2,9 @@
 //
 // A plugin whose start() always throws: the supervisor must mark it faulted
 // and disabled without taking the process down.
+#include "macha_version.hpp"
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"
-#include "macha_version.hpp"
 
 #include <stdexcept>
 
@@ -12,7 +12,9 @@ namespace {
 
 class FaultingSubsystem final : public macha::Subsystem {
   public:
-    std::string_view name() const noexcept override { return "test-plugin-faulting"; }
+    std::string_view name() const noexcept override {
+        return "test-plugin-faulting";
+    }
     void start() override {
         throw std::runtime_error("test-plugin-faulting always fails to start");
     }

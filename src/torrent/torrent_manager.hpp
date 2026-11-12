@@ -22,7 +22,7 @@
 namespace libtorrent {
 struct torrent_handle;
 struct add_torrent_params;
-}
+} // namespace libtorrent
 
 namespace macha {
 
@@ -88,7 +88,8 @@ class TorrentManager final : public TorrentService {
     static void request_resume_save(const libtorrent::torrent_handle&);
     // At stop: request resume data for every torrent and wait, bounded, for it.
     void save_all_resume_data();
-    void write_resume_alert(const libtorrent::torrent_handle&, const libtorrent::add_torrent_params&);
+    void write_resume_alert(const libtorrent::torrent_handle&,
+                            const libtorrent::add_torrent_params&);
     // Per job: the check's position when last sampled, for its rate and ETA.
     struct CheckSample {
         uint64_t checked{};
@@ -169,7 +170,9 @@ class TorrentManager final : public TorrentService {
     void request_stop();
     void stop();
 
-    bool enabled() const noexcept override { return enabled_; }
+    bool enabled() const noexcept override {
+        return enabled_;
+    }
     void reconfigure(TorrentConfig) override;
 
     std::string add(std::string magnet_uri) override;

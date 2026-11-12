@@ -92,8 +92,12 @@ class ClaimDeletion {
     }
     ClaimDeletion(const ClaimDeletion&) = delete;
     ClaimDeletion& operator=(const ClaimDeletion&) = delete;
-    ~ClaimDeletion() { release(); }
-    bool claimed() const noexcept { return claimed_; }
+    ~ClaimDeletion() {
+        release();
+    }
+    bool claimed() const noexcept {
+        return claimed_;
+    }
 
   private:
     inline void release() noexcept;
@@ -168,7 +172,9 @@ class ClaimStore {
     }
     // Under the guard: whether a delete has the object, in which case a
     // claim treats it as not present.
-    bool deleting(const ObjectId& id) const { return locks_.deleting(id); }
+    bool deleting(const ObjectId& id) const {
+        return locks_.deleting(id);
+    }
     // A delete's leave: under the id's stripe, no claim stands and the id is
     // marked, or `claimed`. The stripe is released before this returns.
     static constexpr Waits deletion_waits = guard_waits;

@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-#include "metadata/metadata_server.hpp"
 #include "cluster/data_work.hpp"
-#include "contract/thread_safety.hpp"
-#include "cluster/membership.hpp"
 #include "cluster/distributed_store.hpp"
-#include "metadata/metadata_manager.hpp"
+#include "cluster/membership.hpp"
+#include "contract/thread_safety.hpp"
 #include "ledger/object_trie.hpp"
+#include "metadata/metadata_manager.hpp"
+#include "metadata/metadata_server.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "write_behind.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <future>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <set>
+#include <span>
 #include <stdexcept>
-#include <vector>
 #include <thread>
+#include <vector>
 namespace macha {
 class FsError : public std::runtime_error {
     int c_;
@@ -156,8 +156,8 @@ class ReadHandle {
     const Bytes& extent(size_t, Clock::time_point, std::atomic_bool*) MACHA_REQUIRES(m_);
 
   public:
-    ReadHandle(DistributedStore&, FsEntry, PlaybackTracker* = nullptr,
-               std::string path = {}, FrameType frame_type = FrameType::read_ahead);
+    ReadHandle(DistributedStore&, FsEntry, PlaybackTracker* = nullptr, std::string path = {},
+               FrameType frame_type = FrameType::read_ahead);
     ~ReadHandle();
     void promote(FrameType) noexcept;
     size_t read(uint64_t, std::span<uint8_t>, Clock::time_point deadline = {},
@@ -182,7 +182,8 @@ class PublicationWriter {
     static constexpr ThreadSafety prepare_write_safety = ThreadSafety::thread_safe;
     virtual WritePreparation prepare_write(uint64_t offset, uint64_t byte_budget) = 0;
 
-    static constexpr Waits prepare_commit_waits = Waits::data_device | Waits::network | Waits::locks;
+    static constexpr Waits prepare_commit_waits =
+        Waits::data_device | Waits::network | Waits::locks;
     static constexpr ThreadSafety prepare_commit_safety = ThreadSafety::thread_safe;
     virtual WritePreparation prepare_commit(uint64_t byte_budget) = 0;
 
@@ -238,12 +239,14 @@ class PublicationTarget {
     // Advances whenever the nodes or the storage a publication depends on
     // change: a publication that kept failing is worth another attempt. An
     // atomic read.
-    virtual uint64_t reachability_epoch() const noexcept { return 0; }
+    virtual uint64_t reachability_epoch() const noexcept {
+        return 0;
+    }
 };
 
 class WriteHandle final : public PublicationWriter {
     friend class FileSystem;
-class PlaybackTracker;
+    class PlaybackTracker;
 
     // Held across the temp file's I/O, extent puts and fetches, durability
     // barriers and the metadata commit.
@@ -323,8 +326,8 @@ class PlaybackTracker;
         size_t length{};
         Hash256 hash{};
     };
-    std::map<std::pair<uint64_t, size_t>, std::pair<uint64_t, Hash256>> diagnostic_exact_writes_
-        MACHA_GUARDED_BY(m_);
+    std::map<std::pair<uint64_t, size_t>, std::pair<uint64_t, Hash256>>
+        diagnostic_exact_writes_ MACHA_GUARDED_BY(m_);
     // Trace-only; bounded so it never records every write of a bulk transfer.
     std::deque<DiagnosticWriteRange> diagnostic_writes_ MACHA_GUARDED_BY(m_);
     static constexpr size_t diagnostic_write_limit_ = 4096;
@@ -371,7 +374,10 @@ class PlaybackTracker;
     }
     void drain_staging() override;
     WriteHandleDiagnostics diagnostics() const override;
-    FsEntry committed_entry() const override { Lock lock(m_); return base_; }
+    FsEntry committed_entry() const override {
+        Lock lock(m_);
+        return base_;
+    }
     uint64_t diagnostic_id() const noexcept {
         return diagnostic_id_;
     }
@@ -408,8 +414,8 @@ class FileSystem final : public PublicationTarget {
         bool done{};
     };
     Mutex namespace_batch_queue_mutex_;
-    std::vector<QueuedNamespaceBatch*> namespace_batch_queue_
-        MACHA_GUARDED_BY(namespace_batch_queue_mutex_);
+    std::vector<QueuedNamespaceBatch*>
+        namespace_batch_queue_ MACHA_GUARDED_BY(namespace_batch_queue_mutex_);
     // Held across the metadata commit by the thread committing the queue.
     IoMutex namespace_batch_commit_mutex_;
     void apply_namespace_batch_to(QueuedNamespaceBatch&, NamespaceWorkingSet&, MetadataSnapshot&,
@@ -438,8 +444,8 @@ class FileSystem final : public PublicationTarget {
     std::atomic_uint64_t write_progress_{};
     std::vector<std::jthread> extent_workers_ MACHA_GUARDED_BY(extent_tasks_mutex_);
     void extent_worker(std::stop_token);
-    std::future<WriteHandle::StagedExtentResult> submit_extent_task(
-        std::function<WriteHandle::StagedExtentResult()>);
+    std::future<WriteHandle::StagedExtentResult>
+        submit_extent_task(std::function<WriteHandle::StagedExtentResult()>);
     // A path as the namespace stores it. `ambiguous` when two stored names
     // are canonically equivalent to the one asked for.
     struct ResolvedPath {
@@ -458,11 +464,11 @@ class FileSystem final : public PublicationTarget {
     bool media_index_valid_ MACHA_GUARDED_BY(media_index_mutex_){};
     // Owns the entries media_index_ refers to. Content-addressed media ids stay
     // valid across generations; only a miss inspects newer metadata.
-    std::shared_ptr<const MetadataSnapshot> media_index_snapshot_
-        MACHA_GUARDED_BY(media_index_mutex_);
+    std::shared_ptr<const MetadataSnapshot>
+        media_index_snapshot_ MACHA_GUARDED_BY(media_index_mutex_);
     // Media id to every path holding that content.
-    std::map<std::string, std::vector<std::string>, std::less<>> media_index_
-        MACHA_GUARDED_BY(media_index_mutex_);
+    std::map<std::string, std::vector<std::string>, std::less<>>
+        media_index_ MACHA_GUARDED_BY(media_index_mutex_);
     // The tree the index was built from, when the namespace is a tree.
     std::optional<ObjectId> media_index_root_ MACHA_GUARDED_BY(media_index_mutex_);
     void refresh_media_index(const MetadataSnapshotView&) MACHA_REQUIRES(media_index_mutex_);
@@ -484,8 +490,8 @@ class FileSystem final : public PublicationTarget {
         MACHA_REQUIRES(maintenance_build_mutex_);
     Mutex maintenance_index_mutex_;
     uint64_t maintenance_index_generation_ MACHA_GUARDED_BY(maintenance_index_mutex_){};
-    std::shared_ptr<const MaintenanceObjects> maintenance_index_
-        MACHA_GUARDED_BY(maintenance_index_mutex_);
+    std::shared_ptr<const MaintenanceObjects>
+        maintenance_index_ MACHA_GUARDED_BY(maintenance_index_mutex_);
     // Decoded local replica record, cached apart from MetadataManager's
     // authoritative read path, which local snapshot views must never enter.
     // Held across the replica's materialisation, which reads history frames
@@ -493,26 +499,24 @@ class FileSystem final : public PublicationTarget {
     IoMutex local_snapshot_mutex_;
     uint64_t local_snapshot_generation_ MACHA_GUARDED_BY(local_snapshot_mutex_){};
     Hash256 local_snapshot_hash_ MACHA_GUARDED_BY(local_snapshot_mutex_){};
-    std::shared_ptr<const MetadataSnapshot> local_snapshot_cache_
-        MACHA_GUARDED_BY(local_snapshot_mutex_);
-    void commit_write(WriteHandle&, const FsEntry&, uint64_t,
-                      const std::vector<ExtentRef>&, FsEntry*,
-                      std::optional<int64_t> mtime_override = {});
+    std::shared_ptr<const MetadataSnapshot>
+        local_snapshot_cache_ MACHA_GUARDED_BY(local_snapshot_mutex_);
+    void commit_write(WriteHandle&, const FsEntry&, uint64_t, const std::vector<ExtentRef>&,
+                      FsEntry*, std::optional<int64_t> mtime_override = {});
     static void require_parent(const NamespaceWorkingSet&, const std::string&);
-    static std::optional<FsEntry> apply_namespace_mutation(
-        NamespaceWorkingSet&, MetadataDelta&, const FilesystemNamespaceMutation&);
+    static std::optional<FsEntry> apply_namespace_mutation(NamespaceWorkingSet&, MetadataDelta&,
+                                                           const FilesystemNamespaceMutation&);
 
   public:
     // Removes the write staging files `node` left in `state_path/tmp` when it
     // stopped without finishing them. Only that node's own, and only before
     // its filesystem exists, so no handle can hold one. Returns the files and
     // bytes removed.
-    static std::pair<size_t, uint64_t> remove_abandoned_write_files(
-        const std::filesystem::path& state_path, const NodeId& node);
+    static std::pair<size_t, uint64_t>
+    remove_abandoned_write_files(const std::filesystem::path& state_path, const NodeId& node);
     // Clears this node's abandoned write files first.
     FileSystem(const Config&, NodeId, const Membership&, LocalState&, MetadataServer&,
-               DistributedStore&, MetadataView&, RetainedMemoryLedger&,
-               PlaybackTracker* = nullptr);
+               DistributedStore&, MetadataView&, RetainedMemoryLedger&, PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
     void mkdir(const std::string&, uint32_t, uint32_t, uint32_t);
@@ -526,9 +530,10 @@ class FileSystem final : public PublicationTarget {
     // `atomic`: all or nothing, so with an `identity` "clock advanced" means
     // the whole batch applied. Otherwise the largest valid prefix commits and
     // the failure is reported in the result.
-    FilesystemNamespaceBatchResult apply_namespace_batch(
-        std::span<const FilesystemNamespaceMutation>,
-        std::optional<MetadataMutationIdentity> identity = {}, bool atomic = false);
+    FilesystemNamespaceBatchResult
+    apply_namespace_batch(std::span<const FilesystemNamespaceMutation>,
+                          std::optional<MetadataMutationIdentity> identity = {},
+                          bool atomic = false);
     void truncate_file(const std::string&, uint64_t);
     // A read nobody is viewing: speculative work.
     std::shared_ptr<ReadHandle> open_read(const std::string&);
@@ -566,9 +571,8 @@ class FileSystem final : public PublicationTarget {
     // publication writer's basis is then permanently wrong, so the generation
     // must be replayed from the spool against a fresh writer. Foreground
     // handles keep EAGAIN, where retrying is meaningful.
-    void commit_file(const std::string&, const FsEntry&, uint64_t,
-                     const std::vector<ExtentRef>&, FsEntry*,
-                     std::optional<int64_t> mtime_override = {},
+    void commit_file(const std::string&, const FsEntry&, uint64_t, const std::vector<ExtentRef>&,
+                     FsEntry*, std::optional<int64_t> mtime_override = {},
                      bool stale_basis_is_replayable = false);
     std::pair<uint64_t, uint64_t> logical_capacity() const;
     MetadataSnapshot local_snapshot() const;
@@ -583,12 +587,14 @@ class FileSystem final : public PublicationTarget {
     uint64_t local_committed_metadata_generation() const noexcept {
         return local_.replica().committed_generation();
     }
-    uint64_t known_metadata_generation() const noexcept { return metadata_server_.known_generation(); }
+    uint64_t known_metadata_generation() const noexcept {
+        return metadata_server_.known_generation();
+    }
     // Hashes namespace/content identity, excluding catalogue metadata, so the
     // catalogue scanner's own commits cannot trigger a rescan loop.
     Hash256 namespace_signature(uint64_t* metadata_generation = nullptr);
-    std::optional<Hash256> available_namespace_signature(
-        uint64_t* metadata_generation = nullptr) const;
+    std::optional<Hash256>
+    available_namespace_signature(uint64_t* metadata_generation = nullptr) const;
     // `pause` runs between the entries a build walks, and may throw to end it.
     std::shared_ptr<const MaintenanceObjects>
     maintenance_objects_cached(const std::function<void()>& pause = {});
@@ -606,10 +612,18 @@ class FileSystem final : public PublicationTarget {
     ControlNamespaceNodeStore namespace_nodes() {
         return ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     }
-    void note_interactive_activity(uint64_t bytes = 0) { s_.interactive_activity(bytes); }
-    void note_foreground_activity(uint64_t bytes = 0) { s_.foreground_activity(bytes); }
-    std::chrono::milliseconds idle_for(WorkClass work_class) const { return s_.idle_for(work_class); }
-    void reset_io_cancellation() { io_cancelled_.store(false, std::memory_order_relaxed); }
+    void note_interactive_activity(uint64_t bytes = 0) {
+        s_.interactive_activity(bytes);
+    }
+    void note_foreground_activity(uint64_t bytes = 0) {
+        s_.foreground_activity(bytes);
+    }
+    std::chrono::milliseconds idle_for(WorkClass work_class) const {
+        return s_.idle_for(work_class);
+    }
+    void reset_io_cancellation() {
+        io_cancelled_.store(false, std::memory_order_relaxed);
+    }
     void request_io_cancellation() {
         io_cancelled_.store(true, std::memory_order_relaxed);
         extent_tasks_cv_.notify_all();
@@ -618,7 +632,9 @@ class FileSystem final : public PublicationTarget {
         return io_cancelled_.load(std::memory_order_relaxed);
     }
     ExtentExecutorDiagnostics extent_executor_diagnostics() const;
-    std::atomic_bool* io_cancellation_flag() { return &io_cancelled_; }
+    std::atomic_bool* io_cancellation_flag() {
+        return &io_cancelled_;
+    }
     const Config& config() const {
         return config_;
     }
@@ -630,7 +646,9 @@ class FileSystem final : public PublicationTarget {
     }
     // Process-wide: memory one writer releases can admit another, so any
     // writer's progress re-arms every no-progress window.
-    const std::atomic_uint64_t& write_progress() const noexcept { return write_progress_; }
+    const std::atomic_uint64_t& write_progress() const noexcept {
+        return write_progress_;
+    }
     void note_write_progress() noexcept {
         write_progress_.fetch_add(1, std::memory_order_relaxed);
     }

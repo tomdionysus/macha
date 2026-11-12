@@ -9,7 +9,8 @@ namespace macha::coverage {
 std::string child_profile_name(std::string_view pattern, long pid, std::string_view tag) {
     std::string name(pattern);
     const auto replacement = std::to_string(pid) + std::string(tag);
-    for (auto at = name.find("%p"); at != std::string::npos; at = name.find("%p", at + replacement.size()))
+    for (auto at = name.find("%p"); at != std::string::npos;
+         at = name.find("%p", at + replacement.size()))
         name.replace(at, 2, replacement);
     return name;
 }

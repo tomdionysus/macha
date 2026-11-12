@@ -16,14 +16,18 @@ class SteppedTime final : public TimeSource {
 
   public:
     // Precondition: by >= 0.
-    void advance(Clock::duration by) noexcept { now_.fetch_add(by.count()); }
+    void advance(Clock::duration by) noexcept {
+        now_.fetch_add(by.count());
+    }
     Clock::time_point now() const noexcept override {
         reads_.fetch_add(1);
         return Clock::time_point(Clock::duration(now_.load()));
     }
     // How many times now() has been read: lets a test wait for another thread
     // to have taken its reading before moving time on.
-    uint64_t reads() const noexcept { return reads_.load(); }
+    uint64_t reads() const noexcept {
+        return reads_.load();
+    }
 };
 
 } // namespace macha::test_support

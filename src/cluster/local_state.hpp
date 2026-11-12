@@ -42,7 +42,9 @@ class RecoveryProgress {
         retention = 1U << 3,
         metadata = 1U << 4,
     };
-    void mark(Plane plane) noexcept { planes_.fetch_or(plane, std::memory_order_acq_rel); }
+    void mark(Plane plane) noexcept {
+        planes_.fetch_or(plane, std::memory_order_acq_rel);
+    }
     bool has(Plane plane) const noexcept {
         return (planes_.load(std::memory_order_acquire) & plane) != 0;
     }
@@ -63,17 +65,22 @@ class RecoveryProgress {
         }
         cv_.notify_all();
     }
-    bool complete() const noexcept { return complete_.load(std::memory_order_acquire); }
+    bool complete() const noexcept {
+        return complete_.load(std::memory_order_acquire);
+    }
     uint64_t ready_unix_ms() const noexcept {
         return ready_unix_ms_.load(std::memory_order_acquire);
     }
     // Waits until complete, failed, or `timeout`; true when complete.
     bool wait_complete(std::chrono::milliseconds timeout) const {
         Lock lock(mutex_);
-        cv_.wait_for(lock.native(), timeout, [this]() MACHA_REQUIRES(mutex_) { return complete() || failed(); });
+        cv_.wait_for(lock.native(), timeout,
+                     [this]() MACHA_REQUIRES(mutex_) { return complete() || failed(); });
         return complete();
     }
-    bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
+    bool failed() const noexcept {
+        return failed_.load(std::memory_order_acquire);
+    }
     std::string error() const {
         Lock lock(mutex_);
         return error_;
@@ -114,13 +121,27 @@ class LocalState {
     LocalState(const LocalState&) = delete;
     LocalState& operator=(const LocalState&) = delete;
 
-    StoragePool& data() noexcept { return *data_; }
-    LocalStore& control() noexcept { return *control_; }
-    ControlObjectFetch& control_fetch() noexcept { return *control_fetch_; }
-    PersistentBlockCache& cache() noexcept { return *cache_; }
-    RetentionStore& retention() noexcept { return *retention_; }
-    ReferenceCounts& references() noexcept { return *references_; }
-    MetadataReplica& replica() noexcept { return *replica_; }
+    StoragePool& data() noexcept {
+        return *data_;
+    }
+    LocalStore& control() noexcept {
+        return *control_;
+    }
+    ControlObjectFetch& control_fetch() noexcept {
+        return *control_fetch_;
+    }
+    PersistentBlockCache& cache() noexcept {
+        return *cache_;
+    }
+    RetentionStore& retention() noexcept {
+        return *retention_;
+    }
+    ReferenceCounts& references() noexcept {
+        return *references_;
+    }
+    MetadataReplica& replica() noexcept {
+        return *replica_;
+    }
 
     // Applies a live reload's storage backends and cache settings.
     void reconfigure(const Config&);

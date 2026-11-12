@@ -56,7 +56,9 @@ class Lifecycle {
 
 struct OpenOnExit {
     TestGate& gate;
-    ~OpenOnExit() { gate.open(); }
+    ~OpenOnExit() {
+        gate.open();
+    }
 };
 
 bool absent(FileSystem& fs, const std::string& path) {
@@ -187,7 +189,9 @@ void startup_fails(const StartupFailure& failure) {
 }
 
 MACHA_TEST("service_root", test_a_failed_startup_is_what_every_caller_is_told) {
-    startup_fails({"data-storage", "backend missing", "control-storage",
+    startup_fails({"data-storage",
+                   "backend missing",
+                   "control-storage",
                    {"control_plane=ready", "data_storage=recovering", "control_storage=recovering",
                     "failed=true"},
                    "backend missing"});
@@ -195,10 +199,12 @@ MACHA_TEST("service_root", test_a_failed_startup_is_what_every_caller_is_told) {
 
 // The other plane, failing with nothing to say for itself.
 MACHA_TEST("service_root", test_a_failed_startup_with_no_reason_still_says_it_failed) {
-    startup_fails({"cache", "", "data-storage",
-                   {"control_storage=ready", "cache=recovering", "data_storage=recovering",
-                    "failed=true"},
-                   "server startup failed"});
+    startup_fails(
+        {"cache",
+         "",
+         "data-storage",
+         {"control_storage=ready", "cache=recovering", "data_storage=recovering", "failed=true"},
+         "server startup failed"});
 }
 
 // A node whose only disk is offline comes up and runs: its data plane is ready,
@@ -396,7 +402,8 @@ MACHA_TEST("service_root", test_a_request_is_admitted_by_session_capability_and_
 
     // No token, or one this node never minted: refused before any handler.
     CHECK(http_request(port, "GET", "/api/v1/catalogue/items").status == 401);
-    CHECK(http_request(port, "GET", "/api/v1/catalogue/items", bearer("never-minted")).status == 401);
+    CHECK(http_request(port, "GET", "/api/v1/catalogue/items", bearer("never-minted")).status ==
+          401);
 
     // Liveness and the client itself need none; /api stays the server's.
     CHECK(http_request(port, "GET", "/api/v1/health").status == 200);
@@ -407,8 +414,8 @@ MACHA_TEST("service_root", test_a_request_is_admitted_by_session_capability_and_
     CHECK(http_request(port, "GET", "/api/v1/no-such-route").status == 401);
 
     // A stream URL carries its own authority; the session beside it does not.
-    CHECK(http_request(port, "GET", "/api/v1/playback/sessions/none/stream/token/index.m3u8").status ==
-          404);
+    CHECK(http_request(port, "GET", "/api/v1/playback/sessions/none/stream/token/index.m3u8")
+              .status == 404);
     CHECK(http_request(port, "GET", "/api/v1/playback/sessions/none").status == 401);
 
     // Signing in needs no token, and the session it mints needs no role to
@@ -417,8 +424,9 @@ MACHA_TEST("service_root", test_a_request_is_admitted_by_session_capability_and_
     const auto alice =
         users.create("alice", "correct horse battery", {std::string(role_media_viewer)}, self);
     REQUIRE(alice.has_value());
-    const auto refused = http_request(port, "POST", "/api/v1/session", {},
-                              R"({"credentials":{"username":"alice","password":"wrong horse"}})");
+    const auto refused =
+        http_request(port, "POST", "/api/v1/session", {},
+                     R"({"credentials":{"username":"alice","password":"wrong horse"}})");
     CHECK(refused.status == 401);
     CHECK(refused.has("invalid_credentials"));
     const auto alice_token = sign_in(port, "alice", "correct horse battery");
@@ -586,10 +594,10 @@ MACHA_TEST("service_root", test_standing_conflicts_are_listed_and_resolved_over_
     const auto installed = fs.getattr("/kept-base");
     REQUIRE(catalogue_repair.wait_for_entries(1, 10s));
 
-    const auto take_left = entry_conflict("/take-left", 1, std::nullopt, file_entry(),
-                                          directory_entry());
-    const auto take_right = entry_conflict("/take-right", 3, std::nullopt, file_entry(),
-                                           directory_entry());
+    const auto take_left =
+        entry_conflict("/take-left", 1, std::nullopt, file_entry(), directory_entry());
+    const auto take_right =
+        entry_conflict("/take-right", 3, std::nullopt, file_entry(), directory_entry());
     const auto take_base = entry_conflict("/kept-base", 5, installed, file_entry(), std::nullopt);
     MetadataConflict catalogue;
     catalogue.kind = MetadataConflictKind::catalogue_root;
@@ -639,20 +647,22 @@ MACHA_TEST("service_root", test_standing_conflicts_are_listed_and_resolved_over_
     // A resolution is a POST to /{id}/resolve naming one of the three sides.
     const auto resolve = [&](const MetadataConflict& conflict, std::string_view choice) {
         return http_request(port, "POST",
-                    route + "/" + metadata_conflict_id(conflict) + "/resolve?choice=" +
-                        std::string(choice),
-                    admin);
+                            route + "/" + metadata_conflict_id(conflict) +
+                                "/resolve?choice=" + std::string(choice),
+                            admin);
     };
     const auto left_id = metadata_conflict_id(take_left);
-    CHECK(http_request(port, "GET", route + "/" + left_id + "/resolve?choice=left", admin).status == 405);
+    CHECK(http_request(port, "GET", route + "/" + left_id + "/resolve?choice=left", admin).status ==
+          405);
     CHECK(http_request(port, "POST", route + "/" + left_id, admin).status == 404);
-    CHECK(http_request(port, "POST", route + "/" + left_id + "/settle?choice=left", admin).status == 404);
+    CHECK(http_request(port, "POST", route + "/" + left_id + "/settle?choice=left", admin).status ==
+          404);
     const auto unnamed = http_request(port, "POST", route + "/" + left_id + "/resolve", admin);
     CHECK(unnamed.status == 400);
     CHECK(unnamed.has("bad_choice"));
     CHECK(resolve(take_left, "newest").status == 400);
-    const auto unknown =
-        http_request(port, "POST", route + "/" + std::string(64, '0') + "/resolve?choice=left", admin);
+    const auto unknown = http_request(
+        port, "POST", route + "/" + std::string(64, '0') + "/resolve?choice=left", admin);
     CHECK(unknown.status == 409);
     CHECK(unknown.has("not_standing"));
     // Nothing above resolved anything.
@@ -697,8 +707,8 @@ MACHA_TEST("service_root", test_conflict_routes_say_when_metadata_is_unavailable
     const auto listed = http_request(port, "GET", route, admin);
     CHECK(listed.status == 503);
     CHECK(listed.has("metadata_unavailable"));
-    const auto resolved =
-        http_request(port, "POST", route + "/" + std::string(64, '0') + "/resolve?choice=left", admin);
+    const auto resolved = http_request(
+        port, "POST", route + "/" + std::string(64, '0') + "/resolve?choice=left", admin);
     CHECK(resolved.status == 503);
     CHECK(resolved.has("metadata_unavailable"));
 }

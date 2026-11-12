@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "storage/storage_pool.hpp"
 
+#include "cluster/placement.hpp"
 #include "codec.hpp"
 #include "diagnostics.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
 #include "observation.hpp"
-#include "cluster/placement.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -73,8 +73,7 @@ struct StoragePool::Backend {
 };
 
 StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
-                         std::vector<StorageBackendConfig> configs,
-                         std::array<uint8_t, 32> key,
+                         std::vector<StorageBackendConfig> configs, std::array<uint8_t, 32> key,
                          std::chrono::milliseconds durability_batch_window,
                          StoragePackingConfig packing, uint64_t ledger_cache,
                          LocalStoreFiles& files)
@@ -91,18 +90,18 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::snapshot() const
 }
 
 std::shared_ptr<DurabilityDomain> StoragePool::domain_for(const std::filesystem::path& path) {
-    struct stat st {};
+    struct stat st{};
     if (::stat(path.c_str(), &st) != 0)
         throw std::runtime_error("cannot stat storage durability domain " + path.string());
     const auto device = static_cast<uint64_t>(st.st_dev);
     Lock lock(domain_mutex_);
-    if (const auto found = domains_by_device_.find(device); found != domains_by_device_.end() &&
-        !found->second->failed()) {
+    if (const auto found = domains_by_device_.find(device);
+        found != domains_by_device_.end() && !found->second->failed()) {
         found->second->add_representative(path);
         return found->second;
     }
-    auto domain = std::make_shared<DurabilityDomain>(next_domain_id_++, path,
-                                                     durability_batch_window_);
+    auto domain =
+        std::make_shared<DurabilityDomain>(next_domain_id_++, path, durability_batch_window_);
     domains_by_device_[device] = domain;
     return domain;
 }
@@ -114,8 +113,8 @@ std::filesystem::path StoragePool::identity_path(const std::filesystem::path& pa
 }
 
 void StoragePool::deactivate(const std::shared_ptr<Backend>& backend,
-                             const std::shared_ptr<LocalStore>& expected,
-                             const std::string& reason, uint64_t expected_generation) const {
+                             const std::shared_ptr<LocalStore>& expected, const std::string& reason,
+                             uint64_t expected_generation) const {
     std::shared_ptr<LocalStore> retired;
     std::filesystem::path path;
     bool log = false;
@@ -142,8 +141,8 @@ void StoragePool::deactivate(const std::shared_ptr<Backend>& backend,
     if (log)
         Log::warn("storage backend offline " + path.string() + ": " + reason);
     if (was_online)
-        observations().event({unix_ms(), "backend_offline", {},
-                              {{"path", path.string()}, {"reason", reason}}});
+        observations().event(
+            {unix_ms(), "backend_offline", {}, {{"path", path.string()}, {"reason", reason}}});
 }
 
 bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
@@ -248,9 +247,8 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
             options.ledger_dir = state_path_ / "ledger" / ("data-" + to_string(token));
             options.ledger_cache_bytes =
                 static_cast<size_t>(ledger_cache_ / std::max<size_t>(1, ledger_shares_.load()));
-            store = std::make_shared<LocalStore>(cfg.path, options, key_,
-                                                 LocalStoreMode::authoritative,
-                                                 durability_domain, files_);
+            store = std::make_shared<LocalStore>(
+                cfg.path, options, key_, LocalStoreMode::authoritative, durability_domain, files_);
         } else {
             Lock lock(backend->mutex);
             durability_domain = backend->durability_domain;
@@ -279,8 +277,8 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now() - activate_started);
             Log::info("storage backend online " + cfg.path.string() +
-                      " elapsed_ms=" + std::to_string(elapsed.count()) +
-                      " accounting=" + std::string(store->scan_complete() ? "ready" : "reconciling"));
+                      " elapsed_ms=" + std::to_string(elapsed.count()) + " accounting=" +
+                      std::string(store->scan_complete() ? "ready" : "reconciling"));
             observations().event({unix_ms(),
                                   "backend_online",
                                   {{"elapsed_ms", static_cast<uint64_t>(elapsed.count())}},
@@ -303,10 +301,11 @@ void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) 
             auto normalized = cfg.path.lexically_normal();
             if (!wanted.insert(normalized).second)
                 throw std::runtime_error("duplicate storage backend: " + normalized.string());
-            auto existing = std::find_if(backends_.begin(), backends_.end(), [&](const auto& backend) {
-                Lock backend_lock(backend->mutex);
-                return backend->cfg.path.lexically_normal() == normalized;
-            });
+            auto existing =
+                std::find_if(backends_.begin(), backends_.end(), [&](const auto& backend) {
+                    Lock backend_lock(backend->mutex);
+                    return backend->cfg.path.lexically_normal() == normalized;
+                });
             if (existing == backends_.end()) {
                 auto backend = std::make_shared<Backend>();
                 {
@@ -325,8 +324,7 @@ void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) 
                     ++(*existing)->generation;
                     (*existing)->online = false;
                     if ((*existing)->store)
-                        (*existing)->departed_removals +=
-                            (*existing)->store->held_removals() + 1;
+                        (*existing)->departed_removals += (*existing)->store->held_removals() + 1;
                     retired.push_back(std::move((*existing)->store));
                 }
             }
@@ -388,9 +386,8 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const Obj
     std::vector<std::shared_ptr<Backend>> out;
     out.reserve(order.size());
     for (const auto& placed : order) {
-        auto it = std::find_if(lookup.begin(), lookup.end(), [&](const auto& item) {
-            return item.first == placed.id;
-        });
+        auto it = std::find_if(lookup.begin(), lookup.end(),
+                               [&](const auto& item) { return item.first == placed.id; });
         if (it != lookup.end())
             out.push_back(it->second);
     }
@@ -428,8 +425,8 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
     return false;
 }
 
-std::optional<StoragePool::DurabilityToken> StoragePool::put_deferred(
-    const ObjectId& id, std::span<const uint8_t> data) {
+std::optional<StoragePool::DurabilityToken>
+StoragePool::put_deferred(const ObjectId& id, std::span<const uint8_t> data) {
     // The provisional write path: ingest and FUSE publication put every extent here.
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
@@ -462,8 +459,8 @@ std::optional<StoragePool::DurabilityToken> StoragePool::put_deferred(
             {
                 Lock lock(backend->mutex);
                 if (!backend->online || backend->store != store ||
-                    backend->instance_id != backend_instance ||
-                    !backend->durability_domain || backend->durability_domain->id() != domain)
+                    backend->instance_id != backend_instance || !backend->durability_domain ||
+                    backend->durability_domain->id() != domain)
                     continue;
             }
             return DurabilityToken{domain, *generation, backend_instance};
@@ -495,8 +492,8 @@ void StoragePool::durability_barrier(const DurabilityToken& token, DurabilityUrg
             {
                 Lock lock(backend->mutex);
                 if (!backend->online || backend->store != store ||
-                    backend->instance_id != token.backend_instance ||
-                    !backend->durability_domain || backend->durability_domain->id() != token.domain)
+                    backend->instance_id != token.backend_instance || !backend->durability_domain ||
+                    backend->durability_domain->id() != token.domain)
                     throw std::runtime_error(
                         "storage durability placement changed while awaiting barrier");
             }
@@ -535,21 +532,19 @@ void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {
 
     if (!Log::enabled(LogLevel::all))
         return;
-    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            Clock::now().time_since_epoch())
-                            .count();
+    const auto now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
+            .count();
     auto previous = diag_get_report_ns_.load(std::memory_order_relaxed);
     constexpr int64_t report_ns = 5'000'000'000LL;
     if (!previous) {
         int64_t unset = 0;
-        (void)diag_get_report_ns_.compare_exchange_strong(unset, now_ns,
-                                                          std::memory_order_relaxed);
+        (void)diag_get_report_ns_.compare_exchange_strong(unset, now_ns, std::memory_order_relaxed);
         return;
     }
     if (now_ns - previous < report_ns)
         return;
-    if (!diag_get_report_ns_.compare_exchange_strong(previous, now_ns,
-                                                     std::memory_order_relaxed))
+    if (!diag_get_report_ns_.compare_exchange_strong(previous, now_ns, std::memory_order_relaxed))
         return;
 
     const auto window_ms = static_cast<uint64_t>((now_ns - previous) / 1'000'000LL);
@@ -560,10 +555,8 @@ void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {
     if (!gets)
         return;
     Log::trace("DIAG storage-get window_ms=" + std::to_string(window_ms) +
-               " gets=" + std::to_string(gets) +
-               " bytes=" + std::to_string(total_bytes) +
-               " avg_ms=" + std::to_string(total_ms / gets) +
-               " max_ms=" + std::to_string(max_ms));
+               " gets=" + std::to_string(gets) + " bytes=" + std::to_string(total_bytes) +
+               " avg_ms=" + std::to_string(total_ms / gets) + " max_ms=" + std::to_string(max_ms));
 }
 
 void StoragePool::note_read_failure(const ObjectId& id, const std::filesystem::path& path,
@@ -603,15 +596,15 @@ std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
             if (Log::enabled(LogLevel::all))
                 Log::trace("DIAG backend-get path=" + path.string() + " id=" + to_string(id) +
-                       " result=" + std::to_string(data ? 1 : 0) +
-                       " bytes=" + std::to_string(data ? data->size() : 0) +
-                       " ms=" + std::to_string(elapsed.count()));
+                           " result=" + std::to_string(data ? 1 : 0) +
+                           " bytes=" + std::to_string(data ? data->size() : 0) +
+                           " ms=" + std::to_string(elapsed.count()));
             observe_get(data ? data->size() : 0, static_cast<uint64_t>(elapsed.count()));
             return data;
         } catch (const ObjectCorrupt& error) {
             // Corrupt content is an object failure, not a backend failure.
-            Log::warn("discarding corrupt local object " + to_string(id) + " on " +
-                      path.string() + ": " + error.what());
+            Log::warn("discarding corrupt local object " + to_string(id) + " on " + path.string() +
+                      ": " + error.what());
             try {
                 (void)store->remove(id);
             } catch (...) {
@@ -776,7 +769,7 @@ std::vector<ObjectId> StoragePool::list() const {
 }
 
 std::optional<StoragePool::CursorItem> StoragePool::next_physical(Cursor& cursor,
-                                                                 bool& pass_complete) const {
+                                                                  bool& pass_complete) const {
     pass_complete = false;
     struct View {
         std::shared_ptr<Backend> backend;
@@ -976,9 +969,9 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
     return result;
 }
 
-StoragePool::MaintenanceResult
-StoragePool::scrub_step(uint64_t budget_bytes, size_t operation_budget,
-                        const std::function<bool()>& should_yield) {
+StoragePool::MaintenanceResult StoragePool::scrub_step(uint64_t budget_bytes,
+                                                       size_t operation_budget,
+                                                       const std::function<bool()>& should_yield) {
     MaintenanceResult result;
     while (!operation_budget || result.objects < operation_budget) {
         if (should_yield && should_yield()) {
@@ -1019,8 +1012,7 @@ StoragePool::scrub_step(uint64_t budget_bytes, size_t operation_budget,
 }
 
 StoragePool::MaintenanceResult
-StoragePool::gc_step(const IdLookup& live,
-                     const std::vector<ObjectId>& protected_ids,
+StoragePool::gc_step(const IdLookup& live, const std::vector<ObjectId>& protected_ids,
                      std::chrono::milliseconds orphan_grace, size_t operation_budget,
                      const std::function<bool()>& should_yield,
                      const std::function<bool(const ObjectId&)>& is_retained,
@@ -1082,8 +1074,8 @@ StoragePool::gc_step(const IdLookup& live,
                 result.deferred = true;
             }
         } catch (const std::exception& error) {
-            Log::debug("garbage collection skipped local object " + to_string(id) +
-                       " on " + item->path.string() + ": " + error.what());
+            Log::debug("garbage collection skipped local object " + to_string(id) + " on " +
+                       item->path.string() + ": " + error.what());
         }
     }
     return result;
@@ -1123,7 +1115,8 @@ LocalStore::VerifyResult StoragePool::verify_step(size_t directories) {
 size_t StoragePool::compact_packs(std::stop_token stop) {
     size_t visited = 0;
     for (const auto& backend : snapshot()) {
-        if (stop.stop_requested()) break;
+        if (stop.stop_requested())
+            break;
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
         {
@@ -1207,8 +1200,7 @@ LocalStoreDiagnostics StoragePool::diagnostics() const {
             continue;
         const auto current = store->diagnostics();
         total.loose_reaffirmation_fast_paths += current.loose_reaffirmation_fast_paths;
-        total.loose_reaffirmation_full_validations +=
-            current.loose_reaffirmation_full_validations;
+        total.loose_reaffirmation_full_validations += current.loose_reaffirmation_full_validations;
         total.presence_index_entries += current.presence_index_entries;
         total.pack_recovery_truncated_tails += current.pack_recovery_truncated_tails;
         total.pack_recovery_skipped_regions += current.pack_recovery_skipped_regions;

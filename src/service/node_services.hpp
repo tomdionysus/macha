@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "metadata/metadata_server.hpp"
 #include "acquisition/ingest.hpp"
 #include "api/acquisition_api.hpp"
 #include "api/catalogue_api.hpp"
 #include "api/manage_api.hpp"
 #include "catalogue/catalogue.hpp"
-#include "catalogue/catalogue_installer.hpp"
 #include "catalogue/catalogue_hints.hpp"
+#include "catalogue/catalogue_installer.hpp"
+#include "metadata/metadata_server.hpp"
 #if MACHA_HAVE_BOOKS
 #include "catalogue/book_conversion.hpp"
 #endif
+#include "api/files_api.hpp"
 #include "catalogue/cluster_unmatched.hpp"
 #include "catalogue/media_catalogue.hpp"
 #include "catalogue/media_information.hpp"
@@ -21,10 +22,9 @@
 #include "filesystem/hydration.hpp"
 #include "ledger/node_horizon_builder.hpp"
 #include "ledger/retention_ledger.hpp"
-#include "api/files_api.hpp"
-#include "service/availability_service.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "playback/playback.hpp"
+#include "service/availability_service.hpp"
 #include "service/maintenance.hpp"
 #include "service/maintenance_clock.hpp"
 #include "subsystem/subsystem_registry.hpp"
@@ -85,8 +85,7 @@ struct NodeServicesInstruments {
 class NodeServices {
   public:
     NodeServices(NodeRuntime&, NodeResources&, LocalState&, MetadataServer&, MessageRoutes&,
-                 SubsystemRegistry&, MaintenancePort&,
-                 NodeServicesInstruments);
+                 SubsystemRegistry&, MaintenancePort&, NodeServicesInstruments);
     ~NodeServices();
     NodeServices(const NodeServices&) = delete;
     NodeServices& operator=(const NodeServices&) = delete;
@@ -106,24 +105,60 @@ class NodeServices {
     // while a mount is published, the frontend's.
     std::map<std::string, uint64_t> observation_gauges();
 
-    DistributedStore& store() { return store_; }
-    MetadataManager& metadata() { return metadata_; }
-    CatalogueManager& catalogue() { return catalogue_; }
-    AvailabilityService& availability() { return availability_; }
-    FilesApi& files_api() { return files_api_; }
-    FileSystem& filesystem() { return filesystem_; }
-    CatalogueHintQueue& catalogue_hints() { return catalogue_hints_; }
-    HydrationManager& hydration() { return hydration_; }
-    IngestManager& ingest() { return ingest_; }
-    ClusterJobView& cluster_jobs() { return cluster_jobs_; }
-    ClusterUnmatchedView& cluster_unmatched() { return cluster_unmatched_; }
-    TorrentCoordinator& torrent_coordinator() { return torrent_coordinator_; }
-    AcquisitionApi& acquisition_api() { return acquisition_api_; }
-    CatalogueApi& catalogue_api() { return catalogue_api_; }
-    ManageApi& manage_api() { return manage_api_; }
-    CatalogueScanner& scanner() { return scanner_; }
-    PlaybackManager& streaming() { return streaming_; }
-    SubsystemSupervisor& subsystems() { return subsystems_; }
+    DistributedStore& store() {
+        return store_;
+    }
+    MetadataManager& metadata() {
+        return metadata_;
+    }
+    CatalogueManager& catalogue() {
+        return catalogue_;
+    }
+    AvailabilityService& availability() {
+        return availability_;
+    }
+    FilesApi& files_api() {
+        return files_api_;
+    }
+    FileSystem& filesystem() {
+        return filesystem_;
+    }
+    CatalogueHintQueue& catalogue_hints() {
+        return catalogue_hints_;
+    }
+    HydrationManager& hydration() {
+        return hydration_;
+    }
+    IngestManager& ingest() {
+        return ingest_;
+    }
+    ClusterJobView& cluster_jobs() {
+        return cluster_jobs_;
+    }
+    ClusterUnmatchedView& cluster_unmatched() {
+        return cluster_unmatched_;
+    }
+    TorrentCoordinator& torrent_coordinator() {
+        return torrent_coordinator_;
+    }
+    AcquisitionApi& acquisition_api() {
+        return acquisition_api_;
+    }
+    CatalogueApi& catalogue_api() {
+        return catalogue_api_;
+    }
+    ManageApi& manage_api() {
+        return manage_api_;
+    }
+    CatalogueScanner& scanner() {
+        return scanner_;
+    }
+    PlaybackManager& streaming() {
+        return streaming_;
+    }
+    SubsystemSupervisor& subsystems() {
+        return subsystems_;
+    }
 
   private:
     void note(std::string_view event) const {

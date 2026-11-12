@@ -257,8 +257,8 @@ NodeInfo node_info_from(const dannan::membership::NodeRecord& record) {
     node.metadata_generation = record.advert_u64(advert::metadata_generation).value_or(0);
     node.metadata_write_replicas_required =
         static_cast<uint32_t>(record.advert_u64(advert::metadata_write_replicas).value_or(0));
-    node.flags = node_flags_for(record.inbound_capable(),
-                                record.advert(advert::hosts_extents).has_value());
+    node.flags =
+        node_flags_for(record.inbound_capable(), record.advert(advert::hosts_extents).has_value());
     return node;
 }
 
@@ -285,9 +285,10 @@ Registration rule(std::string name, Lanes lanes, Frames frames, bool notificatio
 
 std::vector<MachaRegistration> build_registrations() {
     std::vector<MachaRegistration> out;
-    const auto control = [&](MessageType type, Frames frames = Frames::any, bool notification = false,
-                             bool ordered = false) {
-        out.push_back({type, rule(message_type_name(type), Lanes::control, frames, notification, ordered)});
+    const auto control = [&](MessageType type, Frames frames = Frames::any,
+                             bool notification = false, bool ordered = false) {
+        out.push_back(
+            {type, rule(message_type_name(type), Lanes::control, frames, notification, ordered)});
     };
     const auto data = [&](MessageType type) {
         out.push_back({type, rule(message_type_name(type), Lanes::data, Frames::not_control)});

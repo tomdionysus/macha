@@ -48,7 +48,8 @@ void StorageServer::refresh() {
     local_.refresh();
     const auto refresh_ms = elapsed_ms(started);
     if (refresh_ms >= 100 && Log::enabled(LogLevel::all))
-        Log::trace("DIAG node-stage stage=storage-refresh elapsed_ms=" + std::to_string(refresh_ms));
+        Log::trace("DIAG node-stage stage=storage-refresh elapsed_ms=" +
+                   std::to_string(refresh_ms));
     node_.advertise_storage(local_.used(), local_.limit());
     const auto online = static_cast<uint32_t>(local_.online_backends());
     node_.advertise_storage_backends(online);
@@ -83,10 +84,11 @@ void StorageServer::bind_routes() {
               ObjectId id{reader.fixed<32>()};
               reader.finish();
               Writer writer;
-              auto resource = data_resources_.try_acquire(
-                  DataWorkContext(frame_type, extent_size_), extent_size_);
+              auto resource = data_resources_.try_acquire(DataWorkContext(frame_type, extent_size_),
+                                                          extent_size_);
               if (!resource)
-                  return error_reply(503, "storage_busy", "DATA resource admission busy or stopping");
+                  return error_reply(503, "storage_busy",
+                                     "DATA resource admission busy or stopping");
               // Repair/rebalance trust this "present" without re-verifying, so
               // authenticate, decrypt and hash: a corrupt replica never counts as
               // healthy placement. (have_objects and retain_objects check presence.)
@@ -112,10 +114,11 @@ void StorageServer::bind_routes() {
               // (select_present_batched), never by repair. "Present" only makes
               // a node a candidate; retain_objects then claims on index
               // presence. One admission for the whole batch: no per-object I/O.
-              auto resource = data_resources_.try_acquire(
-                  DataWorkContext(frame_type, extent_size_), extent_size_);
+              auto resource = data_resources_.try_acquire(DataWorkContext(frame_type, extent_size_),
+                                                          extent_size_);
               if (!resource)
-                  return error_reply(503, "storage_busy", "DATA resource admission busy or stopping");
+                  return error_reply(503, "storage_busy",
+                                     "DATA resource admission busy or stopping");
               Writer writer;
               writer.u32(count);
               for (const auto& id : ids)
@@ -128,7 +131,8 @@ void StorageServer::bind_routes() {
               Reader reader(request.payload);
               const auto count = reader.u32();
               if (!count || count > have_valid_objects_max)
-                  return error_reply(400, "invalid_request", "invalid validated presence batch count");
+                  return error_reply(400, "invalid_request",
+                                     "invalid validated presence batch count");
               std::vector<ObjectId> ids;
               ids.reserve(count);
               for (uint32_t i = 0; i < count; ++i) {
@@ -171,7 +175,8 @@ void StorageServer::bind_routes() {
               Reader reader(request.payload);
               const auto count = reader.u32();
               if (!count || count > 200000)
-                  return error_reply(400, "invalid_request", "invalid control presence batch count");
+                  return error_reply(400, "invalid_request",
+                                     "invalid control presence batch count");
               std::vector<ObjectId> ids;
               ids.reserve(count);
               for (uint32_t i = 0; i < count; ++i) {
@@ -192,8 +197,8 @@ void StorageServer::bind_routes() {
               Reader reader(request.payload);
               ObjectId id{reader.fixed<32>()};
               reader.finish();
-              auto resource = data_resources_.acquire(DataWorkContext(frame_type, extent_size_),
-                                                      extent_size_);
+              auto resource =
+                  data_resources_.acquire(DataWorkContext(frame_type, extent_size_), extent_size_);
               if (!resource)
                   return error_reply(503, "stopping", "DATA resource admission stopping");
               // Not found is final only when no offline backend could hold it.
@@ -331,7 +336,7 @@ void StorageServer::bind_routes() {
               }
               try {
                   local_.durability_barrier({domain, required_generation, backend_instance},
-                                                   DurabilityUrgency::batchable);
+                                            DurabilityUrgency::batchable);
                   node_.advertise_storage(local_.used(), local_.limit());
                   return {MessageType::ok, {}};
               } catch (const std::exception& error) {
@@ -373,12 +378,12 @@ void StorageServer::bind_routes() {
               // present.
               const auto guard = claims_.guard(ids);
               for (const auto& id : ids) {
-                  const bool present = !claims_.deleting(id) &&
-                                       (object_class == RetentionClass::data
-                                            ? local_.has(id)
-                                            : control_.has(id));
+                  const bool present =
+                      !claims_.deleting(id) &&
+                      (object_class == RetentionClass::data ? local_.has(id) : control_.has(id));
                   if (!present)
-                      return error_reply(409, "not_present", "retention object is not durably present");
+                      return error_reply(409, "not_present",
+                                         "retention object is not durably present");
               }
               claims_.retain_batch(object_class, ids, dot);
               return {MessageType::ok, {}};
@@ -393,10 +398,11 @@ void StorageServer::bind_routes() {
               const auto deletion = claims_.deletion(RetentionClass::data, id);
               if (deletion.claimed())
                   return error_reply(409, "claimed", "object has an active retention claim");
-              auto resource = data_resources_.try_acquire(
-                  DataWorkContext(frame_type, extent_size_), extent_size_);
+              auto resource = data_resources_.try_acquire(DataWorkContext(frame_type, extent_size_),
+                                                          extent_size_);
               if (!resource)
-                  return error_reply(503, "storage_busy", "DATA resource admission busy or stopping");
+                  return error_reply(503, "storage_busy",
+                                     "DATA resource admission busy or stopping");
               (void)local_.remove(id);
               (void)cache_.remove(id);
               node_.advertise_storage(local_.used(), local_.limit());

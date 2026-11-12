@@ -20,7 +20,8 @@ namespace {
 constexpr std::string_view line_version = "v1";
 
 bool parse_u64(std::string_view text, uint64_t& out) {
-    if (text.empty()) return false;
+    if (text.empty())
+        return false;
     const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
     return ec == std::errc{} && end == text.data() + text.size();
 }
@@ -35,23 +36,27 @@ std::map<std::string, TorrentExtentJournal::File>
 TorrentExtentJournal::load(const std::filesystem::path& save_path) {
     std::map<std::string, File> out;
     std::ifstream in(path_for(save_path), std::ios::binary);
-    if (!in) return out;
+    if (!in)
+        return out;
     std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     size_t start = 0;
     while (start < content.size()) {
         const auto end = content.find('\n', start);
-        if (end == std::string::npos) break; // torn final line
+        if (end == std::string::npos)
+            break; // torn final line
         const std::string_view line(content.data() + start, end - start);
         start = end + 1;
         std::string_view fields[6];
         size_t field = 0, from = 0;
         for (; field < 5; ++field) {
             const auto tab = line.find('\t', from);
-            if (tab == std::string_view::npos) break;
+            if (tab == std::string_view::npos)
+                break;
             fields[field] = line.substr(from, tab - from);
             from = tab + 1;
         }
-        if (field != 5 || fields[0] != line_version) continue;
+        if (field != 5 || fields[0] != line_version)
+            continue;
         fields[5] = line.substr(from);
         const auto id_bytes = unhex(std::string(fields[1]));
         Extent extent;
@@ -64,7 +69,8 @@ TorrentExtentJournal::load(const std::filesystem::path& save_path) {
         auto& file = out[std::string(fields[5])];
         // A file's recorded size is the size the torrent says it has; a line
         // that disagrees belongs to some other torrent layout and is ignored.
-        if (!file.extents.empty() && file.size != file_size) continue;
+        if (!file.extents.empty() && file.size != file_size)
+            continue;
         file.size = file_size;
         file.extents[extent.offset] = extent;
     }
@@ -73,15 +79,18 @@ TorrentExtentJournal::load(const std::filesystem::path& save_path) {
 
 std::optional<std::vector<ExtentRef>> TorrentExtentJournal::manifest(const File& file,
                                                                      uint64_t size) {
-    if (file.size != size) return std::nullopt;
+    if (file.size != size)
+        return std::nullopt;
     std::vector<ExtentRef> out;
     uint64_t next = 0;
     for (const auto& [offset, extent] : file.extents) {
-        if (offset != next) return std::nullopt;
+        if (offset != next)
+            return std::nullopt;
         out.push_back(ExtentRef{extent.offset, extent.length, extent.id, false});
         next += extent.length;
     }
-    if (next != size) return std::nullopt;
+    if (next != size)
+        return std::nullopt;
     return out;
 }
 
@@ -95,7 +104,8 @@ TorrentExtentJournal::TorrentExtentJournal(std::filesystem::path save_path)
 }
 
 TorrentExtentJournal::~TorrentExtentJournal() {
-    if (fd_ >= 0) ::close(fd_);
+    if (fd_ >= 0)
+        ::close(fd_);
 }
 
 void TorrentExtentJournal::append(const std::string& relative_path, uint64_t file_size,
@@ -110,7 +120,8 @@ void TorrentExtentJournal::append(const std::string& relative_path, uint64_t fil
     size_t done = 0;
     while (done < text.size()) {
         const auto wrote = ::write(fd_, text.data() + done, text.size() - done);
-        if (wrote < 0 && errno == EINTR) continue;
+        if (wrote < 0 && errno == EINTR)
+            continue;
         if (wrote <= 0)
             throw std::runtime_error("torrent extent journal write failed: " +
                                      std::string(std::strerror(errno)));

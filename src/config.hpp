@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "media/ffmpeg_log.hpp"
 #include "log.hpp"
+#include "media/ffmpeg_log.hpp"
 #include "retry_policy.hpp"
 #include "types.hpp"
 #include <chrono>

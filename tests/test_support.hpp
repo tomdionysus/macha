@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "cluster/call_deadline.hpp"
 #include "catalogue/catalogue.hpp"
+#include "cluster/call_deadline.hpp"
+#include "cluster/distributed_store.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
-#include "cluster/distributed_store.hpp"
 #include "filesystem/filesystem.hpp"
-#include "ledger/retention_ledger.hpp"
 #include "fuse/fuse_frontend.hpp"
+#include "ledger/retention_ledger.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "metadata/namespace_tree.hpp"
@@ -21,21 +21,21 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
-#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <netinet/in.h>
 #include <span>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
-#include <utility>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace macha::test_support {
@@ -172,7 +172,9 @@ class TempDir {
     TempDir(const TempDir&) = delete;
     TempDir& operator=(const TempDir&) = delete;
 
-    const std::filesystem::path& path() const { return path_; }
+    const std::filesystem::path& path() const {
+        return path_;
+    }
 };
 
 // The runner's per-run salt, inherited by every case it runs; set
@@ -270,12 +272,12 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
     // the production reserve; capacity tests set explicit limits instead.
     c.fuse.spool_reserve_free = 0;
     // The production retry policy's shape with short delays.
-    c.fuse.publication_retry = RetryPolicy{100, std::chrono::minutes(30),
-                                           std::chrono::milliseconds(20),
-                                           std::chrono::milliseconds(200)};
-    c.fuse.namespace_retry = RetryPolicy{200, std::chrono::minutes(30),
-                                         std::chrono::milliseconds(20),
-                                         std::chrono::milliseconds(200)};
+    c.fuse.publication_retry =
+        RetryPolicy{100, std::chrono::minutes(30), std::chrono::milliseconds(20),
+                    std::chrono::milliseconds(200)};
+    c.fuse.namespace_retry =
+        RetryPolicy{200, std::chrono::minutes(30), std::chrono::milliseconds(20),
+                    std::chrono::milliseconds(200)};
     c.hydration.enabled = false;
     c.dead_after = 500ms;
     c.connect_timeout = 500ms;
@@ -306,25 +308,32 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
 }
 
 class TestCluster {
-public:
+  public:
     explicit TestCluster(ConfigProfile profile = ConfigProfile::functional)
         : keyfile_(root_.path() / "cluster.key"), profile_(profile) {
         write_key(keyfile_);
         keys_ = load_cluster_keys(keyfile_);
     }
 
-    [[nodiscard]] const std::filesystem::path& path() const { return root_.path(); }
-    [[nodiscard]] const std::filesystem::path& keyfile() const { return keyfile_; }
-    [[nodiscard]] const ClusterKeys& keys() const { return keys_; }
+    [[nodiscard]] const std::filesystem::path& path() const {
+        return root_.path();
+    }
+    [[nodiscard]] const std::filesystem::path& keyfile() const {
+        return keyfile_;
+    }
+    [[nodiscard]] const ClusterKeys& keys() const {
+        return keys_;
+    }
 
     [[nodiscard]] Config node_config(std::string_view name, uint16_t port = 0,
                                      std::vector<Endpoint> bootstrap = {}) const {
-        if (!port) port = free_port();
-        return config_for(root_.path() / std::string(name), keyfile_, port,
-                          std::move(bootstrap), profile_);
+        if (!port)
+            port = free_port();
+        return config_for(root_.path() / std::string(name), keyfile_, port, std::move(bootstrap),
+                          profile_);
     }
 
-private:
+  private:
     TempDir root_;
     std::filesystem::path keyfile_;
     ClusterKeys keys_{};
@@ -339,8 +348,7 @@ class TestService {
     std::unique_ptr<Service> service_;
 
   public:
-    explicit TestService(std::string_view name,
-                         ConfigProfile profile = ConfigProfile::functional)
+    explicit TestService(std::string_view name, ConfigProfile profile = ConfigProfile::functional)
         : keyfile_(temp_.path() / "cluster.key") {
         write_key(keyfile_);
         keys_ = load_cluster_keys(keyfile_);
@@ -348,7 +356,8 @@ class TestService {
     }
 
     ~TestService() {
-        if (!service_) return;
+        if (!service_)
+            return;
         try {
             service_->stop();
         } catch (...) {
@@ -360,11 +369,21 @@ class TestService {
     TestService(const TestService&) = delete;
     TestService& operator=(const TestService&) = delete;
 
-    const std::filesystem::path& path() const noexcept { return temp_.path(); }
-    const std::filesystem::path& keyfile() const noexcept { return keyfile_; }
-    const ClusterKeys& keys() const noexcept { return keys_; }
-    Config& config() noexcept { return config_; }
-    const Config& config() const noexcept { return config_; }
+    const std::filesystem::path& path() const noexcept {
+        return temp_.path();
+    }
+    const std::filesystem::path& keyfile() const noexcept {
+        return keyfile_;
+    }
+    const ClusterKeys& keys() const noexcept {
+        return keys_;
+    }
+    Config& config() noexcept {
+        return config_;
+    }
+    const Config& config() const noexcept {
+        return config_;
+    }
 
     Service& start() {
         REQUIRE(!service_);
@@ -420,7 +439,9 @@ class BareNode : public BareNodeResources, public NodeRuntime {
                       books.events, std::move(hook)),
           resources(NodeRuntime::config(), books, node().memory()),
           durability_batch_window_(durability_batch_window) {}
-    ~BareNode() { stop(); }
+    ~BareNode() {
+        stop();
+    }
     BareNode(const BareNode&) = delete;
     BareNode& operator=(const BareNode&) = delete;
     void start() {
@@ -460,29 +481,57 @@ class BareNode : public BareNodeResources, public NodeRuntime {
         }
     }
 
-    Accounts& accounts() { return accounts_; }
-    UserStore& users() { return accounts_.users(); }
-    SessionManager& sessions() { return accounts_.sessions(); }
-    bool apply_session(const AuthSession& session) { return accounts_.apply_session(session); }
-    void propagate_session(const AuthSession& session) { accounts_.propagate_session(session); }
-    bool apply_user(const UserRecord& user) { return accounts_.apply_user(user); }
-    void propagate_users() { accounts_.propagate_users(); }
-    LocalState& local_state() { return local("local state").state(); }
-    MetadataServer& metadata_server() { return local("metadata replica").metadata(); }
-    StoragePool& local_store() { return local("data storage").state().data(); }
-    LocalStore& control_store() { return local("control storage").state().control(); }
-    PersistentBlockCache& block_cache() { return local("persistent cache").state().cache(); }
-    ClaimStore& claims() { return local("retention state").state().retention(); }
+    Accounts& accounts() {
+        return accounts_;
+    }
+    UserStore& users() {
+        return accounts_.users();
+    }
+    SessionManager& sessions() {
+        return accounts_.sessions();
+    }
+    bool apply_session(const AuthSession& session) {
+        return accounts_.apply_session(session);
+    }
+    void propagate_session(const AuthSession& session) {
+        accounts_.propagate_session(session);
+    }
+    bool apply_user(const UserRecord& user) {
+        return accounts_.apply_user(user);
+    }
+    void propagate_users() {
+        accounts_.propagate_users();
+    }
+    LocalState& local_state() {
+        return local("local state").state();
+    }
+    MetadataServer& metadata_server() {
+        return local("metadata replica").metadata();
+    }
+    StoragePool& local_store() {
+        return local("data storage").state().data();
+    }
+    LocalStore& control_store() {
+        return local("control storage").state().control();
+    }
+    PersistentBlockCache& block_cache() {
+        return local("persistent cache").state().cache();
+    }
+    ClaimStore& claims() {
+        return local("retention state").state().retention();
+    }
     // The ledger over this node's stores, built on first use.
     ObjectLedger& ledger() {
         auto& state = local("the ledger's stores").state();
         std::lock_guard lock(ledger_mutex_);
         if (!ledger_)
-            ledger_ = std::make_unique<RetentionLedger>(state.retention(), state.data(),
-                                                        state.control());
+            ledger_ =
+                std::make_unique<RetentionLedger>(state.retention(), state.data(), state.control());
         return *ledger_;
     }
-    MetadataReplica& metadata_replica() { return local("metadata replica").state().replica(); }
+    MetadataReplica& metadata_replica() {
+        return local("metadata replica").state().replica();
+    }
     uint64_t known_metadata_generation() {
         return progress.complete() ? local_->metadata().known_generation()
                                    : remote_metadata_generation();
@@ -546,8 +595,7 @@ class TestNode {
     bool started_{};
 
   public:
-    explicit TestNode(std::string_view name,
-                      ConfigProfile profile = ConfigProfile::isolated)
+    explicit TestNode(std::string_view name, ConfigProfile profile = ConfigProfile::isolated)
         : keyfile_(temp_.path() / "cluster.key") {
         write_key(keyfile_);
         keys_ = load_cluster_keys(keyfile_);
@@ -555,18 +603,32 @@ class TestNode {
     }
 
     ~TestNode() {
-        if (!started_ || !node_) return;
-        try { node_->stop(); } catch (...) {}
+        if (!started_ || !node_)
+            return;
+        try {
+            node_->stop();
+        } catch (...) {
+        }
     }
 
     TestNode(const TestNode&) = delete;
     TestNode& operator=(const TestNode&) = delete;
 
-    const std::filesystem::path& path() const noexcept { return temp_.path(); }
-    const std::filesystem::path& keyfile() const noexcept { return keyfile_; }
-    const ClusterKeys& keys() const noexcept { return keys_; }
-    Config& config() noexcept { return config_; }
-    const Config& config() const noexcept { return config_; }
+    const std::filesystem::path& path() const noexcept {
+        return temp_.path();
+    }
+    const std::filesystem::path& keyfile() const noexcept {
+        return keyfile_;
+    }
+    const ClusterKeys& keys() const noexcept {
+        return keys_;
+    }
+    Config& config() noexcept {
+        return config_;
+    }
+    const Config& config() const noexcept {
+        return config_;
+    }
 
     void prepare() {
         REQUIRE(!node_);
@@ -574,7 +636,8 @@ class TestNode {
     }
 
     BareNode& start_control_plane() {
-        if (!node_) prepare();
+        if (!node_)
+            prepare();
         REQUIRE(!started_);
         node_->start();
         started_ = true;
@@ -602,25 +665,26 @@ class TestNode {
         REQUIRE(started_);
         REQUIRE(node_->wait_local_state_ready(std::chrono::seconds{10}));
         if (!store_) {
-            store_ = std::make_unique<DistributedStore>(*node_, node_->local_state(), node_->resources.activity,
-                                                        node_->resources.data,
-                                                        node_->resources.memory, node_->resources.events);
+            store_ = std::make_unique<DistributedStore>(
+                *node_, node_->local_state(), node_->resources.activity, node_->resources.data,
+                node_->resources.memory, node_->resources.events);
             metadata_ = std::make_unique<MetadataManager>(
                 *node_, node_->local_state(), node_->metadata_server(), *store_,
-                MetadataPublicationRetention{
-                    [this](const MetadataPublicationContext& context) {
-                        if (publication_guard_)
-                            publication_guard_(context);
-                        return publication_claims_ ? publication_claims_(context)
-                                                   : MetadataPublicationClaims{};
-                    },
-                    [this](const NodeId& origin, uint64_t sequence,
-                           const MetadataPublicationClaims& claims) {
-                        if (peer_retention_)
-                            peer_retention_(origin, sequence, claims);
-                    }});
-            filesystem_ = std::make_unique<FileSystem>(node_->config(), node_->node_id(), node_->membership(), node_->local_state(), node_->metadata_server(), *store_, *metadata_,
-                                                       node_->resources.memory);
+                MetadataPublicationRetention{[this](const MetadataPublicationContext& context) {
+                                                 if (publication_guard_)
+                                                     publication_guard_(context);
+                                                 return publication_claims_
+                                                            ? publication_claims_(context)
+                                                            : MetadataPublicationClaims{};
+                                             },
+                                             [this](const NodeId& origin, uint64_t sequence,
+                                                    const MetadataPublicationClaims& claims) {
+                                                 if (peer_retention_)
+                                                     peer_retention_(origin, sequence, claims);
+                                             }});
+            filesystem_ = std::make_unique<FileSystem>(
+                node_->config(), node_->node_id(), node_->membership(), node_->local_state(),
+                node_->metadata_server(), *store_, *metadata_, node_->resources.memory);
         }
         return *node_;
     }
@@ -630,18 +694,34 @@ class TestNode {
         return wait_ready();
     }
 
-    BareNode& node() { REQUIRE(node_); return *node_; }
-    NodeResources& resources() { REQUIRE(node_); return node_->resources; }
-    DistributedStore& store() { REQUIRE(store_); return *store_; }
-    MetadataManager& metadata() { REQUIRE(metadata_); return *metadata_; }
-    FileSystem& filesystem() { REQUIRE(filesystem_); return *filesystem_; }
+    BareNode& node() {
+        REQUIRE(node_);
+        return *node_;
+    }
+    NodeResources& resources() {
+        REQUIRE(node_);
+        return node_->resources;
+    }
+    DistributedStore& store() {
+        REQUIRE(store_);
+        return *store_;
+    }
+    MetadataManager& metadata() {
+        REQUIRE(metadata_);
+        return *metadata_;
+    }
+    FileSystem& filesystem() {
+        REQUIRE(filesystem_);
+        return *filesystem_;
+    }
 };
 
 // A first write on a forming cluster can find the replica set still forming
 // (a peer not yet answering its survey); product callers retry
 // MetadataNotReady, and so does this, until `write` succeeds or `limit`.
 template <class Write>
-bool retry_while_not_ready(Write&& write, std::chrono::milliseconds limit = std::chrono::seconds(10)) {
+bool retry_while_not_ready(Write&& write,
+                           std::chrono::milliseconds limit = std::chrono::seconds(10)) {
     return wait_until(
         [&] {
             try {
@@ -691,7 +771,8 @@ bool wait_until(Fn&& fn, std::chrono::milliseconds timeout = 5s,
                 std::chrono::milliseconds poll_interval = 10ms) {
     const auto end = Clock::now() + scaled(timeout);
     while (Clock::now() < end) {
-        if (fn()) return true;
+        if (fn())
+            return true;
         std::this_thread::sleep_for(poll_interval);
     }
     return fn();
@@ -741,7 +822,8 @@ inline void write_file(FileSystem& fs, const std::string& path, std::span<const 
     try {
         fs.create_file(path, 0644, getuid(), getgid());
     } catch (const FsError& e) {
-        if (e.code() != EEXIST) throw;
+        if (e.code() != EEXIST)
+            throw;
     }
     auto writer = fs.open_write(path, true);
     REQUIRE(writer->write(0, bytes) == bytes.size());

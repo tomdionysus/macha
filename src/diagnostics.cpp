@@ -23,14 +23,12 @@ constexpr double debug_high_thread_cpu_pct = 10.0;
 constexpr double debug_recovered_thread_cpu_pct = 5.0;
 constexpr auto debug_high_thread_cpu_repeat = std::chrono::seconds(60);
 
-std::string thread_cpu_message(std::string_view prefix, std::string_view name,
-                               int64_t wall_ms, uint64_t cpu_ms, double pct,
-                               uint64_t iterations) {
+std::string thread_cpu_message(std::string_view prefix, std::string_view name, int64_t wall_ms,
+                               uint64_t cpu_ms, double pct, uint64_t iterations) {
     const auto tenths = static_cast<long long>(std::llround(pct * 10.0));
     return std::string(prefix) + " name=" + std::string(name) +
-           " wall_ms=" + std::to_string(wall_ms) +
-           " cpu_ms=" + std::to_string(cpu_ms) + " cpu_pct=" +
-           std::to_string(tenths / 10) + "." + std::to_string(std::abs(tenths % 10)) +
+           " wall_ms=" + std::to_string(wall_ms) + " cpu_ms=" + std::to_string(cpu_ms) +
+           " cpu_pct=" + std::to_string(tenths / 10) + "." + std::to_string(std::abs(tenths % 10)) +
            " iterations=" + std::to_string(iterations);
 }
 } // namespace
@@ -54,8 +52,8 @@ uint64_t thread_cpu_time_ns() noexcept {
     thread_basic_info_data_t info{};
     mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
     const auto thread = mach_thread_self();
-    const auto result = thread_info(thread, THREAD_BASIC_INFO,
-                                    reinterpret_cast<thread_info_t>(&info), &count);
+    const auto result =
+        thread_info(thread, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count);
     mach_port_deallocate(mach_task_self(), thread);
     if (result != KERN_SUCCESS)
         return 0;
@@ -68,8 +66,7 @@ uint64_t thread_cpu_time_ns() noexcept {
     timespec ts{};
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
         return 0;
-    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
-           static_cast<uint64_t>(ts.tv_nsec);
+    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
 #else
     return 0;
 #endif
@@ -79,8 +76,8 @@ uint64_t process_resident_bytes() {
 #if defined(__APPLE__)
     mach_task_basic_info_data_t info{};
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                  reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info),
+                  &count) != KERN_SUCCESS)
         return 0;
     return static_cast<uint64_t>(info.resident_size);
 #elif defined(__linux__)
@@ -109,12 +106,11 @@ void ThreadCpuReporter::tick(uint64_t iterations) {
         return;
 
     const auto cpu_now = thread_cpu_time_ns();
-    const auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - wall_started_)
-                             .count();
+    const auto wall_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - wall_started_).count();
     const auto cpu_ns = cpu_now >= cpu_started_ ? cpu_now - cpu_started_ : 0;
-    const double pct = wall_ns > 0 ? (100.0 * static_cast<double>(cpu_ns) /
-                                      static_cast<double>(wall_ns))
-                                   : 0.0;
+    const double pct =
+        wall_ns > 0 ? (100.0 * static_cast<double>(cpu_ns) / static_cast<double>(wall_ns)) : 0.0;
 
     const auto wall_ms = wall_ns / 1'000'000;
     const auto cpu_ms = cpu_ns / 1'000'000;
@@ -126,16 +122,15 @@ void ThreadCpuReporter::tick(uint64_t iterations) {
     // hysteresis and a long repeat interval so the diagnostic stays quiet.
     if (!Log::enabled(LogLevel::all) && Log::enabled(LogLevel::debug)) {
         if (pct >= debug_high_thread_cpu_pct) {
-            if (!debug_high_cpu_ ||
-                now - debug_last_report_ >= debug_high_thread_cpu_repeat) {
-                Log::debug(thread_cpu_message("DIAG high thread CPU", name_, wall_ms,
-                                              cpu_ms, pct, iterations_));
+            if (!debug_high_cpu_ || now - debug_last_report_ >= debug_high_thread_cpu_repeat) {
+                Log::debug(thread_cpu_message("DIAG high thread CPU", name_, wall_ms, cpu_ms, pct,
+                                              iterations_));
                 debug_last_report_ = now;
             }
             debug_high_cpu_ = true;
         } else if (debug_high_cpu_ && pct <= debug_recovered_thread_cpu_pct) {
-            Log::debug(thread_cpu_message("DIAG thread CPU recovered", name_, wall_ms,
-                                          cpu_ms, pct, iterations_));
+            Log::debug(thread_cpu_message("DIAG thread CPU recovered", name_, wall_ms, cpu_ms, pct,
+                                          iterations_));
             debug_high_cpu_ = false;
         }
     }
@@ -175,9 +170,8 @@ DiagnosticLock::~DiagnosticLock() noexcept {
             Log::trace("DIAG lock-wait lock=" + std::string(name_) +
                        " wait_ms=" + std::to_string(wait_ms_));
         if (held_ms >= threshold_.count())
-            Log::trace("DIAG lock-held lock=" + std::string(name_) +
-                       " held_ms=" + std::to_string(held_ms) +
-                       " wait_ms=" + std::to_string(wait_ms_));
+            Log::trace("DIAG lock-held lock=" + std::string(name_) + " held_ms=" +
+                       std::to_string(held_ms) + " wait_ms=" + std::to_string(wait_ms_));
     } catch (...) {
     }
 }

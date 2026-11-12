@@ -48,13 +48,19 @@ class TorrentSubsystem final : public Subsystem {
         stop();
     }
 
-    std::string_view name() const noexcept override { return "torrent"; }
+    std::string_view name() const noexcept override {
+        return "torrent";
+    }
 
     // A fault the worker cannot contain to one job: the supervisor rebuilds
     // this subsystem from jobs.json.
-    void attach_fault_sink(FaultSink sink) override { manager_->set_fault_sink(std::move(sink)); }
+    void attach_fault_sink(FaultSink sink) override {
+        manager_->set_fault_sink(std::move(sink));
+    }
 
-    void start() override { manager_->start(); }
+    void start() override {
+        manager_->start();
+    }
 
     void stop() override {
         registry_.withdraw_torrent(manager_.get());
@@ -69,11 +75,12 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
     static const macha::SubsystemPluginEntry entry{
         macha::kBuildIdentity,
         [](const macha::SubsystemContext& context) -> std::unique_ptr<macha::Subsystem> {
-            if (!context.config || !context.node || !context.data_resources ||
-                !context.ingest || !context.registry || !context.routes || !context.local_state)
-                throw std::runtime_error("torrent subsystem requires config, node, DATA "
-                                         "resources, ingest, registry, routes and local state in its "
-                                         "context");
+            if (!context.config || !context.node || !context.data_resources || !context.ingest ||
+                !context.registry || !context.routes || !context.local_state)
+                throw std::runtime_error(
+                    "torrent subsystem requires config, node, DATA "
+                    "resources, ingest, registry, routes and local state in its "
+                    "context");
             if (!context.config->torrent.enabled) {
                 // Disabled, not a fault: no instance, and no supervisor retry.
                 macha::Log::info("torrent subsystem not started: torrent.enabled is false");
@@ -81,9 +88,7 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
             }
             return std::make_unique<macha::TorrentSubsystem>(
                 *context.registry, *context.routes, *context.node, *context.local_state,
-                *context.data_resources,
-                *context.ingest,
-                context.config->torrent,
+                *context.data_resources, *context.ingest, context.config->torrent,
                 context.config->state_path,
                 context.time ? *context.time : macha::steady_time_source());
         }};

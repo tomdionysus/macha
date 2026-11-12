@@ -102,9 +102,9 @@ class TraceLog {
                 verdict = std::string(detail.substr(0, 4)) + " when " + node_conditions(detail);
             else if (verdict.empty())
                 verdict = "not yet decided";
-            gates_[std::string(kind)] =
-                compare_verdicts_ ? node_conditions(detail) + "; decided " + verdict
-                                  : node_conditions(detail);
+            gates_[std::string(kind)] = compare_verdicts_
+                                            ? node_conditions(detail) + "; decided " + verdict
+                                            : node_conditions(detail);
             return;
         }
         // Stopping for credit is pacing on real CPU load, so timing; what was
@@ -127,9 +127,8 @@ class TraceLog {
             return a.substr(0, a.find(':')) < b.substr(0, b.find(':'));
         });
         std::set<std::string> seen;
-        std::erase_if(actions_, [&](const std::string& action) {
-            return !seen.insert(action).second;
-        });
+        std::erase_if(actions_,
+                      [&](const std::string& action) { return !seen.insert(action).second; });
         for (auto& action : actions_)
             lines_.push_back("  " + std::move(action));
         actions_.clear();
@@ -175,14 +174,13 @@ class TracedNode {
             if (!namespace_node(local.control().get(id)))
                 ++control_claims;
         std::vector<std::string> lines{
-            "state: data_objects=" + std::to_string(local.data().list().size()) +
-            " data_claims=" +
+            "state: data_objects=" + std::to_string(local.data().list().size()) + " data_claims=" +
             std::to_string(local.retention().retained_ids(RetentionClass::data).size()) +
             " control_claims=" + std::to_string(control_claims)};
         for (const auto& [name, id] : watched_)
-            lines.push_back("object " + name + ": held=" +
-                            (local.data().has(id) ? "1" : "0") + " claimed=" +
-                            (local.retention().retained(RetentionClass::data, id) ? "1" : "0"));
+            lines.push_back(
+                "object " + name + ": held=" + (local.data().has(id) ? "1" : "0") +
+                " claimed=" + (local.retention().retained(RetentionClass::data, id) ? "1" : "0"));
         return lines;
     }
 
@@ -434,7 +432,8 @@ MACHA_FAST_TEST("maintenance_trace", test_manual_clock_moves_and_wakes_only_when
             stop.request_stop();
         });
         std::unique_lock lock(mutex);
-        clock.wait_until(cv, lock, stop.get_token(), Clock::time_point::max(), [] { return false; });
+        clock.wait_until(cv, lock, stop.get_token(), Clock::time_point::max(),
+                         [] { return false; });
         CHECK(stop.stop_requested());
     }
 }
@@ -617,9 +616,12 @@ MACHA_TEST("maintenance_trace", test_trace_peer_unreachable_and_back) {
     auto peer = std::make_unique<Service>(config_b, cluster.keys(), test_durability_window);
     auto& service = node.start();
     peer->start();
-    REQUIRE(wait_until([&] { return service.node().membership().all_known_reachable() &&
-                                    service.node().membership().active().size() == 2; },
-                       10s));
+    REQUIRE(wait_until(
+        [&] {
+            return service.node().membership().all_known_reachable() &&
+                   service.node().membership().active().size() == 2;
+        },
+        10s));
     write_file(service.filesystem(), "/doomed.bin", pattern(64 * 1024, 4));
     node.watch("doomed", "/doomed.bin");
     node.advance(100ms);
@@ -655,7 +657,8 @@ MACHA_TEST("maintenance_trace", test_trace_peer_unreachable_and_back) {
 // began with no viewer, so neither its busy wake nor the share's next turn is
 // set, and the credit is past an extent: repair must still come back within an
 // interval, not sleep until an unrelated event.
-MACHA_TEST("maintenance_trace", test_repair_resumes_after_yielding_to_a_viewer_that_arrived_mid_step) {
+MACHA_TEST("maintenance_trace",
+           test_repair_resumes_after_yielding_to_a_viewer_that_arrived_mid_step) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto port_a = free_port();
     const auto port_b = free_port();
@@ -687,9 +690,12 @@ MACHA_TEST("maintenance_trace", test_repair_resumes_after_yielding_to_a_viewer_t
     viewer_arrives = true;
     auto peer = std::make_unique<Service>(config_b, cluster.keys(), test_durability_window);
     peer->start();
-    REQUIRE(wait_until([&] { return service.node().membership().all_known_reachable() &&
-                                    service.node().membership().active().size() == 2; },
-                       10s));
+    REQUIRE(wait_until(
+        [&] {
+            return service.node().membership().all_known_reachable() &&
+                   service.node().membership().active().size() == 2;
+        },
+        10s));
     node.advance(100ms);
     REQUIRE(!peer->local_state().data().has(id));
     // A pass that begins with no viewer present and meets one in its step.

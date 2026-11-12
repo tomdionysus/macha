@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "test_backend_support.hpp"
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "storage/sealed_journal.hpp"
+#include "test_backend_support.hpp"
 
 #include <cstdio>
 #include <fstream>
-#include <thread>
 #include <future>
 #include <optional>
 #include <string_view>
+#include <thread>
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -36,7 +36,9 @@ struct Mutation {
                                dot);
         head.entries[path] = std::move(entry);
     }
-    void erase(const std::string& path) { head.entries.erase(path); }
+    void erase(const std::string& path) {
+        head.entries.erase(path);
+    }
     void catalogue(const ObjectId& root) {
         head.catalogue_root = root;
         head.catalogue_dot = dot;
@@ -225,7 +227,8 @@ MACHA_FAST_TEST("storage_metadata", test_retention_prune_cursor_cannot_starve_la
 
 // The presence check runs without the store's lock, so a claim made while it
 // runs is seen, and the row it revived is kept.
-MACHA_FAST_TEST("storage_metadata", test_retention_prune_keeps_a_row_claimed_while_it_checks_presence) {
+MACHA_FAST_TEST("storage_metadata",
+                test_retention_prune_keeps_a_row_claimed_while_it_checks_presence) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -330,7 +333,9 @@ MACHA_FAST_TEST("storage_metadata", test_retention_start_checkpoints_a_long_jour
         objects[i].bytes[2] = static_cast<uint8_t>(i >> 16);
     }
     std::sort(objects.begin(), objects.end());
-    { RetentionStore created(state, keys.storage); }
+    {
+        RetentionStore created(state, keys.storage);
+    }
     {
         // As a crash leaves it: frames journaled, no checkpoint.
         constexpr std::array<uint8_t, 8> journal_aad{'M', 'A', 'C', 'H', 'R', 'T', 'J', '1'};
@@ -374,8 +379,8 @@ MACHA_FAST_TEST("storage_metadata", test_retention_prune_survives_a_restart) {
         RetentionStore retention(state, keys.storage);
         retention.retain(RetentionClass::data, pruned, {origin, 1});
         retention.retain(RetentionClass::data, kept, {origin, 1});
-        CHECK(retention.release_unreferenced(RetentionClass::data, {},
-                                             RetentionClock{{origin, 1}}, 8) == 2);
+        CHECK(retention.release_unreferenced(RetentionClass::data, {}, RetentionClock{{origin, 1}},
+                                             8) == 2);
         CHECK(retention.prune_unclaimed(
                   RetentionClass::data, [&](const ObjectId& id) { return id == kept; }, 8) == 1);
     }
@@ -824,8 +829,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
         REQUIRE(common.has_value());
         CHECK(*common == genesis.hash);
 
-        auto merged = merge_metadata_heads(map_snapshot(left.payload),
-                                           map_snapshot(right.payload), left.hash, right.hash);
+        auto merged = merge_metadata_heads(map_snapshot(left.payload), map_snapshot(right.payload),
+                                           left.hash, right.hash);
         CHECK(merged.snapshot.entries.contains("/left"));
         CHECK(merged.snapshot.entries.contains("/right"));
         auto primary = left;
@@ -874,7 +879,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
 }
 
 MACHA_FAST_TEST("storage_metadata",
-               test_accept_commit_refreshes_checkpoint_on_both_repair_and_ordinary_paths) {
+                test_accept_commit_refreshes_checkpoint_on_both_repair_and_ordinary_paths) {
     // accept_commit() persists the checkpoint after releasing its lock: the
     // checkpoint reflects the new head and survives a reload.
     TempDir t;
@@ -1305,8 +1310,7 @@ MACHA_FAST_TEST("storage_metadata", test_full_fallback_boundary_heals_when_paren
     descendant.generation = 51;
     descendant.previous = child.hash;
     descendant.payload = tree_payload(descendant_snapshot);
-    descendant.hash =
-        metadata_hash(descendant.generation, descendant.previous, descendant.payload);
+    descendant.hash = metadata_hash(descendant.generation, descendant.previous, descendant.payload);
 
     auto sibling_snapshot = parent_snapshot;
     sibling_snapshot.entries["/sibling"] = directory;
@@ -1425,7 +1429,7 @@ MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_res
 }
 
 MACHA_FAST_TEST("storage_metadata",
-               test_unreconstructable_accepted_head_is_rate_limited_not_hammered) {
+                test_unreconstructable_accepted_head_is_rate_limited_not_hammered) {
     // Once a head fails to reconstruct and its cooldown is set, later calls
     // neither re-attempt reconstruction nor re-throw.
     TempDir t;
@@ -1467,9 +1471,11 @@ MACHA_FAST_TEST("storage_metadata",
     const auto history = path / "metadata" / "history.log";
     REQUIRE(replica.store_commit(head_a));
     const auto head_a_frame_end = std::filesystem::file_size(history);
-    REQUIRE(replica.accept_commit(MetadataAcceptance{head_a.generation, head_a.hash, 1, {witness}}));
+    REQUIRE(
+        replica.accept_commit(MetadataAcceptance{head_a.generation, head_a.hash, 1, {witness}}));
     REQUIRE(replica.store_commit(head_z));
-    REQUIRE(replica.accept_commit(MetadataAcceptance{head_z.generation, head_z.hash, 1, {witness}}));
+    REQUIRE(
+        replica.accept_commit(MetadataAcceptance{head_z.generation, head_z.hash, 1, {witness}}));
     REQUIRE(replica.committed().hash == head_z.hash);
     REQUIRE(replica.accepted_heads().size() == 2);
 
@@ -1496,7 +1502,8 @@ MACHA_FAST_TEST("storage_metadata",
     REQUIRE(replica.store_commit(head_c));
     bool threw_again = false;
     try {
-        REQUIRE(replica.accept_commit(MetadataAcceptance{head_c.generation, head_c.hash, 1, {witness}}));
+        REQUIRE(replica.accept_commit(
+            MetadataAcceptance{head_c.generation, head_c.hash, 1, {witness}}));
     } catch (const std::exception&) {
         threw_again = true;
     }
@@ -1521,7 +1528,8 @@ MACHA_FAST_TEST("storage_metadata",
     CHECK(replica.unreconstructable_heads() == std::vector<Hash256>{head_a.hash});
 }
 
-MACHA_FAST_TEST("storage_metadata", test_history_transfer_follows_only_materialization_dependencies) {
+MACHA_FAST_TEST("storage_metadata",
+                test_history_transfer_follows_only_materialization_dependencies) {
     Hash256 previous{}, merge_parent{};
     previous.bytes[0] = 1;
     merge_parent.bytes[0] = 2;
@@ -1847,8 +1855,7 @@ MACHA_FAST_TEST("storage_metadata", test_a_checkpoint_write_holds_no_reader_of_t
         CHECK(held);
 
         auto reader = std::async(std::launch::async, [&] {
-            return std::make_pair(replica.committed().hash,
-                                  hashes_of(replica.usable_heads()));
+            return std::make_pair(replica.committed().hash, hashes_of(replica.usable_heads()));
         });
         const bool answered = reader.wait_for(scaled(2s)) == std::future_status::ready;
         {
@@ -2066,7 +2073,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_acc
     CHECK(!reopened.acceptance(cached.hash).has_value());
 }
 
-MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_truncates_not_reseeds) {
+MACHA_FAST_TEST("storage_metadata",
+                test_metadata_journal_mid_frame_corruption_truncates_not_reseeds) {
     // An unauthenticatable frame mid-journal: the journal is a CAS chain, so the
     // prefix before it is exactly a crash before that append. The prefix is kept,
     // the tail quarantined, and startup proceeds normally.
@@ -2098,7 +2106,9 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_t
 
     const auto journal = path / "metadata" / "journal.log";
     uint64_t first_frame_end = 0;
-    { TestReplica opened(path, keys.storage); }
+    {
+        TestReplica opened(path, keys.storage);
+    }
     append_journal_frame(path, keys.storage, journal_prepare_full, first, first.payload);
     first_frame_end = std::filesystem::file_size(journal);
     REQUIRE(first_frame_end > 4);
@@ -2240,8 +2250,8 @@ MACHA_FAST_TEST("storage_metadata", test_an_author_sequence_never_regresses) {
         TestReplica replica(path, keys.storage);
         CHECK((replica.reserve_mutation_dot(node, {}) == MetadataDot{node, 1}));
         // A head that has seen further (merged from a peer) moves it on.
-        CHECK((replica.reserve_mutation_dot(node, {{node, 5}, {other, 9}}) ==
-               MetadataDot{node, 6}));
+        CHECK(
+            (replica.reserve_mutation_dot(node, {{node, 5}, {other, 9}}) == MetadataDot{node, 6}));
         // A head that has seen less does not move it back.
         CHECK((replica.reserve_mutation_dot(node, {{node, 2}}) == MetadataDot{node, 7}));
     }
@@ -2342,9 +2352,9 @@ MACHA_FAST_TEST("storage_metadata", test_protocol20_delta_preserves_governance_s
     auto encoded_delta = encode_metadata_delta(*delta);
     REQUIRE(encoded_delta.size() >= 8);
     CHECK(encoded_delta[7] == '5');
-    CHECK(tree_payload(
-              apply_metadata_delta(parent_snapshot, decode_metadata_delta(encoded_delta))) ==
-          tree_payload(child_snapshot));
+    CHECK(
+        tree_payload(apply_metadata_delta(parent_snapshot, decode_metadata_delta(encoded_delta))) ==
+        tree_payload(child_snapshot));
 
     MetadataRecord child;
     child.generation = parent.generation + 1;
@@ -2578,7 +2588,8 @@ MACHA_TEST("storage_metadata", test_a_new_namespace_is_a_tree_from_its_first_com
     CHECK(node.filesystem().getattr("/Movies").type == EntryType::directory);
 }
 
-MACHA_FAST_TEST("storage_metadata", test_metadata_history_payloads_are_disk_backed_and_byte_bounded) {
+MACHA_FAST_TEST("storage_metadata",
+                test_metadata_history_payloads_are_disk_backed_and_byte_bounded) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -2648,7 +2659,8 @@ MACHA_FAST_TEST("storage_metadata", test_a_damaged_history_frame_loses_only_that
         std::function<void(std::fstream&, uint64_t offset, uint32_t length)> apply;
     };
     const auto put_length = [](std::fstream& file, uint64_t offset, uint32_t value) {
-        const std::array<char, 4> bytes{static_cast<char>(value >> 24), static_cast<char>(value >> 16),
+        const std::array<char, 4> bytes{static_cast<char>(value >> 24),
+                                        static_cast<char>(value >> 16),
                                         static_cast<char>(value >> 8), static_cast<char>(value)};
         file.seekp(static_cast<std::streamoff>(offset));
         file.write(bytes.data(), bytes.size());
@@ -2656,13 +2668,20 @@ MACHA_FAST_TEST("storage_metadata", test_a_damaged_history_frame_loses_only_that
     const std::vector<Damage> damages{
         {"length past the end of the file",
          [&](auto& file, uint64_t offset, uint32_t) { put_length(file, offset, 0x10000000); }},
-        {"length over any record", [&](auto& file, uint64_t offset, uint32_t) { put_length(file, offset, 0xFFFFFFFF); }},
+        {"length over any record",
+         [&](auto& file, uint64_t offset, uint32_t) { put_length(file, offset, 0xFFFFFFFF); }},
         {"length short, inside the file",
-         [&](auto& file, uint64_t offset, uint32_t length) { put_length(file, offset, length / 2); }},
+         [&](auto& file, uint64_t offset, uint32_t length) {
+             put_length(file, offset, length / 2);
+         }},
         {"length long, inside the file",
-         [&](auto& file, uint64_t offset, uint32_t length) { put_length(file, offset, length + 9); }},
-        {"length zero", [&](auto& file, uint64_t offset, uint32_t) { put_length(file, offset, 0); }},
-        {"a body byte", [](auto& file, uint64_t offset, uint32_t length) {
+         [&](auto& file, uint64_t offset, uint32_t length) {
+             put_length(file, offset, length + 9);
+         }},
+        {"length zero",
+         [&](auto& file, uint64_t offset, uint32_t) { put_length(file, offset, 0); }},
+        {"a body byte",
+         [](auto& file, uint64_t offset, uint32_t length) {
              const auto at = static_cast<std::streamoff>(offset + 4 + length / 2);
              file.seekg(at);
              const auto byte = file.get();
@@ -2798,7 +2817,8 @@ MACHA_FAST_TEST("storage_metadata", test_a_failed_read_in_the_history_scan_is_no
             return reinterpret_cast<char*>(bytes.data());
         }
         pos_type seekoff(off_type off, std::ios_base::seekdir, std::ios_base::openmode) override {
-            setg(chars(), chars() + off, chars() + std::min<off_type>(fails_from, static_cast<off_type>(bytes.size())));
+            setg(chars(), chars() + off,
+                 chars() + std::min<off_type>(fails_from, static_cast<off_type>(bytes.size())));
             return off;
         }
         pos_type seekpos(pos_type at, std::ios_base::openmode mode) override {
@@ -2832,7 +2852,8 @@ MACHA_FAST_TEST("storage_metadata", test_a_failed_read_in_the_history_scan_is_no
         FailingBuffer buffer(noise, static_cast<std::streamoff>(noise.size()));
         std::istream stream(&buffer);
         bool read_failed = false;
-        CHECK(!next_history_frame(stream, 1, noise.size(), max_frame, open, read_failed).has_value());
+        CHECK(
+            !next_history_frame(stream, 1, noise.size(), max_frame, open, read_failed).has_value());
         CHECK(!read_failed);
     }
     {
@@ -2840,7 +2861,8 @@ MACHA_FAST_TEST("storage_metadata", test_a_failed_read_in_the_history_scan_is_no
         FailingBuffer buffer(file, 50);
         std::istream stream(&buffer);
         bool read_failed = false;
-        CHECK(!next_history_frame(stream, 1, file.size(), max_frame, open, read_failed).has_value());
+        CHECK(
+            !next_history_frame(stream, 1, file.size(), max_frame, open, read_failed).has_value());
         CHECK(read_failed);
     }
     {
@@ -2848,13 +2870,14 @@ MACHA_FAST_TEST("storage_metadata", test_a_failed_read_in_the_history_scan_is_no
         FailingBuffer buffer(file, 120);
         std::istream stream(&buffer);
         bool read_failed = false;
-        CHECK(!next_history_frame(stream, 100, 100 + 4 + inner + 32 - 1 + 1, max_frame, open, read_failed).has_value());
+        CHECK(!next_history_frame(stream, 100, 100 + 4 + inner + 32 - 1 + 1, max_frame, open,
+                                  read_failed)
+                   .has_value());
         CHECK(read_failed);
     }
 }
 
-MACHA_FAST_TEST("storage_metadata",
-                test_cold_accepted_head_validation_caches_only_owned_results) {
+MACHA_FAST_TEST("storage_metadata", test_cold_accepted_head_validation_caches_only_owned_results) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -2873,8 +2896,8 @@ MACHA_FAST_TEST("storage_metadata",
         policy_root.generation = head.generation + 1;
         policy_root.previous = head.hash;
         policy_root.payload = tree_payload(snapshot);
-        policy_root.hash = metadata_hash(policy_root.generation, policy_root.previous,
-                                         policy_root.payload);
+        policy_root.hash =
+            metadata_hash(policy_root.generation, policy_root.previous, policy_root.payload);
         REQUIRE(writer.store_commit(policy_root));
         head = std::move(policy_root);
         for (size_t i = 0; i < chain_length; ++i) {
@@ -2897,8 +2920,7 @@ MACHA_FAST_TEST("storage_metadata",
             snapshot = std::move(next_snapshot);
             head = std::move(child);
         }
-        REQUIRE(writer.accept_commit(
-            MetadataAcceptance{head.generation, head.hash, 1, {witness}}));
+        REQUIRE(writer.accept_commit(MetadataAcceptance{head.generation, head.hash, 1, {witness}}));
     }
 
     // Constructor-time accepted-head validation uses materialized_locked(). It
@@ -3036,7 +3058,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_dlt7_presence_flags_round_trip
                       << " canonical=" << delta->canonical_garbage << '\n';
         CHECK(encoded[7] == expected_version);
         const auto decoded = decode_metadata_delta(encoded);
-        CHECK(decoded.replace_merge_parents.has_value() == delta->replace_merge_parents.has_value());
+        CHECK(decoded.replace_merge_parents.has_value() ==
+              delta->replace_merge_parents.has_value());
         CHECK(decoded.replace_conflicts.has_value() == delta->replace_conflicts.has_value());
         CHECK(decoded.canonical_garbage == delta->canonical_garbage);
         CHECK(tree_payload(apply_metadata_delta(parent, decoded)) == tree_payload(after));
@@ -3265,8 +3288,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_superseded_conflicts_leave_the
     // merge with it keeps the decision and drops the record.
     auto undecided = merged.snapshot;
     Mutation(undecided, 4).put("/another", file);
-    const auto later = merge_metadata_heads(rewritten, undecided, sha256(pattern(83)),
-                                            sha256(pattern(84)));
+    const auto later =
+        merge_metadata_heads(rewritten, undecided, sha256(pattern(83)), sha256(pattern(84)));
     CHECK(later.conflicts_created == 0);
     CHECK(later.conflicts_superseded == 1);
     CHECK(later.snapshot.conflicts.size() == 1);
@@ -3410,8 +3433,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_re
     parent_record.generation = genesis.generation + 1;
     parent_record.previous = genesis.hash;
     parent_record.payload = tree_payload(parent);
-    parent_record.hash = metadata_hash(parent_record.generation, parent_record.previous,
-                                       parent_record.payload);
+    parent_record.hash =
+        metadata_hash(parent_record.generation, parent_record.previous, parent_record.payload);
 
     auto child = parent;
     child.merge_parents.clear();
@@ -3492,9 +3515,9 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_tombstone_edits_are_line
         // A duplicate id, so "erase removes every copy" is exercised too.
         before.garbage.push_back(tombstone(7, 700));
         for (uint64_t i = 0; i < edits; ++i) {
-            delta.erase_garbage.push_back(make_id(i * 10 + 7));          // existing, incl. id 7
-            delta.upsert_garbage.push_back(tombstone(i * 10 + 3, -1));    // replace in place
-            delta.upsert_garbage.push_back(tombstone(count + i, 5));      // append
+            delta.erase_garbage.push_back(make_id(i * 10 + 7));        // existing, incl. id 7
+            delta.upsert_garbage.push_back(tombstone(i * 10 + 3, -1)); // replace in place
+            delta.upsert_garbage.push_back(tombstone(count + i, 5));   // append
         }
     };
 
@@ -3564,7 +3587,9 @@ MACHA_FAST_TEST("storage_metadata", test_an_entrys_provenance_survives_snapshot_
             bytes += node.size();
             return nodes.put(node);
         }
-        std::optional<Bytes> get(const ObjectId& id) const override { return nodes.get(id); }
+        std::optional<Bytes> get(const ObjectId& id) const override {
+            return nodes.get(id);
+        }
         uint64_t bytes{};
 
       private:
@@ -4387,7 +4412,9 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     // the journal rather than allowing an unbounded replay log.
     auto compact_path = t.path() / "compact-node";
     {
-        { TestReplica opened(compact_path, keys.storage); }
+        {
+            TestReplica opened(compact_path, keys.storage);
+        }
         for (size_t i = 0; i < 130; ++i)
             append_journal_frame(compact_path, keys.storage, journal_commit, genesis_metadata());
         TestReplica compacted(compact_path, keys.storage);
@@ -4469,11 +4496,11 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
     REQUIRE(s1.local_state().data().put(id, bytes));
     REQUIRE(!s2.local_state().data().has(id));
     std::vector<ObjectId> live{id};
-    DistributedStore repair(s1.node(), s1.local_state(), s1.resources().activity, s1.resources().data, s1.resources().memory, s1.resources().events);
+    DistributedStore repair(s1.node(), s1.local_state(), s1.resources().activity,
+                            s1.resources().data, s1.resources().memory, s1.resources().events);
     const auto full_lists_before = s1.local_state().data().full_list_scans();
 
-    auto yielded =
-        repair.repair_step(8ULL * 1024 * 1024, 8, live, [] { return true; });
+    auto yielded = repair.repair_step(8ULL * 1024 * 1024, 8, live, [] { return true; });
     CHECK(yielded.yielded);
     CHECK(!yielded.complete);
     CHECK(yielded.bytes_transferred == 0);
@@ -4527,7 +4554,8 @@ MACHA_TEST("storage_metadata", test_genesis_root_configuration) {
     CHECK(root.mtime_ns > 0);
 }
 
-MACHA_FAST_TEST("storage_metadata", test_metadata_delta_rejects_unrepresentable_garbage_reordering) {
+MACHA_FAST_TEST("storage_metadata",
+                test_metadata_delta_rejects_unrepresentable_garbage_reordering) {
     auto before = founded_snapshot();
     GarbageRef first{object_id(pattern(4097)), 10, random_node_id()};
     GarbageRef second{object_id(pattern(8193)), 20, random_node_id()};
@@ -4569,7 +4597,8 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
     config.torrent.enabled = false;
 
     auto& service = fixture.start();
-    MetadataManager metadata(service.node(), service.local_state(), service.metadata_server(), service.store());
+    MetadataManager metadata(service.node(), service.local_state(), service.metadata_server(),
+                             service.store());
     const auto root = object_id(pattern(97, 5));
     auto committed = metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta&) {
         // The supplied exact delta omits the change: the local replica must reject
@@ -4640,7 +4669,8 @@ MACHA_FAST_TEST("storage_metadata", test_decoded_extent_vectors_carry_no_allocat
 } // namespace
 
 namespace {
-TorrentRequest sample_torrent_request(const std::string& id, const std::string& hash, uint64_t created) {
+TorrentRequest sample_torrent_request(const std::string& id, const std::string& hash,
+                                      uint64_t created) {
     TorrentRequest r;
     r.id = id;
     r.info_hash = hash;
@@ -4701,7 +4731,8 @@ MACHA_FAST_TEST("storage_metadata", test_torrent_requests_join_without_conflicts
     auto removed = base;
     removed.removed_unix_ms = 1000;
 
-    const std::vector<TorrentRequest> variants{base, paused, cancelled, claimed, rival, takeover, removed};
+    const std::vector<TorrentRequest> variants{base,  paused,   cancelled, claimed,
+                                               rival, takeover, removed};
     for (const auto& x : variants) {
         CHECK(merge_torrent_request(x, x) == x);
         for (const auto& y : variants) {
@@ -4743,7 +4774,9 @@ MACHA_FAST_TEST("storage_metadata", test_torrent_requests_join_without_conflicts
 // bytes, a merge is the union, and a head's tombstones are read from its
 // batches, the latest retirement per object.
 MACHA_FAST_TEST("storage_metadata", test_tombstone_batches_ride_the_head_and_its_deltas) {
-    const auto magic = [](const Bytes& bytes) { return std::string(bytes.begin(), bytes.begin() + 8); };
+    const auto magic = [](const Bytes& bytes) {
+        return std::string(bytes.begin(), bytes.begin() + 8);
+    };
     MetadataSnapshot base = founded_snapshot();
     base.metadata_write_replicas_required = 1;
     base.entries.clear();
@@ -4845,7 +4878,9 @@ MACHA_FAST_TEST("storage_metadata", test_tombstone_batches_ride_the_head_and_its
 MACHA_FAST_TEST("storage_metadata", test_torrent_requests_ride_the_snapshot_and_its_deltas) {
     // SM16 and DLT9 carry the collection; a cluster with none keeps its exact
     // encodings.
-    const auto magic = [](const Bytes& bytes) { return std::string(bytes.begin(), bytes.begin() + 8); };
+    const auto magic = [](const Bytes& bytes) {
+        return std::string(bytes.begin(), bytes.begin() + 8);
+    };
     MetadataSnapshot base = founded_snapshot();
     base.metadata_write_replicas_required = 1;
     const auto base_bytes = tree_payload(base);
@@ -4865,22 +4900,23 @@ MACHA_FAST_TEST("storage_metadata", test_torrent_requests_ride_the_snapshot_and_
     CHECK(added->upsert_torrent_requests.size() == 1);
     const auto added_bytes = encode_metadata_delta(*added);
     CHECK(magic(added_bytes) == "DHTMDLT9");
-    CHECK(tree_payload(apply_metadata_delta(base, decode_metadata_delta(added_bytes))) == with_bytes);
+    CHECK(tree_payload(apply_metadata_delta(base, decode_metadata_delta(added_bytes))) ==
+          with_bytes);
 
     auto changed = with;
     changed.torrent_requests[request.id].phase = TorrentPhase::downloading;
     changed.torrent_requests[request.id].phase_epoch = 1;
     const auto update = metadata_delta(with, changed);
     REQUIRE(update.has_value());
-    CHECK(tree_payload(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(*update)))) ==
-          tree_payload(changed));
+    CHECK(tree_payload(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(
+                                                      *update)))) == tree_payload(changed));
 
     // Erased again: the snapshot returns to its pre-request encoding.
     const auto erased = metadata_delta(changed, base);
     REQUIRE(erased.has_value());
     CHECK(erased->erase_torrent_requests == std::vector<std::string>{request.id});
-    CHECK(tree_payload(apply_metadata_delta(changed, decode_metadata_delta(encode_metadata_delta(*erased)))) ==
-          base_bytes);
+    CHECK(tree_payload(apply_metadata_delta(
+              changed, decode_metadata_delta(encode_metadata_delta(*erased)))) == base_bytes);
 
     // A delta that does not touch the collection is still DLT5-8.
     auto unrelated = with;
@@ -4888,8 +4924,8 @@ MACHA_FAST_TEST("storage_metadata", test_torrent_requests_ride_the_snapshot_and_
     const auto quiet = metadata_delta(with, unrelated);
     REQUIRE(quiet.has_value());
     CHECK(magic(encode_metadata_delta(*quiet)) != "DHTMDLT9");
-    CHECK(tree_payload(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(*quiet)))) ==
-          tree_payload(unrelated));
+    CHECK(tree_payload(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(
+                                                      *quiet)))) == tree_payload(unrelated));
 
     // Tree-backed: SM16, and SM14 while empty.
     auto tree = with;

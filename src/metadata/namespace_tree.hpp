@@ -112,8 +112,8 @@ struct NamespaceTreeStats {
 };
 
 // Builds the tree and returns the root id. Deterministic in the entry set alone.
-ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, NamespaceNodeStore& store,
-                              const NamespaceTreeLimits& limits = {});
+ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries,
+                              NamespaceNodeStore& store, const NamespaceTreeLimits& limits = {});
 
 // Visits entries in path order without materialising the namespace. Full-scan
 // readers should use this rather than `read_namespace_tree`.
@@ -125,8 +125,7 @@ void walk_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
 // branch child whose key range cannot intersect the prefix is never fetched,
 // so a listing costs the subtree rather than the library.
 void for_each_namespace_entry_with_prefix(const MetadataSnapshot& snapshot,
-                                          const NamespaceNodeStore* store,
-                                          std::string_view prefix,
+                                          const NamespaceNodeStore* store, std::string_view prefix,
                                           const NamespaceVisitor& visit);
 
 // The entries after `from`, in path order, one budget operation per entry (the
@@ -144,9 +143,15 @@ Page<NamespaceItem, std::string> namespace_entries(const MetadataSnapshot& snaps
 struct NamespaceScanStep {
     enum class Kind { next, stop, seek } kind{Kind::next};
     std::string to;
-    static NamespaceScanStep next() { return {}; }
-    static NamespaceScanStep stop() { return {Kind::stop, {}}; }
-    static NamespaceScanStep seek(std::string key) { return {Kind::seek, std::move(key)}; }
+    static NamespaceScanStep next() {
+        return {};
+    }
+    static NamespaceScanStep stop() {
+        return {Kind::stop, {}};
+    }
+    static NamespaceScanStep seek(std::string key) {
+        return {Kind::seek, std::move(key)};
+    }
 };
 using NamespaceScanVisitor =
     std::function<NamespaceScanStep(const std::string& path, const FsEntry& stat)>;
@@ -160,8 +165,8 @@ void scan_namespace(const MetadataSnapshot& snapshot, const NamespaceNodeStore* 
 // The entries directly inside `directory`, in name order, stat-only. A child
 // directory's contents are stepped over in one descent, so the cost is the
 // directory's own size times the tree's depth.
-using NamespaceChildVisitor = std::function<void(const std::string& name, const std::string& path,
-                                                 const FsEntry& stat)>;
+using NamespaceChildVisitor =
+    std::function<void(const std::string& name, const std::string& path, const FsEntry& stat)>;
 void for_each_namespace_child(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
                               std::string_view directory, const NamespaceChildVisitor& visit);
 
@@ -271,8 +276,8 @@ struct NamespaceTreeMerge {
     NamespaceChanges changes;
 };
 NamespaceTreeMerge merge_tree_backed_heads(const MetadataSnapshot& left,
-                                           const MetadataSnapshot& right,
-                                           const Hash256& left_head, const Hash256& right_head,
+                                           const MetadataSnapshot& right, const Hash256& left_head,
+                                           const Hash256& right_head,
                                            const NamespaceNodeStore& store);
 
 // The merge commit as a delta against its primary parent: what differs outside
@@ -291,7 +296,8 @@ ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore&
 
 // Materialises the whole namespace. For round-trip proofs; nothing on the hot
 // path should need it.
-std::map<std::string, FsEntry> read_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
+std::map<std::string, FsEntry> read_namespace_tree(const ObjectId& root,
+                                                   const NamespaceNodeStore& store,
                                                    const NamespaceTreeLimits& limits = {});
 
 // One path in O(log n) node fetches. With `with_extents` false (stat-only, what
@@ -362,7 +368,6 @@ class NamespaceWorkingSet {
     // delta_.erase_entries as a set, for lookups.
     std::set<std::string, std::less<>> erased_;
 };
-
 
 // The only conversions between namespace forms. `detach_namespace` builds the
 // tree into `store` and returns the snapshot with `namespace_root` set and

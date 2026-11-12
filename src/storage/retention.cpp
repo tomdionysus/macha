@@ -41,8 +41,7 @@ bool valid_class(uint8_t value) {
 
 std::string shard_name(uint8_t shard) {
     std::ostringstream out;
-    out << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(shard)
-        << ".meta";
+    out << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(shard) << ".meta";
     return out.str();
 }
 
@@ -71,7 +70,9 @@ std::string read_small_text(const std::filesystem::path& path, size_t limit) {
 struct ObjectState {
     std::map<NodeId, uint64_t> adds;
     std::map<NodeId, uint64_t> removed;
-    bool empty() const noexcept { return adds.empty() && removed.empty(); }
+    bool empty() const noexcept {
+        return adds.empty() && removed.empty();
+    }
 };
 using StateMap = std::map<ObjectId, ObjectState>;
 
@@ -142,8 +143,7 @@ ObjectState read_clocks(Reader& reader, uint32_t limit) {
 }
 
 void decode_checkpoint_shard(const std::array<uint8_t, 32>& key, uint8_t shard,
-                             std::span<const uint8_t> encoded, StateMap& data,
-                             StateMap& control) {
+                             std::span<const uint8_t> encoded, StateMap& data, StateMap& control) {
     Reader outer(encoded);
     if (outer.fixed<8>() != shard_checkpoint_magic)
         throw DecodeError("bad retention checkpoint shard magic");
@@ -217,8 +217,8 @@ void load_checkpoint_files(const std::filesystem::path& root, const std::array<u
     if (!std::filesystem::exists(manifest)) {
         const auto monolithic = root / "claims.meta";
         if (std::filesystem::exists(monolithic))
-            decode_monolithic_checkpoint(key, read_file(monolithic, max_legacy_frame + 64ULL),
-                                         data, control);
+            decode_monolithic_checkpoint(key, read_file(monolithic, max_legacy_frame + 64ULL), data,
+                                         control);
         return;
     }
     const auto generation = read_small_text(manifest, 256);
@@ -432,8 +432,7 @@ void RetentionStore::load_journal_locked() {
                 for (uint32_t i = 0; i < clocks; ++i) {
                     NodeId node{reader.fixed<16>()};
                     const auto sequence = reader.u64();
-                    if (node == NodeId{} || !sequence ||
-                        !observed.emplace(node, sequence).second)
+                    if (node == NodeId{} || !sequence || !observed.emplace(node, sequence).second)
                         throw DecodeError("bad retention release clock");
                 }
                 (void)apply_release_locked(type, observed, read_ids("release"));
@@ -521,8 +520,9 @@ std::vector<ObjectId> RetentionStore::retained_ids(RetentionClass type) const {
     }
 }
 
-std::optional<ObjectId> RetentionStore::next_retained(
-    RetentionClass type, std::optional<ObjectId>& cursor, bool& complete) const {
+std::optional<ObjectId> RetentionStore::next_retained(RetentionClass type,
+                                                      std::optional<ObjectId>& cursor,
+                                                      bool& complete) const {
     Lock lock(mutex_);
     while (true) {
         const auto page = class_for(type).trie->next(cursor, scan_page);
@@ -602,9 +602,9 @@ bool RetentionStore::compact_if_needed(size_t record_threshold) {
     return true;
 }
 
-size_t RetentionStore::prune_unclaimed(
-    RetentionClass type, const std::function<bool(const ObjectId&)>& exists,
-    size_t operation_budget) {
+size_t RetentionStore::prune_unclaimed(RetentionClass type,
+                                       const std::function<bool(const ObjectId&)>& exists,
+                                       size_t operation_budget) {
     if (!operation_budget || !exists)
         return 0;
     // Three steps, so `exists` (which may read a device) runs without mutex_:

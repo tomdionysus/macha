@@ -18,8 +18,7 @@ namespace {
 constexpr DiskServiceMonitor::Thresholds defaults{25ms, 120ms, 300, 150, 1000};
 
 DataWorkContext work(FrameType frame_type) {
-    return DataWorkContext(frame_type, 0,
-                           DataWorkContext::Clock::now() + 2s);
+    return DataWorkContext(frame_type, 0, DataWorkContext::Clock::now() + 2s);
 }
 
 MACHA_FAST_TEST("io_pressure", test_an_ordinary_large_write_is_not_a_slow_device) {
@@ -45,30 +44,36 @@ MACHA_FAST_TEST("io_pressure", test_pressure_onset_and_release_are_each_logged_o
     struct Capture final : Logger {
         std::mutex mutex;
         std::vector<std::string> lines;
-        bool enabled(LogLevel) const noexcept override { return true; }
+        bool enabled(LogLevel) const noexcept override {
+            return true;
+        }
         void log(LogLevel, const std::string& line) override {
             std::lock_guard lock(mutex);
             lines.push_back(line);
         }
         size_t count(std::string_view what) {
             std::lock_guard lock(mutex);
-            return static_cast<size_t>(std::count_if(lines.begin(), lines.end(), [&](const auto& line) {
-                return line.find(what) != std::string::npos;
-            }));
+            return static_cast<size_t>(
+                std::count_if(lines.begin(), lines.end(), [&](const auto& line) {
+                    return line.find(what) != std::string::npos;
+                }));
         }
     };
     auto capture = std::make_shared<Capture>();
     Log::set_logger(capture);
 
     DiskServiceMonitor monitor(defaults);
-    for (int i = 0; i < 20; ++i) monitor.note(100ms, 4 * 1024 * 1024);
+    for (int i = 0; i < 20; ++i)
+        monitor.note(100ms, 4 * 1024 * 1024);
     CHECK(capture->count("pressure") == 0);
 
-    for (int i = 0; i < 20; ++i) monitor.note(3000ms, 4 * 1024 * 1024);
+    for (int i = 0; i < 20; ++i)
+        monitor.note(3000ms, 4 * 1024 * 1024);
     CHECK(monitor.pressured());
     CHECK(capture->count("DATA device pressure onset") == 1);
 
-    for (int i = 0; i < 200; ++i) monitor.note(10ms, 4 * 1024 * 1024);
+    for (int i = 0; i < 200; ++i)
+        monitor.note(10ms, 4 * 1024 * 1024);
     CHECK(!monitor.pressured());
     CHECK(capture->count("DATA device pressure released") == 1);
     CHECK(capture->count("DATA device pressure onset") == 1);
@@ -250,8 +255,7 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_runs_freely_under_pressure_with_n
     // Law 3: the loader waits only if it would make a viewer wait. A slow
     // device with no viewer does not hold the loader back.
     DiskServiceMonitor monitor(defaults);
-    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms,
-                                [] { return false; });
+    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms, [] { return false; });
     arbiter.observe_device(&monitor, 1);
     for (int i = 0; i < 30; ++i)
         monitor.note(9000ms, 4 * 1024 * 1024);
@@ -275,8 +279,7 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_runs_freely_under_pressure_with_n
 MACHA_FAST_TEST("io_pressure", test_the_loader_yields_to_a_viewer_on_a_slow_device) {
     // With a viewer present the loader yields to a trickle, not a stop.
     DiskServiceMonitor monitor(defaults);
-    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms,
-                                [] { return false; });
+    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms, [] { return false; });
     arbiter.observe_device(&monitor, 1);
     for (int i = 0; i < 30; ++i)
         monitor.note(9000ms, 4 * 1024 * 1024);
@@ -341,8 +344,7 @@ MACHA_FAST_TEST("io_pressure", test_background_work_always_drains_on_a_pressured
     // Law 4. min_background always admits one lease when nothing is active, so
     // background work keeps feeding the monitor and the average can fall.
     DiskServiceMonitor monitor(defaults);
-    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms,
-                                [] { return true; });
+    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms, [] { return true; });
     arbiter.observe_device(&monitor, 1);
     for (int i = 0; i < 200; ++i)
         monitor.note(30000ms, 4 * 1024 * 1024);

@@ -76,10 +76,18 @@ class InventoryHorizon : public ReferencedSets {
                      std::vector<TombstoneBatch> tombstone_batches = {});
 
     // The stamp: the generation the inventory was built at.
-    uint64_t generation() const noexcept { return generation_; }
-    bool catalogue_complete() const noexcept { return catalogue_complete_; }
-    const std::vector<GarbageRef>& garbage() const noexcept { return garbage_; }
-    const std::vector<GarbageRef>& stale_garbage() const noexcept { return stale_garbage_; }
+    uint64_t generation() const noexcept {
+        return generation_;
+    }
+    bool catalogue_complete() const noexcept {
+        return catalogue_complete_;
+    }
+    const std::vector<GarbageRef>& garbage() const noexcept {
+        return garbage_;
+    }
+    const std::vector<GarbageRef>& stale_garbage() const noexcept {
+        return stale_garbage_;
+    }
     // The head's tombstone batches, sorted by id: dropped whole once matured.
     const std::vector<TombstoneBatch>& tombstone_batches() const noexcept {
         return tombstone_batches_;
@@ -102,8 +110,12 @@ class ReleaseHorizon : public ReferencedSets {
     ReleaseHorizon(Hash256 head, RetentionClock clock, ReferencedSets sets);
 
     // The stamp: the head's hash and the mutation clock of the claims it saw.
-    const Hash256& head() const noexcept { return head_; }
-    const RetentionClock& clock() const noexcept { return clock_; }
+    const Hash256& head() const noexcept {
+        return head_;
+    }
+    const RetentionClock& clock() const noexcept {
+        return clock_;
+    }
 
   private:
     Hash256 head_;

@@ -70,9 +70,12 @@ namespace {
 
 NodePhase macha_phase(dannan::status::Phase phase) {
     switch (phase) {
-    case dannan::status::Phase::starting: return NodePhase::starting;
-    case dannan::status::Phase::recovering: return NodePhase::recovering;
-    case dannan::status::Phase::ready: return NodePhase::ready;
+    case dannan::status::Phase::starting:
+        return NodePhase::starting;
+    case dannan::status::Phase::recovering:
+        return NodePhase::recovering;
+    case dannan::status::Phase::ready:
+        return NodePhase::ready;
     }
     return NodePhase::starting;
 }

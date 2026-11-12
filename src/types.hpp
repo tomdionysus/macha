@@ -102,7 +102,8 @@ std::string to_string(const NodeId&);
 std::string to_string(const ObjectId&);
 std::string endpoint_identity_key(std::string_view host, uint16_t port);
 std::string identity_reset_key(std::string_view host, uint16_t port);
-bool identity_reset_matches_endpoint(const IdentityAssociationReset&, std::string_view host, uint16_t port);
+bool identity_reset_matches_endpoint(const IdentityAssociationReset&, std::string_view host,
+                                     uint16_t port);
 bool identity_reset_matches_node(const IdentityAssociationReset&, const NodeId&);
 inline std::string endpoint_identity_key(const Endpoint& endpoint) {
     return endpoint_identity_key(endpoint.host, endpoint.port);

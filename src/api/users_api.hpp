@@ -24,7 +24,6 @@ class UsersApi {
     UsersApi(NodeRuntime& node, Accounts& accounts) : node_(node), accounts_(accounts) {}
     HttpResponse handle(const HttpRequest&);
     static bool routes(std::string_view path);
-
 };
 
 } // namespace macha

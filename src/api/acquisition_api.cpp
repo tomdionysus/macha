@@ -13,18 +13,22 @@ namespace macha {
 namespace {
 
 Json parse_body(const HttpRequest& request) {
-    if (request.body.empty()) return Json(Json::Object{});
+    if (request.body.empty())
+        return Json(Json::Object{});
     const std::string text(reinterpret_cast<const char*>(request.body.data()), request.body.size());
     auto body = Json::parse(text);
-    if (!body.isObject()) throw std::runtime_error("request body must be a JSON object");
+    if (!body.isObject())
+        throw std::runtime_error("request body must be a JSON object");
     return body;
 }
 
 std::optional<std::pair<std::string, std::string>> job_action(std::string_view path,
-                                                               std::string_view prefix) {
-    if (!path.starts_with(prefix)) return {};
+                                                              std::string_view prefix) {
+    if (!path.starts_with(prefix))
+        return {};
     path.remove_prefix(prefix.size());
-    if (path.empty()) return {};
+    if (path.empty())
+        return {};
     const auto slash = path.find('/');
     if (slash == std::string_view::npos)
         return std::pair<std::string, std::string>{std::string(path), {}};
@@ -35,16 +39,20 @@ std::optional<std::pair<std::string, std::string>> job_action(std::string_view p
 // "files/{index}/{pause|resume|cancel}" as (index, action).
 std::optional<std::pair<size_t, std::string>> file_action(std::string_view rest) {
     constexpr std::string_view prefix = "files/";
-    if (!rest.starts_with(prefix)) return {};
+    if (!rest.starts_with(prefix))
+        return {};
     rest.remove_prefix(prefix.size());
     const auto slash = rest.find('/');
-    if (slash == std::string_view::npos || slash == 0) return {};
+    if (slash == std::string_view::npos || slash == 0)
+        return {};
     const auto digits = rest.substr(0, slash);
     const auto action = rest.substr(slash + 1);
-    if (action != "pause" && action != "resume" && action != "cancel") return {};
+    if (action != "pause" && action != "resume" && action != "cancel")
+        return {};
     size_t index = 0;
     for (const char c : digits) {
-        if (c < '0' || c > '9' || index > (std::numeric_limits<size_t>::max() - 9) / 10) return {};
+        if (c < '0' || c > '9' || index > (std::numeric_limits<size_t>::max() - 9) / 10)
+            return {};
         index = index * 10 + static_cast<size_t>(c - '0');
     }
     return std::pair<size_t, std::string>{index, std::string(action)};
@@ -64,7 +72,8 @@ Json sources_json(const std::vector<ClusterJobView::Source>& sources) {
 }
 
 std::optional<NodeId> parse_node_id(const Json& value, std::string& error) {
-    if (value.isNull()) return NodeId{};
+    if (value.isNull())
+        return NodeId{};
     if (!value.isString()) {
         error = "node_id must be a string";
         return std::nullopt;
@@ -80,9 +89,11 @@ std::optional<NodeId> parse_node_id(const Json& value, std::string& error) {
 }
 
 // remove_after_ms: absent (nullopt), null (present, empty), or 0..24 h.
-bool parse_remove_after(const Json& body, std::optional<std::optional<uint64_t>>& out, std::string& error) {
+bool parse_remove_after(const Json& body, std::optional<std::optional<uint64_t>>& out,
+                        std::string& error) {
     const auto* value = body.find("remove_after_ms");
-    if (!value) return true;
+    if (!value)
+        return true;
     if (value->isNull()) {
         out = std::optional<uint64_t>{};
         return true;
@@ -107,7 +118,8 @@ HttpResponse outcome_error(const TorrentCoordinator::Outcome& outcome) {
         axes.scope = FailureScope::node;
         return http_error(outcome.status, outcome.code, outcome.message, outcome.reason, axes);
     }
-    if (!outcome.reason.empty()) return http_error(outcome.status, outcome.code, outcome.message, outcome.reason);
+    if (!outcome.reason.empty())
+        return http_error(outcome.status, outcome.code, outcome.message, outcome.reason);
     return http_error(outcome.status, outcome.code, outcome.message);
 }
 
@@ -117,7 +129,8 @@ HttpResponse unreachable_error() {
 }
 
 HttpResponse action_error(bool exists) {
-    return exists ? http_error(409, "invalid_state", "job cannot perform that action in its current state")
+    return exists ? http_error(409, "invalid_state",
+                               "job cannot perform that action in its current state")
                   : http_error(404, "not_found", "job not found");
 }
 
@@ -125,22 +138,24 @@ HttpResponse action_error(bool exists) {
 
 std::map<NodeId, uint64_t> AcquisitionApi::live_ages() const {
     std::map<NodeId, uint64_t> out;
-    for (const auto& source : jobs_.torrent_jobs().sources) out[source.node_id] = source.as_of_unix_ms;
+    for (const auto& source : jobs_.torrent_jobs().sources)
+        out[source.node_id] = source.as_of_unix_ms;
     return out;
 }
 
 // One torrent job as the API shows it: the cluster request from metadata,
 // with the owner's live state laid over it.
-Json AcquisitionApi::request_json(const TorrentRequest& r, const std::map<NodeId, uint64_t>& as_of) const {
+Json AcquisitionApi::request_json(const TorrentRequest& r,
+                                  const std::map<NodeId, uint64_t>& as_of) const {
     const auto live = torrents_.live_job(r);
     Json::Object out;
     if (live) {
         auto base = torrent_job_api_json(live->job);
         out = base.asObject();
     } else {
-        for (const auto* key : {"bytes_total", "bytes_completed", "download_rate", "upload_rate", "uploaded_total",
-                                "peers", "seeds", "eta_seconds", "progress", "catalogue", "publication",
-                                "waiting_reason", "swarm"})
+        for (const auto* key : {"bytes_total", "bytes_completed", "download_rate", "upload_rate",
+                                "uploaded_total", "peers", "seeds", "eta_seconds", "progress",
+                                "catalogue", "publication", "waiting_reason", "swarm"})
             out[key] = Json(nullptr);
     }
     out["id"] = r.id;
@@ -148,39 +163,46 @@ Json AcquisitionApi::request_json(const TorrentRequest& r, const std::map<NodeId
     out["name"] = live && !live->job.name.empty() ? live->job.name : r.name;
     out["phase"] = std::string(torrent_phase_name(r.phase));
     out["state"] = r.phase == TorrentPhase::awaiting_node ? std::string("awaiting_node")
-                   : live                                ? torrent_job_state_name(live->job.state)
-                                                         : std::string(torrent_phase_name(r.phase));
+                   : live                                 ? torrent_job_state_name(live->job.state)
+                          : std::string(torrent_phase_name(r.phase));
     out["desired"] = std::string(torrent_desired_name(r.desired));
     out["desired_changed_unix_ms"] = r.desired_changed_unix_ms;
-    out["desired_applied"] = torrents_.desired_applied(r, live ? std::optional<TorrentJob>(live->job) : std::nullopt);
+    out["desired_applied"] =
+        torrents_.desired_applied(r, live ? std::optional<TorrentJob>(live->job) : std::nullopt);
     const auto blocked = torrents_.desired_blocked_reason(r);
     out["desired_blocked_reason"] = blocked.empty() ? Json(nullptr) : Json(blocked);
     out["node_id"] = r.claim ? Json(to_string(r.claim->node_id)) : Json(nullptr);
     out["pinned_node_id"] = r.pinned_node_id ? Json(to_string(*r.pinned_node_id)) : Json(nullptr);
     uint64_t live_as_of = 0;
     if (live) {
-        if (live->node_id == jobs_.local_node_id()) live_as_of = unix_ms();
-        else if (auto found = as_of.find(live->node_id); found != as_of.end()) live_as_of = found->second;
+        if (live->node_id == jobs_.local_node_id())
+            live_as_of = unix_ms();
+        else if (auto found = as_of.find(live->node_id); found != as_of.end())
+            live_as_of = found->second;
     }
     out["live_as_of_unix_ms"] = live_as_of ? Json(live_as_of) : Json(nullptr);
     out["remove_after_ms"] = r.remove_after_ms ? Json(*r.remove_after_ms) : Json(nullptr);
     out["remove_at_unix_ms"] = r.remove_after_ms && r.completed_unix_ms
                                    ? Json(r.completed_unix_ms + *r.remove_after_ms)
                                    : Json(nullptr);
-    if (!live) out["ingest_job_id"] = r.ingest_job_id.empty() ? Json(nullptr) : Json(r.ingest_job_id);
+    if (!live)
+        out["ingest_job_id"] = r.ingest_job_id.empty() ? Json(nullptr) : Json(r.ingest_job_id);
     // The ingest job is made on the node that ran the torrent.
     const auto ingest_id = out.find("ingest_job_id");
-    const auto ingest_node = live ? std::optional<NodeId>(live->node_id)
-                                  : r.claim ? std::optional<NodeId>(r.claim->node_id) : std::nullopt;
+    const auto ingest_node = live      ? std::optional<NodeId>(live->node_id)
+                             : r.claim ? std::optional<NodeId>(r.claim->node_id)
+                                       : std::nullopt;
     out["ingest_node_id"] = ingest_id != out.end() && !ingest_id->second.isNull() && ingest_node
                                 ? Json(to_string(*ingest_node))
                                 : Json(nullptr);
-    out["error_code"] = r.error_code.empty() ? (live ? out["error_code"] : Json(nullptr)) : Json(r.error_code);
+    out["error_code"] =
+        r.error_code.empty() ? (live ? out["error_code"] : Json(nullptr)) : Json(r.error_code);
     out["error"] = r.error.empty() ? (live ? out["error"] : Json(nullptr)) : Json(r.error);
     out["created_unix_ms"] = r.created_unix_ms;
     out["completed_unix_ms"] = r.completed_unix_ms ? Json(r.completed_unix_ms) : Json(nullptr);
-    out["updated_unix_ms"] = std::max({r.progress_unix_ms, r.desired_changed_unix_ms, r.settings_changed_unix_ms,
-                                       live ? live->job.updated_unix_ms : uint64_t{0}});
+    out["updated_unix_ms"] =
+        std::max({r.progress_unix_ms, r.desired_changed_unix_ms, r.settings_changed_unix_ms,
+                  live ? live->job.updated_unix_ms : uint64_t{0}});
     return Json(std::move(out));
 }
 
@@ -215,7 +237,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
 
         if (request.method == "GET" && request.path == "/api/v1/ingest/jobs") {
             PageQuery page;
-            if (auto bad = read_page_query(request, page)) return *bad;
+            if (auto bad = read_page_query(request, page))
+                return *bad;
             const auto listing = jobs_.ingest_jobs();
             Json::Array jobs;
             for (const auto& entry : listing.jobs) {
@@ -237,7 +260,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             if (!path || !path->isString() || path->asString().empty())
                 return http_error(400, "bad_request", "path is required");
             std::string display_name;
-            if (const auto* value = body.find("display_name")) display_name = value->asString();
+            if (const auto* value = body.find("display_name"))
+                display_name = value->asString();
             std::optional<bool> delete_source_on_clear;
             if (const auto* value = body.find("delete_source_on_clear"))
                 delete_source_on_clear = value->asBool();
@@ -248,11 +272,13 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             if (const auto* node = body.find("node_id")) {
                 std::string error;
                 auto parsed = parse_node_id(*node, error);
-                if (!parsed) return http_error(400, "bad_request", error);
-                if (*parsed != NodeId{}) owner = *parsed;
+                if (!parsed)
+                    return http_error(400, "bad_request", error);
+                if (*parsed != NodeId{})
+                    owner = *parsed;
             }
-            const auto result = jobs_.submit_ingest(owner, path->asString(), std::move(display_name),
-                                                    delete_source_on_clear);
+            const auto result = jobs_.submit_ingest(
+                owner, path->asString(), std::move(display_name), delete_source_on_clear);
             using Outcome = ClusterJobView::IngestSubmitResult::Outcome;
             switch (result.outcome) {
             case Outcome::submitted:
@@ -262,7 +288,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             case Outcome::not_member:
                 return http_error(409, "placement_failed", result.message, "node_not_member");
             case Outcome::not_capable:
-                return http_error(409, "placement_failed", result.message, "node_not_ingest_capable");
+                return http_error(409, "placement_failed", result.message,
+                                  "node_not_ingest_capable");
             case Outcome::unreachable:
                 return http_error(503, "node_unreachable", result.message);
             }
@@ -275,7 +302,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
         if (auto target = job_action(request.path, "/api/v1/ingest/jobs/")) {
             if (request.method == "GET" && target->second.empty()) {
                 auto detail = jobs_.ingest_job_detail(target->first);
-                if (!detail) return http_error(404, "not_found", "ingest job not found");
+                if (!detail)
+                    return http_error(404, "not_found", "ingest job not found");
                 return http_json(200, detail->dump());
             }
             if (request.method == "POST") {
@@ -284,18 +312,22 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                     target->second == "cancel" || target->second == "clear") {
                     result = jobs_.ingest_action(target->first, target->second);
                 } else if (auto file = file_action(target->second)) {
-                    result = jobs_.ingest_action(target->first, file->second + "_file", file->first);
+                    result =
+                        jobs_.ingest_action(target->first, file->second + "_file", file->first);
                 } else {
                     return http_error(404, "not_found", "unknown ingest action");
                 }
-                if (result.unreachable) return unreachable_error();
-                if (!result.changed) return action_error(result.exists);
+                if (result.unreachable)
+                    return unreachable_error();
+                if (!result.changed)
+                    return action_error(result.exists);
                 if (target->second == "clear") {
                     Json::Object out;
                     out["cleared"] = true;
                     return http_json(200, Json(std::move(out)).dump());
                 }
-                if (!result.updated) return action_error(result.exists);
+                if (!result.updated)
+                    return action_error(result.exists);
                 auto item = ingest_job_json(result.updated->job, false);
                 item["node_id"] = to_string(result.updated->node_id);
                 return http_json(200, item.dump());
@@ -319,12 +351,15 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             // The requests from this node's metadata, with each owner's live state from
             // the cluster view.
             PageQuery page;
-            if (auto bad = read_page_query(request, page)) return *bad;
+            if (auto bad = read_page_query(request, page))
+                return *bad;
             const auto listing = jobs_.torrent_jobs();
             std::map<NodeId, uint64_t> as_of;
-            for (const auto& source : listing.sources) as_of[source.node_id] = source.as_of_unix_ms;
+            for (const auto& source : listing.sources)
+                as_of[source.node_id] = source.as_of_unix_ms;
             Json::Array jobs;
-            for (const auto& r : torrents_.requests()) jobs.push_back(request_json(r, as_of));
+            for (const auto& r : torrents_.requests())
+                jobs.push_back(request_json(r, as_of));
             Json::Object out;
             page_json(jobs, "id", page, out);
             out["jobs"] = std::move(jobs);
@@ -341,15 +376,17 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 item["host"] = node.host;
                 item["local"] = node.local;
                 item["reachable"] = node.reachable;
-                item["as_of_unix_ms"] = node.as_of_unix_ms ? Json(node.as_of_unix_ms) : Json(nullptr);
+                item["as_of_unix_ms"] =
+                    node.as_of_unix_ms ? Json(node.as_of_unix_ms) : Json(nullptr);
                 item["accepting"] = node.offer.accepting && node.reachable;
-                item["not_accepting_reason"] =
-                    !node.reachable ? Json(std::string("unreachable"))
-                    : node.offer.not_accepting_reason.empty() ? Json(nullptr)
-                                                              : Json(node.offer.not_accepting_reason);
+                item["not_accepting_reason"] = !node.reachable ? Json(std::string("unreachable"))
+                                               : node.offer.not_accepting_reason.empty()
+                                                   ? Json(nullptr)
+                                                   : Json(node.offer.not_accepting_reason);
                 item["max_active"] = static_cast<uint64_t>(node.offer.max_active);
                 item["active_jobs"] = static_cast<uint64_t>(node.offer.active_jobs);
-                item["staging"] = node.staging ? staging_capacity_json(*node.staging) : Json(nullptr);
+                item["staging"] =
+                    node.staging ? staging_capacity_json(*node.staging) : Json(nullptr);
                 nodes.push_back(std::move(item));
             }
             Json::Object out;
@@ -368,8 +405,10 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             if (const auto* node = body.find("node_id")) {
                 std::string error;
                 auto parsed = parse_node_id(*node, error);
-                if (!parsed) return http_error(400, "bad_request", error);
-                if (*parsed != NodeId{}) pin = *parsed;
+                if (!parsed)
+                    return http_error(400, "bad_request", error);
+                if (*parsed != NodeId{})
+                    pin = *parsed;
             }
             std::optional<std::optional<uint64_t>> remove_after;
             if (std::string error; !parse_remove_after(body, remove_after, error))
@@ -377,7 +416,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             // Optional: created already paused, in the same write.
             bool paused = false;
             if (const auto* value = body.find("paused"); value && !value->isNull()) {
-                if (!value->isBool()) return http_error(400, "bad_request", "paused must be a boolean");
+                if (!value->isBool())
+                    return http_error(400, "bad_request", "paused must be a boolean");
                 paused = value->asBool();
             }
 
@@ -408,7 +448,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 root["node_id"] = outcome.node ? Json(to_string(*outcome.node)) : Json(nullptr);
                 return http_json(409, Json(std::move(root)).dump());
             }
-            if (outcome.status != 202) return outcome_error(outcome);
+            if (outcome.status != 202)
+                return outcome_error(outcome);
             Json::Object out;
             out["id"] = outcome.request->id;
             out["info_hash"] = outcome.request->info_hash;
@@ -424,7 +465,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             auto response = search_.search(it->second);
             Json::Array results;
             for (const auto& result : response.results) {
-                if (result.acquisition_ref.empty()) continue;
+                if (result.acquisition_ref.empty())
+                    continue;
                 Json::Object item;
                 item["acquisition_ref"] = result.acquisition_ref;
                 item["provider"] = result.provider;
@@ -432,11 +474,13 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 item["size_bytes"] = optional_u64(result.size_bytes);
                 item["seeders"] = optional_u64(result.seeders);
                 item["leechers"] = optional_u64(result.leechers);
-                item["published"] = result.published.empty() ? Json(nullptr) : Json(result.published);
+                item["published"] =
+                    result.published.empty() ? Json(nullptr) : Json(result.published);
                 results.emplace_back(std::move(item));
             }
             Json::Object errors;
-            for (const auto& [provider, message] : response.errors) errors[provider] = message;
+            for (const auto& [provider, message] : response.errors)
+                errors[provider] = message;
             Json::Object out;
             out["results"] = std::move(results);
             out["provider_errors"] = std::move(errors);
@@ -446,7 +490,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
         if (auto target = job_action(request.path, "/api/v1/torrents/jobs/")) {
             if (request.method == "GET" && target->second.empty()) {
                 auto existing = torrents_.request(target->first);
-                if (!existing) return http_error(404, "not_found", "torrent job not found");
+                if (!existing)
+                    return http_error(404, "not_found", "torrent job not found");
                 return http_json(200, request_json(*existing, live_ages()).dump());
             }
             if (request.method == "PATCH" && target->second.empty()) {
@@ -458,30 +503,36 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 if (const auto* node = body.find("node_id")) {
                     std::string error;
                     auto parsed = parse_node_id(*node, error);
-                    if (!parsed) return http_error(400, "bad_request", error);
-                    pin = *parsed == NodeId{} ? std::optional<NodeId>{} : std::optional<NodeId>{*parsed};
+                    if (!parsed)
+                        return http_error(400, "bad_request", error);
+                    pin = *parsed == NodeId{} ? std::optional<NodeId>{}
+                                              : std::optional<NodeId>{*parsed};
                 }
                 if (!remove_after && !pin)
                     return http_error(400, "bad_request", "remove_after_ms or node_id is required");
                 const auto outcome = torrents_.patch(target->first, remove_after, pin);
-                if (outcome.status != 200) return outcome_error(outcome);
+                if (outcome.status != 200)
+                    return outcome_error(outcome);
                 return http_json(200, request_json(*outcome.request, live_ages()).dump());
             }
             if (request.method == "POST") {
                 const auto& action = target->second;
-                if (action != "pause" && action != "resume" && action != "retry" && action != "cancel" &&
-                    action != "clear")
+                if (action != "pause" && action != "resume" && action != "retry" &&
+                    action != "cancel" && action != "clear")
                     return http_error(404, "not_found", "unknown torrent action");
                 const auto outcome = torrents_.act(target->first, action);
-                if (outcome.status != 202) return outcome_error(outcome);
+                if (outcome.status != 202)
+                    return outcome_error(outcome);
                 if (action == "clear") {
                     Json::Object out;
                     out["cleared"] = true;
                     return http_json(202, Json(std::move(out)).dump());
                 }
                 // Intent recorded; the owner applies it and `state` follows.
-                const auto shown = outcome.request ? outcome.request : torrents_.request(target->first);
-                if (!shown) return http_error(404, "not_found", "torrent job not found");
+                const auto shown =
+                    outcome.request ? outcome.request : torrents_.request(target->first);
+                if (!shown)
+                    return http_error(404, "not_found", "torrent job not found");
                 return http_json(202, request_json(*shown, live_ages()).dump());
             }
         }

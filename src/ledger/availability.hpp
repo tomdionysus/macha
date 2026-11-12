@@ -62,7 +62,6 @@ AvailabilitySurvey survey_by_diff(const std::shared_ptr<const TrieUnion>& mine,
 // For a survey some peer could not finish: what `last` found held by no
 // reachable node stays so in `next`, less what this node now holds, and is no
 // longer unknown.
-void keep_unavailable(AvailabilitySurvey& next, const AvailabilitySurvey& last,
-                      const HeldFn& held);
+void keep_unavailable(AvailabilitySurvey& next, const AvailabilitySurvey& last, const HeldFn& held);
 
 } // namespace macha

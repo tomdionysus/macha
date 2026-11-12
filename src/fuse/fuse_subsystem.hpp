@@ -69,13 +69,17 @@ class FuseSubsystem final : public Subsystem {
     FuseSubsystem(const SubsystemContext&, std::unique_ptr<FuseMountDriver>);
     ~FuseSubsystem() override;
 
-    std::string_view name() const noexcept override { return "fuse"; }
+    std::string_view name() const noexcept override {
+        return "fuse";
+    }
     void start() override;
     void stop() override;
     void attach_fault_sink(FaultSink) override;
 
     // For tests; core uses SubsystemRegistry::fuse().
-    const std::shared_ptr<FuseFrontend>& frontend() const noexcept { return frontend_; }
+    const std::shared_ptr<FuseFrontend>& frontend() const noexcept {
+        return frontend_;
+    }
 
   private:
     void run_mount(std::stop_token);

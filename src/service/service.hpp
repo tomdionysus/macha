@@ -1,33 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "contract/thread_safety.hpp"
-#include "metadata/metadata_server.hpp"
-#include "api/acquisition_api.hpp"
-#include "catalogue/catalogue.hpp"
-#include "api/catalogue_api.hpp"
-#include "catalogue/catalogue_hints.hpp"
-#include "service/convergence_demand.hpp"
-#include "filesystem/filesystem.hpp"
-#include "fuse/fuse_frontend.hpp"
-#include "filesystem/hydration.hpp"
 #include "acquisition/ingest.hpp"
+#include "api/acquisition_api.hpp"
+#include "api/catalogue_api.hpp"
 #include "api/manage_api.hpp"
-#include "catalogue/media_catalogue.hpp"
-#include "catalogue/media_information.hpp"
-#include "playback/playback.hpp"
 #include "api/session_api.hpp"
+#include "api/status_api.hpp"
 #include "api/users_api.hpp"
 #include "api/web_api.hpp"
-#include "api/status_api.hpp"
-#include "torrent/torrent.hpp"
+#include "auth/accounts.hpp"
+#include "catalogue/catalogue.hpp"
+#include "catalogue/catalogue_hints.hpp"
+#include "catalogue/media_catalogue.hpp"
+#include "catalogue/media_information.hpp"
+#include "cluster/local_services.hpp"
+#include "cluster/node_resources.hpp"
+#include "contract/thread_safety.hpp"
+#include "filesystem/filesystem.hpp"
+#include "filesystem/hydration.hpp"
+#include "fuse/fuse_frontend.hpp"
+#include "metadata/metadata_server.hpp"
 #include "observation.hpp"
+#include "playback/playback.hpp"
+#include "service/convergence_demand.hpp"
 #include "service/maintenance.hpp"
 #include "service/maintenance_clock.hpp"
 #include "service/node_services.hpp"
-#include "auth/accounts.hpp"
-#include "cluster/local_services.hpp"
-#include "cluster/node_resources.hpp"
+#include "torrent/torrent.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
@@ -40,7 +40,6 @@
 #include <vector>
 
 namespace macha {
-
 
 // What a test injects into a Service. Production passes none of it: the
 // system clock, every call placed, no trace and no lifecycle record.
@@ -138,8 +137,7 @@ class Service {
     Service(Config, ClusterKeys, std::chrono::milliseconds durability_batch_window,
             NodeRuntime::StartupStageHook startup_stage_hook = {},
             MaintenanceStageHook maintenance_stage_hook = {},
-            StartupStallHandler startup_stall_handler = {},
-            ServiceInstruments instruments = {});
+            StartupStallHandler startup_stall_handler = {}, ServiceInstruments instruments = {});
     ~Service();
     void start();
     void request_stop();

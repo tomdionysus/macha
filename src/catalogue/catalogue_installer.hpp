@@ -22,7 +22,9 @@ class CatalogueInstaller {
   public:
     CatalogueInstaller(CatalogueManager& catalogue, NodeEvents& events) noexcept
         : catalogue_(catalogue), events_(events) {}
-    ~CatalogueInstaller() { stop(); }
+    ~CatalogueInstaller() {
+        stop();
+    }
     CatalogueInstaller(const CatalogueInstaller&) = delete;
     CatalogueInstaller& operator=(const CatalogueInstaller&) = delete;
 

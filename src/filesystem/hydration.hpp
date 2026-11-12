@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "cluster/net.hpp"
 #include "config.hpp"
 #include "contract/thread_safety.hpp"
 #include "metadata/metadata.hpp"
-#include "cluster/net.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -73,7 +73,9 @@ class HydrationHintProvider {
     virtual std::vector<HydrationHint> hints() = 0;
     // Optional: wakes a blocked hydrator when the hint set changes. Hints stay
     // authoritative.
-    virtual void set_wake_callback(std::function<void()> callback) { (void)callback; }
+    virtual void set_wake_callback(std::function<void()> callback) {
+        (void)callback;
+    }
 };
 
 // Weighted fair scheduler for ordered runs. Hints for the same run merge and
@@ -83,10 +85,9 @@ class HydrationScheduler {
     std::map<std::string, double> virtual_finish_;
 
   public:
-    std::optional<HydrationRequest>
-    next(const std::vector<HydrationHint>&,
-         const std::function<bool(const ObjectId&)>& present,
-         const std::function<bool(const ObjectId&)>& blocked = {});
+    std::optional<HydrationRequest> next(const std::vector<HydrationHint>&,
+                                         const std::function<bool(const ObjectId&)>& present,
+                                         const std::function<bool(const ObjectId&)>& blocked = {});
     void reset();
 };
 
@@ -99,7 +100,9 @@ class ReadAheadHintProvider final : public HydrationHintProvider {
 
   public:
     ReadAheadHintProvider(PlaybackTracker&, const HydrationConfig&, size_t window);
-    std::string_view name() const override { return "read_ahead"; }
+    std::string_view name() const override {
+        return "read_ahead";
+    }
     std::vector<HydrationHint> hints() override;
     void reconfigure(const HydrationConfig&, size_t window);
 };
@@ -112,7 +115,9 @@ class CurrentFileHintProvider final : public HydrationHintProvider {
 
   public:
     CurrentFileHintProvider(PlaybackTracker&, const HydrationConfig&);
-    std::string_view name() const override { return "current_file"; }
+    std::string_view name() const override {
+        return "current_file";
+    }
     std::vector<HydrationHint> hints() override;
     void reconfigure(const HydrationConfig&);
 };
@@ -129,7 +134,9 @@ class CatalogueSequenceHintProvider final : public HydrationHintProvider {
   public:
     CatalogueSequenceHintProvider(PlaybackTracker&, FileSystem&, CatalogueManager&,
                                   const HydrationConfig&);
-    std::string_view name() const override { return "catalogue"; }
+    std::string_view name() const override {
+        return "catalogue";
+    }
     std::vector<HydrationHint> hints() override;
     void reconfigure(const HydrationConfig&);
 };
@@ -216,9 +223,15 @@ class HydrationManager {
     void request_stop();
     void stop();
     void reconfigure(HydrationConfig, size_t read_ahead_extents);
-    CacheHydrator& hydrator() { return hydrator_; }
-    void add_provider(std::shared_ptr<HydrationHintProvider> provider) { hydrator_.add_provider(std::move(provider)); }
-    void remove_provider(const HydrationHintProvider* provider) { hydrator_.remove_provider(provider); }
+    CacheHydrator& hydrator() {
+        return hydrator_;
+    }
+    void add_provider(std::shared_ptr<HydrationHintProvider> provider) {
+        hydrator_.add_provider(std::move(provider));
+    }
+    void remove_provider(const HydrationHintProvider* provider) {
+        hydrator_.remove_provider(provider);
+    }
 };
 
 } // namespace macha

@@ -81,7 +81,9 @@ struct Author {
         head.entries[to] = std::move(entry);
     }
     // Takes everything another node has, keeping its own identity.
-    void adopt(const MetadataSnapshot& other) { head = other; }
+    void adopt(const MetadataSnapshot& other) {
+        head = other;
+    }
 };
 
 Hash256 head_of(const MetadataSnapshot& snapshot) {

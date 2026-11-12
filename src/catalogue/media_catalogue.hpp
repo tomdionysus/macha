@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "metadata/metadata_server.hpp"
 #include "catalogue/catalogue.hpp"
 #include "catalogue/catalogue_hints.hpp"
 #include "config.hpp"
 #include "contract/thread_safety.hpp"
 #include "filesystem/filesystem.hpp"
-#include "metadata/namespace_tree.hpp"
 #include "json.hpp"
+#include "metadata/metadata_server.hpp"
+#include "metadata/namespace_tree.hpp"
 
-#include <chrono>
-#include <functional>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -141,7 +141,9 @@ class HttpClient {
     virtual ~HttpClient() = default;
     virtual void request_stop() noexcept {}
     virtual void reset_stop() noexcept {}
-    virtual bool stop_requested() const noexcept { return false; }
+    virtual bool stop_requested() const noexcept {
+        return false;
+    }
     virtual RemoteHttpResponse get(std::string_view url,
                                    const std::vector<std::string>& headers = {},
                                    size_t maximum_bytes = 16 * 1024 * 1024) = 0;
@@ -153,8 +155,12 @@ class CurlHttpClient final : public HttpClient {
   public:
     CurlHttpClient();
     ~CurlHttpClient() override;
-    void request_stop() noexcept override { stop_requested_.store(true, std::memory_order_relaxed); }
-    void reset_stop() noexcept override { stop_requested_.store(false, std::memory_order_relaxed); }
+    void request_stop() noexcept override {
+        stop_requested_.store(true, std::memory_order_relaxed);
+    }
+    void reset_stop() noexcept override {
+        stop_requested_.store(false, std::memory_order_relaxed);
+    }
     bool stop_requested() const noexcept override {
         return stop_requested_.load(std::memory_order_relaxed);
     }
@@ -256,7 +262,9 @@ class MetadataProvider {
     virtual std::string_view name() const noexcept = 0;
     virtual bool supports(MediaProbeKind) const = 0;
     virtual std::optional<ProviderMatch> lookup(const MediaProbe&) = 0;
-    virtual std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) { return {}; }
+    virtual std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) {
+        return {};
+    }
     // Images for a role of record `kind`:`id` (TMDB `movie`/`tv`, MusicBrainz
     // `release`); `numbers` narrow a show to a season or episode.
     virtual std::vector<ArtworkOption> artwork_options(std::string_view /*kind*/,
@@ -280,15 +288,19 @@ class TmdbProvider final : public MetadataProvider {
     std::map<std::string, std::optional<Json>> season_cache_;
     size_t cache_bytes_{};
 
-    Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
-    std::optional<Json> api_optional(std::string_view path,
-                                    const std::vector<std::pair<std::string, std::string>>& query = {});
+    Json api(std::string_view path,
+             const std::vector<std::pair<std::string, std::string>>& query = {});
+    std::optional<Json>
+    api_optional(std::string_view path,
+                 const std::vector<std::pair<std::string, std::string>>& query = {});
     std::string image_url(std::string_view path) const;
     std::optional<Json> find_show(const MediaProbe&);
 
   public:
     TmdbProvider(HttpClient&, CatalogueTmdbConfig);
-    std::string_view name() const noexcept override { return "tmdb"; }
+    std::string_view name() const noexcept override {
+        return "tmdb";
+    }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
     std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) override;
@@ -298,7 +310,9 @@ class TmdbProvider final : public MetadataProvider {
     size_t cache_entries() const noexcept {
         return movie_cache_.size() + show_cache_.size() + season_cache_.size();
     }
-    size_t cache_bytes() const noexcept { return cache_bytes_; }
+    size_t cache_bytes() const noexcept {
+        return cache_bytes_;
+    }
 };
 
 class MusicBrainzProvider final : public MetadataProvider {
@@ -313,7 +327,8 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::shared_ptr<ProviderGate> gate_;
     bool interactive_{};
 
-    Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
+    Json api(std::string_view path,
+             const std::vector<std::pair<std::string, std::string>>& query = {});
     std::optional<Json> release_by_id(std::string_view);
     std::optional<Json> find_release(const MediaProbe&);
     std::optional<Json> find_recording(const MediaProbe&);
@@ -329,7 +344,9 @@ class MusicBrainzProvider final : public MetadataProvider {
     static constexpr std::chrono::seconds interactive_wait_max{5};
     MusicBrainzProvider(HttpClient&, CatalogueMusicBrainzConfig,
                         std::shared_ptr<ProviderGate> gate = {}, bool interactive = false);
-    std::string_view name() const noexcept override { return "musicbrainz"; }
+    std::string_view name() const noexcept override {
+        return "musicbrainz";
+    }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
     std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) override;
@@ -341,7 +358,9 @@ class MusicBrainzProvider final : public MetadataProvider {
         return release_cache_.size() + release_id_cache_.size() + recording_cache_.size() +
                cover_art_cache_.size();
     }
-    size_t cache_bytes() const noexcept { return cache_bytes_; }
+    size_t cache_bytes() const noexcept {
+        return cache_bytes_;
+    }
 };
 
 class DiscogsProvider final : public MetadataProvider {
@@ -361,11 +380,17 @@ class DiscogsProvider final : public MetadataProvider {
 
   public:
     DiscogsProvider(HttpClient&, CatalogueDiscogsConfig);
-    std::string_view name() const noexcept override { return "discogs"; }
+    std::string_view name() const noexcept override {
+        return "discogs";
+    }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
-    size_t cache_entries() const noexcept { return search_cache_.size() + release_cache_.size(); }
-    size_t cache_bytes() const noexcept { return cache_bytes_; }
+    size_t cache_entries() const noexcept {
+        return search_cache_.size() + release_cache_.size();
+    }
+    size_t cache_bytes() const noexcept {
+        return cache_bytes_;
+    }
 };
 
 // The version of the rules the scanner catalogues a book by, stamped on each
@@ -397,10 +422,12 @@ class OpenLibraryProvider final : public MetadataProvider {
     std::shared_ptr<ProviderGate> gate_;
     bool interactive_{};
 
-    Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
+    Json api(std::string_view path,
+             const std::vector<std::pair<std::string, std::string>>& query = {});
     // None for a record Open Library has not got.
-    std::optional<Json> api_optional(std::string_view path,
-                                     const std::vector<std::pair<std::string, std::string>>& query = {});
+    std::optional<Json>
+    api_optional(std::string_view path,
+                 const std::vector<std::pair<std::string, std::string>>& query = {});
     std::optional<Json> edition_by_isbn(std::string_view isbn);
     std::optional<Json> edition_by_id(std::string_view olid);
     std::optional<Json> work_by_id(std::string_view olid);
@@ -412,7 +439,9 @@ class OpenLibraryProvider final : public MetadataProvider {
     static constexpr std::chrono::seconds interactive_wait_max{5};
     OpenLibraryProvider(HttpClient&, CatalogueOpenLibraryConfig,
                         std::shared_ptr<ProviderGate> gate = {}, bool interactive = false);
-    std::string_view name() const noexcept override { return "openlibrary"; }
+    std::string_view name() const noexcept override {
+        return "openlibrary";
+    }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
     std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) override;
@@ -423,7 +452,9 @@ class OpenLibraryProvider final : public MetadataProvider {
         return edition_cache_.size() + work_cache_.size() + author_cache_.size() +
                search_cache_.size();
     }
-    size_t cache_bytes() const noexcept { return cache_bytes_; }
+    size_t cache_bytes() const noexcept {
+        return cache_bytes_;
+    }
 };
 
 // The catalogue items a book probe describes on its own: the book, its
@@ -440,24 +471,29 @@ class CatalogueScanProvider {
     virtual std::string_view name() const noexcept = 0;
     virtual const std::vector<std::string>& roots() const noexcept = 0;
     // Whether this provider's files have playback profiles to build.
-    virtual bool profiles_media() const noexcept { return true; }
+    virtual bool profiles_media() const noexcept {
+        return true;
+    }
     // Cheap discovery predicate: never reads media; probing is hint processing.
     virtual bool accepts_path(std::string_view path) const noexcept = 0;
-    virtual MediaProbeFile probe_file(FileSystem&, std::string_view root,
-                                      std::string_view path, const FsEntry&) = 0;
+    virtual MediaProbeFile probe_file(FileSystem&, std::string_view root, std::string_view path,
+                                      const FsEntry&) = 0;
     std::vector<MediaProbeCandidate> probe_candidates(FileSystem& fs, std::string_view root,
-                                                       std::string_view path, const FsEntry& entry) {
+                                                      std::string_view path, const FsEntry& entry) {
         return probe_file(fs, root, path, entry).candidates;
     }
-    std::optional<MediaProbe> probe(FileSystem& fs, std::string_view root,
-                                    std::string_view path, const FsEntry& entry) {
+    std::optional<MediaProbe> probe(FileSystem& fs, std::string_view root, std::string_view path,
+                                    const FsEntry& entry) {
         auto candidates = probe_candidates(fs, root, path, entry);
-        if (candidates.empty()) return {};
+        if (candidates.empty())
+            return {};
         return std::move(candidates.front().probe);
     }
     virtual std::optional<ProviderMatch> lookup(const MediaProbe&) = 0;
     // The named metadata provider ("tmdb", "musicbrainz") when it is configured.
-    virtual MetadataProvider* metadata(std::string_view) noexcept { return nullptr; }
+    virtual MetadataProvider* metadata(std::string_view) noexcept {
+        return nullptr;
+    }
 };
 
 class MovieScanProvider final : public CatalogueScanProvider {
@@ -466,8 +502,12 @@ class MovieScanProvider final : public CatalogueScanProvider {
 
   public:
     MovieScanProvider(HttpClient&, CatalogueMovieProviderConfig);
-    std::string_view name() const noexcept override { return "movies"; }
-    const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    std::string_view name() const noexcept override {
+        return "movies";
+    }
+    const std::vector<std::string>& roots() const noexcept override {
+        return roots_;
+    }
     bool accepts_path(std::string_view path) const noexcept override;
     MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
                               const FsEntry&) override;
@@ -485,8 +525,12 @@ class TvScanProvider final : public CatalogueScanProvider {
 
   public:
     TvScanProvider(HttpClient&, CatalogueTvProviderConfig);
-    std::string_view name() const noexcept override { return "tv"; }
-    const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    std::string_view name() const noexcept override {
+        return "tv";
+    }
+    const std::vector<std::string>& roots() const noexcept override {
+        return roots_;
+    }
     bool accepts_path(std::string_view path) const noexcept override;
     MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
                               const FsEntry&) override;
@@ -508,8 +552,12 @@ class MusicScanProvider final : public CatalogueScanProvider {
                       size_t max_artwork_bytes = 16 * 1024 * 1024,
                       std::shared_ptr<ProviderGate> musicbrainz_gate = {},
                       bool interactive = false);
-    std::string_view name() const noexcept override { return "music"; }
-    const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    std::string_view name() const noexcept override {
+        return "music";
+    }
+    const std::vector<std::string>& roots() const noexcept override {
+        return roots_;
+    }
     bool accepts_path(std::string_view path) const noexcept override;
     MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
                               const FsEntry&) override;
@@ -529,9 +577,15 @@ class BookScanProvider final : public CatalogueScanProvider {
     BookScanProvider(HttpClient&, CatalogueBookProviderConfig,
                      size_t max_artwork_bytes = 16 * 1024 * 1024,
                      std::shared_ptr<ProviderGate> openlibrary_gate = {}, bool interactive = false);
-    std::string_view name() const noexcept override { return "books"; }
-    const std::vector<std::string>& roots() const noexcept override { return roots_; }
-    bool profiles_media() const noexcept override { return false; }
+    std::string_view name() const noexcept override {
+        return "books";
+    }
+    const std::vector<std::string>& roots() const noexcept override {
+        return roots_;
+    }
+    bool profiles_media() const noexcept override {
+        return false;
+    }
     bool accepts_path(std::string_view path) const noexcept override;
     MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
                               const FsEntry&) override;
@@ -551,9 +605,9 @@ struct ProviderRefMatch {
 // The files under one catalogue root in one metadata snapshot. Discovery and the
 // reconciliation's namespace signature must share a generation: never mix this
 // with live readdir()/getattr().
-std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
-    std::string_view root, const MetadataSnapshot& namespace_snapshot,
-    const NamespaceNodeStore* namespace_nodes, std::stop_token stop = {});
+std::vector<std::pair<std::string, FsEntry>>
+catalogue_snapshot_files(std::string_view root, const MetadataSnapshot& namespace_snapshot,
+                         const NamespaceNodeStore* namespace_nodes, std::stop_token stop = {});
 
 class CatalogueScanner {
     NodeRuntime& node_;
@@ -611,8 +665,8 @@ class CatalogueScanner {
     void configure_providers() MACHA_REQUIRES(config_mutex_);
     bool coordinator() const;
     void loop(std::stop_token);
-    size_t scan_once(std::stop_token, bool force, std::string_view hint_source,
-                     int hint_priority, bool unique_source_ref = false);
+    size_t scan_once(std::stop_token, bool force, std::string_view hint_source, int hint_priority,
+                     bool unique_source_ref = false);
     struct PreparedHintMatch {
         std::string hint_id;
         std::string provider;
@@ -639,25 +693,24 @@ class CatalogueScanner {
     bool stage_remote_artwork(ProviderMatch& match,
                               const std::function<bool(std::string_view)>& locked,
                               std::stop_token stop, size_t max_artwork_bytes,
-                              DistributedStore::DurabilityBatch& artwork_batch,
-                              FrameType frame);
+                              DistributedStore::DurabilityBatch& artwork_batch, FrameType frame);
     // The editor's metadata provider for a scan provider ("movies", "tv",
     // "music") and a metadata provider name.
-    static MetadataProvider* editor_metadata(
-        const std::vector<std::unique_ptr<CatalogueScanProvider>>& providers,
-        std::string_view scan_provider, std::string_view metadata_provider);
+    static MetadataProvider*
+    editor_metadata(const std::vector<std::unique_ptr<CatalogueScanProvider>>& providers,
+                    std::string_view scan_provider, std::string_view metadata_provider);
 
   public:
     // One hint against one namespace snapshot. A hint created after
     // `snapshot_taken_unix_ms` may name a file the snapshot lacks, and is
     // deferred rather than failed.
-    std::optional<PreparedHintMatch> prepare_hint(
-        const CatalogueHint&, std::stop_token, const MetadataSnapshot& namespace_snapshot,
-        uint64_t snapshot_taken_unix_ms, DistributedStore::DurabilityBatch& artwork_batch);
+    std::optional<PreparedHintMatch> prepare_hint(const CatalogueHint&, std::stop_token,
+                                                  const MetadataSnapshot& namespace_snapshot,
+                                                  uint64_t snapshot_taken_unix_ms,
+                                                  DistributedStore::DurabilityBatch& artwork_batch);
 
     CatalogueScanner(NodeRuntime&, MetadataServer&, FileSystem&, CatalogueManager&,
-                     CatalogueHintQueue&,
-                     CatalogueScannerConfig, std::unique_ptr<HttpClient> = {},
+                     CatalogueHintQueue&, CatalogueScannerConfig, std::unique_ptr<HttpClient> = {},
                      std::chrono::milliseconds diagnostic_interval = std::chrono::seconds(5),
                      std::shared_ptr<MediaEngine> profile_engine = {},
                      MediaInformationService* media_information = nullptr);

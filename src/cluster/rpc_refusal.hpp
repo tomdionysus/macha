@@ -58,8 +58,10 @@ inline bool rpc_try_later(const RpcRefusal& refusal) noexcept {
     case 500:
     case 502:
     case 503:
-    case 504: return true;
-    default: return false;
+    case 504:
+        return true;
+    default:
+        return false;
     }
 }
 
