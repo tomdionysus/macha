@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Build Macha's tests instrumented for coverage, run them, and report.
 #
 # Works on both toolchains this project is built with, which need entirely

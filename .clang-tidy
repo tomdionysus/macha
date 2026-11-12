@@ -1,0 +1,28 @@
+---
+# clang-tidy for Macha's sources (src/ and tools/). Bug-finding, concurrency and
+# performance checks, plus the static analyser. Style is clang-format's job;
+# narrowing is the compiler's.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  clang-analyzer-*,
+  -clang-analyzer-optin.performance.Padding,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  concurrency-*,
+  performance-*,
+  -performance-enum-size,
+  misc-*,
+  -misc-const-correctness,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  -misc-no-recursion,
+  -misc-use-anonymous-namespace,
+  modernize-use-override,
+  modernize-use-nullptr,
+  modernize-use-emplace,
+  readability-container-size-empty,
+  readability-redundant-string-cstr
+WarningsAsErrors: "*"
+HeaderFilterRegex: "/(src|tools)/"
