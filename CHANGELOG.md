@@ -1,5 +1,19 @@
 # Current release
 
+## 0.94.0: the cluster transport is Dannan's
+
+The transport cutover. Every node runs Dannan 0.5.3's node beneath Macha: its
+transport, roster, telemetry, public connectivity and inbound answer, with Macha's
+message types on its routes (Macha's types numbered from 512). Nodes on 0.93 and on
+0.94 cannot talk to each other, so every node changes together. Before the first
+start, `dannan-import-macha <state>` converts the roster, the inbound answer and the
+last-known telemetry, keeping each original as `<name>.macha`; restoring those and
+reinstalling 0.93.6 is the rollback. A node hosts extents while it carries the
+`dagda/extents` advert. Each cluster call names its deadline: control 2 min,
+metadata 5 min, object transfer 30 min, presence probe 2 min. The transport and Macha
+share one retained-memory budget, the node's. Dannan's journal lines go through
+Macha's log, each led by its scope.
+
 ## 0.93.6: repair comes back after yielding to a viewer
 
 Repair: a step that yielded to a viewer or loader set no wake for the next one. The
