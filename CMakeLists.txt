@@ -770,10 +770,11 @@ if(MACHA_BUILD_TESTS)
                 COMMAND ${MACHA_LCOV} --quiet --zerocounters --directory .
                 COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/run-tests.sh ${CMAKE_BINARY_DIR}
                 COMMAND ${MACHA_LCOV} --quiet --capture --directory . --output-file coverage/all.info
-                    --ignore-errors mismatch,negative,unused
+                    --ignore-errors mismatch,negative,unused,inconsistent
                 COMMAND ${MACHA_LCOV} --quiet --extract coverage/all.info
                     "${CMAKE_CURRENT_SOURCE_DIR}/src/*" --output-file coverage/coverage.info
-                COMMAND ${MACHA_LCOV} --summary coverage/coverage.info
+                    --ignore-errors inconsistent,unused
+                COMMAND ${MACHA_LCOV} --summary coverage/coverage.info --ignore-errors inconsistent
                 WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
                 DEPENDS macha-tests
                 USES_TERMINAL)
