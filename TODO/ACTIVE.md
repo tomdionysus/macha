@@ -114,7 +114,12 @@ corruption (now seen on macnessa, 2026-11-06).
 
 ## Cluster state (2026-11-12, read from the nodes at 22:15Z)
 
-- **Both on 0.94.0** (`/api/v1/health` on each), service active. inverbeg 10:59Z, macnessa 11:00Z, by
+- **Both on 0.94.2** since 2026-11-13 (inverbeg 15:30Z, macnessa 15:31Z; met over both lanes, writable at 171521,
+  `replicas=2/2`): the first optimised build (RelWithDebInfo), built and gated on corvus-develop, tarball sha256
+  `b6d1b65a...0d95`, installed by `build/install-0.94.2.sh` (rollback: `/root/pre-0.94.2/`, 0.94.0's binaries,
+  libdannan and config). inverbeg logged one `torrent alert queue overflowed: 1 alert types lost` at start, its
+  first in the journal since it became persistent; recovered by design from the bitfield; watch for a repeat.
+- **Before that, both on 0.94.0** (`/api/v1/health` on each), service active. inverbeg 10:59Z, macnessa 11:00Z, by
   `build/install-0.94.0.sh` (untracked). Rollback per node: stop; move each of `membership/known-nodes.bin.macha`,
   `connectivity/inbound.bin.macha`, `telemetry/last-known.bin.macha` back over its name (all six files present);
   restore `/root/pre-0.94.0/` (`bin.tgz`, `macha.yaml`, `state.tgz`: 0.93.6); start. inverbeg lost power 2026-11-11
