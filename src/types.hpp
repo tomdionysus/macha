@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "dannan/identity/crypto.h"
+#include "dannan/identity/node_id.h"
+
 #include <array>
 #include <chrono>
 #include <compare>
@@ -15,15 +18,10 @@ namespace macha {
 using Bytes = std::vector<uint8_t>;
 using Clock = std::chrono::steady_clock;
 
-struct NodeId {
-    std::array<uint8_t, 16> bytes{};
-    auto operator<=>(const NodeId&) const = default;
-};
-
-struct Hash256 {
-    std::array<uint8_t, 32> bytes{};
-    auto operator<=>(const Hash256&) const = default;
-};
+// One definition of each identity across the stack: Dannan's.
+using NodeId = dannan::identity::NodeId;
+using Hash256 = dannan::identity::Hash256;
+using dannan::identity::to_string;
 
 using ObjectId = Hash256;
 
@@ -98,7 +96,6 @@ struct SessionIdentity {
 
 std::string hex(std::span<const uint8_t>);
 std::optional<Bytes> unhex(const std::string&);
-std::string to_string(const NodeId&);
 std::string to_string(const ObjectId&);
 std::string endpoint_identity_key(std::string_view host, uint16_t port);
 std::string identity_reset_key(std::string_view host, uint16_t port);
