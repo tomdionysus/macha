@@ -1739,23 +1739,25 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
     CHECK(gated.runs_completed == claimed.runs_completed);
 
     repair_gate.open();
-    const bool settled_in_two = wait_until(
+    const bool burst_served = wait_until(
         [&] {
             const auto diagnostics = s1.metadata_convergence_diagnostics();
+            // A run after the held one served the whole burst.
             return !diagnostics.scheduled && diagnostics.runs_completed > claimed.runs_completed &&
+                   diagnostics.latest_generation >= final_generation &&
                    s1.local_state().replica().committed_generation() == final_generation;
         },
         10s);
-    if (!settled_in_two) {
+    if (!burst_served) {
         const auto seen = s1.metadata_convergence_diagnostics();
         std::cerr << "convergence not settled: scheduled=" << seen.scheduled << " runs_scheduled=+"
                   << (seen.runs_scheduled - claimed.runs_scheduled) << " runs_completed=+"
                   << (seen.runs_completed - claimed.runs_completed)
                   << " committed=" << s1.local_state().replica().committed_generation()
-                  << " final=" << final_generation << " metadata_events=+"
-                  << (metadata_events() - events_claimed) << '\n';
+                  << " final=" << final_generation << " latest=" << seen.latest_generation
+                  << " metadata_events=+" << (metadata_events() - events_claimed) << '\n';
     }
-    REQUIRE(settled_in_two);
+    REQUIRE(burst_served);
 
     // The burst coalesced: far fewer runs than commits, whatever else woke one.
     const auto settled = s1.metadata_convergence_diagnostics();
