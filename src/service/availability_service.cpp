@@ -454,6 +454,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         std::vector<RemoteTrie> tries;
         tries.reserve(hosts.size());
         std::vector<TrieSource*> sources;
+        sources.reserve(hosts.size());
         for (const auto& host : hosts)
             sources.push_back(&tries.emplace_back(node_, host));
         std::vector<PeerDiff> diffs;
