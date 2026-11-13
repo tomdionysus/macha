@@ -34,12 +34,36 @@ their owners: [`2026-11-08-found-issues.md`](2026-11-08-found-issues.md).
 3. **Release 0.94.1**: CHANGELOG, CMake and README version; annotated tag `0.94.0` on `f28414e` and `0.94.1` on the
    release commit; fast-forward `develop` to the branch and `main` to `develop`; push with tags; build on macnessa,
    ship the tarball, inverbeg first.
-4. **The store cutover (task 8)**: review Dagda by reading its code, then build it on the tag Dagda cuts. Dagda is on
+4. **Macha as a Debian package on Dannan 0.5.6** (operator, 2026-11-13: "Yes, cut 0.5.6"; Macha gets its own deb,
+   and libdannan comes in as a package dependency, not in the tarball). Dannan 0.5.6 brings `libdannan0.5.6` (SONAME
+   `libdannan.so.0.5.6`), `libdannan-dev` (exact) and `dannan-tools` (`dannan-ca`, `dannan-import-macha`,
+   `dannan-version`), in the tomcully.com apt repo (`../tomcully-apt`; signing and upload are the operator's).
+   Macha's deb follows Manannan's pattern (debian/ with debhelper over CMake, a build-deb script versioned from git
+   describe, CI with lintian, arm64 and x86-64), `Depends: libdannan0.5.6 (= exact)` and `dannan-tools`; CMake pins
+   the exact Dannan version. Settle rollback under apt (the previous version reinstalled) against today's
+   `/root/pre-V`. After 0.94.2 ships. **Dannan 0.5.6 is tagged and published** (2026-11-13, main `081439c`, no
+   library change from 0.5.5; trixie main, amd64 and arm64): `libdannan0.5.6` (`/usr/lib/<multiarch>`, SONAME the
+   whole version), `libdannan-dev` (CMake package in `/usr/lib/<multiarch>/cmake/dannan`, ExactVersion; Depends
+   `libdannan0.5.6 (= 0.5.6)`, `libboost-dev (>= 1.83)`, `libssl-dev`), `dannan-tools` (with man pages), dbgsym for
+   both. Macha: `find_package(dannan 0.5.6 CONFIG REQUIRED)`; Build-Depends `libdannan-dev (= 0.5.6)`; Depends from
+   shlibs plus `dannan-tools`. Repo: `curl -fsSLo /etc/apt/sources.list.d/tomcully.sources
+   https://tomcully.com/apt/tomcully.sources`. Nothing installed on the Pis yet: that is the operator's word.
+5. **The store cutover (task 8)**: review Dagda by reading its code, then build it on the tag Dagda cuts. Dagda is on
    `feature/manifest-lock` at `c264fa2` (a 0.1.2 version commit; tags `0.1.0` and `0.1.1` exist, 0.1.2 not yet);
    `dagda-migrate` refusing a second manifest pass is the 0.1.2 change. Unproved for the cutover: macnessa's
    migration bytes and time at 6.3 TB (read rates measured: macnessa 103 MB/s, inverbeg 87 MB/s, so about 2 to
    2.5 days there and about 20 h on inverbeg). Dagda names its own deadlines; the rehearsal on corvus-develop passed.
-5. **Status thread names** (operator, 2026-11-11): the port maps Dannan's threads to Macha's names in Status
+   Decided 2026-11-13 (Dagda asked; operator: Macha's code, this session's call): `MachaLogSink::write`
+   (`dannan_bridge.cpp`) writes the message alone for any `dagda.` scope, so store lines read exactly as Macha's
+   (Dagda restores Macha's text and level for every line before 0.1.2); Dannan's lines keep their scope. Lands with
+   the cutover, not before (operator, 2026-11-13: do not start the Dagda work).
+   Dagda 0.1.2 tagged 2026-11-13 (local, on Dannan 0.5.3): manifest pass under flock, every store journal line in
+   Macha's text and level (`../dagda/TODO/2026-11-12-journal-mapping.md`, section 8 the differences left), Dagda's
+   open lines at DEBUG. For the facade: write " table=" on "availability surveyed" (Dagda cannot know it); fill
+   Reachability's optional `entries` and `extents` from the namespace counts (DIAG maintenance-inventory); the
+   provider keeps its own lines at 8a. Asked of Dagda before the review: its 15 forked-child TSan cases that pass
+   only alone, and the 2 simulated crashes exiting with a thread unjoined.
+6. **Status thread names** (operator, 2026-11-11): the port maps Dannan's threads to Macha's names in Status
    `threads[]`. Change every client (Core and each client session) to Dannan's real names, announced first, then
    drop the mapping.
 
