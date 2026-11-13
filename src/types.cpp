@@ -39,10 +39,6 @@ std::optional<Bytes> unhex(const std::string& value) {
     return out;
 }
 
-std::string to_string(const NodeId& id) {
-    return hex(id.bytes);
-}
-
 std::string to_string(const ObjectId& id) {
     return hex(id.bytes);
 }

@@ -50,7 +50,30 @@ re-checked against `develop` at `875df7e`: 100 of its 104 Macha paths exist (abo
    0.94.x node's state (control store, ledgers, a pack sample) with the verifier listing every id before and after;
    custody provisioned and backed up off-node; each node's control store copied off-node; then both nodes at once.
 
+## Macha's own items from the stack's needs (Dannan's list P6, 2026-11-13)
+
+Agreed with the Dannan session as Macha's to fix, at the cutover or when its holders become hosted owners:
+- Async calls carry no watch: move onto Dannan's per-call `CallWatch` (`Routes::call`), drop the zeroed node-wide watches
+  (`src/cluster/dannan_bridge.cpp:55-59`) and `rpc_wait.cpp`'s polling.
+- The operator's connectivity check blocks an HTTP thread up to the summed timeouts plus 5 s
+  (`src/cluster/cluster.cpp:627-645`, from `src/api/status_api.cpp:1453`): answer it deferred.
+- `FrameType` and `WorkClass` cast by value to Dannan's (`dannan_bridge.hpp:50-55`): use Dannan's enums.
+- Two memory fits (Macha's `validate`; Dannan's `fit_memory_limit` unused, `dannan_bridge.cpp:71-77`).
+- Two durability epochs per process (`node_identity.cpp:45`): goes with the store.
+- Payload copies per request (`dannan_host.cpp:21-26`, `:108-111`): adopt Dannan's `net::Message` in handlers.
+Dannan's own fixes, after the operator rules on its list: `connections_canonical` written by the node, the
+key-derivation labels exported, `idle_for` from creation, a const `inbound()`.
+
 ## Log
 
+- 2026-11-13: `NodeId` and `Hash256` are Dannan's (`src/types.hpp` aliases; Macha's `to_string(NodeId)` gone for
+  Dannan's): one definition across the stack, so object ids cross into Dagda unconverted. Laptop `build-store` 714 of 714.
+- 2026-11-13: step 0 done on the laptop: Dagda 0.1.4 (local tag `f3a9852`, not yet on its remote) built into
+  `build/deps/prefix-dagda-0.1.4` (Boost 1.88 on the path), Macha's tree `build-store` links it; `storage_v18` 22 of 22
+  run from it. The port branch carries the store work; `develop` stays on 0.94.2's line until the cutover is gated
+  (CI runs on main and develop only). CI and the container image need Dagda from its tag, so Dagda's tags must be
+  pushed (operator's word) before develop takes this. On corvus-develop Dagda 0.1.4 fails under GCC 14 Release with
+  `-DDAGDA_WARNINGS_AS_ERRORS=ON` (`-Wnonnull` at `migrate/compare.cpp:271`, `-Wstringop-overread` in libstdc++;
+  reported to Dagda); built there without it.
 - 2026-11-13: plan written; baselines on 0.94.2 running (`build/baselines/run_0942.sh`, results in
   `build/baselines/results-0.94.2/`); Dagda asked for its install rules.
