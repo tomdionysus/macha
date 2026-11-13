@@ -1,5 +1,20 @@
 # Current release
 
+## 0.94.1: an async playback start lets go of its candidate
+
+Playback: an async start owned the session it was building and that session owned
+the start back, so every async transcode start kept its candidate session, with its
+plan, probe, source lease and subtitle cache, for the life of the process. The start
+now lets go of the candidate when its worker finishes; the live session keeps its
+start for status. Found by the new CI gate's LeakSanitizer run.
+
+The repository gains its CI: GitHub Actions builds on Debian trixie against Dannan
+0.5.3, runs every test binary, clang-tidy 19 with warnings as errors, the ASan and
+UBSan suites and coverage (`tools/ci.sh` runs the same gate locally or on a host
+over SSH), with CodeQL beside it. The tree is formatted with clang-format 19 and
+clang-tidy reports nothing; neither changes behaviour. `strerror` gives way to a
+thread-safe `errno_text`.
+
 ## 0.94.0: the cluster transport is Dannan's
 
 The transport cutover. Every node runs Dannan 0.5.3's node beneath Macha: its
