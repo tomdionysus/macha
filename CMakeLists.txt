@@ -20,6 +20,12 @@ if(NOT MACHA_README_VERSION STREQUAL "*v${PROJECT_VERSION}*")
                         "project version ${PROJECT_VERSION}; update it to *v${PROJECT_VERSION}*")
 endif()
 
+# A tree configured with no build type would compile at -O0; the default is
+# what CI gates and what is deployed: optimised, with symbols for cores.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

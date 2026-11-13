@@ -9,6 +9,11 @@ everything only that peer held `unknown` until the next topology change. Every
 peer is now asked, and a diff that fails is asked again on the survey's backoff
 (1 s, doubling to 5 minutes). Test ports stay below Linux's ephemeral range.
 
+Build: a tree configured with no build type now builds RelWithDebInfo (-O2 with
+symbols), the configuration CI gates. The deploy trees had none, so 0.94.1 and every
+release before it ran Macha's own code unoptimised; 0.94.2 is the first deployed
+optimised build, and CPU and latency figures move with it.
+
 ## 0.94.1: an async playback start lets go of its candidate
 
 Playback: an async start owned the session it was building and that session owned
