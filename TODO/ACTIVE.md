@@ -48,7 +48,9 @@ their owners: [`2026-11-08-found-issues.md`](2026-11-08-found-issues.md).
    both. Macha: `find_package(dannan 0.5.6 CONFIG REQUIRED)`; Build-Depends `libdannan-dev (= 0.5.6)`; Depends from
    shlibs plus `dannan-tools`. Repo: `curl -fsSLo /etc/apt/sources.list.d/tomcully.sources
    https://tomcully.com/apt/tomcully.sources`. Nothing installed on the Pis yet: that is the operator's word.
-5. **The store cutover (task 8)**: review Dagda by reading its code, then build it on the tag Dagda cuts. Dagda is on
+5. **The store cutover (task 8), building** (operator 2026-11-13: "proceed"; build on corvus-develop): plan and log in
+   [`2026-11-13-store-cutover.md`](2026-11-13-store-cutover.md). Reviewed: Dagda's report and its migration's write path.
+   Earlier notes: Dagda is on
    `feature/manifest-lock` at `c264fa2` (a 0.1.2 version commit; tags `0.1.0` and `0.1.1` exist, 0.1.2 not yet);
    `dagda-migrate` refusing a second manifest pass is the 0.1.2 change. Unproved for the cutover: macnessa's
    migration bytes and time at 6.3 TB (read rates measured: macnessa 103 MB/s, inverbeg 87 MB/s, so about 2 to
