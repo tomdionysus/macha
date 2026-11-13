@@ -158,6 +158,8 @@ find_package(yaml-cpp QUIET)
 # The cluster's transport and node: Dannan, pinned by minor version (0.x: a minor
 # is a new API), at least the patch the port was reviewed against.
 find_package(dannan 0.5.3 CONFIG REQUIRED)
+# The store: Dagda, on the same Dannan.
+find_package(dagda 0.1.4 CONFIG REQUIRED)
 
 # Some environments expose a static CURL::libcurl without its transitive link
 # dependencies. Prefer pkg-config's complete imported target when available.
@@ -391,7 +393,7 @@ target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
-    dannan::dannan OpenSSL::Crypto Threads::Threads ${MACHA_CURL_TARGET} ZLIB::ZLIB ${CMAKE_DL_LIBS})
+    dannan::dannan dagda::dagda OpenSSL::Crypto Threads::Threads ${MACHA_CURL_TARGET} ZLIB::ZLIB ${CMAKE_DL_LIBS})
 if(APPLE)
     find_library(MACHA_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
     target_link_libraries(macha_core PUBLIC ${MACHA_COREFOUNDATION_FRAMEWORK})
