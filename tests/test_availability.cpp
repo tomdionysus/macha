@@ -8,7 +8,9 @@
 #include "metadata/namespace_tree.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -827,6 +829,88 @@ MACHA_TEST("availability", test_what_only_a_host_out_of_reach_holds_is_unavailab
     second->start();
     CHECK(wait_until([&] { return kept() == Availability::complete; }, 30s));
     second->stop();
+    first.stop();
+}
+
+// A diff that fails is asked again on the survey's own timer, with nothing
+// else changing: no membership event, no new holdings, no new commit.
+MACHA_TEST("availability", test_a_failed_diff_is_asked_again_on_a_timer) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto first_port = free_port();
+    const auto second_port = free_port();
+    auto first_config =
+        cluster.node_config("retry-first", first_port, {{"127.0.0.1", second_port}});
+    auto second_config =
+        cluster.node_config("retry-second", second_port, {{"127.0.0.1", first_port}});
+    for (auto* config : {&first_config, &second_config}) {
+        config->replication = 2;
+        config->write_copies = 2;
+        config->catalogue.scanner.enabled = false;
+        config->ingest.enabled = false;
+        config->torrent.enabled = false;
+    }
+
+    // The second node's trie questions fail at once while refusing is set.
+    auto refusing = std::make_shared<std::atomic_bool>(false);
+    ServiceInstruments instruments;
+    instruments.call_fault = [refusing](const NodeInfo&,
+                                        MessageType type) -> std::optional<AsyncRpc> {
+        if (type != MessageType::trie_diff || !refusing->load())
+            return std::nullopt;
+        std::promise<RpcReply> promise;
+        promise.set_exception(
+            std::make_exception_ptr(std::runtime_error("trie_diff refused by the test")));
+        return AsyncRpc(
+            promise.get_future(), [] {}, [] {}, {}, [] { return std::chrono::milliseconds{}; });
+    };
+    Service first(first_config, cluster.keys(), test_durability_window);
+    Service second(second_config, cluster.keys(), test_durability_window, {}, {}, {}, instruments);
+    first.start();
+    second.start();
+    (void)first.filesystem();
+    (void)second.filesystem();
+    REQUIRE(wait_until(
+        [&] {
+            return first.node().membership().active().size() == 2 &&
+                   second.node().membership().active().size() == 2;
+        },
+        10s));
+    const auto extent = first_config.extent_size;
+    REQUIRE(retry_while_not_ready(
+        [&] { write_file(first.filesystem(), "/kept.bin", pattern(extent * 2, 4)); }));
+    REQUIRE(wait_until(
+        [&] {
+            const auto snapshot = second.availability().snapshot();
+            if (!snapshot)
+                return false;
+            const auto found = snapshot->paths.find("/kept.bin");
+            return found != snapshot->paths.end() && found->second.extents_local == 2;
+        },
+        20s));
+
+    // The second node loses one extent while its questions fail: it cannot
+    // tell whether the first node holds it.
+    refusing->store(true);
+    const auto lost = first.filesystem().getattr("/kept.bin").extents.at(0).id;
+    REQUIRE(second.local_state().data().remove(lost));
+    REQUIRE(wait_until(
+        [&] {
+            const auto snapshot = second.availability().snapshot();
+            return snapshot && snapshot->survey.peers_failed == 1 &&
+                   !snapshot->survey.unknown.empty();
+        },
+        20s));
+
+    // The first node answers again; only the timer brings the next question.
+    refusing->store(false);
+    REQUIRE(wait_until(
+        [&] {
+            const auto snapshot = second.availability().snapshot();
+            return snapshot && snapshot->survey.peers_failed == 0 &&
+                   snapshot->survey.unknown.empty() && snapshot->survey.unavailable.empty();
+        },
+        20s));
+    second.stop();
     first.stop();
 }
 

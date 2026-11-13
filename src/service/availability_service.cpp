@@ -25,19 +25,13 @@ namespace macha {
 
 namespace {
 
-// The first release that answers trie_diff.
-constexpr ReleaseVersion first_trie_version{0, 90, 72};
-
 // A peer's held trie asked over RPC, every round of a diff from the snapshot
 // its root question pinned.
 class RemoteTrie final : public TrieSource {
   public:
-    RemoteTrie(NodeRuntime& node, NodeInfo peer, bool supported)
-        : node_(node), peer_(std::move(peer)), supported_(supported) {}
+    RemoteTrie(NodeRuntime& node, NodeInfo peer) : node_(node), peer_(std::move(peer)) {}
 
     ObjectTrie::Summary root() override {
-        if (!supported_)
-            throw std::runtime_error("peer does not answer trie_diff");
         const auto summary = decode_trie_root(ask(question(TrieQuestionKind::root, {})));
         at_ = summary.hash;
         return summary;
@@ -109,7 +103,6 @@ class RemoteTrie final : public TrieSource {
 
     NodeRuntime& node_;
     NodeInfo peer_;
-    bool supported_;
     Hash256 at_{};
     Spent spent_;
 };
@@ -458,15 +451,11 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     if (ask) {
         // A host out of reach holds nothing reachable: with none in reach,
         // what this node lacks is unavailable until one comes back.
-        const auto telemetry = node_.telemetry().all();
         std::vector<RemoteTrie> tries;
         tries.reserve(hosts.size());
         std::vector<TrieSource*> sources;
-        std::vector<bool> supported;
-        for (const auto& host : hosts) {
-            supported.push_back(runs_at_least(telemetry, host.id, first_trie_version));
-            sources.push_back(&tries.emplace_back(node_, host, supported.back()));
-        }
+        for (const auto& host : hosts)
+            sources.push_back(&tries.emplace_back(node_, host));
         std::vector<PeerDiff> diffs;
         next.survey =
             survey_by_diff(view.trie, *missing_here, inventory->lookup(RetentionClass::data),
@@ -490,9 +479,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                     std::chrono::duration_cast<std::chrono::milliseconds>(spent.waited).count()));
             if (!diffs[i].answered) {
                 lacks.complete = false;
-                // A peer too old to answer is asked again when the membership
-                // changes, not on a timer.
-                retry_needed = retry_needed || supported[i];
+                retry_needed = true;
                 continue;
             }
             roots.emplace(hosts[i].id, diffs[i].root);
