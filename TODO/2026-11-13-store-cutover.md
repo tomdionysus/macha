@@ -46,6 +46,14 @@ re-checked against `develop` at `875df7e`: 100 of its 104 Macha paths exist (abo
 6. **Removal** of the store code Dagda now holds (plan S.1's list), each test retired against the case
    `../dagda/TODO/2026-11-05-test-mapping.md` names, recorded case by case as the transport's were.
 7. **8a** the reachability provider, **8b** the lease template, each with its gate.
+7b. **Custody** (found 2026-11-13: Macha's Dannan node is given none today, `dannan_bridge.cpp` sets no
+   `NodeConfig::custody`, and a Dagda node without custody is refused). A config key naming the systemd credential
+   (operator's ruling: a credential, so the nodes restart unattended after a power cut); `NodeConfig::custody =
+   KeySource::systemd_credential(name)`; the unit's `LoadCredentialEncrypted=` (no TPM on the Pis: sealed with the
+   host key); made once per node with `dannan-node --state <state_path> --init-custody --custody-credential <name>`
+   (prints the root to seal with `systemd-creds encrypt`), so the tarball carries `dannan-node`; the custody file and
+   the sealed root backed up off-node (losing custody after migration loses that node's claims and reference
+   counts). Test fixtures make custody under a test credential directory.
 8. **Before the flag day:** suites green on corvus-develop and in the container; the rehearsal on a fresh copy of a
    0.94.x node's state (control store, ledgers, a pack sample) with the verifier listing every id before and after;
    custody provisioned and backed up off-node; each node's control store copied off-node; then both nodes at once.
@@ -66,6 +74,15 @@ key-derivation labels exported, `idle_for` from creation, a const `inbound()`.
 
 ## Log
 
+- 2026-11-13, step 1 reading: Dagda registers 20 of Macha's numbers and 3 of its own (`dagda/store/messages.cpp:26-59`);
+  Macha's table (`src/cluster/dannan_bridge.cpp:286-365`) drops them at the same moment: requests have_object 515,
+  get_object 516, put_object 517, delete_object 525, get/put_control_object 531/532, put_object_deferred 534,
+  object_durability_barrier 535, retain_objects 544, have_objects 552, have_control_objects 557, have_valid_objects
+  559, trie_diff 561; replies bool_reply 615, object_reply 616, control_object_reply 619, have_objects_reply 630,
+  have_control_objects_reply 633, have_valid_objects_reply 635, trie_diff_reply 637. Rule differences, harmless
+  across the flag day: delete_object and have_valid_objects are `not_control` in Dagda (any in Macha); bool_reply is
+  both lanes (Macha's metadata replies ride it: a superset). **Client-visible:** registration names become
+  `dagda.<name>`, so Status figures keyed by type name change: announce to Core and the clients before shipping.
 - 2026-11-13: `NodeId` and `Hash256` are Dannan's (`src/types.hpp` aliases; Macha's `to_string(NodeId)` gone for
   Dannan's): one definition across the stack, so object ids cross into Dagda unconverted. Laptop `build-store` 714 of 714.
 - 2026-11-13: step 0 done on the laptop: Dagda 0.1.4 (local tag `f3a9852`, not yet on its remote) built into
