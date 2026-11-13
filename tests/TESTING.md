@@ -125,7 +125,7 @@ the sanitizer-proof section of `docs/ownership.md`.
 
 ## Runtime model
 
-A single suite executable does not mean serial execution. By default each runner uses up to twelve hardware-derived resource slots and gives integration/heavy cases larger weights. Each case runs after `fork()` in its own process, so global loggers, environment, signal state, temporary files and background threads cannot leak into another test. `free_port()` assigns each case a separate loopback-port block before it starts real RPC/HTTP listeners.
+A single suite executable does not mean serial execution. By default each runner uses up to twelve hardware-derived resource slots and gives integration/heavy cases larger weights. Each case runs after `fork()` in its own process, so global loggers, environment, signal state, temporary files and background threads cannot leak into another test. `free_port()` assigns each case a separate 32-port loopback block, below the ephemeral range, before it starts real RPC/HTTP listeners.
 
 Useful runner options:
 

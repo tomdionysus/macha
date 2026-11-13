@@ -205,13 +205,16 @@ std::chrono::duration<Rep, Period> scaled(std::chrono::duration<Rep, Period> bou
 }
 
 inline uint16_t free_port() {
-    // Each case gets its own 64-port block, so no other test can claim a probed
+    // Each case gets its own 32-port block, so no other test can claim a probed
     // port before the server binds it. Candidates are still bind-probed because
-    // unrelated host processes may hold ports in the range.
+    // unrelated host processes may hold ports in the range. The blocks stay
+    // below Linux's ephemeral range (32768 up), where an outbound connection
+    // of a case running beside this one could take a probed port before its
+    // node binds it.
     static uint16_t within_case{};
-    constexpr uint16_t first = 20000;
-    constexpr uint16_t block = 64;
-    constexpr uint16_t blocks = 600; // 20000..58399
+    constexpr uint16_t first = 10000;
+    constexpr uint16_t block = 32;
+    constexpr uint16_t blocks = 711; // 10000..32751
     // The salt shifts which cases of two runners on one machine land on the
     // same block; it cannot keep them apart, there being more cases than
     // blocks. What keeps their nodes apart is the key (write_key).

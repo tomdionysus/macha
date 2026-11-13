@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <map>
 #include <set>
@@ -892,7 +893,7 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
     write_file(first.filesystem(), "/later.bin", pattern(extent, 3));
 
     for (auto* service : {&first, &second}) {
-        REQUIRE(wait_until(
+        const bool settled = wait_until(
             [&] {
                 // The later file with its data: it is named before its
                 // extent is committed.
@@ -905,7 +906,21 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
                 return holed && holed->extents_unavailable == 1 && later && later->extents == 1 &&
                        survey->survey.unknown.empty() && survey->survey.unavailable.size() == 1;
             },
-            20s));
+            20s);
+        if (!settled) {
+            const auto holed = path_of(*service, "/dir/holed.bin");
+            const auto later = path_of(*service, "/later.bin");
+            const auto survey = service->availability().snapshot();
+            std::cerr << "survey not settled on the " << (service == &first ? "first" : "second")
+                      << " node: generation=" << survey->generation << " holed="
+                      << (holed ? std::to_string(holed->extents_unavailable) : "absent")
+                      << " later=" << (later ? std::to_string(later->extents) : "absent")
+                      << " unknown=" << survey->survey.unknown.size()
+                      << " unavailable=" << survey->survey.unavailable.size()
+                      << " peers_asked=" << survey->survey.peers_asked
+                      << " peers_failed=" << survey->survey.peers_failed << '\n';
+        }
+        REQUIRE(settled);
         const auto snapshot = service->availability().snapshot();
         CHECK(snapshot->survey.unavailable == std::vector<ObjectId>{lost});
         CHECK(snapshot->survey.unknown.empty());
