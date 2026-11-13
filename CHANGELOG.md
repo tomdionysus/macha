@@ -326,6 +326,11 @@ manual books. Catalogue shards are written as MCAT0023; 0021 and 0022
 shards are still read. A node on an older release cannot load a catalogue
 holding a book, so every node is upgraded before the provider is enabled.
 
+## 0.91.6: a namespace is a tree from its first commit (unreleased)
+
+- Work-in-progress number on the branch that became 0.93.0: a new namespace is founded on the Merkle tree, every metadata mutation is an exact delta onto the tree, and `macha-namespace-migrate` is removed.
+- Never tagged; the branch was merged into develop as 0.93.0 (`076115f`). See 0.93.0.
+
 ## 0.91.5: an import waits for its disk
 
 An ingest job whose bytes no node present can take, because the DATA disk
@@ -2879,6 +2884,8 @@ refresh.
 
 ## 0.73.1: Repair sends several objects at once and keeps its place (development)
 
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.73.2 (`efa9c21`).
+
 On 0.73.0 with `idle_bandwidth_fraction: 0.9`, gbni-1 moved ~500 KB/s to
 fi-1 with full credit, no credit stops and a link that carried at least
 2.8 MB/s. Two causes:
@@ -2906,6 +2913,8 @@ pass, and at stop) and resumed after a restart by skipping that many objects
 by index.
 
 ## 0.73.0: Repair uses the link it has; nodes report their traffic by class (development)
+
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.73.2 (`efa9c21`).
 
 On 0.72.1 with `idle_bandwidth_fraction: 0.5`, gbni-1's repair moved about
 10 KB/s to fi-1 over a path measured at 1.3 MB/s. In 185 s it ran 24 steps,
@@ -2956,6 +2965,8 @@ API addition (announce to Core and every client):
 
 ## 0.72.1: Held retention claims no longer spend repair's credit (development)
 
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.73.2 (`efa9c21`).
+
 Deployed with `idle_bandwidth_fraction: 0.5`, 0.72.0 still moved no bytes on
 either node, with the credit at 0. The retention-claim walk, which runs ahead
 of each repair step, charged an extent of credit for every claim it examined,
@@ -2977,6 +2988,8 @@ back until metadata is ready. Since 0.72.0 ran a step on every pass, that
 refreshed the catalogue ahead of the convergence it depends on.
 
 ## 0.72.0: Repair credit pays for transfers, not for finding them (development)
+
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.73.2 (`efa9c21`).
 
 **Repair no longer waits for credit before looking.** Repair earns transfer
 credit at `idle_bandwidth_fraction` of the measured link, and until now a
@@ -3721,6 +3734,11 @@ On 2026-09-24 gbni-1 failed an ingest with "namespace node could not reach
 the metadata durability floor" while its only peer restarted. It was a bare
 `runtime_error`, so 0.57.0's block-and-retry did not apply; it now does.
 
+## 0.57.1: the server plays what it is told and chooses nothing (renumbered) (development)
+
+- Same release as 0.58.0: playback sessions require `media_id` and refuse `item_id`, and an open stream or container choice is refused with its candidates.
+- Built and deployed to the test cluster as 0.57.1, then renumbered 0.58.0 before any tag because it breaks clients. See 0.58.0.
+
 ## 0.57.0: A torrent is imported once it is published, and a metadata outage no longer kills an ingest (development)
 
 Finishes stage 2 of `TODO/archive/2026-09-23-torrent-disk-backend-plan.md`, and
@@ -4160,7 +4178,6 @@ for it. A viewer is never gated by pressure at all.
 `GET /api/v1/status`, beside the service time and worst case, because a mean
 latency cannot be judged without knowing the size of the operations behind it.
 
-
 ## 0.51.0: The namespace tree is protected from the collector, and a slow disk stops being invisible (development)
 
 **The namespace tree was collectable.** Found on the live cluster six hours
@@ -4262,7 +4279,6 @@ the four previous reproduction attempts failed because the synthetic load was
 the wrong shape. A live torrent download is the right shape, and that test is
 next rather than claimed.
 
-
 ## 0.50.1: What the cutover found in its first two minutes (development)
 
 **The live cluster was re-rooted onto the tree at 12:41Z on 2026-09-22**, all
@@ -4298,7 +4314,6 @@ produced a wrong answer to anything that was asked, and neither would have
 appeared in a test suite that did not restart a second node and then look at
 its mount. The first one in particular was invisible from the node doing the
 writing, because that node's FUSE frontend already had the change locally.
-
 
 ## 0.50.0: The namespace can be re-rooted onto the tree (development)
 
@@ -4366,7 +4381,6 @@ because the record is a pure function of the converged head, it always will
 have. The previous checkpoint, journal, history, heads and acceptance proof are
 quarantined under `.pre-migration.<ns>` rather than deleted.
 
-
 ## 0.49.1: The namespace read and written through one door (development)
 
 **Nothing in this release is reachable in production, and that is deliberate.**
@@ -4423,7 +4437,6 @@ other direction -- not "an empty namespace read as no files" but "an empty
 extent list read as a file with no content" -- and it is why trimming a read
 to stat data needs an audit of what callers do with the entry rather than what
 the FUSE path does with it.
-
 
 ## 0.49.0: A record that points at the namespace (development)
 
@@ -4482,7 +4495,6 @@ The SM14 garbage reserve is bounded by `Reader::remaining()` rather than by
 the count in the payload - the same defect the node decoder carried and which
 reading it, not fuzzing it, found.
 
-
 ## 0.48.2: Things a node can say about itself (development)
 
 **Timestamps in the journal are UTC and say so.** Every line now reads
@@ -4534,7 +4546,6 @@ double-counts it, a failover can "move" to the machine it just left, and a node
 selector offers the same box twice. `api_endpoint` cannot serve the purpose,
 because it is the node's own advertised name, which by definition differs from
 the address the client used in exactly the case that matters.
-
 
 ## 0.48.1: What testing 0.48.0 found (development)
 
@@ -4606,7 +4617,6 @@ contradicting it.
 Otherwise the node-wide limit refuses first and the distinction between the two
 429s - which mean opposite things to a client - is lost in the one case it
 exists for.
-
 
 ## 0.48.0: A playback session is a resource (development)
 
@@ -4751,7 +4761,6 @@ intermediate `Bytes` and copied twice, which is not free across the thousands
 of names in a metadata snapshot. Telemetry decode now borrows throughout: at
 up to 64 records, one allocation per record became none. What owns its storage
 and outlives the buffer still copies once, into the thing that owns it.
-
 
 ## 0.47.0: How fast this node is actually producing (development)
 
@@ -6781,6 +6790,8 @@ twice its planned media.
 
 ## 0.36.0: The playlist says what the fragment holds (development)
 
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.36.1 (`7982b32`).
+
 Deployed to all three cluster nodes on 2026-09-08: gbni-1, gbni-2 and es-1
 run an identical binary, verified by hash, with the torrent plugin loading on
 each and metadata generations converging. gbni-1's copy was built on gbni-2
@@ -7751,6 +7762,8 @@ apply_metadata_delta_in_place` for the whole 120 s.
 
 ## 0.28.2: Compact deltas for merges and the write after them (development)
 
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.28.3 (`f65bde4`).
+
 `WARN local metadata delta rejected; retrying full record generation=N` had
 been firing on every node for days, and the 0.27.0 theory that it was an
 evicted parent did not survive contact with the 0.28.0 processes. The 24 h
@@ -7844,6 +7857,8 @@ is not what you reach for at 2am.
   transitively, libstdc++ does not, so every cluster node failed to compile.
 
 ## 0.28.0: BitTorrent acquisition moves into a real plugin (`libmacha-torrent`) (development)
+
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.28.1 (`6f75081`).
 
 Phase 1 of `TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md`. The download
 engine and its whole libtorrent linkage now live in a `dlopen`'d module
@@ -7987,6 +8002,8 @@ clusters keep working, they just cannot repair *from* an old peer.
 
 ## 0.26.2: Bound the second, separate retry storm from the same 0.26.1 failure mode (development)
 
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.27.0 (`1c686fc`).
+
 Found while writing up 0.26.1's own follow-up notes, not by further live
 reproduction: a *second*, independent code path hits the same "cannot accept
 this peer's metadata certificate" condition and was not covered by 0.26.1's
@@ -8017,6 +8034,8 @@ fix.
   same live incident's log evidence, not by a new automated test.
 
 ## 0.26.1: Bound retry storms from an unreconstructable accepted metadata head (development)
+
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.27.0 (`1c686fc`).
 
 Fixes a live 2026-09-06 incident found while stress-testing 0.26.0 with
 deliberate concurrent multi-origin writes (movies from one node, TV from
@@ -8070,6 +8089,8 @@ similar at 2-47 times/second.
 
 ## 0.26.0: Batch and cheapen DATA retention-check presence probes, fixing a serial-decrypt/RPC scaling cliff (development)
 
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.27.0 (`1c686fc`).
+
 Fixes the live 2026-09-06 `corvus-es-1` incident: a bulk movie rsync froze
 data publication for minutes, pinned the maintenance thread near 100% CPU,
 and produced a hard control-RPC timeout against an unrelated peer. Root
@@ -8105,6 +8126,8 @@ cause, evidence and phased fix are in
   rolling upgrade, not a correctness or availability issue.
 
 ## 0.25.0: Foundation for subsystem crash isolation: a mandatory thread guard, a shared macha_core, and a dlopen'd plugin loader (development)
+
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.27.0 (`1c686fc`).
 
 Phase 0 of `TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md`, the design
 response to 0.24.4's `corvus-es-1` crash-loop (an uncaught exception during
@@ -8161,6 +8184,8 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   node's `macha.yaml` needs this key moved before upgrading.
 
 ## 0.24.4: Fix a crash-loop introduced by 0.24.3's namespace-skip escape hatch (development)
+
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.27.0 (`1c686fc`).
 
 - Fixed a same-night regression in 0.24.3's `skip_blocked_namespace_operation()`:
   it journals a `namespace_done` marker for an operation that was
@@ -8458,6 +8483,8 @@ plugin migration is Phase 1/2); this release only lays the foundation.
 
 ## 0.23.7: Per-node advertised API address fixes any-node Direct Play failover (development)
 
+Built and run from a working tree; no commit carries this number. Its code is in git with 0.23.8 (`87b876b`).
+
 - `GET /api/v1/status` now reports `api_host`/`api_port` on every entry in
   `nodes[]`: where clients should reach that node's HTTP/catalogue API,
   distinct from the existing `host`/`port`, which is the node's internal RPC
@@ -8611,6 +8638,17 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   namespace removal, proving exactly one terminal attempt, scheduler quiescence,
   and continued access to unrelated files.
 
+## 0.23.0: memory amplification and parallel decode (development)
+
+- Add `runtime.glibc_arena_max` (default 4, range 1 to 64), applied before service or codec threads start, so short-lived transcode threads cannot grow retained glibc arenas.
+- Add `streaming.video_decoder_threads` (default 2, range 1 to 16) to bound decoder threads per transformed video.
+
+## 0.22.4: ownership, teardown and retained-memory work (development)
+
+- Make a late hydration submission during stop a rejected result instead of an exception that aborted the process, and complete queued promises before join.
+- Add retained-owner counters for FUSE operations, overlay ranges, publication snapshots, durability tickets and playback fragments to status.
+- Add `fuse.max_pending_write_bytes` (default 32 MiB) to bound copied FUSE write payloads before they enter the spool.
+
 ## 0.22.2: metadata reconciliation recovery (development)
 
 - Reject compact metadata deltas which cannot reproduce the exact immutable
@@ -8625,6 +8663,18 @@ plugin migration is Phase 1/2); this release only lays the foundation.
 - Retire reset identities from ordinary status listings, cluster health and
   capacity totals while preserving an explicit per-node `state: "retired"`
   audit response.
+
+## 0.22.1: media information service and metadata repair tool (development)
+
+- Add the media information service (`media_information.cpp`): session admission reads the immutable media profile from metadata and coalesces first-use inspection of the same file.
+- Add the offline `macha-metadata-repair` tool for manual causal-merge repair of two accepted metadata heads.
+- Add `docs/HA.md`, a three-node high-availability configuration guide.
+
+## 0.22.0: media profiles during catalogue processing (development)
+
+- Precompute each file's playback profile during catalogue hint processing and serve it at `GET /api/v1/catalogue/media/{media_id}/profile`.
+- Make playback session creation idempotent under an `Idempotency-Key` header; a reused key with a different request is `409 idempotency_conflict`.
+- Raise FUSE publication throughput: loader-class priority, resumable per-inode publication, within-file extent pipelining and pressure-aware spool retirement.
 
 ## 0.21.0: asynchronous node startup (development)
 
@@ -8641,6 +8691,12 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   pressure starts publication, admission progressively follows measured drain
   throughput, and saturation blocks writers rather than returning logical
   `ENOSPC`.
+
+## 0.20.0: lifecycle, status and readiness
+
+- Bring the RPC control plane and status API online before local backend recovery, and report readiness separately from cluster reachability and storage availability.
+- Make metadata-history cold start linear and add periodic full-history anchors.
+- These bullets were later relabelled 0.21.0 in the changelog and now open the 0.21.0 entry.
 
 ## 0.19.0: metadata replica availability
 
@@ -8701,4 +8757,253 @@ plugin migration is Phase 1/2); this release only lays the foundation.
 - Bump the incompatible cluster transport/storage contract to protocol 18.
 - Replace migration-era documentation with the current storage, durability and recovery invariants.
 
-Older development history remains in Git history rather than this operational document.
+## 0.17.0: memory leak fixes, zero copy
+
+- Share immutable metadata-record payloads and hash records incrementally, so copying a record no longer duplicates the namespace.
+- Apply ordinary filesystem, catalogue and garbage mutations as exact in-place deltas, and replace full garbage-index copies with compact sorted indexes.
+- Bound full metadata checkpoint and seed fan-out to one remote payload in flight; further file-descriptor exhaustion fixes (`8090686`).
+
+## 0.16.0: ticket-based durability
+
+- Replace layered object barriers with one `DurabilityDomain` per filesystem (`st_dev`); publication waits on generation tickets and only the domain coordinator issues `syncfs()`.
+- Group-commit replayable publication generations in a 500 ms window; bump the transport to v15.
+- Move capacity accounting out of publication transactions (one DIRTY marker per session, one CLEAN checkpoint at teardown) and add `docs/durability.md`.
+
+## 0.15.2: durability generations
+
+- Replace boolean deferred-durability state with monotonic LocalStore and StoragePool generations, so a barrier records the exact cut it made durable.
+- Qualify provisional replica acknowledgements and barrier RPCs by `(process epoch, generation)`; bump the transport to v14.
+- Retire completed FUSE spools by immediate unlink after the journal completion marker.
+
+## 0.15.1: fsync() rearchitecture
+
+- Move spool-backed publication from per-extent `fsync()` to publication generations with one stable-storage barrier before the metadata commit.
+- Treat the FUSE spool and operation journal as the publication write-ahead log, with per-chunk spool digests so corrupt dirty data abandons only that inode.
+- Make the persistent block cache explicitly ephemeral: it issues no barriers.
+
+## 0.15.0: unified test framework
+
+- Replace the monolithic test runner with one self-registering `macha-tests` framework running process-isolated cases concurrently, and add `MACHA_TEST_COVERAGE`.
+- Also carries untitled fixes made after 0.14.12: FUSE recovery and recovery startup, FUSE descriptor limits, node genesis on startup, CPU use on a non-authoritative cataloguer, zero-length files in the cataloguer and control-plane priority.
+
+## 0.14.12: FUSE stability fixes
+
+- Quarantine non-empty FUSE spool files with no journal attribution as `*.orphan.*` instead of aborting startup; journal-referenced missing or short spools stay fatal.
+- Keep one `ReadHandle` per open readable descriptor, acknowledge FUSE writes with POSIX buffered semantics, and make `fsync()` wait for the distributed commit.
+- Add `fuse.spool_path` and `fuse.operation_journal_path`.
+
+## 0.14.11: metadata recovery
+
+- Recover a complete-length but unauthenticated final metadata-journal frame as a torn append, and name the failing file and offset when replay fails.
+- When the primary checkpoint or journal is unrecoverable, seed from the persistent metadata cache snapshot behind a `metadata/recovery.required` marker until a quorum read succeeds.
+- Route checkpoint replacement through the fsync-and-rename primitive and check journal fsync and close failures.
+
+## 0.14.10: merge hardening and architecture tests
+
+- Detach an open dirty inode from a path replaced elsewhere, so it cannot publish stale writes into the replacement.
+- Make replica-presence checks verify stored objects, so re-putting good bytes replaces a corrupt replica.
+- Bound pre-authentication RPC handshakes (eight, five-second deadline), add `catalogue.api.client_io_timeout_ms`, and add one fsync-and-rename durable state-file primitive.
+
+## 0.14.9: durable FUSE operation journal
+
+- Add a durable FUSE operation journal (`fuse-spool/operations.log`): mutations are fsynced locally before FUSE acknowledges them, and startup rebuilds pending namespace and data state from it.
+- Refuse pre-0.14.9 non-empty spools, which have no journal describing them.
+- A `direct` playback mode request is an explicit override and no longer checks client capabilities (`8fac19f`).
+
+## 0.14.8: session and write priority
+
+- Classify write-handle traffic as interactive rather than playback foreground, and pause FUSE publication while playback is active.
+- Reuse the prepared VOD plan for a seek that repeats unchanged preferences, and reserve two of eight DATA RPC slots for foreground requests.
+- Also carries cataloguer and namespace discovery fixes, hash exchange instead of full namespace metadata in discovery, and a scrub schedule (untitled commits).
+
+## 0.14.7: wait-state and signalling refactor
+
+- Fix stop-token condition-variable waits that could swallow notifications; hydration, playback cleanup and torrent sampling wake on events.
+- Includes the 0.14.6 work: FUSE namespace adoption is local and revision-based, idle workers block instead of polling, and FUSE cache TTLs rise to 1 s (500 ms negative).
+- Clear Metadata queues only the released media for rematching, and scanner state survives restart.
+
+## 0.14.5: event-driven FUSE
+
+- Remove the FUSE namespace refresh timer; namespace operations adopt a newer decoded snapshot on demand, and `fuse.refresh_interval_ms` is removed.
+- Remove the 10 ms shutdown polling thread.
+
+## 0.14.4: FUSE interface optimisation
+
+- Namespace refresh checks the metadata generation first and reuses the shared decoded snapshot.
+- Catalogue hint consumption is event-driven instead of a 10 Hz scan.
+- Lower default settled maintenance pressure: 1 s scheduler interval, 10% idle targets, 2% scrub share.
+
+## 0.14.3: FUSE stability, test visibility
+
+- Make catalogue provider budgeting fair per metadata hypothesis, with a persisted, restart-safe candidate cursor.
+- Includes 0.14.1 and 0.14.2: FUSE mutations time out only while queued, transient publication failures are retried, and bootstrap genesis fails closed after an incomplete checkpoint survey.
+- Log each test's start, result and duration, and raise the CTest timeout to 300 s.
+
+## 0.14.0: catalogue rework
+
+- Add a persistent, prioritised, coalescing catalogue hint queue (`state_path/catalogue/hints.json`) fed by discovery, mutations, rescans and ingest, with `GET /api/v1/catalogue/hints`.
+- Ingest jobs stay `cataloguing` until their hints settle, then report match results.
+- Replace post-copy source deletion with explicit `clear` semantics and `delete_*_source_on_*` cleanup settings.
+
+## 0.13.2: ingest, torrent and libtorrent build fixes
+
+- Add the ingest and torrent acquisition mechanism (`acquisition_api`, `ingest`, `torrent`).
+- Includes 0.13.1: closing a read-only FUSE handle no longer publishes another handle's dirty writes, and publication drops to one worker under sustained mount activity.
+- Fix libtorrent 2.1 builds and select CMake policy CMP0167.
+
+## 0.13.0: asynchronous, scheduled FUSE
+
+- Replace the synchronous FUSE adapter with a bounded inode-based `FuseFrontend`: callbacks do only local work, with per-class deadlines and bounded publication queues under `fuse:`.
+- Stage writes in a local append-only spool published asynchronously; `fsync` means local spool durability.
+- Add a mount-table watchdog, and route FFmpeg diagnostics through Macha's logger with `ffmpeg_log_level`.
+
+## 0.12.3: metadata editing and artwork
+
+- Add `DELETE /api/v1/catalogue/items/{id}/metadata` and keep manual edits stable against the scanner.
+- Treat attached-picture streams as artwork rather than video, ingest embedded audio cover art, and reconcile artwork by role and object ID.
+
+## 0.12.2: Discogs and TV matching
+
+- Add Discogs as an optional fallback music metadata provider, with 60-second circuit breaking for MusicBrainz and Discogs.
+- Treat a one-year premiere difference as weak evidence in TMDB TV matching, and require episode titles to corroborate.
+
+## 0.12.1: music matching candidates
+
+- Make bounded provider work fair across Movies, TV and Music with round-robin queues.
+- Resolve music through separate embedded-tag, recording-first, tags-plus-path and path candidate generators, keeping album artist and track artist apart.
+
+## 0.12.0: subtitles and heuristic catalogue matching
+
+- Replace single-pass parsing with scored `MediaProbeCandidateGenerator` hypotheses and bounded provider fallback across them.
+- Serve subtitles as lazy time-segmented WebVTT; a subtitle-only PATCH no longer restarts the A/V generation, and bitmap formats are not advertised.
+
+## 0.11.0: non-primary node extent write
+
+- Add `dht.min_write_replicas` (default 1) as the degraded durable floor for data writes.
+- Hedge stalled remote extent PUTs onto fallback owners after `dht.write_stall_ms` (default 2500).
+
+## 0.10.4: catalogue cache invalidation
+
+- Make catalogue API reads generation-aware: warm reads are served from a shared immutable snapshot, and the control plane refreshes it single-flight.
+- Add `known_metadata_generation` to `/api/v1/catalogue/status`.
+
+## 0.10.3: music catalogue scan rework
+
+- Give each movie, TV and music provider its own roots (`providers.movies`, `providers.tv`, `providers.music`); the scanner-wide `roots` is removed.
+- Read embedded audio tags first, with conservative filename fallback and MusicBrainz recording lookup.
+
+## 0.10.2: Unicode paths and provider bounding
+
+- Fix macOS Unicode path identity: NFD directory entries, aliases resolved to the stored spelling, existing keys unchanged.
+- Negative-cache provider misses, fix TMDB TV-search caching, and bound enrichment with `catalogue.scanner.max_provider_requests_per_scan`.
+
+## 0.10.1: FUSE caching and shutdown
+
+- Replace zero-duration FUSE entry, attribute and negative caches with configurable 250/250/100 ms defaults.
+- Make shutdown two-phase: signal every worker before joining, cancel mounted reads and writes, and stop RPC before joining maintenance.
+
+## 0.10.0: garbage collection
+
+- Replace tombstone-only reclamation with bounded local reachability GC after `maintenance.garbage_grace_ms`.
+- Make garbage tombstones finite (SM8/DLT2) and bump the transport to v13.
+
+## 0.9.4: put() fallback on peer failure
+
+- Send a write to the fallback owner at once when a preferred owner's `put_object` cannot launch, instead of stalling the quorum.
+- Allow partial catalogue scans when roots are absent, and add `catalogue.scanner.rescan_debounce_ms` and `rescan_max_delay_ms`.
+- Remove the temporary rsync-stall instrumentation.
+
+## 0.9.3: catalogue root transfer
+
+- Move catalogue-root transfer to a metadata-object RPC on the CONTROL connection, and stop catalogue readiness waiting for all artwork.
+- Bump the transport to v12.
+
+## 0.9.2: catalogue TMDB matching
+
+- Canonicalise Arabic, Roman and spelled-out numbers when scoring provider titles.
+- Include the parsed identity in `no provider match` debug messages.
+
+## 0.9.1: client stream info and catalogue scan
+
+- Playback session responses report resolved mode, selected streams, source and output separately, and advertise only choices that negotiate.
+- Rescan the catalogue after namespace content changes, debounced by `catalogue.scanner.mutation_debounce_ms`, and harden movie and TV path parsing.
+
+## 0.9.0: metadata journalling
+
+- Replace whole-snapshot metadata mutation with delta CAS, verified by every voter.
+- Replace per-mutation snapshot rewrites with an encrypted append-only metadata journal and idle checkpoint compaction; 0.8.x state migrates on first start.
+- Bump the transport to v11.
+
+## 0.8.7: append to extent
+
+- Append and resume writes extend the file extent by extent instead of rematerialising the whole file; overwrites reuse unchanged extents.
+- Mounted writes can be cancelled, so SIGINT and SIGTERM do not hang behind a blocked FUSE write.
+
+## 0.8.6: cache locking fixes
+
+- Remove the persistent block cache's read/write lock convoy and the full cache enumeration on every insert.
+- Serve catalogue reads from the synchronised snapshot, and fix a snapshot race that returned `EIO` to FUSE.
+
+## 0.8.5: write performance and DEBUG noise
+
+- Make foreground metadata mutation optimistic, with compact commit acknowledgements and compact successful CAS replies.
+- Move broad timing telemetry from DEBUG to ALL.
+- Bump the transport to v10 (0.8.5 was first committed as v9).
+
+## 0.8.4: getattr/readdir and mounted-op priority
+
+- Rank traffic as playback `foreground`, mounted I/O and read-ahead `read_ahead`, and maintenance `speculative`; move maintenance probes to the DATA lane.
+- Serve `getattr` and `readdir` from a generation-cached decoded snapshot, and restore LocalStore accounting from a checksummed journal at restart.
+- Report `server_version` in catalogue and playback status.
+
+## 0.8.3: GC behaviour rework
+
+- Stop rebuilding the full live/garbage inventory every five seconds: cache it per metadata generation and back off when settled.
+- Replace repair's full-store listing with bounded cursors, and move hot-path logs from DEBUG to ALL.
+
+## 0.8.2: seek behaviour
+
+- A seek-only session PATCH reuses the prepared VOD plan instead of re-probing the source.
+- Preserve the source sample aspect ratio through remux and transcode.
+- The tag `0.8.2` is on `559b2f1`, the 0.18.2 commit, whose subject has the typo; 0.8.2 itself is `cf0143a`, untagged.
+
+## 0.8.1: VOD playlist fixes
+
+- Includes 0.8.0: transformed playback is a complete immutable HLS VOD manifest with keyframe-planned segments.
+- Fix Matroska/WebM startup with a partially populated index, and reject remux plans whose index is too sparse.
+
+## 0.7.3: mutex lock fixes
+
+- Includes 0.7.2: `StoragePool` runs disk operations outside backend mutexes, RPCs no longer refresh storage usage, and scrub and rebalance use bounded persistent cursors.
+- Remove the unused `DistributedStore::scrub_offset_`, fixing Clang `-Werror` builds.
+
+## 0.7.1: back to two lanes
+
+- Split peer transport into a CONTROL lane and a lazily opened DATA lane; bump the transport to v8.
+- Make LocalStore capacity accounting asynchronous, so a large store no longer delays startup.
+
+## 0.7.0: streaming player, FFmpeg integration
+
+- Add negotiated playback sessions: direct play, fragmented-MP4 HLS remux and transcoding through an in-process libav media engine.
+- Add capability-scoped stream URLs, a concurrent HTTP server with byte ranges, playback admission limits and `seek_ms` on session creation.
+- Move operational documentation from `README.md` into `docs/`.
+
+## 0.6.2: placement weights
+
+- Replace equal-node extent placement with a stable capacity-weighted 2^32 shard space that keeps failure-domain diversity; bump the transport to v7.
+- Add a per-node metadata mutation sequence clock (snapshot format 7), fixing the two-voter `EEXIST` race.
+
+## 0.6.1: TMDB integration provider
+
+- Add automatic catalogue scanning for movies, TV and music with TMDB and MusicBrainz providers and artwork download.
+- Make the lowest active node ID the scanner coordinator.
+
+## 0.6.0: single TCP connection mux, catalogue API
+
+- Collapse peer lanes into one authenticated connection per peer with prioritised, pre-emptive variable-length frames; bump the transport to v6.
+- Includes 0.5.0 to 0.5.2: a distributed media catalogue with an HTTP/JSON API, a priority cache hydrator with catalogue prediction, and a load-aware replica selector.
+
+## 0.4.0: renamed to Macha
+
+- Initial import into this repository: renamed to Macha throughout, transport v4 (`MCH4`), with no compatibility with pre-Macha nodes or state.
+- Fix metadata genesis for symmetric bootstrap and more than one voter; replica counts can change by coordinated whole-cluster restart.
