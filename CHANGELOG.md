@@ -1,5 +1,14 @@
 # Current release
 
+## 0.94.2: the availability survey asks again after any failure
+
+Availability: a survey read a peer whose telemetry had not yet arrived as one too
+old to answer, failed its diff without asking, and asked it again only when the
+membership changed. A survey that ran first after a start or a restart left
+everything only that peer held `unknown` until the next topology change. Every
+peer is now asked, and a diff that fails is asked again on the survey's backoff
+(1 s, doubling to 5 minutes). Test ports stay below Linux's ephemeral range.
+
 ## 0.94.1: an async playback start lets go of its candidate
 
 Playback: an async start owned the session it was building and that session owned

@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.94.1*
+*v0.94.2*
 
 [![CI](https://github.com/tomdionysus/macha/actions/workflows/ci.yml/badge.svg)](https://github.com/tomdionysus/macha/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/tomdionysus/macha/graph/badge.svg)](https://codecov.io/gh/tomdionysus/macha)
