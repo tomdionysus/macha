@@ -11,9 +11,9 @@ namespace macha {
 // (law 2), loader (law 3), then speculative (repair, prefetch, maintenance).
 // Every subsystem that admits, paces or measures work by class reads
 // work_class(), and none decides class from a frame itself.
-using dannan::sched::FrameType;
 using dannan::sched::frame_for;
 using dannan::sched::frame_type_name;
+using dannan::sched::FrameType;
 using dannan::sched::work_class;
 using dannan::sched::WorkClass;
 

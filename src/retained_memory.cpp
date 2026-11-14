@@ -27,15 +27,14 @@ std::optional<RetainedMemoryLedger::Lease>
 RetainedMemoryLedger::acquire(WorkClass work, MemoryOwner owner, uint64_t bytes,
                               Clock::time_point deadline, std::atomic_bool* cancelled,
                               bool reclaimable, std::function<void()> shed) {
-    return ledger_.acquire(work, dannan_owner(owner), bytes, deadline, cancelled,
-                           reclaimable, std::move(shed));
+    return ledger_.acquire(work, dannan_owner(owner), bytes, deadline, cancelled, reclaimable,
+                           std::move(shed));
 }
 
 std::optional<RetainedMemoryLedger::Lease>
 RetainedMemoryLedger::try_acquire(WorkClass work, MemoryOwner owner, uint64_t bytes,
                                   bool reclaimable, std::function<void()> shed) {
-    return ledger_.try_acquire(work, dannan_owner(owner), bytes, reclaimable,
-                               std::move(shed));
+    return ledger_.try_acquire(work, dannan_owner(owner), bytes, reclaimable, std::move(shed));
 }
 
 RetainedMemoryLedger::Lease RetainedMemoryLedger::restore(WorkClass work, MemoryOwner owner,

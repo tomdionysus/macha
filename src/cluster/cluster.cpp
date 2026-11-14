@@ -394,8 +394,7 @@ AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
 }
 
 size_t NodeRuntime::broadcast_best_effort(const RpcMessage& message, FrameType frame_type) {
-    return host_.node().channels().broadcast_best_effort(dannan_message(message),
-                                                         frame_type);
+    return host_.node().channels().broadcast_best_effort(dannan_message(message), frame_type);
 }
 
 size_t NodeRuntime::broadcast_notify(const RpcMessage& message, FrameType frame_type) {

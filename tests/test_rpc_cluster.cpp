@@ -286,8 +286,8 @@ MACHA_FAST_TEST("rpc_cluster", test_store_concurrent_readers_share_one_fetch_and
         reply_gate.enter_and_wait();
         auto reply = object_reply(bytes);
         reply.retained_memory = std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
-        reply.retained_memory->push_back(
-            *memory.try_acquire(WorkClass::foreground, MemoryOwner::rpc_frame, reply.payload.size()));
+        reply.retained_memory->push_back(*memory.try_acquire(
+            WorkClass::foreground, MemoryOwner::rpc_frame, reply.payload.size()));
         return reply;
     });
     const auto held = [&] {
