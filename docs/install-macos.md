@@ -14,8 +14,9 @@ xcode-select --install
 
 Macha requires CMake 3.20 or later, a C++20 compiler, OpenSSL, libcurl,
 zlib, yaml-cpp, Boost 1.83 or later (Asio) and FFmpeg 6 or later development
-libraries, and [Dannan](https://github.com/tomdionysus/dannan) 0.5.3, the
-cluster transport, built and installed first. zlib comes with the macOS SDK.
+libraries, [Dannan](https://github.com/tomdionysus/dannan) 0.6, the cluster
+transport, and [Dagda](https://github.com/tomdionysus/dagda) 0.1.5, the store,
+built and installed first. zlib comes with the macOS SDK.
 macFUSE supplies the mounted filesystem, and libtorrent-rasterbar 2.0 or later
 enables BitTorrent acquisition. UPnP port mapping is Dannan's and needs
 nothing extra.
@@ -45,14 +46,19 @@ brew install --cask macfuse
 prefix on both `/usr/local` Intel installations and `/opt/homebrew` Apple
 Silicon installations; it does not need to be force-linked.
 
-Build and install Dannan 0.5.3 from its tag, then configure and build Macha
-as your normal user, naming Dannan's prefix:
+Build and install Dannan 0.6.0 and then Dagda 0.1.5 from their tags, then
+configure and build Macha as your normal user:
 
 ```bash
-git clone --branch 0.5.3 https://github.com/tomdionysus/dannan.git
+git clone --branch 0.6.0 https://github.com/tomdionysus/dannan.git
 cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release
 cmake --build dannan/build --parallel
 sudo cmake --install dannan/build --prefix /usr/local
+
+git clone --branch 0.1.5 https://github.com/tomdionysus/dagda.git
+cmake -S dagda -B dagda/build -DCMAKE_BUILD_TYPE=Release
+cmake --build dagda/build --parallel
+sudo cmake --install dagda/build --prefix /usr/local
 
 cmake -S . -B build-homebrew \
   -DCMAKE_BUILD_TYPE=Release \
@@ -83,11 +89,17 @@ system location. MacPorts installs FFmpeg 7's pkg-config files below its
 versioned `libexec` directory, so expose that directory while configuring:
 
 ```bash
-git clone --branch 0.5.3 https://github.com/tomdionysus/dannan.git
+git clone --branch 0.6.0 https://github.com/tomdionysus/dannan.git
 cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="/opt/local/libexec/boost/1.88;/opt/local"
 cmake --build dannan/build --parallel
 sudo cmake --install dannan/build --prefix /opt/local
+
+git clone --branch 0.1.5 https://github.com/tomdionysus/dagda.git
+cmake -S dagda -B dagda/build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="/opt/local/libexec/boost/1.88;/opt/local"
+cmake --build dagda/build --parallel
+sudo cmake --install dagda/build --prefix /opt/local
 
 export PKG_CONFIG_PATH="/opt/local/libexec/ffmpeg7/lib/pkgconfig:/opt/local/lib/pkgconfig:/opt/local/share/pkgconfig"
 cmake -S . -B build-macports \
