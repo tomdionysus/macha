@@ -17,6 +17,16 @@ Dagda, then the harness and the migration rehearsal. Deps: Dannan 0.7.0 and Dagd
 
 ## R1. The root (composition and lifecycle) [root section rewrites 1-5, 13, 14; metadata 1]
 
+**Progress:** `f975a47` pins Dannan 0.7.0 and Dagda 0.2.0 (the tree compiled unchanged); `05ca9a6` the root builds
+`dagda::Node(OpenLater)` over `node_.node()` in `Service`'s constructor, `open_store()` first in
+`initialise_services`, `Node::stop()` after `services_->stop()` (compiles on build-3 with
+`build/pi/macha_port_compile.sh`; does not run while `LocalState` opens Macha's store too). **Next in R1: the state
+lock.** `Service::state_lock_` is taken first so `NodeIdentity` reads no state file unlocked; Dagda's node takes its
+`StorageLock` on `state` only in `open_store()`, and Dannan's `.dannan.lock` comes with the Dannan node inside
+`NodeRuntime`. Before dropping Macha's lock, settle who holds a lock while `NodeIdentity` and the layout marker
+are read (read Dannan's `Node` constructor for when `.dannan.lock` is taken; if before any state read, Macha's
+identity moves after it or onto Dannan's identity), then drop `state_lock_`.
+
 - `LocalState` goes. `Service` builds `dagda::Node(context, options, OpenLater)` after `NodeRuntime` and before
   `node_.start()` (registrations before the Dannan node starts); `open_store()` on the startup thread; `Node::stop()`
   after `services_->stop()`, before `node_.stop()`. Macha keeps only its `MetadataReplica` (heads off until 8c) and
