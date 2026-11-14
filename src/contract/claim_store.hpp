@@ -6,6 +6,8 @@
 #include "contract/work.hpp"
 #include "types.hpp"
 
+#include "dagda/contract/claim_store.h"
+
 #include <array>
 #include <compare>
 #include <cstddef>
@@ -24,20 +26,11 @@
 // RetentionStore.
 namespace macha {
 
-enum class RetentionClass : uint8_t {
-    data = 1,
-    control = 2,
-};
-
-// One claim's causal identity: the writing node and its sequence.
-struct RetentionDot {
-    NodeId origin{};
-    uint64_t sequence{};
-    auto operator<=>(const RetentionDot&) const = default;
-};
-
-// What a metadata head has observed of each node's claim writes.
-using RetentionClock = std::map<NodeId, uint64_t>;
+// A claim's class, its causal dot (the writing node and its sequence), and
+// what a metadata head has observed of each node's claim writes: Dagda's.
+using RetentionClass = dagda::contract::RetentionClass;
+using RetentionDot = dagda::contract::RetentionDot;
+using RetentionClock = dagda::contract::RetentionClock;
 
 // This node's guard over an object's claims against its copy, so no claim
 // lands between a delete's check that none stands and the delete. A claim's
