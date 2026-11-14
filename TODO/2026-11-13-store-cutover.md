@@ -89,6 +89,12 @@ the first telemetry at join (inferred, never observed).
 
 ## Log
 
+- 2026-11-14: **Dagda 0.1.5 tagged** (local main `c20f88c`; remote at the operator's "push"): Dannan 0.6.0
+  (SameMinorVersion, `libdannan.so.0.6`), Dagda exact (`find_package(dagda 0.1.5 CONFIG)`, `libdagda.so.0.1.5`), Debian
+  packages (`libdagda0.1.5`, `libdagda-dev` on `libdannan-dev (>= 0.6.0), (<< 0.7~)`, `dagda-tools` with `dagda-migrate`),
+  GCC 14 Release -Werror clean on arm64 (fixed in code). Gates: macOS 1041; jupiter arm64 970 passed, 71 skipped (68 for
+  Macha's fixtures, now to be copied to the Pi), lintian clean. **Macha moves to 0.1.5 and Dannan 0.6.0 next** (the
+  store branch is on 0.1.4 and 0.5.3), building on the Pis only (operator, 2026-11-14: no builds on the Mac).
 - 2026-11-13: Dannan 0.6.0 tagged and pushed (main `45dc96b`): the ABI promise starts here (`libdannan.so.0.6`, package
   `libdannan0.6`), after Macha's review found 0.5.4 broke `libdannan.so.0.5`'s ABI against 0.5.3. Macha's path: Dagda 0.1.5
   on Dannan 0.6.0, then `Depends: libdannan0.6 (>= 0.6.0)`, one relink from 0.5.3. Packages signed and uploaded by the
