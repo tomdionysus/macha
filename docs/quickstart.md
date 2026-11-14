@@ -30,13 +30,18 @@ brew install --cask macfuse
 
 libtorrent-rasterbar (2.0 or later) is optional: without it the BitTorrent acquisition plugin is simply not built. FUSE 3 or macFUSE builds the mount plugin; without it the node runs with no mount. Everything else is required. Do not install a second Boost alongside the one your libtorrent-rasterbar was built with: the torrent plugin compiled against mismatched Boost headers can crash at runtime. Debian 12 and Ubuntu 22.04 ship FFmpeg versions that are too old. For Arch, MacPorts, the FFmpeg version check and the full installation procedure, see [install-linux.md](install-linux.md) and [install-macos.md](install-macos.md).
 
-Then build and install [Dannan](https://github.com/tomdionysus/dannan) 0.5.3, the cluster transport (UPnP port mapping comes with it), and Macha against it:
+Then build and install [Dannan](https://github.com/tomdionysus/dannan) 0.6.0, the cluster transport (UPnP port mapping comes with it), then [Dagda](https://github.com/tomdionysus/dagda) 0.1.5, the store, and Macha against them:
 
 ```bash
-git clone --branch 0.5.3 https://github.com/tomdionysus/dannan.git
+git clone --branch 0.6.0 https://github.com/tomdionysus/dannan.git
 cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release
 cmake --build dannan/build --parallel
 sudo cmake --install dannan/build --prefix /usr/local
+
+git clone --branch 0.1.5 https://github.com/tomdionysus/dagda.git
+cmake -S dagda -B dagda/build -DCMAKE_BUILD_TYPE=Release
+cmake --build dagda/build --parallel
+sudo cmake --install dagda/build --prefix /usr/local
 
 cmake -S . -B build
 cmake --build build --parallel

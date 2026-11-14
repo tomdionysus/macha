@@ -2,8 +2,8 @@
 #
 # tools/ci.sh on GitHub's runners: format and SPDX checks, the release build
 # with every test binary, clang-tidy, the ASan and UBSan build with the same
-# tests, and the coverage build, its report sent to Codecov. Dannan is built
-# from its tag first. The run on a cluster node stays the gate for what needs
+# tests, and the coverage build, its report sent to Codecov. Dannan and Dagda
+# are built from their tags first. The run on a cluster node stays the gate for what needs
 # real disks and peers.
 name: CI
 
@@ -16,7 +16,8 @@ permissions:
   contents: read
 
 env:
-  DANNAN_VERSION: "0.5.3"
+  DANNAN_VERSION: "0.6.0"
+  DAGDA_VERSION: "0.1.5"
 
 jobs:
   build-and-test:
@@ -44,6 +45,14 @@ jobs:
           cmake -S /opt/dannan-src -B /opt/dannan-build -DCMAKE_BUILD_TYPE=Release
           cmake --build /opt/dannan-build -j "$(nproc)"
           cmake --install /opt/dannan-build --prefix /usr/local
+          ldconfig
+
+      - name: Build and install Dagda
+        run: |
+          git clone --depth 1 --branch "$DAGDA_VERSION" https://github.com/tomdionysus/dagda.git /opt/dagda-src
+          cmake -S /opt/dagda-src -B /opt/dagda-build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /opt/dagda-build -j "$(nproc)"
+          cmake --install /opt/dagda-build --prefix /usr/local
           ldconfig
 
       - uses: actions/checkout@v4
