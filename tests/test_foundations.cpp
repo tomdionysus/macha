@@ -618,7 +618,7 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_preserves_priority_he
     // Speculative use cannot consume the loader floor; viewer and control
     // reserves stay usable at full lower load.
     auto loader = ledger.try_acquire(WorkClass::loader, MemoryOwner::publication, 10);
-    auto viewer = ledger.try_acquire(WorkClass::viewer, MemoryOwner::playback_segment, 30);
+    auto viewer = ledger.try_acquire(WorkClass::foreground, MemoryOwner::playback_segment, 30);
     auto control = ledger.try_acquire(WorkClass::control, MemoryOwner::rpc_frame, 10);
     REQUIRE(loader.has_value());
     REQUIRE(viewer.has_value());
@@ -693,7 +693,7 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
     std::atomic_bool viewer_started{false};
     std::jthread viewer([&] {
         viewer_started.store(true);
-        (void)ledger.acquire(WorkClass::viewer, MemoryOwner::playback_segment, 40,
+        (void)ledger.acquire(WorkClass::foreground, MemoryOwner::playback_segment, 40,
                              RetainedMemoryLedger::Clock::now() + 1s, &viewer_cancel);
     });
     while (!viewer_started.load())
@@ -732,7 +732,7 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_sheds_borrowed_cache_
     REQUIRE(borrowed.has_value());
     CHECK(ledger.stats().reclaimable_bytes == 90);
 
-    auto viewer = ledger.acquire(WorkClass::viewer, MemoryOwner::playback_segment, 30,
+    auto viewer = ledger.acquire(WorkClass::foreground, MemoryOwner::playback_segment, 30,
                                  RetainedMemoryLedger::Clock::now() + 1s);
     REQUIRE(viewer.has_value());
     CHECK(!borrowed.has_value());
@@ -750,10 +750,10 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_restores_durable_over
     const auto overcommitted = ledger.stats();
     CHECK(overcommitted.used_bytes == 120);
     CHECK(overcommitted.restored_bytes == 120);
-    CHECK(!ledger.try_acquire(WorkClass::viewer, MemoryOwner::playback_segment, 1).has_value());
+    CHECK(!ledger.try_acquire(WorkClass::foreground, MemoryOwner::playback_segment, 1).has_value());
 
     restored.reset();
-    auto viewer = ledger.try_acquire(WorkClass::viewer, MemoryOwner::playback_segment, 30);
+    auto viewer = ledger.try_acquire(WorkClass::foreground, MemoryOwner::playback_segment, 30);
     REQUIRE(viewer.has_value());
     CHECK(ledger.stats().used_bytes == 30);
 }

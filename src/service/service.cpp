@@ -76,7 +76,7 @@ Service::Service(const Config& config, ClusterKeys keys,
                 if (path == prefix || (path.size() > prefix.size() && path.starts_with(prefix) &&
                                        path[prefix.size()] == '/'))
                     return WorkClass::control;
-            return WorkClass::viewer;
+            return WorkClass::foreground;
         });
         catalogue_http_->set_activity(
             [this](WorkClass work, uint64_t) { resources_.activity.note(work); });

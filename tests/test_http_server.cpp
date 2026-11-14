@@ -202,7 +202,7 @@ MACHA_TEST("http_server", test_a_blocking_body_read_on_one_connection_does_not_d
         return http_error(404, "not_found", "not found");
     });
     server.set_work_class([](std::string_view path) {
-        return path == "/api/v1/health" ? WorkClass::control : WorkClass::viewer;
+        return path == "/api/v1/health" ? WorkClass::control : WorkClass::foreground;
     });
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
@@ -242,7 +242,7 @@ MACHA_TEST("http_server",
         return http_error(404, "not_found", "not found");
     });
     server.set_work_class([](std::string_view path) {
-        return path == "/api/v1/health" ? WorkClass::control : WorkClass::viewer;
+        return path == "/api/v1/health" ? WorkClass::control : WorkClass::foreground;
     });
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
@@ -296,7 +296,7 @@ MACHA_TEST("http_server", test_an_inline_route_answers_with_every_worker_busy) {
         return http_error(404, "not_found", "not found");
     });
     server.set_work_class([](std::string_view path) {
-        return path == "/block-control" ? WorkClass::control : WorkClass::viewer;
+        return path == "/block-control" ? WorkClass::control : WorkClass::foreground;
     });
     std::atomic<int> inline_calls{0};
     server.set_inline_route("/api/v1/health", [&] {
@@ -385,7 +385,7 @@ MACHA_TEST("http_server", test_a_body_draining_to_a_slow_client_keeps_its_class_
     server.set_activity([&](WorkClass work, uint64_t bytes) {
         notes.fetch_add(1, std::memory_order_relaxed);
         wire_bytes.fetch_add(bytes, std::memory_order_relaxed);
-        if (work != WorkClass::viewer)
+        if (work != WorkClass::foreground)
             other_class.fetch_add(1, std::memory_order_relaxed);
     });
     server.start();
@@ -452,7 +452,7 @@ MACHA_TEST("http_server", test_hundreds_of_idle_keep_alive_connections_cost_noth
         return http_json(200, "{\"ok\":true}");
     });
     server.set_work_class([](std::string_view path) {
-        return path == "/api/v1/health" ? WorkClass::control : WorkClass::viewer;
+        return path == "/api/v1/health" ? WorkClass::control : WorkClass::foreground;
     });
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));

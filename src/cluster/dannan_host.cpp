@@ -21,7 +21,7 @@ dannan::net::RequestHandler dispatch_to(MessageRoutes& routes) {
         dannan::net::Message copy;
         copy.type = request.type;
         copy.payload = request.payload;
-        auto reply = routes.dispatch(node_info_from(peer), macha_frame(frame),
+        auto reply = routes.dispatch(node_info_from(peer), frame,
                                      macha_message(std::move(copy)));
         return dannan::net::Handled::processed(dannan_message(reply));
     };
@@ -184,7 +184,7 @@ AsyncRpc DannanHost::wrap(const std::shared_ptr<std::promise<RpcReply>>& promise
     const auto made = Clock::now();
     return AsyncRpc(
         std::move(future), [handle] { handle->cancel(); }, [handle] { handle->abort(); },
-        [handle](FrameType frame) { handle->promote(dannan_frame(frame)); },
+        [handle](FrameType frame) { handle->promote(frame); },
         [handle, made] {
             const auto idle = handle->idle_for();
             if (idle != std::chrono::milliseconds::max())
@@ -212,7 +212,7 @@ AsyncRpc DannanHost::call_async(const NodeInfo& peer, MessageType type,
     auto promise = std::make_shared<std::promise<RpcReply>>();
     auto handle = node_->routes().call(
         record_for(peer), dannan_type(type), dannan::net::Bytes(payload.begin(), payload.end()),
-        dannan_frame(frame), deadline, io_.get_executor(),
+        frame, deadline, io_.get_executor(),
         [promise](dannan::net::CallOutcome outcome) { settle(*promise, std::move(outcome)); });
     return wrap(promise, handle);
 }
@@ -223,7 +223,7 @@ AsyncRpc DannanHost::call_async(const Endpoint& endpoint, MessageType type,
     auto promise = std::make_shared<std::promise<RpcReply>>();
     auto handle = node_->routes().call(
         dannan::net::Endpoint{endpoint.host, endpoint.port}, dannan_type(type),
-        dannan::net::Bytes(payload.begin(), payload.end()), dannan_frame(frame), deadline,
+        dannan::net::Bytes(payload.begin(), payload.end()), frame, deadline,
         io_.get_executor(),
         [promise](dannan::net::CallOutcome outcome) { settle(*promise, std::move(outcome)); });
     return wrap(promise, handle);

@@ -174,7 +174,7 @@ RpcServerWorkStats macha_work_stats(const dannan::net::WorkStats& stats) {
     out.data_pending_bytes = stats.data_pending_bytes;
     out.rejected_jobs = stats.rejected;
     for (const auto& [frame, timing] : stats.frame_timings)
-        out.frame_timings[macha_frame(frame)] = macha_timing(timing);
+        out.frame_timings[frame] = macha_timing(timing);
     for (const auto& [type, timing] : stats.message_timings)
         out.message_timings[macha_type(type)] = macha_timing(timing);
     return out;

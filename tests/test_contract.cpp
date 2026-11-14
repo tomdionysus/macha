@@ -55,7 +55,7 @@ MACHA_FAST_TEST("contract", test_work_may_allow_itself_less_never_more) {
     // A memory-only read: viewer work allowing no network wait.
     const WorkContext read(FrameType::foreground, {}, nullptr, "read",
                            Waits::state_device | Waits::locks);
-    CHECK(read.work() == WorkClass::viewer);
+    CHECK(read.work() == WorkClass::foreground);
     CHECK(may_enter(read.allowed(), Waits::state_device));
     CHECK(!may_enter(read.allowed(), Waits::network));
     CHECK(!may_enter(read.allowed(), Waits::data_device));

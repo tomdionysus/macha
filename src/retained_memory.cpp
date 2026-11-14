@@ -3,12 +3,6 @@
 
 namespace macha {
 
-namespace {
-dannan::sched::WorkClass dannan_work(WorkClass work) noexcept {
-    return static_cast<dannan::sched::WorkClass>(static_cast<uint8_t>(work));
-}
-} // namespace
-
 dannan::sched::MemoryOwner dannan_owner(MemoryOwner owner) noexcept {
     if (owner == MemoryOwner::rpc_frame)
         return dannan::sched::MemoryOwner::rpc_frame;
@@ -33,20 +27,20 @@ std::optional<RetainedMemoryLedger::Lease>
 RetainedMemoryLedger::acquire(WorkClass work, MemoryOwner owner, uint64_t bytes,
                               Clock::time_point deadline, std::atomic_bool* cancelled,
                               bool reclaimable, std::function<void()> shed) {
-    return ledger_.acquire(dannan_work(work), dannan_owner(owner), bytes, deadline, cancelled,
+    return ledger_.acquire(work, dannan_owner(owner), bytes, deadline, cancelled,
                            reclaimable, std::move(shed));
 }
 
 std::optional<RetainedMemoryLedger::Lease>
 RetainedMemoryLedger::try_acquire(WorkClass work, MemoryOwner owner, uint64_t bytes,
                                   bool reclaimable, std::function<void()> shed) {
-    return ledger_.try_acquire(dannan_work(work), dannan_owner(owner), bytes, reclaimable,
+    return ledger_.try_acquire(work, dannan_owner(owner), bytes, reclaimable,
                                std::move(shed));
 }
 
 RetainedMemoryLedger::Lease RetainedMemoryLedger::restore(WorkClass work, MemoryOwner owner,
                                                           uint64_t bytes) {
-    return ledger_.restore(dannan_work(work), dannan_owner(owner), bytes);
+    return ledger_.restore(work, dannan_owner(owner), bytes);
 }
 
 void RetainedMemoryLedger::wake() {

@@ -708,7 +708,7 @@ struct HttpServer::Impl {
           authenticate(std::move(auth)) {}
 
     WorkClass request_class(std::string_view path) const {
-        return classify ? classify(path) : WorkClass::viewer;
+        return classify ? classify(path) : WorkClass::foreground;
     }
     bool control_route(std::string_view path) const {
         return request_class(path) == WorkClass::control;
