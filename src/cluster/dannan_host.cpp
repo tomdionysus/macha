@@ -21,8 +21,7 @@ dannan::net::RequestHandler dispatch_to(MessageRoutes& routes) {
         dannan::net::Message copy;
         copy.type = request.type;
         copy.payload = request.payload;
-        auto reply = routes.dispatch(node_info_from(peer), frame,
-                                     macha_message(std::move(copy)));
+        auto reply = routes.dispatch(node_info_from(peer), frame, macha_message(std::move(copy)));
         return dannan::net::Handled::processed(dannan_message(reply));
     };
 }
@@ -223,8 +222,7 @@ AsyncRpc DannanHost::call_async(const Endpoint& endpoint, MessageType type,
     auto promise = std::make_shared<std::promise<RpcReply>>();
     auto handle = node_->routes().call(
         dannan::net::Endpoint{endpoint.host, endpoint.port}, dannan_type(type),
-        dannan::net::Bytes(payload.begin(), payload.end()), frame, deadline,
-        io_.get_executor(),
+        dannan::net::Bytes(payload.begin(), payload.end()), frame, deadline, io_.get_executor(),
         [promise](dannan::net::CallOutcome outcome) { settle(*promise, std::move(outcome)); });
     return wrap(promise, handle);
 }

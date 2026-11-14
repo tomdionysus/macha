@@ -1324,8 +1324,8 @@ void Maintenance::run(std::stop_token stop) {
             // A busy pass suppressed GC, repair and rebalance; it re-evaluates as soon as
             // the foreground quiet period is met, or at once if it already has, rather
             // than sleeping until an unrelated event.
-            auto idle =
-                std::min(store_.idle_for(WorkClass::foreground), store_.idle_for(WorkClass::loader));
+            auto idle = std::min(store_.idle_for(WorkClass::foreground),
+                                 store_.idle_for(WorkClass::loader));
             deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
                                                                 ? policy.foreground_quiet - idle
                                                                 : Clock::duration{}));
