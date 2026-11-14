@@ -12,8 +12,10 @@
 #include "test_support.hpp"
 
 #include <dannan/identity/cluster_key.h>
+#include <dannan/identity/key_custody.h>
 
 #include <atomic>
+#include <fstream>
 #include <mutex>
 
 using namespace macha;
@@ -35,6 +37,61 @@ dannan::NodeConfig host_config(const std::filesystem::path& state, const std::fi
 }
 
 } // namespace
+
+// custody.credential gives the node its key custody, the root read from the credential;
+// a node told to use custody that was never made is refused at construction, saying so.
+MACHA_TEST("dannan_host", test_custody_from_the_named_credential) {
+    TempDir dir;
+    const auto key = dir.path() / "cluster.key";
+    write_key(key);
+    const auto credentials = dir.path() / "credentials";
+    std::filesystem::create_directories(credentials);
+
+    Config config;
+    config.listen_host = "127.0.0.1";
+    config.custody.credential = "macha-custody";
+    config.custody.credentials_directory = credentials;
+
+    config.state_path = dir.path() / "with";
+    std::filesystem::create_directories(config.state_path);
+    const auto root = dannan::identity::KeyCustody::create(
+        config.state_path,
+        dannan::identity::KeySource::systemd_credential("macha-custody", credentials));
+    REQUIRE(root.has_value());
+    {
+        std::ofstream out(credentials / "macha-custody", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(root->reveal().data()),
+                  static_cast<std::streamsize>(root->size()));
+    }
+    config.port = free_port();
+    auto node = dannan_node_config(config, dannan::identity::load_cluster_key(key));
+    REQUIRE(node.custody.has_value());
+    node.version = "test";
+    MessageRoutes routes;
+    DannanHost with(std::move(node), routes, 2, {});
+    with.start();
+    REQUIRE(with.node().identity().has_custody());
+    with.stop();
+
+    config.state_path = dir.path() / "without";
+    std::filesystem::create_directories(config.state_path);
+    config.port = free_port();
+    auto refused = dannan_node_config(config, dannan::identity::load_cluster_key(key));
+    refused.version = "test";
+    std::string why;
+    try {
+        DannanHost without(std::move(refused), routes, 2, {});
+    } catch (const std::exception& error) {
+        why = error.what();
+    }
+    REQUIRE(!why.empty());
+
+    // No custody configured: none, as before.
+    config.custody = {};
+    config.state_path = dir.path() / "none";
+    config.port = free_port();
+    REQUIRE(!dannan_node_config(config, dannan::identity::load_cluster_key(key)).custody);
+}
 
 MACHA_TEST("dannan_host", test_a_call_reaches_the_peers_route_and_answers) {
     TempDir dir;

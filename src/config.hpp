@@ -584,6 +584,16 @@ struct SessionConfig {
     std::chrono::milliseconds failed_login_lockout{std::chrono::seconds(30)};
 };
 
+// The node's key custody (custody.credential): the systemd credential holding the
+// root its custody file is sealed under, unsealed by the unit into
+// $CREDENTIALS_DIRECTORY at each start. Unset: no custody. `credentials_directory`
+// reads the credential from a directory of its own instead (tests, or a node run
+// outside systemd).
+struct CustodyConfig {
+    std::string credential;
+    std::filesystem::path credentials_directory;
+};
+
 struct Config {
     std::filesystem::path state_path;
     std::vector<StorageBackendConfig> storage_backends;
@@ -618,6 +628,7 @@ struct Config {
     std::chrono::milliseconds service_startup_timeout{0};
 
     std::filesystem::path key_file;
+    CustodyConfig custody;
     // Plugin directory SubsystemSupervisor scans. Unset = the compile-time
     // kDefaultPluginDir (MACHA_PLUGIN_INSTALL_DIR), not the executable's bindir.
     std::optional<std::filesystem::path> plugin_path;

@@ -147,6 +147,48 @@ MACHA_FAST_TEST("runtime_dependencies", test_advertised_api_endpoint_is_validate
     }
 }
 
+// custody names a credential, and only a name; without the mapping the node has no
+// custody.
+MACHA_FAST_TEST("runtime_dependencies", test_yaml_custody_names_a_credential) {
+    TempDir t;
+    auto yaml = t.path() / "custody.yaml";
+    auto write = [&](const std::string& custody) {
+        std::ofstream out(yaml);
+        out << "state_path: " << (t.path() / "state").string() << "\n"
+            << "key_file: " << (t.path() / "key").string() << "\n"
+            << "storage:\n  hosts_extents: false\n  metadata:\n    limit: 1G\n"
+            << "bootstrap:\n  - seed1.example:7437\n"
+            << custody;
+        out.close();
+        return yaml;
+    };
+    auto rejected = [&](const std::string& custody) {
+        try {
+            (void)load_yaml_config(write(custody));
+            return false;
+        } catch (const std::exception&) {
+            return true;
+        }
+    };
+
+    const auto none = load_yaml_config(write(""));
+    CHECK(none.custody.credential.empty());
+    CHECK(none.custody.credentials_directory.empty());
+
+    const auto named = load_yaml_config(write("custody:\n  credential: macha-custody\n"));
+    CHECK(named.custody.credential == "macha-custody");
+    CHECK(named.custody.credentials_directory.empty());
+
+    const auto directed = load_yaml_config(
+        write("custody:\n  credential: macha-custody\n  credentials_directory: /run/creds\n"));
+    CHECK(directed.custody.credentials_directory == "/run/creds");
+
+    CHECK(rejected("custody:\n  credentials_directory: /run/creds\n"));
+    CHECK(rejected("custody:\n  credential: \"\"\n"));
+    CHECK(rejected("custody:\n  credential: /etc/credstore/macha-custody\n"));
+    CHECK(rejected("custody:\n  credential: macha-custody\n  root: abc\n"));
+}
+
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_edge_node_needs_no_data_backends) {
     // An edge node: storage.hosts_extents false and no storage.data at all.
     // The metadata store stays required and is defaulted as usual.

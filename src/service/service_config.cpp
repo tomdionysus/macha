@@ -17,6 +17,9 @@ void Service::reload_config() {
     if (updated.state_path != node_.config().state_path ||
         updated.key_file != node_.config().key_file)
         throw std::runtime_error("state_path/key_file cannot be changed by live reload");
+    if (updated.custody.credential != node_.config().custody.credential ||
+        updated.custody.credentials_directory != node_.config().custody.credentials_directory)
+        throw std::runtime_error("custody changes require a restart");
     if (updated.fuse.spool_path != node_.config().fuse.spool_path ||
         updated.fuse.operation_journal_path != node_.config().fuse.operation_journal_path)
         throw std::runtime_error("FUSE spool/journal paths cannot be changed by live reload");
