@@ -11,6 +11,8 @@ this rationalisation is `archive/2026-11-14-ACTIVE-before-rationalisation.md`. A
 glibc heap-check run stay in item 1 below). Macha's work now: review Dagda's store-side map against code
 (`../dagda/TODO/macha-store-map/`, `../dagda/TODO/2026-11-14-macha-store-map.md`), then write Macha's half.
 
+**Next: the rewrites, in order** (`TODO/2026-11-14-port-rewrites.md`, R1 root to R7 removal), against Dagda
+`feature/macha-store-gaps` (Context v2 gated green at `3ce0e10`; compaction `7f14515` reviewed and passed).
 **Macha's half of the map written (2026-11-14 night):** `TODO/store-map-callers/` (six sections, 222 rows, index
 README with what Macha verified). Sent to Dagda for review.
 **Map review done (2026-11-14 night):** six reviewers, one per Dagda section, files in `build/map-review/`; 214 rows
