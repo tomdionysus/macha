@@ -44,6 +44,30 @@ node as `nodes[].node_name` (`null` when unset), beside `host` and never in
 place of it: `host` stays the address peers and tools connect to. Nothing
 routes, ranks or authenticates on the name.
 
+## Key custody
+
+```yaml
+custody:
+  credential: macha-custody
+  credentials_directory: /run/macha-credentials   # optional
+```
+
+The node's key custody: its node key and the root its node-local keys are derived
+from, sealed in `<state_path>/identity/custody`. `credential` names the systemd
+credential holding the root that file is sealed under; the unit loads it with
+`LoadCredentialEncrypted=` and the node reads it from `$CREDENTIALS_DIRECTORY` at
+each start, so a node restarts unattended after a power cut. `credentials_directory`
+reads it from another directory instead (a node run outside systemd). Without
+`custody` the node has none.
+
+Custody is made once per node, before the first start that names it:
+`dannan-node --state <state_path> --init-custody --custody-credential macha-custody`
+writes the custody file and prints the new root, which is sealed with
+`systemd-creds encrypt` and never kept in clear. Custody is never replaced; a node
+whose custody or credential is missing, or whose root does not open it, refuses to
+start and says which. Back up the custody file and the sealed root off the node.
+Changing `custody` needs a restart.
+
 ## Runtime memory bound
 
 ```yaml
