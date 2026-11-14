@@ -68,9 +68,16 @@ table.
 
 ## Macha defects the readers found (fix in Macha first; report to the operator before fixing)
 
-- `reload_config` calls `StorageServer::refresh` while the refresher may be running it: a race on `online_backends_`.
-- `reconfigure_local` writes `cfg_` on the SIGHUP thread while other threads read it: a data race on strings and
-  vectors, the kind that smashes a heap (a lead for the parked heap P0).
+- `reload_config` calls `StorageServer::refresh` while the refresher may be running it (checked by the Macha session):
+  `online_backends_` is a plain `uint32_t` (`storage_server.hpp:64-65`, commented "refresher alone", untrue), so a
+  storage event can be missed; and two concurrent `StoragePool::activate` (`storage_pool.cpp:149-223`, works
+  unlocked after copying state) can both adopt a fresh empty backend with different random tokens, leaving it
+  offline on an identity mismatch. No heap damage: backends are shared pointers under per-backend mutexes.
+- `reconfigure_local` writes `cfg_.storage_backends`, `cache`, `hydration` on the SIGHUP thread
+  (`cluster.cpp:698-706`); checked: the only concurrent reader of those fields is `readiness()`'s
+  `storage_backends.empty()` (`:178`), a pointer comparison, so a briefly wrong degraded flag and nothing worse.
+  `FileSystem` and accounts hold `const Config&` but read other fields; hydration and torrent copy theirs. Not a
+  heap lead (the readers' first report said it was; that was wrong).
 - A reload that adds the first backend never re-resolves hosting.
 - Ingest: an unreadable tail extent on resume fails the job instead of blocking it; a refused torrent admission lets
   the disk I/O run without credit.

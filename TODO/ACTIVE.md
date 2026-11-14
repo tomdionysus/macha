@@ -33,9 +33,10 @@ confirmed, 10 wrong verdicts, about 35 incomplete, 40-odd missing rows. Sent to 
    then a re-derived token over a torn payload); not fixed in Macha (cutover in days).
 4. The repair-share wake rounds down to milliseconds and can fall back to a wake up to 2 s late (reviewer).
 5. Repair's drop-local checks a claim then removes with nothing held (`:2913-2922`), already Dagda's gap 7.
-6. From the callers' map (`TODO/store-map-callers/README.md`): `reload_config` races the storage refresher on
-   `online_backends_`; `reconfigure_local` writes `cfg_` on the SIGHUP thread while others read it (a heap-smashing
-   class of race: a lead for the parked heap P0); a reload adding the first backend never re-resolves hosting.
+6. From the callers' map (`TODO/store-map-callers/README.md`, checked by the Macha session): a reload racing the
+   storage refresher can miss a storage event or double-adopt a fresh empty backend (offline on a token
+   mismatch); `reconfigure_local`'s `cfg_` writes race only `readiness()`'s `empty()`. Not heap leads. A reload adding
+   the first backend never re-resolves hosting (unchecked).
 
 **The port, re-ruled (operator to Dagda, 2026-11-14 evening, relayed by Dagda):** no shims in Macha; where Macha's
 code is shaped around its own store it is rewritten to use Dagda natively through `dagda::Node` and `Context`, with
