@@ -7,6 +7,15 @@ this rationalisation is `archive/2026-11-14-ACTIVE-before-rationalisation.md`. A
 
 ## Resume here
 
+**The port, re-ruled (operator to Dagda, 2026-11-14 evening, relayed by Dagda):** no shims in Macha; where Macha's
+code is shaped around its own store it is rewritten to use Dagda natively through `dagda::Node` and `Context`, with
+no loss; Dagda must handle DHT storage at least as well as Macha's store, measured side by side (a harness on the Pis
+with identical workloads, then the live baselines). A call-by-call map from Macha's store calls to Node and Context,
+written by both and each reviewing the other: Macha proposed develop `f0597a4`, Macha the callers' side (filesystem,
+FUSE, catalogue, metadata, ingest, torrent, media, HTTP, composition root), Dagda the store's side. Custody
+(operator to Macha, same evening): **provision it on macnessa and inverbeg at the next deploy, ahead of the
+cutover** (Tom told Dagda "at the cutover"; this answer is the later one). Macha's heap P0 first.
+
 **Store cutover ON HOLD (operator, 2026-11-14 ~16:00Z):** on the 1a finding (Dagda's ObjectTrie,
 UnreferencedSince, DiskServiceMonitor are not what Macha uses), Tom: Dagda was built explicitly to handle Macha's
 storage; bolting things on until Macha can work is not acceptable; if Dagda doesn't fundamentally support these
@@ -30,9 +39,27 @@ comes first when it lands).
    (`filesystem.cpp:2045-2075`). So the victim's path ran thousands of times on both nodes, clean, and media load
    is not the missing ingredient. With 125 ASan-clean rounds of the exact crash workload, and victims that vary
    (ingest-job JSON and hint JSON on macnessa, `media_ids` on inverbeg: whatever allocates next), the likelier
-   class is a data race corrupting a container, which ASan does not see. Proposed next: the same workload under
-   TSan on jupiter (the TSan Pi, clang 19, 4K pages; Dannan built with TSan too). Put to the operator. The setup
-   as run: node A on corvus-neptune (unit `macha-heap-a`, FUSE mount
+   class is a data race corrupting a container, which ASan does not see. Operator: "that points to something
+   smashing your heap that you haven't thought of. Open Your Mind, then read the code, then TSan. ASan doesn't help
+   you, you've proved that."
+   **Reading, 2026-11-14 evening:**
+   - **Found, a real defect (not yet fixed; report first):** `FuseFrontend::dispatch` (`fuse_frontend.hpp:633-637`)
+     returns ETIMEDOUT for a *running* read at its deadline while the broker worker keeps running `read_impl`,
+     which holds a span over libfuse's buffer (`fuse_frontend.cpp:5913`, captured `output`). libfuse3's
+     high-level `fuse_lib_read` mallocs that buffer, calls `op_read`, replies and frees it; the worker can then
+     write into the freed chunk: `fill_n` at :5980 with no cancellation check after an unbounded `inode->mutex`
+     wait, and `reader->read` / `pread_exact` (:6007, :6033) mid-copy past their check. In a glibc build that
+     smashes the free chunk's links (macnessa's `corrupted double-linked list`). Only `read_impl` captures caller
+     memory; every other dispatch captures values.
+   - **Ruled out for inverbeg 11-13 by evidence:** `filesystem.timed_out_requests` was 0 before and after every
+     baseline read and write sample (`build/baselines/results-0.94.2/inverbeg/*.jsonl`, last sample about 8 min
+     before the crash), and the small-file phase does no reads. So this defect did not fire in that run.
+   - Checked and clean: `fork` in book conversion (child is async-signal-safe only), `mallopt` (once, before
+     threads), `malloc_trim` (thread-safe), the only sanitizer-conditional code (`process_allocator.cpp`), the
+     AVIO callbacks (respect `buffer_size`), `ReadHandle::read` (synchronous, caller's thread).
+   - Not exercised by any ASan run so far: the catalogue scanner over a real library after deletes, and
+     media-information probing real media through FFmpeg (every root was empty). Next to read.
+   The setup as run: node A on corvus-neptune (unit `macha-heap-a`, FUSE mount
    `/mnt/heaptest`, driver `/root/heap_driver.py` writing 200 x 64 KiB files fsynced then deleted per round, about
    130 s a round, `ROUNDS=300`), node B on corvus-saturn (unit `macha-heap-b`, replica, `replicas=2/2`). Results in
    `/root/heap-pair/` on each (`asan.*`, `ubsan.*`, `macha.log`, `driver.log`); scripts in `build/heap/`.
