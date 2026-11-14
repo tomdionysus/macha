@@ -7,6 +7,14 @@ this rationalisation is `archive/2026-11-14-ACTIVE-before-rationalisation.md`. A
 
 ## Resume here
 
+**Store cutover ON HOLD (operator, 2026-11-14 ~16:00Z):** on the 1a finding (Dagda's ObjectTrie,
+UnreferencedSince, DiskServiceMonitor are not what Macha uses), Tom: Dagda was built explicitly to handle Macha's
+storage; bolting things on until Macha can work is not acceptable; if Dagda doesn't fundamentally support these
+concepts in a way Macha can use natively it is not fit for purpose and must be redesigned. Dagda was told to stop all
+work until Tom talks to it. No further store-cutover work here until Tom says. Pushed to origin at `0bad518`.
+Sanitizers: Tom clarified they are fine for investigating this class of bug (the ban is on pointless runs), so the
+media-load heap pair goes ahead.
+
 **Two things run at once** (operator, 2026-11-14: the store work in parallel with the heap chase; the heap result
 comes first when it lands).
 
@@ -16,8 +24,15 @@ comes first when it lands).
    rounds. **The ASan pair, 01:30Z to 04:30Z 2026-11-14: clean.** 72 rounds (about 14,400 files of 64 KiB written,
    fsynced and deleted through FUSE on node A, replicated to B), no ASan or UBSan report during the run or at exit,
    zero ERROR lines, WARN only the expected startup ones; both units stopped `inactive`, FUSE unmounted, both Pis
-   released. Plain FUSE churn with replication does not reproduce it; the victim's caller (`prune`) never ran,
-   since there was no media. **Next waits on the operator:** the media-load pair (below). The setup as run: node A on corvus-neptune (unit `macha-heap-a`, FUSE mount
+   released. **Correction (read 2026-11-14 ~16:00Z):** `prune` did run, constantly. Maintenance requests it on
+   every metadata event (`maintenance.cpp:1402`), the service runs whenever the FFmpeg engine is available
+   (streaming was on in both configs), and `media_ids()` refreshes the index over every file, media or not
+   (`filesystem.cpp:2045-2075`). So the victim's path ran thousands of times on both nodes, clean, and media load
+   is not the missing ingredient. With 125 ASan-clean rounds of the exact crash workload, and victims that vary
+   (ingest-job JSON and hint JSON on macnessa, `media_ids` on inverbeg: whatever allocates next), the likelier
+   class is a data race corrupting a container, which ASan does not see. Proposed next: the same workload under
+   TSan on jupiter (the TSan Pi, clang 19, 4K pages; Dannan built with TSan too). Put to the operator. The setup
+   as run: node A on corvus-neptune (unit `macha-heap-a`, FUSE mount
    `/mnt/heaptest`, driver `/root/heap_driver.py` writing 200 x 64 KiB files fsynced then deleted per round, about
    130 s a round, `ROUNDS=300`), node B on corvus-saturn (unit `macha-heap-b`, replica, `replicas=2/2`). Results in
    `/root/heap-pair/` on each (`asan.*`, `ubsan.*`, `macha.log`, `driver.log`); scripts in `build/heap/`.
