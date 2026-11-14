@@ -27,6 +27,15 @@ Ordered by what they cost a user.
    on the operator's word, 2026-11-08; their stacks had been read; capture stays on. **Operator: left until after the port**, and
    attributed to undervoltage or to the FUSE crashes. The reproducer to try then: 200 small files written and
    deleted through macnessa's mount, repeated, under an ASan build.
+   **2026-11-13: reproduced on inverbeg under 0.94.2** (the first optimised build): SIGSEGV inside `malloc` at
+   21:01:17Z (core `/mnt/diskB/crash/core.macha-media-inf.12251.1794603677`; victim the media-information prune,
+   `FileSystem::media_ids`, `filesystem.cpp:2094`), during the baseline's fifth round of 200 files of 64 KiB, each
+   fsynced, then removed through the mount: the workload of macnessa's 11-06 crashes. Operator: chase it now, on
+   corvus-develop, ASan, single node, that workload (`build/heap/`).
+   Single node under ASan (0.94.2 tag, inverbeg's config single-node, fresh key): 53 rounds clean over two runs
+   (26, then a power loss on the Pi at 23:17Z; then 27), no ASan or UBSan report. Not reproduced without a peer: next,
+   an ASan pair over the real network (neptune with the mount, saturn the replica, 2 replicas), so writes replicate
+   and repair runs as on inverbeg.
 2. **`rm` in the FUSE mount with a filter can crash macha** (operator's report, 2026-11-06). Not reproduced
    here; may be item 1.
 3. **A full control store is silent and costly** (run). macnessa's `metadata-objects` reached its 4G limit at

@@ -21,14 +21,14 @@ re-checked against `develop` at `875df7e`: 100 of its 104 Macha paths exist (abo
 - **Destructive maintenance off at first.** With no reachability provider the node removes nothing
   (`NodeMaintenance.WithNoProviderTheCollectorRemovesNothingAndSaysSo`); the provider (8a) is built and gated, but
   sweeps stay off on the live nodes until its answers match the namespace on both.
-- **Build and gate on corvus-develop** (10.44.1.202), never on the live nodes; tell the Dagda session before long
+- **Build and gate on corvus-neptune** (10.44.1.202), never on the live nodes; tell the Dagda session before long
   runs there.
 
 ## Order
 
 0. **Link.** Waiting on Dagda: install rules, `dagdaConfig.cmake` (ExactVersion, `dagda::dagda`, `find_dependency(dannan)`),
    SONAME at the full version, `dagda-migrate` installed (asked 2026-11-13, as 0.1.4). Then `find_package(dagda 0.1.4
-   CONFIG REQUIRED)` beside Dannan on the laptop (`build/deps/`) and corvus-develop (`/home/tom/deps/`).
+   CONFIG REQUIRED)` beside Dannan on the laptop (`build/deps/`) and corvus-neptune (`/home/tom/deps/`).
 1. **The node in Macha's root.** `LocalState` opens a `dagda::Node` in two parts: constructed before the Dannan node
    starts (planes declared, types registered), `open_store()` on the recovery thread. `LocalState` keeps only Macha's
    `MetadataReplica` until 8c; the control store reaches it as `Node::control()` through an adapter; the cache seed for
@@ -54,7 +54,7 @@ re-checked against `develop` at `875df7e`: 100 of its 104 Macha paths exist (abo
    (prints the root to seal with `systemd-creds encrypt`), so the tarball carries `dannan-node`; the custody file and
    the sealed root backed up off-node (losing custody after migration loses that node's claims and reference
    counts). Test fixtures make custody under a test credential directory.
-8. **Before the flag day:** suites green on corvus-develop and in the container; the rehearsal on a fresh copy of a
+8. **Before the flag day:** suites green on corvus-neptune and in the container; the rehearsal on a fresh copy of a
    0.94.x node's state (control store, ledgers, a pack sample) with the verifier listing every id before and after;
    custody provisioned and backed up off-node; each node's control store copied off-node; then both nodes at once.
 
@@ -69,11 +69,30 @@ Agreed with the Dannan session as Macha's to fix, at the cutover or when its hol
 - Two memory fits (Macha's `validate`; Dannan's `fit_memory_limit` unused, `dannan_bridge.cpp:71-77`).
 - Two durability epochs per process (`node_identity.cpp:45`): goes with the store.
 - Payload copies per request (`dannan_host.cpp:21-26`, `:108-111`): adopt Dannan's `net::Message` in handlers.
-Dannan's own fixes, after the operator rules on its list: `connections_canonical` written by the node, the
-key-derivation labels exported, `idle_for` from creation, a const `inbound()`.
+- `connections_canonical` written twice: Dannan 0.5.3's node writes it (`node.cpp:1066`); Macha's telemetry hook writes it
+  again (`src/cluster/cluster.cpp:168-170`, from F15 against an older Dannan): delete Macha's.
+Dannan's own fixes (feature/macha-fixes, for 0.7): the key-derivation labels exported (`ClusterKey::from_master`),
+`idle_for` from creation, a const `inbound()`, `free_port` below 32768, handlers by value. Withdrawn as not Dannan's:
+the first telemetry at join (inferred, never observed).
+
+## The operator's rulings on the stack's needs (2026-11-13)
+
+- **Dannan (`../dannan/TODO/2026-11-13-stack-needs.md`):** P1 the ABI promise first: `libdannan.so.0.5`, package
+  `libdannan0.5`, CMake SameMinorVersion, abidiff in CI; Macha's deb depends on `libdannan0.5` at a minimum patch.
+  Then P6, all approved: the seven small fixes, the owners' test seam, the advert-change watch, non-blocking logging,
+  each sent here for review. P4: CPU pacing moves into Dannan, proved by
+  `test_repair_is_paced_not_stopped_while_higher_classes_stay_busy`, `maintenance_trace` and a node baseline (the node
+  run at the operator's word).
+- **Dagda (`../dagda/TODO/2026-11-13-three-systems-design.md`):** as proposed; 0.1.5 (Dannan 0.5.6, the debs) first in
+  slice 0, on the port's critical path; any tag changing a path Macha runs needs Macha's baseline comparison first.
+  8b is empty for Macha at stage one.
 
 ## Log
 
+- 2026-11-13: Dannan 0.6.0 tagged and pushed (main `45dc96b`): the ABI promise starts here (`libdannan.so.0.6`, package
+  `libdannan0.6`), after Macha's review found 0.5.4 broke `libdannan.so.0.5`'s ABI against 0.5.3. Macha's path: Dagda 0.1.5
+  on Dannan 0.6.0, then `Depends: libdannan0.6 (>= 0.6.0)`, one relink from 0.5.3. Packages signed and uploaded by the
+  operator; nothing on the Pis without his word.
 - 2026-11-13, step 1 reading: Dagda registers 20 of Macha's numbers and 3 of its own (`dagda/store/messages.cpp:26-59`);
   Macha's table (`src/cluster/dannan_bridge.cpp:286-365`) drops them at the same moment: requests have_object 515,
   get_object 516, put_object 517, delete_object 525, get/put_control_object 531/532, put_object_deferred 534,
@@ -89,7 +108,7 @@ key-derivation labels exported, `idle_for` from creation, a const `inbound()`.
   `build/deps/prefix-dagda-0.1.4` (Boost 1.88 on the path), Macha's tree `build-store` links it; `storage_v18` 22 of 22
   run from it. The port branch carries the store work; `develop` stays on 0.94.2's line until the cutover is gated
   (CI runs on main and develop only). CI and the container image need Dagda from its tag, so Dagda's tags must be
-  pushed (operator's word) before develop takes this. On corvus-develop Dagda 0.1.4 fails under GCC 14 Release with
+  pushed (operator's word) before develop takes this. On corvus-neptune Dagda 0.1.4 fails under GCC 14 Release with
   `-DDAGDA_WARNINGS_AS_ERRORS=ON` (`-Wnonnull` at `migrate/compare.cpp:271`, `-Wstringop-overread` in libstdc++;
   reported to Dagda); built there without it.
 - 2026-11-13: plan written; baselines on 0.94.2 running (`build/baselines/run_0942.sh`, results in

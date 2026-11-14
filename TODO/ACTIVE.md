@@ -48,13 +48,13 @@ their owners: [`2026-11-08-found-issues.md`](2026-11-08-found-issues.md).
    both. Macha: `find_package(dannan 0.5.6 CONFIG REQUIRED)`; Build-Depends `libdannan-dev (= 0.5.6)`; Depends from
    shlibs plus `dannan-tools`. Repo: `curl -fsSLo /etc/apt/sources.list.d/tomcully.sources
    https://tomcully.com/apt/tomcully.sources`. Nothing installed on the Pis yet: that is the operator's word.
-5. **The store cutover (task 8), building** (operator 2026-11-13: "proceed"; build on corvus-develop): plan and log in
+5. **The store cutover (task 8), building** (operator 2026-11-13: "proceed"; build on corvus-neptune): plan and log in
    [`2026-11-13-store-cutover.md`](2026-11-13-store-cutover.md). Reviewed: Dagda's report and its migration's write path.
    Earlier notes: Dagda is on
    `feature/manifest-lock` at `c264fa2` (a 0.1.2 version commit; tags `0.1.0` and `0.1.1` exist, 0.1.2 not yet);
    `dagda-migrate` refusing a second manifest pass is the 0.1.2 change. Unproved for the cutover: macnessa's
    migration bytes and time at 6.3 TB (read rates measured: macnessa 103 MB/s, inverbeg 87 MB/s, so about 2 to
-   2.5 days there and about 20 h on inverbeg). Dagda names its own deadlines; the rehearsal on corvus-develop passed.
+   2.5 days there and about 20 h on inverbeg). Dagda names its own deadlines; the rehearsal on corvus-neptune passed.
    Decided 2026-11-13 (Dagda asked; operator: Macha's code, this session's call): `MachaLogSink::write`
    (`dannan_bridge.cpp`) writes the message alone for any `dagda.` scope, so store lines read exactly as Macha's
    (Dagda restores Macha's text and level for every line before 0.1.2); Dannan's lines keep their scope. Lands with
@@ -117,7 +117,7 @@ corruption (now seen on macnessa, 2026-11-06).
 ## Cluster state (2026-11-12, read from the nodes at 22:15Z)
 
 - **Both on 0.94.2** since 2026-11-13 (inverbeg 15:30Z, macnessa 15:31Z; met over both lanes, writable at 171521,
-  `replicas=2/2`): the first optimised build (RelWithDebInfo), built and gated on corvus-develop, tarball sha256
+  `replicas=2/2`): the first optimised build (RelWithDebInfo), built and gated on corvus-neptune, tarball sha256
   `b6d1b65a...0d95`, installed by `build/install-0.94.2.sh` (rollback: `/root/pre-0.94.2/`, 0.94.0's binaries,
   libdannan and config). inverbeg logged one `torrent alert queue overflowed: 1 alert types lost` at start, its
   first in the journal since it became persistent; recovered by design from the bitfield; watch for a repeat.
