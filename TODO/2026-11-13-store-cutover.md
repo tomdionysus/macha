@@ -89,6 +89,21 @@ the first telemetry at join (inferred, never observed).
 
 ## Log
 
+- 2026-11-14: **The store API map** (`build/store-api-map.md`, read from both trees): LocalStore aliases as-is;
+  StoragePool, PersistentBlockCache (`remember_metadata`/`metadata` become `with_seed`), RetentionStore, ReferenceCounts
+  (`views()` returns Dagda's trie snapshot: `filesystem.cpp:2542`, `:2610`) and ControlObjectFetch (Macha builds it
+  from `node.dannan()` and `node.control()`) alias with small adapters; DistributedStore (WriteOptions and tickets for
+  `DurabilityBatch`, `wait(tickets)` for `durability_barrier`, ReadOptions, RepairLists; no `note_repair_gate`) and
+  AvailabilityService (no path table: Macha keeps `paths`/`by_hash`) need adapters. 69 call sites outside the store,
+  48 on DistributedStore. Underneath: every leaf type crossing the boundary is a Macha twin of Dagda's (ObjectStore,
+  HeldView, RetentionClass/Dot/Clock, IdLookup, UnreferencedSince, ObjectTrie, TrieUnion, FrameType, WorkClass with
+  Macha's `viewer` as Dannan's `foreground`, DiskServiceMonitor, StorageUnavailable; a catch of Macha's
+  StorageUnavailable in `ingest.cpp` and `filesystem.hpp` would silently miss Dagda's). ClaimStore and ObjectLedger
+  differ: guard and deletion moved to `StoragePool::claim_locks()`, which serves both classes (Dagda's collector guards a
+  CONTROL deletion with it, `collector.cpp:338-339`), so `catalogue.cpp:2721`'s `claim_deletion` maps there and
+  Macha's RetentionLedger gives way to `Node::ledger()`. **Order this sets:** 1a the leaf types become Dagda's aliases
+  while Macha's store still runs (as NodeId did: buildable and green at each step, WorkClass's `viewer` renamed);
+  1b the node in LocalState with the classes aliased and the adapters; then the callers.
 - 2026-11-14: **Dagda 0.1.5 tagged** (local main `c20f88c`; remote at the operator's "push"): Dannan 0.6.0
   (SameMinorVersion, `libdannan.so.0.6`), Dagda exact (`find_package(dagda 0.1.5 CONFIG)`, `libdagda.so.0.1.5`), Debian
   packages (`libdagda0.1.5`, `libdagda-dev` on `libdannan-dev (>= 0.6.0), (<< 0.7~)`, `dagda-tools` with `dagda-migrate`),
