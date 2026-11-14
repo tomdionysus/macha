@@ -25,7 +25,12 @@ confirmed, 10 wrong verdicts, about 35 incomplete, 40-odd missing rows. Sent to 
    (`local_store.cpp:1413-1443`). **Operator, 2026-11-14: Dagda's to fix; the cutover is in the next few days, so
    Macha does not fix its own store.** Macha reviews Dagda's fix.
 2. Prompt replication's wait has no timeout (`distributed_store.cpp:1227`): retries stall on an idle node (reviewer).
-3. The local barrier re-derives on any failure (`:626-646`); Dagda only on a stale ticket (reviewer; decide which is right).
+3. **Settled (operator 2026-11-14: healing is better):** a failed local barrier re-derives, as Macha's does
+   (`:626-646`), with two guards sent to Dagda: re-derive by an authenticated read, not `has()`, since pack replay
+   accepts a header whose payload never reached the disk (`local_store.cpp:1049-1067`); and persist a sync failure
+   per backend across reopen and restart, never re-deriving what was written in the failed window (the page cache
+   can still hold bytes the disk lost). Live exposure in Macha's own store until the cutover: case 2 (power cut,
+   then a re-derived token over a torn payload); not fixed in Macha (cutover in days).
 4. The repair-share wake rounds down to milliseconds and can fall back to a wake up to 2 s late (reviewer).
 5. Repair's drop-local checks a claim then removes with nothing held (`:2913-2922`), already Dagda's gap 7.
 6. From the callers' map (`TODO/store-map-callers/README.md`): `reload_config` races the storage refresher on
