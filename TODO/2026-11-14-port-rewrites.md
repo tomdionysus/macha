@@ -7,8 +7,13 @@ is shaped around its own store, losing nothing. Sources: the callers' map (`stor
 guards, co-owned cancellation, typed `ReadEnd` and `BarrierLoss`); Devices (admission, device monitor) gates next.
 Build against that branch until Dagda tags it; record the commit each Macha step built on.
 
-The cutover is one disk event (S, 8a, 8b together; `2026-11-13-store-cutover.md`), so these land on
-`port/dannan-dagda` as buildable steps, each through every suite on a Pi, and ship together.
+The cutover is one disk event (S, 8a, 8b together; `2026-11-13-store-cutover.md`). **Staging (operator,
+2026-11-14): one branch, gate at the end.** Macha's store and Dagda's node cannot run side by side (same disks and
+lock, v18 against v19), so R1 to R7 land on `port/dannan-dagda` as commits that each compile (GCC and clang,
+warnings as errors) but the suites run once the whole set is in; then fix forward until Macha's suites pass on
+Dagda, then the harness and the migration rehearsal. Deps: Dannan 0.7.0 and Dagda `2f7eba6` built on build-3 into
+`/home/maintainer/deps/prefix-0.7.0` and `prefix-dagda-2f7eba6` (`build/pi/deps_070.sh`); the cutover pins Dannan 0.8.0
+(the `dannan-custody` tool lands there) and Dagda's tag once it builds on 0.8.0.
 
 ## R1. The root (composition and lifecycle) [root section rewrites 1-5, 13, 14; metadata 1]
 
