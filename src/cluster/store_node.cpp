@@ -43,9 +43,8 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
     out.pool.pack_threshold = config.storage_packing.threshold;
     out.pool.pack_target_size = config.storage_packing.target_size;
 
-    out.control.path = config.metadata_store.path.empty()
-                           ? config.state_path / "metadata-objects"
-                           : config.metadata_store.path;
+    out.control.path = config.metadata_store.path.empty() ? config.state_path / "metadata-objects"
+                                                          : config.metadata_store.path;
     out.control.limit = config.metadata_store.limit;
     out.control.pack_threshold = config.metadata_store.packing.threshold;
     out.control.pack_target_size = config.metadata_store.packing.target_size;
