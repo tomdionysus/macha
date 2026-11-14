@@ -75,6 +75,9 @@ dannan::NodeConfig dannan_node_config(const Config& config, dannan::identity::Cl
     out.loader_reserve_bytes = config.runtime.loader_memory_reserve_bytes;
     out.reassembly_reserve_bytes = config.runtime.reassembly_memory_reserve_bytes;
     out.memory_limit_bytes = 0;
+    if (!config.custody.credential.empty())
+        out.custody = dannan::identity::KeySource::systemd_credential(
+            config.custody.credential, config.custody.credentials_directory);
     return out;
 }
 

@@ -889,6 +889,20 @@ void parse_web(const ConfigNode& root, Config& c) {
         throw std::runtime_error("web.index must be a file name inside web.root");
 }
 
+void parse_custody(const ConfigNode& root, Config& c) {
+    auto custody = root["custody"];
+    if (!custody)
+        return;
+    if (custody["credential"])
+        c.custody.credential = custody["credential"].as<std::string>();
+    if (custody["credentials_directory"])
+        c.custody.credentials_directory = custody["credentials_directory"].as<std::string>();
+    if (c.custody.credential.empty())
+        throw std::runtime_error("custody.credential must name the credential");
+    if (c.custody.credential.find('/') != std::string::npos)
+        throw std::runtime_error("custody.credential must be a credential name, not a path");
+}
+
 void parse_session(const ConfigNode& root, Config& c) {
     auto session = root["session"];
     if (!session)
@@ -1071,6 +1085,7 @@ Config load_yaml_config(const std::filesystem::path& path) {
     parse_runtime(root, c);
     parse_session(root, c);
     parse_web(root, c);
+    parse_custody(root, c);
 
     if (auto bootstrap = root["bootstrap"]) {
         if (!bootstrap.IsSequence())
