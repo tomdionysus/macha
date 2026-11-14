@@ -45,7 +45,7 @@ std::chrono::milliseconds ActivityClocks::idle_for(WorkClass work) const {
 }
 
 bool ActivityClocks::viewer_recently_active(std::chrono::milliseconds window) const {
-    return idle_for(WorkClass::viewer) < window;
+    return idle_for(WorkClass::foreground) < window;
 }
 
 } // namespace macha

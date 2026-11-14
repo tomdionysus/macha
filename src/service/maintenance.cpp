@@ -401,7 +401,7 @@ void Maintenance::run(std::stop_token stop) {
         auto interactive_bytes = store_.take_interactive_bytes();
         auto loader_bytes = store_.take_loader_bytes();
         const bool viewer_busy = playback_bytes > 0 || interactive_bytes > 0 ||
-                                 store_.idle_for(WorkClass::viewer) < policy.foreground_quiet;
+                                 store_.idle_for(WorkClass::foreground) < policy.foreground_quiet;
         // Law 3: the loader outranks background work, so loader activity (an
         // ingest) counts as busy too.
         const bool loader_busy =
@@ -703,7 +703,7 @@ void Maintenance::run(std::stop_token stop) {
                     } restorer{store_, network_credit, extent, trace_action};
                     const auto higher_class_active = [this, &policy, peer_viewers] {
                         const auto quiet = policy.foreground_quiet;
-                        return peer_viewers || store_.idle_for(WorkClass::viewer) < quiet ||
+                        return peer_viewers || store_.idle_for(WorkClass::foreground) < quiet ||
                                store_.idle_for(WorkClass::loader) < quiet;
                     };
                     repair_share.started(clock_->now(), repair_busy);
@@ -1032,7 +1032,7 @@ void Maintenance::run(std::stop_token stop) {
                         inventory->lookup(RetentionClass::data), protected_ids, orphan_grace, 64,
                         [this] {
                             const auto quiet = node_.config().maintenance.foreground_quiet;
-                            return store_.idle_for(WorkClass::viewer) < quiet ||
+                            return store_.idle_for(WorkClass::foreground) < quiet ||
                                    store_.idle_for(WorkClass::loader) < quiet;
                         },
                         [this](const ObjectId& id) {
@@ -1104,7 +1104,7 @@ void Maintenance::run(std::stop_token stop) {
                 auto rebalance =
                     local_.data().rebalance_step(static_cast<uint64_t>(local_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
-                        return store_.idle_for(WorkClass::viewer) < quiet ||
+                        return store_.idle_for(WorkClass::foreground) < quiet ||
                                store_.idle_for(WorkClass::loader) < quiet;
                     });
                 log_slow_stage("local-rebalance", rebalance_stage,
@@ -1165,7 +1165,7 @@ void Maintenance::run(std::stop_token stop) {
                 auto scrub =
                     local_.data().scrub_step(static_cast<uint64_t>(scrub_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
-                        return store_.idle_for(WorkClass::viewer) < quiet ||
+                        return store_.idle_for(WorkClass::foreground) < quiet ||
                                store_.idle_for(WorkClass::loader) < quiet;
                     });
                 log_slow_stage("scrub", scrub_stage,
@@ -1325,7 +1325,7 @@ void Maintenance::run(std::stop_token stop) {
             // the foreground quiet period is met, or at once if it already has, rather
             // than sleeping until an unrelated event.
             auto idle =
-                std::min(store_.idle_for(WorkClass::viewer), store_.idle_for(WorkClass::loader));
+                std::min(store_.idle_for(WorkClass::foreground), store_.idle_for(WorkClass::loader));
             deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
                                                                 ? policy.foreground_quiet - idle
                                                                 : Clock::duration{}));

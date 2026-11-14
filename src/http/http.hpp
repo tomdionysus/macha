@@ -37,7 +37,7 @@ struct HttpRequest {
     Clock::time_point resume_deadline{};
     // The request's work class, from the route table; the work it does
     // carries it (frame_for(work) for its DATA work).
-    WorkClass work{WorkClass::viewer};
+    WorkClass work{WorkClass::foreground};
     // Every value of each repeatable query parameter, in order; `query` keeps
     // the last.
     std::map<std::string, std::vector<std::string>, std::less<>> query_all{};

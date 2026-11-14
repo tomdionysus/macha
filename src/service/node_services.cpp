@@ -192,7 +192,7 @@ std::map<std::string, uint64_t> NodeServices::observation_gauges() {
         gauges["memory_ledger_caches_bytes"] = config.ledger_cache;
         gauges["memory_catalogue_bytes"] = catalogue_.resident_bytes();
     }
-    gauges["viewer_idle_ms"] = idle_ms(store_.idle_for(WorkClass::viewer));
+    gauges["viewer_idle_ms"] = idle_ms(store_.idle_for(WorkClass::foreground));
     gauges["loader_idle_ms"] = idle_ms(store_.idle_for(WorkClass::loader));
     const auto repair = store_.repair_diagnostics();
     gauges["repair_push_examined"] = repair.push_examined;

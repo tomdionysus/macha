@@ -241,7 +241,7 @@ ViewerWeightedAdmission::ViewerWeightedAdmission(FileSystem& filesystem, const F
       share_(config.viewer_weight, config.loader_weight) {}
 
 bool ViewerWeightedAdmission::viewer_active() const {
-    return quiet_.count() > 0 && fs_.idle_for(WorkClass::viewer) < quiet_;
+    return quiet_.count() > 0 && fs_.idle_for(WorkClass::foreground) < quiet_;
 }
 
 bool ViewerWeightedAdmission::can_start(TimePoint now) {
@@ -266,7 +266,7 @@ void ViewerWeightedAdmission::finished(TimePoint now) {
 
 std::optional<std::chrono::milliseconds> ViewerWeightedAdmission::retry_after(TimePoint now) {
     // The earlier of the viewer window closing and the loader's cooldown.
-    const auto idle = fs_.idle_for(WorkClass::viewer);
+    const auto idle = fs_.idle_for(WorkClass::foreground);
     if (quiet_.count() <= 0 || idle >= quiet_)
         return std::chrono::milliseconds(0);
     auto retry = quiet_ - idle;
