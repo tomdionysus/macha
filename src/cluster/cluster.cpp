@@ -92,25 +92,21 @@ PlaybackBudgets enforced_playback_budgets(const StreamingConfig& streaming) {
     return playback;
 }
 
-NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryProgress& progress,
+NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, RecoveryProgress& progress,
                          TranscodeRateBook& transcode_rates, MessageRoutes& routes,
                          NodeEvents& events, StartupStageHook startup_stage_hook)
-    : cfg_(normalize_config(std::move(config))), identity_(identity), progress_(progress),
+    : cfg_(normalize_config(std::move(config))), keys_(std::move(keys)), progress_(progress),
       transcode_rates_(transcode_rates), events_(events),
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()),
       host_(node_config(), routes, 2,
             [this](const NodeInfo&, const RpcMessage& notice) { on_metadata_notice(notice); }),
+      identity_(keys_, host_.node().identity()),
       members_(
           self_info(cfg_, identity_.id,
                     node_flags_for(host_.node().inbound().capable(),
                                    resolve_hosts_extents(cfg_, host_.node().inbound().capable()))),
           cfg_.dead_after),
       telemetry_(std::make_shared<DannanTelemetry>(host_.node().telemetry())) {
-    // One identity file, read by both: a mismatch is a state path in two minds.
-    if (host_.node().identity().id() != dannan_id(identity_.id))
-        throw std::logic_error(
-            "the node's id is not Macha's: " + to_string(macha_id(host_.node().identity().id())) +
-            " and " + to_string(identity_.id));
     auto& node = host_.node();
     members_.follow(std::make_shared<DannanMembership>(node.nodes(), node.nodes().self().id));
     // Ready once the planes are and recovery has built what runs on them.
@@ -126,7 +122,7 @@ NodeRuntime::~NodeRuntime() {
 }
 
 dannan::NodeConfig NodeRuntime::node_config() {
-    auto config = dannan_node_config(cfg_, dannan_cluster_key(identity_.keys));
+    auto config = dannan_node_config(cfg_, dannan_cluster_key(keys_));
     config.version = std::string(kServerVersion);
     for (const auto& [plane, name] : recovery_planes)
         config.planes.emplace_back(name);

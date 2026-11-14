@@ -13,7 +13,8 @@
 namespace macha {
 
 // What the root builds before the node: the books the node writes to, read and
-// counted by every layer after it. Built under the state path's lock.
+// counted by every layer after it. Built before the state path is locked, so
+// reading nothing; the root opens them once the node holds the lock.
 struct NodeBooks {
     explicit NodeBooks(const Config&);
     NodeBooks(const NodeBooks&) = delete;

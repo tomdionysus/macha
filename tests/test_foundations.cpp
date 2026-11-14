@@ -1174,6 +1174,7 @@ MACHA_FAST_TEST("foundations", test_transcode_rates_keep_a_median_per_class_and_
     CHECK(TranscodeRateBook::height_class(4320) == 4320);
     {
         TranscodeRateBook book(path);
+        book.open();
         CHECK(book.summary().empty());
         for (const double rate : {0.30, 0.35, 0.33})
             book.record("video", "hevc", 10, 2160, rate, 1);
@@ -1184,6 +1185,7 @@ MACHA_FAST_TEST("foundations", test_transcode_rates_keep_a_median_per_class_and_
     }
     // A restart keeps what the hardware has shown.
     TranscodeRateBook reloaded(path);
+    reloaded.open();
     const auto rates = reloaded.summary();
     REQUIRE(rates.size() == 3);
     const auto find = [&](const std::string& codec) {

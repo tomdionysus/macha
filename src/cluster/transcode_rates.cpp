@@ -22,7 +22,9 @@ template <typename T> T median(std::vector<T> values) {
 
 } // namespace
 
-TranscodeRateBook::TranscodeRateBook(std::filesystem::path path) : path_(std::move(path)) {
+TranscodeRateBook::TranscodeRateBook(std::filesystem::path path) : path_(std::move(path)) {}
+
+void TranscodeRateBook::open() {
     Lock lock(mutex_);
     load();
 }

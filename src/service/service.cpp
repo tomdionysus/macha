@@ -32,14 +32,13 @@ Service::Service(const Config& config, ClusterKeys keys,
     : clock_(instruments.clock ? std::move(instruments.clock)
                                : std::make_shared<SystemMaintenanceClock>()),
       maintenance_trace_(std::move(instruments.trace)),
-      lifecycle_(std::move(instruments.lifecycle)), state_lock_(config.state_path),
-      identity_(config.state_path, keys), recovery_stage_hook_(startup_stage_hook),
+      lifecycle_(std::move(instruments.lifecycle)), recovery_stage_hook_(startup_stage_hook),
       durability_batch_window_(durability_batch_window), books_(config),
-      node_(config, identity_, progress_, books_.transcode_rates, routes_, books_.events,
+      node_(config, keys, progress_, books_.transcode_rates, routes_, books_.events,
             std::move(startup_stage_hook)),
       resources_(node_.config(), books_, node_.node().memory(),
                  [clock = clock_] { return clock->now(); }),
-      accounts_(node_.config(), identity_, node_, resources_.events, routes_),
+      accounts_(node_.config(), node_.identity(), node_, resources_.events, routes_),
       cluster_status_(node_, accounts_, resources_.activity, resources_.data, resources_.memory),
       session_api_(node_, accounts_), users_api_(node_, accounts_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
@@ -47,6 +46,8 @@ Service::Service(const Config& config, ClusterKeys keys,
       startup_stall_handler_(std::move(startup_stall_handler)) {
     if (instruments.call_fault)
         node_.set_call_fault(std::move(instruments.call_fault));
+    // The node holds the state path's lock from here.
+    books_.transcode_rates.open();
     // Registers the store's message types and declares its planes; opens nothing.
     store_node_ = std::make_unique<dagda::Node>(
         node_.node(),
@@ -518,7 +519,7 @@ void Service::initialise_services(const std::stop_token& stop) {
         try {
             note_lifecycle("open store");
             store_node_->open_store();
-            local_ = std::make_unique<LocalServices>(node_.config(), identity_, progress_,
+            local_ = std::make_unique<LocalServices>(node_.config(), node_.identity(), progress_,
                                                      recovery_stage_hook_, stop, node_, resources_,
                                                      routes_, durability_batch_window_);
         } catch (const RecoveryCancelled&) {

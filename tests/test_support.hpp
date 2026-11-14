@@ -415,15 +415,12 @@ inline bool capacities_known(const std::vector<NodeInfo>& active, size_t count) 
 
 // The root parts a NodeRuntime takes, built before it (a base is built first).
 struct BareNodeResources {
-    StorageLock state_lock;
-    NodeIdentity identity;
     RecoveryProgress progress;
     MessageRoutes routes;
     LocalState::StageHook stage_hook;
     NodeBooks books;
-    BareNodeResources(const Config& config, ClusterKeys keys, LocalState::StageHook hook)
-        : state_lock(config.state_path), identity(config.state_path, std::move(keys)),
-          stage_hook(std::move(hook)), books(config) {}
+    BareNodeResources(const Config& config, LocalState::StageHook hook)
+        : stage_hook(std::move(hook)), books(config) {}
 };
 
 // A NodeRuntime with the root parts it takes, owned as Service owns them: the
@@ -438,11 +435,14 @@ class BareNode : public BareNodeResources, public NodeRuntime {
 
     BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {},
              std::chrono::milliseconds durability_batch_window = test_durability_window)
-        : BareNodeResources(config, keys, hook),
-          NodeRuntime(std::move(config), identity, progress, books.transcode_rates, routes,
+        : BareNodeResources(config, hook),
+          NodeRuntime(std::move(config), std::move(keys), progress, books.transcode_rates, routes,
                       books.events, std::move(hook)),
           resources(NodeRuntime::config(), books, node().memory()),
-          durability_batch_window_(durability_batch_window) {}
+          durability_batch_window_(durability_batch_window) {
+        // The node holds the state path's lock from here.
+        books.transcode_rates.open();
+    }
     ~BareNode() {
         stop();
     }
@@ -456,7 +456,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
         recovery_ = std::jthread([this](std::stop_token stop) {
             run_supervised_once("cluster-state-recovery", [this, stop] {
                 try {
-                    local_ = std::make_unique<LocalServices>(config(), identity, progress,
+                    local_ = std::make_unique<LocalServices>(config(), identity(), progress,
                                                              stage_hook, stop, *this, resources,
                                                              routes, durability_batch_window_);
                 } catch (const std::exception&) {
@@ -551,7 +551,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     }
 
     std::chrono::milliseconds durability_batch_window_;
-    Accounts accounts_{config(), identity, *this, resources.events, routes};
+    Accounts accounts_{config(), identity(), *this, resources.events, routes};
     // Declared in this order so the recovery thread goes before what it built.
     std::unique_ptr<LocalServices> local_;
     std::jthread recovery_;

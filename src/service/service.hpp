@@ -70,9 +70,7 @@ class Service {
         if (lifecycle_)
             lifecycle_(event);
     }
-    // Held first: no state file is read before this process owns state_path.
-    StorageLock state_lock_;
-    NodeIdentity identity_;
+    // No state file is read before node_'s Dannan node takes state_path's lock, its first act.
     RecoveryProgress progress_;
     // Inbound requests by message type; each part binds what it answers.
     MessageRoutes routes_;
