@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# CodeQL security analysis of Macha's C++, built as in CI with Dannan from its
-# tag; the tests are not built here.
+# CodeQL security analysis of Macha's C++, built as in CI with Dannan and Dagda
+# from their tags; the tests are not built here.
 name: CodeQL
 
 on:
@@ -15,7 +15,8 @@ permissions:
   contents: read
 
 env:
-  DANNAN_VERSION: "0.5.3"
+  DANNAN_VERSION: "0.6.0"
+  DAGDA_VERSION: "0.1.5"
 
 jobs:
   analyze:
@@ -42,6 +43,14 @@ jobs:
           cmake -S /opt/dannan-src -B /opt/dannan-build -DCMAKE_BUILD_TYPE=Release
           cmake --build /opt/dannan-build -j "$(nproc)"
           cmake --install /opt/dannan-build --prefix /usr/local
+          ldconfig
+
+      - name: Build and install Dagda
+        run: |
+          git clone --depth 1 --branch "$DAGDA_VERSION" https://github.com/tomdionysus/dagda.git /opt/dagda-src
+          cmake -S /opt/dagda-src -B /opt/dagda-build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /opt/dagda-build -j "$(nproc)"
+          cmake --install /opt/dagda-build --prefix /usr/local
           ldconfig
 
       - uses: actions/checkout@v4

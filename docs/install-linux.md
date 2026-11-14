@@ -14,8 +14,9 @@ Macha requires:
   60, `libavutil` 58, `libswscale` 7 and `libswresample` 4, or later)
 - pkg-config and POSIX threads
 - Boost 1.83 or later (Asio) development headers
-- [Dannan](https://github.com/tomdionysus/dannan) 0.5.3, the cluster transport,
-  built and installed first (below)
+- [Dannan](https://github.com/tomdionysus/dannan) 0.6, the cluster transport,
+  and [Dagda](https://github.com/tomdionysus/dagda) 0.1.5, the store, built and
+  installed first (below)
 
 FUSE 3 is required for the mounted filesystem. libtorrent-rasterbar 2.0 or
 later is optional at build time, but is needed for BitTorrent acquisition.
@@ -98,15 +99,22 @@ pkg-config --exists 'libavformat >= 60' 'libavcodec >= 60' 'libavutil >= 58' \
   'libswscale >= 7' 'libswresample >= 4' && echo "FFmpeg API is suitable"
 ```
 
-## Build Dannan
+## Build Dannan and Dagda
 
-Macha builds against Dannan 0.5.3, from its tag:
+Macha builds against Dannan 0.6 and Dagda 0.1.5, each from its tag, Dannan
+first:
 
 ```bash
-git clone --branch 0.5.3 https://github.com/tomdionysus/dannan.git
+git clone --branch 0.6.0 https://github.com/tomdionysus/dannan.git
 cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release
 cmake --build dannan/build --parallel
 sudo cmake --install dannan/build --prefix /usr/local
+sudo ldconfig
+
+git clone --branch 0.1.5 https://github.com/tomdionysus/dagda.git
+cmake -S dagda -B dagda/build -DCMAKE_BUILD_TYPE=Release
+cmake --build dagda/build --parallel
+sudo cmake --install dagda/build --prefix /usr/local
 sudo ldconfig
 ```
 
@@ -116,7 +124,7 @@ upgrade to 0.94 (see the CHANGELOG); install it beside Macha on such a node.
 ## Build and test
 
 Run configure and compilation as your normal user. Do not use `sudo` for
-either step. Where Dannan is not under a default prefix, add
+either step. Where Dannan or Dagda is not under a default prefix, add
 `-DCMAKE_PREFIX_PATH=<its prefix>`:
 
 ```bash
