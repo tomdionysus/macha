@@ -20,12 +20,14 @@ comes first when it lands).
    **Check:** `ssh root@10.44.1.202 'ls /root/heap-pair; tail -n 3 /root/heap-pair/driver.log; systemctl is-active
    macha-heap-a'` and the same on 10.44.1.170 for `macha-heap-b`. **Stop at the claim's end, 04:30Z** (about 80
    rounds) if clean: `systemctl stop macha-heap-a macha-heap-b`, `fusermount3 -u /mnt/heaptest`, pkill pattern
-   `"[h]eap_driver"`. **If clean, next (operator's choice): the pair again with media load**: scanner and
+   `"[h]eap_driver"`. **If clean, next (operator's choice, but confirm with him first after the 11-14 test-volume rule): the pair
+   again with media load**: scanner and
    media-information service on over a media library (make test media with ffmpeg `testsrc` on the Pi, never copy
    from the live nodes unasked) so `prune` runs during the FUSE churn. If ASan names a writer: report the
    mechanism to the operator before any edit.
 2. **The store cutover, step 1a** (plan and log: [`2026-11-13-store-cutover.md`](2026-11-13-store-cutover.md);
-   the class-by-class map: `build/store-api-map.md`). **Uncommitted in the working tree, building on neptune:**
+   the class-by-class map: `build/store-api-map.md`). **Committed 2026-11-14 after neptune went green (714/714,
+   20/20, 21/21):** `1a27043` (the bump) and `f84337c` (the first slice), as described here:
    - the move to Dannan 0.6.0 and Dagda 0.1.5: `CMakeLists.txt` (`find_package(dannan 0.6.0)`, `dagda 0.1.5`), both
      workflows (Dagda built from its tag after Dannan; both tags are on their remotes), CONTRIBUTING, the install
      guides and quickstart. Dannan's public headers 0.5.3 to 0.6.0 change nothing Macha uses;
@@ -40,10 +42,18 @@ comes first when it lands).
    `/root/pi/macha.result`). **Check:** `ssh root@10.44.1.202 'cat /root/pi/macha.result; tail -n 20
    /root/pi/macha.log'`. Green: commit the bump and 1a as two commits (named paths). Red: fix, re-rsync (the rule
    below), rerun the script.
-   **Next in 1a:** the remaining twins, each its own buildable commit: `RetentionClass`, `RetentionDot`,
-   `RetentionClock` (`src/contract/claim_store.hpp`, values identical to Dagda's), `StorageUnavailable` (Macha's
-   catches in `ingest.cpp` and `filesystem.hpp` must catch Dagda's), `IdLookup`, `UnreferencedSince`, `ObjectTrie`,
-   `TrieUnion`, `ObjectStore`, `HeldView`, `DiskServiceMonitor`. Then 1b: `dagda::Node(OpenLater)` in `LocalState`,
+   **Then, green on neptune (714/714, 20/20, 21/21) and committed:** `00a741f` (`RetentionClass`, `RetentionDot`,
+   `RetentionClock`), `f2de690` (`IdLookup`), `ed1d3fd` (`StorageUnavailable`, so Macha's catches catch Dagda's).
+   **Finding, for the operator (report before acting):** the rest of 1a's list are not twins. The map's "inferred
+   identical" is wrong, checked by a normalised diff against Dagda 0.1.5 (`build/twin_diff.py MACHA DAGDA`):
+   `ObjectTrie` takes a `shared_ptr<const domain::StorageKey>` and a logger (Macha: a raw 32-byte key) and adds
+   `rekey`, `probe`, `read_only` and a different journal replay; `UnreferencedSince` **seals its file** under the
+   storage key (aad `dagda/sightings/1`; Macha's is plain), an on-disk format change; `DiskServiceMonitor` and
+   `DiskServiceTimer` need a logger and a `TimeSource` at every construction and timer site. `TrieUnion` is identical
+   apart from holding Dagda's `ObjectTrie`, and `ObjectStore`/`HeldView` hold a `TrieUnion`, so all five go together.
+   Recommendation: end 1a here and move these five into 1b, where Dagda's `Node` builds the stores that construct
+   them; `UnreferencedSince`'s format goes with the migration (dagda-migrate), not an alias. Waiting on the operator.
+   Then 1b: `dagda::Node(OpenLater)` in `LocalState`,
    the classes aliased, adapters for `DistributedStore` (tickets for `DurabilityBatch`, ReadOptions, RepairLists)
    and `AvailabilityService` (Macha keeps the path table); `catalogue.cpp:2721`'s `claim_deletion` becomes
    `node.data().claim_locks().deletion(id, retained(control))`, as Dagda's collector does (`collector.cpp:338`).
@@ -73,16 +83,28 @@ alongside node B (agreed); Dagda holds jupiter (bench, then its 0.1.5 packages w
 
 ## Where the code is
 
-- `port/dannan-dagda` at `0d2a8e4`, six commits past `develop` (`f0597a4`), pushed to `0a0801b` (one TODO commit
-  local). `main` is `37fa763`, tagged 0.94.2; `develop` carries TODO commits past it. CMake says 0.94.2.
+- `port/dannan-dagda` at `ed1d3fd` (plus this TODO commit), past `develop` (`f0597a4`), pushed to `0a0801b`; the
+  commits since are local: two TODO commits, the bump, 1a's four slices. `main` is `37fa763`, tagged 0.94.2; `develop` carries TODO commits past it. CMake says 0.94.2.
 - The branch so far: Dagda 0.1.4 linked (`de57596`), `NodeId` and `Hash256` Dannan's (`6d8c6e7`), Macha's config as
   `dagda::NodeOptions` (`a95e9cc`, `src/cluster/store_node.{hpp,cpp}`).
-- Peers: Dannan (0.6.0 tagged and pushed; 0.7 `feature/macha-fixes` approved), Dagda (0.1.5 tagged and pushed),
+- Peers: Dannan (0.6.0 tagged and pushed; 0.7.0 tagged 2026-11-14, SONAME `libdannan.so.0.7`, with Macha's fixes;
+  0.8.0's P6 seams on `feature/owner-test-seam` reviewed at `c860fb5`, all four fit: `call_fault` replaces
+  `NodeRuntime::CallFault` and `StalledCalls` (Macha counts held calls in its own callback, since Dannan's
+  `stalled_calls()` is the count held now), `test::BarePeer` replaces `tests/stand_in_peer.hpp` via `tune` and
+  `before_start`, `watch_advert` for the storage figures only (the generation stays on the roster watch),
+  `AsyncSink` around Macha's sink; the review found a leave could be coalesced away at `c860fb5`, now fixed;
+  `LogSink::write_at(time, ...)` added for 0.8.0, so Macha's stamping sink must override `write_at` when it moves
+  behind `AsyncSink`; the fixes `2b1ce5f`, `8a0bce3` and `76537c6` read and passed, one note sent: the withdrawal test's 1 s
+  wall-clock bound must have headroom; Macha's fixtures must destroy a node before the io threads it posts to), Dagda (0.1.5 tagged and pushed; its arm64 debs, built from the tag with Macha's fixtures, all
+  fixture-gated cases run and passed, are in `build/debs/dagda-0.1.5/`, sha256 checked),
   Lugh, Lir, Corvus LoRa, Corvus Radioberry; `SendMessage`, `ListAgents`. Their repositories are read-only to this
   session.
 
 ## Waiting on the operator
 
+- Whether 1a ends at the five aliases, with `ObjectTrie`, `TrieUnion`, `ObjectStore`/`HeldView`,
+  `UnreferencedSince` and `DiskServiceMonitor` moving into 1b (the finding in "Resume here").
+- Whether to run the heap pair again with media load after a clean ASan pair, given the 11-14 test-volume rule.
 - The Codecov token for the repository.
 - Carried, unchecked: the media-kind import hint; truncated pack records; the `*.pre-migration.*` archives; the
   replica journal reader with no writer left.
@@ -143,7 +165,9 @@ corruption.
   matches English text.
 - **Proportion.** Account for and control what matters to the user's experience.
 - **Testing**: test the change once on a Pi (the suites there are the gate; `tools/ci.sh` is the merge gate, ASan
-  and UBSan included); no repeat or soak runs; sanitizers otherwise only as a targeted debugger.
+  and UBSan included); no repeat or soak runs; sanitizers otherwise only as a targeted debugger. Operator to every
+  session, 2026-11-14 (relayed): ASan and TSan runs are for releases; running the same tests more than once needs a
+  flaky test or odd behaviour to justify it ("We're spending 50% of our time heating silicon for no good reason").
 - **Report findings before fixing; prove a mechanism before editing.** Design questions go to the operator with a
   recommendation.
 - **Every response has a snake_case code; errors add a message; clients own sorting and presentation; every API
