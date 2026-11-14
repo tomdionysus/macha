@@ -534,7 +534,7 @@ MACHA_TEST("service_root", test_an_api_request_is_viewer_work_and_a_viewer_prese
     service.start();
     REQUIRE(wait_metadata_writable(service));
     auto& activity = service.resources().activity;
-    const auto viewer_idle = [&] { return activity.idle_for(WorkClass::viewer); };
+    const auto viewer_idle = [&] { return activity.idle_for(WorkClass::foreground); };
 
     // Refused for want of a session: nobody is present.
     const auto before = viewer_idle();

@@ -517,7 +517,7 @@ void ClusterStatusService::persist_local_status() {
     // lock or enter publication CAS. The small durable write (with its fsync) is
     // deferred while viewer-critical work is active.
     constexpr auto idle_before_persist = std::chrono::seconds(30);
-    if (activity_.idle_for(WorkClass::viewer) < idle_before_persist)
+    if (activity_.idle_for(WorkClass::foreground) < idle_before_persist)
         return;
     node_.telemetry().persist();
     accounts_.sessions().persist();

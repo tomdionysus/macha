@@ -46,14 +46,6 @@ inline MessageType macha_type(dannan::net::MessageType type) noexcept {
     return static_cast<MessageType>(static_cast<uint16_t>(type));
 }
 
-// The two enums have equal values, 1 to 5.
-inline dannan::sched::FrameType dannan_frame(FrameType frame) noexcept {
-    return static_cast<dannan::sched::FrameType>(static_cast<uint8_t>(frame));
-}
-inline FrameType macha_frame(dannan::sched::FrameType frame) noexcept {
-    return static_cast<FrameType>(static_cast<uint8_t>(frame));
-}
-
 inline dannan::identity::NodeId dannan_id(const NodeId& id) noexcept {
     dannan::identity::NodeId out;
     out.bytes = id.bytes;

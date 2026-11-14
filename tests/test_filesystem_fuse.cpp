@@ -441,7 +441,7 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         // Viewer class, because it is bounded only by the non-control
         // capacity: a loader-class lease could not take the whole budget a
         // wedged publication pipeline fills.
-        auto hog = ledger.try_acquire(WorkClass::viewer, MemoryOwner::playback_segment,
+        auto hog = ledger.try_acquire(WorkClass::foreground, MemoryOwner::playback_segment,
                                       ledger.stats().capacity_bytes -
                                           ledger.stats().control_reserve_bytes);
         REQUIRE(hog.has_value());
@@ -951,7 +951,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
 
         // Publication replay must not mark its own chunks as viewer work, or
         // the quiet policy would throttle it by one quiet interval per chunk.
-        CHECK(fs.idle_for(WorkClass::viewer) >= 1h);
+        CHECK(fs.idle_for(WorkClass::foreground) >= 1h);
         CHECK(frontend->status().pending_data == 0);
         const auto entry = fs.getattr("/movie.bin");
         CHECK(entry.size == expected.size());
@@ -960,9 +960,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
         // does not move.
         auto fuse_reader = frontend->open("/movie.bin", true, false, false, false);
         Bytes fuse_probe(4096);
-        const auto viewer_before = fs.idle_for(WorkClass::viewer);
+        const auto viewer_before = fs.idle_for(WorkClass::foreground);
         REQUIRE(frontend->read(fuse_reader, 0, fuse_probe) == fuse_probe.size());
-        CHECK(fs.idle_for(WorkClass::viewer) >= viewer_before);
+        CHECK(fs.idle_for(WorkClass::foreground) >= viewer_before);
         frontend->release(fuse_reader.inode, false);
 
         CHECK(read_back(fs, "/movie.bin", expected.size()) == expected);

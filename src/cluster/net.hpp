@@ -136,7 +136,6 @@ inline constexpr size_t have_valid_objects_max = 16;
 inline constexpr size_t max_pending_rpc_requests = dannan::net::max_pending_replies;
 inline constexpr size_t max_peer_outbound_messages = dannan::net::max_outbound_messages;
 
-const char* frame_type_name(FrameType) noexcept;
 const char* message_type_name(MessageType) noexcept;
 unsigned frame_type_priority(FrameType) noexcept;
 // The frame a call of this type takes when its caller names none.

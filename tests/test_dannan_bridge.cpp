@@ -363,14 +363,8 @@ MACHA_TEST("dannan_bridge", test_telemetry_goes_into_the_record_and_back) {
     REQUIRE(node_telemetry_from(record).has_value());
 }
 
-// Every frame class, id and message survives the trip both ways.
-MACHA_TEST("dannan_bridge", test_frames_ids_and_messages_convert_both_ways) {
-    for (const auto frame : {FrameType::control, FrameType::foreground, FrameType::read_ahead,
-                             FrameType::speculative, FrameType::loader})
-        REQUIRE(macha_frame(dannan_frame(frame)) == frame);
-    REQUIRE(work_class(FrameType::foreground) == WorkClass::viewer);
-    REQUIRE(dannan::sched::work_class(dannan_frame(FrameType::foreground)) ==
-            dannan::sched::WorkClass::foreground);
+// Every id and message survives the trip both ways.
+MACHA_TEST("dannan_bridge", test_ids_and_messages_convert_both_ways) {
     NodeId id;
     for (size_t i = 0; i < id.bytes.size(); ++i)
         id.bytes[i] = static_cast<uint8_t>(i * 17);

@@ -3,22 +3,6 @@
 
 namespace macha {
 
-const char* frame_type_name(FrameType type) noexcept {
-    switch (type) {
-    case FrameType::control:
-        return "control";
-    case FrameType::foreground:
-        return "foreground";
-    case FrameType::read_ahead:
-        return "read-ahead";
-    case FrameType::speculative:
-        return "speculative";
-    case FrameType::loader:
-        return "loader";
-    }
-    return "unknown";
-}
-
 const char* message_type_name(MessageType type) noexcept {
     switch (type) {
     case MessageType::ping:

@@ -179,7 +179,7 @@ class DataResourceArbiter {
     uint64_t cancelled_waits_ MACHA_GUARDED_BY(mutex_){};
 
     static bool viewer(FrameType frame_type) noexcept {
-        return work_class(frame_type) == WorkClass::viewer;
+        return work_class(frame_type) == WorkClass::foreground;
     }
     static bool loader(FrameType frame_type) noexcept {
         return work_class(frame_type) == WorkClass::loader;
