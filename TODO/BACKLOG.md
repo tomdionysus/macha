@@ -319,3 +319,6 @@ read, write and viewer phases before and after.
   buffer it cannot happen; no interim patch unless the heap chase implicates it.
 - **Not twice:** the libfuse-facing adapter is separate from `FuseFrontend`'s store calls, which the Dagda port's map
   covers (Macha's half). Do this after the port lands, on the ported frontend.
+- **Told to Dagda 2026-11-14 for the port's map:** the read API Macha's file reads use must never write caller
+  memory after returning (owned results, or a cancel that waits for the copy), cancel promptly at fetch boundaries
+  with the outcome told, offer an async form on a caller's executor, and carry the read class per call.
