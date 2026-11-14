@@ -24,10 +24,12 @@ a call only a `Node` part serves today.
   `flock`s on separate descriptors conflict within one process, so the node is refused as "in use". One lock, one
   owner: Macha's root rewrite drops its own.
 - **Data safety, confirmed in Dagda:** `WriteOptions::cancelled` and `ReadOptions::cancelled` are raw
-  `std::atomic_bool*` (`dagda/store/distributed_store.h:158`, `:197`), read by a store worker in the async forms after
-  the caller has returned. The read requirements gain a fifth: cancellation through a token the store co-owns.
-- **Resolved on the port branch:** `ingest.cpp:1627` catches `StorageUnavailable`, which is Dagda's type since
-  `ed1d3fd`; what remains is that Context returns evidence rather than throwing, so the filesystem turns an unlanded
+  `std::atomic_bool*` (`dagda/store/distributed_store.h:158`, `:197`), read by a store worker after the caller has
+  returned: in the async forms, and in Context's blocking forms too, whose `await()` throws at deadline plus margin
+  while the job still holds the pointer (Dagda's review, context.cpp:36-43). Requirement 5: every Context form takes a
+  cancellation the store co-owns.
+- **Resolved on the port branch:** `ingest.cpp:1627` catches `StorageUnavailable`; at f0597a4 that is Macha's own
+  type, and on `port/dannan-dagda` it is an alias of Dagda's since Macha's commit `ed1d3fd`; what remains is that Context returns evidence rather than throwing, so the filesystem turns an unlanded
   write into `FsStorageUnavailable` (a rewrite, not a gap).
 - **Ruled out:** the catalogue reader's question whether `maintenance_objects` can report complete without the current
   root's shards. `complete` needs `cached_root_ == metadata_root` (`catalogue.cpp:2643-2645`) and the root set always
@@ -36,8 +38,10 @@ a call only a `Node` part serves today.
 
 ## The largest gaps for Dagda (readers' findings; Dagda checks each against code)
 
-1. **CONTROL through Context:** fetch to local, local get/has, strict local put, an offer that writes no claim; the
-   catalogue's manifest and shards and every metadata tree read and commit depend on them.
+1. **CONTROL through Context, the bare forms:** `Claims::retain(RetentionClass::control)` (context.cpp:177-211) already
+   fetches to local, puts locally, offers and claims; missing are a fetch with no claim, local get and has, a strict
+   local put and a claimless offer. The catalogue's manifest and shards and every metadata tree read and commit need
+   them.
 2. **Blocking forms on the caller's thread with no deadline** (reads and writes), known-id writes, deferred writes
    returning tickets, a many-ticket wait carrying the caller's frame.
 3. **Typed outcomes:** a read told cancelled / timed out / unavailable (`FetchAnswer` is ok / not_found / try_later);
@@ -48,9 +52,11 @@ a call only a `Node` part serves today.
    monitor, `retain_data_here`, the cache seed, reference counts, the reachability provider: all Node-only today.
 5. **The hosting advert written by two paths:** Macha withdraws it on a failed dial-back, Dagda's storage server puts it
    back at its next refresh (reader: SS:89-102).
-6. Performance: Context work on 4 store workers in one FIFO whatever the class; barriers always at loader; a
-   transient barrier failure waits to the deadline; no retained-memory lease on reads; `offer_control_on` holds the
-   whole missing graph in memory; an extra SHA-256 per extent through Context.
+6. Performance: Objects, Claims and barriers through Context run on 4 store workers in one FIFO whatever the class
+   (Heads, Leases and ephemeral writes do not); barriers always at loader; a transient barrier failure waits to the
+   deadline; no retained-memory lease on reads; `offer_control_on` holds the whole missing graph in memory; extra
+   copies per extent through Context (the content-addressed path hashes twice on both sides; only a missing known-id
+   write would add a third).
 
 ## API changes the port brings (announce to Core and every client before they ship)
 
@@ -68,19 +74,11 @@ table.
 - A reload that adds the first backend never re-resolves hosting.
 - Ingest: an unreadable tail extent on resume fails the job instead of blocking it; a refused torrent admission lets
   the disk I/O run without credit.
-</content>
-</invoke>
-<invoke name="Bash">
-<parameter name="command">cd /Users/tom/devroot/macha && python3 - <<'EOF'
-p="TODO/ACTIVE.md"; t=open(p).read()
-old="5. Repair's drop-local checks a claim then removes with nothing held (`:2913-2922`), already Dagda's gap 7.\n"
-new=old+("6. From the callers' map (`TODO/store-map-callers/README.md`): `reload_config` races the storage refresher on\n"
-         "   `online_backends_`; `reconfigure_local` writes `cfg_` on the SIGHUP thread while others read it (a heap-smashing\n"
-         "   class of race: a lead for the parked heap P0); a reload adding the first backend never re-resolves hosting.\n")
-assert t.count(old)==1; t=t.replace(old,new)
-old2="**Map review done (2026-11-14 night):**"
-new2=("**Macha's half of the map written (2026-11-14 night):** `TODO/store-map-callers/` (six sections, 222 rows, index\n"
-      "README with what Macha verified). Sent to Dagda for review.\n"+old2)
-assert t.count(old2)==1; t=t.replace(old2,new2); open(p,"w").write(t); print("ok")
-EOF
-git add -- TODO/store-map-callers TODO/ACTIVE.md && git commit -q -m "TODO: Macha's half of the store map, the callers' side, six sections and an index" && git -c core.pager=cat log --oneline -1
+
+## Reviewed by Dagda (2026-11-14 night)
+
+All 222 rows against code (Dagda's `build/callers-map-review.md`): 280 claims confirmed, 27 wrong in detail, 14 not
+reached, no wrong verdict. Its corrections are applied above. Open for Macha: the barrier's re-put set at f0597a4 is
+wider than "absent" (peer-unknown and any failed local barrier, re-derived from disk first, are definitive,
+`distributed_store.cpp:606-646`, `:734-737`); whether a failed local barrier re-derives is Macha's to settle first,
+and Dagda matches.
