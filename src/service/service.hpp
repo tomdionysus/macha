@@ -16,6 +16,7 @@
 #include "catalogue/media_information.hpp"
 #include "cluster/local_services.hpp"
 #include "cluster/node_resources.hpp"
+#include "cluster/store_node.hpp"
 #include "contract/thread_safety.hpp"
 #include "filesystem/filesystem.hpp"
 #include "filesystem/hydration.hpp"
@@ -80,6 +81,10 @@ class Service {
     std::chrono::milliseconds durability_batch_window_;
     NodeBooks books_;
     NodeRuntime node_;
+    // Dagda's node over the Dannan node beneath node_: built here so its message types are
+    // registered before node_ starts, its store opened on the startup thread, stopped after the
+    // services and before node_.
+    std::unique_ptr<dagda::Node> store_node_;
     // After the node, whose ledger they charge; stopped before it.
     NodeResources resources_;
     // After the node, whose transport carries its gossip; started after the

@@ -47,6 +47,11 @@ Service::Service(const Config& config, ClusterKeys keys,
       startup_stall_handler_(std::move(startup_stall_handler)) {
     if (instruments.call_fault)
         node_.set_call_fault(std::move(instruments.call_fault));
+    // Registers the store's message types and declares its planes; opens nothing.
+    store_node_ = std::make_unique<dagda::Node>(
+        node_.node(),
+        store_node_options(node_.config(), keys, node_.hosts_extents(), durability_batch_window_),
+        dagda::Node::OpenLater{});
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
@@ -511,6 +516,8 @@ void Service::wait_services_ready() {
 void Service::initialise_services(const std::stop_token& stop) {
     try {
         try {
+            note_lifecycle("open store");
+            store_node_->open_store();
             local_ = std::make_unique<LocalServices>(node_.config(), identity_, progress_,
                                                      recovery_stage_hook_, stop, node_, resources_,
                                                      routes_, durability_batch_window_);
@@ -631,6 +638,9 @@ void Service::stop() {
     }
     if (services_)
         services_->stop();
+    // After everything that writes into the store, before the node beneath it.
+    note_lifecycle("stop store");
+    store_node_->stop();
     request_stop();
     note_lifecycle("stop status");
     cluster_status_.stop();
