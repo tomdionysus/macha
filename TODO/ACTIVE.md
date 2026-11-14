@@ -13,7 +13,11 @@ comes first when it lands).
 1. **The heap corruption P0** (found-issues 1; operator chose "Chase it now", report the mechanism before fixing,
    fix in Macha first). inverbeg crashed in malloc under 0.94.2; the core's victim was `FileSystem::media_ids`
    (`filesystem.cpp:2094`) from `MediaInformationService::prune`. Single node under ASan on neptune: 53 clean
-   rounds. **Running now: the ASan pair** since 01:30Z: node A on corvus-neptune (unit `macha-heap-a`, FUSE mount
+   rounds. **The ASan pair, 01:30Z to 04:30Z 2026-11-14: clean.** 72 rounds (about 14,400 files of 64 KiB written,
+   fsynced and deleted through FUSE on node A, replicated to B), no ASan or UBSan report during the run or at exit,
+   zero ERROR lines, WARN only the expected startup ones; both units stopped `inactive`, FUSE unmounted, both Pis
+   released. Plain FUSE churn with replication does not reproduce it; the victim's caller (`prune`) never ran,
+   since there was no media. **Next waits on the operator:** the media-load pair (below). The setup as run: node A on corvus-neptune (unit `macha-heap-a`, FUSE mount
    `/mnt/heaptest`, driver `/root/heap_driver.py` writing 200 x 64 KiB files fsynced then deleted per round, about
    130 s a round, `ROUNDS=300`), node B on corvus-saturn (unit `macha-heap-b`, replica, `replicas=2/2`). Results in
    `/root/heap-pair/` on each (`asan.*`, `ubsan.*`, `macha.log`, `driver.log`); scripts in `build/heap/`.
@@ -61,7 +65,7 @@ comes first when it lands).
 **Afterwards, in order:** the store cutover's steps 2 to 8 (plan file); custody (7b); Macha's deb on
 `libdannan0.6 (>= 0.6.0)` and `libdagda0.1.5`; the partition rerun and the write-up of the 0.94.2 baselines
 (`build/baselines/results-0.94.2/`, `partition.py`'s path fixed in build/); the Macha-side friction items in the plan
-file (duplicate `connections_canonical` write, async call watches, deferred connectivity check, memory fit,
+file (the duplicate `connections_canonical` write is done, `5d8b6dd`; left: async call watches, deferred connectivity check, memory fit,
 durability epoch, payload copies); announce the `dagda.<name>` registration names to Core and the clients **at the
 cutover** (operator, 2026-11-14), not before; Status thread names (clients to Dannan's names, announced, then drop
 the mapping).
@@ -74,8 +78,8 @@ Docker); **nobody schedules the Pis**: claim a free one on Lir's board, first co
 the job ends, ask a holder to use a claimed one. One heavy job per Pi, -j2 or -j3, nice 19. After a session restart
 the claim-board plugin gives `claim_take`, `claim_release`, `status_set` and blocks heavy ssh commands without a
 heavy claim. By hand: version-1 JSON on `stack/pis/<host>/claims/Macha%20Server` and
-`stack/sessions/Macha%20Server/status` (details: memory `project_build_host`). **Held now:** neptune heavy and
-saturn light, until 04:30Z; release both when the heap run and the build end. Corvus LoRa builds on saturn
+`stack/sessions/Macha%20Server/status` (details: memory `project_build_host`). **Held now:** nothing (neptune and saturn
+released 04:31Z 2026-11-14). Corvus LoRa builds on saturn
 alongside node B (agreed); Dagda holds jupiter (bench, then its 0.1.5 packages with Macha's fixtures, copied to
 `/root/dagda-arm64/macha-fixtures`). Macha's state on the Pis: neptune `/home/tom/deps`, `/home/tom/macha-store`,
 `/home/tom/macha-asan` (ASan build of 0.94.2's line), `/root/pi`, `/root/heap*`; saturn `/home/tom/macha-asan`,
@@ -84,7 +88,10 @@ alongside node B (agreed); Dagda holds jupiter (bench, then its 0.1.5 packages w
 ## Where the code is
 
 - `port/dannan-dagda` at `ed1d3fd` (plus this TODO commit), past `develop` (`f0597a4`), pushed to `0a0801b`; the
-  commits since are local: two TODO commits, the bump, 1a's four slices. `main` is `37fa763`, tagged 0.94.2; `develop` carries TODO commits past it. CMake says 0.94.2.
+  commits since are local: TODO commits, the bump, 1a's four slices, two clang-format fixes (the 1a slice and
+  `a95e9cc` had left eight files unformatted; the whole tree now passes clang-format 19), the
+  `connections_canonical` deletion. Before committing, check formatting on the Pi:
+  `clang-format-19 --dry-run --Werror` on every changed file. `main` is `37fa763`, tagged 0.94.2; `develop` carries TODO commits past it. CMake says 0.94.2.
 - The branch so far: Dagda 0.1.4 linked (`de57596`), `NodeId` and `Hash256` Dannan's (`6d8c6e7`), Macha's config as
   `dagda::NodeOptions` (`a95e9cc`, `src/cluster/store_node.{hpp,cpp}`).
 - Peers: Dannan (0.6.0 tagged and pushed; 0.7.0 tagged 2026-11-14, SONAME `libdannan.so.0.7`, with Macha's fixes;
@@ -95,7 +102,18 @@ alongside node B (agreed); Dagda holds jupiter (bench, then its 0.1.5 packages w
   `AsyncSink` around Macha's sink; the review found a leave could be coalesced away at `c860fb5`, now fixed;
   `LogSink::write_at(time, ...)` added for 0.8.0, so Macha's stamping sink must override `write_at` when it moves
   behind `AsyncSink`; the fixes `2b1ce5f`, `8a0bce3` and `76537c6` read and passed, one note sent: the withdrawal test's 1 s
-  wall-clock bound must have headroom; Macha's fixtures must destroy a node before the io threads it posts to), Dagda (0.1.5 tagged and pushed; its arm64 debs, built from the tag with Macha's fixtures, all
+  wall-clock bound must have headroom; Macha's fixtures must destroy a node before the io threads it posts to; merged to Dannan's develop as
+  `3d1d4c0`, rewritten ids checked by patch-id; `7921d23` raised: `supervised_loop(nullptr)`'s function-local
+  static can be destroyed before a static `AsyncSink`'s writer stops, UB at exit; fixed in `bcd8b55` (the fallback and the process clocks never destroyed), read and passed; P4's design (`../dannan/TODO/2026-11-14-p4-worker-pool.md`) answered: Macha's maintenance
+  takes the pool's pacing as a gate (started / should_yield / finished, plus the CPU scale), not per-task
+  submission, and the pool and any loop must share one per-class `DutyShare` per node; code `f531ce5` reviewed: two
+  wiring changes asked, `set_contended` safe after start (Macha's reading needs the store, built after the node
+  starts) and the gates' time and process CPU injectable apart from the node's (the trace tests step
+  `MaintenanceClock`); both done in `f752aa9` (`NodeConfig::gate_time`, `gate_process_cpu`), and the reading swap
+  made safe at clear in `537c619` (once `set_contended` returns the old reading is never called; Macha clears it
+  before destroying its store), both read and passed. For Macha's own move later: today `started()` gets `repair_busy` (this pass's byte counters
+  too) while `should_yield`/`finished` get the `idle_for` reading (`maintenance.cpp:704-720`); one `contended()`
+  unifies them, so check the pacing cases on that), Dagda (0.1.5 tagged and pushed; its arm64 debs, built from the tag with Macha's fixtures, all
   fixture-gated cases run and passed, are in `build/debs/dagda-0.1.5/`, sha256 checked),
   Lugh, Lir, Corvus LoRa, Corvus Radioberry; `SendMessage`, `ListAgents`. Their repositories are read-only to this
   session.
