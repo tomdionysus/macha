@@ -57,6 +57,12 @@ comes first when it lands).
    apart from holding Dagda's `ObjectTrie`, and `ObjectStore`/`HeldView` hold a `TrieUnion`, so all five go together.
    Recommendation: end 1a here and move these five into 1b, where Dagda's `Node` builds the stores that construct
    them; `UnreferencedSince`'s format goes with the migration (dagda-migrate), not an alias. Waiting on the operator.
+   **Custody moved ahead of 1b** (Dagda's `Node::open_store` refuses a node without custody, `node.cpp:199` at
+   0.1.5, so plan 7b's Macha half is a prerequisite of step 1): `9770427` adds `custody.credential` (and
+   `credentials_directory`) as `NodeConfig::custody`, unset = none as before, documented in
+   `docs/configuration.md`; gated 715/21/21. Left of 7b: the unit's `LoadCredentialEncrypted=`, making and sealing
+   custody on each node (`dannan-node --state <state_path> --init-custody --custody-credential <name>` prints the
+   root), `dannan-node` in the tarball, off-node backups; all at deploy, on the operator's word.
    Then 1b: `dagda::Node(OpenLater)` in `LocalState`,
    the classes aliased, adapters for `DistributedStore` (tickets for `DurabilityBatch`, ReadOptions, RepairLists)
    and `AvailabilityService` (Macha keeps the path table); `catalogue.cpp:2721`'s `claim_deletion` becomes
@@ -75,7 +81,8 @@ the mapping).
 corvus-jupiter `root@10.44.1.169`, corvus-saturn `root@10.44.1.170`, corvus-neptune `root@10.44.1.202`: Pi 5,
 16 GB, Debian 13 arm64, shared by every session. **Operator, 2026-11-14: no builds on the Mac** (no cmake, suites,
 Docker); **nobody schedules the Pis**: claim a free one on Lir's board, first come first served, release the moment
-the job ends, ask a holder to use a claimed one. One heavy job per Pi, -j2 or -j3, nice 19. After a session restart
+the job ends. Operator, 2026-11-14 afternoon: the board is the only coordination channel (claims_list, claim_take,
+claim_release, note_post for anything disruptive); never message a holder for permission. One heavy job per Pi, -j2 or -j3, nice 19. After a session restart
 the claim-board plugin gives `claim_take`, `claim_release`, `status_set` and blocks heavy ssh commands without a
 heavy claim. By hand: version-1 JSON on `stack/pis/<host>/claims/Macha%20Server` and
 `stack/sessions/Macha%20Server/status` (details: memory `project_build_host`). **Held now:** nothing (neptune and saturn
