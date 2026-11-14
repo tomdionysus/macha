@@ -11,6 +11,8 @@ this rationalisation is `archive/2026-11-14-ACTIVE-before-rationalisation.md`. A
 glibc heap-check run stay in item 1 below). Macha's work now: review Dagda's store-side map against code
 (`../dagda/TODO/macha-store-map/`, `../dagda/TODO/2026-11-14-macha-store-map.md`), then write Macha's half.
 
+**Macha's half of the map written (2026-11-14 night):** `TODO/store-map-callers/` (six sections, 222 rows, index
+README with what Macha verified). Sent to Dagda for review.
 **Map review done (2026-11-14 night):** six reviewers, one per Dagda section, files in `build/map-review/`; 214 rows
 confirmed, 10 wrong verdicts, about 35 incomplete, 40-odd missing rows. Sent to Dagda with what Macha verified.
 **Macha defects the review found (fix in Macha first; report to the operator before fixing):**
@@ -26,6 +28,9 @@ confirmed, 10 wrong verdicts, about 35 incomplete, 40-odd missing rows. Sent to 
 3. The local barrier re-derives on any failure (`:626-646`); Dagda only on a stale ticket (reviewer; decide which is right).
 4. The repair-share wake rounds down to milliseconds and can fall back to a wake up to 2 s late (reviewer).
 5. Repair's drop-local checks a claim then removes with nothing held (`:2913-2922`), already Dagda's gap 7.
+6. From the callers' map (`TODO/store-map-callers/README.md`): `reload_config` races the storage refresher on
+   `online_backends_`; `reconfigure_local` writes `cfg_` on the SIGHUP thread while others read it (a heap-smashing
+   class of race: a lead for the parked heap P0); a reload adding the first backend never re-resolves hosting.
 
 **The port, re-ruled (operator to Dagda, 2026-11-14 evening, relayed by Dagda):** no shims in Macha; where Macha's
 code is shaped around its own store it is rewritten to use Dagda natively through `dagda::Node` and `Context`, with
@@ -146,8 +151,9 @@ the mapping).
 corvus-jupiter `root@10.44.1.169`, corvus-saturn `root@10.44.1.170`, corvus-neptune `root@10.44.1.202`: Pi 5,
 16 GB, Debian 13 arm64, shared by every session. **Operator, 2026-11-14: no builds on the Mac** (no cmake, suites,
 Docker); **nobody schedules the Pis**: claim a free one on Lir's board, first come first served, release the moment
-the job ends. Operator, 2026-11-14 afternoon: the board is the only coordination channel (claims_list, claim_take,
-claim_release, note_post for anything disruptive); never message a holder for permission. One heavy job per Pi, -j2 or -j3, nice 19. After a session restart
+the job ends. Claim board 0.2.0 (2026-11-14 night): claims by cores (`cores` = the -j, "all", or 0 for light work);
+queue with `claim-board wait ... --cores N --for 2h` as a background command, never poll; asking a holder to make
+room is allowed again (operator reversed the afternoon's rule). Details: memory `project_build_host`. One heavy job per Pi, -j2 or -j3, nice 19. After a session restart
 the claim-board plugin gives `claim_take`, `claim_release`, `status_set` and blocks heavy ssh commands without a
 heavy claim. By hand: version-1 JSON on `stack/pis/<host>/claims/Macha%20Server` and
 `stack/sessions/Macha%20Server/status` (details: memory `project_build_host`). **Held now:** nothing (neptune and saturn
