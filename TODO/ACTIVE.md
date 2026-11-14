@@ -57,6 +57,9 @@ comes first when it lands).
    - Checked and clean: `fork` in book conversion (child is async-signal-safe only), `mallopt` (once, before
      threads), `malloc_trim` (thread-safe), the only sanitizer-conditional code (`process_allocator.cpp`), the
      AVIO callbacks (respect `buffer_size`), `ReadHandle::read` (synchronous, caller's thread).
+   - **Operator, 2026-11-14: libfuse's high-level API is suspect; move to the low-level API after the Dagda port,
+     done once** (BACKLOG "FUSE: libfuse's low-level API", macOS support checked). It fixes the read late-write by
+     design, so no interim patch unless the chase implicates it.
    - Not exercised by any ASan run so far: the catalogue scanner over a real library after deletes, and
      media-information probing real media through FFmpeg (every root was empty). Next to read.
    The setup as run: node A on corvus-neptune (unit `macha-heap-a`, FUSE mount

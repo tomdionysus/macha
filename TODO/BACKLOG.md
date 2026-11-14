@@ -295,3 +295,27 @@ on control threads no longer grow with deletes. Left:
   operation at a time (about 100 ms each); the hint store rewrites its file
   per change (266 KB with 409 hints); the head record's largest part is now
   its 72 torrent requests (only if they grow).
+
+## FUSE: libfuse's low-level API (operator, 2026-11-14: the way to go, after the Dagda port, done once)
+
+Macha's adapter (`src/fuse/fuse_adapter.cpp`) uses libfuse's high-level, path-based API while `FuseFrontend`
+keeps its own inode table, so every request is resolved twice and libfuse's node table, path cache, forget counts
+and per-request read buffers run in-process, uninstrumented, beside Macha's. The move: `fuse_lowlevel_ops`, Macha's
+inodes the only ones, replies from Macha's broker workers (async), Macha-owned reply buffers, interrupts
+(`fuse_req_interrupt_func`), lookup and forget counts, readdirplus with a plain readdir fallback, and precise kernel
+invalidation (`fuse_lowlevel_notify_inval_inode` / `_inval_entry`), which would let the 1 s entry and attribute
+timeouts and `kernel_cache=0` be raised. Expected faster and more controllable; prove it with the baseline's list,
+read, write and viewer phases before and after.
+- **macOS (must keep working), checked 2026-11-14 against macFUSE's own header** (`macfuse/library`,
+  `support/libfuse-3.18`, `include/fuse_lowlevel.h`, copy in `build/macfuse/`): every call above is declared with no
+  platform guard. On Darwin `fuse_reply_entry`, `fuse_add_direntry(_plus)`, setattr and the xattr ops take Darwin
+  types unless `FUSE_DARWIN_ENABLE_EXTENSIONS` is 0 (`fuse_common.h:61-71`): a thin attribute layer. macFUSE wiki and
+  notes: INVAL_INODE, INVAL_ENTRY, DELETE supported; STORE, RETRIEVE, POLL not (ENOSYS since 5.4.0); interrupts
+  supported; readdirplus delivery not documented; fd-based zero-copy replies not documented on macOS. Linux nodes run
+  libfuse 3.17.2, macFUSE 5.5.0 ships 3.18.3: target the common API. Require macFUSE 5.x. macFUSE 5.5.0 notes its FSKit
+  backend on macOS 26/27 rejects an empty FUSE_READ reply with EIO; Macha answers EOF with an empty read.
+- **Fixes by design** the read late-write defect found in the heap chase (ACTIVE, item 1): `dispatch` returns
+  ETIMEDOUT for a running read while the worker still writes into libfuse's buffer. With Macha owning the reply
+  buffer it cannot happen; no interim patch unless the heap chase implicates it.
+- **Not twice:** the libfuse-facing adapter is separate from `FuseFrontend`'s store calls, which the Dagda port's map
+  covers (Macha's half). Do this after the port lands, on the ported frontend.
