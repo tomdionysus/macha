@@ -6,6 +6,7 @@
 #include "cluster/replica_selector.hpp"
 #include "contract/id_lookup.hpp"
 #include "contract/thread_safety.hpp"
+#include "dagda/store/distributed_store.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -24,10 +25,8 @@
 namespace macha {
 // No node present can take a write now: no backend online, none with room,
 // or none answering in time. It passes, so a caller waits and tries again.
-class StorageUnavailable final : public std::runtime_error {
-  public:
-    using std::runtime_error::runtime_error;
-};
+// Dagda's, so a catch here also catches the store's.
+using StorageUnavailable = dagda::store::StorageUnavailable;
 
 // Where repair keeps its place across restarts (none: each pass starts at the
 // beginning), and the repair decision trace (tests only).
