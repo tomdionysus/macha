@@ -7,6 +7,10 @@ this rationalisation is `archive/2026-11-14-ACTIVE-before-rationalisation.md`. A
 
 ## Resume here
 
+**Operator, 2026-11-14 night: port first, heap later.** The heap P0 is parked (its findings and the proposed
+glibc heap-check run stay in item 1 below). Macha's work now: review Dagda's store-side map against code
+(`../dagda/TODO/macha-store-map/`, `../dagda/TODO/2026-11-14-macha-store-map.md`), then write Macha's half.
+
 **The port, re-ruled (operator to Dagda, 2026-11-14 evening, relayed by Dagda):** no shims in Macha; where Macha's
 code is shaped around its own store it is rewritten to use Dagda natively through `dagda::Node` and `Context`, with
 no loss; Dagda must handle DHT storage at least as well as Macha's store, measured side by side (a harness on the Pis
