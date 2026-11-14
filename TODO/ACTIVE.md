@@ -19,7 +19,9 @@ confirmed, 10 wrong verdicts, about 35 incomplete, 40-odd missing rows. Sent to 
    put/remove/touch in pack order (`:1055-1078`). After a restart (a) a removed object whose put is in an older
    pack comes back, re-entered in the held ledger (`:526-528`); (b) a re-affirmed object's age reverts, so
    `remove_if_older_than` (`:1574-1582`) can collect it as an orphan before its claim lands: data loss for a fresh
-   write whose content matched an old object. No test covers it. Dagda reportedly the same.
+   write whose content matched an old object. No test covers it. Dagda confirmed the same in its code
+   (`local_store.cpp:1413-1443`). **Operator, 2026-11-14: Dagda's to fix; the cutover is in the next few days, so
+   Macha does not fix its own store.** Macha reviews Dagda's fix.
 2. Prompt replication's wait has no timeout (`distributed_store.cpp:1227`): retries stall on an idle node (reviewer).
 3. The local barrier re-derives on any failure (`:626-646`); Dagda only on a stale ticket (reviewer; decide which is right).
 4. The repair-share wake rounds down to milliseconds and can fall back to a wake up to 2 s late (reviewer).
