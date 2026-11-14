@@ -165,9 +165,6 @@ void NodeRuntime::write_telemetry(dannan::status::Telemetry& record) const {
     hosted.cache.misses = advertised_cache_misses_.load(std::memory_order_relaxed);
     hosted.cache.evictions = advertised_cache_evictions_.load(std::memory_order_relaxed);
     write_hosted_telemetry(record, hosted);
-    // A core field the node leaves unwritten: the routes usable now.
-    if (const auto stats = readable_node().client_stats())
-        record.set_u64(dannan::status::field::connections_canonical, stats->canonical_connections);
 }
 
 bool NodeRuntime::all_local_state_ready() const noexcept {
