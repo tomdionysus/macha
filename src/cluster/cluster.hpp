@@ -75,8 +75,8 @@ class NodeRuntime : public ClusterNode {
 
   private:
     Config cfg_;
-    // Owned by the root, which built it under the state path's lock.
-    const NodeIdentity& identity_;
+    // Before host_, whose configuration they key.
+    ClusterKeys keys_;
     // Owned by the root; the node reads it for readiness and telemetry.
     RecoveryProgress& progress_;
     // Playback records, telemetry publishes.
@@ -134,6 +134,8 @@ class NodeRuntime : public ClusterNode {
     // reachable while its durable state recovers; built after everything its
     // callbacks read, and destroyed before it. Requests reach `routes`.
     DannanHost host_;
+    // The node's id and epoch, after host_, whose node holds the state lock and reads them.
+    NodeIdentity identity_;
     // Views over the node's roster and telemetry; this node's own figures are
     // Membership's.
     Membership members_;
@@ -167,8 +169,9 @@ class NodeRuntime : public ClusterNode {
     dannan::Node& readable_node() const;
 
   public:
-    // The caller holds state_path's StorageLock for this node's life.
-    NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, TranscodeRateBook&, MessageRoutes&,
+    // Its Dannan node takes state_path's lock first, before any state is read, for this node's
+    // life.
+    NodeRuntime(Config, ClusterKeys, RecoveryProgress&, TranscodeRateBook&, MessageRoutes&,
                 NodeEvents&, StartupStageHook startup_stage_hook);
     ~NodeRuntime() override;
     // Before start().
@@ -195,6 +198,9 @@ class NodeRuntime : public ClusterNode {
     }
     const ClusterKeys& keys() const {
         return identity_.keys;
+    }
+    const NodeIdentity& identity() const noexcept {
+        return identity_;
     }
     NodeId node_id() const override {
         return identity_.id;

@@ -41,6 +41,9 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
 
 } // namespace
 
+NodeIdentity::NodeIdentity(ClusterKeys cluster_keys, const dannan::Identity& node)
+    : keys(std::move(cluster_keys)), id(node.id()), durability_epoch(node.durability_epoch()) {}
+
 NodeIdentity::NodeIdentity(const std::filesystem::path& state_path, ClusterKeys cluster_keys)
     : keys(cluster_keys), id(load_v18_node_id(state_path)), durability_epoch(random_node_id()) {}
 

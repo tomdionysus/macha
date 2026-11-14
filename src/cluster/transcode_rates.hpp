@@ -22,7 +22,11 @@ class TranscodeRateBook {
   public:
     static constexpr size_t kept_observations = 16;
 
+    // Reads nothing: `path` is read by open().
     explicit TranscodeRateBook(std::filesystem::path path);
+    // Reads what was persisted; once, before the first record or summary, with the state path
+    // locked.
+    void open();
 
     // One finished generation. `kind` is "video" (keyed by the source video
     // stream) or "audio" (audio-only transcodes, keyed by the audio codec).
