@@ -46,6 +46,14 @@ written by both and each reviewing the other: Macha proposed develop `f0597a4`, 
 FUSE, catalogue, metadata, ingest, torrent, media, HTTP, composition root), Dagda the store's side. Custody
 (operator to Macha, same evening): **provision it on live-a and live-b at the next deploy, ahead of the
 cutover** (the maintainer told Dagda "at the cutover"; this answer is the later one). Macha's heap P0 first.
+**Custody at the next deploy, checked 2026-11-14 night (read-only on the nodes):** systemd 257, no TPM
+(`systemd-analyze has-tpm2`: partial), so roots seal with the host key (`/var/lib/systemd/credential.secret`, made at
+first use); no `dannan-node` on either node, and Dannan 0.6.0 does not install it (a test tool,
+`tools/CMakeLists.txt:35-37`): asked Dannan for an installed custody tool (make, printing the root once; show
+identity; refuse under the state lock; man page). Making custody needs Macha stopped (it takes `.dannan.lock`), so it
+runs in the deploy between stop and start. **Backup:** a host-key-sealed root opens only on the host that sealed it,
+so the off-node backup must hold the plain root (kept offline) or the sealed root with that node's
+`credential.secret`; the plan's "sealed root backed up off-node" alone cannot restore a dead root filesystem.
 
 **Store cutover ON HOLD (operator, 2026-11-14 ~16:00Z):** on the 1a finding (Dagda's ObjectTrie,
 UnreferencedSince, DiskServiceMonitor are not what Macha uses), the maintainer: Dagda was built explicitly to handle Macha's
