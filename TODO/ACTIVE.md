@@ -11,6 +11,20 @@ this rationalisation is `archive/2026-11-14-ACTIVE-before-rationalisation.md`. A
 glibc heap-check run stay in item 1 below). Macha's work now: review Dagda's store-side map against code
 (`../dagda/TODO/macha-store-map/`, `../dagda/TODO/2026-11-14-macha-store-map.md`), then write Macha's half.
 
+**Map review done (2026-11-14 night):** six reviewers, one per Dagda section, files in `build/map-review/`; 214 rows
+confirmed, 10 wrong verdicts, about 35 incomplete, 40-odd missing rows. Sent to Dagda with what Macha verified.
+**Macha defects the review found (fix in Macha first; report to the operator before fixing):**
+1. **Data safety, verified in code:** pack compaction keeps only the victim's live puts (`local_store.cpp:1806-1843`
+   at f0597a4), dropping its remove and touch records, with no guard on victim choice (`:1738-1797`); replay is
+   put/remove/touch in pack order (`:1055-1078`). After a restart (a) a removed object whose put is in an older
+   pack comes back, re-entered in the held ledger (`:526-528`); (b) a re-affirmed object's age reverts, so
+   `remove_if_older_than` (`:1574-1582`) can collect it as an orphan before its claim lands: data loss for a fresh
+   write whose content matched an old object. No test covers it. Dagda reportedly the same.
+2. Prompt replication's wait has no timeout (`distributed_store.cpp:1227`): retries stall on an idle node (reviewer).
+3. The local barrier re-derives on any failure (`:626-646`); Dagda only on a stale ticket (reviewer; decide which is right).
+4. The repair-share wake rounds down to milliseconds and can fall back to a wake up to 2 s late (reviewer).
+5. Repair's drop-local checks a claim then removes with nothing held (`:2913-2922`), already Dagda's gap 7.
+
 **The port, re-ruled (operator to Dagda, 2026-11-14 evening, relayed by Dagda):** no shims in Macha; where Macha's
 code is shaped around its own store it is rewritten to use Dagda natively through `dagda::Node` and `Context`, with
 no loss; Dagda must handle DHT storage at least as well as Macha's store, measured side by side (a harness on the Pis
