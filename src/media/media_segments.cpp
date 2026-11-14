@@ -269,8 +269,8 @@ bool MediaSegmentStore::attach_memory_ledger(RetainedMemoryLedger& ledger) {
     Lock lock(impl_->mutex);
     if (impl_->retained_memory)
         return true;
-    auto lease =
-        ledger.try_acquire(WorkClass::foreground, MemoryOwner::playback_segment, impl_->memory_limit);
+    auto lease = ledger.try_acquire(WorkClass::foreground, MemoryOwner::playback_segment,
+                                    impl_->memory_limit);
     if (!lease)
         return false;
     impl_->retained_memory.emplace(std::move(*lease));
