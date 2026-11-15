@@ -103,7 +103,8 @@ class MediaInput {
     virtual ~MediaInput() = default;
     virtual uint64_t size() const = 0;
     virtual size_t read(uint64_t offset, std::span<uint8_t> destination,
-                        Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr) = 0;
+                        Clock::time_point deadline = {},
+                        std::shared_ptr<std::atomic_bool> cancelled = {}) = 0;
 };
 
 struct MediaSource {

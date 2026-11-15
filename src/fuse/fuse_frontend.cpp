@@ -5910,161 +5910,164 @@ FuseOpenHandle FuseFrontend::create(std::string_view path, uint32_t mode, uint32
 size_t FuseFrontend::read_impl(uint64_t inode_id,
                                const std::shared_ptr<FuseReadSession>& read_session,
                                uint64_t offset, std::span<uint8_t> output) {
-    return dispatch(FuseOperationClass::read, [this, inode_id, read_session, offset,
-                                               output](Clock::time_point deadline,
-                                                       std::atomic_bool& cancelled) {
-        auto inode = state_->resolve_inode(inode_id);
-        struct ReadOverlay {
-            uint64_t begin{};
-            uint64_t end{};
-            uint64_t spool_offset{};
-            bool zero{};
-        };
-        std::optional<FsEntry> base_snapshot;
-        uint64_t base_size = 0;
-        uint64_t base_version = 0;
-        uint64_t visible_size = 0;
-        size_t count = 0;
-        std::vector<ReadOverlay> overlay;
-        std::filesystem::path spool_path;
-        std::string logical_path;
-        {
-            Lock lock(inode->mutex);
-            if (inode->visible.type != EntryType::file)
-                throw FsError(EISDIR, "directory");
-            visible_size = inode->visible.size;
-            if (offset >= visible_size || output.empty())
-                return size_t{0};
-            count = static_cast<size_t>(std::min<uint64_t>(output.size(), visible_size - offset));
-            base_size = inode->base.size;
-            base_version = inode->base.version;
+    return dispatch(
+        FuseOperationClass::read,
+        [this, inode_id, read_session, offset,
+         output](Clock::time_point deadline, const std::shared_ptr<std::atomic_bool>& cancelled) {
+            auto inode = state_->resolve_inode(inode_id);
+            struct ReadOverlay {
+                uint64_t begin{};
+                uint64_t end{};
+                uint64_t spool_offset{};
+                bool zero{};
+            };
+            std::optional<FsEntry> base_snapshot;
+            uint64_t base_size = 0;
+            uint64_t base_version = 0;
+            uint64_t visible_size = 0;
+            size_t count = 0;
+            std::vector<ReadOverlay> overlay;
+            std::filesystem::path spool_path;
+            std::string logical_path;
+            {
+                Lock lock(inode->mutex);
+                if (inode->visible.type != EntryType::file)
+                    throw FsError(EISDIR, "directory");
+                visible_size = inode->visible.size;
+                if (offset >= visible_size || output.empty())
+                    return size_t{0};
+                count =
+                    static_cast<size_t>(std::min<uint64_t>(output.size(), visible_size - offset));
+                base_size = inode->base.size;
+                base_version = inode->base.version;
+                if (offset < base_size) {
+                    bool need_snapshot = !read_session;
+                    if (read_session) {
+                        Lock session_lock(read_session->mutex);
+                        need_snapshot =
+                            !read_session->reader || read_session->base_version != base_version;
+                    }
+                    if (need_snapshot)
+                        base_snapshot = inode->base;
+                }
+                spool_path = inode->spool_path;
+                logical_path =
+                    inode->current_path.empty() ? std::string("<unlinked>") : inode->current_path;
+
+                auto range = inode->data_overlay.lower_bound(offset);
+                if (range != inode->data_overlay.begin()) {
+                    auto previous = std::prev(range);
+                    if (previous->second.end > offset)
+                        range = previous;
+                }
+                uint64_t examined = 0;
+                const auto requested_end = offset + count;
+                for (; range != inode->data_overlay.end() && range->first < requested_end;
+                     ++range) {
+                    ++examined;
+                    const auto copy_begin = std::max(offset, range->first);
+                    const auto copy_end = std::min(requested_end, range->second.end);
+                    if (copy_begin >= copy_end)
+                        continue;
+                    overlay.push_back({copy_begin, copy_end,
+                                       range->second.zero ? 0
+                                                          : range->second.spool_offset +
+                                                                (copy_begin - range->first),
+                                       range->second.zero});
+                }
+                state_->data_overlay_read_queries.fetch_add(1, std::memory_order_relaxed);
+                state_->data_overlay_ranges_examined.fetch_add(examined, std::memory_order_relaxed);
+                state_->data_overlay_descriptors_copied.fetch_add(overlay.size(),
+                                                                  std::memory_order_relaxed);
+            }
+            std::fill_n(output.data(), count, uint8_t{0});
+
             if (offset < base_size) {
-                bool need_snapshot = !read_session;
+                const auto base_count =
+                    static_cast<size_t>(std::min<uint64_t>(count, base_size - offset));
+                std::shared_ptr<ReadHandle> reader;
                 if (read_session) {
                     Lock session_lock(read_session->mutex);
-                    need_snapshot =
-                        !read_session->reader || read_session->base_version != base_version;
-                }
-                if (need_snapshot)
-                    base_snapshot = inode->base;
-            }
-            spool_path = inode->spool_path;
-            logical_path =
-                inode->current_path.empty() ? std::string("<unlinked>") : inode->current_path;
-
-            auto range = inode->data_overlay.lower_bound(offset);
-            if (range != inode->data_overlay.begin()) {
-                auto previous = std::prev(range);
-                if (previous->second.end > offset)
-                    range = previous;
-            }
-            uint64_t examined = 0;
-            const auto requested_end = offset + count;
-            for (; range != inode->data_overlay.end() && range->first < requested_end; ++range) {
-                ++examined;
-                const auto copy_begin = std::max(offset, range->first);
-                const auto copy_end = std::min(requested_end, range->second.end);
-                if (copy_begin >= copy_end)
-                    continue;
-                overlay.push_back({copy_begin, copy_end,
-                                   range->second.zero
-                                       ? 0
-                                       : range->second.spool_offset + (copy_begin - range->first),
-                                   range->second.zero});
-            }
-            state_->data_overlay_read_queries.fetch_add(1, std::memory_order_relaxed);
-            state_->data_overlay_ranges_examined.fetch_add(examined, std::memory_order_relaxed);
-            state_->data_overlay_descriptors_copied.fetch_add(overlay.size(),
-                                                              std::memory_order_relaxed);
-        }
-        std::fill_n(output.data(), count, uint8_t{0});
-
-        if (offset < base_size) {
-            const auto base_count =
-                static_cast<size_t>(std::min<uint64_t>(count, base_size - offset));
-            std::shared_ptr<ReadHandle> reader;
-            if (read_session) {
-                Lock session_lock(read_session->mutex);
-                if (read_session->inode != inode_id)
-                    throw FsError(EBADF, "FUSE read session inode mismatch");
-                if (!read_session->reader || read_session->base_version != base_version) {
+                    if (read_session->inode != inode_id)
+                        throw FsError(EBADF, "FUSE read session inode mismatch");
+                    if (!read_session->reader || read_session->base_version != base_version) {
+                        if (!base_snapshot)
+                            throw std::logic_error("FUSE read base snapshot unavailable");
+                        read_session->reader = state_->fs.open_read(*base_snapshot, logical_path,
+                                                                    false, FrameType::loader);
+                        read_session->base_version = base_version;
+                    }
+                    reader = read_session->reader;
+                } else {
                     if (!base_snapshot)
                         throw std::logic_error("FUSE read base snapshot unavailable");
-                    read_session->reader = state_->fs.open_read(*base_snapshot, logical_path, false,
-                                                                FrameType::loader);
-                    read_session->base_version = base_version;
+                    reader = state_->fs.open_read(*base_snapshot, logical_path, false,
+                                                  FrameType::loader);
                 }
-                reader = read_session->reader;
-            } else {
-                if (!base_snapshot)
-                    throw std::logic_error("FUSE read base snapshot unavailable");
-                reader =
-                    state_->fs.open_read(*base_snapshot, logical_path, false, FrameType::loader);
+                size_t done = 0;
+                while (done < base_count) {
+                    check_deadline(deadline, *cancelled);
+                    auto n = reader->read(offset + done, {output.data() + done, base_count - done},
+                                          deadline, cancelled);
+                    if (!n)
+                        break;
+                    done += n;
+                }
+                if (done < base_count)
+                    throw FsError(Clock::now() >= deadline ? ETIMEDOUT : EIO,
+                                  "FUSE read source unavailable");
             }
-            size_t done = 0;
-            while (done < base_count) {
-                check_deadline(deadline, cancelled);
-                auto n = reader->read(offset + done, {output.data() + done, base_count - done},
-                                      deadline, &cancelled);
-                if (!n)
-                    break;
-                done += n;
-            }
-            if (done < base_count)
-                throw FsError(Clock::now() >= deadline ? ETIMEDOUT : EIO,
-                              "FUSE read source unavailable");
-        }
 
-        ScopedFd spool;
-        for (const auto& range : overlay) {
-            check_deadline(deadline, cancelled);
-            if (range.zero) {
-                std::fill(output.begin() + static_cast<ptrdiff_t>(range.begin - offset),
-                          output.begin() + static_cast<ptrdiff_t>(range.end - offset), 0);
-                continue;
-            }
-            if (spool.get() < 0) {
-                const int fd = ::open(spool_path.c_str(), O_RDONLY);
-                if (fd < 0)
-                    throw FsError(errno, "cannot open FUSE write spool for read");
-                spool.reset(fd);
-            }
-            const auto n = static_cast<size_t>(range.end - range.begin);
-            if (pread_exact(spool.get(),
-                            {output.data() + static_cast<size_t>(range.begin - offset), n},
-                            range.spool_offset) != n)
-                throw FsError(EIO, "short FUSE spool read");
-        }
-
-        // Kernel demand also becomes a high-priority cache hint, for read-ahead
-        // and retries.
-        if (base_snapshot && !base_snapshot->extents.empty()) {
-            const auto& base = *base_snapshot;
-            size_t first = base.extents.size();
-            size_t last = 0;
-            for (size_t i = 0; i < base.extents.size(); ++i) {
-                const auto& extent = base.extents[i];
-                if (extent.offset + extent.length <= offset)
+            ScopedFd spool;
+            for (const auto& range : overlay) {
+                check_deadline(deadline, *cancelled);
+                if (range.zero) {
+                    std::fill(output.begin() + static_cast<ptrdiff_t>(range.begin - offset),
+                              output.begin() + static_cast<ptrdiff_t>(range.end - offset), 0);
                     continue;
-                if (extent.offset >= offset + count)
-                    break;
-                first = std::min(first, i);
-                last = i;
-            }
-            if (first < base.extents.size()) {
-                std::function<void()> wake;
-                {
-                    Lock hint_lock(state_->hint_mutex);
-                    state_->hint_states[inode_id] = State::HintState{
-                        base, first, last, Clock::now() + state_->config.hint_lifetime};
-                    wake = state_->hint_wake_callback;
                 }
-                if (wake)
-                    wake();
+                if (spool.get() < 0) {
+                    const int fd = ::open(spool_path.c_str(), O_RDONLY);
+                    if (fd < 0)
+                        throw FsError(errno, "cannot open FUSE write spool for read");
+                    spool.reset(fd);
+                }
+                const auto n = static_cast<size_t>(range.end - range.begin);
+                if (pread_exact(spool.get(),
+                                {output.data() + static_cast<size_t>(range.begin - offset), n},
+                                range.spool_offset) != n)
+                    throw FsError(EIO, "short FUSE spool read");
             }
-        }
-        return count;
-    });
+
+            // Kernel demand also becomes a high-priority cache hint, for read-ahead
+            // and retries.
+            if (base_snapshot && !base_snapshot->extents.empty()) {
+                const auto& base = *base_snapshot;
+                size_t first = base.extents.size();
+                size_t last = 0;
+                for (size_t i = 0; i < base.extents.size(); ++i) {
+                    const auto& extent = base.extents[i];
+                    if (extent.offset + extent.length <= offset)
+                        continue;
+                    if (extent.offset >= offset + count)
+                        break;
+                    first = std::min(first, i);
+                    last = i;
+                }
+                if (first < base.extents.size()) {
+                    std::function<void()> wake;
+                    {
+                        Lock hint_lock(state_->hint_mutex);
+                        state_->hint_states[inode_id] = State::HintState{
+                            base, first, last, Clock::now() + state_->config.hint_lifetime};
+                        wake = state_->hint_wake_callback;
+                    }
+                    if (wake)
+                        wake();
+                }
+            }
+            return count;
+        });
 }
 
 size_t FuseFrontend::read(uint64_t inode_id, uint64_t offset, std::span<uint8_t> output) {

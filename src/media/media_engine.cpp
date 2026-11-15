@@ -181,7 +181,8 @@ struct InputIoState {
     std::string media_id;
     MediaReadPurpose purpose{MediaReadPurpose::playback};
     uint64_t offset{};
-    std::atomic_bool* cancelled{};
+    // Co-owned: a read the store still holds may check it after this state goes.
+    std::shared_ptr<std::atomic_bool> cancelled;
     Clock::time_point deadline{};
     // libav flattens read failures into EIO; keep the first underlying failure so
     // the caller can tell unreachable extents from bytes that are not media.
@@ -300,8 +301,9 @@ class InputContext {
     }
 
   public:
-    InputContext(const MediaSource& source, MediaReadPurpose purpose, std::atomic_bool* cancelled,
-                 uint64_t probe_bytes = 0, std::chrono::milliseconds analyze = {},
+    InputContext(const MediaSource& source, MediaReadPurpose purpose,
+                 std::shared_ptr<std::atomic_bool> cancelled, uint64_t probe_bytes = 0,
+                 std::chrono::milliseconds analyze = {},
                  std::chrono::milliseconds wall_timeout = {},
                  MediaStartProgress* progress = nullptr) {
         try {
@@ -320,7 +322,7 @@ class InputContext {
                                  "media source reader could not be opened");
             state_.media_id = source.media_id;
             state_.purpose = purpose;
-            state_.cancelled = cancelled;
+            state_.cancelled = std::move(cancelled);
             state_.progress = progress;
             if (wall_timeout.count() > 0)
                 state_.deadline = Clock::now() + wall_timeout;
@@ -1343,8 +1345,9 @@ void flush_encoder(StreamPipeline& pipe, AVFormatContext* output, AVPacket* pack
 
 void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                   std::chrono::milliseconds segment_duration,
-                  std::shared_ptr<MediaSegmentStore> store, std::atomic_bool& cancelled,
-                  uint64_t probe_bytes, std::chrono::milliseconds analyze_duration,
+                  std::shared_ptr<MediaSegmentStore> store,
+                  const std::shared_ptr<std::atomic_bool>& cancelled, uint64_t probe_bytes,
+                  std::chrono::milliseconds analyze_duration,
                   std::chrono::milliseconds startup_timeout, size_t video_decoder_threads,
                   size_t video_encoder_threads, MediaStartProgress& progress) {
     const auto& plan = vod_plan.playback;
@@ -1354,8 +1357,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
     // This context repeats some container inspection because it owns the
     // decoder/muxer state. Bound it so stopping a failed generation never joins a
     // worker blocked in stream discovery.
-    InputContext input(source, MediaReadPurpose::playback, &cancelled, probe_bytes,
-                       analyze_duration, startup_timeout, &progress);
+    InputContext input(source, MediaReadPurpose::playback, cancelled, probe_bytes, analyze_duration,
+                       startup_timeout, &progress);
     auto* in = input.get();
     const auto stream_info_started = Clock::now();
     auto stream_info_rc = avformat_find_stream_info(in, nullptr);
@@ -1366,7 +1369,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         throw MediaError(MediaFailure::timed_out,
                          "playback pipeline timed out while reading stream information");
     av_require(stream_info_rc, "read stream information");
-    if (cancelled.load())
+    if (cancelled->load())
         throw std::runtime_error("stream cancelled");
     // The deadline guards startup only; playback reads use the cancellation path.
     input.clear_deadline();
@@ -1500,7 +1503,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         };
 
         try {
-            while (!cancelled.load() && (rc = av_read_frame(in, packet.get())) >= 0) {
+            while (!cancelled->load() && (rc = av_read_frame(in, packet.get())) >= 0) {
                 auto it = by_input.find(packet->stream_index);
                 if (it == by_input.end()) {
                     av_packet_unref(packet.get());
@@ -1598,10 +1601,10 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                 }
                 av_packet_unref(packet.get());
             }
-            if (rc < 0 && rc != AVERROR_EOF && !cancelled.load())
+            if (rc < 0 && rc != AVERROR_EOF && !cancelled->load())
                 av_require(rc, "read media packet");
 
-            if (!cancelled.load()) {
+            if (!cancelled->load()) {
                 for (const auto& pipe : pipelines) {
                     if (pipe->transform != MediaTransform::copy ||
                         !pipe->copy_timestamps.repair_count())
@@ -1644,7 +1647,8 @@ class LibavSession final : public MediaEngineSession {
     size_t video_encoder_threads_{};
     std::shared_ptr<MediaSegmentStore> store_;
     std::jthread worker_;
-    std::atomic_bool cancelled_{};
+    // Co-owned with the reads the store holds for this pipeline.
+    std::shared_ptr<std::atomic_bool> cancelled_ = std::make_shared<std::atomic_bool>(false);
     std::atomic_bool running_{true};
     std::atomic_int exit_code_{-1};
     mutable Mutex diagnostics_mutex_;
@@ -1654,11 +1658,11 @@ class LibavSession final : public MediaEngineSession {
     void run(const std::stop_token& stop) {
         try {
             if (stop.stop_requested())
-                cancelled_.store(true);
+                cancelled_->store(true);
             run_pipeline(source_, vod_plan_, segment_duration_, store_, cancelled_, probe_bytes_,
                          analyze_duration_, startup_timeout_, video_decoder_threads_,
                          video_encoder_threads_, progress_);
-            if (cancelled_.load()) {
+            if (cancelled_->load()) {
                 exit_code_.store(0);
             } else {
                 store_->finish();
@@ -1672,7 +1676,7 @@ class LibavSession final : public MediaEngineSession {
                 }
             }
         } catch (const std::exception& e) {
-            if (!cancelled_.load()) {
+            if (!cancelled_->load()) {
                 {
                     Lock lock(diagnostics_mutex_);
                     diagnostics_ = e.what();
@@ -1732,7 +1736,7 @@ class LibavSession final : public MediaEngineSession {
         store_->note_requested(index);
     }
     void stop() override {
-        cancelled_.store(true);
+        cancelled_->store(true);
         store_->cancel();
         if (worker_.joinable()) {
             worker_.request_stop();
@@ -1766,8 +1770,8 @@ class LibavMediaEngine final : public MediaEngine {
             timeout = config_.probe_timeout;
         Log::debug("playback probe begin media=" + source.media_id +
                    " size=" + std::to_string(source.size));
-        InputContext input(source, MediaReadPurpose::probe, source.cancelled.get(),
-                           config_.probe_bytes, config_.probe_analyze_duration, timeout);
+        InputContext input(source, MediaReadPurpose::probe, source.cancelled, config_.probe_bytes,
+                           config_.probe_analyze_duration, timeout);
         auto* format = input.get();
         auto probe_rc = avformat_find_stream_info(format, nullptr);
         if (probe_rc < 0) {
@@ -1845,8 +1849,8 @@ class LibavMediaEngine final : public MediaEngine {
                                                      std::chrono::milliseconds timeout) override {
         if (timeout.count() <= 0)
             timeout = config_.probe_timeout;
-        InputContext input(source, MediaReadPurpose::probe, source.cancelled.get(),
-                           config_.probe_bytes, config_.probe_analyze_duration, timeout);
+        InputContext input(source, MediaReadPurpose::probe, source.cancelled, config_.probe_bytes,
+                           config_.probe_analyze_duration, timeout);
         auto* format = input.get();
         const auto rc = avformat_find_stream_info(format, nullptr);
         if (rc < 0) {
@@ -1932,8 +1936,8 @@ class LibavMediaEngine final : public MediaEngine {
         const double requested_seek = requested_ms / 1000.0;
         result.playback.seek_requested = std::chrono::milliseconds(requested_ms);
 
-        InputContext input(source, MediaReadPurpose::probe, source.cancelled.get(),
-                           config_.probe_bytes, config_.probe_analyze_duration, timeout);
+        InputContext input(source, MediaReadPurpose::probe, source.cancelled, config_.probe_bytes,
+                           config_.probe_analyze_duration, timeout);
         auto* format = input.get();
         auto rc = avformat_find_stream_info(format, nullptr);
         if (rc < 0 && input.timed_out())
@@ -2070,8 +2074,8 @@ class LibavMediaEngine final : public MediaEngine {
         if (range_end <= range_start)
             throw std::invalid_argument("subtitle segment range must be non-empty");
 
-        std::atomic_bool cancelled{};
-        InputContext input(source, MediaReadPurpose::subtitle, &cancelled, config_.probe_bytes,
+        auto cancelled = std::make_shared<std::atomic_bool>(false);
+        InputContext input(source, MediaReadPurpose::subtitle, cancelled, config_.probe_bytes,
                            config_.probe_analyze_duration, config_.probe_timeout);
         auto* format = input.get();
 

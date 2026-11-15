@@ -269,7 +269,7 @@ class MemoryInput final : public MediaInput {
         return bytes_.size();
     }
     size_t read(uint64_t offset, std::span<uint8_t> destination, Clock::time_point,
-                std::atomic_bool*) override {
+                std::shared_ptr<std::atomic_bool>) override {
         if (offset >= bytes_.size())
             return 0;
         const auto available = static_cast<size_t>(bytes_.size() - offset);

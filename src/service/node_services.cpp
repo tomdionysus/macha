@@ -52,7 +52,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       catalogue_(node_, local_, metadata_server_, store_, metadata_, ledger_),
       catalogue_installer_(catalogue_, resources_.events),
       filesystem_(node_.config(), node_.node_id(), node_.membership(), local_, metadata_server_,
-                  store_, metadata_, resources_.memory, &playback_),
+                  store_, context_, metadata_, resources_.memory, &playback_),
       catalogue_hints_(node_.config().state_path), media_engine_(media_engine_for(node_.config())),
       media_information_(filesystem_, catalogue_, media_engine_, node_.config().state_path),
       scanner_(node_, metadata_server_, filesystem_, catalogue_, catalogue_hints_,

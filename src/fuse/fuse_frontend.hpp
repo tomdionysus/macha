@@ -556,10 +556,19 @@ class FuseFrontend final : public HydrationHintProvider {
     size_t read_impl(uint64_t inode, const std::shared_ptr<FuseReadSession>&, uint64_t offset,
                      std::span<uint8_t>);
 
+    // What dispatch passes an operation for its cancellation: the request's shared flag
+    // when the operation takes it co-owned (it hands it to the store), else a reference.
     template <class Fn>
-    auto dispatch(FuseOperationClass operation, Fn&& fn)
-        -> std::invoke_result_t<Fn, Clock::time_point, std::atomic_bool&> {
-        using Result = std::invoke_result_t<Fn, Clock::time_point, std::atomic_bool&>;
+    static constexpr bool TakesToken =
+        std::is_invocable_v<Fn, Clock::time_point, const std::shared_ptr<std::atomic_bool>&>;
+    template <class Fn>
+    using DispatchResult = typename std::conditional_t<
+        TakesToken<Fn>,
+        std::invoke_result<Fn, Clock::time_point, const std::shared_ptr<std::atomic_bool>&>,
+        std::invoke_result<Fn, Clock::time_point, std::atomic_bool&>>::type;
+
+    template <class Fn> auto dispatch(FuseOperationClass operation, Fn&& fn) -> DispatchResult<Fn> {
+        using Result = DispatchResult<Fn>;
         const auto timeout = std::min(timeout_for(operation), absolute_timeout());
         const auto deadline = Clock::now() + timeout;
         const bool complete_once_started =
@@ -599,12 +608,20 @@ class FuseFrontend final : public HydrationHintProvider {
             try {
                 const auto effective_deadline =
                     complete_once_started ? Clock::time_point::max() : task_deadline;
+                // An operation that hands the request's cancellation to the store takes it
+                // co-owned: the broker's flag is this same shared one.
+                const auto run = [&]() -> decltype(auto) {
+                    if constexpr (TakesToken<Fn>)
+                        return fn(effective_deadline, cancelled);
+                    else
+                        return fn(effective_deadline, task_cancelled);
+                };
                 if constexpr (std::is_void_v<Result>) {
-                    fn(effective_deadline, task_cancelled);
+                    run();
                     request_state->store(FuseRequestState::complete, std::memory_order_release);
                     promise->set_value();
                 } else {
-                    auto result = fn(effective_deadline, task_cancelled);
+                    auto result = run();
                     request_state->store(FuseRequestState::complete, std::memory_order_release);
                     promise->set_value(std::move(result));
                 }

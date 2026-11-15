@@ -81,9 +81,9 @@ uint64_t fd_size(int fd) {
 }
 
 } // namespace
-ReadHandle::ReadHandle(DistributedStore& s, FsEntry e, PlaybackTracker* playback, std::string path,
+ReadHandle::ReadHandle(dagda::Context& c, FsEntry e, PlaybackTracker* playback, std::string path,
                        FrameType frame_type)
-    : s_(s), e_(std::move(e)), playback_(playback), frame_type_(frame_type) {
+    : c_(c), e_(std::move(e)), playback_(playback), frame_type_(frame_type) {
     if (playback_)
         playback_session_ = playback_->open(std::move(path), e_);
     if (Log::enabled(LogLevel::all))
@@ -113,7 +113,8 @@ void ReadHandle::promote(FrameType requested) noexcept {
     }
 }
 
-const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline, std::atomic_bool* cancelled) {
+const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
+                                const std::shared_ptr<std::atomic_bool>& cancelled) {
     if (cached_index_ == i) {
         if (Log::enabled(LogLevel::all))
             Log::trace("DIAG read-extent cache-hit ptr=" +
@@ -128,16 +129,31 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline, std::atomi
     cached_extent_.reset();
     cached_index_ = static_cast<size_t>(-1);
     auto started = Clock::now();
-    auto data =
-        s_.get_shared(x.id, i, frame_type_.load(std::memory_order_relaxed), deadline, cancelled);
-    if (!data) {
-        if (cancelled && cancelled->load())
-            fail(ECANCELED, "extent read cancelled");
-        if (deadline != Clock::time_point{} && Clock::now() >= deadline)
+    dagda::store::ReadOptions options;
+    options.frame = frame_type_.load(std::memory_order_relaxed);
+    options.stripe = i;
+    options.cancelled = cancelled;
+    if (deadline != Clock::time_point{}) {
+        if (started >= deadline)
             fail(ETIMEDOUT, "extent read timed out");
+        options.deadline =
+            std::max(std::chrono::milliseconds(1),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(deadline - started));
+    }
+    auto result = c_.objects().read(x.id, options);
+    switch (result.end) {
+    case dagda::store::ReadEnd::served:
+        break;
+    case dagda::store::ReadEnd::cancelled:
+        fail(ECANCELED, "extent read cancelled");
+    case dagda::store::ReadEnd::timed_out:
+        fail(ETIMEDOUT, "extent read timed out");
+    case dagda::store::ReadEnd::not_found:
+    case dagda::store::ReadEnd::unavailable:
         fail(EIO, "extent unavailable");
     }
-    if (data->bytes.size() != x.length)
+    auto data = std::move(result.object);
+    if (!data || data->bytes.size() != x.length)
         fail(EIO, "extent corrupt");
 
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
@@ -154,7 +170,7 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline, std::atomi
 }
 
 size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point deadline,
-                        std::atomic_bool* cancelled) {
+                        std::shared_ptr<std::atomic_bool> cancelled) {
     Lock g(m_);
     if (off >= e_.size || out.empty())
         return 0;
@@ -184,12 +200,9 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point 
     last_ = off + done;
     if (done) {
         const auto frame_type = frame_type_.load(std::memory_order_relaxed);
-        if (frame_type == FrameType::foreground)
-            s_.foreground_activity(done);
-        else if (frame_type == FrameType::read_ahead)
-            s_.interactive_activity(done);
-        else if (frame_type == FrameType::loader)
-            s_.loader_activity(done);
+        if (frame_type == FrameType::foreground || frame_type == FrameType::read_ahead ||
+            frame_type == FrameType::loader)
+            c_.activity().note(frame_type, done);
     }
     if (seq && done && playback_ && playback_session_ && last_extent != static_cast<size_t>(-1))
         playback_->progress(playback_session_, last_extent);
@@ -378,9 +391,9 @@ std::chrono::milliseconds WriteHandle::flush() {
     try {
         if (durability_ == WriteDurability::publication_generation)
             id = fs_.store().put_deferred(buffer_, durability_batch_, work_context_.frame_type(),
-                                          &fs_.io_cancelled_, &work_context_);
+                                          fs_.io_cancelled_.get(), &work_context_);
         else
-            id = fs_.store().put(buffer_, work_context_.frame_type(), &fs_.io_cancelled_);
+            id = fs_.store().put(buffer_, work_context_.frame_type(), fs_.io_cancelled_.get());
     } catch (...) {
         if (fs_.io_cancellation_requested())
             fail(EINTR, "write cancelled");
@@ -412,7 +425,7 @@ std::chrono::milliseconds WriteHandle::flush() {
 
 void WriteHandle::launch_pending_extent(PendingExtent& pending) {
     auto* store = &fs_.store();
-    auto* cancelled = &fs_.io_cancelled_;
+    auto* cancelled = fs_.io_cancelled_.get();
     const auto cache_put = pending.cache_put;
     const auto offset = pending.offset;
     const auto bytes = pending.payload;
@@ -488,7 +501,7 @@ void WriteHandle::prepare_append_tail() {
         bytes.assign(static_cast<size_t>(tail.length), 0);
     } else {
         auto data = fs_.store().get(tail.id, static_cast<size_t>(tail.offset / fs_.extent_size()),
-                                    work_context_.frame_type(), {}, &fs_.io_cancelled_);
+                                    work_context_.frame_type(), {}, fs_.io_cancelled_.get());
         if (!data) {
             if (fs_.io_cancellation_requested())
                 fail(EINTR, "write cancelled");
@@ -639,8 +652,9 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
                 Bytes zeros(static_cast<size_t>(extent.length), 0);
                 stage_temp(zeros, extent.offset);
             } else {
-                auto bytes = fs_.store().get(extent.id, materialize_extent_index_,
-                                             work_context_.frame_type(), {}, &fs_.io_cancelled_);
+                auto bytes =
+                    fs_.store().get(extent.id, materialize_extent_index_,
+                                    work_context_.frame_type(), {}, fs_.io_cancelled_.get());
                 ++materialize_source_reads_;
                 if (!bytes || bytes->size() != extent.length) {
                     if (fs_.io_cancellation_requested())
@@ -670,10 +684,10 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
 
         const auto n = static_cast<size_t>(std::min<uint64_t>(
             {fs_.extent_size(), source_size - materialize_offset_, remaining_budget}));
-        ReadHandle reader(fs_.store(), base_, nullptr, {}, work_context_.frame_type());
+        ReadHandle reader(fs_.context(), base_, nullptr, {}, work_context_.frame_type());
         Bytes bytes(n);
         ++materialize_source_reads_;
-        if (reader.read(materialize_offset_, bytes, {}, &fs_.io_cancelled_) != n) {
+        if (reader.read(materialize_offset_, bytes, {}, fs_.io_cancelled_) != n) {
             if (fs_.io_cancellation_requested())
                 fail(EINTR, "write cancelled");
             fail(EIO, "short source read");
@@ -1035,9 +1049,9 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
                     const auto copy =
                         static_cast<size_t>(std::min<uint64_t>(n, source_extent->length));
                     if (!source_extent->hole) {
-                        auto source =
-                            fs_.store().get(source_extent->id, rebuild_index_,
-                                            work_context_.frame_type(), {}, &fs_.io_cancelled_);
+                        auto source = fs_.store().get(source_extent->id, rebuild_index_,
+                                                      work_context_.frame_type(), {},
+                                                      fs_.io_cancelled_.get());
                         if (!source || source->size() != source_extent->length ||
                             source->size() < copy)
                             fail(EIO, "cannot read changed source extent");
@@ -1081,8 +1095,9 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
             const bool ok =
                 durability_ == WriteDurability::publication_generation
                     ? fs_.store().put_deferred(id, data, durability_batch_,
-                                               work_context_.frame_type(), &fs_.io_cancelled_)
-                    : fs_.store().put(id, data, work_context_.frame_type(), &fs_.io_cancelled_);
+                                               work_context_.frame_type(), fs_.io_cancelled_.get())
+                    : fs_.store().put(id, data, work_context_.frame_type(),
+                                      fs_.io_cancelled_.get());
             elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
             if (!ok) {
                 if (fs_.io_cancellation_requested())
@@ -1213,7 +1228,8 @@ void WriteHandle::commit() {
                 std::erase_if(durability_batch_.requirements,
                               [&](const auto& requirement) { return requirement.id == id; });
                 if (!fs_.store().put_deferred(id, *data, durability_batch_,
-                                              work_context_.frame_type(), &fs_.io_cancelled_)) {
+                                              work_context_.frame_type(),
+                                              fs_.io_cancelled_.get())) {
                     reput_all = false;
                     break;
                 }
@@ -1363,11 +1379,11 @@ FileSystem::remove_abandoned_write_files(const std::filesystem::path& state_path
 
 FileSystem::FileSystem(const Config& config, NodeId node_id, const Membership& membership,
                        LocalState& local, MetadataServer& metadata_server, DistributedStore& s,
-                       MetadataView& m, RetainedMemoryLedger& retained_memory,
-                       PlaybackTracker* playback)
+                       dagda::Context& context, MetadataView& m,
+                       RetainedMemoryLedger& retained_memory, PlaybackTracker* playback)
     : config_(config), node_id_(node_id), membership_(membership), local_(local),
-      metadata_server_(metadata_server), retained_memory_(retained_memory), s_(s), m_(m),
-      playback_(playback) {
+      metadata_server_(metadata_server), retained_memory_(retained_memory), s_(s),
+      context_(context), m_(m), playback_(playback) {
     const auto [files, bytes] = remove_abandoned_write_files(config_.state_path, node_id_);
     if (files)
         Log::info("filesystem removed abandoned write files files=" + std::to_string(files) +
@@ -2194,7 +2210,7 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry,
                                                   bool track_playback, FrameType frame_type) {
     if (entry.type != EntryType::file)
         fail(EISDIR, "directory");
-    return std::make_shared<ReadHandle>(s_, entry, track_playback ? playback_ : nullptr,
+    return std::make_shared<ReadHandle>(context_, entry, track_playback ? playback_ : nullptr,
                                         normalize_path(logical_path), frame_type);
 }
 uint64_t FileSystem::reachability_epoch() const noexcept {
