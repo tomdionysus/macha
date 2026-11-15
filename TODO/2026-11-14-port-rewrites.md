@@ -28,11 +28,13 @@ not shims.
 `initialise_services`, `Node::stop()` after `services_->stop()`; `03e10a9` one state lock and one identity: Macha's
 `Service::state_lock_` is gone (the Dannan node takes `state_path`'s lock as its first member, `node.cpp:440-444` at
 0.7.0; Dagda's `.macha.lock` follows in `open_store()`), `NodeRuntime` takes `ClusterKeys` and builds `NodeIdentity`
-from the Dannan node's id and epoch, `TranscodeRateBook` opens after the lock. Each compiles on build-3 with
-`build/pi/macha_port_compile.sh`; nothing runs while `LocalState` still opens Macha's store. **Next in R1:** readiness
-from Dannan's planes (Macha keeps `metadata`), one `StartupProgress`, Dannan's events, `NodeResources` dropping
-`data` and `activity` for Dagda's, HTTP presence into `Context::activity()`, `SubsystemContext` carrying the
-Context; then R2. The path-built `NodeIdentity` constructor and `StoreBench` go in R7.
+from the Dannan node's id and epoch, `TranscodeRateBook` opens after the lock; `cd2c278` the store's readiness planes are the store node's (Macha declares
+only `metadata`; `readiness()` reads the four from the node); `88d3d07` HTTP notes viewer presence on
+`Context::activity()` (and Macha's own clock while its store remains), `NodeServices` takes `dagda::Context&` and
+passes it as `SubsystemContext::store`, `BareNode` builds and opens its store node as `Service` does. Each compiles on build-3 with
+`build/pi/macha_port_compile.sh`; nothing runs while `LocalState` still opens Macha's store. **Rest of R1, landing with R2 to R6** (they matter only once the consumers leave Macha's): one `StartupProgress`,
+Dannan's events for `NodeEvents`, `NodeResources` dropping `data` and `activity` for Dagda's. **Next: R2**, the
+filesystem and FUSE onto Context (`NodeServices::context_` is there to pass). The path-built `NodeIdentity` constructor and `StoreBench` go in R7.
 
 - `LocalState` goes. `Service` builds `dagda::Node(context, options, OpenLater)` after `NodeRuntime` and before
   `node_.start()` (registrations before the Dannan node starts); `open_store()` on the startup thread; `Node::stop()`
