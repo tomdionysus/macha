@@ -15,6 +15,12 @@ Dagda, then the harness and the migration rehearsal. Deps: Dannan 0.7.0 and Dagd
 `/home/maintainer/deps/prefix-0.7.0` and `prefix-dagda-2f7eba6` (`build/pi/deps_070.sh`); the cutover pins Dannan 0.8.0
 (the `dannan-custody` tool lands there) and Dagda's tag once it builds on 0.8.0.
 
+**Owner surface (operator, 2026-11-15, relayed by Dagda):** Macha's composition root, which opens and owns the
+node, keeps `dagda::Node`'s owner surface: `open` / `OpenLater` and `open_store`, `stop`, `reconfigure`, and the
+maintenance steps Macha's interim loop drives until 8c. Every call Macha's other code makes goes through
+`dagda::Context`. The retirement batch codec (`dagda::heads`) and `lease::ClaimedCollection` stay library helpers,
+not shims.
+
 ## R1. The root (composition and lifecycle) [root section rewrites 1-5, 13, 14; metadata 1]
 
 **Progress:** `f975a47` pins Dannan 0.7.0 and Dagda 0.2.0 (the tree compiled unchanged); `05ca9a6` the root builds
