@@ -5,6 +5,8 @@
 
 #include "cluster/node_identity.hpp"
 #include "config.hpp"
+#include "metadata/metadata.hpp"
+#include "metadata/metadata_seed.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -114,9 +116,11 @@ class LocalState {
     // `durability_batch_window` is how long a DATA commit that asks for
     // durability waits so that others share its physical sync: latency for
     // fewer syncs.
-    LocalState(const Config&, const NodeIdentity&, ClusterNode&, RecoveryProgress&,
-               const StageHook&, std::stop_token,
-               std::chrono::milliseconds durability_batch_window);
+    // `apply_namespace`: how metadata replay brings a namespace tree to a
+    // delta, writing its nodes where the owner keeps them.
+    LocalState(const Config&, const NodeIdentity&, ClusterNode&,
+               NamespaceDeltaApplier apply_namespace, RecoveryProgress&, const StageHook&,
+               std::stop_token, std::chrono::milliseconds durability_batch_window);
     ~LocalState();
     LocalState(const LocalState&) = delete;
     LocalState& operator=(const LocalState&) = delete;
@@ -139,6 +143,9 @@ class LocalState {
     ReferenceCounts& references() noexcept {
         return *references_;
     }
+    MetadataSeed& seed() noexcept {
+        return *seed_;
+    }
     MetadataReplica& replica() noexcept {
         return *replica_;
     }
@@ -149,8 +156,9 @@ class LocalState {
   private:
     void recover_data(const Config&, const NodeIdentity&, RecoveryProgress&, const StageHook&,
                       const std::stop_token&, std::chrono::milliseconds durability_batch_window);
-    void recover_state(const Config&, const NodeIdentity&, ClusterNode&, RecoveryProgress&,
-                       const StageHook&, const std::stop_token&);
+    void recover_state(const Config&, const NodeIdentity&, ClusterNode&,
+                       NamespaceDeltaApplier apply_namespace, RecoveryProgress&, const StageHook&,
+                       const std::stop_token&);
 
     // The replica is declared after the cache it reads, so destroyed first.
     std::unique_ptr<StoragePool> data_;
@@ -159,6 +167,7 @@ class LocalState {
     std::unique_ptr<PersistentBlockCache> cache_;
     std::unique_ptr<RetentionStore> retention_;
     std::unique_ptr<ReferenceCounts> references_;
+    std::unique_ptr<MetadataSeed> seed_;
     std::unique_ptr<MetadataReplica> replica_;
 };
 

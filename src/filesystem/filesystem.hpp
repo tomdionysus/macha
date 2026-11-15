@@ -647,7 +647,7 @@ class FileSystem final : public PublicationTarget {
     // Read-only view of the namespace tree nodes. Cheap, so made per call
     // rather than cached, which also prevents writing through it.
     ControlNamespaceNodeStore namespace_nodes() {
-        return ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+        return ControlNamespaceNodeStore::for_reading(context_);
     }
     void note_interactive_activity(uint64_t bytes = 0) {
         context_.activity().note(FrameType::read_ahead, bytes);

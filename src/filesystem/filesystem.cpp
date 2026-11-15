@@ -3,6 +3,7 @@
 #include "contract/stopping.hpp"
 #include "errno_text.hpp"
 
+#include "cluster/call_deadline.hpp"
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "filesystem/hydration.hpp"
@@ -419,7 +420,11 @@ std::chrono::milliseconds WriteHandle::flush() {
 dagda::Ticket FileSystem::put_extent(const ObjectId& id, std::span<const uint8_t> bytes,
                                      bool deferred, FrameType frame,
                                      const DataWorkContext* budget) {
+    // Macha's floor: one copy on disk, this node's when it can take it, the
+    // rest owed to prompt replication; a publication's barrier then makes it
+    // durable where it landed.
     dagda::store::WriteOptions options;
+    options.level = dagda::store::Durability::persisted;
     options.deferred = deferred;
     options.frame = frame;
     options.cancelled = io_cancelled_;
@@ -437,9 +442,9 @@ dagda::Ticket FileSystem::put_extent(const ObjectId& id, std::span<const uint8_t
 
 WriteHandle::DurabilityOutcome
 WriteHandle::await_durability(const std::vector<Durability>& extents) {
-    // The work's deadline when it has one, else the bound a store call has
-    // always had (object_transfer, 30 min).
-    auto deadline = std::chrono::milliseconds(std::chrono::minutes(30));
+    // The work's deadline when it has one, else the bound an object transfer
+    // has always had.
+    auto deadline = call_deadline::object_transfer;
     if (work_context_.deadline() != Clock::time_point{})
         deadline = std::max(std::chrono::milliseconds(1),
                             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1555,14 +1560,14 @@ FileSystem::ResolvedPath FileSystem::resolve_in(const MetadataSnapshot& snapshot
 
 std::optional<std::string> FileSystem::resolve_existing_path(const std::string& p) {
     const auto view = m_.local();
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     return resolve_in(*view.snapshot, nodes, normalize_path(p)).path;
 }
 
 std::string FileSystem::resolve_new_path(const std::string& p) {
     auto q = normalize_path(p);
     const auto view = m_.local();
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     const auto existing = resolve_in(*view.snapshot, nodes, q);
     if (existing.path)
         return *existing.path;
@@ -1590,7 +1595,7 @@ void FileSystem::require_parent(const NamespaceWorkingSet& working, const std::s
 }
 FsEntry FileSystem::getattr(const std::string& p) {
     const auto view = m_.local();
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     const auto resolved = resolve_in(*view.snapshot, nodes, normalize_path(p)).path;
     if (!resolved)
         fail(ENOENT, "not found");
@@ -1603,7 +1608,7 @@ FsEntry FileSystem::getattr(const std::string& p) {
 }
 std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::string& p) {
     const auto view = m_.local();
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     const auto resolved = resolve_in(*view.snapshot, nodes, normalize_path(p)).path;
     if (!resolved)
         fail(ENOENT, "not found");
@@ -1828,7 +1833,7 @@ FileSystem::apply_namespace_batch(std::span<const FilesystemNamespaceMutation> o
         QueuedNamespaceBatch alone{operations, atomic, {}, {}, false};
         alone.result.record = m_.mutate_delta(
             [&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-                auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+                auto nodes = ControlNamespaceNodeStore::for_reading(context_);
                 NamespaceWorkingSet working(snapshot, delta, &nodes);
                 apply_namespace_batch_to(alone, working, snapshot, delta);
                 std::sort(delta.erase_entries.begin(), delta.erase_entries.end());
@@ -1871,8 +1876,7 @@ FileSystem::apply_namespace_batch(std::span<const FilesystemNamespaceMutation> o
                 try {
                     const auto record =
                         m_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-                            auto nodes =
-                                ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+                            auto nodes = ControlNamespaceNodeStore::for_reading(context_);
                             NamespaceWorkingSet working(snapshot, delta, &nodes);
                             size_t committed = 0;
                             for (auto* batch : group) {
@@ -2080,7 +2084,7 @@ std::string file_media_id(const FsEntry& entry) {
 // built from and the tree now, so the cost is the change. The whole namespace
 // is walked the first time and for a namespace that is not a tree.
 void FileSystem::refresh_media_index(const MetadataSnapshotView& view) {
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     const auto& root = view.snapshot->namespace_root;
     const bool current =
         media_index_valid_ &&
@@ -2178,7 +2182,7 @@ std::optional<FsEntry> FileSystem::media_stat(std::string_view id, std::string_v
     if (found == media_index_.end() ||
         std::find(found->second.begin(), found->second.end(), path) == found->second.end())
         return {};
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     auto entry = namespace_entry(*media_index_snapshot_, &nodes, path, false);
     if (!entry || entry->type != EntryType::file)
         return {};
@@ -2211,7 +2215,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
     const auto view = m_.local();
     Lock lock(media_index_mutex_);
     refresh_media_index(view);
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
 
     const auto found = media_index_.find(std::string(id));
     if (found == media_index_.end())
@@ -2364,7 +2368,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
     auto q = normalize_path(p);
     FsEntry committed;
     m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
-        auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+        auto nodes = ControlNamespaceNodeStore::for_reading(context_);
         NamespaceWorkingSet working(s, delta, &nodes);
         // With extents: compared against the basis, and dropped ones retired.
         auto entry = working.get(q);
@@ -2483,7 +2487,7 @@ void FileSystem::census_walk(const MetadataSnapshot& snapshot, const std::functi
     std::vector<ObjectId> extents;
     std::vector<ObjectId> tree_nodes;
     ReferenceCounts::Totals totals;
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     for_each_namespace_entry(
         snapshot, &nodes,
         [&](const std::string&, const FsEntry& entry) {
@@ -2502,7 +2506,7 @@ void FileSystem::census_walk(const MetadataSnapshot& snapshot, const std::functi
 
 bool FileSystem::census_follow(const ObjectId& root, const std::function<void()>& pause) {
     auto& counts = local_.references();
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     std::vector<ObjectId> extents_in, extents_out, nodes_in, nodes_out;
     diff_namespace_tree_nodes(*counts.root(), root, nodes, nodes_in, nodes_out);
     auto totals = counts.totals();
@@ -2583,7 +2587,7 @@ MaintenanceObjects FileSystem::maintenance_objects_from(const MetadataSnapshotVi
     // Tombstones keep retired_at_ns: maintenance combines filesystem and
     // catalogue liveness before collecting, and it makes pruning ABA-safe.
     // A batch that cannot be read leaves its objects to the sighting grace.
-    auto batches = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto batches = ControlNamespaceNodeStore::for_reading(context_);
     size_t unreadable = 0;
     built.garbage =
         tombstones_of(snapshot, [&](const ObjectId& id) { return batches.get(id); }, &unreadable);
@@ -2635,7 +2639,7 @@ FileSystem::namespace_references(const MetadataSnapshot& snapshot) {
 NamespaceListing FileSystem::walk_namespace_references() {
     const auto view = m_.converged();
     NamespaceListing listing;
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     for_each_namespace_entry(
         *view.snapshot, &nodes,
         [&](const std::string&, const FsEntry& entry) {

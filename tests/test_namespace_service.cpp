@@ -898,8 +898,7 @@ MACHA_TEST("namespace_service", test_a_merge_claims_what_it_introduces) {
     const auto base = replica.committed();
     const auto base_snapshot = decode_snapshot(base.payload);
     REQUIRE(base_snapshot.namespace_root.has_value());
-    auto nodes = ControlNamespaceNodeStore::for_commit(service.local_state().control(),
-                                                       service.filesystem().store());
+    auto nodes = ControlNamespaceNodeStore::for_commit(service.store_context());
     const auto make_branch = [&](const std::string& directory, const FsEntry& disputed) {
         // Each branch is another author's one mutation, stamped as a commit
         // stamps what it writes.

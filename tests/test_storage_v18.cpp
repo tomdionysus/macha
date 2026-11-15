@@ -691,7 +691,6 @@ class StorageClusterNode {
     const ClusterKeys& keys_;
     std::unique_ptr<BareNode> node_;
     std::unique_ptr<DistributedStore> store_;
-    std::unique_ptr<DistributedStore> metadata_store_;
     std::unique_ptr<MetadataManager> metadata_;
     std::unique_ptr<CatalogueManager> catalogue_;
     bool started_{};
@@ -727,9 +726,8 @@ class StorageClusterNode {
         store_ = std::make_unique<DistributedStore>(
             *node_, node_->local_state(), node_->resources.activity, node_->resources.data,
             node_->resources.memory, node_->resources.events);
-        metadata_store_ = macha::test_support::distributed_store_for(*node_);
-        metadata_ = std::make_unique<MetadataManager>(*node_, node_->local_state(),
-                                                      node_->metadata_server(), *metadata_store_);
+        metadata_ = std::make_unique<MetadataManager>(
+            *node_, node_->local_state(), node_->metadata_server(), node_->store_context());
         catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->local_state(),
                                                         node_->metadata_server(), *store_,
                                                         *metadata_, node_->ledger());
@@ -1498,8 +1496,7 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
     // restores them, not the catalogue's.
     std::vector<ObjectId> tree;
     {
-        const auto reader =
-            ControlNamespaceNodeStore::for_reading(a.node().control_store(), a.store());
+        const auto reader = ControlNamespaceNodeStore::for_reading(a.node().store_context());
         for_each_namespace_entry(
             a.metadata().snapshot(), &reader, [](const std::string&, const FsEntry&) {}, tree);
     }

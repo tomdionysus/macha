@@ -20,10 +20,12 @@
 #include <string>
 #include <vector>
 
+namespace dagda {
+class Context;
+}
+
 namespace macha {
 
-class DistributedStore;
-class LocalState;
 class NodeRuntime;
 
 // What is known of one path's extents. A directory sums what is beneath it.
@@ -82,8 +84,8 @@ AvailabilitySnapshot decode_availability_paths(std::span<const uint8_t>);
 // the root.
 class AvailabilityService {
   public:
-    AvailabilityService(NodeRuntime&, LocalState&, DistributedStore&, const ObjectLedger&,
-                        const NodeEvents&, MessageRoutes&, std::filesystem::path persisted);
+    AvailabilityService(NodeRuntime&, dagda::Context&, const ObjectLedger&, const NodeEvents&,
+                        MessageRoutes&, std::filesystem::path persisted);
     ~AvailabilityService();
     AvailabilityService(const AvailabilityService&) = delete;
     AvailabilityService& operator=(const AvailabilityService&) = delete;
@@ -165,8 +167,7 @@ class AvailabilityService {
     RpcMessage answer_trie(const RpcMessage& request) const;
 
     NodeRuntime& node_;
-    LocalState& local_;
-    DistributedStore& store_;
+    dagda::Context& store_;
     const ObjectLedger& ledger_;
     const NodeEvents& events_;
     MessageRoutes& routes_;

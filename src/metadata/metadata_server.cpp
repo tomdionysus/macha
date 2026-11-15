@@ -4,7 +4,7 @@
 #include "cluster/cluster.hpp"
 #include "codec.hpp"
 #include "log.hpp"
-#include "storage/persistent_cache.hpp"
+#include "metadata/metadata_seed.hpp"
 #include "supervised.hpp"
 
 #include <algorithm>
@@ -21,10 +21,9 @@ RpcMessage metadata_identity_reply(const MetadataIdentity& identity) {
 
 } // namespace
 
-MetadataServer::MetadataServer(NodeRuntime& node, MetadataReplica& replica,
-                               PersistentBlockCache& cache, MessageRoutes& routes,
-                               std::chrono::milliseconds refresh_interval)
-    : node_(node), replica_(replica), cache_(cache), routes_(routes),
+MetadataServer::MetadataServer(NodeRuntime& node, MetadataReplica& replica, MetadataSeed& seed,
+                               MessageRoutes& routes, std::chrono::milliseconds refresh_interval)
+    : node_(node), replica_(replica), seed_(seed), routes_(routes),
       refresh_interval_(refresh_interval) {
     // Identity-reset tombstones must be active before metadata exchange.
     try {
@@ -93,7 +92,7 @@ bool MetadataServer::accept_commit(const MetadataAcceptance& acceptance) {
     if (!heads_changed)
         return true;
     if (after.hash != before.hash)
-        cache_.remember_metadata(after);
+        seed_.remember(after);
     // A same-generation sibling may leave the preferred head unchanged, but
     // peers still need a wake-up so cache validation and reconciliation see
     // the new head set.

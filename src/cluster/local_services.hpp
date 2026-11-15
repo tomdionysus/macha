@@ -10,6 +10,10 @@
 #include <chrono>
 #include <stop_token>
 
+namespace dagda {
+class Context;
+}
+
 namespace macha {
 
 class NodeRuntime;
@@ -25,8 +29,9 @@ class NodeRuntime;
 class LocalServices {
   public:
     LocalServices(const Config&, const NodeIdentity&, RecoveryProgress&,
-                  const LocalState::StageHook&, std::stop_token, NodeRuntime&, NodeResources&,
-                  MessageRoutes&, std::chrono::milliseconds durability_batch_window);
+                  const LocalState::StageHook&, std::stop_token, NodeRuntime&,
+                  dagda::Context& store, NodeResources&, MessageRoutes&,
+                  std::chrono::milliseconds durability_batch_window);
     // Detaches the DATA pool's monitor from the arbiter before the pool goes.
     ~LocalServices();
     LocalServices(const LocalServices&) = delete;

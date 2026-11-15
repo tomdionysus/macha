@@ -174,6 +174,11 @@ class Service {
         wait_services_ready();
         return services_->store();
     }
+    // The store, through the contract Macha's code calls.
+    dagda::Context& store_context() {
+        wait_services_ready();
+        return store_node_->context();
+    }
     MetadataManager& metadata_manager() {
         wait_services_ready();
         return services_->metadata();

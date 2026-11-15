@@ -909,9 +909,8 @@ MACHA_FAST_TEST("rpc_cluster", test_store_runtime_cache_keeps_a_playback_fetch) 
 }
 
 // The control store is not on the DATA device: finding a local control
-// object never waits for DATA credit. A namespace node is written by a node
-// on its own.
-MACHA_FAST_TEST("rpc_cluster", test_store_control_objects_take_no_data_credit_and_commit_alone) {
+// object never waits for DATA credit.
+MACHA_FAST_TEST("rpc_cluster", test_store_control_objects_take_no_data_credit) {
     StoreBench bench([](Config& c) {
         c.data_inflight_bytes = 2 * c.extent_size;
         c.data_viewer_reserve_bytes = c.extent_size;
@@ -929,11 +928,6 @@ MACHA_FAST_TEST("rpc_cluster", test_store_control_objects_take_no_data_credit_an
     held.reset(); // lets a regressed build finish rather than hang the suite
     CHECK(prompt);
     CHECK(found.get());
-
-    auto nodes = ControlNamespaceNodeStore::for_commit(bench.local.control(), *store);
-    const auto node = nodes.put(pattern(512, 17));
-    CHECK(bench.local.control().has(node));
-    CHECK(nodes.written() == std::vector<ObjectId>{node});
 }
 
 // The startup gate fires on silence, never on slow progress: a reading that
@@ -1471,8 +1465,8 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     REQUIRE(wait_until([&] { return active_on(node, phantom.id); }, 15s));
     REQUIRE(node.wait_local_state_ready(10s));
 
-    auto metadata_store = macha::test_support::distributed_store_for(node);
-    MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server(),
+                             node.store_context());
     bool rejected = false;
     try {
         (void)metadata.snapshot_view();
@@ -1628,7 +1622,7 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
         }
     }));
 
-    MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server(), s1.store());
+    MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server(), s1.store_context());
     auto snapshot = m1.snapshot();
     CHECK(snapshot.metadata_voters.empty());
     CHECK(snapshot.data_replication == 2);
@@ -2070,8 +2064,8 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
         entry.gid = getgid();
         MetadataDelta delta;
         delta.upsert_entries[path] = entry;
-        auto snapshot = macha::test_support::with_namespace_delta(
-            decode_snapshot(base.payload), service.local_state().control(), service.store(), delta);
+        auto snapshot = macha::test_support::with_namespace_delta(decode_snapshot(base.payload),
+                                                                  service.store_context(), delta);
         ++snapshot.mutation_sequences[service.node().node_id()];
 
         MetadataRecord sibling;
@@ -2195,8 +2189,8 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
 
-    auto metadata_store = macha::test_support::distributed_store_for(node);
-    MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server(),
+                             node.store_context());
     const auto directory = [] {
         FsEntry entry;
         entry.type = EntryType::directory;
@@ -2220,8 +2214,7 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     foreign_delta.erase_entries.push_back("/mine");
     foreign_delta.upsert_entries["/theirs"] = made;
     auto foreign_snapshot = macha::test_support::with_namespace_delta(
-        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store,
-        foreign_delta);
+        decode_snapshot(mine.payload), node.store_context(), foreign_delta);
     foreign_snapshot.mutation_sequences.clear();
     foreign_snapshot.legacy_clock.emplace();
     foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
@@ -2240,8 +2233,7 @@ MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     REQUIRE(node.metadata_replica().accepted_heads().size() == 2);
 
     const auto holds = [&](const MetadataSnapshot& snapshot, std::string_view path) {
-        return macha::test_support::namespace_holds(snapshot, node.local_state().control(),
-                                                    *metadata_store, path);
+        return macha::test_support::namespace_holds(snapshot, node.store_context(), path);
     };
     const auto merged = metadata.snapshot();
     CHECK(holds(merged, "/mine"));
@@ -2346,8 +2338,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
         },
         10s));
 
-    auto metadata1_store = macha::test_support::distributed_store_for(n1);
-    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), *metadata1_store);
+    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), n1.store_context());
     // One mutation, so the siblings fork from a real post-genesis record.
     REQUIRE(macha::test_support::retry_while_not_ready([&] {
         metadata1.mutate_delta([](MetadataSnapshot&, MetadataDelta& delta) {
@@ -2371,8 +2362,8 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
         entry.gid = getgid();
         MetadataDelta delta;
         delta.upsert_entries[path] = entry;
-        auto snapshot = macha::test_support::with_namespace_delta(
-            decode_snapshot(base.payload), node.local_state().control(), *metadata1_store, delta);
+        auto snapshot = macha::test_support::with_namespace_delta(decode_snapshot(base.payload),
+                                                                  node.store_context(), delta);
         ++snapshot.mutation_sequences[node.node_id()];
 
         MetadataRecord sibling;
@@ -3109,7 +3100,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
         REQUIRE(retry_while_not_ready(
             [&] { s1.filesystem().mkdir("/base", 0755, getuid(), getgid()); }));
         MetadataManager initial_repair(s1.node(), s1.local_state(), s1.metadata_server(),
-                                       s1.store());
+                                       s1.store_context());
         // A round in which a reachable peer did not take the head says so and
         // is run again.
         REQUIRE(retry_while_not_ready([&] { initial_repair.repair_once(); }));
@@ -3189,7 +3180,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
             return active2.size() == 2 && active3.size() == 2;
         }));
 
-        MetadataManager reconcile(s2.node(), s2.local_state(), s2.metadata_server(), s2.store());
+        MetadataManager reconcile(s2.node(), s2.local_state(), s2.metadata_server(),
+                                  s2.store_context());
         REQUIRE(wait_until(
             [&] {
                 try {
@@ -3283,7 +3275,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
 
         REQUIRE(wait_metadata_writable(s1));
         s1.filesystem().mkdir("/after-grow", 0755, getuid(), getgid());
-        MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server(), s1.store());
+        MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server(), s1.store_context());
         auto snapshot = m1.snapshot();
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 2);
@@ -3325,7 +3317,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
 
         REQUIRE(retry_while_not_ready(
             [&] { s2.filesystem().mkdir("/after-shrink", 0755, getuid(), getgid()); }));
-        MetadataManager m2(s2.node(), s2.local_state(), s2.metadata_server(), s2.store());
+        MetadataManager m2(s2.node(), s2.local_state(), s2.metadata_server(), s2.store_context());
         auto snapshot = m2.snapshot();
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 1);
@@ -3407,7 +3399,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
 
     // One metadata pass makes node 2 a durable checkpoint witness first.
     MetadataManager witness_repair(s2->node(), s2->local_state(), s2->metadata_server(),
-                                   s2->store());
+                                   s2->store_context());
     witness_repair.repair_once();
     CHECK(s2->local_state().replica().committed().generation > 1);
 
@@ -4701,8 +4693,8 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
 
-    auto metadata_store = macha::test_support::distributed_store_for(node);
-    MetadataManager metadata(node, node.local_state(), node.metadata_server(), *metadata_store);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server(),
+                             node.store_context());
     auto& replica = node.metadata_replica();
     const auto directory = [] {
         FsEntry entry;
@@ -4726,8 +4718,7 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
     foreign_delta.erase_entries.push_back("/mine");
     foreign_delta.upsert_entries["/theirs"] = made;
     auto foreign_snapshot = macha::test_support::with_namespace_delta(
-        decode_snapshot(mine.payload), node.local_state().control(), *metadata_store,
-        foreign_delta);
+        decode_snapshot(mine.payload), node.store_context(), foreign_delta);
     foreign_snapshot.mutation_sequences.clear();
     foreign_snapshot.legacy_clock.emplace();
     foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
@@ -4752,8 +4743,7 @@ MACHA_TEST("rpc_cluster", test_history_is_not_truncated_while_two_heads_are_held
     CHECK(replica.accepted_heads().size() == 2);
 
     const auto holds = [&](const MetadataSnapshot& snapshot, std::string_view path) {
-        return macha::test_support::namespace_holds(snapshot, node.local_state().control(),
-                                                    *metadata_store, path);
+        return macha::test_support::namespace_holds(snapshot, node.store_context(), path);
     };
     // Reading merges the two; the one head then becomes the root.
     CHECK(holds(metadata.snapshot(), "/theirs"));

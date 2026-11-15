@@ -184,7 +184,7 @@ void Maintenance::maintain_garbage_metadata(const std::vector<GarbageRef>& erase
         // A later retirement of the same object is another batch and is kept.
         if (snapshot.tombstone_batches.empty())
             return;
-        const auto reader = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
+        const auto reader = ControlNamespaceNodeStore::for_reading(context_);
         std::vector<TombstoneBatch> kept;
         for (const auto& batch : snapshot.tombstone_batches) {
             const auto bytes = reader.get(batch.id);

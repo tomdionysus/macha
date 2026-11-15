@@ -85,8 +85,8 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
 }
 
 NodeHorizonBuilder::NodeHorizonBuilder(FileSystem& filesystem, CatalogueManager& catalogue,
-                                       LocalStore& control, DistributedStore& store) noexcept
-    : filesystem_(filesystem), catalogue_(catalogue), control_(control), store_(store) {}
+                                       dagda::Context& store) noexcept
+    : filesystem_(filesystem), catalogue_(catalogue), store_(store) {}
 
 std::shared_ptr<const MaintenanceObjects>
 NodeHorizonBuilder::namespace_objects(const std::function<void()>& pause) {
@@ -100,7 +100,7 @@ NodeHorizonBuilder::inventory(const MaintenanceObjects& namespace_objects,
 }
 
 ReleaseBuild NodeHorizonBuilder::release(const MetadataSnapshotView& head) {
-    auto nodes = ControlNamespaceNodeStore::for_reading(control_, store_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(store_);
     // The filesystem's census, brought to this head's tree: no walk.
     std::optional<NamespaceReferences> counted;
     try {

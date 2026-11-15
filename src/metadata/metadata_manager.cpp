@@ -51,7 +51,7 @@ bool bool_reply(const RpcReply& reply) {
 } // namespace
 
 MetadataManager::MetadataManager(NodeRuntime& node, LocalState& local,
-                                 MetadataServer& metadata_server, DistributedStore& namespace_store,
+                                 MetadataServer& metadata_server, dagda::Context& namespace_store,
                                  PublicationRetention publication_retention, const TimeSource& time)
     : node_(node), local_(local), metadata_server_(metadata_server),
       namespace_store_(namespace_store), time_(time),
@@ -1183,8 +1183,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             const auto& right_snapshot = *right_materialized->snapshot;
             if (!left_snapshot.namespace_root || !right_snapshot.namespace_root)
                 throw MergeUnavailable("a metadata head to merge holds no namespace tree");
-            const auto reading =
-                ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
+            const auto reading = ControlNamespaceNodeStore::for_reading(namespace_store_);
             auto tree_merge = merge_tree_backed_heads(left_snapshot, right_snapshot, left.hash,
                                                       right.hash, reading);
             auto merged = std::move(tree_merge.merged);
@@ -1206,8 +1205,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             // The merged namespace's tree; its nodes are written and replicated
             // before the record naming the root is published.
             {
-                auto commit_nodes =
-                    ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
+                auto commit_nodes = ControlNamespaceNodeStore::for_commit(namespace_store_);
                 merged.snapshot.namespace_root =
                     update_namespace_tree(tree_merge.onto, commit_nodes, tree_merge.changes);
             }
@@ -1437,7 +1435,7 @@ MetadataRecord MetadataManager::discover_or_form() {
     // A namespace is a tree from its first commit: the record carries only the
     // root, so no record, replay or checkpoint grows with the library. The
     // tree is a function of the entries alone, so founders still agree.
-    auto nodes = ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
+    auto nodes = ControlNamespaceNodeStore::for_commit(namespace_store_);
     snapshot = detach_namespace(std::move(snapshot), nodes);
 
     MetadataRecord formed;
@@ -1710,8 +1708,7 @@ MetadataManager::mutate_delta(const std::function<void(MetadataSnapshot&, Metada
             }
             if (!supplied_delta.upsert_entries.empty() || !supplied_delta.append_entries.empty()) {
                 // The parent's namespace: the tree is not yet rewritten.
-                const auto reader =
-                    ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
+                const auto reader = ControlNamespaceNodeStore::for_reading(namespace_store_);
                 for (auto& [path, entry] : supplied_delta.upsert_entries) {
                     const auto prior = namespace_entry(snapshot, &reader, path);
                     stamp_entry_provenance(entry, path, prior ? &*prior : nullptr, mutation);
@@ -1746,7 +1743,7 @@ MetadataManager::mutate_delta(const std::function<void(MetadataSnapshot&, Metada
             if (!snapshot.entries.empty())
                 throw std::runtime_error(
                     "metadata mutation wrote the namespace map on a tree-backed snapshot");
-            auto nodes = ControlNamespaceNodeStore::for_commit(local_.control(), namespace_store_);
+            auto nodes = ControlNamespaceNodeStore::for_commit(namespace_store_);
             snapshot.namespace_root =
                 apply_delta_to_namespace_tree(*snapshot.namespace_root, nodes, supplied_delta);
             // The mutation's tombstones, each group one batch object written
@@ -1777,8 +1774,7 @@ MetadataManager::mutate_delta(const std::function<void(MetadataSnapshot&, Metada
         // Drop the conflicts this mutation decided by rewriting their subject,
         // read from the namespace as the mutation leaves it.
         if (!snapshot.conflicts.empty()) {
-            const auto reader =
-                ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
+            const auto reader = ControlNamespaceNodeStore::for_reading(namespace_store_);
             const NamespaceLookup lookup = [&](const std::string& path) {
                 return namespace_entry(snapshot, &reader, path);
             };
@@ -1894,7 +1890,7 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
             // Through the working set: on a tree-backed snapshot a map write would
             // never be applied.
             auto nodes = std::optional<ControlNamespaceNodeStore>(
-                ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_));
+                ControlNamespaceNodeStore::for_reading(namespace_store_));
             NamespaceWorkingSet working(snapshot, delta, nodes ? &*nodes : nullptr);
             if (chosen) {
                 // A decision is a change even when it keeps the value in
@@ -2003,7 +1999,7 @@ Page<std::pair<std::string, FsEntry>, std::string>
 MetadataManager::entries(const MetadataSnapshotView& view, Cursor<std::string> from,
                          Budget& budget) {
     (void)WaitGuard::enter(budget.context(), entries_waits, "MetadataManager::entries");
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), namespace_store_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(namespace_store_);
     return namespace_entries(*view.snapshot, &nodes, std::move(from), budget);
 }
 

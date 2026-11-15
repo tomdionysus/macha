@@ -52,7 +52,8 @@ uint64_t ledger_cache_share(const Config& cfg, LedgerShare share) {
 } // namespace
 
 LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, ClusterNode& node,
-                       RecoveryProgress& progress, const StageHook& hook, std::stop_token stop,
+                       NamespaceDeltaApplier apply_namespace, RecoveryProgress& progress,
+                       const StageHook& hook, std::stop_token stop,
                        std::chrono::milliseconds durability_batch_window) {
     // The DATA pool and the control-side chain are independent; recover them
     // side by side, as a large pool can take a while.
@@ -68,7 +69,7 @@ LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, ClusterN
     });
     std::exception_ptr state_failure;
     try {
-        recover_state(cfg, identity, node, progress, hook, stop);
+        recover_state(cfg, identity, node, std::move(apply_namespace), progress, hook, stop);
     } catch (...) {
         state_failure = std::current_exception();
     }
@@ -131,8 +132,8 @@ void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
 }
 
 void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity, ClusterNode& node,
-                               RecoveryProgress& progress, const StageHook& hook,
-                               const std::stop_token& stop) {
+                               NamespaceDeltaApplier apply_namespace, RecoveryProgress& progress,
+                               const StageHook& hook, const std::stop_token& stop) {
     try {
         stage(hook, "control-storage", stop);
         LocalStoreOptions control_options{cfg.metadata_store.limit, 0,
@@ -162,17 +163,11 @@ void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity, 
         progress.mark(RecoveryProgress::retention);
 
         stage(hook, "metadata", stop);
-        // Replay writes nodes locally and replicates nothing: the commit reached
-        // the floor when made, and rebuilding a local head must not depend on
-        // peers.
+        seed_ = std::make_unique<MetadataSeed>(cfg.state_path, identity.keys.storage);
         replica_ = std::make_unique<MetadataReplica>(
-            cfg.state_path, identity.keys.storage, cache_->metadata(), cfg.bootstrap.empty(),
-            cfg.metadata_materialization_cache_bytes,
-            [this](const ObjectId& root, const MetadataDelta& delta) {
-                auto nodes = ControlNamespaceNodeStore::for_replay(*control_, *control_fetch_);
-                return apply_delta_to_namespace_tree(root, nodes, delta);
-            });
-        cache_->remember_metadata(replica_->committed());
+            cfg.state_path, identity.keys.storage, seed_->read(), cfg.bootstrap.empty(),
+            cfg.metadata_materialization_cache_bytes, std::move(apply_namespace));
+        seed_->remember(replica_->committed());
         note_startup_progress();
         progress.mark(RecoveryProgress::metadata);
         Log::info("node metadata ready generation=" +

@@ -298,11 +298,10 @@ AvailabilitySnapshot decode_availability_paths(std::span<const uint8_t> bytes) {
     return snapshot;
 }
 
-AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
-                                         DistributedStore& store, const ObjectLedger& ledger,
-                                         const NodeEvents& events, MessageRoutes& routes,
-                                         std::filesystem::path persisted)
-    : node_(node), local_(local), store_(store), ledger_(ledger), events_(events), routes_(routes),
+AvailabilityService::AvailabilityService(NodeRuntime& node, dagda::Context& store,
+                                         const ObjectLedger& ledger, const NodeEvents& events,
+                                         MessageRoutes& routes, std::filesystem::path persisted)
+    : node_(node), store_(store), ledger_(ledger), events_(events), routes_(routes),
       persisted_(std::move(persisted)) {
     if (!persisted_.empty()) {
         std::ifstream in(persisted_, std::ios::binary);
@@ -506,7 +505,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         kept(next.survey.unavailable);
         kept(next.survey.unknown);
     }
-    const auto stored = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
+    const auto stored = ControlNamespaceNodeStore::for_reading(store_);
     const auto& root = head.snapshot->namespace_root;
     const char* table = "kept";
     bool table_changed = false;
