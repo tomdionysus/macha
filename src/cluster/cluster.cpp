@@ -34,12 +34,9 @@ NodeInfo self_info(const Config& config, const NodeId& id, uint8_t flags) {
     return node;
 }
 
-// Macha's recovery planes, by the names the node's readiness declares.
-constexpr std::array<std::pair<RecoveryProgress::Plane, const char*>, 5> recovery_planes{{
-    {RecoveryProgress::data_storage, "data_storage"},
-    {RecoveryProgress::control_storage, "control_storage"},
-    {RecoveryProgress::cache, "cache"},
-    {RecoveryProgress::retention, "retention"},
+// Macha's own recovery plane, by the name the node's readiness declares. The store's
+// planes are the store node's to declare and mark.
+constexpr std::array<std::pair<RecoveryProgress::Plane, const char*>, 1> recovery_planes{{
     {RecoveryProgress::metadata, "metadata"},
 }};
 
@@ -170,12 +167,14 @@ bool NodeRuntime::all_local_state_ready() const noexcept {
 NodeReadiness NodeRuntime::readiness() const {
     NodeReadiness out;
     out.control_plane_online = control_plane_online_.load(std::memory_order_acquire);
-    out.data_storage_ready = progress_.has(RecoveryProgress::data_storage);
+    // The store's planes, as the store node marks them on the node's readiness.
+    const auto& planes = readable_node().readiness();
+    out.data_storage_ready = planes.has("data_storage");
     out.data_storage_degraded = out.data_storage_ready && !cfg_.storage_backends.empty() &&
                                 advertised_backends_online_.load(std::memory_order_relaxed) == 0;
-    out.control_storage_ready = progress_.has(RecoveryProgress::control_storage);
-    out.cache_ready = progress_.has(RecoveryProgress::cache);
-    out.retention_ready = progress_.has(RecoveryProgress::retention);
+    out.control_storage_ready = planes.has("control_storage");
+    out.cache_ready = planes.has("cache");
+    out.retention_ready = planes.has("retention");
     out.metadata_ready = progress_.has(RecoveryProgress::metadata);
     out.local_state_ready = all_local_state_ready();
     out.failed = progress_.failed();
