@@ -1093,7 +1093,7 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
         s1.local_state().retention().retain(RetentionClass::data, id, claim);
         s2.local_state().retention().retain(RetentionClass::data, id, claim);
         REQUIRE(!s2.local_state().data().valid(id));
-        s2.resources().events.notify(NodeEvent::storage);
+        s2.resources().events.notify(node_event::storage);
         return std::pair{id, bytes};
     };
 
@@ -1709,8 +1709,8 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
     const auto claimed = s1.metadata_convergence_diagnostics();
     CHECK(claimed.runs_scheduled >= before.runs_scheduled + 1);
     const auto metadata_events = [&] {
-        return s1.resources().events.count(NodeEvent::metadata) +
-               s1.resources().events.count(NodeEvent::topology);
+        return s1.resources().events.count(node_event::metadata) +
+               s1.resources().events.count(node_event::membership);
     };
     const auto events_claimed = metadata_events();
 
@@ -2096,8 +2096,8 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     // The node counts a changed accepted head as an event; the held pass turns
     // it into convergence demand once released.
     const auto convergence_events = [](Service& service) {
-        return service.resources().events.count(NodeEvent::metadata) +
-               service.resources().events.count(NodeEvent::topology);
+        return service.resources().events.count(node_event::metadata) +
+               service.resources().events.count(node_event::membership);
     };
     const auto before_sibling_notice = convergence_events(s1);
 
@@ -2109,7 +2109,7 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     // Identical acceptance evidence produces no local event and no rebroadcast.
     std::this_thread::sleep_for(100ms);
     const auto metadata_only = [](Service& service) {
-        return service.resources().events.count(NodeEvent::metadata);
+        return service.resources().events.count(node_event::metadata);
     };
     const auto before_metadata1 = metadata_only(s1);
     const auto before_metadata2 = metadata_only(s2);
@@ -2985,7 +2985,7 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
     CHECK(!s2.local_state().data().valid(id));
     // A detector outside the storage wrappers must publish the mutation event;
     // heartbeats do not trigger maintenance.
-    s2.resources().events.notify(NodeEvent::storage);
+    s2.resources().events.notify(node_event::storage);
 
     // `id` is unreachable from namespace and catalogue; only its retention
     // claim tells maintenance to restore it.
@@ -3043,7 +3043,7 @@ MACHA_TEST("rpc_cluster", test_held_retention_claims_cost_repair_no_credit) {
     REQUIRE(s1.local_state().data().put(id, bytes));
     s2.local_state().retention().retain(RetentionClass::data, id, claim);
     REQUIRE(!s2.local_state().data().valid(id));
-    s2.resources().events.notify(NodeEvent::storage);
+    s2.resources().events.notify(node_event::storage);
 
     REQUIRE(wait_until([&] { return s2.local_state().data().valid(id); }, 5s));
     CHECK(*s2.local_state().data().get(id) == bytes);

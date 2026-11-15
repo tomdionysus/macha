@@ -5820,8 +5820,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         },
         5s));
     const auto convergence_events = [&] {
-        return s1.resources().events.count(NodeEvent::metadata) +
-               s1.resources().events.count(NodeEvent::topology);
+        return s1.resources().events.count(node_event::metadata) +
+               s1.resources().events.count(node_event::membership);
     };
     const auto events_before = convergence_events();
 

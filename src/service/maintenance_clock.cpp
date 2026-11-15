@@ -20,14 +20,10 @@ int64_t SystemMaintenanceClock::wall_ns() const {
     return system_wall_ns();
 }
 
-void SystemMaintenanceClock::wait_until(std::condition_variable_any& cv,
-                                        std::unique_lock<std::mutex>& lock, std::stop_token stop,
+void SystemMaintenanceClock::wait_until(NodeEvents& events, std::stop_token stop,
                                         Clock::time_point deadline,
                                         const std::function<bool()>& ready) {
-    if (deadline == Clock::time_point::max())
-        cv.wait(lock, stop, ready);
-    else
-        cv.wait_until(lock, stop, deadline, ready);
+    (void)wait_for_events(events, stop, deadline, ready);
 }
 
 ManualMaintenanceClock::ManualMaintenanceClock(std::chrono::milliseconds poll)
@@ -47,12 +43,15 @@ int64_t ManualMaintenanceClock::wall_ns() const {
     return wall_ns_.load(std::memory_order_acquire);
 }
 
-void ManualMaintenanceClock::wait_until(std::condition_variable_any& cv,
-                                        std::unique_lock<std::mutex>& lock, std::stop_token stop,
+void ManualMaintenanceClock::wait_until(NodeEvents& events, std::stop_token stop,
                                         Clock::time_point deadline,
                                         const std::function<bool()>& ready) {
-    while (!ready() && !stop.stop_requested() && now() < deadline)
-        cv.wait_for(lock, stop, poll_, ready);
+    while (!stop.stop_requested() && now() < deadline) {
+        const auto seen = events.total();
+        if (ready())
+            return;
+        (void)events.wait_for_change(seen, poll_, stop);
+    }
 }
 
 } // namespace macha

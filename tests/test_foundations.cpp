@@ -1280,16 +1280,30 @@ MACHA_FAST_TEST("foundations", test_rpc_refusals_say_whether_asking_again_may_he
     CHECK(rpc_try_later(*empty));
 }
 
-MACHA_FAST_TEST("foundations", test_node_events_count_each_kind) {
+MACHA_FAST_TEST("foundations", test_node_event_kinds_land_at_their_numbers) {
+    // Counting is Dannan's (its NodeEvents cases); Macha's part is the numbers
+    // its kinds are read by, which the store node's naming must not move.
     NodeEvents events;
-    CHECK(events.total() == 0);
-    events.notify(NodeEvent::metadata);
-    events.notify(NodeEvent::metadata);
-    events.notify(NodeEvent::storage);
-    CHECK(events.count(NodeEvent::metadata) == 2);
-    CHECK(events.count(NodeEvent::storage) == 1);
-    CHECK(events.count(NodeEvent::topology) == 0);
-    CHECK(events.total() == 3);
+    node_event::name_kinds(events);
+    CHECK(events.kind("storage") == node_event::storage);
+    CHECK(events.kind("metadata") == node_event::metadata);
+    CHECK(events.kind("claims") == node_event::claims);
+    events.notify(node_event::metadata);
+    events.notify(node_event::storage);
+    CHECK(events.count(node_event::metadata) == 1);
+    CHECK(events.count(node_event::storage) == 1);
+    CHECK(events.count(node_event::membership) == 0);
+
+    // A kind named first by anything else would move them: refused.
+    NodeEvents taken;
+    (void)taken.kind("other");
+    bool refused = false;
+    try {
+        node_event::name_kinds(taken);
+    } catch (const std::logic_error&) {
+        refused = true;
+    }
+    CHECK(refused);
 }
 
 namespace {

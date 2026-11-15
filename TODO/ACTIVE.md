@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-15 about 22:45Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-16 about 00:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-15-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
 `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
@@ -15,29 +15,25 @@ Rulings: Macha calls `dagda::Context` only, no shims; the root keeps `dagda::Nod
 reconfigure, the reference counts, reachability registration, the maintenance steps until 8c); agreement waits for
 Dannan 0.9.0; ack levels are the stack standard (`persisted` = the disk that took it, this node's when it can).
 
-**Where it stands (2026-11-15 night):**
-- Pushed to `25a37d3`: R1 (root, one lock, one identity, readiness), R2 (reads, the FUSE reply buffer, writes,
-  publication on tickets, hydration, activity, capacity), R3's first slice (the namespace tree on `Context::Control`,
-  the claims barrier on `Context::Claims`, the replica's sealed interim seed `<state>/metadata.seed`), every write
-  naming `persisted`; then `d35239d` (TODO).
-- **Uncommitted, compiling on build-3 at this note** (claim until 23:56Z, verdict `/root/pi/port.result`): R3's last
-  piece (the reachability provider `MachaReachability`, the census on `Node::references()`, `Maintenance` driving
-  the node's steps, `MaintenanceStopping` aliased, new key `maintenance.collect_garbage` default false), R4's
-  catalogue on Context, R5's torrent publish hook on Context. On green: format check, release build-3, commit
-  (named paths), push (the operator allowed pushing this session).
-- **Builds:** build-3 `/home/maintainer/macha-store`, `build/pi/macha_port_compile.sh` (compile only) against Dannan 0.8.0
-  (`/home/maintainer/deps/prefix-0.8.0`) and Dagda `6ea9d04` (`prefix-dagda-6ea9d04`, `build/pi/deps_dagda_6ea9d04.sh`).
-  **First next step: move to Dagda `6bfb5b2`** (gated 2026-11-15, build-2, 1105/1108 passed, 3 skipped): build its
-  prefix as `deps_dagda_6ea9d04.sh` did (a copy for `6bfb5b2`), point `macha_port_compile.sh` at it, and rename
-  Macha's `WriteOptions::level` to `ack_level` (the four `options.level = ...persisted` sites: `FileSystem::put_extent`,
-  `CatalogueManager::put_media_index`, the torrent publish hook, the hydration test fixture). `replicated` is now a
-  majority; `put_here`/`put_deferred_here` are `persisted`. Dagda's figures are one advert `dagda/figures`, read with
-  `store::figures_of(record)` / `used_of(record)` (`store/placement.h`); `dagda/capacity` and `dagda/extents` stay;
-  `dagda/used`, `backends-online` and the `cache-*` adverts are gone (R6 reads them through the accessor). Deploy deps
-  from Dannan's newest 0.8 patch (0.8.3).
-- **Next:** what the plan lists as left in R4 and R5, then R6, R7 and the plan's "Before any suite can run" list
-  (`LocalState`'s store parts, Macha's storage server and store messages, Macha's survey, the trace clock into
-  `MaintenanceOptions`); then the suites, fix forward, the harness, the migration rehearsal.
+**Where it stands (2026-11-15, 23:30Z):**
+- Pushed to `25a37d3`, then `d35239d` (TODO). **Committed, not pushed:** `c176854`, R3's last piece (the provider
+  `MachaReachability`, the census on `Node::references()`, `Maintenance` on the node's steps, key
+  `maintenance.collect_garbage` default false), R4 (the catalogue on Context; a store failure is `CatalogueUnavailable`),
+  R5 (torrent admission and I/O through `Context::devices()`, ingest blocking on `FsStorageUnavailable` only), all on
+  Dagda `6bfb5b2` with `ack_level`. Compiled green on build-3 (`/home/maintainer/macha-store-2`, `build/pi/macha_port_compile.sh`).
+- **Committed, not pushed, after `c176854`:** `NodeEvents` becomes Dannan's (R1's leftover and catalogue row 31), on
+  Dannan 0.8.3 with develop's `fbcbb90` applied (`NodeEvents::wait_for_change` with a stop token, added at Macha's
+  ask, offered for 0.8.4, the maintainer's call; develop is 0.9.0; prefix `prefix-dannan-083-stop`,
+  `build/pi/deps_dannan_083_stop.sh`). Detail in the plan under R4. Compiled green on build-3.
+- **Builds:** build-3 `/home/maintainer/macha-store-2` (the current tree; `/home/maintainer/macha-store` holds an older copy),
+  `build/pi/macha_port_compile.sh` with `S` and `R` set, against `prefix-dannan-083-stop` and `prefix-dagda-6bfb5b2`.
+  Dagda has since gated `6adc5ed` (2026-11-15: synchronous ticket waits on the caller's thread, placement ranked once,
+  the barrier's log lines; API unchanged): move the prefix to it at the next rebuild. Deploy deps from Dannan's newest 0.8 patch (0.8.3, or 0.8.4 if the maintainer cuts one with the stop-aware wait) and Dagda's tag.
+- **Next:** R6 (adverts from `dagda/capacity` and `store::figures_of`, telemetry and Status from Dagda's figures,
+  reload through Dagda, the files path table from Dagda's survey) together with R7 and the plan's "Before any suite
+  can run" list (`LocalState`'s store parts, Macha's `DistributedStore` and `StorageServer`, Macha's survey, the
+  trace clock into `MaintenanceOptions`), each Macha test retired against the Dagda case
+  `../dagda/TODO/2026-11-05-test-mapping.md` names; then the suites, fix forward, the harness, the migration rehearsal.
 
 **Parked by the operator (2026-11-14: port first, heap later):** the heap corruption P0. Findings so far: 125
 ASan-clean rounds of the crash workload; the FUSE read late-write (a timed-out read's worker writing into libfuse's

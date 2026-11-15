@@ -61,11 +61,8 @@ void Maintenance::start() {
 void Maintenance::request_stop() noexcept {
     if (!thread_.joinable())
         return;
+    // The pass's wait ends on its stop token.
     thread_.request_stop();
-    {
-        Lock lock(events_.wait_mutex);
-    }
-    events_.wait_cv.notify_all();
 }
 
 void Maintenance::stop() {
@@ -102,17 +99,11 @@ void Maintenance::run(std::stop_token stop) {
     uint64_t last_local_metadata_generation = local_.replica().committed_generation();
     // Events before the pass existed are not replayed; one convergence run
     // validates the state they left.
-    absorbed_storage_ = events_.count(NodeEvent::storage);
-    absorbed_metadata_ = events_.count(NodeEvent::metadata);
-    absorbed_topology_ = events_.count(NodeEvent::topology);
-    absorbed_claims_ = events_.count(NodeEvent::claims);
-    absorbed_total_ =
-        absorbed_storage_ + absorbed_metadata_ + absorbed_topology_ + absorbed_claims_;
+    absorbed_ = store_node_.maintenance_events();
     port_.metadata_convergence.request(metadata_server_.known_generation());
-    // Macha's events and the store node's: either moving is work to look at.
-    const auto events_now = [this] {
-        return events_.total() + store_node_.maintenance_events().total();
-    };
+    // The kinds the pass counts, on the node's events: any moving is work to
+    // look at; an advert alone is not.
+    const auto events_now = [this] { return store_node_.maintenance_events().total(); };
     uint64_t observed_event = events_now();
     auto gc_quiescent_until = Clock::time_point{};
     // The store's repair: credit, its share against the classes above it, the
@@ -532,24 +523,19 @@ void Maintenance::run(std::stop_token stop) {
 }
 
 bool Maintenance::absorb_events() {
-    const auto storage = events_.count(NodeEvent::storage);
-    const auto metadata = events_.count(NodeEvent::metadata);
-    const auto topology = events_.count(NodeEvent::topology);
-    const auto claims = events_.count(NodeEvent::claims);
-    bool wake = storage != absorbed_storage_ || claims != absorbed_claims_;
-    if (metadata != absorbed_metadata_)
+    // `topology` here is Dannan's membership: a node joined or left, or its
+    // place or capabilities changed.
+    const auto now = store_node_.maintenance_events();
+    bool wake = now.storage != absorbed_.storage || now.claims != absorbed_.claims;
+    if (now.metadata != absorbed_.metadata)
         media_information_.request_prune();
-    if (metadata != absorbed_metadata_ || topology != absorbed_topology_) {
+    if (now.metadata != absorbed_.metadata || now.topology != absorbed_.topology) {
         if (port_.metadata_convergence.request(metadata_server_.known_generation()))
             wake = true;
         else
             note_retry_trigger(clock_->now());
     }
-    absorbed_storage_ = storage;
-    absorbed_metadata_ = metadata;
-    absorbed_topology_ = topology;
-    absorbed_claims_ = claims;
-    absorbed_total_ = storage + metadata + topology + claims;
+    absorbed_ = now;
     return wake;
 }
 
@@ -561,12 +547,11 @@ void Maintenance::wait_for_events(const std::stop_token& stop, Clock::time_point
             std::min(deadline, retry_trigger_due().value_or(Clock::time_point::max()));
         if (clock_->now() >= until)
             return;
-        {
-            Lock wait_lock(events_.wait_mutex);
-            clock_->wait_until(events_.wait_cv, wait_lock.native(), stop, until,
-                               [this] { return events_.total() != absorbed_total_; });
-        }
-        if (events_.total() != absorbed_total_ && absorb_events())
+        const auto unabsorbed = [this] {
+            return store_node_.maintenance_events().total() != absorbed_.total();
+        };
+        clock_->wait_until(events_, stop, until, unabsorbed);
+        if (unabsorbed() && absorb_events())
             return;
     }
 }

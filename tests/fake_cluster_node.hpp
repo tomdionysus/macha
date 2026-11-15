@@ -177,7 +177,7 @@ class StoreBench {
   public:
     explicit StoreBench(const std::function<void(Config&)>& tune = {})
         : config_(configure(cluster_, tune)), state_lock_(config_.state_path), books_(config_),
-          memory_(standalone_memory(config_)), resources(config_, books_, *memory_),
+          memory_(standalone_memory(config_)), resources(config_, books_, *memory_, events_),
           identity_(config_.state_path, cluster_.keys()),
           node(config_, self_info(config_, identity_.id), identity_.durability_epoch),
           local(config_, identity_, node, no_namespace_replay, progress_, {}, std::stop_token{},
@@ -237,8 +237,9 @@ class StoreBench {
     Config config_;
     StorageLock state_lock_;
     NodeBooks books_;
-    // No node: a ledger of the bench's own.
+    // No node: a ledger and events of the bench's own.
     std::unique_ptr<dannan::sched::RetainedMemoryLedger> memory_;
+    NodeEvents events_;
 
   public:
     NodeResources resources;

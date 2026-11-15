@@ -91,10 +91,10 @@ PlaybackBudgets enforced_playback_budgets(const StreamingConfig& streaming) {
 
 NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, RecoveryProgress& progress,
                          TranscodeRateBook& transcode_rates, MessageRoutes& routes,
-                         NodeEvents& events, StartupStageHook startup_stage_hook)
+                         StartupStageHook startup_stage_hook)
     : cfg_(normalize_config(std::move(config))), keys_(std::move(keys)), progress_(progress),
-      transcode_rates_(transcode_rates), events_(events),
-      startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()),
+      transcode_rates_(transcode_rates), startup_stage_hook_(std::move(startup_stage_hook)),
+      startup_unix_ms_(unix_ms()),
       host_(node_config(), routes, 2,
             [this](const NodeInfo&, const RpcMessage& notice) { on_metadata_notice(notice); }),
       identity_(keys_, host_.node().identity()),
@@ -105,6 +105,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, RecoveryProgress& prog
           cfg_.dead_after),
       telemetry_(std::make_shared<DannanTelemetry>(host_.node().telemetry())) {
     auto& node = host_.node();
+    // Before the store node, which names the same kinds.
+    node_event::name_kinds(node.events());
     members_.follow(std::make_shared<DannanMembership>(node.nodes(), node.nodes().self().id));
     // Ready once the planes are and recovery has built what runs on them.
     node.readiness().hold_until_marked();
@@ -422,7 +424,7 @@ void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     // pre-sibling snapshot until the cache TTL expires.
     metadata_announcements_.fetch_add(1, std::memory_order_relaxed);
     remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    events_.notify(NodeEvent::metadata);
+    events().notify(node_event::metadata);
     advertise_metadata_generation(generation);
     Writer writer;
     writer.u64(generation);
@@ -449,7 +451,7 @@ void NodeRuntime::on_metadata_notice(const RpcMessage& notice) {
     // Only a notice made stale by a strictly newer generation is ignored.
     if (current <= generation) {
         remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
-        events_.notify(NodeEvent::metadata);
+        events().notify(node_event::metadata);
     }
 }
 
@@ -458,22 +460,21 @@ void NodeRuntime::on_roster_change(const dannan::RosterChange& change) {
     if (node.id == identity_.id)
         return;
     const auto previous_generation = remote_metadata_generation_.load();
-    bool topology = false;
+    // Joins, leaves and place changes are Dannan's membership events; what
+    // Macha raises is metadata: a higher generation heard of, or a peer's
+    // write floor changed.
+    bool floor_changed = false;
     switch (change.kind) {
     case dannan::RosterChange::Kind::joined:
-        topology = true;
         roster_told_[node.id] = node;
         break;
     case dannan::RosterChange::Kind::left:
-        topology = true;
         roster_told_.erase(node.id);
         break;
     case dannan::RosterChange::Kind::changed: {
         auto [told, inserted] = roster_told_.try_emplace(node.id, node);
-        const auto& before = told->second;
-        topology = inserted || before.host != node.host || before.port != node.port ||
-                   before.failure_domain != node.failure_domain || before.flags != node.flags ||
-                   before.metadata_write_replicas_required != node.metadata_write_replicas_required;
+        floor_changed = !inserted && told->second.metadata_write_replicas_required !=
+                                         node.metadata_write_replicas_required;
         told->second = node;
         break;
     }
@@ -483,8 +484,8 @@ void NodeRuntime::on_roster_change(const dannan::RosterChange& change) {
         raise_remote_metadata_generation(node.metadata_generation);
         newer = node.metadata_generation > previous_generation;
     }
-    if (topology || newer)
-        events_.notify(topology ? NodeEvent::topology : NodeEvent::metadata);
+    if (newer || floor_changed)
+        events().notify(node_event::metadata);
 }
 
 void NodeRuntime::wake_runtime() {
@@ -532,21 +533,19 @@ void NodeRuntime::follow_self() {
         " source=" + (connectivity ? connectivity->advertised_source : std::string("configured")));
 }
 
-// The node logs its inbound change, with hosts_extents beside it; here placement
-// moves as for a join or leave.
+// The node logs its inbound change, with hosts_extents beside it.
 void NodeRuntime::follow_inbound() {
     const bool capable = host_.node().inbound().capable();
     if (inbound_applied_ == capable)
         return;
-    const bool first = !inbound_applied_;
     inbound_applied_ = capable;
     const bool hosts = resolve_hosts_extents(cfg_, capable);
     if (hosts)
         host_.node().nodes().advertise(advert::hosts_extents, dannan::net::Bytes{1});
     else
         host_.node().nodes().withdraw(advert::hosts_extents);
-    if (members_.set_flags(capable, hosts) && !first)
-        events_.notify(NodeEvent::topology);
+    // Dannan raises membership for the capability and topology for the advert.
+    (void)members_.set_flags(capable, hosts);
 }
 
 // The highest generation heard of is only worth chasing while some node
@@ -572,7 +571,7 @@ void NodeRuntime::settle_remote_generation() {
         return;
     auto expected = heard;
     if (remote_metadata_generation_.compare_exchange_strong(expected, backed))
-        events_.notify(NodeEvent::metadata);
+        events().notify(node_event::metadata);
     remote_generation_unbacked_since_.reset();
 }
 

@@ -10,6 +10,7 @@
 #include "contract/horizon_builder.hpp"
 #include "contract/object_ledger.hpp"
 #include "dagda/context.h"
+#include "dagda/node.h"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/metadata_server.hpp"
 #include "service/availability_service.hpp"
@@ -144,12 +145,8 @@ class Maintenance final {
 
     bool cluster_stable_observed_{};
 
-    // The event counts absorb_events() has turned into work, and their sum.
-    uint64_t absorbed_storage_{};
-    uint64_t absorbed_metadata_{};
-    uint64_t absorbed_topology_{};
-    uint64_t absorbed_claims_{};
-    uint64_t absorbed_total_{};
+    // The event counts absorb_events() has turned into work.
+    dagda::MaintenanceEvents absorbed_{};
     // Convergence demand that found a run already scheduled since that run
     // began: the first and the last.
     std::optional<Clock::time_point> retry_trigger_first_;

@@ -438,8 +438,8 @@ class BareNode : public BareNodeResources, public NodeRuntime {
              std::chrono::milliseconds durability_batch_window = test_durability_window)
         : BareNodeResources(config, hook),
           NodeRuntime(std::move(config), std::move(keys), progress, books.transcode_rates, routes,
-                      books.events, std::move(hook)),
-          resources(NodeRuntime::config(), books, node().memory()),
+                      std::move(hook)),
+          resources(NodeRuntime::config(), books, node().memory(), events()),
           durability_batch_window_(durability_batch_window) {
         // The node holds the state path's lock from here.
         books.transcode_rates.open();
@@ -567,7 +567,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     }
 
     std::chrono::milliseconds durability_batch_window_;
-    Accounts accounts_{config(), identity(), *this, resources.events, routes};
+    Accounts accounts_{config(), identity(), *this, routes};
     // Declared in this order so the recovery thread goes before what it built.
     std::unique_ptr<dagda::Node> store_node_;
     std::unique_ptr<LocalServices> local_;

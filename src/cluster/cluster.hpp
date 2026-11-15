@@ -81,9 +81,6 @@ class NodeRuntime : public ClusterNode {
     RecoveryProgress& progress_;
     // Playback records, telemetry publishes.
     TranscodeRateBook& transcode_rates_;
-    // Storage, metadata and topology changes are counted here for whoever
-    // watches; the node never calls a consumer.
-    NodeEvents& events_;
 
     StartupStageHook startup_stage_hook_;
     std::atomic_bool control_plane_online_{};
@@ -92,7 +89,7 @@ class NodeRuntime : public ClusterNode {
     // The roster as the watch last told it, read only on the watch's strand.
     std::map<NodeId, NodeInfo> roster_told_;
     std::optional<uint64_t> roster_watch_;
-    // The inbound answer the topology was last moved for; the runtime thread's.
+    // The inbound answer last applied; the runtime thread's.
     std::optional<bool> inbound_applied_;
 
     std::atomic_uint64_t remote_metadata_generation_{};
@@ -150,8 +147,8 @@ class NodeRuntime : public ClusterNode {
     void write_telemetry(dannan::status::Telemetry&) const;
     // A peer's metadata notice, on its session: must not wait.
     void on_metadata_notice(const RpcMessage& notice);
-    // A change to the active roster, on the watch's strand: topology on a place,
-    // capability or Macha advert change, metadata on a higher generation.
+    // A change to the active roster, on the watch's strand: metadata on a higher
+    // generation or a changed write floor.
     void on_roster_change(const dannan::RosterChange&);
     // Each heartbeat or wake: the readiness planes, the advertised endpoint, the
     // inbound answer, and the generation heard of.
@@ -172,7 +169,7 @@ class NodeRuntime : public ClusterNode {
     // Its Dannan node takes state_path's lock first, before any state is read, for this node's
     // life.
     NodeRuntime(Config, ClusterKeys, RecoveryProgress&, TranscodeRateBook&, MessageRoutes&,
-                NodeEvents&, StartupStageHook startup_stage_hook);
+                StartupStageHook startup_stage_hook);
     ~NodeRuntime() override;
     // Before start().
     void set_call_fault(CallFault fault) {
@@ -216,6 +213,11 @@ class NodeRuntime : public ClusterNode {
     void signal_telemetry_refresh();
     Membership& membership() override {
         return members_;
+    }
+    // What has happened on this node, counted by its Dannan node for whoever
+    // watches; Macha's kinds are named before the node starts.
+    NodeEvents& events() {
+        return host_.node().events();
     }
     const Membership& membership() const override {
         return members_;

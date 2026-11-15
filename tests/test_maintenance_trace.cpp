@@ -368,9 +368,8 @@ MACHA_FAST_TEST("maintenance_trace", test_manual_clock_moves_and_wakes_only_when
         int64_t wall_ns() const override {
             return -5;
         }
-        void wait_until(std::condition_variable_any&, std::unique_lock<std::mutex>&,
-                        std::stop_token, Clock::time_point, const std::function<bool()>&) override {
-        }
+        void wait_until(NodeEvents&, std::stop_token, Clock::time_point,
+                        const std::function<bool()>&) override {}
     } before_epoch;
     CHECK(before_epoch.wall_ms() == 0);
 
@@ -386,20 +385,13 @@ MACHA_FAST_TEST("maintenance_trace", test_manual_clock_moves_and_wakes_only_when
     CHECK(clock.wall_ns() == wall + 1'500'000'000);
     CHECK(clock.wall_ms() == static_cast<uint64_t>(wall + 1'500'000'000) / 1'000'000);
 
-    std::condition_variable_any cv;
-    std::mutex mutex;
+    NodeEvents events;
     std::stop_source stop;
 
     // Ready already: no wait at all.
-    {
-        std::unique_lock lock(mutex);
-        clock.wait_until(cv, lock, stop.get_token(), Clock::time_point::max(), [] { return true; });
-    }
+    clock.wait_until(events, stop.get_token(), Clock::time_point::max(), [] { return true; });
     // A deadline already reached in this clock's time.
-    {
-        std::unique_lock lock(mutex);
-        clock.wait_until(cv, lock, stop.get_token(), clock.now(), [] { return false; });
-    }
+    clock.wait_until(events, stop.get_token(), clock.now(), [] { return false; });
     // Reached only when another thread advances the clock, never by real time.
     {
         std::atomic_bool advanced{};
@@ -408,20 +400,18 @@ MACHA_FAST_TEST("maintenance_trace", test_manual_clock_moves_and_wakes_only_when
             advanced = true;
             clock.advance(1h);
         });
-        std::unique_lock lock(mutex);
-        clock.wait_until(cv, lock, stop.get_token(), clock.now() + 1h, [] { return false; });
+        clock.wait_until(events, stop.get_token(), clock.now() + 1h, [] { return false; });
         CHECK(advanced.load());
     }
-    // An unbounded wait ends when the predicate becomes true.
+    // An unbounded wait ends when the predicate becomes true and an event says so.
     {
         std::atomic_bool ready{};
         std::jthread setter([&] {
             std::this_thread::sleep_for(20ms);
             ready = true;
-            cv.notify_all();
+            events.notify(node_event::storage);
         });
-        std::unique_lock lock(mutex);
-        clock.wait_until(cv, lock, stop.get_token(), Clock::time_point::max(),
+        clock.wait_until(events, stop.get_token(), Clock::time_point::max(),
                          [&] { return ready.load(); });
         CHECK(ready.load());
     }
@@ -431,9 +421,7 @@ MACHA_FAST_TEST("maintenance_trace", test_manual_clock_moves_and_wakes_only_when
             std::this_thread::sleep_for(20ms);
             stop.request_stop();
         });
-        std::unique_lock lock(mutex);
-        clock.wait_until(cv, lock, stop.get_token(), Clock::time_point::max(),
-                         [] { return false; });
+        clock.wait_until(events, stop.get_token(), Clock::time_point::max(), [] { return false; });
         CHECK(stop.stop_requested());
     }
 }
@@ -446,13 +434,11 @@ MACHA_FAST_TEST("maintenance_trace", test_system_clock_reads_and_waits_in_real_t
                           std::chrono::system_clock::now().time_since_epoch())
                           .count();
     CHECK(std::llabs(clock.wall_ns() - wall) < 1'000'000'000);
-    std::condition_variable_any cv;
-    std::mutex mutex;
+    NodeEvents events;
     std::stop_source stop;
     {
-        std::unique_lock lock(mutex);
         const auto started = Clock::now();
-        clock.wait_until(cv, lock, stop.get_token(), started + 20ms, [] { return false; });
+        clock.wait_until(events, stop.get_token(), started + 20ms, [] { return false; });
         CHECK(Clock::now() - started >= 20ms);
     }
     {
@@ -460,8 +446,7 @@ MACHA_FAST_TEST("maintenance_trace", test_system_clock_reads_and_waits_in_real_t
         // time_point::max() can overflow and return at once on some libraries.
         std::atomic_bool returned{};
         std::jthread waiter([&] {
-            std::unique_lock lock(mutex);
-            clock.wait_until(cv, lock, stop.get_token(), Clock::time_point::max(),
+            clock.wait_until(events, stop.get_token(), Clock::time_point::max(),
                              [] { return false; });
             returned = true;
         });

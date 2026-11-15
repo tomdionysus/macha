@@ -15,13 +15,9 @@ void CatalogueInstaller::start() {
 }
 
 void CatalogueInstaller::request_stop() {
-    if (!worker_.joinable())
-        return;
-    worker_.request_stop();
-    {
-        Lock lock(events_.wait_mutex);
-    }
-    events_.wait_cv.notify_all();
+    // The worker's wait ends on its stop token.
+    if (worker_.joinable())
+        worker_.request_stop();
 }
 
 void CatalogueInstaller::stop() {
@@ -32,7 +28,7 @@ void CatalogueInstaller::stop() {
 
 void CatalogueInstaller::loop(const std::stop_token& stop) {
     const auto retry_events = [this] {
-        return events_.count(NodeEvent::topology) + events_.count(NodeEvent::storage);
+        return events_.count(node_event::membership) + events_.count(node_event::storage);
     };
     // The first pass installs whatever the head holds at start.
     bool first = true;
@@ -40,13 +36,13 @@ void CatalogueInstaller::loop(const std::stop_token& stop) {
     uint64_t seen_metadata = 0;
     uint64_t seen_retry = 0;
     const auto due = [&] {
-        return first || events_.count(NodeEvent::metadata) != seen_metadata ||
+        return first || events_.count(node_event::metadata) != seen_metadata ||
                (failed && retry_events() != seen_retry);
     };
     while (!stop.stop_requested()) {
         if (due()) {
             first = false;
-            seen_metadata = events_.count(NodeEvent::metadata);
+            seen_metadata = events_.count(node_event::metadata);
             seen_retry = retry_events();
             try {
                 catalogue_.follow_head();
@@ -57,8 +53,7 @@ void CatalogueInstaller::loop(const std::stop_token& stop) {
             }
             continue;
         }
-        Lock lock(events_.wait_mutex);
-        events_.wait_cv.wait(lock.native(), stop, due);
+        (void)wait_for_events(events_, stop, std::chrono::steady_clock::time_point::max(), due);
     }
 }
 

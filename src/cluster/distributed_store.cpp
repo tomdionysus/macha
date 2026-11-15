@@ -304,7 +304,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             }
             const auto started = Clock::now();
             if (!local_.data().has(id))
-                events_.notify(NodeEvent::storage);
+                events_.notify(node_event::storage);
             if (batch) {
                 if (const auto token = local_.data().put_deferred(id, data)) {
                     ++success;
@@ -1015,7 +1015,7 @@ bool DistributedStore::put_here(const ObjectId& id, std::span<const uint8_t> dat
     if (!local_.data().put(id, data))
         return put(id, data, frame_type);
     if (!held)
-        events_.notify(NodeEvent::storage);
+        events_.notify(node_event::storage);
     queue_prompt_replication(id);
     return true;
 }
@@ -1037,7 +1037,7 @@ bool DistributedStore::put_deferred_here(const ObjectId& id, std::span<const uin
                {DurableReplica{n_.node_id(), n_.durability_epoch(), token->domain,
                                token->generation, token->backend_instance}}});
     if (!held)
-        events_.notify(NodeEvent::storage);
+        events_.notify(node_event::storage);
     queue_prompt_replication(id);
     return true;
 }
@@ -1305,7 +1305,7 @@ void DistributedStore::prompt_replication_loop(const std::stop_token& stop) {
                 continue;
             if (put_on(*destination, *id, *data, false)) {
                 prompt_copies_.fetch_add(1, std::memory_order_relaxed);
-                events_.notify(NodeEvent::storage);
+                events_.notify(node_event::storage);
             } else {
                 retry_later();
             }
@@ -1329,7 +1329,7 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
         if (!resource)
             return false;
         if (!local_.data().has(id))
-            events_.notify(NodeEvent::storage);
+            events_.notify(node_event::storage);
         return local_.data().put(id, data);
     }
     // No local lease across the peer's admission (see replicate()).
@@ -2225,7 +2225,7 @@ ControlOffer DistributedStore::offer_control(const std::vector<ObjectId>& input)
 }
 
 uint64_t DistributedStore::reachability_epoch() const noexcept {
-    return (events_.count(NodeEvent::topology) << 8) + local_.data().online_backends();
+    return (events_.count(node_event::membership) << 8) + local_.data().online_backends();
 }
 
 bool DistributedStore::locally_available(const ObjectId& id) const {

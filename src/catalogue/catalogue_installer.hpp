@@ -11,7 +11,8 @@ namespace macha {
 // Keeps the catalogue view at this node's head: each head change installs
 // the head's catalogue, the latest head when several arrive at once. An
 // install that fails (a shard no node present can supply) is tried again on
-// the next head, membership or storage change. Readers never wait on it.
+// the next head, a membership change (Dannan's) or a storage change (the
+// store node's). Readers never wait on it.
 class CatalogueInstaller {
     CatalogueManager& catalogue_;
     NodeEvents& events_;

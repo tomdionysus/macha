@@ -372,7 +372,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                                   uint64_t now_unix_ms, const std::function<void()>& pause) {
     if (!head.snapshot)
         return false;
-    const auto topology_events = events_.count(NodeEvent::topology);
+    const auto topology_events = events_.count(node_event::membership);
     const auto inventory = ledger_.inventory();
     auto view = ledger_.held_view(RetentionClass::data);
     due_ = retry_at_;

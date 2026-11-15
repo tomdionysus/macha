@@ -11,7 +11,7 @@ NodeBooks::NodeBooks(const Config& cfg)
 
 NodeResources::NodeResources(const Config& cfg, NodeBooks& books,
                              dannan::sched::RetainedMemoryLedger& node_memory,
-                             ActivityClocks::Source activity_clock)
+                             NodeEvents& node_events, ActivityClocks::Source activity_clock)
     : activity(std::move(activity_clock)),
       data(cfg.data_inflight_bytes, cfg.data_viewer_reserve_bytes,
            cfg.maintenance.background_concurrency
@@ -21,7 +21,7 @@ NodeResources::NodeResources(const Config& cfg, NodeBooks& books,
            [this, window = cfg.maintenance.foreground_quiet] {
                return activity.viewer_recently_active(window);
            }),
-      memory(node_memory), transcode_rates(books.transcode_rates), events(books.events) {}
+      memory(node_memory), transcode_rates(books.transcode_rates), events(node_events) {}
 
 void NodeResources::stop() {
     data.stop();
