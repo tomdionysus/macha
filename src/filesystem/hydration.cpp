@@ -3,7 +3,7 @@
 #include "diagnostics.hpp"
 
 #include "catalogue/catalogue.hpp"
-#include "cluster/distributed_store.hpp"
+#include "dagda/context.h"
 #include "filesystem/filesystem.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
@@ -461,8 +461,8 @@ std::vector<HydrationHint> CatalogueSequenceHintProvider::hints() {
     return out;
 }
 
-CacheHydrator::CacheHydrator(DistributedStore& store, HydrationConfig config)
-    : store_(store), config_(config) {
+CacheHydrator::CacheHydrator(dagda::Context& context, HydrationConfig config)
+    : context_(context), config_(config) {
     status_.enabled = config_.enabled;
 }
 
@@ -514,6 +514,7 @@ void CacheHydrator::start() {
             return;
         workers = config_.max_inflight;
     }
+    stopping_->store(false, std::memory_order_relaxed);
     {
         Lock lock(fetch_mutex_);
         fetch_stopping_ = false;
@@ -559,6 +560,7 @@ void CacheHydrator::stop() {
 }
 
 void CacheHydrator::request_stop() {
+    stopping_->store(true, std::memory_order_relaxed);
     {
         Lock lock(mutex_);
         if (worker_.joinable())
@@ -603,6 +605,14 @@ void CacheHydrator::reconfigure(HydrationConfig config) {
     wake();
 }
 
+bool CacheHydrator::fetch(const HydrationRequest& request) {
+    dagda::store::ReadOptions options;
+    options.frame = request.frame_type;
+    options.stripe = request.sequence_index;
+    options.cancelled = stopping_;
+    return context_.objects().hydrate(request.object, std::move(options));
+}
+
 void CacheHydrator::fetch_loop(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         std::shared_ptr<FetchTask> task;
@@ -618,8 +628,7 @@ void CacheHydrator::fetch_loop(const std::stop_token& stop) {
             fetch_queued_.fetch_sub(1, std::memory_order_relaxed);
         }
         try {
-            task->result.set_value(store_.hydrate(
-                task->request.object, task->request.sequence_index, task->request.frame_type));
+            task->result.set_value(fetch(task->request));
         } catch (...) {
             try {
                 task->result.set_exception(std::current_exception());
@@ -686,13 +695,13 @@ bool CacheHydrator::run_once() {
         const auto now = Clock::now();
         std::erase_if(failed_until_, [&](const auto& item) { return item.second <= now; });
     }
-    if (!store_.hydration_available())
+    if (!context_.objects().hydration_available())
         return false;
 
     auto hints = collect_hints();
     const auto now = Clock::now();
     auto request = scheduler_.next(
-        hints, [&](const ObjectId& id) { return store_.locally_available(id); },
+        hints, [&](const ObjectId& id) { return context_.objects().locally_available(id); },
         [&](const ObjectId& id) {
             Lock lock(mutex_);
             auto it = failed_until_.find(id);
@@ -708,7 +717,7 @@ bool CacheHydrator::run_once() {
         status_.last_reason = request->reason;
     }
 
-    if (store_.hydrate(request->object, request->sequence_index, request->frame_type)) {
+    if (fetch(*request)) {
         Lock lock(mutex_);
         ++status_.fetched;
         failed_until_.erase(request->object);
@@ -790,14 +799,14 @@ void CacheHydrator::loop(const std::stop_token& stop) {
             std::erase_if(failed_until_, [&](const auto& item) { return item.second <= now; });
         }
 
-        if (config.enabled && store_.hydration_available()) {
+        if (config.enabled && context_.objects().hydration_available()) {
             while (!stop.stop_requested() && pending.size() < config.max_inflight) {
                 auto hints = collect_hints();
                 const auto now = Clock::now();
                 auto request = scheduler_.next(
                     hints,
                     [&](const ObjectId& id) {
-                        if (store_.locally_available(id))
+                        if (context_.objects().locally_available(id))
                             return true;
                         return std::any_of(
                             pending.begin(), pending.end(),
@@ -869,7 +878,7 @@ void CacheHydrator::loop(const std::stop_token& stop) {
     }
 }
 
-HydrationManager::HydrationManager(DistributedStore& store, PlaybackTracker& playback,
+HydrationManager::HydrationManager(dagda::Context& context, PlaybackTracker& playback,
                                    FileSystem& filesystem, CatalogueManager& catalogue,
                                    HydrationConfig config, size_t read_ahead_extents)
     : playback_(playback),
@@ -877,7 +886,7 @@ HydrationManager::HydrationManager(DistributedStore& store, PlaybackTracker& pla
       current_file_(std::make_shared<CurrentFileHintProvider>(playback, config)),
       catalogue_sequence_(
           std::make_shared<CatalogueSequenceHintProvider>(playback, filesystem, catalogue, config)),
-      hydrator_(store, config) {
+      hydrator_(context, config) {
     playback_.set_change_callback([this] { hydrator_.wake(); });
     hydrator_.add_provider(read_ahead_);
     hydrator_.add_provider(current_file_);

@@ -267,10 +267,23 @@ class WriteHandle final : public PublicationWriter {
     const bool cache_puts_{};
     const WriteDurability durability_{WriteDurability::immediate};
     const DataWorkContext work_context_{};
-    DistributedStore::DurabilityBatch durability_batch_ MACHA_GUARDED_BY(m_);
+    // A deferred extent and the ticket its barrier is asked through.
+    struct Durability {
+        ObjectId id;
+        dagda::Ticket ticket;
+    };
+    std::vector<Durability> deferred_extents_ MACHA_GUARDED_BY(m_);
+    // One wait over the extents' tickets. `lost`: copies a barrier refused for
+    // good (BarrierLoss) or tickets the store forgot, to be put again;
+    // `unmet`: anything else short of its level, a transient failure.
+    struct DurabilityOutcome {
+        bool unmet{};
+        std::vector<Durability> extents;
+    };
+    DurabilityOutcome await_durability(const std::vector<Durability>& extents) MACHA_REQUIRES(m_);
     struct StagedExtentResult {
         ExtentRef extent;
-        DistributedStore::DurabilityBatch durability;
+        dagda::Ticket ticket;
         std::chrono::milliseconds elapsed{};
     };
     struct PendingExtent {
@@ -431,6 +444,16 @@ class FileSystem final : public PublicationTarget {
     // it into DistributedStore.
     // Co-owned with the store's reads, which may check it after a call returns.
     std::shared_ptr<std::atomic_bool> io_cancelled_ = std::make_shared<std::atomic_bool>(false);
+    // One extent `id` through the Context under the mount's cancel: deferred
+    // for a publication generation, else at once; `budget` carries a
+    // no-progress budget and its counter when set. Failures are FsErrors
+    // (EINTR cancelled, FsStorageUnavailable when no node took it); the
+    // ticket is a deferred write's, for the barrier.
+    dagda::Ticket put_extent(const ObjectId& id, std::span<const uint8_t> bytes, bool deferred,
+                             FrameType frame, const DataWorkContext* budget);
+    // An existing extent through the Context, under the mount's cancel and no
+    // deadline: null when it could not be read.
+    dagda::store::ObjectData get_extent(const ObjectId& id, size_t stripe, FrameType frame);
     // Fixed process-lifetime executor for publication extents: a thread per
     // extent makes glibc's per-thread arenas retain gigabytes. The queue holds
     // two tasks per worker, matching the default per-publication pipeline.
@@ -449,7 +472,9 @@ class FileSystem final : public PublicationTarget {
     // into the manifest, a handle committing): the only events that can end a
     // retained-memory admission wait. Admitted quanta must not count, or a
     // failing node re-arms every no-progress deadline and never parks.
-    std::atomic_uint64_t write_progress_{};
+    // Co-owned with the store writes that read it as their progress.
+    std::shared_ptr<std::atomic_uint64_t> write_progress_ =
+        std::make_shared<std::atomic_uint64_t>(0);
     std::vector<std::jthread> extent_workers_ MACHA_GUARDED_BY(extent_tasks_mutex_);
     void extent_worker(const std::stop_token&);
     std::future<WriteHandle::StagedExtentResult>
@@ -625,13 +650,13 @@ class FileSystem final : public PublicationTarget {
         return ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     }
     void note_interactive_activity(uint64_t bytes = 0) {
-        s_.interactive_activity(bytes);
+        context_.activity().note(FrameType::read_ahead, bytes);
     }
     void note_foreground_activity(uint64_t bytes = 0) {
-        s_.foreground_activity(bytes);
+        context_.activity().note(FrameType::foreground, bytes);
     }
     std::chrono::milliseconds idle_for(WorkClass work_class) const {
-        return s_.idle_for(work_class);
+        return context_.activity().idle_for(work_class);
     }
     void reset_io_cancellation() {
         io_cancelled_->store(false, std::memory_order_relaxed);
@@ -658,11 +683,11 @@ class FileSystem final : public PublicationTarget {
     }
     // Process-wide: memory one writer releases can admit another, so any
     // writer's progress re-arms every no-progress window.
-    const std::atomic_uint64_t& write_progress() const noexcept {
+    std::shared_ptr<const std::atomic_uint64_t> write_progress() const noexcept {
         return write_progress_;
     }
     void note_write_progress() noexcept {
-        write_progress_.fetch_add(1, std::memory_order_relaxed);
+        write_progress_->fetch_add(1, std::memory_order_relaxed);
     }
 };
 

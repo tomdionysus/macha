@@ -251,9 +251,8 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_to_a_silent_replica_returns_on_the
     });
     auto store = bench.store();
     const auto data = pattern(64 * 1024, 3);
-    std::atomic_uint64_t progress{};
     const DataWorkContext work(FrameType::loader, bench.config().extent_size, {}, nullptr,
-                               &progress, scaled(30s));
+                               std::make_shared<std::atomic_uint64_t>(0), scaled(30s));
     DistributedStore::DurabilityBatch batch;
     const auto started = Clock::now();
     CHECK(store->put_deferred(data, batch, FrameType::loader, nullptr, &work) == object_id(data));

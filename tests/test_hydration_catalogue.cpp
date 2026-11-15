@@ -412,17 +412,15 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     REQUIRE(n1.wait_local_state_ready(10s));
     REQUIRE(n2.wait_local_state_ready(10s));
 
-    DistributedStore source(n1, n1.local_state(), n1.resources.activity, n1.resources.data,
-                            n1.resources.memory, n1.resources.events);
-    DistributedStore target(n2, n2.local_state(), n2.resources.activity, n2.resources.data,
-                            n2.resources.memory, n2.resources.events);
+    auto& target = n2.store_context();
+    // Held by n1's pool alone: placed there directly, so no copy is owed.
     auto make_remote = [&](uint8_t value) {
         Bytes data(128 * 1024, value);
         auto id = object_id(data);
-        REQUIRE(source.replicate_all(id, data, false) >= 2);
-        n2.local_store().remove(id);
-        n2.block_cache().remove(id);
-        REQUIRE(!target.locally_available(id));
+        REQUIRE(n1.store_node().data().put(id, data));
+        (void)n2.store_node().data().remove(id);
+        (void)n2.store_node().cache().remove(id);
+        REQUIRE(!target.objects().locally_available(id));
         return id;
     };
 
@@ -454,17 +452,17 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     hydrator.add_provider(provider);
     REQUIRE(hydrator.run_once());
     CHECK(hydrator.status().last_object == a);
-    CHECK(n2.block_cache().has(a));
-    CHECK(!n2.local_store().has(a));
+    CHECK(n2.store_node().cache().has(a));
+    CHECK(!n2.store_node().data().has(a));
     REQUIRE(hydrator.run_once());
     CHECK(hydrator.status().last_object == b);
     REQUIRE(hydrator.run_once());
     CHECK(hydrator.status().last_object == c);
     REQUIRE(hydrator.run_once());
     CHECK(hydrator.status().last_object == n0);
-    CHECK(n2.block_cache().has(n0));
-    CHECK(!n2.local_store().has(n0));
-    CHECK(!n2.block_cache().has(nnext));
+    CHECK(n2.store_node().cache().has(n0));
+    CHECK(!n2.store_node().data().has(n0));
+    CHECK(!n2.store_node().cache().has(nnext));
 
     // The production worker keeps a bounded speculative window in flight so
     // several replicas can contribute bandwidth. Dispatch is still ordered and
@@ -494,9 +492,9 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     CHECK(concurrent_status.in_flight == 0);
     CHECK(concurrent_status.executor_workers == 0);
     CHECK(concurrent_status.executor_queued == 0);
-    CHECK(n2.block_cache().has(parallel0));
-    CHECK(n2.block_cache().has(parallel1));
-    CHECK(n2.block_cache().has(parallel2));
+    CHECK(n2.store_node().cache().has(parallel0));
+    CHECK(n2.store_node().cache().has(parallel1));
+    CHECK(n2.store_node().cache().has(parallel2));
 
     // With no work the production hydrator must block, not sample providers at
     // hydration.interval. A producer notification wakes it immediately when a
@@ -542,7 +540,7 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     std::this_thread::sleep_for(25ms);
     CHECK(notifying_provider->calls.load() <= 2);
     notifying_provider->publish({{"event", {event_object}, 1000, "event-test"}});
-    REQUIRE(wait_until([&] { return n2.block_cache().has(event_object); }, 3s));
+    REQUIRE(wait_until([&] { return n2.store_node().cache().has(event_object); }, 3s));
     event_hydrator.stop();
 
     // A service stop can race a provider which is already inside hints(). The
@@ -595,7 +593,7 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     CHECK(shutdown_status.executor_queued == 0);
     CHECK(shutdown_status.executor_submitted == 0);
     CHECK(shutdown_status.executor_rejected == 1);
-    CHECK(!n2.block_cache().has(shutdown_object));
+    CHECK(!n2.store_node().cache().has(shutdown_object));
 
     n2.stop();
     n1.stop();
@@ -3246,7 +3244,8 @@ PublishedSource make_published_source(const std::filesystem::path& root, uint64_
         const std::span<const uint8_t> slice(bytes.data() + offset, static_cast<size_t>(length));
         ObjectId id;
         if (store_them) {
-            id = fs.store().put(slice, FrameType::loader);
+            id = object_id(slice);
+            REQUIRE(fs.context().objects().write(id, slice, {}).holders() > 0);
         } else {
             // A different object of the same length, never stored.
             Bytes other(slice.begin(), slice.end());

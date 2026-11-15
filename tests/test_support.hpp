@@ -521,6 +521,10 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     dagda::Context& store_context() {
         return store_node_->context();
     }
+    // Its parts, for a fixture that places objects directly.
+    dagda::Node& store_node() {
+        return *store_node_;
+    }
     MetadataServer& metadata_server() {
         return local("metadata replica").metadata();
     }

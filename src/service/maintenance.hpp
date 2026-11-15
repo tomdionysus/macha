@@ -9,6 +9,7 @@
 #include "contract/horizon.hpp"
 #include "contract/horizon_builder.hpp"
 #include "contract/object_ledger.hpp"
+#include "dagda/context.h"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/metadata_server.hpp"
 #include "service/availability_service.hpp"
@@ -70,6 +71,8 @@ struct MaintenanceDependencies {
     LocalState& local;
     MetadataServer& metadata_server;
     DistributedStore& store;
+    // Where reads and writes note their activity: the pacing signal.
+    dagda::Context& context;
     MetadataView& metadata;
     MetadataMaintenance& metadata_upkeep;
     CatalogueManager& catalogue;
@@ -137,6 +140,7 @@ class Maintenance final {
     LocalState& local_;
     MetadataServer& metadata_server_;
     DistributedStore& store_;
+    dagda::Context& context_;
     MetadataView& metadata_;
     MetadataMaintenance& metadata_upkeep_;
     CatalogueManager& catalogue_;

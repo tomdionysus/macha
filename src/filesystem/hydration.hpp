@@ -20,10 +20,13 @@
 #include <thread>
 #include <vector>
 
+namespace dagda {
+class Context;
+}
+
 namespace macha {
 
 class CatalogueManager;
-class DistributedStore;
 class FileSystem;
 
 struct PlaybackObservation {
@@ -159,7 +162,10 @@ struct HydrationStatus {
 };
 
 class CacheHydrator {
-    DistributedStore& store_;
+    dagda::Context& context_;
+    // Every fetch's cancel, co-owned with the store: request_stop() sets it,
+    // so a fetch in flight is abandoned; start() clears it.
+    const std::shared_ptr<std::atomic_bool> stopping_ = std::make_shared<std::atomic_bool>(false);
     mutable Mutex mutex_;
     std::condition_variable_any cv_;
     std::atomic_uint64_t wake_revision_{};
@@ -192,9 +198,11 @@ class CacheHydrator {
     void loop(const std::stop_token&);
     void fetch_loop(const std::stop_token&);
     std::optional<std::future<bool>> submit(HydrationRequest);
+    // True once the object is here, fetched into the cache if it was not.
+    bool fetch(const HydrationRequest&);
 
   public:
-    CacheHydrator(DistributedStore&, HydrationConfig);
+    CacheHydrator(dagda::Context&, HydrationConfig);
     ~CacheHydrator();
     void add_provider(std::shared_ptr<HydrationHintProvider>);
     void remove_provider(const HydrationHintProvider*);
@@ -215,7 +223,7 @@ class HydrationManager {
     CacheHydrator hydrator_;
 
   public:
-    HydrationManager(DistributedStore&, PlaybackTracker&, FileSystem&, CatalogueManager&,
+    HydrationManager(dagda::Context&, PlaybackTracker&, FileSystem&, CatalogueManager&,
                      HydrationConfig, size_t read_ahead_extents);
     ~HydrationManager();
     void start();

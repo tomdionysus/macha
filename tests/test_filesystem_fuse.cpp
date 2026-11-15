@@ -446,27 +446,27 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
                                           ledger.stats().control_reserve_bytes);
         REQUIRE(hog.has_value());
 
-        std::atomic_uint64_t stalled_progress{0};
+        auto stalled_progress = std::make_shared<std::atomic_uint64_t>(0);
         auto stalled = fs.open_write(
             "/stalled.bin", false, false, WriteDurability::publication_generation, 0,
-            DataWorkContext(FrameType::loader, extent, {}, nullptr, &stalled_progress, 100ms));
+            DataWorkContext(FrameType::loader, extent, {}, nullptr, stalled_progress, 100ms));
         const auto stalled_started = std::chrono::steady_clock::now();
         CHECK(error_code_of([&] { (void)stalled->write(0, contents); }) == EAGAIN);
         CHECK(std::chrono::steady_clock::now() - stalled_started < 10s);
 
         // Progress for 500 ms, then none: the write must outlast the progress,
         // which a plain 100 ms timeout would not.
-        std::atomic_uint64_t moving_progress{0};
+        auto moving_progress = std::make_shared<std::atomic_uint64_t>(0);
         const auto moving_started = std::chrono::steady_clock::now();
         std::jthread progress_thread([&] {
             while (std::chrono::steady_clock::now() - moving_started < 500ms) {
-                moving_progress.fetch_add(1, std::memory_order_relaxed);
+                moving_progress->fetch_add(1, std::memory_order_relaxed);
                 std::this_thread::sleep_for(20ms);
             }
         });
         auto moving = fs.open_write(
             "/moving.bin", false, false, WriteDurability::publication_generation, 0,
-            DataWorkContext(FrameType::loader, extent, {}, nullptr, &moving_progress, 100ms));
+            DataWorkContext(FrameType::loader, extent, {}, nullptr, moving_progress, 100ms));
         CHECK(error_code_of([&] { (void)moving->write(0, contents); }) == EAGAIN);
         CHECK(std::chrono::steady_clock::now() - moving_started > 500ms);
     }
@@ -486,7 +486,7 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         fs.create_file("/loader.bin", 0644, getuid(), getgid());
         const auto contents = pattern(2 * extent + 123);
         write_file(fs, "/loader.bin", contents);
-        (void)fs.store().take_interactive_bytes();
+        (void)fs.context().activity().take_bytes(FrameType::read_ahead);
 
         auto loader =
             fs.open_write("/loader.bin", false, false, WriteDurability::publication_generation, 0,
@@ -503,8 +503,8 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         CHECK(diagnostics.rebuild_put_extents == 1);
         CHECK(diagnostics.work_frame_type == FrameType::loader);
         CHECK(diagnostics.work_quantum_bytes == extent);
-        CHECK(fs.store().take_interactive_bytes() == 0);
-        CHECK(fs.store().take_foreground_bytes() == 0);
+        CHECK(fs.context().activity().take_bytes(FrameType::read_ahead) == 0);
+        CHECK(fs.context().activity().take_bytes(FrameType::foreground) == 0);
 
         fs.create_file("/interactive.bin", 0644, getuid(), getgid());
         auto interactive =
@@ -512,7 +512,7 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
                           DataWorkContext(FrameType::read_ahead, extent));
         const auto bytes = pattern(4096);
         REQUIRE(interactive->write(0, bytes) == bytes.size());
-        CHECK(fs.store().take_interactive_bytes() == bytes.size());
+        CHECK(fs.context().activity().take_bytes(FrameType::read_ahead) == bytes.size());
     }
 
     // Loader materialisation is resumable and byte bounded: one canonical
@@ -1742,7 +1742,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         CHECK(admission.can_start(t0));
         CHECK(!admission.should_yield(t0));
         CHECK(admission.retry_after(t0) == std::optional<std::chrono::milliseconds>(0ms));
-        fs.store().loader_activity(1);
+        fs.context().activity().note(FrameType::loader, 1);
         CHECK(admission.can_start(t0));
         CHECK(!admission.should_yield(t0));
 

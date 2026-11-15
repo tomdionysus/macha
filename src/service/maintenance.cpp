@@ -92,9 +92,10 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
     : node_(dependencies.node), local_(dependencies.local),
       metadata_server_(dependencies.metadata_server), store_(dependencies.store),
-      metadata_(dependencies.metadata), metadata_upkeep_(dependencies.metadata_upkeep),
-      catalogue_(dependencies.catalogue), builder_(dependencies.builder),
-      ledger_(dependencies.ledger), data_unreferenced_(dependencies.data_unreferenced),
+      context_(dependencies.context), metadata_(dependencies.metadata),
+      metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
+      builder_(dependencies.builder), ledger_(dependencies.ledger),
+      data_unreferenced_(dependencies.data_unreferenced),
       control_unreferenced_(dependencies.control_unreferenced),
       availability_(dependencies.availability), media_information_(dependencies.media_information),
       events_(dependencies.events), port_(dependencies.port), clock_(std::move(dependencies.clock)),
@@ -397,15 +398,17 @@ void Maintenance::run(std::stop_token stop) {
         last_cpu = cpu_now;
         last_own_cpu_ns = own_cpu_ns;
 
-        auto playback_bytes = store_.take_foreground_bytes();
-        auto interactive_bytes = store_.take_interactive_bytes();
-        auto loader_bytes = store_.take_loader_bytes();
-        const bool viewer_busy = playback_bytes > 0 || interactive_bytes > 0 ||
-                                 store_.idle_for(WorkClass::foreground) < policy.foreground_quiet;
+        auto playback_bytes = context_.activity().take_bytes(FrameType::foreground);
+        auto interactive_bytes = context_.activity().take_bytes(FrameType::read_ahead);
+        auto loader_bytes = context_.activity().take_bytes(FrameType::loader);
+        const bool viewer_busy =
+            playback_bytes > 0 || interactive_bytes > 0 ||
+            context_.activity().idle_for(WorkClass::foreground) < policy.foreground_quiet;
         // Law 3: the loader outranks background work, so loader activity (an
         // ingest) counts as busy too.
         const bool loader_busy =
-            loader_bytes > 0 || store_.idle_for(WorkClass::loader) < policy.foreground_quiet;
+            loader_bytes > 0 ||
+            context_.activity().idle_for(WorkClass::loader) < policy.foreground_quiet;
         // Viewer > loader > repair/rebalance/scrub. Both higher classes pace
         // background work, while the transport queues order within them.
         bool busy = viewer_busy || loader_busy;
@@ -703,8 +706,9 @@ void Maintenance::run(std::stop_token stop) {
                     } restorer{store_, network_credit, extent, trace_action};
                     const auto higher_class_active = [this, &policy, peer_viewers] {
                         const auto quiet = policy.foreground_quiet;
-                        return peer_viewers || store_.idle_for(WorkClass::foreground) < quiet ||
-                               store_.idle_for(WorkClass::loader) < quiet;
+                        return peer_viewers ||
+                               context_.activity().idle_for(WorkClass::foreground) < quiet ||
+                               context_.activity().idle_for(WorkClass::loader) < quiet;
                     };
                     repair_share.started(clock_->now(), repair_busy);
                     // A throw from either repair stage must still close the
@@ -1032,8 +1036,8 @@ void Maintenance::run(std::stop_token stop) {
                         inventory->lookup(RetentionClass::data), protected_ids, orphan_grace, 64,
                         [this] {
                             const auto quiet = node_.config().maintenance.foreground_quiet;
-                            return store_.idle_for(WorkClass::foreground) < quiet ||
-                                   store_.idle_for(WorkClass::loader) < quiet;
+                            return context_.activity().idle_for(WorkClass::foreground) < quiet ||
+                                   context_.activity().idle_for(WorkClass::loader) < quiet;
                         },
                         [this](const ObjectId& id) {
                             return ledger_.retained(RetentionClass::data, id);
@@ -1104,8 +1108,8 @@ void Maintenance::run(std::stop_token stop) {
                 auto rebalance =
                     local_.data().rebalance_step(static_cast<uint64_t>(local_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
-                        return store_.idle_for(WorkClass::foreground) < quiet ||
-                               store_.idle_for(WorkClass::loader) < quiet;
+                        return context_.activity().idle_for(WorkClass::foreground) < quiet ||
+                               context_.activity().idle_for(WorkClass::loader) < quiet;
                     });
                 log_slow_stage("local-rebalance", rebalance_stage,
                                "bytes=" + std::to_string(rebalance.bytes) +
@@ -1165,8 +1169,8 @@ void Maintenance::run(std::stop_token stop) {
                 auto scrub =
                     local_.data().scrub_step(static_cast<uint64_t>(scrub_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
-                        return store_.idle_for(WorkClass::foreground) < quiet ||
-                               store_.idle_for(WorkClass::loader) < quiet;
+                        return context_.activity().idle_for(WorkClass::foreground) < quiet ||
+                               context_.activity().idle_for(WorkClass::loader) < quiet;
                     });
                 log_slow_stage("scrub", scrub_stage,
                                "bytes=" + std::to_string(scrub.bytes) +
@@ -1324,8 +1328,8 @@ void Maintenance::run(std::stop_token stop) {
             // A busy pass suppressed GC, repair and rebalance; it re-evaluates as soon as
             // the foreground quiet period is met, or at once if it already has, rather
             // than sleeping until an unrelated event.
-            auto idle = std::min(store_.idle_for(WorkClass::foreground),
-                                 store_.idle_for(WorkClass::loader));
+            auto idle = std::min(context_.activity().idle_for(WorkClass::foreground),
+                                 context_.activity().idle_for(WorkClass::loader));
             deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
                                                                 ? policy.foreground_quiet - idle
                                                                 : Clock::duration{}));
