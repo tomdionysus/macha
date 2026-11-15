@@ -1624,8 +1624,7 @@ void IngestManager::process_job(const std::string& id, const std::stop_token& st
         // No node present can take the bytes now (a disk offline, stalled or
         // full): the job keeps its progress, blocks as storage_unavailable and
         // retries after blocked_retry.
-        if (dynamic_cast<const StorageUnavailable*>(&e) ||
-            dynamic_cast<const FsStorageUnavailable*>(&e)) {
+        if (dynamic_cast<const FsStorageUnavailable*>(&e)) {
             const auto line = "ingest blocked id=" + id + ": " + e.what() + "; retrying";
             if (retrying_storage)
                 Log::debug(line);

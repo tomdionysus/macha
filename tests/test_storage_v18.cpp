@@ -728,9 +728,8 @@ class StorageClusterNode {
             node_->resources.memory, node_->resources.events);
         metadata_ = std::make_unique<MetadataManager>(
             *node_, node_->local_state(), node_->metadata_server(), node_->store_context());
-        catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->local_state(),
-                                                        node_->metadata_server(), *store_,
-                                                        *metadata_, node_->ledger());
+        catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->metadata_server(),
+                                                        node_->store_context(), *metadata_);
     }
     // A process restart in miniature: a fresh NodeRuntime over the same
     // on-disk state gets a fresh durability epoch and fresh backend instance
@@ -1515,8 +1514,8 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
     // A fresh catalogue manager has no in-memory snapshot to hide the missing
     // physical control objects. Repair must fetch the manifest/shards from the
     // other metadata replica and leave them durable locally again.
-    CatalogueManager fresh(a.node(), a.node().local_state(), a.node().metadata_server(), a.store(),
-                           a.metadata(), a.node().ledger());
+    CatalogueManager fresh(a.node(), a.node().metadata_server(), a.node().store_context(),
+                           a.metadata());
     fresh.repair_once();
     REQUIRE(fresh.get(item.id).has_value());
     for (const auto& id : referenced)

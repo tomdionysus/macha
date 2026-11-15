@@ -21,7 +21,7 @@
 #include "dagda/context.h"
 #include "filesystem/filesystem.hpp"
 #include "filesystem/hydration.hpp"
-#include "ledger/node_horizon_builder.hpp"
+#include "ledger/macha_reachability.hpp"
 #include "ledger/retention_ledger.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "playback/playback.hpp"
@@ -85,7 +85,10 @@ struct NodeServicesInstruments {
 
 class NodeServices {
   public:
-    NodeServices(NodeRuntime&, NodeResources&, LocalState&, dagda::Context&, MetadataServer&,
+    // `store`: the opened store node; its owner surface (the census's counts,
+    // the reachability provider, the maintenance steps) is the root's, and
+    // every other call goes through its Context.
+    NodeServices(NodeRuntime&, NodeResources&, LocalState&, dagda::Node& store, MetadataServer&,
                  MessageRoutes&, SubsystemRegistry&, MaintenancePort&, NodeServicesInstruments);
     ~NodeServices();
     NodeServices(const NodeServices&) = delete;
@@ -173,6 +176,7 @@ class NodeServices {
     NodeRuntime& node_;
     NodeResources& resources_;
     LocalState& local_;
+    dagda::Node& store_node_;
     // The store, through the contract Macha's code calls.
     dagda::Context& context_;
     MetadataServer& metadata_server_;
@@ -212,7 +216,10 @@ class NodeServices {
     ManageApi manage_api_;
     PlaybackManager streaming_;
     SubsystemSupervisor subsystems_;
-    NodeHorizonBuilder horizon_builder_;
+    // What Macha's state refers to, for the store node's collector:
+    // registered for Macha's domain while this runs, when it reclaims.
+    MachaReachability reachability_;
+    bool reachability_registered_{};
     FilesApi files_api_;
     Maintenance maintenance_;
 };

@@ -538,7 +538,7 @@ void Service::initialise_services(const std::stop_token& stop) {
             return;
 
         auto services = std::make_unique<NodeServices>(
-            node_, resources_, local_->state(), store_node_->context(), local_->metadata(), routes_,
+            node_, resources_, local_->state(), *store_node_, local_->metadata(), routes_,
             registry_, maintenance_port_,
             NodeServicesInstruments{clock_, maintenance_trace_, maintenance_stage_hook_, lifecycle_,
                                     constructed_});

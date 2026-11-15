@@ -11,17 +11,11 @@ The cutover is one disk event (S, 8a, 8b together; `2026-11-13-store-cutover.md`
 2026-11-14): one branch, gate at the end.** Macha's store and Dagda's node cannot run side by side (same disks and
 lock, v18 against v19), so R1 to R7 land on `port/dannan-dagda` as commits that each compile (GCC and clang,
 warnings as errors) but the suites run once the whole set is in; then fix forward until Macha's suites pass on
-Dagda, then the harness and the migration rehearsal. Deps: Dannan 0.7.0 and Dagda `2f7eba6` built on build-3 into
-`/home/maintainer/deps/prefix-0.7.0` and `prefix-dagda-2f7eba6` (`build/pi/deps_070.sh`); the cutover pins Dannan 0.8.0
-(the `dannan-custody` tool lands there) and Dagda's tag once it builds on 0.8.0.
-**On Dannan 0.8.0 since `6dfc975`** (2026-11-15): deps on build-3 in `/home/maintainer/deps/prefix-0.8.0` and
-`prefix-dagda-f6e3b58` (`build/pi/deps_080.sh`; `dannan-custody` installed there); Macha has no test double of
-`dannan::Nodes`, so 0.8.0's new pure virtuals touch nothing; a clean build directory was needed so CMake would not keep
-the 0.7.0 prefix. **Dannan 0.8.1** (2026-11-15, `53cc933`: TCP_NODELAY on accepted sockets, a
-`stop_accepting` that never hangs; ABI kept, custody tool unchanged): the pin's minimum 0.8.0 already accepts it;
-build the deploy's deps from the newest 0.8 patch: **0.8.2** (`20771a6`: placement copies only its answer, a
-listener's key refused for what is actually wrong; ABI 0.8.0's). **0.8.3** (`00a3a12`: the outbound StreamConnector, RS256 verification;
-ABI 0.8.0's, custody tool unchanged) is now the newest patch to build the deploy's deps from.
+Dagda, then the harness and the migration rehearsal. **Deps now (2026-11-15):** Dannan 0.8.0 (`/home/maintainer/deps/prefix-0.8.0`, `build/pi/deps_080.sh`, `dannan-custody`
+installed there) and Dagda `6ea9d04` on `feature/macha-store-gaps` (`prefix-dagda-6ea9d04`,
+`build/pi/deps_dagda_6ea9d04.sh`; `Objects::logical_capacity`), compiled by `build/pi/macha_port_compile.sh`, which
+drops the CMake cache when the Dagda prefix changes. Moving to Dagda `6bfb5b2` (gated: `WriteOptions::ack_level`, `replicated` a majority, figures in one `dagda/figures` advert read through `store::figures_of`): its prefix is `prefix-dagda-6bfb5b2` (`build/pi/deps_dagda_6bfb5b2.sh`), Macha's four writes name `ack_level`. The deploy's
+deps come from Dannan's newest 0.8 patch, 0.8.3 (`00a3a12`; ABI 0.8.0's, custody tool unchanged) and Dagda's tag.
 
 **Owner surface (operator, 2026-11-15, relayed by Dagda):** Macha's composition root, which opens and owns the
 node, keeps `dagda::Node`'s owner surface: `open` / `OpenLater` and `open_store`, `stop`, `reconfigure`, and the
@@ -117,9 +111,10 @@ the cancel; the reachability epoch and `logical_capacity` (Dagda `6ea9d04`, `Obj
 replication 2), `decided` comes with Dannan 0.9.0, the setting `ack_level`. Every Macha write wants its floor (one
 copy, this node first, the rest to prompt replication), so every write names `persisted` explicitly (set in
 `FileSystem::put_extent`; R4's and R5's writes the same); `replicated` would put the WAN peer on every write and stop
-writes while a node is away. **Open, put to Dagda for the maintainer:** an edge node or a full node lands Macha's one copy on a
-peer (`test_a_full_preferred_node_spills_data_but_not_control`); the new `persisted` cannot answer that. Recommended:
-`persisted` = the disk of the node that takes the write, this one when it can.
+writes while a node is away. **Settled (the maintainer, 2026-11-15, via Dagda):** `persisted` is "the disk that took it": one node's disk,
+this node's when it can hold the copy, else the next in placement order, as Dagda already behaves, so the edge and
+full-node cases (`test_a_full_preferred_node_spills_data_but_not_control`) stand. Dagda renames the setting
+`ack_level` and makes `replicated` a majority; build against its commit once gated.
 
 ## R3. Metadata and the control store [metadata 2-7]
 
@@ -188,7 +183,37 @@ answers match the namespace on both.
    `AvailabilityService` keeps serving its API from its last survey until R6 moves the files path table and Status
    onto Dagda's survey), the scrub schedule file (Dagda keeps `<state>/maintenance/scrub.next`, Macha's name).
 
+**R3's last piece, done 2026-11-15 (compile pending, build-3 held by a reboot):** `MachaReachability` (the
+provider; `reachability_inventory` and `reachability_release` pure, `test_horizon_builder.cpp` ported onto them)
+replaces `NodeHorizonBuilder`; the catalogue answers `control_epoch` and `within_control_epoch`; the census counts
+into `Node::references()`; `Maintenance` drives the node's steps (above), and `MaintenanceStopping` aliases Dagda's.
+**New config key** `maintenance.collect_garbage` (default false, documented): the root registers the provider only
+when it is set, so the live nodes reclaim nothing until the provider's answers are checked against the namespace
+(the cutover ruling). The pass waits at most one interval (the store's cadence) until Macha's `NodeEvents` become
+Dannan's.
+
+**Before any suite can run** (the gate at the end; each is one of R1's leftovers or R6/R7): `LocalState`'s store
+parts go (its pool, control store, cache, retention store and reference counts open the same paths as the store
+node; only the replica and its seed stay); Macha's `StorageServer` and its store message handlers go (the node's
+answer them); Macha's `AvailabilityService` stops surveying and its `trie_diff` route goes, its API reading Dagda's
+survey (R6); the trace fixtures' `ManualMaintenanceClock` reaches the node as `MaintenanceOptions::time`/`wall`.
+
 ## R4. The catalogue [catalogue 1-7]
+
+**Progress (2026-11-15, compiles with R3's last piece):** `CatalogueManager(NodeRuntime&, MetadataServer&,
+dagda::Context&, MetadataView&)`: its CONTROL reads, writes and offer through `Context::Control`, DATA reads through
+`Objects::read` (`read_data`, none when not served), the media index written `persisted`, artwork staged with
+`put_here` / `put_deferred_here` into `ArtworkTickets` and made durable by one `Tickets::wait` (every ticket met, else
+the batch is kept and retried); `control_gc_step` and its cursor and epoch map are gone (the store's collector sweeps,
+the provider answers the epoch). Test changed: `hydration_catalogue/test_catalogue_on_one_node_predicts_caches_and_protects_its_control_objects`
+no longer sweeps through `control_gc_step`; it checks the epoch Macha answers (it moves on a new root, and a removal
+judged in an earlier epoch does not run); the sweep itself is Dagda's `LedgerCollector.AControlObjectStagedInTheCurrentEpochIsKept`
+and `.AControlRemovalNeverRacesANewEpoch`. Row 32 done: every catalogue store call goes through `store_call` (anything
+the store throws becomes `CatalogueUnavailable`) or `control_object` (ensure-local then get, one call), and artwork
+that cannot be stored is `CatalogueUnavailable`, never a plain error, so a store fault defers a hint without spending
+an attempt. Left: `CatalogueInstaller` on Dannan's events (row 31), which waits on Macha's `NodeEvents` becoming
+Dannan's (R1's leftover): asked of Dannan 2026-11-15, a `wait_for_change` overload taking a `std::stop_token`, since
+every Macha consumer waits stop-aware and Dannan's waits only on a timeout.
 
 CONTROL calls onto `Context::Control`; `CatalogueManager::control_gc_step` and its state go (the provider answers
 the root epoch); the scanner's and editor's batches become tickets; every store result maps to `CatalogueUnavailable`
@@ -196,6 +221,17 @@ the root epoch); the scanner's and editor's batches become tickets; every store 
 `CatalogueInstaller` waits on Dannan's storage and membership events.
 
 ## R5. Ingest and torrent [ingest 1-6]
+
+**Progress (2026-11-15):** the torrent publish hook writes through `Objects::write` at `persisted`, cancelled by the
+disk backend's abort flag, now co-owned (`TorrentDiskHooks::publish` takes `shared_ptr<atomic_bool>`); a cancelled or
+landed-nowhere write is no extent. Then: `loader_admission(dagda::Context&)` admits through
+`Devices::admit_data` at loader class in one-second slices (Dagda's arbiter checks the cancel only in its predicate,
+as Macha's did), the hook's abort co-owned; the torrent's I/O observed through `Devices::note_io`; `TorrentManager`
+no longer takes `LocalState` or the arbiter (nor does the plugin's context check); its tests run on a `TestNode`'s
+store (`LoaderNode`), reading the credit from `Node::credit()->stats()`. One extent size: the hook's
+`config.extent_size` is the key `store_node.cpp` gives the node's options, so there is one source. The ingest blocks as
+`storage_unavailable` on `FsStorageUnavailable` only (Context's writes answer with evidence; the filesystem maps
+landed-nowhere to it); its metadata classification was already typed (`MetadataNotReady`). R5 is done.
 
 Torrent publish through Context (co-owned cancel, evidence to `optional<ObjectId>`); `loader_admission` and the
 device monitor through Context's Devices noun; one extent size from the node's options; the ingest's blocked

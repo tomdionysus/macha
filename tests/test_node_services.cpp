@@ -42,7 +42,7 @@ class ServicesBench {
         };
         instruments.constructed = Clock::now();
         services = std::make_unique<NodeServices>(
-            *node, node->resources, node->local_state(), node->store_context(),
+            *node, node->resources, node->local_state(), node->store_node(),
             node->metadata_server(), node->routes, registry, port, std::move(instruments));
     }
     ~ServicesBench() {

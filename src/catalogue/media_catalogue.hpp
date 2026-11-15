@@ -694,7 +694,7 @@ class CatalogueScanner {
     bool stage_remote_artwork(ProviderMatch& match,
                               const std::function<bool(std::string_view)>& locked,
                               std::stop_token stop, size_t max_artwork_bytes,
-                              DistributedStore::DurabilityBatch& artwork_batch, FrameType frame);
+                              ArtworkTickets& artwork_batch, FrameType frame);
     // The editor's metadata provider for a scan provider ("movies", "tv",
     // "music") and a metadata provider name.
     static MetadataProvider*
@@ -708,7 +708,7 @@ class CatalogueScanner {
     std::optional<PreparedHintMatch> prepare_hint(const CatalogueHint&, const std::stop_token&,
                                                   const MetadataSnapshot& namespace_snapshot,
                                                   uint64_t snapshot_taken_unix_ms,
-                                                  DistributedStore::DurabilityBatch& artwork_batch);
+                                                  ArtworkTickets& artwork_batch);
 
     CatalogueScanner(NodeRuntime&, MetadataServer&, FileSystem&, CatalogueManager&,
                      CatalogueHintQueue&, CatalogueScannerConfig, std::unique_ptr<HttpClient> = {},

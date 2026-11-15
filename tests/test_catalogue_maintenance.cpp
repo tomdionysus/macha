@@ -131,9 +131,8 @@ MACHA_TEST("catalogue_maintenance",
            test_without_metadata_nothing_installs_and_the_read_is_incomplete) {
     Node fixture;
     FakeMetadataView metadata;
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     bool failed = false;
     try {
         catalogue.follow_head();
@@ -157,9 +156,8 @@ MACHA_TEST("catalogue_maintenance", test_the_read_is_complete_only_when_the_view
     const auto known = fixture.node->known_metadata_generation();
     metadata.view =
         MetadataSnapshotView{known, 0, Hash256{}, std::make_shared<const MetadataSnapshot>()};
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     const auto head = catalogue.maintenance_head();
     CHECK(head.current);
     // Nothing installed yet.
@@ -188,9 +186,8 @@ MACHA_TEST("catalogue_maintenance",
         MetadataSnapshotView{known - 1, 0, Hash256{}, std::make_shared<const MetadataSnapshot>()};
     metadata.after_record =
         MetadataSnapshotView{known, 0, Hash256{}, std::make_shared<const MetadataSnapshot>()};
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     const auto head = catalogue.maintenance_head();
     CHECK(head.current);
     CHECK(head.generation == known);
@@ -213,9 +210,8 @@ MACHA_TEST("catalogue_maintenance", test_a_commit_installs_what_it_wrote_once) {
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     catalogue.follow_head();
     const auto cold = catalogue.installs();
     CHECK(cold == 1);
@@ -233,9 +229,8 @@ MACHA_TEST("catalogue_maintenance", test_an_unchanged_root_is_never_installed_ag
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     (void)catalogue.upsert(movie("movie:one", "One"));
     const auto installs = catalogue.installs();
     // New heads that leave the catalogue alone: the view stands.
@@ -252,12 +247,10 @@ MACHA_TEST("catalogue_maintenance", test_another_writers_commit_is_installed_on_
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager reader(*fixture.node, fixture.node->local_state(),
-                            fixture.node->metadata_server(), *fixture.store, metadata,
-                            fixture.node->ledger());
-    CatalogueManager writer(*fixture.node, fixture.node->local_state(),
-                            fixture.node->metadata_server(), *fixture.store, metadata,
-                            fixture.node->ledger());
+    CatalogueManager reader(*fixture.node, fixture.node->metadata_server(),
+                            fixture.node->store_context(), metadata);
+    CatalogueManager writer(*fixture.node, fixture.node->metadata_server(),
+                            fixture.node->store_context(), metadata);
     auto item = reader.upsert(movie("movie:one", "One"));
     item.title = "Edited elsewhere";
     item = writer.upsert(item, item.revision);
@@ -278,9 +271,8 @@ MACHA_TEST("catalogue_maintenance", test_a_root_that_cannot_be_read_keeps_the_vi
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     (void)catalogue.upsert(movie("movie:one", "One"));
     const auto installs = catalogue.installs();
     const auto held_root = catalogue.status().root;
@@ -303,9 +295,8 @@ MACHA_TEST("catalogue_maintenance", test_an_install_racing_a_commit_takes_what_i
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     catalogue.follow_head();
     const auto loads = catalogue.loads();
     // The installer runs between the head moving and the commit installing.
@@ -316,9 +307,8 @@ MACHA_TEST("catalogue_maintenance", test_an_install_racing_a_commit_takes_what_i
     CHECK(catalogue.get("movie:2").has_value());
     // A root nobody staged is read from the control store.
     metadata.after_commit = {};
-    CatalogueManager other(*fixture.node, fixture.node->local_state(),
-                           fixture.node->metadata_server(), *fixture.store, metadata,
-                           fixture.node->ledger());
+    CatalogueManager other(*fixture.node, fixture.node->metadata_server(),
+                           fixture.node->store_context(), metadata);
     other.follow_head();
     CHECK(other.loads() == 1);
     CHECK(other.get("movie:2").has_value());
@@ -398,9 +388,8 @@ MACHA_TEST("catalogue_maintenance", test_what_a_commit_installs_is_what_a_load_o
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager writer(*fixture.node, fixture.node->local_state(),
-                            fixture.node->metadata_server(), *fixture.store, metadata,
-                            fixture.node->ledger());
+    CatalogueManager writer(*fixture.node, fixture.node->metadata_server(),
+                            fixture.node->store_context(), metadata);
     // What the writes should leave, kept apart from the catalogue's own code.
     std::map<std::string, std::string> titles;
     std::set<std::string> profiled;
@@ -467,9 +456,8 @@ MACHA_TEST("catalogue_maintenance", test_what_a_commit_installs_is_what_a_load_o
             break;
         }
         }
-        CatalogueManager reader(*fixture.node, fixture.node->local_state(),
-                                fixture.node->metadata_server(), *fixture.store, metadata,
-                                fixture.node->ledger());
+        CatalogueManager reader(*fixture.node, fixture.node->metadata_server(),
+                                fixture.node->store_context(), metadata);
         reader.follow_head();
         REQUIRE(reader.loads() == 1);
         CHECK(matches(writer));
@@ -482,12 +470,10 @@ MACHA_TEST("catalogue_maintenance", test_a_load_reuses_every_shard_the_new_root_
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager writer(*fixture.node, fixture.node->local_state(),
-                            fixture.node->metadata_server(), *fixture.store, metadata,
-                            fixture.node->ledger());
-    CatalogueManager reader(*fixture.node, fixture.node->local_state(),
-                            fixture.node->metadata_server(), *fixture.store, metadata,
-                            fixture.node->ledger());
+    CatalogueManager writer(*fixture.node, fixture.node->metadata_server(),
+                            fixture.node->store_context(), metadata);
+    CatalogueManager reader(*fixture.node, fixture.node->metadata_server(),
+                            fixture.node->store_context(), metadata);
     std::vector<CatalogueItem> batch;
     for (int i = 0; i < 300; ++i)
         batch.push_back(movie("movie:" + std::to_string(i), "Title"));
@@ -517,9 +503,8 @@ MACHA_TEST("catalogue_maintenance", test_a_write_shares_every_shard_it_did_not_t
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     std::vector<CatalogueItem> batch;
     for (int i = 0; i < 300; ++i)
         batch.push_back(movie("movie:" + std::to_string(i), "Title"));
@@ -543,9 +528,8 @@ MACHA_TEST("catalogue_maintenance", test_data_is_released_only_when_nothing_refe
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     const auto released = [&](const ObjectId& id) {
         return std::find(metadata.retired.begin(), metadata.retired.end(), id) !=
                metadata.retired.end();
@@ -580,9 +564,8 @@ MACHA_TEST("catalogue_maintenance", test_artwork_is_staged_in_the_class_of_whoev
     Node fixture;
     FakeMetadataView metadata;
     metadata.view = empty_head(fixture.node->known_metadata_generation());
-    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(),
-                               fixture.node->metadata_server(), *fixture.store, metadata,
-                               fixture.node->ledger());
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
     auto& data = fixture.node->resources.data;
     (void)catalogue.upsert(movie("movie:one", "One"));
 

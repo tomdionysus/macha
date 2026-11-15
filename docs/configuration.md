@@ -682,7 +682,10 @@ maintenance:
   convergence_settle_ms: 1000
   convergence_max_delay_ms: 10000
   garbage_grace_ms: 2592000000
+  collect_garbage: false
 ```
+
+**Nothing is reclaimed unless `collect_garbage` is true.** It turns on the destructive half of maintenance: retiring tombstones, releasing retention claims, and the CONTROL and DATA sweeps. Off (the default), the node removes nothing it holds; repair, the availability survey, rebalance, scrub, compaction and the ledger's verify run either way.
 
 **A failed metadata convergence run retries once things settle.** Its retry backs off from 30 s (`no_progress_backoff_ms` clamped to 5..30 s), doubling to `no_progress_backoff_ms`. A peer joining or leaving, a new head from a peer, or a local commit brings the retry forward: it runs `convergence_settle_ms` after the last such event, so a burst of them costs one run, and never later than `convergence_max_delay_ms` after the first, so a steady stream cannot hold it off. A run that has not failed is not delayed: the first event runs it at once, and the events during it become one follow-up. `convergence_settle_ms` is 0..300000 (0 retries on the first event); `convergence_max_delay_ms` is from `convergence_settle_ms` to 3600000.
 

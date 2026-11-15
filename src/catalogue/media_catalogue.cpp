@@ -4543,8 +4543,7 @@ void add_artwork(CatalogueItem& item, CatalogueArtwork art) {
 bool CatalogueScanner::stage_remote_artwork(ProviderMatch& match,
                                             const std::function<bool(std::string_view)>& locked,
                                             std::stop_token stop, size_t max_artwork_bytes,
-                                            DistributedStore::DurabilityBatch& artwork_batch,
-                                            FrameType frame) {
+                                            ArtworkTickets& artwork_batch, FrameType frame) {
     struct Fetch {
         const RemoteArtwork* art{};
         CatalogueItem* target{};
@@ -4814,7 +4813,7 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(const CatalogueHint& hint
         throw ProviderRequestError(404, "provider_not_found", "the record names no playable item");
     const auto leaf_id = leaf->id;
 
-    DistributedStore::DurabilityBatch artwork_batch;
+    ArtworkTickets artwork_batch;
     const auto locked = [&](std::string_view item_id) {
         auto item = catalogue_.get(item_id);
         if (!item)
@@ -4825,7 +4824,7 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(const CatalogueHint& hint
     const auto lookup_ms = stage_ms();
     (void)stage_remote_artwork(*match, locked, {}, max_artwork_bytes, artwork_batch, frame);
     const auto artwork_ms = stage_ms();
-    if (!catalogue_.artwork_durability_barrier(artwork_batch, frame))
+    if (!catalogue_.artwork_durability_barrier(artwork_batch))
         throw CatalogueUnavailable("catalogue artwork durability floor unavailable");
     const auto barrier_ms = stage_ms();
     catalogue_.reconcile_scanner(match->items, {probe.media_id}, false, {}, {}, {}, frame);
@@ -5075,8 +5074,7 @@ bool stale_scanner_book(const CatalogueItem& item) {
 std::optional<CatalogueScanner::PreparedHintMatch>
 CatalogueScanner::prepare_hint(const CatalogueHint& hint, const std::stop_token& stop,
                                const MetadataSnapshot& namespace_snapshot,
-                               uint64_t snapshot_taken_unix_ms,
-                               DistributedStore::DurabilityBatch& artwork_batch) {
+                               uint64_t snapshot_taken_unix_ms, ArtworkTickets& artwork_batch) {
     if (stop.stop_requested())
         return {};
     CatalogueScannerConfig config;
@@ -5357,7 +5355,7 @@ CatalogueScanner::HintBatchResult CatalogueScanner::process_hint_batch(const std
     HintBatchResult out;
     std::vector<PreparedHintMatch> prepared;
     prepared.reserve(max_hints);
-    DistributedStore::DurabilityBatch artwork_batch;
+    ArtworkTickets artwork_batch;
 
     // One namespace view per batch, taken lazily: an empty queue does no
     // metadata work. Normally a cache read.

@@ -6,9 +6,7 @@
 #include "test_framework.hpp"
 #include "test_support.hpp"
 
-#include "cluster/data_work.hpp"
 #include "crypto.hpp"
-#include "storage/io_pressure.hpp"
 #include "torrent/torrent_disk_io.hpp"
 #include "torrent/torrent_extent_journal.hpp"
 #include "torrent/torrent_session_policy.hpp"
@@ -54,9 +52,27 @@ using namespace std::chrono_literals;
 namespace macha {
 namespace {
 namespace lt = libtorrent;
+using test_support::BareNode;
 using test_support::TempDir;
+using test_support::TestNode;
 
 constexpr int block = lt::default_block_size;
+
+// A node whose store admits DATA as the torrent backend's real admission sees
+// it: `inflight` bytes of credit, `reserve` of them the viewer's, at most
+// `background` loader leases at once.
+struct LoaderNode {
+    TestNode test{"loader"};
+    BareNode* node{};
+    LoaderNode(uint64_t inflight, uint64_t reserve, size_t background) {
+        test.config().data_inflight_bytes = inflight;
+        test.config().data_viewer_reserve_bytes = reserve;
+        test.config().maintenance.background_concurrency = background;
+        test.config().data_credit_no_progress_deadline = 500ms;
+        node = &test.start_control_plane();
+        REQUIRE(node->wait_local_state_ready(10s));
+    }
+};
 
 // Non-repeating, so content addressing does not deduplicate equal extents.
 std::vector<char> pattern_bytes(size_t size, int seed) {
@@ -305,20 +321,21 @@ MACHA_TEST("torrent_disk_io",
     const std::vector<int64_t> sizes{300000, 5000, 131072, 70001};
     const auto torrent = make_torrent(dir.path() / "seed", sizes, 2 * block);
 
-    DataResourceArbiter arbiter(64 * 1024 * 1024, 16 * 1024 * 1024, 2, 500ms);
+    LoaderNode loader(64 * 1024 * 1024, 16 * 1024 * 1024, 2);
+    const auto credit = [&] { return loader.node->store_node().credit()->stats(); };
     std::atomic<uint64_t> observed_bytes{0};
     std::mutex published_mutex;
     std::map<ObjectId, Bytes> published;
     std::atomic<size_t> publishes{0};
     TorrentDiskHooks hooks;
-    hooks.admit = loader_admission(arbiter);
+    hooks.admit = loader_admission(loader.node->store_context());
     hooks.observe = [&](std::chrono::nanoseconds, uint64_t bytes) { observed_bytes += bytes; };
     // Every extent is published as its pieces verify.
     constexpr uint64_t extent_size = 64 * 1024;
     hooks.extent_size = extent_size;
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
     hooks.publish = [&](std::span<const uint8_t> bytes,
-                        std::atomic_bool&) -> std::optional<ObjectId> {
+                        const std::shared_ptr<std::atomic_bool>&) -> std::optional<ObjectId> {
         const auto id = object_id(bytes);
         std::lock_guard lock(published_mutex);
         published[id] = Bytes(bytes.begin(), bytes.end());
@@ -399,10 +416,10 @@ MACHA_TEST("torrent_disk_io",
             CHECK(read_file(leech_dir / "payload" / name) ==
                   read_file(dir.path() / "seed" / "payload" / name));
         }
-        const auto stats = arbiter.stats();
+        const auto stats = credit();
         CHECK(stats.loader_admissions > 0);
         CHECK(stats.speculative_admissions == 0);
-        CHECK(stats.viewer_admissions == 0);
+        CHECK(stats.foreground_admissions == 0);
         CHECK(observed_bytes.load() > 0);
 
         leecher.remove_torrent(downloading, lt::session_handle::delete_files);
@@ -412,7 +429,7 @@ MACHA_TEST("torrent_disk_io",
             [&] { return !std::filesystem::exists(TorrentExtentJournal::path_for(leech_dir)); },
             10s));
         CHECK(wait_for([&] { return open_files_under(leech_dir) == 0; }, 10s));
-        CHECK(wait_for([&] { return arbiter.stats().used_bytes == 0; }, 10s));
+        CHECK(wait_for([&] { return credit().used_bytes == 0; }, 10s));
     }
     seeder.remove_torrent(seeding);
 }
@@ -432,7 +449,7 @@ MACHA_TEST("torrent_disk_io",
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
     hooks.publish_retry = 50ms;
     hooks.publish = [&](std::span<const uint8_t> bytes,
-                        std::atomic_bool&) -> std::optional<ObjectId> {
+                        const std::shared_ptr<std::atomic_bool>&) -> std::optional<ObjectId> {
         if (attempts.fetch_add(1) == 0)
             return std::nullopt;
         const auto id = object_id(bytes);
@@ -499,7 +516,7 @@ MACHA_TEST("torrent_disk_io",
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
     hooks.publish_retry = 20ms;
     hooks.publish = [&](std::span<const uint8_t> bytes,
-                        std::atomic_bool&) -> std::optional<ObjectId> {
+                        const std::shared_ptr<std::atomic_bool>&) -> std::optional<ObjectId> {
         if (!release.load())
             return std::nullopt;
         return object_id(bytes);
@@ -547,7 +564,7 @@ MACHA_TEST("torrent_disk_io",
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
     hooks.publish_retry = 20ms;
     hooks.publish = [&](std::span<const uint8_t> bytes,
-                        std::atomic_bool&) -> std::optional<ObjectId> {
+                        const std::shared_ptr<std::atomic_bool>&) -> std::optional<ObjectId> {
         if (started.fetch_add(1) == 0) {
             std::unique_lock lock(gate_mutex);
             gate_cv.wait(lock, [&] { return open; });
@@ -606,7 +623,7 @@ MACHA_TEST("torrent_disk_io", test_lost_piece_alerts_are_recovered_from_the_held
     hooks.extent_size = 3 * block;
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
     hooks.publish = [&](std::span<const uint8_t> bytes,
-                        std::atomic_bool&) -> std::optional<ObjectId> {
+                        const std::shared_ptr<std::atomic_bool>&) -> std::optional<ObjectId> {
         ++publishes;
         return object_id(bytes);
     };
@@ -638,7 +655,7 @@ MACHA_TEST("torrent_disk_io", test_a_restarted_backend_does_not_republish_journa
         hooks.extent_size = 3 * block;
         hooks.verifications = std::make_shared<TorrentPieceVerifications>();
         hooks.publish = [&](std::span<const uint8_t> bytes,
-                            std::atomic_bool&) -> std::optional<ObjectId> {
+                            const std::shared_ptr<std::atomic_bool>&) -> std::optional<ObjectId> {
             ++publishes;
             return object_id(bytes);
         };
@@ -714,7 +731,8 @@ MACHA_TEST("torrent_disk_io", test_a_hash_issued_before_its_writes_complete_sees
     TempDir dir;
     TorrentDiskHooks hooks;
     hooks.threads = 4;
-    hooks.admit = [](uint64_t bytes, const std::atomic_bool&) -> std::shared_ptr<void> {
+    hooks.admit = [](uint64_t bytes,
+                     const std::shared_ptr<std::atomic_bool>&) -> std::shared_ptr<void> {
         if (bytes == static_cast<uint64_t>(block))
             std::this_thread::sleep_for(2ms);
         return std::make_shared<int>(0);
@@ -742,7 +760,8 @@ MACHA_TEST("torrent_disk_io", test_every_read_write_and_hash_is_admitted_and_mea
     std::atomic<int> admissions{0};
     std::atomic<uint64_t> observed_bytes{0};
     TorrentDiskHooks hooks;
-    hooks.admit = [&](uint64_t bytes, const std::atomic_bool&) -> std::shared_ptr<void> {
+    hooks.admit = [&](uint64_t bytes,
+                      const std::shared_ptr<std::atomic_bool>&) -> std::shared_ptr<void> {
         admitted_bytes += bytes;
         ++admissions;
         return std::make_shared<int>(0);
@@ -770,10 +789,11 @@ MACHA_TEST("torrent_disk_io", test_a_blocked_admission_pushes_back_on_the_networ
     bool open = false;
     TorrentDiskHooks hooks;
     hooks.threads = 1;
-    hooks.admit = [&](uint64_t, const std::atomic_bool& aborting) -> std::shared_ptr<void> {
+    hooks.admit = [&](uint64_t,
+                      const std::shared_ptr<std::atomic_bool>& aborting) -> std::shared_ptr<void> {
         std::unique_lock lock(gate_mutex);
-        gate_cv.wait(lock, [&] { return open || aborting.load(); });
-        return aborting.load() ? nullptr : std::make_shared<int>(0);
+        gate_cv.wait(lock, [&] { return open || aborting->load(); });
+        return aborting->load() ? nullptr : std::make_shared<int>(0);
     };
     Harness h(layout({16 * block}, 16 * block), dir.path(), hooks, 4 * block);
 
@@ -817,8 +837,9 @@ MACHA_TEST("torrent_disk_io", test_abort_releases_jobs_blocked_in_admission) {
     TempDir dir;
     TorrentDiskHooks hooks;
     hooks.threads = 2;
-    hooks.admit = [](uint64_t, const std::atomic_bool& aborting) -> std::shared_ptr<void> {
-        while (!aborting.load())
+    hooks.admit = [](uint64_t,
+                     const std::shared_ptr<std::atomic_bool>& aborting) -> std::shared_ptr<void> {
+        while (!aborting->load())
             std::this_thread::sleep_for(5ms);
         return nullptr;
     };
@@ -900,18 +921,17 @@ MACHA_TEST("torrent_disk_io",
 }
 
 MACHA_TEST("torrent_disk_io", test_loader_admission_waits_for_credit_and_yields_on_abort) {
-    // The node's arbiter-backed admission at loader class: admitted on a
-    // pressured device with no viewer, waits while the loader ceiling is full,
-    // proceeds when a lease is released, and gives up promptly on abort.
-    DiskServiceMonitor monitor;
-    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 1, 500ms, [] { return false; });
-    arbiter.observe_device(&monitor, 1);
+    // The node's admission at loader class: admitted on a pressured device
+    // with no viewer, waits while the loader ceiling is full, proceeds when a
+    // lease is released, and gives up promptly on abort.
+    LoaderNode loader(16 * 1024 * 1024, 4 * 1024 * 1024, 1);
+    auto& devices = loader.node->store_context().devices();
     for (int i = 0; i < 30; ++i)
-        monitor.note(9000ms, 4 * 1024 * 1024);
-    REQUIRE(monitor.pressured());
+        devices.note_io(9000ms, 4 * 1024 * 1024);
+    REQUIRE(devices.pressured());
 
-    auto admit = loader_admission(arbiter);
-    std::atomic_bool aborting{false};
+    auto admit = loader_admission(loader.node->store_context());
+    const auto aborting = std::make_shared<std::atomic_bool>(false);
     auto first = admit(block, aborting);
     REQUIRE(first != nullptr);
 
@@ -937,7 +957,7 @@ MACHA_TEST("torrent_disk_io", test_loader_admission_waits_for_credit_and_yields_
         returned = none == nullptr;
     });
     std::this_thread::sleep_for(100ms);
-    aborting = true;
+    *aborting = true;
     const auto started = std::chrono::steady_clock::now();
     blocked.join();
     CHECK(returned.load());
@@ -952,12 +972,12 @@ namespace {
 // A session on macha's disk backend that counts every byte read, which is how
 // a recheck shows itself.
 struct CountingSession {
-    DataResourceArbiter arbiter{64 * 1024 * 1024, 16 * 1024 * 1024, 2, 500ms};
+    LoaderNode loader{64 * 1024 * 1024, 16 * 1024 * 1024, 2};
     std::atomic<uint64_t> read_bytes{0};
     TorrentDiskHooks hooks;
     std::unique_ptr<lt::session> session;
     CountingSession() {
-        hooks.admit = loader_admission(arbiter);
+        hooks.admit = loader_admission(loader.node->store_context());
         hooks.observe = [this](std::chrono::nanoseconds, uint64_t bytes) { read_bytes += bytes; };
         auto params = loopback_session_params();
         params.disk_io_constructor = macha_disk_io_constructor(hooks);
@@ -1121,12 +1141,12 @@ MACHA_TEST("torrent_disk_io", test_shutdown_cancels_a_publication_in_flight) {
     hooks.extent_size = 3 * block;
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
     hooks.publish = [&](std::span<const uint8_t>,
-                        std::atomic_bool& abort) -> std::optional<ObjectId> {
+                        const std::shared_ptr<std::atomic_bool>& abort) -> std::optional<ObjectId> {
         entered.store(true);
         const auto give_up = std::chrono::steady_clock::now() + 10s;
-        while (!abort.load() && std::chrono::steady_clock::now() < give_up)
+        while (!abort->load() && std::chrono::steady_clock::now() < give_up)
             std::this_thread::sleep_for(5ms);
-        saw_abort.store(abort.load());
+        saw_abort.store(abort->load());
         return std::nullopt;
     };
     const auto verifications = hooks.verifications;

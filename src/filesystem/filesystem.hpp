@@ -5,6 +5,7 @@
 #include "cluster/membership.hpp"
 #include "contract/thread_safety.hpp"
 #include "dagda/context.h"
+#include "dagda/ledger/reference_counts.h"
 #include "ledger/object_trie.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/metadata_server.hpp"
@@ -43,8 +44,8 @@ class FsStaleBasis final : public FsError {
   public:
     explicit FsStaleBasis(const std::string& s) : FsError(EAGAIN, s) {}
 };
-// StorageUnavailable as the filesystem reports it: EIO to a caller that reads
-// only the code; a writer that can wait catches this.
+// No node present could take the bytes (a write that landed nowhere): EIO to
+// a caller that reads only the code; a writer that can wait catches this.
 class FsStorageUnavailable final : public FsError {
   public:
     explicit FsStorageUnavailable(const std::string& s) : FsError(EIO, s) {}
@@ -55,8 +56,8 @@ class PlaybackTracker;
 // What a namespace tree refers to, frozen at one root: its DATA extents and
 // the tree's own nodes (control objects). A record's value is its count.
 struct NamespaceReferences {
-    ObjectTrie::Snapshot extents;
-    ObjectTrie::Snapshot nodes;
+    dagda::ledger::ObjectTrie::Snapshot extents;
+    dagda::ledger::ObjectTrie::Snapshot nodes;
 };
 
 // The same, listed: each sorted and distinct.
@@ -68,8 +69,8 @@ struct NamespaceListing {
 struct MaintenanceObjects {
     // What the namespace refers to at `metadata_generation`: its DATA
     // extents and the tree's own nodes (empty for an inline namespace).
-    ObjectTrie::Snapshot referenced_extents;
-    ObjectTrie::Snapshot referenced_nodes;
+    dagda::ledger::ObjectTrie::Snapshot referenced_extents;
+    dagda::ledger::ObjectTrie::Snapshot referenced_nodes;
     // The extents of unresolved conflict alternatives, sorted and distinct:
     // live until resolved.
     std::vector<ObjectId> conflict_live;
@@ -416,6 +417,9 @@ class FileSystem final : public PublicationTarget {
     DistributedStore& s_;
     // The store, through the contract Macha's code calls.
     dagda::Context& context_;
+    // The namespace's reference counts, the store node's: the census is their
+    // single owner, on the maintenance thread.
+    dagda::ledger::ReferenceCounts& references_;
     MetadataView& m_;
     PlaybackTracker* playback_{};
     // Held across open_write()'s path resolution and getattr, and the rename
@@ -549,8 +553,8 @@ class FileSystem final : public PublicationTarget {
     remove_abandoned_write_files(const std::filesystem::path& state_path, const NodeId& node);
     // Clears this node's abandoned write files first.
     FileSystem(const Config&, NodeId, const Membership&, LocalState&, MetadataServer&,
-               DistributedStore&, dagda::Context&, MetadataView&, RetainedMemoryLedger&,
-               PlaybackTracker* = nullptr);
+               DistributedStore&, dagda::Context&, dagda::ledger::ReferenceCounts&, MetadataView&,
+               RetainedMemoryLedger&, PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
     void mkdir(const std::string&, uint32_t, uint32_t, uint32_t);

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "torrent/torrent_disk_io.hpp"
 
+#include "cluster/frame_type.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
 #include "torrent/torrent_extent_journal.hpp"
@@ -233,7 +234,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             // Always a whole block: libtorrent 2.1 assumes it.
             char* buffer = new char[static_cast<size_t>(lt::default_block_size)];
             lt::storage_error error;
-            if (!admitted && aborting_.load())
+            if (!admitted && aborting_->load())
                 error = aborted();
             else
                 read(*storage, request.piece, request.start, buffer, request.length, error);
@@ -261,7 +262,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         enqueue(storage, [this, storage, request, bytes, size, handler = std::move(handler)] {
             auto admitted = admit(size);
             lt::storage_error error;
-            if (!admitted && aborting_.load())
+            if (!admitted && aborting_->load())
                 error = aborted();
             else
                 write(*storage, request.piece, request.start, bytes->data(), request.length, error);
@@ -291,7 +292,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             auto admitted = admit(static_cast<uint64_t>(std::max(piece_size, piece_size2)));
             lt::storage_error error;
             lt::hasher v1_hasher;
-            if (!admitted && aborting_.load()) {
+            if (!admitted && aborting_->load()) {
                 error = aborted();
             } else {
                 std::vector<char> block(static_cast<size_t>(lt::default_block_size));
@@ -331,7 +332,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             auto admitted = admit(static_cast<uint64_t>(length));
             lt::storage_error error;
             lt::hasher256 hasher;
-            if (!admitted && aborting_.load()) {
+            if (!admitted && aborting_->load()) {
                 error = aborted();
             } else {
                 std::vector<char> block(static_cast<size_t>(length));
@@ -450,7 +451,9 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     std::deque<std::shared_ptr<Storage>> ready_ MACHA_GUARDED_BY(mutex_);
     std::vector<std::shared_ptr<lt::disk_observer>> observers_ MACHA_GUARDED_BY(mutex_);
     bool stopping_ MACHA_GUARDED_BY(mutex_){};
-    std::atomic_bool aborting_{false};
+    // Co-owned with a store write that may still look at it after the
+    // backend has gone.
+    const std::shared_ptr<std::atomic_bool> aborting_ = std::make_shared<std::atomic_bool>(false);
     std::vector<std::thread> workers_;
 
     std::atomic<uint64_t> queued_write_bytes_{0};
@@ -603,7 +606,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             try {
                 published = publish(job);
             } catch (const std::exception& e) {
-                if (!aborting_.load())
+                if (!aborting_->load())
                     Log::warn("torrent extent publication failed path=" +
                               job.storage->extents[job.extent].relative_path + ": " + e.what() +
                               "; retrying");
@@ -622,7 +625,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         std::vector<uint8_t> bytes(static_cast<size_t>(extent.length));
         {
             auto admitted = admit(extent.length);
-            if (!admitted && aborting_.load())
+            if (!admitted && aborting_->load())
                 return false;
             lt::storage_error error;
             if (!read_extent(storage, extent, bytes, error)) {
@@ -636,7 +639,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         if (!id) {
             // Cancelled at shutdown, not failed: unjournalled, it is published
             // again on resume.
-            if (aborting_.load())
+            if (aborting_->load())
                 return false;
             Log::warn("torrent extent publication failed path=" + extent.relative_path +
                       " offset=" + std::to_string(extent.offset) + "; retrying");
@@ -762,7 +765,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     // After an abort queued jobs still run, skipping admission and I/O, and
     // answer operation_aborted; nothing unhashed is marked downloaded.
     void shut_down() {
-        aborting_.store(true);
+        aborting_->store(true);
         if (publishing()) {
             hooks_.verifications->detach();
             {
@@ -985,16 +988,18 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
 
 } // namespace
 
-std::function<std::shared_ptr<void>(uint64_t, const std::atomic_bool&)>
-loader_admission(DataResourceArbiter& arbiter) {
-    return [&arbiter](uint64_t bytes, const std::atomic_bool& aborting) -> std::shared_ptr<void> {
-        while (!aborting.load()) {
-            const auto deadline = DataWorkContext::Clock::now() + std::chrono::seconds(1);
-            auto lease =
-                arbiter.acquire(DataWorkContext(FrameType::loader, bytes, deadline), bytes);
-            if (lease)
-                return std::make_shared<DataResourceArbiter::Lease>(std::move(*lease));
-            if (DataWorkContext::Clock::now() < deadline)
+std::function<std::shared_ptr<void>(uint64_t, const std::shared_ptr<std::atomic_bool>&)>
+loader_admission(dagda::Context& store) {
+    return [&store](uint64_t bytes,
+                    const std::shared_ptr<std::atomic_bool>& aborting) -> std::shared_ptr<void> {
+        constexpr auto slice = std::chrono::seconds(1);
+        while (!aborting->load()) {
+            const auto started = std::chrono::steady_clock::now();
+            auto admission = store.devices().admit_data(FrameType::loader, bytes,
+                                                        std::chrono::milliseconds(slice), aborting);
+            if (admission)
+                return std::make_shared<dagda::store::DataAdmission>(std::move(*admission));
+            if (std::chrono::steady_clock::now() - started < slice)
                 return nullptr;
         }
         return nullptr;

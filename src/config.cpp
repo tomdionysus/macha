@@ -259,6 +259,8 @@ void parse_maintenance(const ConfigNode& root, Config& c) {
     if (m["garbage_grace_ms"])
         c.maintenance.garbage_grace =
             milliseconds(m["garbage_grace_ms"], "maintenance.garbage_grace_ms");
+    if (m["collect_garbage"])
+        c.maintenance.collect_garbage = m["collect_garbage"].as<bool>();
     if (m["busy_bandwidth_fraction"])
         c.maintenance.busy_bandwidth_fraction =
             parse_fraction(m["busy_bandwidth_fraction"], "busy_bandwidth_fraction");
