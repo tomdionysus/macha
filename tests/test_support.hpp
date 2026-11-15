@@ -4,6 +4,7 @@
 #include "catalogue/catalogue.hpp"
 #include "cluster/call_deadline.hpp"
 #include "cluster/distributed_store.hpp"
+#include "cluster/store_node.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
 #include "errno_text.hpp"
@@ -442,6 +443,11 @@ class BareNode : public BareNodeResources, public NodeRuntime {
           durability_batch_window_(durability_batch_window) {
         // The node holds the state path's lock from here.
         books.transcode_rates.open();
+        store_node_ = std::make_unique<dagda::Node>(
+            node(),
+            store_node_options(NodeRuntime::config(), NodeRuntime::keys(), hosts_extents(),
+                               durability_batch_window_),
+            dagda::Node::OpenLater{});
     }
     ~BareNode() {
         stop();
@@ -456,6 +462,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
         recovery_ = std::jthread([this](std::stop_token stop) {
             run_supervised_once("cluster-state-recovery", [this, stop] {
                 try {
+                    store_node_->open_store();
                     local_ = std::make_unique<LocalServices>(config(), identity(), progress,
                                                              stage_hook, stop, *this, resources,
                                                              routes, durability_batch_window_);
@@ -478,6 +485,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     void stop() {
         resources.stop();
         accounts_.stop();
+        store_node_->stop();
         NodeRuntime::stop();
         if (recovery_.joinable()) {
             recovery_.request_stop();
@@ -508,6 +516,10 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     }
     LocalState& local_state() {
         return local("local state").state();
+    }
+    // The store, through the contract Macha's code calls.
+    dagda::Context& store_context() {
+        return store_node_->context();
     }
     MetadataServer& metadata_server() {
         return local("metadata replica").metadata();
@@ -553,6 +565,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     std::chrono::milliseconds durability_batch_window_;
     Accounts accounts_{config(), identity(), *this, resources.events, routes};
     // Declared in this order so the recovery thread goes before what it built.
+    std::unique_ptr<dagda::Node> store_node_;
     std::unique_ptr<LocalServices> local_;
     std::jthread recovery_;
     std::mutex ledger_mutex_;

@@ -41,9 +41,9 @@ class ServicesBench {
             events_.emplace_back(event);
         };
         instruments.constructed = Clock::now();
-        services = std::make_unique<NodeServices>(*node, node->resources, node->local_state(),
-                                                  node->metadata_server(), node->routes, registry,
-                                                  port, std::move(instruments));
+        services = std::make_unique<NodeServices>(
+            *node, node->resources, node->local_state(), node->store_context(),
+            node->metadata_server(), node->routes, registry, port, std::move(instruments));
     }
     ~ServicesBench() {
         if (services)

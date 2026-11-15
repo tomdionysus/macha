@@ -9,6 +9,10 @@
 #include <string>
 #include <string_view>
 
+namespace dagda {
+class Context;
+}
+
 namespace macha {
 
 // Lifecycle state the supervisor tracks per subsystem; held by the supervisor,
@@ -45,6 +49,8 @@ struct SubsystemContext {
     RetainedMemoryLedger* retained_memory{};
     MessageRoutes* routes{};
     LocalState* local_state{};
+    // The store, through the contract Macha's code calls.
+    dagda::Context* store{};
     IngestManager* ingest{};
     SubsystemRegistry* registry{};
     FileSystem* filesystem{};
