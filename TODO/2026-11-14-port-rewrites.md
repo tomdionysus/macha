@@ -14,6 +14,10 @@ warnings as errors) but the suites run once the whole set is in; then fix forwar
 Dagda, then the harness and the migration rehearsal. Deps: Dannan 0.7.0 and Dagda `2f7eba6` built on build-3 into
 `/home/maintainer/deps/prefix-0.7.0` and `prefix-dagda-2f7eba6` (`build/pi/deps_070.sh`); the cutover pins Dannan 0.8.0
 (the `dannan-custody` tool lands there) and Dagda's tag once it builds on 0.8.0.
+**Dannan 0.8.0 tagged 2026-11-15** (`6c240cc`, with `dannan-custody`). Move Macha to it once Dagda's branch builds on
+0.8.0 (one Dannan for both): raise `find_package(dannan ...)` to 0.8.0 (SameMinorVersion would fall back to an
+installed 0.7), rebuild once for `libdannan.so.0.8`, and give any test double of `dannan::Nodes` the new pure
+virtuals `watch_advert` / `unwatch_advert`.
 
 **Owner surface (operator, 2026-11-15, relayed by Dagda):** Macha's composition root, which opens and owns the
 node, keeps `dagda::Node`'s owner surface: `open` / `OpenLater` and `open_store`, `stop`, `reconfigure`, and the
