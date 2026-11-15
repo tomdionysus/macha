@@ -57,6 +57,24 @@ filesystem and FUSE onto Context (`NodeServices::context_` is there to pass). Th
 
 ## R2. The filesystem and FUSE reads and publication [filesystem 1-8; FUSE 1-5, 7]
 
+**R2 design, read 2026-11-15 against Dagda `caec517`:** Context offers `Objects::read(id, ReadOptions)` blocking on
+the caller's thread with no deadline of its own; `ReadOptions{frame, deadline (relative ms, 0 none), stripe,
+shared_ptr<atomic_bool> cancelled}`; `ReadResult{ObjectData object, source, served_by, answer, ReadEnd end}` with
+`ReadEnd{served, not_found, cancelled, timed_out, unavailable}`; Dagda's `ObjectData` is
+`shared_ptr<const ObjectBuffer{Bytes bytes; MemoryHold memory}>`, the same shape as Macha's. Order:
+1. `FileSystem` takes `dagda::Context&` (built in `NodeServices`, `tests/test_support.hpp:702`,
+   `tests/test_hydration_catalogue.cpp:4429`); `open_read` hands it to `ReadHandle`.
+2. `ReadHandle` (`filesystem.cpp:84-197`) holds the Context and caches Dagda's `ObjectData`; `extent()` calls
+   `Objects::read` with the remaining time from the caller's deadline and maps `ReadEnd` to ECANCELED, ETIMEDOUT,
+   ENOENT/EIO (no own clock check); activity notes go to `Context::activity().note(frame, bytes)`.
+3. **The cancel token cascade (requirement 5):** `ReadHandle::read` takes `shared_ptr<atomic_bool>` instead of
+   `atomic_bool*`, so every caller owns one: FUSE `read_impl` (the broker's `cancelled` is already a
+   `shared_ptr` in `dispatch`, `fuse_frontend.hpp:567`; pass it into the task instead of the reference), the media
+   inputs' `InputIoState::cancelled` (`media_engine.cpp:184`), playback (`playback.cpp:252, 272`),
+   `media_information.cpp:27`, `web_api.cpp:89`, `media_catalogue.cpp:90`, `http.hpp:51, 170`.
+4. `read_impl` builds its reply in a Macha-owned buffer from owned parts and copies into libfuse's buffer only on
+   the worker before `dispatch` returns (the late-write fix), then publication on tickets, hydration, figures.
+
 - FileSystem, ReadHandle, WriteHandle, CacheHydrator, HydrationManager hold `dagda::Context&`; `FileSystem::store()`
   goes.
 - **Reads return owned parts:** ReadHandle returns `ReadResult::object` slices (shared, owned); `read_impl` assembles
