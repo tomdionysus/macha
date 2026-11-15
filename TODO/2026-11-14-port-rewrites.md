@@ -98,6 +98,19 @@ shared_ptr<atomic_bool> cancelled}`; `ReadResult{ObjectData object, source, serv
 - Hydration on Context with the hydrator's stop flag as cancel; activity, `idle_for`, reachability epoch (as a change
   notice; the parked recheck poll goes), capacity and extent size through Context; FUSE memory through Dannan's ledger.
 
+**R2 writes, done 2026-11-15:** every WriteHandle and `truncate_file` store call goes through Context
+(`FileSystem::put_extent` / `get_extent`, under the mount's co-owned cancel token). The handle holds `{id, Ticket}` per
+deferred extent; `commit` makes one many-ticket wait (the work's deadline, else 30 min) and reads the evidence: met ->
+commit; a copy with a `BarrierLoss` or a forgotten ticket -> re-put from any readable copy and wait once more, else
+ESTALE; anything else unmet -> EIO (FUSE retries). The "two cancel sources" gap was moot: production publications
+carry no cancel of their own, only the mount's. The publication's progress counter is co-owned
+(`DataWorkContext::shared_progress`, `FileSystem::write_progress_`). Activity (reads, writes, `idle_for`, the
+maintenance pacing reads and the idle gauges) is Context's now. **Not consistent until their steps land:** the torrent
+publish hook still writes to Macha's store (R5) and the catalogue still uses `DurabilityBatch` (R4), while every
+filesystem read is Dagda's; the namespace tree's CONTROL reads are R3. Hydration is on Context with the hydrator's stop token as
+the cancel; the reachability epoch and `logical_capacity` (Dagda `6ea9d04`, `Objects::logical_capacity`) too.
+`FileSystem::membership_` is now unused; it leaves the constructor with `LocalState&` in R7.
+
 ## R3. Metadata and the control store [metadata 2-7]
 
 - `ControlNamespaceNodeStore` and `MetadataManager` over `Context::Control` (the replica's applier built after

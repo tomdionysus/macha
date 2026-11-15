@@ -3576,7 +3576,7 @@ struct FuseFrontend::State {
                     *snapshot.published_path, config.write_through_cache && !publication->recovered,
                     config.publication_pipeline_bytes,
                     DataWorkContext(FrameType::loader, config.publication_quantum_bytes, {},
-                                    nullptr, &fs.write_progress(),
+                                    nullptr, fs.write_progress(),
                                     config.publication_no_progress_deadline));
             } catch (const FsError& e) {
                 if (e.code() == ENOENT && publication_path_may_still_appear(inode))
@@ -6530,7 +6530,7 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->peak_open_publications.load(std::memory_order_relaxed),
         state_->config.publication_max_open_writers,
         state_->data_publication_selections_under_writer_cap.load(std::memory_order_relaxed),
-        state_->fs.write_progress().load(std::memory_order_relaxed),
+        state_->fs.write_progress()->load(std::memory_order_relaxed),
         state_->data_publication_bytes_read.load(std::memory_order_relaxed),
         state_->data_publication_bytes_committed.load(std::memory_order_relaxed),
         state_->data_publication_bytes_confirmed.load(std::memory_order_relaxed),

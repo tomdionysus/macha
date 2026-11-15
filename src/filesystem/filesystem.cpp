@@ -3,7 +3,6 @@
 #include "contract/stopping.hpp"
 #include "errno_text.hpp"
 
-#include "cluster/placement.hpp"
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "filesystem/hydration.hpp"
@@ -387,20 +386,14 @@ std::chrono::milliseconds WriteHandle::flush() {
         peak_pending_extents_ = std::max(peak_pending_extents_, pending_extents_.size());
         return waited;
     }
-    ObjectId id;
-    try {
-        if (durability_ == WriteDurability::publication_generation)
-            id = fs_.store().put_deferred(buffer_, durability_batch_, work_context_.frame_type(),
-                                          fs_.io_cancelled_.get(), &work_context_);
-        else
-            id = fs_.store().put(buffer_, work_context_.frame_type(), fs_.io_cancelled_.get());
-    } catch (...) {
-        if (fs_.io_cancellation_requested())
-            fail(EINTR, "write cancelled");
-        throw;
-    }
+    const bool deferred = durability_ == WriteDurability::publication_generation;
+    const auto id = object_id(buffer_);
+    const auto ticket = fs_.put_extent(id, buffer_, deferred, work_context_.frame_type(),
+                                       deferred ? &work_context_ : nullptr);
+    if (deferred)
+        deferred_extents_.push_back({id, ticket});
     if (cache_puts_)
-        (void)fs_.store().cache_local(id, buffer_);
+        (void)fs_.context().objects().cache_local(id, buffer_);
     ++new_extent_puts_;
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
@@ -423,28 +416,90 @@ std::chrono::milliseconds WriteHandle::flush() {
     return elapsed;
 }
 
+dagda::Ticket FileSystem::put_extent(const ObjectId& id, std::span<const uint8_t> bytes,
+                                     bool deferred, FrameType frame,
+                                     const DataWorkContext* budget) {
+    dagda::store::WriteOptions options;
+    options.deferred = deferred;
+    options.frame = frame;
+    options.cancelled = io_cancelled_;
+    if (budget) {
+        options.no_progress_budget = budget->no_progress_budget();
+        options.progress = budget->shared_progress();
+    }
+    const auto evidence = context_.objects().write(id, bytes, std::move(options));
+    if (evidence.cancelled || io_cancellation_requested())
+        fail(EINTR, "write cancelled");
+    if (evidence.holders() == 0)
+        throw FsStorageUnavailable("object replication quorum unavailable");
+    return evidence.ticket;
+}
+
+WriteHandle::DurabilityOutcome
+WriteHandle::await_durability(const std::vector<Durability>& extents) {
+    // The work's deadline when it has one, else the bound a store call has
+    // always had (object_transfer, 30 min).
+    auto deadline = std::chrono::milliseconds(std::chrono::minutes(30));
+    if (work_context_.deadline() != Clock::time_point{})
+        deadline = std::max(std::chrono::milliseconds(1),
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                work_context_.deadline() - Clock::now()));
+    std::vector<dagda::Ticket> tickets;
+    tickets.reserve(extents.size());
+    for (const auto& extent : extents)
+        tickets.push_back(extent.ticket);
+    const auto evidence = fs_.context().tickets().wait(tickets, deadline);
+    if (fs_.io_cancellation_requested())
+        fail(EINTR, "write cancelled");
+    DurabilityOutcome out;
+    for (size_t i = 0; i < extents.size(); ++i) {
+        const auto& one = evidence.at(i);
+        if (one.met)
+            continue;
+        const bool forgotten = !one.ticket.valid();
+        const bool refused_for_good =
+            std::ranges::any_of(one.replicas, [](const dagda::store::ReplicaEvidence& replica) {
+                return replica.loss != dagda::store::BarrierLoss::none;
+            });
+        if (forgotten || refused_for_good)
+            out.extents.push_back(extents[i]);
+        else
+            out.unmet = true;
+    }
+    return out;
+}
+
+dagda::store::ObjectData FileSystem::get_extent(const ObjectId& id, size_t stripe,
+                                                FrameType frame) {
+    dagda::store::ReadOptions options;
+    options.frame = frame;
+    options.stripe = stripe;
+    options.cancelled = io_cancelled_;
+    auto result = context_.objects().read(id, std::move(options));
+    if (result.end != dagda::store::ReadEnd::served)
+        return {};
+    return std::move(result.object);
+}
+
 void WriteHandle::launch_pending_extent(PendingExtent& pending) {
-    auto* store = &fs_.store();
-    auto* cancelled = fs_.io_cancelled_.get();
+    auto* fs = &fs_;
     const auto cache_put = pending.cache_put;
     const auto offset = pending.offset;
     const auto bytes = pending.payload;
-    const auto frame_type = work_context_.frame_type();
     // The context carries the progress counter and no-progress budget, so a
     // put to a silent peer fails rather than holding drain_one_extent().
     const auto context = work_context_;
-    pending.result =
-        fs_.submit_extent_task([store, cancelled, cache_put, offset, frame_type, bytes, context] {
-            const auto put_started = Clock::now();
-            DistributedStore::DurabilityBatch batch;
-            auto id = store->put_deferred(*bytes, batch, frame_type, cancelled, &context);
-            if (cache_put)
-                (void)store->cache_local(id, *bytes);
-            return StagedExtentResult{
-                {offset, bytes->size(), id, false},
-                std::move(batch),
-                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - put_started)};
-        });
+    pending.result = fs_.submit_extent_task([fs, cache_put, offset, bytes, context] {
+        const auto put_started = Clock::now();
+        const auto id = object_id(*bytes);
+        const auto ticket = fs->put_extent(id, *bytes, true, context.frame_type(), &context);
+        if (cache_put)
+            (void)fs->context().objects().cache_local(id, *bytes);
+        return StagedExtentResult{
+            {offset, bytes->size(), id, false},
+            ticket,
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - put_started)};
+    });
 }
 
 std::chrono::milliseconds WriteHandle::drain_one_extent() {
@@ -456,10 +511,7 @@ std::chrono::milliseconds WriteHandle::drain_one_extent() {
     if (!pending.result.valid())
         launch_pending_extent(pending);
     auto result = pending.result.get();
-    durability_batch_.requirements.insert(
-        durability_batch_.requirements.end(),
-        std::make_move_iterator(result.durability.requirements.begin()),
-        std::make_move_iterator(result.durability.requirements.end()));
+    deferred_extents_.push_back({result.extent.id, result.ticket});
     extents_.push_back(result.extent);
     ++new_extent_puts_;
     if (result.elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
@@ -500,16 +552,17 @@ void WriteHandle::prepare_append_tail() {
     if (tail.hole) {
         bytes.assign(static_cast<size_t>(tail.length), 0);
     } else {
-        auto data = fs_.store().get(tail.id, static_cast<size_t>(tail.offset / fs_.extent_size()),
-                                    work_context_.frame_type(), {}, fs_.io_cancelled_.get());
+        const auto data =
+            fs_.get_extent(tail.id, static_cast<size_t>(tail.offset / fs_.extent_size()),
+                           work_context_.frame_type());
         if (!data) {
             if (fs_.io_cancellation_requested())
                 fail(EINTR, "write cancelled");
             fail(EIO, "cannot read append tail extent");
         }
-        if (data->size() != tail.length)
+        if (data->bytes.size() != tail.length)
             fail(EIO, "append tail extent length mismatch");
-        bytes = std::move(*data);
+        bytes = data->bytes;
     }
     ++append_tail_fetches_;
     buffer_ = std::move(bytes);
@@ -652,16 +705,15 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
                 Bytes zeros(static_cast<size_t>(extent.length), 0);
                 stage_temp(zeros, extent.offset);
             } else {
-                auto bytes =
-                    fs_.store().get(extent.id, materialize_extent_index_,
-                                    work_context_.frame_type(), {}, fs_.io_cancelled_.get());
+                const auto data = fs_.get_extent(extent.id, materialize_extent_index_,
+                                                 work_context_.frame_type());
                 ++materialize_source_reads_;
-                if (!bytes || bytes->size() != extent.length) {
+                if (!data || data->bytes.size() != extent.length) {
                     if (fs_.io_cancellation_requested())
                         fail(EINTR, "write cancelled");
                     fail(EIO, "cannot rematerialize staged extent");
                 }
-                stage_temp(*bytes, extent.offset);
+                stage_temp(data->bytes, extent.offset);
             }
             materialize_offset_ += extent.length;
             processed += extent.length;
@@ -899,14 +951,10 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
         }
     }
     dirty_ = true;
-    if (work_context_.frame_type() == FrameType::foreground)
-        fs_.store().foreground_activity(d.size());
-    else if (work_context_.frame_type() == FrameType::read_ahead)
-        fs_.store().interactive_activity(d.size());
-    else if (work_context_.frame_type() == FrameType::loader)
-        // Ingest writes here with a default (loader) context; maintenance
-        // scheduling reads this clock.
-        fs_.store().loader_activity(d.size());
+    // Ingest writes here with a default (loader) context; maintenance
+    // scheduling reads this clock. Speculative work notes nothing.
+    if (work_context_.frame_type() != FrameType::speculative)
+        fs_.context().activity().note(work_context_.frame_type(), d.size());
     const auto total =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (total >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
@@ -1049,14 +1097,13 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
                     const auto copy =
                         static_cast<size_t>(std::min<uint64_t>(n, source_extent->length));
                     if (!source_extent->hole) {
-                        auto source = fs_.store().get(source_extent->id, rebuild_index_,
-                                                      work_context_.frame_type(), {},
-                                                      fs_.io_cancelled_.get());
-                        if (!source || source->size() != source_extent->length ||
-                            source->size() < copy)
+                        const auto source = fs_.get_extent(source_extent->id, rebuild_index_,
+                                                           work_context_.frame_type());
+                        if (!source || source->bytes.size() != source_extent->length ||
+                            source->bytes.size() < copy)
                             fail(EIO, "cannot read changed source extent");
-                        std::copy_n(source->data(), copy, bytes.data());
-                        source_bytes += source->size();
+                        std::copy_n(source->bytes.data(), copy, bytes.data());
+                        source_bytes += source->bytes.size();
                     }
                 }
                 for (const auto& range : changed_ranges_) {
@@ -1092,20 +1139,14 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
         } else {
             const auto data = std::span<const uint8_t>{bytes.data(), n};
             const auto started = Clock::now();
-            const bool ok =
-                durability_ == WriteDurability::publication_generation
-                    ? fs_.store().put_deferred(id, data, durability_batch_,
-                                               work_context_.frame_type(), fs_.io_cancelled_.get())
-                    : fs_.store().put(id, data, work_context_.frame_type(),
-                                      fs_.io_cancelled_.get());
+            const bool deferred = durability_ == WriteDurability::publication_generation;
+            const auto ticket =
+                fs_.put_extent(id, data, deferred, work_context_.frame_type(), nullptr);
+            if (deferred)
+                deferred_extents_.push_back({id, ticket});
             elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-            if (!ok) {
-                if (fs_.io_cancellation_requested())
-                    fail(EINTR, "write cancelled");
-                throw FsStorageUnavailable("object replication quorum unavailable");
-            }
             if (cache_puts_)
-                (void)fs_.store().cache_local(id, data);
+                (void)fs_.context().objects().cache_local(id, data);
             result = {rebuild_offset_, n, id, false};
             ++rebuild_put_extents_;
             if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug))
@@ -1210,45 +1251,31 @@ void WriteHandle::commit() {
                        " index=" + std::to_string(i) + " offset=" + std::to_string(x.offset) +
                        " length=" + std::to_string(x.length) + " id=" + to_string(x.id));
     }
-    if (durability_ == WriteDurability::publication_generation && !durability_batch_.empty()) {
+    if (durability_ == WriteDurability::publication_generation && !deferred_extents_.empty()) {
         const auto durability_started = Clock::now();
-        std::vector<ObjectId> unsatisfiable;
-        if (!fs_.store().durability_barrier(durability_batch_, work_context_.frame_type(),
-                                            &unsatisfiable)) {
-            // What remains is an object no peer holds (the barrier handles dead
-            // placement tokens). Re-put from a local copy, else ESTALE: the
-            // generation must be replayed from the WAL. Never retry the batch.
-            bool reput_all = !unsatisfiable.empty();
-            for (const auto& id : unsatisfiable) {
-                const auto data = fs_.local_.data().get(id);
-                if (!data) {
-                    reput_all = false;
-                    break;
-                }
-                std::erase_if(durability_batch_.requirements,
-                              [&](const auto& requirement) { return requirement.id == id; });
-                if (!fs_.store().put_deferred(id, *data, durability_batch_,
-                                              work_context_.frame_type(),
-                                              fs_.io_cancelled_.get())) {
-                    reput_all = false;
-                    break;
-                }
+        auto lost = await_durability(deferred_extents_);
+        if (lost.unmet)
+            fail(EIO, "object durability quorum unavailable before publication");
+        if (!lost.extents.empty()) {
+            // Copies a barrier refused for good, or tickets the store forgot:
+            // put again from a readable copy, else ESTALE: the generation must
+            // be replayed from the WAL. Never retry the same tickets.
+            for (auto& extent : lost.extents) {
+                const auto data = fs_.get_extent(extent.id, 0, work_context_.frame_type());
+                if (!data)
+                    fail(ESTALE, "object durability lost on a peer and no local copy; "
+                                 "publication must be replayed");
+                extent.ticket = fs_.put_extent(extent.id, data->bytes, true,
+                                               work_context_.frame_type(), nullptr);
             }
-            if (!reput_all)
-                fail(unsatisfiable.empty() ? EIO : ESTALE,
-                     unsatisfiable.empty()
-                         ? "object durability quorum unavailable before publication"
-                         : "object durability lost on a peer and no local copy; "
-                           "publication must be replayed");
             Log::info("write stage id=" + std::to_string(diagnostic_id_) +
-                      " path=" + current_path() + " re-put " +
-                      std::to_string(unsatisfiable.size()) + " extent(s) a peer no longer held");
-            unsatisfiable.clear();
-            if (!fs_.store().durability_barrier(durability_batch_, work_context_.frame_type(),
-                                                &unsatisfiable))
+                      " path=" + current_path() + " re-put " + std::to_string(lost.extents.size()) +
+                      " extent(s) a peer no longer held");
+            const auto again = await_durability(lost.extents);
+            if (again.unmet || !again.extents.empty())
                 fail(EIO, "object durability quorum unavailable after re-put");
         }
-        durability_batch_.clear();
+        deferred_extents_.clear();
         const auto durability_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - durability_started);
         if (durability_elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug))
@@ -2015,10 +2042,12 @@ void FileSystem::truncate_file(const std::string& p, uint64_t z) {
             if (x.hole)
                 xs.push_back({x.offset, keep, {}, true});
             else {
-                auto d = s_.get(x.id, i);
-                if (!d || d->size() < keep)
+                const auto d = get_extent(x.id, i, FrameType::foreground);
+                if (!d || d->bytes.size() < keep)
                     fail(EIO, "truncate source unavailable");
-                auto id = s_.put({d->data(), keep});
+                const std::span<const uint8_t> kept{d->bytes.data(), keep};
+                const auto id = object_id(kept);
+                (void)put_extent(id, kept, false, FrameType::loader, nullptr);
                 xs.push_back({x.offset, keep, id, false});
             }
             break;
@@ -2214,7 +2243,7 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry,
                                         normalize_path(logical_path), frame_type);
 }
 uint64_t FileSystem::reachability_epoch() const noexcept {
-    return s_.reachability_epoch();
+    return context_.objects().reachability_epoch();
 }
 
 std::shared_ptr<PublicationWriter> FileSystem::open_publication(const std::string& path,
@@ -2426,31 +2455,8 @@ std::optional<MetadataSnapshotView> FileSystem::available_snapshot_view() const 
 }
 
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
-    auto ns = membership_.active();
-    // Edge nodes hold no extents and must not enter the water-level
-    // calculation: their presence would skew replica and failure-domain maths.
-    std::erase_if(ns, [](const NodeInfo& node) { return !node_hosts_extents(node); });
-    // Membership may be empty or lack capacities just after start; never
-    // report less than this node's own store.
-    const auto local_fallback = [&]() -> std::pair<uint64_t, uint64_t> {
-        const uint64_t limit = local_.data().limit();
-        const uint64_t used = std::min(limit, local_.data().used());
-        return {limit, used};
-    };
-    if (ns.empty())
-        return local_fallback();
-    const size_t r = std::max<size_t>(1, std::min(config_.replication, ns.size()));
-    const uint64_t total = placement_logical_capacity(ns, r);
-    if (!total)
-        return local_fallback();
-
-    __uint128_t physical_used = 0;
-    for (const auto& node : ns)
-        physical_used += node.used;
-    uint64_t used = static_cast<uint64_t>(
-        std::min<__uint128_t>(physical_used / r, std::numeric_limits<uint64_t>::max()));
-    used = std::min(used, total);
-    return {total, used};
+    const auto capacity = context_.objects().logical_capacity();
+    return {capacity.total, capacity.used};
 }
 Hash256 FileSystem::namespace_signature(uint64_t* metadata_generation) {
     const auto view = m_.local();

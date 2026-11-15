@@ -58,7 +58,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       scanner_(node_, metadata_server_, filesystem_, catalogue_, catalogue_hints_,
                node_.config().catalogue.scanner, std::unique_ptr<HttpClient>{},
                std::chrono::seconds(5), media_engine_, &media_information_),
-      hydration_(store_, playback_, filesystem_, catalogue_, node_.config().hydration,
+      hydration_(context_, playback_, filesystem_, catalogue_, node_.config().hydration,
                  node_.config().read_ahead_extents),
       ingest_(node_, filesystem_, catalogue_hints_, node_.config().ingest, &media_information_),
       torrent_search_(node_.config().torrent), cluster_jobs_(node_, ingest_, registry_),
@@ -131,11 +131,26 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
       horizon_builder_(filesystem_, catalogue_, local_.control(), store_),
       files_api_(filesystem_, availability_),
-      maintenance_(MaintenanceDependencies{
-          node_, local_, metadata_server_, store_, metadata_, metadata_, catalogue_,
-          horizon_builder_, ledger_, data_unreferenced_, control_unreferenced_, availability_,
-          media_information_, resources_.events, port_, instruments_.clock, instruments_.trace,
-          instruments_.maintenance_stage_hook, instruments_.constructed}) {
+      maintenance_(MaintenanceDependencies{node_,
+                                           local_,
+                                           metadata_server_,
+                                           store_,
+                                           context_,
+                                           metadata_,
+                                           metadata_,
+                                           catalogue_,
+                                           horizon_builder_,
+                                           ledger_,
+                                           data_unreferenced_,
+                                           control_unreferenced_,
+                                           availability_,
+                                           media_information_,
+                                           resources_.events,
+                                           port_,
+                                           instruments_.clock,
+                                           instruments_.trace,
+                                           instruments_.maintenance_stage_hook,
+                                           instruments_.constructed}) {
     routes_.bind(MessageType::get_ingest_jobs,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return RpcMessage{MessageType::ingest_jobs_reply,
@@ -193,8 +208,8 @@ std::map<std::string, uint64_t> NodeServices::observation_gauges() {
         gauges["memory_ledger_caches_bytes"] = config.ledger_cache;
         gauges["memory_catalogue_bytes"] = catalogue_.resident_bytes();
     }
-    gauges["viewer_idle_ms"] = idle_ms(store_.idle_for(WorkClass::foreground));
-    gauges["loader_idle_ms"] = idle_ms(store_.idle_for(WorkClass::loader));
+    gauges["viewer_idle_ms"] = idle_ms(context_.activity().idle_for(WorkClass::foreground));
+    gauges["loader_idle_ms"] = idle_ms(context_.activity().idle_for(WorkClass::loader));
     const auto repair = store_.repair_diagnostics();
     gauges["repair_push_examined"] = repair.push_examined;
     gauges["repair_pull_examined"] = repair.pull_examined;
