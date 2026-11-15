@@ -5909,11 +5909,16 @@ FuseOpenHandle FuseFrontend::create(std::string_view path, uint32_t mode, uint32
 
 size_t FuseFrontend::read_impl(uint64_t inode_id,
                                const std::shared_ptr<FuseReadSession>& read_session,
-                               uint64_t offset, std::span<uint8_t> output) {
-    return dispatch(
+                               uint64_t offset, std::span<uint8_t> reply_to) {
+    // The worker fills a buffer this request owns; the caller's buffer is written only
+    // here, on the caller's thread, once dispatch has the answer. A read that times out
+    // while running leaves its worker writing nothing the caller still sees.
+    auto reply = std::make_shared<Bytes>(reply_to.size());
+    const auto read_bytes = dispatch(
         FuseOperationClass::read,
         [this, inode_id, read_session, offset,
-         output](Clock::time_point deadline, const std::shared_ptr<std::atomic_bool>& cancelled) {
+         reply](Clock::time_point deadline, const std::shared_ptr<std::atomic_bool>& cancelled) {
+            const std::span<uint8_t> output(reply->data(), reply->size());
             auto inode = state_->resolve_inode(inode_id);
             struct ReadOverlay {
                 uint64_t begin{};
@@ -6068,8 +6073,9 @@ size_t FuseFrontend::read_impl(uint64_t inode_id,
             }
             return count;
         });
+    std::copy_n(reply->data(), read_bytes, reply_to.data());
+    return read_bytes;
 }
-
 size_t FuseFrontend::read(uint64_t inode_id, uint64_t offset, std::span<uint8_t> output) {
     return read_impl(inode_id, {}, offset, output);
 }
