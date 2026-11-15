@@ -72,6 +72,12 @@ shared_ptr<atomic_bool> cancelled}`; `ReadResult{ObjectData object, source, serv
    `shared_ptr` in `dispatch`, `fuse_frontend.hpp:567`; pass it into the task instead of the reference), the media
    inputs' `InputIoState::cancelled` (`media_engine.cpp:184`), playback (`playback.cpp:252, 272`),
    `media_information.cpp:27`, `web_api.cpp:89`, `media_catalogue.cpp:90`, `http.hpp:51, 170`.
+   Owners found: `MediaSource::cancelled` is already a `shared_ptr` (probes pass `.get()`,
+   `media_engine.cpp:1769, 1848, 1935`: pass the pointer itself); playback (`:1357`) and subtitles (`:2074`) pass the
+   address of a local `atomic_bool`: make it a `shared_ptr`; `MediaInput::read` (`media_engine.hpp:106`) and
+   `InputContext`'s constructor (`media_engine.cpp:303`) take the `shared_ptr`; `FileSystem::io_cancellation_flag`
+   (`filesystem.hpp:635`) and `WorkContext::cancelled_` (`contract/work.hpp:39-75`) feed Macha's own store and go
+   with it in R7, except where they reach a `ReadHandle`.
 4. `read_impl` builds its reply in a Macha-owned buffer from owned parts and copies into libfuse's buffer only on
    the worker before `dispatch` returns (the late-write fix), then publication on tickets, hydration, figures.
 
