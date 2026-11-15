@@ -287,6 +287,10 @@ corruption.
 - **A Macha defect the port finds is fixed in Macha first**; the libraries match the fix. A Macha test retires only
   against a named library case, recorded case by case.
 - **One definition per concept**: a type Dannan or Dagda defines is aliased, never twinned.
+- **Agreement is Dannan's** (operator 2026-11-15, relayed by Dannan): anything that could use consensus or agreement
+  waits for Dannan's agreement primitive (0.9.0, leaderless, CASPaxos-shaped, per register; design in
+  `../dannan/TODO/2026-11-15-agreement-design.md`). Macha builds no new consensus, no lease standing in for one,
+  and no workaround meanwhile.
 - **Builds** only on the Pis, -j2 or -j3, nice 19, claimed. Never edit sources under a running build of the same
   tree (the Pi has its own copy, so editing on the Mac is fine). Format with clang-format 19; clang-tidy reports
   nothing; a suppression is a `NOLINTNEXTLINE(check)` with its reason beside it.
