@@ -154,13 +154,10 @@ struct TorrentManager::Impl {
         : session(make_session_params(config, advertise, std::move(disk_hooks))) {}
 };
 
-TorrentManager::TorrentManager(NodeRuntime& node, LocalState& local,
-                               DataResourceArbiter& data_resources, IngestManager& ingest,
-                               TorrentConfig config, const std::filesystem::path& state_path,
-                               const TimeSource& time)
-    : node_(node), local_(local), data_resources_(data_resources), ingest_(ingest), time_(time),
-      config_(std::move(config)), enabled_(config_.enabled),
-      state_file_(state_path / "torrent" / "jobs.json"),
+TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, TorrentConfig config,
+                               const std::filesystem::path& state_path, const TimeSource& time)
+    : node_(node), ingest_(ingest), time_(time), config_(std::move(config)),
+      enabled_(config_.enabled), state_file_(state_path / "torrent" / "jobs.json"),
       resume_dir_(state_path / "torrent" / "resume") {
     if (!config_.enabled)
         return;
@@ -1268,18 +1265,29 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
         Lock lock(mutex_);
         hooks.threads = config_.disk_threads;
     }
-    hooks.admit = loader_admission(data_resources_);
+    dagda::Context* store = &ingest_.filesystem().context();
+    hooks.admit = loader_admission(*store);
     // Every verified extent is published durably at loader class into the
     // ingest's store and journalled; the ingest commits files by naming them.
     hooks.extent_size = node_.config().extent_size;
     hooks.verifications = verifications_;
-    FileSystem* fs = &ingest_.filesystem();
-    hooks.publish = [fs](std::span<const uint8_t> bytes,
-                         std::atomic_bool& abort) -> std::optional<ObjectId> {
+    hooks.publish =
+        [store](std::span<const uint8_t> bytes,
+                const std::shared_ptr<std::atomic_bool>& abort) -> std::optional<ObjectId> {
+        // One copy on disk (Macha's floor) before the extent is journalled;
+        // the rest is prompt replication's.
+        const auto id = object_id(bytes);
+        dagda::store::WriteOptions options;
+        options.ack_level = dagda::store::Durability::persisted;
+        options.frame = FrameType::loader;
+        options.cancelled = abort;
         try {
-            return fs->store().put(bytes, FrameType::loader, &abort);
+            const auto evidence = store->objects().write(id, bytes, std::move(options));
+            if (evidence.cancelled || evidence.holders() == 0)
+                return std::nullopt;
+            return id;
         } catch (const std::exception& e) {
-            if (!abort.load())
+            if (!abort->load())
                 Log::debug(std::string("torrent extent put failed: ") + e.what());
             return std::nullopt;
         }
@@ -1322,10 +1330,9 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
         return shared;
     };
     (void)shares_data_device();
-    hooks.observe = [monitor = &local_.data().service_monitor(),
-                     shares_data_device](std::chrono::nanoseconds elapsed, uint64_t bytes) {
+    hooks.observe = [store, shares_data_device](std::chrono::nanoseconds elapsed, uint64_t bytes) {
         if (shares_data_device())
-            monitor->note(elapsed, bytes);
+            store->devices().note_io(elapsed, bytes);
     };
     Log::info("torrent disk backend threads=" + std::to_string(hooks.threads) +
               " admission=loader");

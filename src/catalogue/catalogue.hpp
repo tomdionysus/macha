@@ -4,6 +4,8 @@
 #include "cluster/distributed_store.hpp"
 #include "contract/object_ledger.hpp"
 #include "contract/thread_safety.hpp"
+#include "dagda/context.h"
+#include "dagda/contract/reachability.h"
 #include "media/media_engine.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/metadata_server.hpp"
@@ -329,14 +331,18 @@ class CatalogueUnavailable : public std::runtime_error {
 // catalogue.cpp; only the manager makes one.
 class CatalogueDraft;
 
+// Staged artwork's write tickets, made durable together by one barrier.
+using ArtworkTickets = std::vector<dagda::Ticket>;
+
 class CatalogueManager {
     NodeRuntime& node_;
-    LocalState& local_;
-    const ObjectLedger& ledger_;
     MetadataServer& metadata_server_;
-    DistributedStore& store_;
+    // The store: the catalogue's manifest and shards are CONTROL objects, its
+    // artwork and media indexes DATA.
+    dagda::Context& store_;
     MetadataView& metadata_;
-    // Held across control-store reads and removals in control_gc_step().
+    // Held across control-store reads, and across a CONTROL removal the
+    // store's collector runs within the root epoch.
     mutable IoMutex mutex_;
     // One install at a time; guards nothing. Held across the head read and
     // the control store reads that load a new root.
@@ -362,7 +368,6 @@ class CatalogueManager {
     Clock::time_point control_gc_root_epoch_ MACHA_GUARDED_BY(mutex_){};
     uint64_t control_gc_root_epoch_sequence_ MACHA_GUARDED_BY(mutex_){};
     bool control_gc_root_epoch_initialized_ MACHA_GUARDED_BY(mutex_){};
-    std::map<ObjectId, uint64_t> control_gc_unreferenced_epoch_ MACHA_GUARDED_BY(mutex_);
     bool ready_ MACHA_GUARDED_BY(mutex_){};
     std::string error_code_ MACHA_GUARDED_BY(mutex_); // converging, unavailable
     std::string error_ MACHA_GUARDED_BY(mutex_);
@@ -378,12 +383,17 @@ class CatalogueManager {
         resolved_media_profiles_ MACHA_GUARDED_BY(media_profile_mutex_);
     std::map<std::string, std::shared_ptr<MediaProfileFlight>, std::less<>>
         media_profile_flights_ MACHA_GUARDED_BY(media_profile_mutex_);
-    // Owned by the maintenance thread, the only caller of control_gc_step().
-    LocalStore::Cursor control_gc_cursor_;
     std::optional<ObjectId> control_converged_root_ MACHA_GUARDED_BY(mutex_);
     std::vector<NodeId> control_converged_nodes_ MACHA_GUARDED_BY(mutex_);
     Clock::time_point control_convergence_retry_ MACHA_GUARDED_BY(mutex_){};
 
+    // A DATA object's bytes, on the caller's thread with no deadline; none
+    // when it could not be read. Every store call here throws only
+    // CatalogueUnavailable: a store failure never spends a hint's attempt.
+    std::optional<Bytes> read_data(const ObjectId&, FrameType);
+    // A CONTROL object's bytes, held here or fetched from a peer; none when
+    // neither has it.
+    std::optional<Bytes> control_object(const ObjectId&);
     // Every DATA object the catalogue references: artwork and media indexes.
     static std::set<ObjectId> data_object_ids(const CatalogueSnapshot&);
     static std::set<ObjectId> data_object_ids(const CatalogueView&);
@@ -434,8 +444,7 @@ class CatalogueManager {
                 std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict = {});
 
   public:
-    CatalogueManager(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore&, MetadataView&,
-                     const ObjectLedger&);
+    CatalogueManager(NodeRuntime&, MetadataServer&, dagda::Context& store, MetadataView&);
 
     const ClusterKeys& cluster_keys() const noexcept {
         return node_.keys();
@@ -514,14 +523,14 @@ class CatalogueManager {
                                    std::span<const uint8_t> bytes,
                                    FrameType frame = FrameType::speculative);
     CatalogueArtwork stage_artwork_deferred(std::string role, std::string mime_type,
-                                            std::span<const uint8_t> bytes,
-                                            DistributedStore::DurabilityBatch& batch,
+                                            std::span<const uint8_t> bytes, ArtworkTickets& batch,
                                             FrameType frame = FrameType::speculative);
-    bool artwork_durability_barrier(DistributedStore::DurabilityBatch& batch,
-                                    FrameType frame = FrameType::speculative);
+    // Every staged artwork's copy durable where it landed. False, the batch
+    // kept, when any is not: the caller tries the batch again later.
+    bool artwork_durability_barrier(ArtworkTickets& batch);
     // Whether this node holds the artwork object itself.
     bool artwork_held_here(const ObjectId& id) const {
-        return store_.held_here(id);
+        return store_.objects().has(id);
     }
     // `vanished_media`: media a complete scan found nowhere in the namespace.
     // With `prune_missing`, every leaf drops them, manual items included; a
@@ -544,11 +553,14 @@ class CatalogueManager {
     CatalogueMaintenance maintenance_objects(const CatalogueMaintenanceHead&);
     CatalogueRetentionObjects retention_objects(const std::optional<ObjectId>& old_root,
                                                 const std::optional<ObjectId>& new_root);
-    // Given `sightings`, an object goes only once this node has seen it
-    // unreferenced and unclaimed for `grace`.
-    size_t control_gc_step(const IdLookup& live, std::chrono::milliseconds grace,
-                           size_t operation_budget = 32, UnreferencedSince* sightings = nullptr,
-                           uint64_t now_unix_ms = 0);
+    // The CONTROL publication epoch: the catalogue root's, which a root's
+    // publication advances. None until the first root is seen. Publication is
+    // data before metadata, so a future root's objects are briefly
+    // unreferenced; one first seen so survives the epoch it was seen in.
+    std::optional<dagda::contract::ControlEpoch> control_epoch() const;
+    // Runs `removal` under the lock a root's publication takes, if the epoch
+    // is still `sequence`; whether it ran.
+    bool within_control_epoch(uint64_t sequence, const std::function<void()>& removal);
 };
 
 } // namespace macha

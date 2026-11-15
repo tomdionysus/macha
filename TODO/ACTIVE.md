@@ -1,222 +1,66 @@
 # Active tasks
 
-Last updated: 2026-11-14 about 02:15Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-15 about 22:45Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
-this rationalisation is `archive/2026-11-14-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
+this rationalisation is `archive/2026-11-15-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
 `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
 
 ## Resume here
 
-**Operator, 2026-11-14 night: port first, heap later.** The heap P0 is parked (its findings and the proposed
-glibc heap-check run stay in item 1 below). Macha's work now: review Dagda's store-side map against code
-(`../dagda/TODO/macha-store-map/`, `../dagda/TODO/2026-11-14-macha-store-map.md`), then write Macha's half.
+**The port: Macha onto Dannan and Dagda, one branch, gate at the end** (operator, 2026-11-14; cutover "in the next
+few days"). The plan and its progress, step by step: [`2026-11-14-port-rewrites.md`](2026-11-14-port-rewrites.md)
+(R1 root, R2 filesystem and FUSE, R3 metadata and control, R4 catalogue, R5 ingest and torrent, R6 status and
+adverts, R7 removal, then the flag day). The call-by-call map it follows: `store-map-callers/` (six sections).
+Rulings: Macha calls `dagda::Context` only, no shims; the root keeps `dagda::Node`'s owner surface (open, stop,
+reconfigure, the reference counts, reachability registration, the maintenance steps until 8c); agreement waits for
+Dannan 0.9.0; ack levels are the stack standard (`persisted` = the disk that took it, this node's when it can).
 
-**Next: the rewrites, in order** (`TODO/2026-11-14-port-rewrites.md`, R1 root to R7 removal), against Dagda
-`feature/macha-store-gaps` (Context v2 gated green at `3ce0e10`; compaction `7f14515` reviewed and passed).
-**Macha's half of the map written (2026-11-14 night):** `TODO/store-map-callers/` (six sections, 222 rows, index
-README with what Macha verified). Sent to Dagda for review.
-**Map review done (2026-11-14 night):** six reviewers, one per Dagda section, files in `build/map-review/`; 214 rows
-confirmed, 10 wrong verdicts, about 35 incomplete, 40-odd missing rows. Sent to Dagda with what Macha verified.
-**Macha defects the review found (fix in Macha first; report to the operator before fixing):**
-1. **Data safety, verified in code:** pack compaction keeps only the victim's live puts (`local_store.cpp:1806-1843`
-   at f0597a4), dropping its remove and touch records, with no guard on victim choice (`:1738-1797`); replay is
-   put/remove/touch in pack order (`:1055-1078`). After a restart (a) a removed object whose put is in an older
-   pack comes back, re-entered in the held ledger (`:526-528`); (b) a re-affirmed object's age reverts, so
-   `remove_if_older_than` (`:1574-1582`) can collect it as an orphan before its claim lands: data loss for a fresh
-   write whose content matched an old object. No test covers it. Dagda confirmed the same in its code
-   (`local_store.cpp:1413-1443`). **Operator, 2026-11-14: Dagda's to fix; the cutover is in the next few days, so
-   Macha does not fix its own store.** Macha reviews Dagda's fix.
-2. Prompt replication's wait has no timeout (`distributed_store.cpp:1227`): retries stall on an idle node (reviewer).
-3. **Settled (operator 2026-11-14: healing is better):** a failed local barrier re-derives, as Macha's does
-   (`:626-646`), with two guards sent to Dagda: re-derive by an authenticated read, not `has()`, since pack replay
-   accepts a header whose payload never reached the disk (`local_store.cpp:1049-1067`); and persist a sync failure
-   per backend across reopen and restart, never re-deriving what was written in the failed window (the page cache
-   can still hold bytes the disk lost). Live exposure in Macha's own store until the cutover: case 2 (power cut,
-   then a re-derived token over a torn payload); not fixed in Macha (cutover in days).
-4. The repair-share wake rounds down to milliseconds and can fall back to a wake up to 2 s late (reviewer).
-5. Repair's drop-local checks a claim then removes with nothing held (`:2913-2922`), already Dagda's gap 7.
-6. From the callers' map (`TODO/store-map-callers/README.md`, checked by the Macha session): a reload racing the
-   storage refresher can miss a storage event or double-adopt a fresh empty backend (offline on a token
-   mismatch); `reconfigure_local`'s `cfg_` writes race only `readiness()`'s `empty()`. Not heap leads. A reload adding
-   the first backend never re-resolves hosting (unchecked).
+**Where it stands (2026-11-15 night):**
+- Pushed to `25a37d3`: R1 (root, one lock, one identity, readiness), R2 (reads, the FUSE reply buffer, writes,
+  publication on tickets, hydration, activity, capacity), R3's first slice (the namespace tree on `Context::Control`,
+  the claims barrier on `Context::Claims`, the replica's sealed interim seed `<state>/metadata.seed`), every write
+  naming `persisted`; then `d35239d` (TODO).
+- **Uncommitted, compiling on build-3 at this note** (claim until 23:56Z, verdict `/root/pi/port.result`): R3's last
+  piece (the reachability provider `MachaReachability`, the census on `Node::references()`, `Maintenance` driving
+  the node's steps, `MaintenanceStopping` aliased, new key `maintenance.collect_garbage` default false), R4's
+  catalogue on Context, R5's torrent publish hook on Context. On green: format check, release build-3, commit
+  (named paths), push (the operator allowed pushing this session).
+- **Builds:** build-3 `/home/maintainer/macha-store`, `build/pi/macha_port_compile.sh` (compile only) against Dannan 0.8.0
+  (`/home/maintainer/deps/prefix-0.8.0`) and Dagda `6ea9d04` (`prefix-dagda-6ea9d04`, `build/pi/deps_dagda_6ea9d04.sh`).
+  **First next step: move to Dagda `6bfb5b2`** (gated 2026-11-15, build-2, 1105/1108 passed, 3 skipped): build its
+  prefix as `deps_dagda_6ea9d04.sh` did (a copy for `6bfb5b2`), point `macha_port_compile.sh` at it, and rename
+  Macha's `WriteOptions::level` to `ack_level` (the four `options.level = ...persisted` sites: `FileSystem::put_extent`,
+  `CatalogueManager::put_media_index`, the torrent publish hook, the hydration test fixture). `replicated` is now a
+  majority; `put_here`/`put_deferred_here` are `persisted`. Dagda's figures are one advert `dagda/figures`, read with
+  `store::figures_of(record)` / `used_of(record)` (`store/placement.h`); `dagda/capacity` and `dagda/extents` stay;
+  `dagda/used`, `backends-online` and the `cache-*` adverts are gone (R6 reads them through the accessor). Deploy deps
+  from Dannan's newest 0.8 patch (0.8.3).
+- **Next:** what the plan lists as left in R4 and R5, then R6, R7 and the plan's "Before any suite can run" list
+  (`LocalState`'s store parts, Macha's storage server and store messages, Macha's survey, the trace clock into
+  `MaintenanceOptions`); then the suites, fix forward, the harness, the migration rehearsal.
 
-**The port, re-ruled (operator to Dagda, 2026-11-14 evening, relayed by Dagda):** no shims in Macha; where Macha's
-code is shaped around its own store it is rewritten to use Dagda natively through `dagda::Node` and `Context`, with
-no loss; Dagda must handle DHT storage at least as well as Macha's store, measured side by side (a harness on the Pis
-with identical workloads, then the live baselines). A call-by-call map from Macha's store calls to Node and Context,
-written by both and each reviewing the other: Macha proposed develop `f0597a4`, Macha the callers' side (filesystem,
-FUSE, catalogue, metadata, ingest, torrent, media, HTTP, composition root), Dagda the store's side. Custody
-(operator to Macha, same evening): **provision it on live-a and live-b at the next deploy, ahead of the
-cutover** (the maintainer told Dagda "at the cutover"; this answer is the later one). Macha's heap P0 first.
-**Custody at the next deploy, checked 2026-11-14 night (read-only on the nodes):** systemd 257, no TPM
-(`systemd-analyze has-tpm2`: partial), so roots seal with the host key (`/var/lib/systemd/credential.secret`, made at
-first use); no `dannan-node` on either node, and Dannan 0.6.0 does not install it (a test tool,
-`tools/CMakeLists.txt:35-37`): asked Dannan for an installed custody tool (make, printing the root once; show
-identity; refuse under the state lock; man page). Making custody needs Macha stopped (it takes `.dannan.lock`), so it
-runs in the deploy between stop and start. **Backup:** a host-key-sealed root opens only on the host that sealed it,
-so the off-node backup must hold the plain root (kept offline) or the sealed root with that node's
-`credential.secret`; the plan's "sealed root backed up off-node" alone cannot restore a dead root filesystem.
+**Parked by the operator (2026-11-14: port first, heap later):** the heap corruption P0. Findings so far: 125
+ASan-clean rounds of the crash workload; the FUSE read late-write (a timed-out read's worker writing into libfuse's
+freed buffer) found and fixed by R2's reply buffer (`01eecf0`); libfuse's low-level API after the port (BACKLOG).
+Detail in `archive/2026-11-15-ACTIVE-before-rationalisation.md`, item 1. Macha defects the map review found are
+recorded there too; pack compaction's was Dagda's to fix (done, `7f14515`, reviewed).
 
-**Store cutover ON HOLD (operator, 2026-11-14 ~16:00Z):** on the 1a finding (Dagda's ObjectTrie,
-UnreferencedSince, DiskServiceMonitor are not what Macha uses), the maintainer: Dagda was built explicitly to handle Macha's
-storage; bolting things on until Macha can work is not acceptable; if Dagda doesn't fundamentally support these
-concepts in a way Macha can use natively it is not fit for purpose and must be redesigned. Dagda was told to stop all
-work until the maintainer talks to it. No further store-cutover work here until the maintainer says. Pushed to origin at `0bad518`.
-Sanitizers: the maintainer clarified they are fine for investigating this class of bug (the ban is on pointless runs), so the
-media-load heap pair goes ahead.
-
-**Two things run at once** (operator, 2026-11-14: the store work in parallel with the heap chase; the heap result
-comes first when it lands).
-
-1. **The heap corruption P0** (found-issues 1; operator chose "Chase it now", report the mechanism before fixing,
-   fix in Macha first). live-b crashed in malloc under 0.94.2; the core's victim was `FileSystem::media_ids`
-   (`filesystem.cpp:2094`) from `MediaInformationService::prune`. Single node under ASan on build-3: 53 clean
-   rounds. **The ASan pair, 01:30Z to 04:30Z 2026-11-14: clean.** 72 rounds (about 14,400 files of 64 KiB written,
-   fsynced and deleted through FUSE on node A, replicated to B), no ASan or UBSan report during the run or at exit,
-   zero ERROR lines, WARN only the expected startup ones; both units stopped `inactive`, FUSE unmounted, both Pis
-   released. **Correction (read 2026-11-14 ~16:00Z):** `prune` did run, constantly. Maintenance requests it on
-   every metadata event (`maintenance.cpp:1402`), the service runs whenever the FFmpeg engine is available
-   (streaming was on in both configs), and `media_ids()` refreshes the index over every file, media or not
-   (`filesystem.cpp:2045-2075`). So the victim's path ran thousands of times on both nodes, clean, and media load
-   is not the missing ingredient. With 125 ASan-clean rounds of the exact crash workload, and victims that vary
-   (ingest-job JSON and hint JSON on live-a, `media_ids` on live-b: whatever allocates next), the likelier
-   class is a data race corrupting a container, which ASan does not see. Operator: "that points to something
-   smashing your heap that you haven't thought of. Open Your Mind, then read the code, then TSan. ASan doesn't help
-   you, you've proved that."
-   **Reading, 2026-11-14 evening:**
-   - **Found, a real defect (not yet fixed; report first):** `FuseFrontend::dispatch` (`fuse_frontend.hpp:633-637`)
-     returns ETIMEDOUT for a *running* read at its deadline while the broker worker keeps running `read_impl`,
-     which holds a span over libfuse's buffer (`fuse_frontend.cpp:5913`, captured `output`). libfuse3's
-     high-level `fuse_lib_read` mallocs that buffer, calls `op_read`, replies and frees it; the worker can then
-     write into the freed chunk: `fill_n` at :5980 with no cancellation check after an unbounded `inode->mutex`
-     wait, and `reader->read` / `pread_exact` (:6007, :6033) mid-copy past their check. In a glibc build that
-     smashes the free chunk's links (live-a's `corrupted double-linked list`). Only `read_impl` captures caller
-     memory; every other dispatch captures values.
-   - **Ruled out for live-b 11-13 by evidence:** `filesystem.timed_out_requests` was 0 before and after every
-     baseline read and write sample (`build/baselines/results-0.94.2/live-b/*.jsonl`, last sample about 8 min
-     before the crash), and the small-file phase does no reads. So this defect did not fire in that run.
-   - Checked and clean: `fork` in book conversion (child is async-signal-safe only), `mallopt` (once, before
-     threads), `malloc_trim` (thread-safe), the only sanitizer-conditional code (`process_allocator.cpp`), the
-     AVIO callbacks (respect `buffer_size`), `ReadHandle::read` (synchronous, caller's thread).
-   - **Operator, 2026-11-14: libfuse's high-level API is suspect; move to the low-level API after the Dagda port,
-     done once** (BACKLOG "FUSE: libfuse's low-level API", macOS support checked). It fixes the read late-write by
-     design, so no interim patch unless the chase implicates it.
-   - Not exercised by any ASan run so far: the catalogue scanner over a real library after deletes, and
-     media-information probing real media through FFmpeg (every root was empty). Next to read.
-   The setup as run: node A on build-3 (unit `macha-heap-a`, FUSE mount
-   `/mnt/heaptest`, driver `/root/heap_driver.py` writing 200 x 64 KiB files fsynced then deleted per round, about
-   130 s a round, `ROUNDS=300`), node B on build-2 (unit `macha-heap-b`, replica, `replicas=2/2`). Results in
-   `/root/heap-pair/` on each (`asan.*`, `ubsan.*`, `macha.log`, `driver.log`); scripts in `build/heap/`.
-   **Check:** `ssh root@192.0.2.202 'ls /root/heap-pair; tail -n 3 /root/heap-pair/driver.log; systemctl is-active
-   macha-heap-a'` and the same on 192.0.2.170 for `macha-heap-b`. **Stop at the claim's end, 04:30Z** (about 80
-   rounds) if clean: `systemctl stop macha-heap-a macha-heap-b`, `fusermount3 -u /mnt/heaptest`, pkill pattern
-   `"[h]eap_driver"`. **If clean, next (operator's choice, but confirm with him first after the 11-14 test-volume rule): the pair
-   again with media load**: scanner and
-   media-information service on over a media library (make test media with ffmpeg `testsrc` on the Pi, never copy
-   from the live nodes unasked) so `prune` runs during the FUSE churn. If ASan names a writer: report the
-   mechanism to the operator before any edit.
-2. **The store cutover, step 1a** (plan and log: [`2026-11-13-store-cutover.md`](2026-11-13-store-cutover.md);
-   the class-by-class map: `build/store-api-map.md`). **Committed 2026-11-14 after build-3 went green (714/714,
-   20/20, 21/21):** `1a27043` (the bump) and `f84337c` (the first slice), as described here:
-   - the move to Dannan 0.6.0 and Dagda 0.1.5: `CMakeLists.txt` (`find_package(dannan 0.6.0)`, `dagda 0.1.5`), both
-     workflows (Dagda built from its tag after Dannan; both tags are on their remotes), CONTRIBUTING, the install
-     guides and quickstart. Dannan's public headers 0.5.3 to 0.6.0 change nothing Macha uses;
-   - 1a's first slice: `FrameType`, `WorkClass`, `work_class`, `frame_for`, `frame_type_name` are Dannan's
-     (`src/cluster/frame_type.hpp`), `WorkClass::viewer` renamed `foreground` everywhere, `Waits`, `ThreadSafety`,
-     `local_waits`, `default_waits`, `includes`, `may_enter` aliased (`src/contract/work.hpp`; Macha's own
-     `WorkContext` and static `WaitGuard` remain), the cast helpers `dannan_frame`, `macha_frame`, `dannan_work`
-     gone (the friction list's "enum casts"). 35 files.
-   **Build:** `build/pi/deps_060.sh` (Dannan 0.6.0 and Dagda 0.1.5 into `/home/maintainer/deps/prefix-0.6.0` and
-   `prefix-dagda-0.1.5` on build-3, log `/root/pi/deps.log`), then the tree rsynced to `/home/maintainer/macha-store` and
-   `build/pi/macha_store_build.sh` (default preset, -j2, nice 19, every suite; log `/root/pi/macha.log`, verdict
-   `/root/pi/macha.result`). **Check:** `ssh root@192.0.2.202 'cat /root/pi/macha.result; tail -n 20
-   /root/pi/macha.log'`. Green: commit the bump and 1a as two commits (named paths). Red: fix, re-rsync (the rule
-   below), rerun the script.
-   **Then, green on build-3 (714/714, 20/20, 21/21) and committed:** `00a741f` (`RetentionClass`, `RetentionDot`,
-   `RetentionClock`), `f2de690` (`IdLookup`), `ed1d3fd` (`StorageUnavailable`, so Macha's catches catch Dagda's).
-   **Finding, for the operator (report before acting):** the rest of 1a's list are not twins. The map's "inferred
-   identical" is wrong, checked by a normalised diff against Dagda 0.1.5 (`build/twin_diff.py MACHA DAGDA`):
-   `ObjectTrie` takes a `shared_ptr<const domain::StorageKey>` and a logger (Macha: a raw 32-byte key) and adds
-   `rekey`, `probe`, `read_only` and a different journal replay; `UnreferencedSince` **seals its file** under the
-   storage key (aad `dagda/sightings/1`; Macha's is plain), an on-disk format change; `DiskServiceMonitor` and
-   `DiskServiceTimer` need a logger and a `TimeSource` at every construction and timer site. `TrieUnion` is identical
-   apart from holding Dagda's `ObjectTrie`, and `ObjectStore`/`HeldView` hold a `TrieUnion`, so all five go together.
-   Recommendation: end 1a here and move these five into 1b, where Dagda's `Node` builds the stores that construct
-   them; `UnreferencedSince`'s format goes with the migration (dagda-migrate), not an alias. Waiting on the operator.
-   **Custody moved ahead of 1b** (Dagda's `Node::open_store` refuses a node without custody, `node.cpp:199` at
-   0.1.5, so plan 7b's Macha half is a prerequisite of step 1): `9770427` adds `custody.credential` (and
-   `credentials_directory`) as `NodeConfig::custody`, unset = none as before, documented in
-   `docs/configuration.md`; gated 715/21/21. Left of 7b: the unit's `LoadCredentialEncrypted=`, making and sealing
-   custody on each node (`dannan-node --state <state_path> --init-custody --custody-credential <name>` prints the
-   root), `dannan-node` in the tarball, off-node backups; all at deploy, on the operator's word.
-   Then 1b: `dagda::Node(OpenLater)` in `LocalState`,
-   the classes aliased, adapters for `DistributedStore` (tickets for `DurabilityBatch`, ReadOptions, RepairLists)
-   and `AvailabilityService` (Macha keeps the path table); `catalogue.cpp:2721`'s `claim_deletion` becomes
-   `node.data().claim_locks().deletion(id, retained(control))`, as Dagda's collector does (`collector.cpp:338`).
-
-**Afterwards, in order:** the store cutover's steps 2 to 8 (plan file); custody (7b); Macha's deb on
-`libdannan0.6 (>= 0.6.0)` and `libdagda0.1.5`; the partition rerun and the write-up of the 0.94.2 baselines
-(`build/baselines/results-0.94.2/`, `partition.py`'s path fixed in build/); the Macha-side friction items in the plan
-file (the duplicate `connections_canonical` write is done, `5d8b6dd`; left: async call watches, deferred connectivity check, memory fit,
-durability epoch, payload copies); announce the `dagda.<name>` registration names to Core and the clients **at the
-cutover** (operator, 2026-11-14), not before; Status thread names (clients to Dannan's names, announced, then drop
-the mapping).
+**Custody at the next deploy, ahead of the cutover** (operator): `dannan-custody` from Dannan 0.8.x, roots sealed
+with the host key (no TPM on the Pis), the unit's `LoadCredentialEncrypted=`, an off-node backup of the plain root or
+of the sealed root with `credential.secret`; run between stop and start.
 
 ## The shared build Pis
 
-build-1 `root@192.0.2.169`, build-2 `root@192.0.2.170`, build-3 `root@192.0.2.202`: Pi 5,
-16 GB, Debian 13 arm64, shared by every session. **Operator, 2026-11-14: no builds on the Mac** (no cmake, suites,
-Docker); **nobody schedules the Pis**: claim a free one on Lir's board, first come first served, release the moment
-the job ends. Claim board 0.2.0 (2026-11-14 night): claims by cores (`cores` = the -j, "all", or 0 for light work);
-queue with `claim-board wait ... --cores N --for 2h` as a background command, never poll; asking a holder to make
-room is allowed again (operator reversed the afternoon's rule). Details: memory `project_build_host`. One heavy job per Pi, -j2 or -j3, nice 19. After a session restart
-the claim-board plugin gives `claim_take`, `claim_release`, `status_set` and blocks heavy ssh commands without a
-heavy claim. By hand: version-1 JSON on `stack/pis/<host>/claims/Macha%20Server` and
-`stack/sessions/Macha%20Server/status` (details: memory `project_build_host`). **Held now:** nothing (build-3 and build-2
-released 04:31Z 2026-11-14). LoRa builds on build-2
-alongside node B (agreed); Dagda holds build-1 (bench, then its 0.1.5 packages with Macha's fixtures, copied to
-`/root/dagda-arm64/macha-fixtures`). Macha's state on the Pis: build-3 `/home/maintainer/deps`, `/home/maintainer/macha-store`,
-`/home/maintainer/macha-asan` (ASan build of 0.94.2's line), `/root/pi`, `/root/heap*`; build-2 `/home/maintainer/macha-asan`,
-`/home/maintainer/heap`, `/root/heap*`. A shared TSan Pi (clang 19, 4K pages) is Lugh's and Dagda's to settle.
-
-## Where the code is
-
-- `port/dannan-dagda` at `ed1d3fd` (plus this TODO commit), past `develop` (`f0597a4`), pushed to `0a0801b`; the
-  commits since are local: TODO commits, the bump, 1a's four slices, two clang-format fixes (the 1a slice and
-  `a95e9cc` had left eight files unformatted; the whole tree now passes clang-format 19), the
-  `connections_canonical` deletion. Before committing, check formatting on the Pi:
-  `clang-format-19 --dry-run --Werror` on every changed file. `main` is `37fa763`, tagged 0.94.2; `develop` carries TODO commits past it. CMake says 0.94.2.
-- The branch so far: Dagda 0.1.4 linked (`de57596`), `NodeId` and `Hash256` Dannan's (`6d8c6e7`), Macha's config as
-  `dagda::NodeOptions` (`a95e9cc`, `src/cluster/store_node.{hpp,cpp}`).
-- Peers: Dannan (0.6.0 tagged and pushed; 0.7.0 tagged 2026-11-14, SONAME `libdannan.so.0.7`, with Macha's fixes;
-  0.8.0's P6 seams on `feature/owner-test-seam` reviewed at `c860fb5`, all four fit: `call_fault` replaces
-  `NodeRuntime::CallFault` and `StalledCalls` (Macha counts held calls in its own callback, since Dannan's
-  `stalled_calls()` is the count held now), `test::BarePeer` replaces `tests/stand_in_peer.hpp` via `tune` and
-  `before_start`, `watch_advert` for the storage figures only (the generation stays on the roster watch),
-  `AsyncSink` around Macha's sink; the review found a leave could be coalesced away at `c860fb5`, now fixed;
-  `LogSink::write_at(time, ...)` added for 0.8.0, so Macha's stamping sink must override `write_at` when it moves
-  behind `AsyncSink`; the fixes `2b1ce5f`, `8a0bce3` and `76537c6` read and passed, one note sent: the withdrawal test's 1 s
-  wall-clock bound must have headroom; Macha's fixtures must destroy a node before the io threads it posts to; merged to Dannan's develop as
-  `3d1d4c0`, rewritten ids checked by patch-id; `7921d23` raised: `supervised_loop(nullptr)`'s function-local
-  static can be destroyed before a static `AsyncSink`'s writer stops, UB at exit; fixed in `bcd8b55` (the fallback and the process clocks never destroyed), read and passed; P4's design (`../dannan/TODO/2026-11-14-p4-worker-pool.md`) answered: Macha's maintenance
-  takes the pool's pacing as a gate (started / should_yield / finished, plus the CPU scale), not per-task
-  submission, and the pool and any loop must share one per-class `DutyShare` per node; code `f531ce5` reviewed: two
-  wiring changes asked, `set_contended` safe after start (Macha's reading needs the store, built after the node
-  starts) and the gates' time and process CPU injectable apart from the node's (the trace tests step
-  `MaintenanceClock`); both done in `f752aa9` (`NodeConfig::gate_time`, `gate_process_cpu`), and the reading swap
-  made safe at clear in `537c619` (once `set_contended` returns the old reading is never called; Macha clears it
-  before destroying its store), both read and passed. For Macha's own move later: today `started()` gets `repair_busy` (this pass's byte counters
-  too) while `should_yield`/`finished` get the `idle_for` reading (`maintenance.cpp:704-720`); one `contended()`
-  unifies them, so check the pacing cases on that), Dagda (0.1.5 tagged and pushed; its arm64 debs, built from the tag with Macha's fixtures, all
-  fixture-gated cases run and passed, are in `build/debs/dagda-0.1.5/`, sha256 checked),
-  Lugh, Lir, LoRa, the radio project; `SendMessage`, `ListAgents`. Their repositories are read-only to this
-  session.
+build-1 `root@192.0.2.169`, build-2 `.170`, build-3 `.202`, build-4 `.228`: Pi 5, 16 GB,
+Debian 13 arm64, shared by every session. No builds on the Mac. Claim cores on Lir's board (`claim-board claim`,
+gate on "Taken"; `claim-board wait ... --for 90m` as a background command when none are free; release when the job
+ends); details in memory `project_build_host`. Macha's state there: build-3 `/home/maintainer/deps`,
+`/home/maintainer/macha-store`, `/home/maintainer/macha-asan`, `/root/pi`, `/root/heap*`; build-2 `/home/maintainer/macha-asan`,
+`/home/maintainer/heap`, `/root/heap*`.
 
 ## Waiting on the operator
 
-- Whether 1a ends at the five aliases, with `ObjectTrie`, `TrieUnion`, `ObjectStore`/`HeldView`,
-  `UnreferencedSince` and `DiskServiceMonitor` moving into 1b (the finding in "Resume here").
-- Whether to run the heap pair again with media load after a clean ASan pair, given the 11-14 test-volume rule.
+- After the port: whether the heap chase resumes with media load (the 11-14 test-volume rule applies).
 - The Codecov token for the repository.
 - Carried, unchecked: the media-kind import hint; truncated pack records; the `*.pre-migration.*` archives; the
   replica journal reader with no writer left.

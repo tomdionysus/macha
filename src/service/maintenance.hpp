@@ -70,19 +70,13 @@ struct MaintenanceDependencies {
     NodeRuntime& node;
     LocalState& local;
     MetadataServer& metadata_server;
-    DistributedStore& store;
-    // Where reads and writes note their activity: the pacing signal.
-    dagda::Context& context;
+    // The store node: its maintenance steps, which this pass drives until
+    // heads move to it (MaintenanceOptions::automatic off), and its Context,
+    // where reads and writes note their activity, the pacing signal.
+    dagda::Node& store_node;
     MetadataView& metadata;
     MetadataMaintenance& metadata_upkeep;
     CatalogueManager& catalogue;
-    HorizonBuilder& builder;
-    ObjectLedger& ledger;
-    // When this node first saw each DATA and CONTROL object unreferenced.
-    UnreferencedSince& data_unreferenced;
-    UnreferencedSince& control_unreferenced;
-    // Kept current by the pass.
-    AvailabilityService& availability;
     // Pruned when metadata changes.
     MediaInformationService& media_information;
     // Wakes the pass; it turns what it sees into work.
@@ -95,10 +89,12 @@ struct MaintenanceDependencies {
     Clock::time_point constructed;
 };
 
-// The node's maintenance pass: metadata and catalogue
-// convergence, the claim walk and network repair, tombstones, retention
-// release, garbage collection, rebalance, compaction and scrub, on one
-// thread, paced against the classes above it.
+// The node's maintenance pass, on one thread: Macha's metadata and catalogue
+// convergence, head repair and history truncation, and between them the store
+// node's steps in Macha's order (the claim walk and network repair, the
+// inventory, tombstones, retention release, garbage collection, rebalance,
+// compaction, scrub and the ledger's verify), paced against the classes
+// above it.
 class Maintenance final {
   public:
     explicit Maintenance(MaintenanceDependencies);
@@ -129,28 +125,15 @@ class Maintenance final {
     // without a trigger.
     std::optional<Clock::time_point> retry_trigger_due() const;
     void note_retry_trigger(Clock::time_point now);
-    std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
-    void save_sightings(UnreferencedSince&, Clock::time_point& saved, bool complete = false);
-    void maintain_garbage_metadata(const std::vector<GarbageRef>& erase);
-    // Drops the tombstone batches whose grace has run (each batch's
-    // tombstones retire together).
-    void maintain_tombstone_batches(const InventoryHorizon&);
 
     NodeRuntime& node_;
     LocalState& local_;
     MetadataServer& metadata_server_;
-    DistributedStore& store_;
+    dagda::Node& store_node_;
     dagda::Context& context_;
     MetadataView& metadata_;
     MetadataMaintenance& metadata_upkeep_;
     CatalogueManager& catalogue_;
-    HorizonBuilder& builder_;
-    ObjectLedger& ledger_;
-    UnreferencedSince& data_unreferenced_;
-    UnreferencedSince& control_unreferenced_;
-    Clock::time_point data_sightings_saved_{};
-    Clock::time_point control_sightings_saved_{};
-    AvailabilityService& availability_;
     MediaInformationService& media_information_;
     NodeEvents& events_;
     MaintenancePort& port_;
@@ -160,6 +143,7 @@ class Maintenance final {
     Clock::time_point constructed_;
 
     bool cluster_stable_observed_{};
+
     // The event counts absorb_events() has turned into work, and their sum.
     uint64_t absorbed_storage_{};
     uint64_t absorbed_metadata_{};

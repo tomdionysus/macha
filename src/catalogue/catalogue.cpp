@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "catalogue/catalogue.hpp"
+#include "cluster/call_deadline.hpp"
 #include "diagnostics.hpp"
 
 #include "codec.hpp"
@@ -1011,11 +1012,43 @@ std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueView& c
     return newest ? newest->artwork : std::vector<CatalogueArtwork>{};
 }
 
-CatalogueManager::CatalogueManager(NodeRuntime& node, LocalState& local,
-                                   MetadataServer& metadata_server, DistributedStore& store,
-                                   MetadataView& metadata, const ObjectLedger& ledger)
-    : node_(node), local_(local), ledger_(ledger), metadata_server_(metadata_server), store_(store),
-      metadata_(metadata) {}
+CatalogueManager::CatalogueManager(NodeRuntime& node, MetadataServer& metadata_server,
+                                   dagda::Context& store, MetadataView& metadata)
+    : node_(node), metadata_server_(metadata_server), store_(store), metadata_(metadata) {}
+
+namespace {
+
+// A store call: whatever the store throws is the store unavailable, never the
+// content's fault.
+template <class Call> auto store_call(std::string_view what, Call&& call) -> decltype(call()) {
+    try {
+        return call();
+    } catch (const CatalogueUnavailable&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw CatalogueUnavailable(std::string(what) + ": " + e.what());
+    }
+}
+
+} // namespace
+
+std::optional<Bytes> CatalogueManager::read_data(const ObjectId& id, FrameType frame) {
+    dagda::store::ReadOptions options;
+    options.frame = frame;
+    auto result = store_call("catalogue DATA read failed",
+                             [&] { return store_.objects().read(id, std::move(options)); });
+    if (result.end != dagda::store::ReadEnd::served || !result.object)
+        return {};
+    return result.object->bytes;
+}
+
+std::optional<Bytes> CatalogueManager::control_object(const ObjectId& id) {
+    return store_call("catalogue CONTROL read failed", [&]() -> std::optional<Bytes> {
+        if (!store_.control().ensure_local(id))
+            return {};
+        return store_.control().get(id);
+    });
+}
 
 std::set<ObjectId> CatalogueManager::data_object_ids(const CatalogueSnapshot& snapshot) {
     std::set<ObjectId> ids;
@@ -1042,11 +1075,9 @@ CatalogueManager::load_view(const std::optional<ObjectId>& root, const Catalogue
                             size_t* decoded) {
     if (!root)
         return std::make_shared<const CatalogueView>();
-    if (!store_.ensure_control_local(*root))
-        throw CatalogueUnavailable("catalogue manifest unavailable");
-    auto encoded_manifest = local_.control().get(*root);
+    auto encoded_manifest = control_object(*root);
     if (!encoded_manifest)
-        throw CatalogueUnavailable("catalogue manifest unavailable locally");
+        throw CatalogueUnavailable("catalogue manifest unavailable");
     const auto manifest = decode_catalogue_manifest(*encoded_manifest);
     CatalogueView::Shards shards;
     size_t read_shards = 0;
@@ -1063,12 +1094,9 @@ CatalogueManager::load_view(const std::optional<ObjectId>& root, const Catalogue
             continue;
         }
         const auto read_started = Clock::now();
-        if (!store_.ensure_control_local(*shard_id))
-            throw CatalogueUnavailable("catalogue shard unavailable: " + to_string(*shard_id));
-        auto encoded_shard = local_.control().get(*shard_id);
+        auto encoded_shard = control_object(*shard_id);
         if (!encoded_shard)
-            throw CatalogueUnavailable("catalogue shard unavailable locally: " +
-                                       to_string(*shard_id));
+            throw CatalogueUnavailable("catalogue shard unavailable: " + to_string(*shard_id));
         read_ms += ms_since(read_started);
         ++read_shards;
         bytes += encoded_shard->size();
@@ -1123,11 +1151,9 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
     }
 
     try {
-        if (!store_.ensure_control_local(*root))
-            throw CatalogueUnavailable("catalogue manifest unavailable for control repair");
-        auto encoded_manifest = local_.control().get(*root);
+        auto encoded_manifest = control_object(*root);
         if (!encoded_manifest)
-            throw CatalogueUnavailable("catalogue manifest unavailable locally for control repair");
+            throw CatalogueUnavailable("catalogue manifest unavailable for control repair");
         const auto manifest = decode_catalogue_manifest(*encoded_manifest);
 
         std::vector<ObjectId> objects{*root};
@@ -1135,7 +1161,8 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
         for (const auto& shard_id : manifest.shards) {
             if (!shard_id)
                 continue;
-            if (!store_.ensure_control_local(*shard_id))
+            if (!store_call("catalogue CONTROL fetch failed",
+                            [&] { return store_.control().ensure_local(*shard_id); }))
                 throw CatalogueUnavailable("catalogue shard unavailable for control repair: " +
                                            to_string(*shard_id));
             objects.push_back(*shard_id);
@@ -1143,7 +1170,8 @@ bool CatalogueManager::converge_control_replicas(const std::optional<ObjectId>& 
 
         // Each node present is asked what it lacks and sent only that.
         const auto offer_started = Clock::now();
-        const auto offer = store_.offer_control(objects);
+        const auto offer = store_call("catalogue CONTROL offer failed",
+                                      [&] { return store_.control().offer(objects); });
         const bool complete = offer.held_by >= active_nodes.size();
         Log::debug("catalogue control convergence root=" + to_string(*root).substr(0, 12) +
                    " objects=" + std::to_string(objects.size()) +
@@ -1389,8 +1417,8 @@ CatalogueStatus CatalogueManager::status() const {
                 art.insert(artwork.id);
     status.artwork_objects = art.size();
     for (const auto& id : art)
-        status.local_artwork_objects += local_.data().has(id) ? 1 : 0;
-    const bool root_local = !status.root || local_.control().has(*status.root);
+        status.local_artwork_objects += store_.objects().has(id) ? 1 : 0;
+    const bool root_local = !status.root || store_.control().has(*status.root);
     status.ready = status.ready && root_local;
     return status;
 }
@@ -1550,14 +1578,20 @@ std::optional<Bytes> CatalogueManager::media_index(std::string_view media_id) {
     const auto* found = snapshot->media_index(media_id);
     if (!found)
         return {};
-    return store_.get(*found, 0, FrameType::foreground);
+    return read_data(*found, FrameType::foreground);
 }
 
 void CatalogueManager::put_media_index(std::string media_id, std::span<const uint8_t> bytes) {
     if (!media_id.starts_with("macha:") || bytes.empty())
         throw std::invalid_argument("invalid media index");
     const auto id = object_id(bytes);
-    if (!store_.put(id, bytes, FrameType::speculative))
+    dagda::store::WriteOptions options;
+    options.ack_level = dagda::store::Durability::persisted;
+    options.frame = FrameType::speculative;
+    const auto evidence = store_call("media index write failed", [&] {
+        return store_.objects().write(id, bytes, std::move(options));
+    });
+    if (evidence.holders() == 0)
         throw CatalogueUnavailable("cannot store media index in distributed DATA storage");
     TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     install_head();
@@ -1793,20 +1827,18 @@ void CatalogueManager::publish(
     for (const auto& id : prepared.added) {
         // Held here is enough; only one that is not is fetched to prove it
         // exists somewhere.
-        if (local_.data().has(id))
+        if (store_call("catalogue DATA lookup failed", [&] { return store_.objects().has(id); }))
             continue;
-        if (!store_.get(id, 0, frame))
+        if (!read_data(id, frame))
             throw CatalogueUnavailable("referenced artwork object is unavailable: " +
                                        to_string(id));
     }
 
     CatalogueManifest old_manifest;
     if (expected_root) {
-        if (!store_.ensure_control_local(*expected_root))
-            throw CatalogueUnavailable("current catalogue manifest unavailable");
-        auto encoded = local_.control().get(*expected_root);
+        auto encoded = control_object(*expected_root);
         if (!encoded)
-            throw CatalogueUnavailable("current catalogue manifest unavailable locally");
+            throw CatalogueUnavailable("current catalogue manifest unavailable");
         old_manifest = decode_catalogue_manifest(*encoded);
     }
 
@@ -1858,11 +1890,15 @@ void CatalogueManager::publish(
     // A commit may reference a control object once this node holds it. The
     // other nodes are sent it with the commit's claims, and convergence
     // offers it to every active node, whatever its DATA capacity.
+    const auto put_control = [&](const ObjectId& id, std::span<const uint8_t> bytes) {
+        return store_call("catalogue CONTROL write failed",
+                          [&] { return store_.control().put(id, bytes); });
+    };
     for (const auto& [id, encoded] : changed_control) {
-        if (!local_.control().put(id, encoded))
+        if (!put_control(id, encoded))
             throw CatalogueUnavailable("catalogue shard could not be stored");
     }
-    if (!local_.control().put(root, encoded_manifest))
+    if (!put_control(root, encoded_manifest))
         throw CatalogueUnavailable("catalogue manifest could not be stored");
 
     const auto& released = prepared.released;
@@ -2169,28 +2205,40 @@ CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string m
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
-    if (!store_.put_here(art.id, bytes, frame))
-        throw std::runtime_error("cannot store artwork in distributed DATA storage");
+    if (!store_call("artwork write failed",
+                    [&] { return store_.objects().put_here(art.id, bytes, frame); }))
+        throw CatalogueUnavailable("cannot store artwork in distributed DATA storage");
     return art;
 }
 
 CatalogueArtwork CatalogueManager::stage_artwork_deferred(std::string role, std::string mime_type,
                                                           std::span<const uint8_t> bytes,
-                                                          DistributedStore::DurabilityBatch& batch,
-                                                          FrameType frame) {
+                                                          ArtworkTickets& batch, FrameType frame) {
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
     // Written on this node, durable at the batch's barrier; no peer is waited
     // for.
-    if (!store_.put_deferred_here(art.id, bytes, batch, frame))
-        throw std::runtime_error("cannot stage artwork in distributed DATA storage");
+    const auto evidence = store_call("artwork write failed", [&] {
+        return store_.objects().put_deferred_here(art.id, bytes, frame);
+    });
+    if (evidence.holders() == 0)
+        throw CatalogueUnavailable("cannot stage artwork in distributed DATA storage");
+    batch.push_back(evidence.ticket);
     return art;
 }
 
-bool CatalogueManager::artwork_durability_barrier(DistributedStore::DurabilityBatch& batch,
-                                                  FrameType frame) {
-    return store_.durability_barrier(batch, frame);
+bool CatalogueManager::artwork_durability_barrier(ArtworkTickets& batch) {
+    if (batch.empty())
+        return true;
+    const auto evidence = store_call("artwork durability wait failed", [&] {
+        return store_.tickets().wait(batch, call_deadline::object_transfer);
+    });
+    if (!std::ranges::all_of(evidence,
+                             [](const dagda::store::WriteEvidence& one) { return one.met; }))
+        return false;
+    batch.clear();
+    return true;
 }
 
 void CatalogueManager::reconcile_scanner(
@@ -2471,7 +2519,7 @@ std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId&
         return {};
     // Reading DATA never makes the reader an owner: artwork is read from its
     // owner like any remote extent, cached without using replica quota.
-    auto bytes = store_.get(id, 0, FrameType::foreground);
+    auto bytes = read_data(id, FrameType::foreground);
     if (!bytes)
         return {};
     return CatalogueArtworkContent{std::move(*mime_type), std::move(*bytes)};
@@ -2484,26 +2532,24 @@ CatalogueManager::retention_objects(const std::optional<ObjectId>& old_root,
     if (!new_root)
         return out;
 
-    if (!store_.ensure_control_local(*new_root))
-        throw CatalogueUnavailable("catalogue manifest unavailable for retention publication");
-    auto encoded_manifest = local_.control().get(*new_root);
+    auto encoded_manifest = control_object(*new_root);
     if (!encoded_manifest)
-        throw CatalogueUnavailable(
-            "catalogue manifest unavailable locally for retention publication");
+        throw CatalogueUnavailable("catalogue manifest unavailable for retention publication");
     const auto manifest = decode_catalogue_manifest(*encoded_manifest);
     // Only a shard the two roots do not share can hold anything new: the
     // rest are the same object, claimed when it was written. An old root
     // that cannot be read is taken as empty, which claims more, never less.
     CatalogueManifest old_manifest;
-    if (old_root && store_.ensure_control_local(*old_root))
-        if (const auto encoded = local_.control().get(*old_root))
+    if (old_root)
+        if (const auto encoded = control_object(*old_root))
             old_manifest = decode_catalogue_manifest(*encoded);
     out.control.push_back(*new_root);
     for (size_t i = 0; i < manifest.shards.size(); ++i) {
         const auto& shard = manifest.shards[i];
         if (!shard || shard == old_manifest.shards[i])
             continue;
-        if (!store_.ensure_control_local(*shard))
+        if (!store_call("catalogue CONTROL fetch failed",
+                        [&] { return store_.control().ensure_local(*shard); }))
             throw CatalogueUnavailable("catalogue shard unavailable for retention publication: " +
                                        to_string(*shard));
         out.control.push_back(*shard);
@@ -2513,9 +2559,7 @@ CatalogueManager::retention_objects(const std::optional<ObjectId>& old_root,
         CatalogueSnapshot shard;
         if (!id)
             return shard;
-        std::optional<Bytes> encoded;
-        if (store_.ensure_control_local(*id))
-            encoded = local_.control().get(*id);
+        const auto encoded = control_object(*id);
         if (!encoded) {
             if (required)
                 throw CatalogueUnavailable("catalogue shard unavailable locally: " +
@@ -2591,8 +2635,8 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     if (root) {
         out.control_live.insert(*root);
         try {
-            if (store_.ensure_control_local(*root)) {
-                if (auto encoded = local_.control().get(*root)) {
+            if (store_.control().ensure_local(*root)) {
+                if (auto encoded = store_.control().get(*root)) {
                     const auto manifest = decode_catalogue_manifest(*encoded);
                     for (const auto& shard : manifest.shards)
                         if (shard)
@@ -2606,11 +2650,11 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     bool protected_roots_complete = true;
     for (const auto& protected_root : metadata_roots) {
         try {
-            if (!store_.ensure_control_local(protected_root)) {
+            if (!store_.control().ensure_local(protected_root)) {
                 protected_roots_complete = false;
                 continue;
             }
-            auto encoded_manifest = local_.control().get(protected_root);
+            auto encoded_manifest = store_.control().get(protected_root);
             if (!encoded_manifest) {
                 protected_roots_complete = false;
                 continue;
@@ -2620,11 +2664,11 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
                 if (!shard_id)
                     continue;
                 out.control_live.insert(*shard_id);
-                if (!store_.ensure_control_local(*shard_id)) {
+                if (!store_.control().ensure_local(*shard_id)) {
                     protected_roots_complete = false;
                     continue;
                 }
-                auto encoded_shard = local_.control().get(*shard_id);
+                auto encoded_shard = store_.control().get(*shard_id);
                 if (!encoded_shard) {
                     protected_roots_complete = false;
                     continue;
@@ -2651,89 +2695,20 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     return out;
 }
 
-size_t CatalogueManager::control_gc_step(const IdLookup& live, std::chrono::milliseconds grace,
-                                         size_t operation_budget, UnreferencedSince* sightings,
-                                         uint64_t now_unix_ms) {
-    if (!operation_budget)
-        return 0;
+std::optional<dagda::contract::ControlEpoch> CatalogueManager::control_epoch() const {
+    Lock lock(mutex_);
+    if (!control_gc_root_epoch_initialized_)
+        return {};
+    return dagda::contract::ControlEpoch{control_gc_root_epoch_sequence_, control_gc_root_epoch_};
+}
 
-    // Publication is data-before-metadata, so a future root's CONTROL objects
-    // are briefly unreferenced. Time is no fence: the root may advance between
-    // staging and a pass. An unreferenced object survives the root epoch in
-    // which GC first sees (or re-affirms) it; only a later epoch orphans it.
-    Clock::time_point root_epoch;
-    uint64_t root_epoch_sequence = 0;
-    {
-        Lock lock(mutex_);
-        if (!control_gc_root_epoch_initialized_)
-            return 0;
-        root_epoch = control_gc_root_epoch_;
-        root_epoch_sequence = control_gc_root_epoch_sequence_;
-    }
-    const auto since_root =
-        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - root_epoch);
-    const auto staged_since_root = since_root + std::chrono::milliseconds(1);
-
-    size_t removed = 0;
-    bool exhausted = false;
-    for (size_t operations = 0; operations < operation_budget && !exhausted; ++operations) {
-        auto id = local_.control().next_object(control_gc_cursor_, exhausted);
-        if (!id)
-            continue;
-
-        if (live.contains(*id)) {
-            if (sightings)
-                sightings->forget(*id);
-            Lock lock(mutex_);
-            control_gc_unreferenced_epoch_.erase(*id);
-            continue;
-        }
-        if (sightings && ledger_.retained(RetentionClass::control, *id)) {
-            sightings->forget(*id);
-            continue;
-        }
-        const bool waited = !sightings || sightings->matured(*id, now_unix_ms, grace);
-
-        // A content-addressed object may be reused by the current publication;
-        // put() touches it, so keep any object touched since this root was seen.
-        if (!local_.control().older_than(*id, staged_since_root)) {
-            Lock lock(mutex_);
-            if (control_gc_root_epoch_sequence_ != root_epoch_sequence)
-                continue;
-            control_gc_unreferenced_epoch_[*id] = root_epoch_sequence;
-            continue;
-        }
-
-        {
-            Lock lock(mutex_);
-            if (control_gc_root_epoch_sequence_ != root_epoch_sequence)
-                continue;
-            auto [seen, inserted] =
-                control_gc_unreferenced_epoch_.emplace(*id, root_epoch_sequence);
-            if (inserted || seen->second == root_epoch_sequence)
-                continue;
-
-            // cache() takes this mutex to publish a new root, so GC never races
-            // a root transition and deletes its staging. The claim deletion
-            // keeps a claim from landing between its check and the delete.
-            if (!waited)
-                continue;
-            const auto deletion = ledger_.claim_deletion(RetentionClass::control, *id);
-            if (deletion.claimed())
-                continue;
-            if (local_.control().remove_if_older_than(*id, grace)) {
-                control_gc_unreferenced_epoch_.erase(seen);
-                if (sightings)
-                    sightings->forget(*id);
-                ++removed;
-            }
-        }
-    }
-    if (exhausted && sightings)
-        sightings->pass_complete();
-    if (exhausted && removed)
-        (void)local_.control().compact_packs();
-    return removed;
+bool CatalogueManager::within_control_epoch(uint64_t sequence,
+                                            const std::function<void()>& removal) {
+    Lock lock(mutex_);
+    if (!control_gc_root_epoch_initialized_ || control_gc_root_epoch_sequence_ != sequence)
+        return false;
+    removal();
+    return true;
 }
 
 } // namespace macha

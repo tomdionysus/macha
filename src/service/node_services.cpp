@@ -2,6 +2,8 @@
 #include "service/node_services.hpp"
 
 #include "cluster/call_deadline.hpp"
+#include "dagda/domain/domain_id.h"
+#include "dagda/node.h"
 #include "fuse/fuse_frontend.hpp"
 #include "log.hpp"
 #include "media/media_engine.hpp"
@@ -24,12 +26,12 @@ std::shared_ptr<MediaEngine> media_engine_for(const Config& config) {
 } // namespace
 
 NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalState& local,
-                           dagda::Context& context, MetadataServer& metadata_server,
+                           dagda::Node& store, MetadataServer& metadata_server,
                            MessageRoutes& routes, SubsystemRegistry& registry,
                            MaintenancePort& port, NodeServicesInstruments instruments)
-    : node_(node), resources_(resources), local_(local), context_(context),
-      metadata_server_(metadata_server), routes_(routes), registry_(registry), port_(port),
-      instruments_(std::move(instruments)),
+    : node_(node), resources_(resources), local_(local), store_node_(store),
+      context_(store.context()), metadata_server_(metadata_server), routes_(routes),
+      registry_(registry), port_(port), instruments_(std::move(instruments)),
       store_(node_, local_, resources_.activity, resources_.data, resources_.memory,
              resources_.events,
              DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
@@ -50,10 +52,11 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       control_unreferenced_(node_.config().state_path / "retention" / "unreferenced-control.bin"),
       availability_(node_, context_, ledger_, resources_.events, routes_,
                     node_.config().state_path / "availability" / "last-survey.bin"),
-      catalogue_(node_, local_, metadata_server_, store_, metadata_, ledger_),
+      catalogue_(node_, metadata_server_, context_, metadata_),
       catalogue_installer_(catalogue_, resources_.events),
       filesystem_(node_.config(), node_.node_id(), node_.membership(), local_, metadata_server_,
-                  store_, context_, metadata_, resources_.memory, &playback_),
+                  store_, context_, store_node_.references(), metadata_, resources_.memory,
+                  &playback_),
       catalogue_hints_(node_.config().state_path), media_engine_(media_engine_for(node_.config())),
       media_information_(filesystem_, catalogue_, media_engine_, node_.config().state_path),
       scanner_(node_, metadata_server_, filesystem_, catalogue_, catalogue_hints_,
@@ -130,27 +133,12 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
           },
           steady_time_source()),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
-      horizon_builder_(filesystem_, catalogue_, context_), files_api_(filesystem_, availability_),
-      maintenance_(MaintenanceDependencies{node_,
-                                           local_,
-                                           metadata_server_,
-                                           store_,
-                                           context_,
-                                           metadata_,
-                                           metadata_,
-                                           catalogue_,
-                                           horizon_builder_,
-                                           ledger_,
-                                           data_unreferenced_,
-                                           control_unreferenced_,
-                                           availability_,
-                                           media_information_,
-                                           resources_.events,
-                                           port_,
-                                           instruments_.clock,
-                                           instruments_.trace,
-                                           instruments_.maintenance_stage_hook,
-                                           instruments_.constructed}) {
+      reachability_(filesystem_, catalogue_, metadata_, metadata_server_, context_),
+      files_api_(filesystem_, availability_),
+      maintenance_(MaintenanceDependencies{
+          node_, local_, metadata_server_, store_node_, metadata_, metadata_, catalogue_,
+          media_information_, resources_.events, port_, instruments_.clock, instruments_.trace,
+          instruments_.maintenance_stage_hook, instruments_.constructed}) {
     routes_.bind(MessageType::get_ingest_jobs,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return RpcMessage{MessageType::ingest_jobs_reply,
@@ -285,6 +273,13 @@ void NodeServices::start() {
     subsystems_.start(context);
     for (const auto& subsystem : subsystems_.statuses())
         note("subsystem " + subsystem.name);
+    // The store node reclaims only what Macha's state no longer refers to,
+    // and only when this node is set to: with no provider it removes nothing.
+    if (node_.config().maintenance.collect_garbage) {
+        note("register reachability");
+        store_node_.register_reachability(dagda::domain::domain_v1, reachability_);
+        reachability_registered_ = true;
+    }
     note("start maintenance");
     maintenance_.start();
 }
@@ -340,6 +335,12 @@ void NodeServices::stop() {
     metadata_.stop_replication();
     note("stop maintenance");
     maintenance_.stop();
+    if (reachability_registered_) {
+        // Waits for a pass in progress, so the node reads the provider no more.
+        note("unregister reachability");
+        store_node_.unregister_reachability(dagda::domain::domain_v1);
+        reachability_registered_ = false;
+    }
     note("stop catalogue-installer");
     catalogue_installer_.stop();
     note("stop streaming");

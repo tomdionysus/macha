@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/maintenance.hpp"
-#include "contract/gates.hpp"
 #include "contract/stopping.hpp"
+#include "dagda/node.h"
 #include "diagnostics.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "log.hpp"
-#include "metadata/namespace_control_store.hpp"
 #include "observation.hpp"
-#include "service/claim_walk.hpp"
 #include "supervised.hpp"
 #include <algorithm>
 #include <cmath>
@@ -28,57 +26,6 @@ std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfi
 
 namespace {
 
-std::filesystem::path scrub_due_path(const std::filesystem::path& state_path) {
-    return state_path / "maintenance" / "scrub.next";
-}
-
-void persist_scrub_due(const std::filesystem::path& path, uint64_t due_unix_ms) {
-    std::filesystem::create_directories(path.parent_path());
-    auto temp = path;
-    temp += ".tmp";
-    {
-        std::ofstream out(temp, std::ios::trunc);
-        if (!out)
-            throw std::runtime_error("cannot write scrub schedule " + temp.string());
-        out << due_unix_ms << '\n';
-        out.flush();
-        if (!out)
-            throw std::runtime_error("cannot flush scrub schedule " + temp.string());
-    }
-    std::error_code error;
-    std::filesystem::rename(temp, path, error);
-    if (error) {
-        std::filesystem::remove(temp, error);
-        throw std::runtime_error("cannot publish scrub schedule " + path.string());
-    }
-}
-
-uint64_t initialise_scrub_due(const std::filesystem::path& state_path,
-                              std::chrono::milliseconds interval) {
-    const auto path = scrub_due_path(state_path);
-    {
-        std::ifstream in(path);
-        uint64_t due{};
-        if (in >> due && due)
-            return due;
-    }
-
-    const auto now = unix_ms();
-    const auto interval_ms = static_cast<uint64_t>(std::max<int64_t>(1, interval.count()));
-    const auto due = now > std::numeric_limits<uint64_t>::max() - interval_ms
-                         ? std::numeric_limits<uint64_t>::max()
-                         : now + interval_ms;
-    try {
-        persist_scrub_due(path, due);
-    } catch (const std::exception& error) {
-        // The schedule file is only a neighbourliness hint. Failure to persist it
-        // must not stop the server; this process still honours the in-memory due time.
-        Log::debug("maintenance: scrub schedule persistence unavailable: " +
-                   std::string(error.what()));
-    }
-    return due;
-}
-
 void log_slow_stage(std::string_view stage, Clock::time_point started,
                     const std::string& detail = {}) {
     const auto ms = elapsed_ms(started);
@@ -91,14 +38,11 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
     : node_(dependencies.node), local_(dependencies.local),
-      metadata_server_(dependencies.metadata_server), store_(dependencies.store),
-      context_(dependencies.context), metadata_(dependencies.metadata),
+      metadata_server_(dependencies.metadata_server), store_node_(dependencies.store_node),
+      context_(dependencies.store_node.context()), metadata_(dependencies.metadata),
       metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
-      builder_(dependencies.builder), ledger_(dependencies.ledger),
-      data_unreferenced_(dependencies.data_unreferenced),
-      control_unreferenced_(dependencies.control_unreferenced),
-      availability_(dependencies.availability), media_information_(dependencies.media_information),
-      events_(dependencies.events), port_(dependencies.port), clock_(std::move(dependencies.clock)),
+      media_information_(dependencies.media_information), events_(dependencies.events),
+      port_(dependencies.port), clock_(std::move(dependencies.clock)),
       maintenance_trace_(std::move(dependencies.trace)),
       maintenance_stage_hook_(std::move(dependencies.stage_hook)),
       constructed_(dependencies.constructed) {}
@@ -134,117 +78,6 @@ void Maintenance::stop() {
     Log::debug("shutdown: service maintenance joined");
 }
 
-// A sweep slice can add sightings every pass; the table is written when a
-// sweep completes and otherwise at most twice a minute. A sighting lost to a
-// crash is taken again, which only delays that object's deletion.
-void Maintenance::save_sightings(UnreferencedSince& sightings, Clock::time_point& saved,
-                                 bool complete) {
-    const auto now = clock_->now();
-    if (!complete && now - saved < std::chrono::seconds(30))
-        return;
-    saved = now;
-    sightings.save();
-}
-
-std::vector<GarbageRef> Maintenance::collect_garbage(const std::vector<GarbageRef>& garbage) {
-    const auto grace = node_.config().maintenance.garbage_grace;
-    const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(grace).count();
-    const auto now_ns = clock_->wall_ns();
-    std::vector<GarbageRef> matured;
-    matured.reserve(garbage.size());
-
-    for (const auto& candidate : garbage) {
-        // A zero retirement time marks a legacy tombstone: ineligible until
-        // maintain_garbage_metadata() stamps it, which grants a full grace period.
-        if (candidate.retired_at_ns <= 0 || now_ns < candidate.retired_at_ns ||
-            now_ns - candidate.retired_at_ns < grace_ns)
-            continue;
-
-        // A matured tombstone no longer protects the object from the reachability
-        // sweep. Authoritative bytes are not deleted here: the sweep's atomic
-        // age-check-and-remove spares a recently reaffirmed object even if this view
-        // is stale. A cache copy is disposable and goes now.
-        local_.cache().remove(candidate.id);
-        matured.push_back(candidate);
-    }
-    return matured;
-}
-
-void Maintenance::maintain_garbage_metadata(const std::vector<GarbageRef>& erase) {
-    if (erase.empty())
-        return;
-
-    std::map<ObjectId, GarbageRef> erase_expected;
-    for (const auto& candidate : erase)
-        erase_expected[candidate.id] = candidate;
-
-    metadata_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-        // A head keeps its tombstones in immutable batches: a batch holding one
-        // to erase is dropped, and the rest of it written again at its own time.
-        // A later retirement of the same object is another batch and is kept.
-        if (snapshot.tombstone_batches.empty())
-            return;
-        const auto reader = ControlNamespaceNodeStore::for_reading(context_);
-        std::vector<TombstoneBatch> kept;
-        for (const auto& batch : snapshot.tombstone_batches) {
-            const auto bytes = reader.get(batch.id);
-            if (!bytes) {
-                kept.push_back(batch);
-                continue;
-            }
-            auto content = decode_tombstone_batch(*bytes);
-            MetadataDelta::PendingTombstones rest{false, content.retired_at_ns, {}};
-            for (const auto& id : content.ids) {
-                const auto expected = erase_expected.find(id);
-                if (expected == erase_expected.end() ||
-                    content.retired_at_ns > expected->second.retired_at_ns)
-                    rest.ids.push_back(id);
-            }
-            if (rest.ids.size() == content.ids.size()) {
-                kept.push_back(batch);
-                continue;
-            }
-            delta.drop_tombstone_batches.push_back(batch.id);
-            if (!rest.ids.empty())
-                delta.pending_tombstones.push_back(std::move(rest));
-        }
-        snapshot.tombstone_batches = std::move(kept);
-        std::sort(delta.drop_tombstone_batches.begin(), delta.drop_tombstone_batches.end());
-    });
-}
-
-void Maintenance::maintain_tombstone_batches(const InventoryHorizon& inventory) {
-    const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              node_.config().maintenance.garbage_grace)
-                              .count();
-    const auto now_ns = clock_->wall_ns();
-    std::set<ObjectId> matured;
-    for (const auto& batch : inventory.tombstone_batches())
-        if (batch.retired_at_ns > 0 && now_ns >= batch.retired_at_ns &&
-            now_ns - batch.retired_at_ns >= grace_ns)
-            matured.insert(batch.id);
-    const auto view = metadata_.converged();
-    // Only what the head still names: the erase above may have dropped a
-    // matured batch already.
-    std::erase_if(matured, [&](const ObjectId& id) {
-        const auto& named = view.snapshot->tombstone_batches;
-        return std::none_of(named.begin(), named.end(),
-                            [&](const TombstoneBatch& batch) { return batch.id == id; });
-    });
-    if (matured.empty())
-        return;
-    metadata_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-        // A batch is immutable, so dropping it by id cannot drop a later
-        // retirement of the same objects: that is another batch.
-        std::erase_if(snapshot.tombstone_batches, [&](const TombstoneBatch& batch) {
-            const bool drop = matured.contains(batch.id);
-            if (drop)
-                delta.drop_tombstone_batches.push_back(batch.id);
-            return drop;
-        });
-    });
-}
-
 double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds, double wall_seconds,
                             double cpu_target) {
     if (wall_seconds <= 0.0)
@@ -258,9 +91,6 @@ double background_cpu_scale(double process_cpu_seconds, double own_cpu_seconds, 
 void Maintenance::run(std::stop_token stop) {
     const auto& policy = node_.config().maintenance;
     ThreadCpuReporter cpu_reporter("macha-maint", std::chrono::seconds(5), true);
-    auto last_wall = clock_->now();
-    auto last_cpu = std::clock();
-    auto last_own_cpu_ns = thread_cpu_time_ns();
     uint64_t last_metadata_remote_epoch = node_.remote_metadata_epoch();
     std::vector<NodeId> last_active_nodes;
     bool metadata_dirty = false;
@@ -279,59 +109,20 @@ void Maintenance::run(std::stop_token stop) {
     absorbed_total_ =
         absorbed_storage_ + absorbed_metadata_ + absorbed_topology_ + absorbed_claims_;
     port_.metadata_convergence.request(metadata_server_.known_generation());
-    uint64_t observed_event = absorbed_total_;
-    auto network_quiescent_until = Clock::time_point{};
-    auto local_quiescent_until = Clock::time_point{};
-    auto ledger_verify_due = Clock::time_point{};
-    auto ledger_verify_at = Clock::time_point{};
-    double ledger_verify_credit = 0.0;
+    // Macha's events and the store node's: either moving is work to look at.
+    const auto events_now = [this] {
+        return events_.total() + store_node_.maintenance_events().total();
+    };
+    uint64_t observed_event = events_now();
     auto gc_quiescent_until = Clock::time_point{};
-    auto scrub_due_unix_ms = initialise_scrub_due(node_.config().state_path, policy.scrub_interval);
-    double network_credit = 0.0;
-    double local_credit = 0.0;
-    // Replica repair shares time with every higher class by weight, in the
-    // duty-cycle form the FUSE frontend uses for viewer:loader. It is paced, never
-    // switched off: a node that is always busy must still repair.
-    WeightedLoaderService repair_share(policy.foreground_weight, policy.repair_weight,
-                                       std::chrono::milliseconds(25));
-    double scrub_credit = 0.0;
-    ClaimWalk data_claim_walk(RetentionClass::data);
-    ClaimWalk control_claim_walk(RetentionClass::control);
-    // Why the destructive DATA sweep did not run, logged at DEBUG when the answer
-    // changes.
-    std::string last_gc_skip_reason;
-    bool release_horizon_incomplete_logged = false;
-
-    // The decision trace: every gate's verdict and inputs on each pass that
-    // evaluates it, and every action as it happens. Pass counts are timing, not
-    // decisions. Nothing is recorded without a hook.
-    const auto trace_gate = [&](std::string_view gate, bool open, const std::string& inputs) {
-        if (maintenance_trace_)
-            maintenance_trace_(gate, (open ? "open " : "shut ") + inputs);
+    // The store's repair: credit, its share against the classes above it, the
+    // survey and the transfers. Its own clock is the store node's, real time.
+    auto& repair = store_node_.repair();
+    bool repair_quiescent = false;
+    const auto pause = [&stop] {
+        if (stop.stop_requested())
+            throw MaintenanceStopping{};
     };
-    const auto trace_action = [&](std::string_view kind, const std::string& detail) {
-        if (maintenance_trace_)
-            maintenance_trace_(kind, detail);
-    };
-    const auto flag = [](std::string_view name, bool value) {
-        return std::string(name) + (value ? "=1" : "=0");
-    };
-    // The tombstones before the first inventory: none.
-    static const std::vector<GarbageRef> no_garbage;
-    // What repair pulls: this node's missing namespace extents, from its
-    // holdings, and the objects outside the namespace; rebuilt when either
-    // changes.
-    std::shared_ptr<const std::vector<ObjectId>> pull_missing;
-    std::shared_ptr<const InventoryHorizon> pull_inventory;
-    std::vector<ObjectId> pull_list;
-    // Advanced at each refill: the lists are refilled in place, so their
-    // addresses say nothing about whether they changed.
-    uint64_t pull_list_version = 0;
-    std::shared_ptr<const AvailabilityService::PeerLacks> push_lacks;
-    std::shared_ptr<const InventoryHorizon> push_inventory;
-    std::vector<ObjectId> push_list;
-    uint64_t push_list_version = 0;
-    bool pushing_listed = false;
 
     while (!stop.stop_requested()) {
         port_.wakeups.fetch_add(1, std::memory_order_relaxed);
@@ -342,7 +133,7 @@ void Maintenance::run(std::stop_token stop) {
         auto now = clock_->now();
         absorb_events();
         metadata_dirty = port_.metadata_convergence.pending();
-        const auto current_event = events_.total();
+        const auto current_event = events_now();
         const bool event_changed = current_event != observed_event;
         observed_event = current_event;
         const auto local_metadata_generation = local_.replica().committed_generation();
@@ -354,8 +145,7 @@ void Maintenance::run(std::stop_token stop) {
             gc_quiescent_until = now + policy.foreground_quiet;
         }
         if (event_changed) {
-            network_quiescent_until = Clock::time_point{};
-            local_quiescent_until = Clock::time_point{};
+            repair_quiescent = false;
             // Object arrival and namespace publication are separate durable
             // operations. Start an exact quiet window so a sweep cannot race
             // the retention claim which makes newly-arrived bytes reachable.
@@ -383,75 +173,23 @@ void Maintenance::run(std::stop_token stop) {
             metadata_retry_due = Clock::time_point{};
             retry_trigger_first_.reset();
         }
-        auto wall_seconds = std::chrono::duration<double>(now - last_wall).count();
-        if (wall_seconds <= 0.0)
-            wall_seconds = std::chrono::duration<double>(policy.interval).count();
-        // The load background work yields to is everyone else's: this
-        // thread's own CPU (repair, GC, the census) does not count against it.
-        auto cpu_now = std::clock();
-        const auto own_cpu_ns = thread_cpu_time_ns();
-        const double own_seconds =
-            static_cast<double>(own_cpu_ns >= last_own_cpu_ns ? own_cpu_ns - last_own_cpu_ns : 0) /
-            1e9;
-        const double process_seconds = static_cast<double>(cpu_now - last_cpu) / CLOCKS_PER_SEC;
-        last_wall = now;
-        last_cpu = cpu_now;
-        last_own_cpu_ns = own_cpu_ns;
 
-        auto playback_bytes = context_.activity().take_bytes(FrameType::foreground);
-        auto interactive_bytes = context_.activity().take_bytes(FrameType::read_ahead);
-        auto loader_bytes = context_.activity().take_bytes(FrameType::loader);
+        // Law 3: the loader outranks background work, so loader activity (an
+        // ingest) counts as busy too. Viewer > loader > background.
+        const auto playback_bytes = context_.activity().take_bytes(FrameType::foreground);
+        const auto interactive_bytes = context_.activity().take_bytes(FrameType::read_ahead);
+        const auto loader_bytes = context_.activity().take_bytes(FrameType::loader);
         const bool viewer_busy =
             playback_bytes > 0 || interactive_bytes > 0 ||
             context_.activity().idle_for(WorkClass::foreground) < policy.foreground_quiet;
-        // Law 3: the loader outranks background work, so loader activity (an
-        // ingest) counts as busy too.
         const bool loader_busy =
             loader_bytes > 0 ||
             context_.activity().idle_for(WorkClass::loader) < policy.foreground_quiet;
-        // Viewer > loader > repair/rebalance/scrub. Both higher classes pace
-        // background work, while the transport queues order within them.
-        bool busy = viewer_busy || loader_busy;
-        // A peer's viewers pace repair as this node's own do, since repair shares
-        // their links: paced, never stopped, or a later viewer waits for the copy.
-        const bool peer_viewers = node_.peer_viewers_active(
-            std::max(node_.config().telemetry_interval * 3, std::chrono::milliseconds(3000)));
-        const bool repair_busy = busy || peer_viewers;
-        double fraction = busy ? policy.busy_bandwidth_fraction : policy.idle_bandwidth_fraction;
-
-        double bandwidth = store_.estimated_network_bps();
-        if (bandwidth <= 0.0)
-            bandwidth = static_cast<double>(policy.initial_bandwidth);
-        if (policy.max_bandwidth)
-            bandwidth = std::min(bandwidth, static_cast<double>(policy.max_bandwidth));
-
-        // Process CPU includes foreground filesystem/RPC work. Above the target,
-        // background work loses budget continuously rather than stopping in a
-        // fixed block-per-tick pattern.
-        const double cpu_scale =
-            background_cpu_scale(process_seconds, own_seconds, wall_seconds, policy.cpu_target);
-
-        double rate = bandwidth * fraction * cpu_scale;
-        // Repair's byte rate does not drop with busyness; repair_share decides
-        // how much of the time it gets. busy_bandwidth_fraction governs
-        // rebalance and scrub only.
-        const double repair_rate = bandwidth * policy.idle_bandwidth_fraction * cpu_scale;
-        double burst_cap = std::max<double>(node_.config().extent_size, bandwidth * 5.0);
-        network_credit = std::min(burst_cap, network_credit + repair_rate * wall_seconds);
-        local_credit = std::min(burst_cap, local_credit + rate * wall_seconds);
-        const auto wall_now_ms = clock_->wall_ms();
-        const bool scrub_due = policy.scrub_fraction > 0.0 && wall_now_ms >= scrub_due_unix_ms;
-        if (scrub_due) {
-            scrub_credit =
-                std::min(burst_cap, scrub_credit + rate * policy.scrub_fraction * wall_seconds);
-        } else {
-            // Do not bank weeks of scrub credit and explode into a large burst when
-            // the next campaign becomes due. Outside a campaign, scrub is truly idle.
-            scrub_credit = 0.0;
-        }
+        const bool busy = viewer_busy || loader_busy;
 
         bool gc_due_this_pass = false;
         bool repair_continue = false;
+        std::optional<Clock::time_point> repair_wake;
         try {
             // Remote generation notices do no kernel/FUSE or replica I/O themselves; this
             // owner advances the local metadata snapshot promptly, and settled
@@ -560,579 +298,138 @@ void Maintenance::run(std::stop_token stop) {
                 log_slow_stage("catalogue-repair", stage);
             }
 
-            // Credit gates repair's transfers inside the step, not the step:
-            // probing which objects need a copy costs no bulk bandwidth.
-            const bool allow_network_repair = repair_share.can_start(now, repair_busy);
-            const bool network_due = allow_network_repair && now >= network_quiescent_until;
-            store_.note_repair_gate(
-                network_due             ? DistributedStore::RepairGate::ran
-                : !allow_network_repair ? DistributedStore::RepairGate::share
-                                        : DistributedStore::RepairGate::quiescent,
-                network_credit,
-                static_cast<uint8_t>((viewer_busy ? DistributedStore::paced_by_viewer : 0) |
-                                     (loader_busy ? DistributedStore::paced_by_loader : 0) |
-                                     (peer_viewers ? DistributedStore::paced_by_peer_viewer : 0)));
-            trace_gate("gate.repair", network_due,
-                       flag("share", allow_network_repair) + " " +
-                           flag("quiescent", now < network_quiescent_until));
+            // Repair, as the store paces it: credit earned every pass, a turn
+            // when its share against the classes above lets one start. It is
+            // paced, never switched off: a node that is always busy still
+            // repairs.
+            const auto repair_now = Clock::now();
+            const auto credit = repair.earn_credit(repair_now, policy.interval);
+            const auto paced = repair.paced_by();
+            const bool allow_network_repair = repair.may_start(repair_now, paced);
+            const bool network_due = allow_network_repair && !repair_quiescent;
+            repair.note_gate(network_due             ? dagda::store::RepairGate::ran
+                             : !allow_network_repair ? dagda::store::RepairGate::share
+                                                     : dagda::store::RepairGate::quiescent,
+                             paced);
+            if (!allow_network_repair)
+                repair_wake = Clock::now() + repair.turn_wait(repair_now, paced);
+            if (!cluster_stable_observed_ && node_.membership().all_known_reachable() &&
+                metadata_.status().stable) {
+                // Recovery after a restart: every known node reached and
+                // metadata stable, for the first time in this process.
+                cluster_stable_observed_ = true;
+                observations().event({unix_ms(),
+                                      "cluster_stable",
+                                      {{"elapsed_ms", elapsed_us(constructed_) / 1000}},
+                                      {}});
+            }
             const bool garbage_due = !busy && !metadata_dirty;
             const bool gc_due = !busy && now >= gc_quiescent_until;
             gc_due_this_pass = gc_due;
+            // Nothing destructive without a provider: none, the collector is
+            // null and the store removes nothing.
+            auto* collector = store_node_.collector();
 
-            // Destructive maintenance is deliberately opportunistic: degraded
-            // clusters retain garbage. Reclamation is enabled only after every
-            // durably-known node has been directly reached by this process and
-            // metadata repair has validated/converged that complete replica set.
-
-            // What the reachable nodes hold between them: surveyed when what
-            // is referenced, this node's holdings, the membership or a peer's
-            // storage has changed, and a no-op otherwise. It reads the
-            // inventory, so it follows the inventory stage, and repair reads
-            // its lists, so it precedes repair.
-            const auto survey = [&] {
+            if (network_due || garbage_due || gc_due) {
+                // One inventory for repair, tombstones and both sweeps,
+                // rebuilt when the provider's generation has moved. Held back
+                // on a repair-only pass until metadata is ready.
+                std::optional<dagda::ledger::InventoryStep> inventory;
+                if (collector) {
+                    enter_stage("inventory");
+                    const bool repair_only = network_due && !garbage_due && !gc_due;
+                    inventory = collector->inventory_step(pause, !repair_only ||
+                                                                     metadata_ready_for_dependants);
+                    // Never used destructively in the pass that built it.
+                    if (inventory->rebuilt)
+                        gc_quiescent_until = clock_->now() + policy.foreground_quiet;
+                }
                 enter_stage("availability");
                 try {
-                    // The survey's walks (the join against this node's
-                    // holdings, the diff, the path table over the whole
-                    // namespace) check the stop between objects, so a stop
-                    // never waits for a million lookups to finish.
-                    if (const auto head = metadata_.current())
-                        (void)availability_.refresh(*head, clock_->now(), unix_ms(), [&stop] {
-                            if (stop.stop_requested())
-                                throw MaintenanceStopping{};
-                        });
+                    (void)repair.survey(pause);
                 } catch (const MaintenanceStopping&) {
                     throw;
                 } catch (const std::exception& error) {
                     Log::debug("availability survey deferred: " + std::string(error.what()));
                 }
-            };
 
-            // Reachability GC, repair and explicit tombstone accounting share
-            // one immutable namespace inventory. Rebuild it only when one of
-            // those consumers can make progress or metadata has advanced.
-            if (network_due || garbage_due || gc_due) {
-                enter_stage("inventory");
-                const auto inventory_stage = Clock::now();
-                // The horizons this pass reads: the ledger's, as published.
-                auto inventory = ledger_.inventory();
-                auto release = ledger_.release();
-                auto objects = builder_.namespace_objects([&stop] {
-                    if (stop.stop_requested())
-                        throw MaintenanceStopping{};
-                });
-                bool rebuilt_inventory = false;
-                // Rebuilding is held back until metadata is ready, so the inventory
-                // is never read ahead of the metadata convergence it depends on; a
-                // repair-only step uses the last inventory until then.
-                const bool repair_only = network_due && !garbage_due && !gc_due;
-                if ((!inventory || !inventory->catalogue_complete() ||
-                     inventory->generation() != objects->metadata_generation) &&
-                    (!inventory || !repair_only || metadata_ready_for_dependants)) {
-                    // The catalogue's half is its installed view, read against
-                    // the head; complete only when the view is at that head.
-                    const auto catalogue_head = catalogue_.maintenance_head();
-                    // The pass reads what the ledger holds, never its own copy.
-                    ledger_.publish(builder_.inventory(*objects, catalogue_head));
-                    inventory = ledger_.inventory();
-                    rebuilt_inventory = true;
-                    observations().record("maintenance.inventory.build_us",
-                                          elapsed_us(inventory_stage));
-                    trace_action(
-                        "inventory",
-                        "generation=" + std::to_string(objects->metadata_generation) +
-                            " live=" + std::to_string(inventory->size(RetentionClass::data)) +
-                            " control_live=" +
-                            std::to_string(inventory->size(RetentionClass::control)) +
-                            " garbage=" + std::to_string(inventory->garbage().size()) +
-                            " stale_garbage=" + std::to_string(inventory->stale_garbage().size()) +
-                            " " + flag("catalogue_complete", inventory->catalogue_complete()));
-                    observations().add("maintenance.inventory.live_objects",
-                                       inventory->size(RetentionClass::data));
-                    // A newly derived reachability set is never consumed destructively in the
-                    // pass that built it. Schedule one follow-up after the foreground quiet
-                    // boundary, or a quiescent service would never wake to consume it.
-                    gc_quiescent_until = clock_->now() + policy.foreground_quiet;
-                }
-                if (rebuilt_inventory && Log::enabled(LogLevel::all)) {
-                    Log::trace(
-                        "DIAG maintenance-inventory generation=" +
-                        std::to_string(objects->metadata_generation) +
-                        " entries=" + std::to_string(objects->entries) +
-                        " extents=" + std::to_string(objects->extents) +
-                        " live=" + std::to_string(inventory->size(RetentionClass::data)) +
-                        " garbage=" + std::to_string(inventory->garbage().size()) +
-                        " stale_garbage=" + std::to_string(inventory->stale_garbage().size()) +
-                        " elapsed_ms=" + std::to_string(elapsed_ms(inventory_stage)));
-                }
-
-                survey();
                 if (network_due) {
-                    const auto extent = std::max<uint64_t>(1, node_.config().extent_size);
-
-                    size_t retained_repairs = 0;
-                    bool retained_waiting_for_credit = false;
-                    // The walk stopped at its per-step bound with claims left;
-                    // repair is not quiescent until a walk reaches the end.
-                    bool retained_walk_unfinished = false;
-                    // Presence is an index lookup and costs no credit; only a missing claimed
-                    // object, which may be fetched, needs an extent of credit.
-                    struct CreditedRestorer final : ClaimRestorer {
-                        DistributedStore& store;
-                        double& credit;
-                        uint64_t extent;
-                        const decltype(trace_action)& trace;
-                        CreditedRestorer(DistributedStore& s, double& c, uint64_t e,
-                                         const decltype(trace_action)& t)
-                            : store(s), credit(c), extent(e), trace(t) {}
-                        Outcome restore(RetentionClass type, const ObjectId& id) override {
-                            const std::string walked =
-                                std::string(type == RetentionClass::data ? "data " : "control ") +
-                                to_string(id);
-                            if (credit < static_cast<double>(extent)) {
-                                trace("claim-walk", walked + " waiting-for-credit");
-                                return Outcome::waiting_for_credit;
-                            }
-                            const bool restored = type == RetentionClass::data
-                                                      ? store.ensure_local(id, false)
-                                                      : store.ensure_control_local(id);
-                            trace("claim-walk",
-                                  walked + (restored ? " restored" : " not-restored"));
-                            if (!restored)
-                                return Outcome::not_restored;
-                            credit = std::max(0.0, credit - static_cast<double>(extent));
-                            return Outcome::restored;
-                        }
-                    } restorer{store_, network_credit, extent, trace_action};
-                    const auto higher_class_active = [this, &policy, peer_viewers] {
-                        const auto quiet = policy.foreground_quiet;
-                        return peer_viewers ||
-                               context_.activity().idle_for(WorkClass::foreground) < quiet ||
-                               context_.activity().idle_for(WorkClass::loader) < quiet;
-                    };
-                    repair_share.started(clock_->now(), repair_busy);
-                    // A throw from either repair stage must still close the
-                    // turn, or the pacer counts it active forever and never
-                    // computes another cooldown.
-                    struct RepairTurn {
-                        WeightedLoaderService& share;
-                        const decltype(higher_class_active)& active;
-                        const MaintenanceClock& clock;
-                        ~RepairTurn() {
-                            share.finished(clock.now(), active());
-                        }
-                    } repair_turn{repair_share, higher_class_active, *clock_};
-                    enter_stage("retention-repair");
-                    for (auto* walk : {&data_claim_walk, &control_claim_walk}) {
-                        const auto step = walk->step(ledger_, restorer);
-                        retained_repairs += step.restored;
-                        retained_waiting_for_credit |= step.waiting_for_credit;
-                        retained_walk_unfinished |= step.unfinished;
-                    }
-
-                    const auto byte_budget = static_cast<uint64_t>(network_credit);
-                    // The byte budget does not constrain have-object probes: a
-                    // settled or mostly-settled namespace could issue thousands
-                    // of synchronous control RPCs while consuming no network
-                    // credit. Bound each repair slice independently.
-                    constexpr size_t operation_budget = 16;
-                    const auto missing = availability_.missing_here();
-                    if (inventory && (missing != pull_missing || inventory != pull_inventory)) {
-                        // What this node lacks, when the survey knows; every
-                        // referenced object until it does.
-                        if (missing) {
-                            pull_list = *missing;
-                        } else {
-                            pull_list = inventory->all(RetentionClass::data);
-                        }
-                        ++pull_list_version;
-                        pull_missing = missing;
-                        pull_inventory = inventory;
-                    }
-                    const bool pulling_listed = inventory != nullptr;
-                    // What a peer holds, from the diff of its held trie: known
-                    // only for a peer that answered.
-                    const auto peer_lacks = availability_.peer_lacks();
-                    // What some peer lacks, when every peer's list is whole and
-                    // of this inventory: the push works from it instead of
-                    // walking the store.
-                    if (peer_lacks != push_lacks || inventory != push_inventory) {
-                        push_list.clear();
-                        ++push_list_version;
-                        if (peer_lacks && peer_lacks->complete && inventory &&
-                            peer_lacks->generation == inventory->generation()) {
-                            for (const auto& [peer, ids] : peer_lacks->lacks)
-                                push_list.insert(push_list.end(), ids->begin(), ids->end());
-                            std::sort(push_list.begin(), push_list.end());
-                            push_list.erase(std::unique(push_list.begin(), push_list.end()),
-                                            push_list.end());
-                            pushing_listed = true;
-                        } else {
-                            pushing_listed = false;
-                        }
-                        push_lacks = peer_lacks;
-                        push_inventory = inventory;
-                    }
-                    const auto known_present = [&](const NodeId& peer,
-                                                   const ObjectId& id) -> std::optional<bool> {
-                        if (!peer_lacks || !inventory ||
-                            peer_lacks->generation != inventory->generation())
-                            return std::nullopt;
-                        const auto found = peer_lacks->lacks.find(peer);
-                        if (found == peer_lacks->lacks.end())
-                            return std::nullopt;
-                        return !std::binary_search(found->second->begin(), found->second->end(),
-                                                   id);
-                    };
-                    enter_stage("network-repair");
                     if (maintenance_stage_hook_)
                         maintenance_stage_hook_("network-repair-begin");
-                    const auto repair_stage = Clock::now();
-                    auto repair = store_.repair_step(
-                        byte_budget, operation_budget,
-                        inventory ? std::optional(inventory->lookup(RetentionClass::data))
-                                  : std::nullopt,
-                        [&] {
-                            // Repair's turn ends at the next operation boundary
-                            // once its weighted slice is spent; it is paced,
-                            // never stopped.
-                            return repair_share.should_yield(clock_->now(), higher_class_active());
-                        },
-                        inventory ? inventory->generation() : 0,
-                        // No work that cannot complete: the survey asks again
-                        // when membership or storage could change the answer.
-                        [this](const ObjectId& id) { return availability_.unavailable(id); },
-                        pulling_listed ? std::optional<std::span<const ObjectId>>(pull_list)
-                                       : std::nullopt,
-                        known_present,
-                        pushing_listed ? std::optional<std::span<const ObjectId>>(push_list)
-                                       : std::nullopt,
-                        pull_list_version, push_list_version);
-                    {
-                        // Split by whether a higher class was active as the
-                        // step ended: repair idle against repair on its share.
-                        const std::string load = higher_class_active() ? "loaded" : "idle";
-                        observations().record("maintenance.repair.step_us." + load,
-                                              elapsed_us(repair_stage));
-                        observations().add("maintenance.repair.bytes." + load,
-                                           repair.bytes_transferred);
-                        observations().add("maintenance.repair.push_examined." + load,
-                                           repair.push_examined);
-                        observations().add("maintenance.repair.pull_examined." + load,
-                                           repair.pull_examined);
-                        observations().add("maintenance.repair.retained_repairs", retained_repairs);
-                    }
-                    log_slow_stage("network-repair", repair_stage,
-                                   "bytes=" + std::to_string(repair.bytes_transferred) +
-                                       " retained_repairs=" + std::to_string(retained_repairs) +
-                                       " push_examined=" + std::to_string(repair.push_examined) +
-                                       " pull_examined=" + std::to_string(repair.pull_examined) +
-                                       " remote_ops=" + std::to_string(repair.remote_operations) +
-                                       " complete=" + std::to_string(repair.complete ? 1 : 0) +
-                                       " yielded=" + std::to_string(repair.yielded ? 1 : 0));
-                    if (repair.bytes_transferred) {
-                        network_credit = std::max(
-                            0.0, network_credit - static_cast<double>(repair.bytes_transferred));
-                    }
-                    if (repair.credit_limited) {
-                        // The credit deadline below wakes the loop when the
-                        // next extent is affordable.
-                        store_.note_repair_gate(DistributedStore::RepairGate::credit,
-                                                network_credit);
-                    } else if (repair.yielded) {
-                        // Work is left. The higher class may have arrived after the pass
-                        // began, so neither the busy wake nor the share's next turn may
-                        // be set: look again after an interval, when the share decides.
-                        repair_continue = true;
-                        Log::trace("maintenance: repair yielded to foreground I/O");
-                    } else if (!repair.complete || retained_repairs || repair.bytes_transferred ||
-                               retained_walk_unfinished) {
-                        // Work left (a probe or scan budget ran out) or work
-                        // done: the next step is due after one interval, not
-                        // when credit or an unrelated event next wakes the loop.
-                        repair_continue = true;
-                    } else if (!retained_waiting_for_credit) {
-                        network_credit = 0.0;
-                        network_quiescent_until = Clock::time_point::max();
-                        Log::trace("maintenance: repair quiescent; waiting for an event");
-                    }
-                    // Otherwise the claim walk still waits for credit, and the
-                    // credit deadline wakes the loop for it.
-                }
-
-                const bool cluster_gc_stable =
-                    node_.membership().all_known_reachable() && metadata_.status().stable;
-                if (cluster_gc_stable && !cluster_stable_observed_) {
-                    // Recovery after a restart: every known node reached and
-                    // metadata stable, for the first time in this process.
-                    cluster_stable_observed_ = true;
-                    observations().event({unix_ms(),
-                                          "cluster_stable",
-                                          {{"elapsed_ms", elapsed_us(constructed_) / 1000}},
-                                          {}});
-                }
-
-                // What the gates read. The known generation is read again at
-                // each gate, as the pass always has.
-                PassFacts facts;
-                facts.garbage_due = garbage_due;
-                facts.gc_due = gc_due;
-                facts.busy = busy;
-                facts.gc_waiting_for_event = gc_quiescent_until == Clock::time_point::max();
-                facts.rebuilt_inventory = rebuilt_inventory;
-                const auto& garbage = inventory ? inventory->garbage() : no_garbage;
-
-                const auto tombstones = tombstone_gate(facts, inventory.get());
-                trace_gate("gate.tombstones", tombstones.permitted, tombstones.conditions);
-                if (tombstones.permitted) {
-                    auto matured = collect_garbage(garbage);
-
-                    auto erase = inventory ? inventory->stale_garbage() : no_garbage;
-                    erase.insert(erase.end(), matured.begin(), matured.end());
-                    observations().add("maintenance.tombstones.collected", matured.size());
-                    if (!erase.empty()) {
-                        const auto ids = [](const std::vector<GarbageRef>& refs) {
-                            std::vector<std::string> hex;
-                            hex.reserve(refs.size());
-                            for (const auto& ref : refs)
-                                hex.push_back(to_string(ref.id));
-                            std::sort(hex.begin(), hex.end());
-                            std::string joined;
-                            for (const auto& id : hex)
-                                joined += (joined.empty() ? "" : ",") + id;
-                            return joined;
-                        };
-                        trace_action("tombstones", "erase=[" + ids(erase) + "]");
-                        maintain_garbage_metadata(erase);
-                    }
-                    if (inventory)
-                        maintain_tombstone_batches(*inventory);
-                }
-
-                // The control live set (catalogue objects and namespace tree nodes)
-                // comes from the same inventory as DATA reachability. A foreground
-                // mutation may advance metadata after it was built; never sweep the
-                // control store with such a stale set, or a short grace could delete a
-                // newly published manifest, shard or tree node.
-                const auto current_metadata_view = metadata_.current();
-                const auto release_metadata_view = metadata_.release_head();
-
-                // Retention release is local and causal. A sole accepted head
-                // provides a complete live-object set plus the mutation clock of
-                // claim dots it has actually observed. Claims from unseen concurrent
-                // branches are not dominated by that clock and therefore survive.
-                if (auto floor = metadata_.release_head();
-                    floor && floor->hash != (release ? release->head() : Hash256{})) {
-                    ObservedDuration horizon_build(
-                        observations().histogram("maintenance.release_horizon.build_us"));
-                    auto built = builder_.release(*floor);
-                    trace_action("release-horizon",
-                                 std::string(built.complete ? "complete" : "incomplete") +
-                                     " data_live=" +
-                                     std::to_string(built.horizon->size(RetentionClass::data)) +
-                                     " control_live=" +
-                                     std::to_string(built.horizon->size(RetentionClass::control)));
-                    // Refused when incomplete: the ledger keeps the previous.
-                    ledger_.publish(std::move(built));
-                    release = ledger_.release();
-                }
-
-                facts.release_view = release_metadata_view.has_value();
-                facts.known_generation = metadata_server_.known_generation();
-                const auto control = control_gate(facts, inventory.get());
-                // The rule the DATA and tombstone gates keep: a newly built
-                // inventory is never used destructively in the pass that
-                // built it. Traced so a fixture can hold the control gate to it.
-                if (rebuilt_inventory)
-                    trace_action("control-gate-in-rebuilding-pass",
-                                 control.permitted ? "open" : "shut");
-                trace_gate("gate.control", control.permitted, control.conditions);
-                if (control.permitted) {
-                    // Release follows this node's sole head and its causal clock.
-                    // What another node's branch may still refer to is kept by
-                    // the grace the sweep applies below, on this node's clock.
-                    if (release) {
-                        const auto released =
-                            ledger_.release_unreferenced(RetentionClass::control, *release, 64);
-                        observations().add("retention.released.control", released);
-                        if (released)
-                            trace_action("release.control", std::to_string(released));
-                    }
-                    enter_stage("control-gc");
-                    const auto now_unix_ms = static_cast<uint64_t>(clock_->wall_ns() / 1'000'000);
-                    const auto removed = catalogue_.control_gc_step(
-                        inventory->lookup(RetentionClass::control), policy.garbage_grace, 32,
-                        &control_unreferenced_, now_unix_ms);
-                    save_sightings(control_unreferenced_, control_sightings_saved_);
-                    observations().add("catalogue.control_gc.removed", removed);
-                    if (removed)
-                        trace_action("control-gc", std::to_string(removed));
-                    const auto pruned = ledger_.prune_unclaimed(RetentionClass::control, 64);
-                    observations().add("retention.pruned.control", pruned);
-                    if (pruned)
-                        trace_action("prune.control", std::to_string(pruned));
-                    if (removed)
-                        Log::debug("catalogue control GC removed=" + std::to_string(removed));
-                }
-
-                // Physical mark/sweep also catches objects that never got a tombstone (a DATA
-                // put followed by process death before commit acceptance). Recent and legacy
-                // (unstamped) tombstones stay protected for the grace interval. Retention
-                // claims are checked before every physical delete, so an inventory older
-                // than the metadata generation is still safe for orphan cleanup.
-                facts.known_generation = metadata_server_.known_generation();
-                const auto data = data_gate(facts, inventory.get());
-                const std::string& gc_skip_reason = data.reason;
-                trace_gate("gate.data", data.permitted, data.conditions);
-                if (gc_skip_reason != last_gc_skip_reason) {
-                    last_gc_skip_reason = gc_skip_reason;
-                    if (Log::enabled(LogLevel::debug))
-                        Log::debug("garbage collection sweep node=" +
-                                   to_string(node_.node_id()).substr(0, 6) +
-                                   (gc_skip_reason.empty() ? std::string(" enabled")
-                                                           : " skipped: " + gc_skip_reason));
-                }
-                if (data.permitted) {
-                    if (release) {
-                        const auto released =
-                            ledger_.release_unreferenced(RetentionClass::data, *release, 64);
-                        observations().add("retention.released.data", released);
-                        if (released)
-                            trace_action("release.data", std::to_string(released));
-                        if (released && Log::enabled(LogLevel::debug))
-                            Log::debug("retention released DATA claims node=" +
-                                       to_string(node_.node_id()).substr(0, 6) +
-                                       " count=" + std::to_string(released));
-                    } else if (!release_horizon_incomplete_logged) {
-                        release_horizon_incomplete_logged = true;
-                        Log::debug("retention release skipped: horizon incomplete");
-                    }
-                    std::vector<ObjectId> protected_ids;
-                    protected_ids.reserve(garbage.size());
-                    const auto now_ns = clock_->wall_ns();
-                    const auto grace_ns =
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(policy.garbage_grace)
-                            .count();
-                    for (const auto& candidate : garbage) {
-                        const bool matured = candidate.retired_at_ns > 0 &&
-                                             now_ns >= candidate.retired_at_ns &&
-                                             now_ns - candidate.retired_at_ns >= grace_ns;
-                        if (!matured)
-                            protected_ids.push_back(candidate.id);
-                    }
-                    std::sort(protected_ids.begin(), protected_ids.end());
-                    protected_ids.erase(std::unique(protected_ids.begin(), protected_ids.end()),
-                                        protected_ids.end());
-
-                    enter_stage("garbage-collect");
-                    const auto gc_stage = Clock::now();
-                    // Tombstones carry their own retirement deadline. Untombstoned bytes may be
-                    // the data half of an in-flight publication with no causal marker yet, so the
-                    // orphan sweep waits one retry window; a zero tombstone grace must not
-                    // collapse that window.
-                    const auto orphan_grace =
-                        std::max(policy.garbage_grace, policy.no_progress_backoff);
-                    auto gc = local_.data().gc_step(
-                        inventory->lookup(RetentionClass::data), protected_ids, orphan_grace, 64,
-                        [this] {
-                            const auto quiet = node_.config().maintenance.foreground_quiet;
-                            return context_.activity().idle_for(WorkClass::foreground) < quiet ||
-                                   context_.activity().idle_for(WorkClass::loader) < quiet;
-                        },
-                        [this](const ObjectId& id) {
-                            return ledger_.retained(RetentionClass::data, id);
-                        },
-                        &data_unreferenced_, static_cast<uint64_t>(now_ns / 1'000'000),
-                        policy.garbage_grace,
-                        [this](const ObjectId& id) {
-                            return ledger_.claim_deletion(RetentionClass::data, id);
-                        });
-                    save_sightings(data_unreferenced_, data_sightings_saved_, gc.complete);
-                    if (gc.bytes)
-                        trace_action("gc", "reclaimed_bytes=" + std::to_string(gc.bytes));
-                    {
-                        // gc.objects counts objects examined, reclaimed or not.
-                        const auto step_us = elapsed_us(gc_stage);
-                        observations().record("maintenance.gc.step_us", step_us);
-                        observations().add("maintenance.gc.examined", gc.objects);
-                        observations().add("maintenance.gc.reclaimed_bytes", gc.bytes);
-                        if (gc.objects)
-                            observations().record("maintenance.gc.per_object_ns",
-                                                  step_us * 1000 / gc.objects);
-                    }
-                    log_slow_stage("garbage-collect", gc_stage,
-                                   "reclaimed_bytes=" + std::to_string(gc.bytes) +
-                                       " objects=" + std::to_string(gc.objects));
-                    if ((gc.deferred || gc.objects || gc.yielded) && Log::enabled(LogLevel::debug))
-                        Log::debug("garbage collection sweep node=" +
-                                   to_string(node_.node_id()).substr(0, 6) +
-                                   " objects=" + std::to_string(gc.objects) +
-                                   " bytes=" + std::to_string(gc.bytes) +
-                                   " deferred=" + std::to_string(gc.deferred ? 1 : 0) +
-                                   " yielded=" + std::to_string(gc.yielded ? 1 : 0) +
-                                   " complete=" + std::to_string(gc.complete ? 1 : 0) + " live=" +
-                                   std::to_string(inventory->size(RetentionClass::data)) +
-                                   " protected=" + std::to_string(protected_ids.size()));
-                    const auto pruned = ledger_.prune_unclaimed(RetentionClass::data, 64);
-                    observations().add("retention.pruned.data", pruned);
-                    if (pruned)
-                        trace_action("prune.data", std::to_string(pruned));
-                    if (gc.bytes && Log::enabled(LogLevel::debug))
-                        Log::debug("garbage collection reclaimed " + std::to_string(gc.bytes) +
-                                   " local bytes");
-                    if (gc.yielded) {
-                        Log::trace("maintenance: garbage collection yielded to foreground I/O");
-                    } else if (gc.complete) {
-                        if (gc.deferred) {
-                            gc_quiescent_until = clock_->now() + orphan_grace;
-                            Log::trace(
-                                "maintenance: recent orphan deferred to exact grace deadline");
-                        } else {
-                            gc_quiescent_until = Clock::time_point::max();
-                            Log::trace(
-                                "maintenance: garbage collection complete; waiting for an event");
+                    // A throw from either stage still closes the turn.
+                    auto turn =
+                        repair.begin_turn(repair_now, paced, dagda::store::PeerReading::as_begun);
+                    enter_stage("retention-repair");
+                    const auto walks = repair.claim_walks(turn);
+                    enter_stage("network-repair");
+                    const auto step = repair.transfer(turn, repair.lists());
+                    switch (repair.settle(walks, step)) {
+                    case dagda::store::RepairSettled::credit:
+                    case dagda::store::RepairSettled::waiting_for_credit:
+                        // Wake when the next extent is affordable.
+                        if (credit.rate > 0.0) {
+                            const auto short_by = std::max<double>(
+                                0.0, static_cast<double>(node_.config().extent_size) -
+                                         static_cast<double>(repair.credit()));
+                            repair_wake =
+                                Clock::now() +
+                                std::chrono::duration_cast<Clock::duration>(
+                                    std::chrono::duration<double>(short_by / credit.rate));
                         }
+                        break;
+                    case dagda::store::RepairSettled::yielded:
+                    case dagda::store::RepairSettled::more_work:
+                        repair_continue = true;
+                        break;
+                    case dagda::store::RepairSettled::quiescent:
+                        repair_quiescent = true;
+                        break;
                     }
                 }
-            } else {
-                survey();
-            }
 
-            // Local maintenance advances persistent filesystem cursors: a slice examines
-            // at most 64 objects, yields to foreground work, and never rebuilds a full
-            // object list to find placement already correct.
-            if (!busy && now >= local_quiescent_until &&
-                local_credit >= node_.config().extent_size) {
-                enter_stage("local-rebalance");
-                const auto rebalance_stage = Clock::now();
-                auto rebalance =
-                    local_.data().rebalance_step(static_cast<uint64_t>(local_credit), 64, [this] {
-                        const auto quiet = node_.config().maintenance.foreground_quiet;
+                if (collector && inventory) {
+                    dagda::ledger::PassDue due;
+                    due.garbage_due = garbage_due;
+                    due.gc_due = gc_due;
+                    due.busy = busy;
+                    due.gc_waiting_for_event = gc_quiescent_until == Clock::time_point::max();
+                    due.should_yield = [this, &policy] {
+                        const auto quiet = policy.foreground_quiet;
                         return context_.activity().idle_for(WorkClass::foreground) < quiet ||
                                context_.activity().idle_for(WorkClass::loader) < quiet;
-                    });
-                log_slow_stage("local-rebalance", rebalance_stage,
-                               "bytes=" + std::to_string(rebalance.bytes) +
-                                   " objects=" + std::to_string(rebalance.objects));
-                if (rebalance.bytes)
-                    local_credit =
-                        std::max(0.0, local_credit - static_cast<double>(rebalance.bytes));
-                if (rebalance.yielded) {
-                    Log::trace("maintenance: local rebalance yielded to foreground I/O");
-                } else if (rebalance.complete && !rebalance.bytes) {
-                    local_credit = 0.0;
-                    local_quiescent_until = Clock::time_point::max();
-                    Log::trace("maintenance: local rebalance quiescent; waiting for an event");
+                    };
+                    due.pause = pause;
+                    enter_stage("tombstones");
+                    (void)collector->tombstone_step(due, *inventory);
+                    const auto release = collector->release_step();
+                    enter_stage("control-gc");
+                    (void)collector->control_step(due, *inventory, release);
+                    enter_stage("garbage-collect");
+                    const auto data = collector->data_step(due, *inventory, release);
+                    if (data.gate.permitted && !data.swept.yielded && data.swept.complete)
+                        gc_quiescent_until = data.swept.deferred ? clock_->now() + data.orphan_grace
+                                                                 : Clock::time_point::max();
+                }
+            } else {
+                enter_stage("availability");
+                try {
+                    (void)repair.survey(pause);
+                } catch (const MaintenanceStopping&) {
+                    throw;
+                } catch (const std::exception& error) {
+                    Log::debug("availability survey deferred: " + std::string(error.what()));
                 }
             }
 
-            // Retention publication appends are batched but safety-critical. Compact them
-            // only here, so foreground metadata never pays the checkpoint rewrite.
-            // Snapshot-before-truncate makes interruption idempotent.
-            if (!busy) {
-                enter_stage("retention-compact");
-                (void)ledger_.compact_if_needed(4096);
-            }
+            // The store's local stages, each behind its own gate and credit,
+            // with Macha's head repair and history truncation between the
+            // claims' compaction and pack compaction, as its pass has them.
+            auto local = store_node_.begin_local_stages(
+                dagda::LocalTurnOptions{stop, busy, policy.interval});
+            enter_stage("local-rebalance");
+            store_node_.local_rebalance(local);
+            enter_stage("retention-compact");
+            store_node_.retention_compact(local);
 
             // An accepted head this replica cannot replay is excluded from reads
             // (MetadataReplica cooldown) and re-anchored here from any peer that can
@@ -1144,7 +441,6 @@ void Maintenance::run(std::stop_token stop) {
                 Log::debug("maintenance: metadata head repair failed: " +
                            std::string(error.what()));
             }
-
             if (!busy) {
                 try {
                     enter_stage("history-truncate");
@@ -1155,79 +451,12 @@ void Maintenance::run(std::stop_token stop) {
                 }
             }
 
-            // Packed DATA tombstones are dead space. Compact one victim pack per backend
-            // at a time, so the temporary-space envelope is fixed even on multi-terabyte
-            // backends.
-            if (!busy) {
-                enter_stage("compact-packs");
-                (void)local_.data().compact_packs(stop);
-            }
-
-            if (!busy && scrub_due && scrub_credit >= node_.config().extent_size) {
-                enter_stage("scrub");
-                const auto scrub_stage = Clock::now();
-                auto scrub =
-                    local_.data().scrub_step(static_cast<uint64_t>(scrub_credit), 64, [this] {
-                        const auto quiet = node_.config().maintenance.foreground_quiet;
-                        return context_.activity().idle_for(WorkClass::foreground) < quiet ||
-                               context_.activity().idle_for(WorkClass::loader) < quiet;
-                    });
-                log_slow_stage("scrub", scrub_stage,
-                               "bytes=" + std::to_string(scrub.bytes) +
-                                   " objects=" + std::to_string(scrub.objects));
-                if (scrub.bytes)
-                    scrub_credit = std::max(0.0, scrub_credit - static_cast<double>(scrub.bytes));
-                if (scrub.yielded) {
-                    Log::trace("maintenance: scrub yielded to foreground I/O");
-                } else if (scrub.complete) {
-                    // A proactive scrub is a low-frequency campaign: once a full pass finishes,
-                    // stay idle until the next scheduled one rather than the no-progress backoff.
-                    scrub_credit = 0.0;
-                    const auto completed = clock_->wall_ms();
-                    const auto interval_ms = static_cast<uint64_t>(policy.scrub_interval.count());
-                    scrub_due_unix_ms =
-                        completed > std::numeric_limits<uint64_t>::max() - interval_ms
-                            ? std::numeric_limits<uint64_t>::max()
-                            : completed + interval_ms;
-                    try {
-                        persist_scrub_due(scrub_due_path(node_.config().state_path),
-                                          scrub_due_unix_ms);
-                    } catch (const std::exception& error) {
-                        Log::debug("maintenance: scrub schedule persistence unavailable: " +
-                                   std::string(error.what()));
-                    }
-                    Log::trace("maintenance: scrub pass complete; next campaign scheduled");
-                }
-            }
-
-            // The held ledgers checked against the disk at a rate, whatever
-            // the wake cadence: four directories a second, one every four
-            // while viewers or loaders are active (paced, never waiting for
-            // them to stop); a pass of 65,536, then a day's rest.
-            if (now >= ledger_verify_due) {
-                const double seconds =
-                    ledger_verify_at == Clock::time_point{}
-                        ? 1.0
-                        : std::chrono::duration<double>(now - ledger_verify_at).count();
-                ledger_verify_at = now;
-                ledger_verify_credit =
-                    std::min(256.0, ledger_verify_credit + seconds * (busy ? 0.25 : 4.0));
-                const auto directories = static_cast<size_t>(ledger_verify_credit);
-                if (directories) {
-                    ledger_verify_credit -= static_cast<double>(directories);
-                    enter_stage("ledger-verify");
-                    const auto data = local_.data().verify_step(directories);
-                    const auto control = local_.control().verify_step(directories);
-                    observations().add("ledger.verify.directories", directories);
-                    observations().add("ledger.verify.recorded", data.recorded + control.recorded);
-                    observations().add("ledger.verify.lost", data.lost + control.lost);
-                    if (data.complete && control.complete) {
-                        ledger_verify_due = now + std::chrono::hours(24);
-                        ledger_verify_at = {};
-                        Log::info("storage held ledgers verified against the disk");
-                    }
-                }
-            }
+            enter_stage("compact-packs");
+            store_node_.compact_packs(local);
+            enter_stage("scrub");
+            store_node_.local_scrub(local);
+            enter_stage("ledger-verify");
+            store_node_.ledger_verify(local);
             // NOLINTNEXTLINE(bugprone-empty-catch): stop request, handled by the loop
         } catch (const MaintenanceStopping&) {
             // Asked to stop inside a long walk: the loop's condition ends it.
@@ -1244,42 +473,11 @@ void Maintenance::run(std::stop_token stop) {
                 Log::debug("maintenance: " + std::string(message));
         }
 
-        if (gc_due_this_pass && !busy) {
-            // An immature tombstone is future work. Once a GC pass has evaluated the
-            // final accepted inventory, arm one exact wake for its earliest retirement
-            // deadline; otherwise the protected object makes the sweep look quiescent and
-            // it could sleep indefinitely.
-            const auto grace_ns =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(policy.garbage_grace).count();
-            const auto wall_now_ns = clock_->wall_ns();
-            std::optional<std::chrono::nanoseconds> earliest_remaining;
-            const auto inventory = ledger_.inventory();
-            for (const auto& candidate : inventory ? inventory->garbage() : no_garbage) {
-                if (candidate.retired_at_ns <= 0 || grace_ns <= 0)
-                    continue;
-                int64_t remaining_ns{};
-                if (wall_now_ns < candidate.retired_at_ns) {
-                    const auto until_retirement = candidate.retired_at_ns - wall_now_ns;
-                    remaining_ns = until_retirement > std::numeric_limits<int64_t>::max() - grace_ns
-                                       ? std::numeric_limits<int64_t>::max()
-                                       : until_retirement + grace_ns;
-                } else {
-                    const auto elapsed = wall_now_ns - candidate.retired_at_ns;
-                    if (elapsed >= grace_ns)
-                        continue;
-                    remaining_ns = grace_ns - elapsed;
-                }
-                const auto remaining = std::chrono::nanoseconds(remaining_ns);
-                if (!earliest_remaining || remaining < *earliest_remaining)
-                    earliest_remaining = remaining;
-            }
-            if (earliest_remaining)
-                gc_quiescent_until = clock_->now() + *earliest_remaining;
-        }
-
         cpu_reporter.tick();
-        auto deadline = Clock::time_point::max();
         const auto now_after_work = clock_->now();
+        // The store's stages keep their own credit and rest, re-evaluated on
+        // its cadence: at most one interval between passes.
+        auto deadline = now_after_work + policy.interval;
         // `complete()` can turn an in-flight burst into one pending follow-up without
         // another external event, so a dirty owner with no retry delay is runnable
         // now; sleeping would lose the edge and strand metadata and its catalogue
@@ -1295,86 +493,22 @@ void Maintenance::run(std::stop_token stop) {
             deadline = std::min(deadline, catalogue_retry_due == Clock::time_point{}
                                               ? now_after_work
                                               : catalogue_retry_due);
-
         if (gc_quiescent_until != Clock::time_point{} &&
             gc_quiescent_until != Clock::time_point::max()) {
-            if (gc_quiescent_until > now_after_work) {
+            if (gc_quiescent_until > now_after_work)
                 deadline = std::min(deadline, gc_quiescent_until);
-            } else if (!gc_due_this_pass && !busy) {
-                // Work earlier in this pass may run past an exact GC deadline: re-evaluate
-                // at once rather than sleep indefinitely. Once GC has been evaluated, gc_due
-                // holds and event-driven quiescence applies.
+            else if (!gc_due_this_pass && !busy)
                 deadline = std::min(deadline, now_after_work);
-            }
         }
-        const auto scrub_now_ms = clock_->wall_ms();
-        if (scrub_due_unix_ms <= scrub_now_ms) {
-            if (scrub_credit < node_.config().extent_size && rate > 0.0 &&
-                policy.scrub_fraction > 0.0) {
-                const auto seconds =
-                    (static_cast<double>(node_.config().extent_size) - scrub_credit) /
-                    (rate * policy.scrub_fraction);
-                if (std::isfinite(seconds) && seconds > 0.0)
-                    deadline = std::min(deadline, now_after_work +
-                                                      std::chrono::duration_cast<Clock::duration>(
-                                                          std::chrono::duration<double>(seconds)));
-            }
-        } else {
-            deadline = std::min(deadline, now_after_work + std::chrono::milliseconds(
-                                                               scrub_due_unix_ms - scrub_now_ms));
-        }
-
-        if (busy) {
-            // A busy pass suppressed GC, repair and rebalance; it re-evaluates as soon as
-            // the foreground quiet period is met, or at once if it already has, rather
-            // than sleeping until an unrelated event.
-            auto idle = std::min(context_.activity().idle_for(WorkClass::foreground),
-                                 context_.activity().idle_for(WorkClass::loader));
-            deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
-                                                                ? policy.foreground_quiet - idle
-                                                                : Clock::duration{}));
-        }
-
-        auto credit_deadline = [&](double credit, Clock::time_point quiescent) {
-            if (quiescent == Clock::time_point::max() || rate <= 0.0 ||
-                credit >= node_.config().extent_size)
-                return;
-            const auto seconds = (static_cast<double>(node_.config().extent_size) - credit) / rate;
-            if (std::isfinite(seconds) && seconds > 0.0)
-                deadline = std::min(deadline,
-                                    now_after_work + std::chrono::duration_cast<Clock::duration>(
-                                                         std::chrono::duration<double>(seconds)));
-        };
-        {
-            // Credit alone is not enough while repair is cooling down behind a
-            // busy class: wake when its next turn is due, not on the next
-            // unrelated event.
-            if (network_quiescent_until != Clock::time_point::max() && repair_rate > 0.0 &&
-                network_credit < node_.config().extent_size) {
-                const auto seconds =
-                    (static_cast<double>(node_.config().extent_size) - network_credit) /
-                    repair_rate;
-                if (std::isfinite(seconds) && seconds > 0.0)
-                    deadline = std::min(deadline, now_after_work +
-                                                      std::chrono::duration_cast<Clock::duration>(
-                                                          std::chrono::duration<double>(seconds)));
-            }
-            if (network_quiescent_until != Clock::time_point::max()) {
-                const auto turn = repair_share.wait_for(now_after_work, repair_busy);
-                if (turn > Clock::duration{})
-                    deadline = std::min(deadline, now_after_work + turn);
-            }
-            if (repair_continue)
-                deadline = std::min(deadline, now_after_work + policy.interval);
-        }
-        credit_deadline(local_credit, local_quiescent_until);
-        // A deferred survey, or a peer to ask again.
-        if (const auto due = availability_.due())
-            deadline = std::min(deadline, std::max(*due, now_after_work));
+        if (repair_continue)
+            deadline = std::min(deadline, now_after_work + policy.interval);
+        if (repair_wake)
+            deadline = std::min(
+                deadline, std::max(now_after_work, now_after_work + (*repair_wake - Clock::now())));
 
         // A maintenance action can itself commit metadata (retiring a matured garbage
         // marker, say); that event must not be lost for arriving before the wait.
-        if (events_.total() != observed_event)
+        if (events_now() != observed_event)
             continue;
 
         enter_stage("wait");

@@ -30,8 +30,6 @@ class TorrentManager final : public TorrentService {
     struct Impl;
 
     NodeRuntime& node_;
-    LocalState& local_;
-    DataResourceArbiter& data_resources_;
     IngestManager& ingest_;
     // Times the worker's periodic passes.
     const TimeSource& time_;
@@ -160,7 +158,7 @@ class TorrentManager final : public TorrentService {
     // only; ClusterJobView is built from these replies.
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);
-    TorrentManager(NodeRuntime&, LocalState&, DataResourceArbiter&, IngestManager&, TorrentConfig,
+    TorrentManager(NodeRuntime&, IngestManager&, TorrentConfig,
                    const std::filesystem::path& state_path, const TimeSource& time);
     ~TorrentManager() override;
 

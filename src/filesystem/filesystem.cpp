@@ -424,7 +424,7 @@ dagda::Ticket FileSystem::put_extent(const ObjectId& id, std::span<const uint8_t
     // rest owed to prompt replication; a publication's barrier then makes it
     // durable where it landed.
     dagda::store::WriteOptions options;
-    options.level = dagda::store::Durability::persisted;
+    options.ack_level = dagda::store::Durability::persisted;
     options.deferred = deferred;
     options.frame = frame;
     options.cancelled = io_cancelled_;
@@ -1411,11 +1411,12 @@ FileSystem::remove_abandoned_write_files(const std::filesystem::path& state_path
 
 FileSystem::FileSystem(const Config& config, NodeId node_id, const Membership& membership,
                        LocalState& local, MetadataServer& metadata_server, DistributedStore& s,
-                       dagda::Context& context, MetadataView& m,
-                       RetainedMemoryLedger& retained_memory, PlaybackTracker* playback)
+                       dagda::Context& context, dagda::ledger::ReferenceCounts& references,
+                       MetadataView& m, RetainedMemoryLedger& retained_memory,
+                       PlaybackTracker* playback)
     : config_(config), node_id_(node_id), membership_(membership), local_(local),
       metadata_server_(metadata_server), retained_memory_(retained_memory), s_(s),
-      context_(context), m_(m), playback_(playback) {
+      context_(context), references_(references), m_(m), playback_(playback) {
     const auto [files, bytes] = remove_abandoned_write_files(config_.state_path, node_id_);
     if (files)
         Log::info("filesystem removed abandoned write files files=" + std::to_string(files) +
@@ -2486,7 +2487,7 @@ void FileSystem::census_walk(const MetadataSnapshot& snapshot, const std::functi
     // control objects, and throws on any it cannot read.
     std::vector<ObjectId> extents;
     std::vector<ObjectId> tree_nodes;
-    ReferenceCounts::Totals totals;
+    dagda::ledger::ReferenceCounts::Totals totals;
     auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     for_each_namespace_entry(
         snapshot, &nodes,
@@ -2500,12 +2501,11 @@ void FileSystem::census_walk(const MetadataSnapshot& snapshot, const std::functi
                     extents.push_back(extent.id);
         },
         tree_nodes);
-    local_.references().reset(snapshot.namespace_root, std::move(extents), std::move(tree_nodes),
-                              totals);
+    references_.reset(snapshot.namespace_root, std::move(extents), std::move(tree_nodes), totals);
 }
 
 bool FileSystem::census_follow(const ObjectId& root, const std::function<void()>& pause) {
-    auto& counts = local_.references();
+    auto& counts = references_;
     auto nodes = ControlNamespaceNodeStore::for_reading(context_);
     std::vector<ObjectId> extents_in, extents_out, nodes_in, nodes_out;
     diff_namespace_tree_nodes(*counts.root(), root, nodes, nodes_in, nodes_out);
@@ -2532,7 +2532,8 @@ bool FileSystem::census_follow(const ObjectId& root, const std::function<void()>
             nodes_in.insert(nodes_in.end(), spine.begin(), spine.end());
         }
     }
-    return counts.change(root, extents_in, extents_out, nodes_in, nodes_out, totals);
+    return counts.change(root, std::move(extents_in), std::move(extents_out), std::move(nodes_in),
+                         std::move(nodes_out), totals);
 }
 
 void FileSystem::census_count(const MetadataSnapshot& snapshot,
@@ -2542,7 +2543,7 @@ void FileSystem::census_count(const MetadataSnapshot& snapshot,
     // walked the first time, for a namespace that is not a tree, and if the
     // counts and the trees ever disagree (or the tree they stand at can no
     // longer be read).
-    const auto counted = local_.references().root();
+    const auto counted = references_.root();
     if (snapshot.namespace_root && counted) {
         if (*counted == *snapshot.namespace_root)
             return;
@@ -2562,7 +2563,7 @@ void FileSystem::census_count(const MetadataSnapshot& snapshot,
 
 MaintenanceObjects FileSystem::maintenance_objects_from(const MetadataSnapshotView& view) {
     const auto& snapshot = *view.snapshot;
-    const auto& counts = local_.references();
+    const auto& counts = references_;
     const auto views = counts.views();
     MaintenanceObjects built;
     built.referenced_extents = views.extents;
@@ -2632,7 +2633,7 @@ FileSystem::namespace_references(const MetadataSnapshot& snapshot) {
         return {};
     Lock building(maintenance_build_mutex_);
     census_count(snapshot);
-    const auto views = local_.references().views();
+    const auto views = references_.views();
     return NamespaceReferences{views.extents, views.nodes};
 }
 

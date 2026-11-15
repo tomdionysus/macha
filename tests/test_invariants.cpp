@@ -62,8 +62,7 @@ class CatalogueBench {
         config.maintenance.interval = std::chrono::hours(1);
         node_.start();
         auto& node = node_.node();
-        catalogue_.emplace(node, node.local_state(), node.metadata_server(), node_.store(),
-                           node_.metadata(), node.ledger());
+        catalogue_.emplace(node, node.metadata_server(), node.store_context(), node_.metadata());
         hints_.emplace(node.config().state_path);
     }
     const std::filesystem::path& path() const {
@@ -2171,27 +2170,19 @@ MACHA_TEST("invariants", test_catalogue_keeps_what_the_namespace_holds) {
     }
 
     {
-        // Two artworks in one durability domain: the later generation covers
-        // the earlier, so the batch keeps a one-entry frontier, durable only
-        // at its barrier.
-        DistributedStore::DurabilityBatch batch;
+        // Two artworks staged here: a ticket each, both durable at the one
+        // barrier, which empties the batch. How the tickets share a durability
+        // frontier is Dagda's (its durability barrier cases).
+        ArtworkTickets batch;
         const auto a = catalogue.stage_artwork_deferred("poster", "image/jpeg",
                                                         pattern(64 * 1024, 201), batch);
         const auto b = catalogue.stage_artwork_deferred("backdrop", "image/jpeg",
                                                         pattern(64 * 1024, 202), batch);
-        REQUIRE(batch.requirements.size() == 1);
-        const auto token = [&] {
-            const auto& replica = batch.requirements.front().replicas.front();
-            return StoragePool::DurabilityToken{replica.domain, replica.generation,
-                                                replica.backend_instance};
-        };
-        REQUIRE(batch.requirements.front().replicas.size() == 1);
-        REQUIRE(batch.requirements.front().replicas.front().id == node.node_id());
-        CHECK(!node.local_store().durability_covered(token()));
+        REQUIRE(batch.size() == 2);
         REQUIRE(catalogue.artwork_durability_barrier(batch));
-        CHECK(node.local_store().durability_covered(token()));
-        CHECK(node.local_store().has(a.id));
-        CHECK(node.local_store().has(b.id));
+        CHECK(batch.empty());
+        CHECK(catalogue.artwork_held_here(a.id));
+        CHECK(catalogue.artwork_held_here(b.id));
     }
 
     {

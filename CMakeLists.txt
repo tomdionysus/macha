@@ -273,7 +273,7 @@ set(MACHA_CORE_SOURCES
     src/contract/work.cpp
     src/contract/horizon.cpp
     src/contract/gates.cpp
-    src/ledger/node_horizon_builder.cpp
+    src/ledger/macha_reachability.cpp
     src/ledger/availability.cpp
     src/observation.cpp
     src/durable_file.cpp

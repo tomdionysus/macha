@@ -102,9 +102,8 @@ class CatalogueNode {
             node_.set_publication_guard(std::move(guard));
         node_.start();
         auto& bare = node_.node();
-        catalogue_ =
-            std::make_unique<CatalogueManager>(bare, bare.local_state(), bare.metadata_server(),
-                                               node_.store(), node_.metadata(), bare.ledger());
+        catalogue_ = std::make_unique<CatalogueManager>(bare, bare.metadata_server(),
+                                                        bare.store_context(), node_.metadata());
         hints_ = std::make_unique<CatalogueHintQueue>(node_.config().state_path);
     }
 
@@ -2067,7 +2066,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_admits_only_what_is_rea
         };
         const auto snapshot = node.metadata().snapshot(); // no such file in it
         const auto taken = unix_ms();
-        DistributedStore::DurabilityBatch batch;
+        ArtworkTickets batch;
         const auto late_id = node.hints().submit("/Late/Late (2026)/Late.mkv", "ingest", "job",
                                                  CatalogueHintPriority::ingest);
         const auto late = claim(late_id);
@@ -3246,7 +3245,7 @@ PublishedSource make_published_source(const std::filesystem::path& root, uint64_
         if (store_them) {
             id = object_id(slice);
             dagda::store::WriteOptions options;
-            options.level = dagda::store::Durability::persisted;
+            options.ack_level = dagda::store::Durability::persisted;
             REQUIRE(fs.context().objects().write(id, slice, options).holders() > 0);
         } else {
             // A different object of the same length, never stored.
@@ -4373,8 +4372,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     DistributedStore store1(n1, n1.local_state(), n1.resources.activity, n1.resources.data,
                             n1.resources.memory, n1.resources.events);
     MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), n1.store_context());
-    CatalogueManager catalogue1(n1, n1.local_state(), n1.metadata_server(), store1, metadata1,
-                                n1.ledger());
+    CatalogueManager catalogue1(n1, n1.metadata_server(), n1.store_context(), metadata1);
 
     CatalogueItem first;
     first.id = "test:movie:remote-first";
@@ -4387,8 +4385,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     DistributedStore store2(n2, n2.local_state(), n2.resources.activity, n2.resources.data,
                             n2.resources.memory, n2.resources.events);
     MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), n2.store_context());
-    CatalogueManager catalogue2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2,
-                                n2.ledger());
+    CatalogueManager catalogue2(n2, n2.metadata_server(), n2.store_context(), metadata2);
 
     // Cold-load node two from node one's committed catalogue. There is no Service
     // here, so no catalogue maintenance thread can refresh it behind the test.
@@ -4426,8 +4423,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // plane owner has already decoded it locally. Repeated getattr therefore
     // leaves MetadataManager's available generation unchanged.
     FileSystem fs2(n2.config(), n2.node_id(), n2.membership(), n2.local_state(),
-                   n2.metadata_server(), store2, n2.store_context(), metadata2,
-                   n2.resources.memory);
+                   n2.metadata_server(), store2, n2.store_context(), n2.store_node().references(),
+                   metadata2, n2.resources.memory);
     FuseConfig fuse_config;
     fuse_config.commit_workers = 1;
     auto frontend = make_fuse_frontend(fs2, n2.resources.memory, fuse_config);
@@ -4935,11 +4932,10 @@ MACHA_TEST("hydration_catalogue",
                                 "Catalogue Still Loads");
         const auto artwork = node.catalogue().put_artwork(
             item.id, "poster", "image/jpeg", Bytes{0x01, 0x02, 0x03, 0x04}, item.revision);
-        REQUIRE(node.node().local_store().remove(artwork.id));
-        REQUIRE(!node.node().local_store().has(artwork.id));
-        CatalogueManager reloaded(node.node(), node.node().local_state(),
-                                  node.node().metadata_server(), node.store(), node.metadata(),
-                                  node.node().ledger());
+        REQUIRE(node.node().store_node().data().remove(artwork.id));
+        REQUIRE(!node.node().store_node().data().has(artwork.id));
+        CatalogueManager reloaded(node.node(), node.node().metadata_server(),
+                                  node.node().store_context(), node.metadata());
         reloaded.repair_once();
         const auto status = reloaded.status();
         CHECK(status.ready);
@@ -4950,11 +4946,12 @@ MACHA_TEST("hydration_catalogue",
         CHECK(loaded->title == item.title);
     }
 
-    // CONTROL publication is data-before-metadata: an object written after the
-    // observed catalogue root is kept by GC even with zero grace, and becomes an
-    // ordinary orphan once a successor root is committed and observed.
+    // CONTROL publication is data-before-metadata: the catalogue's CONTROL
+    // epoch moves when a new root is installed, and a removal judged in an
+    // earlier epoch does not run. The sweep that reads the epoch is the
+    // store's (Dagda's LedgerCollector.AControlObjectStagedInTheCurrentEpochIsKept
+    // and .AControlRemovalNeverRacesANewEpoch).
     {
-        auto& control = node.node().control_store();
         REQUIRE(wait_until([&] {
             try {
                 node.catalogue().repair_once();
@@ -4963,41 +4960,19 @@ MACHA_TEST("hydration_catalogue",
                 return false;
             }
         }));
-        Bytes staged = pattern(4096 + 37);
-        staged[0] ^= 0x6d;
-        const auto staged_id = object_id(staged);
-        REQUIRE(control.put(staged_id, staged));
-        std::this_thread::sleep_for(5ms);
-        // The namespace tree is live CONTROL too: maintenance's inventory names
-        // its nodes beside the catalogue's.
-        const auto tree_nodes = [&] {
-            std::vector<ObjectId> nodes;
-            const auto reader = node.filesystem().namespace_nodes();
-            for_each_namespace_entry(
-                node.metadata().snapshot(), &reader, [](const std::string&, const FsEntry&) {},
-                nodes);
-            std::sort(nodes.begin(), nodes.end());
-            nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
-            return nodes;
-        };
-        const auto no_catalogue = tree_nodes();
-        for (int i = 0; i < 4; ++i)
-            (void)node.catalogue().control_gc_step(no_catalogue, 0ms, 64);
-        CHECK(control.has(staged_id));
+        const auto before = node.catalogue().control_epoch();
+        REQUIRE(before.has_value());
+        bool ran = false;
+        CHECK(node.catalogue().within_control_epoch(before->sequence, [&] { ran = true; }));
+        CHECK(ran);
         (void)node.upsert("movie:control-publication-fence", CatalogueKind::movie,
                           "Control Publication Fence");
-        std::this_thread::sleep_for(5ms);
-        auto maintenance = maintenance_inventory(node.catalogue());
-        REQUIRE(maintenance.complete);
-        std::vector<ObjectId> live(maintenance.control_live.begin(),
-                                   maintenance.control_live.end());
-        for (const auto& id : tree_nodes())
-            live.push_back(id);
-        std::sort(live.begin(), live.end());
-        live.erase(std::unique(live.begin(), live.end()), live.end());
-        for (int i = 0; i < 4 && control.has(staged_id); ++i)
-            (void)node.catalogue().control_gc_step(live, 0ms, 64);
-        CHECK(!control.has(staged_id));
+        const auto after = node.catalogue().control_epoch();
+        REQUIRE(after.has_value());
+        CHECK(after->sequence > before->sequence);
+        ran = false;
+        CHECK(!node.catalogue().within_control_epoch(before->sequence, [&] { ran = true; }));
+        CHECK(!ran);
     }
 
     // A warm immutable catalogue stays usable when ordinary metadata moves on
@@ -5008,7 +4983,7 @@ MACHA_TEST("hydration_catalogue",
         CHECK(committed.title == "Cached Movie");
         const auto status = node.catalogue().status();
         REQUIRE(status.root.has_value());
-        REQUIRE(node.node().control_store().remove(*status.root));
+        REQUIRE(node.node().store_node().control().remove(*status.root));
         auto root = node.filesystem().getattr("/");
         ++root.version;
         ++root.mtime_ns;
@@ -5047,9 +5022,8 @@ MACHA_TEST("hydration_catalogue",
         return item;
     };
     const auto agrees = [&] {
-        CatalogueManager from_root(node.node(), node.node().local_state(),
-                                   node.node().metadata_server(), node.store(), node.metadata(),
-                                   node.node().ledger());
+        CatalogueManager from_root(node.node(), node.node().metadata_server(),
+                                   node.node().store_context(), node.metadata());
         from_root.repair_once();
         const auto loaded = from_root.snapshot();
         const auto held = catalogue.snapshot();
@@ -5467,9 +5441,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
                   .live.contains(object_id(Bytes(body.begin(), body.end()))));
         // A catalogue loaded from its root has the index too.
         {
-            CatalogueManager from_root(node.node(), node.node().local_state(),
-                                       node.node().metadata_server(), node.store(), node.metadata(),
-                                       node.node().ledger());
+            CatalogueManager from_root(node.node(), node.node().metadata_server(),
+                                       node.node().store_context(), node.metadata());
             from_root.repair_once();
             auto loaded = from_root.media_index(media_id);
             REQUIRE(loaded.has_value());

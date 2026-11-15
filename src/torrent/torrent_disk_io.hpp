@@ -12,9 +12,10 @@
 // commits files by naming extents instead of copying. Extents are read back
 // only through read_extent.
 
-#include "cluster/data_work.hpp"
 #include "contract/thread_safety.hpp"
 #include "types.hpp"
+
+#include <dagda/context.h>
 
 #include <libtorrent/session_params.hpp>
 
@@ -79,8 +80,11 @@ class TorrentPieceVerifications {
 struct TorrentDiskHooks {
     // Blocks until `bytes` of loader-class DATA credit is held and returns it,
     // released on destruction. Returns nullptr promptly once `aborting` is
-    // set. Empty: no admission.
-    std::function<std::shared_ptr<void>(uint64_t bytes, const std::atomic_bool& aborting)> admit;
+    // set. Empty: no admission. Co-owned: the admission keeps `aborting` for
+    // as long as it waits.
+    std::function<std::shared_ptr<void>(uint64_t bytes,
+                                        const std::shared_ptr<std::atomic_bool>& aborting)>
+        admit;
     // Service time of one file operation on the DATA device. Empty when
     // staging is on another device, whose latency must not pressure DATA.
     std::function<void(std::chrono::nanoseconds elapsed, uint64_t bytes)> observe;
@@ -91,8 +95,10 @@ struct TorrentDiskHooks {
     uint64_t extent_size{};
     // Stores one extent durably and returns its id, or nothing on failure (the
     // backend retries). `abort` is set at shutdown to end a write promptly; the
-    // unjournalled extent is published again on resume.
-    std::function<std::optional<ObjectId>(std::span<const uint8_t>, std::atomic_bool& abort)>
+    // unjournalled extent is published again on resume. Co-owned: a store
+    // write may keep it for as long as its work runs.
+    std::function<std::optional<ObjectId>(std::span<const uint8_t>,
+                                          const std::shared_ptr<std::atomic_bool>& abort)>
         publish;
     std::shared_ptr<TorrentPieceVerifications> verifications;
     // How long a failed publication waits before it is tried again.
@@ -101,11 +107,11 @@ struct TorrentDiskHooks {
 
 libtorrent::disk_io_constructor_type macha_disk_io_constructor(TorrentDiskHooks hooks);
 
-// TorrentDiskHooks::admit on the DATA arbiter at loader class: yields only
-// when a viewer would otherwise wait (law 3). Waits in one-second slices to
-// see an abort; a slice ending early means the arbiter stopped or refused,
-// and it returns nullptr.
-std::function<std::shared_ptr<void>(uint64_t, const std::atomic_bool&)>
-loader_admission(DataResourceArbiter& arbiter);
+// TorrentDiskHooks::admit on the node's DATA devices at loader class: credit
+// then a device slot, yielding only when a viewer would otherwise wait (law 3).
+// Waits in one-second slices to see an abort; a slice ending early means the
+// store stopped or refused, and it returns nullptr.
+std::function<std::shared_ptr<void>(uint64_t, const std::shared_ptr<std::atomic_bool>&)>
+loader_admission(dagda::Context& store);
 
 } // namespace macha

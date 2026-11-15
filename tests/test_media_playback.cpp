@@ -77,9 +77,8 @@ class PlaybackNode {
     PlaybackNode() {
         node_.start();
         auto& bare = node_.node();
-        catalogue_ =
-            std::make_unique<CatalogueManager>(bare, bare.local_state(), bare.metadata_server(),
-                                               node_.store(), node_.metadata(), bare.ledger());
+        catalogue_ = std::make_unique<CatalogueManager>(bare, bare.metadata_server(),
+                                                        bare.store_context(), node_.metadata());
         hints_ = std::make_unique<CatalogueHintQueue>(node_.path() / "catalogue-hints");
         filesystem().mkdir("/media", 0755, getuid(), getgid());
     }

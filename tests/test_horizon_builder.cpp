@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The horizon builder's two builds against fake sources (an in-memory namespace
-// tree, a catalogue given as a function), each compared with a reference build.
-#include "ledger/node_horizon_builder.hpp"
+// Macha's reachability answers, the inventory's and the release's, against
+// fake sources (an in-memory namespace tree, a catalogue given as a
+// function), each compared with a reference build, read as the store's
+// horizons read them.
+#include "ledger/macha_reachability.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "test_framework.hpp"
 #include "test_support.hpp"
+
+#include "dagda/contract/horizon.h"
+#include "dannan/identity/secure_memory.h"
+#include "dannan/status/log.h"
 
 #include <algorithm>
 #include <map>
@@ -29,13 +35,30 @@ std::vector<ObjectId> ids_of(std::span<const ObjectId> span) {
 }
 
 // A frozen view of a reference count trie holding `ids`.
-ObjectTrie::Snapshot view_of(const std::filesystem::path& dir, const std::vector<ObjectId>& ids) {
-    ObjectTrie trie(dir, std::array<uint8_t, 32>{}, {});
-    std::vector<ObjectTrie::Change> changes;
+dagda::ledger::ObjectTrie::Snapshot view_of(const std::filesystem::path& dir,
+                                            const std::vector<ObjectId>& ids) {
+    const std::array<uint8_t, 32> raw{};
+    const auto key = std::make_shared<const dagda::domain::StorageKey>(
+        dannan::identity::Secret(std::span<const uint8_t>(raw)));
+    dagda::ledger::ObjectTrie trie(
+        dir, key, {},
+        dannan::status::ScopedLogger(std::make_shared<dannan::status::ConsoleSink>(), "test"));
+    std::vector<dagda::ledger::ObjectTrie::Change> changes;
     for (const auto& id : ids)
         changes.push_back({id, Bytes(8, 1)});
     trie.apply(changes);
     return trie.snapshot();
+}
+
+// An answer as the store's horizons hold it.
+dagda::contract::InventoryHorizon inventory_of(const dagda::contract::Reachability& answer) {
+    return {answer.generation, answer.complete,
+            dagda::contract::ReferencedSets(answer.views, answer.data, answer.control),
+            answer.garbage, answer.batches};
+}
+dagda::contract::ReleaseHorizon release_of(const dagda::contract::Reachability& answer) {
+    return {answer.head, answer.clock,
+            dagda::contract::ReferencedSets(answer.views, answer.data, answer.control)};
 }
 
 FsEntry file(std::initializer_list<std::pair<uint8_t, bool>> extents) {
@@ -146,13 +169,14 @@ MetadataSnapshotView view_of(MetadataSnapshot snapshot, uint8_t hash) {
 void check_matches_reference(const MetadataSnapshotView& head, const NamespaceNodeStore& nodes,
                              const NamespaceNodeStore& reference_nodes,
                              const CatalogueRetentionSource& catalogue) {
-    const auto built = build_release(head, nodes, catalogue);
+    const auto answer = reachability_release(head, nodes, catalogue);
+    const auto built = release_of(answer);
     const auto expected = reference_release(head, reference_nodes, catalogue);
-    CHECK(built.complete == expected.complete);
-    CHECK(ids_of(built.horizon->all(RetentionClass::data)) == expected.data);
-    CHECK(ids_of(built.horizon->all(RetentionClass::control)) == expected.control);
-    CHECK(built.horizon->head() == head.hash);
-    CHECK(built.horizon->clock() == head.snapshot->mutation_sequences);
+    CHECK(answer.complete == expected.complete);
+    CHECK(ids_of(built.all(RetentionClass::data)) == expected.data);
+    CHECK(ids_of(built.all(RetentionClass::control)) == expected.control);
+    CHECK(built.head() == head.hash);
+    CHECK(built.clock() == head.snapshot->mutation_sequences);
 }
 
 MACHA_FAST_TEST("horizon_builder", test_inventory_is_both_live_sets_and_the_catalogue_control_set) {
@@ -172,18 +196,18 @@ MACHA_FAST_TEST("horizon_builder", test_inventory_is_both_live_sets_and_the_cata
     catalogue.control_live = {id(7), id(6)};
     catalogue.complete = false;
 
-    const auto inventory = build_inventory(namespace_objects, catalogue);
-    CHECK(inventory->generation() == 9);
-    CHECK(!inventory->catalogue_complete());
-    CHECK((ids_of(inventory->all(RetentionClass::data)) ==
+    const auto inventory = inventory_of(reachability_inventory(namespace_objects, catalogue));
+    CHECK(inventory.generation() == 9);
+    CHECK(!inventory.complete());
+    CHECK((ids_of(inventory.all(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(2), id(3)}));
-    CHECK((ids_of(inventory->all(RetentionClass::control)) == std::vector<ObjectId>{id(6), id(7)}));
+    CHECK((ids_of(inventory.all(RetentionClass::control)) == std::vector<ObjectId>{id(6), id(7)}));
     // A tombstone revived by catalogue data is stale, as one the namespace revives is.
-    CHECK(inventory->stale_garbage().size() == 1 && inventory->stale_garbage()[0].id == id(2));
-    CHECK(inventory->garbage().size() == 1 && inventory->garbage()[0].id == id(8));
+    CHECK(inventory.stale_garbage().size() == 1 && inventory.stale_garbage()[0].id == id(2));
+    CHECK(inventory.garbage().size() == 1 && inventory.garbage()[0].id == id(8));
 
     catalogue.complete = true;
-    CHECK(build_inventory(namespace_objects, catalogue)->catalogue_complete());
+    CHECK(reachability_inventory(namespace_objects, catalogue).complete);
 }
 
 // The namespace walk names the tree it read, extent spines included, and
@@ -225,11 +249,11 @@ MACHA_FAST_TEST("horizon_builder", test_inventory_control_set_holds_the_namespac
     namespace_objects.referenced_nodes = view_of(dir.path() / "nodes", walked);
     CatalogueMaintenance catalogue;
     catalogue.control_live = {id(7)};
-    const auto inventory = build_inventory(namespace_objects, catalogue);
-    CHECK(inventory->size(RetentionClass::control) == walked.size() + 1);
-    CHECK(inventory->referenced(RetentionClass::control, id(7)));
+    const auto inventory = inventory_of(reachability_inventory(namespace_objects, catalogue));
+    CHECK(inventory.size(RetentionClass::control) == walked.size() + 1);
+    CHECK(inventory.referenced(RetentionClass::control, id(7)));
     for (const auto& node : walked)
-        CHECK(inventory->referenced(RetentionClass::control, node));
+        CHECK(inventory.referenced(RetentionClass::control, node));
 
     // A node served once: the second walk reaches a node it cannot read.
     OnceNodeStore once(nodes);
@@ -274,14 +298,15 @@ MACHA_FAST_TEST("horizon_builder", test_release_over_a_tree_matches_the_pass_bui
         catalogue_of({{id(40), {{id(8), id(1)}, {id(9)}}}, {id(41), {{id(10)}, {id(11), id(9)}}}});
 
     check_matches_reference(head, nodes, nodes, catalogue);
-    const auto built = build_release(head, nodes, catalogue);
-    CHECK(built.complete);
-    CHECK((ids_of(built.horizon->all(RetentionClass::data)) ==
+    const auto answer = reachability_release(head, nodes, catalogue);
+    const auto built = release_of(answer);
+    CHECK(answer.complete);
+    CHECK((ids_of(built.all(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(3), id(4), id(6), id(8), id(10)}));
     // Control: both catalogue roots' control objects and every namespace tree node.
-    CHECK(built.horizon->referenced(RetentionClass::control, id(9)));
-    CHECK(built.horizon->referenced(RetentionClass::control, id(11)));
-    CHECK(built.horizon->size(RetentionClass::control) == 2 + nodes.nodes());
+    CHECK(built.referenced(RetentionClass::control, id(9)));
+    CHECK(built.referenced(RetentionClass::control, id(11)));
+    CHECK(built.size(RetentionClass::control) == 2 + nodes.nodes());
 }
 
 MACHA_FAST_TEST("horizon_builder",
@@ -298,12 +323,12 @@ MACHA_FAST_TEST("horizon_builder",
     MemoryNamespaceNodeStore nodes;
 
     check_matches_reference(head, nodes, nodes, catalogue);
-    const auto built = build_release(head, nodes, catalogue);
-    CHECK(!built.complete);
+    const auto answer = reachability_release(head, nodes, catalogue);
+    const auto built = release_of(answer);
+    CHECK(!answer.complete);
     // What could be read is still in the horizon.
-    CHECK(
-        (ids_of(built.horizon->all(RetentionClass::data)) == std::vector<ObjectId>{id(1), id(8)}));
-    CHECK((ids_of(built.horizon->all(RetentionClass::control)) == std::vector<ObjectId>{id(9)}));
+    CHECK((ids_of(built.all(RetentionClass::data)) == std::vector<ObjectId>{id(1), id(8)}));
+    CHECK((ids_of(built.all(RetentionClass::control)) == std::vector<ObjectId>{id(9)}));
 }
 
 MACHA_FAST_TEST("horizon_builder", test_an_unreadable_tree_node_leaves_the_release_incomplete) {
@@ -319,19 +344,19 @@ MACHA_FAST_TEST("horizon_builder", test_an_unreadable_tree_node_leaves_the_relea
     OnceNodeStore reference_once(nodes);
     check_matches_reference(head, once, reference_once, catalogue);
     OnceNodeStore again(nodes);
-    const auto built = build_release(head, again, catalogue);
-    CHECK(!built.complete);
-    CHECK(
-        (ids_of(built.horizon->all(RetentionClass::data)) == std::vector<ObjectId>{id(1), id(2)}));
+    const auto answer = reachability_release(head, again, catalogue);
+    CHECK(!answer.complete);
+    CHECK((ids_of(release_of(answer).all(RetentionClass::data)) ==
+           std::vector<ObjectId>{id(1), id(2)}));
 }
 
 MACHA_FAST_TEST("horizon_builder", test_an_empty_head_releases_against_nothing) {
     MemoryNamespaceNodeStore nodes;
     const auto head = view_of(MetadataSnapshot{}, 0x54);
-    const auto built = build_release(head, nodes, catalogue_of({}));
-    CHECK(built.complete);
-    CHECK(built.horizon->size(RetentionClass::data) == 0);
-    CHECK(built.horizon->size(RetentionClass::control) == 0);
+    const auto answer = reachability_release(head, nodes, catalogue_of({}));
+    CHECK(answer.complete);
+    CHECK(release_of(answer).size(RetentionClass::data) == 0);
+    CHECK(release_of(answer).size(RetentionClass::control) == 0);
 }
 
 } // namespace
