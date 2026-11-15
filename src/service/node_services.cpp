@@ -548,7 +548,7 @@ NodeServices::retain_metadata_publication(const MetadataPublicationContext& cont
         throw std::runtime_error("CONTROL retention claim could not be recorded on this node");
     }
     report("ok");
-    resources_.events.notify(NodeEvent::claims);
+    resources_.events.notify(node_event::claims);
     return {std::move(data), std::move(control)};
 }
 

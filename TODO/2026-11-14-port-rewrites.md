@@ -211,9 +211,17 @@ judged in an earlier epoch does not run); the sweep itself is Dagda's `LedgerCol
 and `.AControlRemovalNeverRacesANewEpoch`. Row 32 done: every catalogue store call goes through `store_call` (anything
 the store throws becomes `CatalogueUnavailable`) or `control_object` (ensure-local then get, one call), and artwork
 that cannot be stored is `CatalogueUnavailable`, never a plain error, so a store fault defers a hint without spending
-an attempt. Left: `CatalogueInstaller` on Dannan's events (row 31), which waits on Macha's `NodeEvents` becoming
-Dannan's (R1's leftover): asked of Dannan 2026-11-15, a `wait_for_change` overload taking a `std::stop_token`, since
-every Macha consumer waits stop-aware and Dannan's waits only on a timeout.
+an attempt. Row 31 with R1's leftover, `NodeEvents` becoming Dannan's (built on Dannan 0.8.3 with develop's `fbcbb90` applied, which adds
+`NodeEvents::wait_for_change(seen, timeout, std::stop_token)` at Macha's request, ABI kept, for 0.8.4 if the maintainer wants one;
+develop itself is 0.9.0, so Macha does not build on it; prefix `prefix-dannan-083-stop`, `build/pi/deps_dannan_083_stop.sh`):
+`NodeEvents` is Dannan's type, the Dannan node's instance (`NodeRuntime::events()`, handed to `NodeResources`); Macha's
+kinds are `node_event::storage`, `metadata`, `claims` at fixed numbers, named by `NodeRuntime` before the store node
+names the same three; Macha's own topology notion is gone: Dannan raises membership (joins, leaves, place,
+capabilities) and topology (any advert), and Macha raises metadata for a higher generation or a changed write floor.
+The installer retries on storage and membership; maintenance counts through `Node::maintenance_events()` (storage,
+metadata, membership, claims) and its clock waits on `NodeEvents`; availability counts membership; `Accounts` gossips
+to a peer that joins or restarts through a Dannan roster watch and waits on its own demand. Waits end on the
+consumer's stop token (`wait_for_events`).
 
 CONTROL calls onto `Context::Control`; `CatalogueManager::control_gc_step` and its state go (the provider answers
 the root epoch); the scanner's and editor's batches become tickets; every store result maps to `CatalogueUnavailable`

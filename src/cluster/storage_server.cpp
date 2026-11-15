@@ -57,7 +57,7 @@ void StorageServer::refresh() {
     node_.advertise_storage_backends(online);
     // A disk come back changes what this node holds, with nothing written.
     if (online > online_backends_)
-        events_.notify(NodeEvent::storage);
+        events_.notify(node_event::storage);
     online_backends_ = online;
     const auto stats = cache_.stats();
     node_.advertise_cache(cache_max_blocks_ * extent_size_,
@@ -247,7 +247,7 @@ void StorageServer::bind_routes() {
                 return error_reply(503, "stopping", "DATA resource admission stopping");
             activity_.note(frame_type, data.size());
             if (!local_.has(id))
-                events_.notify(NodeEvent::storage);
+                events_.notify(node_event::storage);
             if (request.type == MessageType::put_object_deferred) {
                 const auto generation = local_.put_deferred(id, data);
                 if (!generation)

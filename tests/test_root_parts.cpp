@@ -201,7 +201,8 @@ MACHA_FAST_TEST("root_parts",
     SteppedTime time;
     NodeBooks books(config);
     const auto memory = standalone_memory(config);
-    NodeResources resources(config, books, *memory, [&] { return time.now(); });
+    NodeEvents events;
+    NodeResources resources(config, books, *memory, events, [&] { return time.now(); });
 
     DiskServiceMonitor monitor(DiskServiceMonitor::Thresholds{25ms, 120ms, 300, 150, 1000});
     monitor.note(2000ms, 4096);

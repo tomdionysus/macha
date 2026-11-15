@@ -2,10 +2,13 @@
 #include "auth/accounts.hpp"
 
 #include "cluster/cluster.hpp"
+#include "cluster/dannan_bridge.hpp"
 #include "crypto.hpp"
 #include "diagnostics.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
+
+#include <boost/asio/strand.hpp>
 
 #include <algorithm>
 
@@ -25,8 +28,8 @@ constexpr auto gossip_reannounce_interval = std::chrono::seconds(30);
 } // namespace
 
 Accounts::Accounts(const Config& cfg, const NodeIdentity& identity, NodeRuntime& node,
-                   NodeEvents& events, MessageRoutes& routes)
-    : cfg_(cfg), identity_(identity), node_(node), events_(events), routes_(routes),
+                   MessageRoutes& routes)
+    : cfg_(cfg), identity_(identity), node_(node), routes_(routes),
       sessions_(cfg.session.anonymous_ttl, cfg.session.max_sessions,
                 cfg.state_path / "sessions" / "sessions.bin"),
       users_(cfg.session.max_users, cfg.state_path / "users" / "users.bin",
@@ -75,17 +78,38 @@ void Accounts::start() {
     gossip_ = std::jthread([this](const std::stop_token& stop) {
         run_supervised_loop("accounts-gossip", stop, [this, stop] { gossip_loop(stop); });
     });
+    auto& node = node_.node();
+    roster_watch_ = node.nodes().watch(
+        boost::asio::make_strand(node.time().executor()),
+        [this](const dannan::RosterChange& change) { on_roster_change(change); });
 }
 
 void Accounts::stop() {
+    if (roster_watch_) {
+        node_.node().nodes().unwatch(*roster_watch_);
+        roster_watch_.reset();
+    }
     if (!gossip_.joinable())
         return;
+    // The gossip's wait ends on its stop token.
     gossip_.request_stop();
-    {
-        Lock lock(events_.wait_mutex);
-    }
-    events_.wait_cv.notify_all();
     gossip_.join();
+}
+
+void Accounts::on_roster_change(const dannan::RosterChange& change) {
+    const auto id = macha_id(change.node.id);
+    if (id == identity_.id)
+        return;
+    if (change.kind == dannan::RosterChange::Kind::left) {
+        peer_incarnations_.erase(id);
+        return;
+    }
+    const auto& incarnation = change.node.incarnation;
+    const auto [told, inserted] = peer_incarnations_.try_emplace(id, incarnation);
+    if (!inserted && told->second == incarnation)
+        return;
+    told->second = incarnation;
+    request_gossip();
 }
 
 void Accounts::bind_routes() {
@@ -130,9 +154,9 @@ void Accounts::propagate_session(const AuthSession& session) {
 void Accounts::request_gossip() {
     gossip_demand_.fetch_add(1, std::memory_order_acq_rel);
     {
-        Lock lock(events_.wait_mutex);
+        Lock lock(wait_mutex_);
     }
-    events_.wait_cv.notify_all();
+    wait_cv_.notify_all();
 }
 
 bool Accounts::apply_user(const UserRecord& user) {
@@ -168,7 +192,6 @@ void Accounts::gossip_loop(const std::stop_token& stop) {
     // `network.telemetry_interval_ms`, floored so a mis-set value cannot spin.
     const auto interval = std::max(cfg_.telemetry_interval, std::chrono::milliseconds(250));
     while (!stop.stop_requested()) {
-        const auto topology = events_.count(NodeEvent::topology);
         const auto demand = gossip_demand_.load(std::memory_order_acquire);
         gossip_sessions();
         // The whole user table, tombstones included, so a node that missed a
@@ -181,11 +204,9 @@ void Accounts::gossip_loop(const std::stop_token& stop) {
         for (const auto retry : {gossip_sessions_retry_after_, gossip_users_retry_after_})
             if (retry > now)
                 wait = std::min(wait, retry - now);
-        Lock lock(events_.wait_mutex);
-        events_.wait_cv.wait_for(lock.native(), stop, wait, [&] {
-            return events_.count(NodeEvent::topology) != topology ||
-                   gossip_demand_.load(std::memory_order_acquire) != demand;
-        });
+        Lock lock(wait_mutex_);
+        wait_cv_.wait_for(lock.native(), stop, wait,
+                          [&] { return gossip_demand_.load(std::memory_order_acquire) != demand; });
     }
 }
 

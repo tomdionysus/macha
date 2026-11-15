@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "cluster/node_events.hpp"
 #include "types.hpp"
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
-#include <mutex>
 #include <stop_token>
 
 namespace macha {
@@ -21,7 +20,8 @@ namespace macha {
 // Contract: now() is monotonic non-decreasing and wall_ns() moves with it;
 // both are safe from any thread. wait_until() returns once `ready()` holds,
 // `stop` is requested, or now() has reached `deadline` (never, for
-// Clock::time_point::max()); it may return early and callers re-check.
+// Clock::time_point::max()), looking again at every event on `events`; it
+// may return early and callers re-check.
 class MaintenanceClock {
   public:
     virtual ~MaintenanceClock() = default;
@@ -32,8 +32,7 @@ class MaintenanceClock {
         const auto ns = wall_ns();
         return ns > 0 ? static_cast<uint64_t>(ns) / 1'000'000 : 0;
     }
-    virtual void wait_until(std::condition_variable_any&, std::unique_lock<std::mutex>&,
-                            std::stop_token stop, Clock::time_point deadline,
+    virtual void wait_until(NodeEvents& events, std::stop_token stop, Clock::time_point deadline,
                             const std::function<bool()>& ready) = 0;
 };
 
@@ -42,8 +41,7 @@ class SystemMaintenanceClock final : public MaintenanceClock {
   public:
     Clock::time_point now() const override;
     int64_t wall_ns() const override;
-    void wait_until(std::condition_variable_any&, std::unique_lock<std::mutex>&,
-                    std::stop_token stop, Clock::time_point deadline,
+    void wait_until(NodeEvents& events, std::stop_token stop, Clock::time_point deadline,
                     const std::function<bool()>& ready) override;
 };
 
@@ -62,8 +60,7 @@ class ManualMaintenanceClock final : public MaintenanceClock {
     void advance(Clock::duration by);
     Clock::time_point now() const override;
     int64_t wall_ns() const override;
-    void wait_until(std::condition_variable_any&, std::unique_lock<std::mutex>&,
-                    std::stop_token stop, Clock::time_point deadline,
+    void wait_until(NodeEvents& events, std::stop_token stop, Clock::time_point deadline,
                     const std::function<bool()>& ready) override;
 };
 

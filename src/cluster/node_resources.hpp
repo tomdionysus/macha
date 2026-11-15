@@ -21,7 +21,6 @@ struct NodeBooks {
     NodeBooks& operator=(const NodeBooks&) = delete;
 
     TranscodeRateBook transcode_rates;
-    NodeEvents events;
 };
 
 // The node-wide budgets every layer shares, built by the root after the node and
@@ -31,7 +30,7 @@ struct NodeBooks {
 class NodeResources {
   public:
     NodeResources(const Config&, NodeBooks&, dannan::sched::RetainedMemoryLedger& node_memory,
-                  ActivityClocks::Source activity_clock = {});
+                  NodeEvents& node_events, ActivityClocks::Source activity_clock = {});
     NodeResources(const NodeResources&) = delete;
     NodeResources& operator=(const NodeResources&) = delete;
 
@@ -41,6 +40,7 @@ class NodeResources {
     DataResourceArbiter data;
     RetainedMemoryLedger memory;
     TranscodeRateBook& transcode_rates;
+    // The node's, counted by its Dannan node.
     NodeEvents& events;
 
     // Refuses new leases and wakes every waiter. Idempotent.
