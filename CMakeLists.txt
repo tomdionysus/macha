@@ -155,9 +155,9 @@ find_package(CURL REQUIRED)
 # because src/http/http_compression.cpp calls deflate() itself.
 find_package(ZLIB REQUIRED)
 find_package(yaml-cpp QUIET)
-# The cluster's transport and node: Dannan 0.7, any patch from the one reviewed
+# The cluster's transport and node: Dannan 0.8, any patch from the one reviewed
 # (a patch keeps the minor's ABI; a minor is a new API).
-find_package(dannan 0.7.0 CONFIG REQUIRED)
+find_package(dannan 0.8.0 CONFIG REQUIRED)
 # The store: Dagda, the exact release, built on the same Dannan.
 find_package(dagda 0.2.0 CONFIG REQUIRED)
 
