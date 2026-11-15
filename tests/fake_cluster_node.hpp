@@ -165,6 +165,11 @@ class FakeClusterNode final : public ClusterNode {
     std::vector<std::jthread> threads_;
 };
 
+// A StoreBench has no namespace tree: its replica never replays a delta.
+inline ObjectId no_namespace_replay(const ObjectId&, const MetadataDelta&) {
+    throw std::logic_error("a store bench replays no namespace tree");
+}
+
 // One node's object storage with no transport: a FakeClusterNode, the
 // node-wide resources and recovered local stores, built as the root builds
 // them. `tune` adjusts the configuration first.
@@ -175,7 +180,7 @@ class StoreBench {
           memory_(standalone_memory(config_)), resources(config_, books_, *memory_),
           identity_(config_.state_path, cluster_.keys()),
           node(config_, self_info(config_, identity_.id), identity_.durability_epoch),
-          local(config_, identity_, node, progress_, {}, std::stop_token{},
+          local(config_, identity_, node, no_namespace_replay, progress_, {}, std::stop_token{},
                 test_durability_window) {
         node.advertise_storage(local.data().used(), local.data().limit());
     }

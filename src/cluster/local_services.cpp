@@ -5,18 +5,28 @@
 
 #include "cluster/cluster.hpp"
 #include "metadata/metadata.hpp"
+#include "metadata/namespace_control_store.hpp"
 #include "storage/storage_pool.hpp"
 
 namespace macha {
 
 LocalServices::LocalServices(const Config& cfg, const NodeIdentity& identity,
                              RecoveryProgress& progress, const LocalState::StageHook& hook,
-                             std::stop_token stop, NodeRuntime& node, NodeResources& resources,
-                             MessageRoutes& routes,
+                             std::stop_token stop, NodeRuntime& node, dagda::Context& store,
+                             NodeResources& resources, MessageRoutes& routes,
                              std::chrono::milliseconds durability_batch_window)
     : resources_(resources),
-      state_(cfg, identity, node, progress, hook, std::move(stop), durability_batch_window),
-      metadata_(node, state_.replica(), state_.cache(), routes, cfg.heartbeat),
+      // Replay writes the tree's nodes here and replicates nothing: the
+      // commit reached the floor when made, and rebuilding a local head must
+      // not depend on peers.
+      state_(
+          cfg, identity, node,
+          [&store](const ObjectId& root, const MetadataDelta& delta) {
+              auto nodes = ControlNamespaceNodeStore::for_replay(store);
+              return apply_delta_to_namespace_tree(root, nodes, delta);
+          },
+          progress, hook, std::move(stop), durability_batch_window),
+      metadata_(node, state_.replica(), state_.seed(), routes, cfg.heartbeat),
       storage_(node, identity,
                StorageServer::Stores{state_.data(), state_.control(), state_.retention(),
                                      state_.cache()},

@@ -3245,7 +3245,9 @@ PublishedSource make_published_source(const std::filesystem::path& root, uint64_
         ObjectId id;
         if (store_them) {
             id = object_id(slice);
-            REQUIRE(fs.context().objects().write(id, slice, {}).holders() > 0);
+            dagda::store::WriteOptions options;
+            options.level = dagda::store::Durability::persisted;
+            REQUIRE(fs.context().objects().write(id, slice, options).holders() > 0);
         } else {
             // A different object of the same length, never stored.
             Bytes other(slice.begin(), slice.end());
@@ -4370,8 +4372,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     REQUIRE(n1.wait_local_state_ready(10s));
     DistributedStore store1(n1, n1.local_state(), n1.resources.activity, n1.resources.data,
                             n1.resources.memory, n1.resources.events);
-    auto metadata1_store = macha::test_support::distributed_store_for(n1);
-    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), *metadata1_store);
+    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), n1.store_context());
     CatalogueManager catalogue1(n1, n1.local_state(), n1.metadata_server(), store1, metadata1,
                                 n1.ledger());
 
@@ -4385,8 +4386,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     REQUIRE(n2.wait_local_state_ready(10s));
     DistributedStore store2(n2, n2.local_state(), n2.resources.activity, n2.resources.data,
                             n2.resources.memory, n2.resources.events);
-    auto metadata2_store = macha::test_support::distributed_store_for(n2);
-    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), *metadata2_store);
+    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), n2.store_context());
     CatalogueManager catalogue2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2,
                                 n2.ledger());
 
@@ -4517,15 +4517,13 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     // than turning that expected bootstrap state into an unhandled test failure.
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
-    auto metadata1_store = macha::test_support::distributed_store_for(n1);
-    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), *metadata1_store);
+    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), n1.store_context());
     const auto initial1 = metadata1.snapshot_view();
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
     // Node two's decoded cache lives by a clock the test steps.
     SteppedTime time;
-    auto metadata2_store = macha::test_support::distributed_store_for(n2);
-    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), *metadata2_store, {},
+    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), n2.store_context(), {},
                               time);
 
     std::optional<MetadataSnapshotView> initial2;

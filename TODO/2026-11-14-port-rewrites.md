@@ -20,7 +20,8 @@ Dagda, then the harness and the migration rehearsal. Deps: Dannan 0.7.0 and Dagd
 the 0.7.0 prefix. **Dannan 0.8.1** (2026-11-15, `53cc933`: TCP_NODELAY on accepted sockets, a
 `stop_accepting` that never hangs; ABI kept, custody tool unchanged): the pin's minimum 0.8.0 already accepts it;
 build the deploy's deps from the newest 0.8 patch: **0.8.2** (`20771a6`: placement copies only its answer, a
-listener's key refused for what is actually wrong; ABI 0.8.0's).
+listener's key refused for what is actually wrong; ABI 0.8.0's). **0.8.3** (`00a3a12`: the outbound StreamConnector, RS256 verification;
+ABI 0.8.0's, custody tool unchanged) is now the newest patch to build the deploy's deps from.
 
 **Owner surface (operator, 2026-11-15, relayed by Dagda):** Macha's composition root, which opens and owns the
 node, keeps `dagda::Node`'s owner surface: `open` / `OpenLater` and `open_store`, `stop`, `reconfigure`, and the
@@ -111,7 +112,36 @@ filesystem read is Dagda's; the namespace tree's CONTROL reads are R3. Hydration
 the cancel; the reachability epoch and `logical_capacity` (Dagda `6ea9d04`, `Objects::logical_capacity`) too.
 `FileSystem::membership_` is now unused; it leaves the constructor with `LocalState&` in R7.
 
+**Ack levels (the maintainer, 2026-11-15, relayed by Dagda; Kvasir's `../kvasir/TODO/2026-11-15-ack-levels-standard.md`):**
+`persisted` becomes "this node's own disk", `replicated` a majority of the replication set on disk (both nodes at
+replication 2), `decided` comes with Dannan 0.9.0, the setting `ack_level`. Every Macha write wants its floor (one
+copy, this node first, the rest to prompt replication), so every write names `persisted` explicitly (set in
+`FileSystem::put_extent`; R4's and R5's writes the same); `replicated` would put the WAN peer on every write and stop
+writes while a node is away. **Open, put to Dagda for the maintainer:** an edge node or a full node lands Macha's one copy on a
+peer (`test_a_full_preferred_node_spills_data_but_not_control`); the new `persisted` cannot answer that. Recommended:
+`persisted` = the disk of the node that takes the write, this one when it can.
+
 ## R3. Metadata and the control store [metadata 2-7]
+
+**Progress (2026-11-15):** `ControlNamespaceNodeStore` is over `Context::Control` (`has`, `get`, `put`,
+`ensure_local`): `for_reading`, `for_commit` and `for_replay` take `dagda::Context&`. `MetadataManager`,
+`AvailabilityService` and `NodeHorizonBuilder` take the Context in place of the store and control store; the
+replica's replay applier gets it through `LocalServices` and `LocalState` (built after `open_store()`); `Service`
+has a `store_context()` seam. Test retired in part: `rpc_cluster/test_store_control_objects_take_no_data_credit_and_commit_alone`
+keeps its Macha-store half (renamed `..._take_no_data_credit`, R7's); its "a namespace node is written by a node on
+its own" half is Macha's `test_a_commit_claims_the_nodes_it_introduced_and_prunes_the_rest`
+(`tests/test_namespace_tree.cpp`) and Dagda's `HeadsControlNodeStore.ACommitHoldsEveryNodeItsRootNamesAndWritesOnlyWhatIsNew`.
+The publication claims barrier is on `Context::Claims` (`retain_data_here`, `retain` for DATA sought and CONTROL here,
+the peers' share with `every_node`), each named `call_deadline::metadata`; not finished or unheld throws
+`MetadataNotReady`, CONTROL not `held_here` throws as before.
+**Dagda's answer (2026-11-15) on the rest:** the census is owner surface: `Node::reference_counts()` with the library
+helper `heads::ReferenceCensus` (Macha's census moved into Dagda; one `count(root, nodes, pause)` per root), run on
+the maintenance thread under the build mutex until 8c. `register_reachability`, `publish_inventory` and the
+collector's control epoch are owner surface, the root's. The seed: Dagda's `heads::CacheSeed` serves a head space;
+with heads off until 8c none exists, so Macha's replica keeps its own seed in the interim (proposed: its own file
+under the state path, not the cache Dagda now opens), and it goes at 8c. Dagda agreed, on one condition: sealed as v19
+seals everything at rest (domain in the AAD) and written by Dannan's durable replace; deleted in the same step that
+turns `NodeOptions::heads` on.
 
 - `ControlNamespaceNodeStore` and `MetadataManager` over `Context::Control` (the replica's applier built after
   `open_store`).

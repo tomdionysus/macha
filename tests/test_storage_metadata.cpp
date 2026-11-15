@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "codec.hpp"
 #include "crypto.hpp"
+#include "metadata/metadata_seed.hpp"
 #include "storage/sealed_journal.hpp"
 #include "test_backend_support.hpp"
 
@@ -4090,6 +4091,30 @@ MACHA_TEST("storage_metadata", test_storage_pool_and_persistent_cache) {
     }
 }
 
+// The replica's recovery seed keeps the last head it was given, sealed: it
+// survives a reopen, and under another key it opens as nothing.
+MACHA_FAST_TEST("storage_metadata", test_the_metadata_seed_keeps_the_last_head_sealed) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto head = genesis_metadata();
+    {
+        MetadataSeed seed(t.path(), keys.storage);
+        CHECK(!seed.read().has_value());
+        seed.remember(head);
+        REQUIRE(seed.read().has_value());
+        CHECK(seed.read()->hash == head.hash);
+    }
+    MetadataSeed reopened(t.path(), keys.storage);
+    REQUIRE(reopened.read().has_value());
+    CHECK(reopened.read()->hash == head.hash);
+    auto other = keys.storage;
+    other[0] ^= 0x5a;
+    MetadataSeed foreign(t.path(), other);
+    CHECK(!foreign.read().has_value());
+}
+
 MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -4598,7 +4623,7 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
 
     auto& service = fixture.start();
     MetadataManager metadata(service.node(), service.local_state(), service.metadata_server(),
-                             service.store());
+                             service.store_context());
     const auto root = object_id(pattern(97, 5));
     auto committed = metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta&) {
         // The supplied exact delta omits the change: the local replica must reject

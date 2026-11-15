@@ -1,35 +1,38 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "cluster/cluster.hpp"
-#include "cluster/distributed_store.hpp"
 #include "metadata/namespace_tree.hpp"
+#include "storage/local_store.hpp"
 
 #include <stdexcept>
 
+namespace dagda {
+class Context;
+}
+
 namespace macha {
 
-// The namespace tree in the cluster's content-addressed control store, read
-// through `ensure_control_local` as the catalogue reads: it inherits
+// The namespace tree in the cluster's content-addressed control store,
+// through the store's Control noun as the catalogue reads it: it inherits
 // replication, repair and GC with no second durability model.
 // The only place NamespaceNodeStore (cluster-agnostic, so the tree can be
 // built offline) meets the cluster.
 class ControlNamespaceNodeStore final : public NamespaceNodeStore {
   public:
     // A reader refuses `put`.
-    static ControlNamespaceNodeStore for_reading(LocalStore& control, DistributedStore& store) {
-        return ControlNamespaceNodeStore(control, store, Mode::read);
+    static ControlNamespaceNodeStore for_reading(dagda::Context& store) {
+        return ControlNamespaceNodeStore(store, Mode::read);
     }
     // A commit writes each new node on this node alone; a root is committed
     // once this node holds every node it addresses. The peers are sent them
     // afterwards.
-    static ControlNamespaceNodeStore for_commit(LocalStore& control, DistributedStore& store) {
-        return ControlNamespaceNodeStore(control, store, Mode::commit);
+    static ControlNamespaceNodeStore for_commit(dagda::Context& store) {
+        return ControlNamespaceNodeStore(store, Mode::commit);
     }
     // Replay writes every node it is given: content addressing makes a
     // locally rebuilt node identical to the committed one.
-    static ControlNamespaceNodeStore for_replay(LocalStore& control, ControlObjectSource& source) {
-        return ControlNamespaceNodeStore(control, source, Mode::replay);
+    static ControlNamespaceNodeStore for_replay(dagda::Context& store) {
+        return ControlNamespaceNodeStore(store, Mode::replay);
     }
 
     // Writes the node and returns its content address. Throws when this node
@@ -48,10 +51,9 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
 
   private:
     enum class Mode : uint8_t { read, commit, replay };
-    ControlNamespaceNodeStore(LocalStore& control, ControlObjectSource& source, Mode mode);
+    ControlNamespaceNodeStore(dagda::Context& store, Mode mode) : store_(store), mode_(mode) {}
 
-    LocalStore& control_;
-    ControlObjectSource& source_;
+    dagda::Context& store_;
     Mode mode_;
     std::vector<ObjectId> written_;
 };

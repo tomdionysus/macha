@@ -463,9 +463,9 @@ class BareNode : public BareNodeResources, public NodeRuntime {
             run_supervised_once("cluster-state-recovery", [this, stop] {
                 try {
                     store_node_->open_store();
-                    local_ = std::make_unique<LocalServices>(config(), identity(), progress,
-                                                             stage_hook, stop, *this, resources,
-                                                             routes, durability_batch_window_);
+                    local_ = std::make_unique<LocalServices>(
+                        config(), identity(), progress, stage_hook, stop, *this,
+                        store_node_->context(), resources, routes, durability_batch_window_);
                 } catch (const std::exception&) {
                     // Cancelled, or recorded in `progress`.
                     return;
@@ -585,19 +585,19 @@ inline std::unique_ptr<DistributedStore> distributed_store_for(BareNode& node) {
 }
 
 // `snapshot` with `delta` applied to its namespace tree, the new nodes written
-// to `control`: a head built outside any manager, such as a
+// to `store`'s control store: a head built outside any manager, such as a
 // sibling or another author's history.
-inline MetadataSnapshot with_namespace_delta(MetadataSnapshot snapshot, LocalStore& control,
-                                             DistributedStore& store, const MetadataDelta& delta) {
-    auto nodes = ControlNamespaceNodeStore::for_commit(control, store);
+inline MetadataSnapshot with_namespace_delta(MetadataSnapshot snapshot, dagda::Context& store,
+                                             const MetadataDelta& delta) {
+    auto nodes = ControlNamespaceNodeStore::for_commit(store);
     snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root, nodes, delta);
     return snapshot;
 }
 
-// Whether `snapshot`'s namespace holds `path`, read through `control`.
-inline bool namespace_holds(const MetadataSnapshot& snapshot, LocalStore& control,
-                            DistributedStore& store, std::string_view path) {
-    const auto nodes = ControlNamespaceNodeStore::for_reading(control, store);
+// Whether `snapshot`'s namespace holds `path`, read through `store`.
+inline bool namespace_holds(const MetadataSnapshot& snapshot, dagda::Context& store,
+                            std::string_view path) {
+    const auto nodes = ControlNamespaceNodeStore::for_reading(store);
     return namespace_entry(snapshot, &nodes, path).has_value();
 }
 
@@ -690,7 +690,7 @@ class TestNode {
                 *node_, node_->local_state(), node_->resources.activity, node_->resources.data,
                 node_->resources.memory, node_->resources.events);
             metadata_ = std::make_unique<MetadataManager>(
-                *node_, node_->local_state(), node_->metadata_server(), *store_,
+                *node_, node_->local_state(), node_->metadata_server(), node_->store_context(),
                 MetadataPublicationRetention{[this](const MetadataPublicationContext& context) {
                                                  if (publication_guard_)
                                                      publication_guard_(context);

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/node_services.hpp"
 
+#include "cluster/call_deadline.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "log.hpp"
 #include "media/media_engine.hpp"
@@ -35,7 +36,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                                      instruments_.trace}),
       // The guard reaches the catalogue, declared after this: it runs only
       // for a commit, which nothing makes before construction finishes.
-      metadata_(node_, local_, metadata_server_, store_,
+      metadata_(node_, local_, metadata_server_, context_,
                 MetadataPublicationRetention{[this](const MetadataPublicationContext& context) {
                                                  return retain_metadata_publication(context);
                                              },
@@ -47,7 +48,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       ledger_(local_.retention(), local_.data(), local_.control()),
       data_unreferenced_(node_.config().state_path / "retention" / "unreferenced-data.bin"),
       control_unreferenced_(node_.config().state_path / "retention" / "unreferenced-control.bin"),
-      availability_(node_, local_, store_, ledger_, resources_.events, routes_,
+      availability_(node_, context_, ledger_, resources_.events, routes_,
                     node_.config().state_path / "availability" / "last-survey.bin"),
       catalogue_(node_, local_, metadata_server_, store_, metadata_, ledger_),
       catalogue_installer_(catalogue_, resources_.events),
@@ -129,8 +130,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
           },
           steady_time_source()),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
-      horizon_builder_(filesystem_, catalogue_, local_.control(), store_),
-      files_api_(filesystem_, availability_),
+      horizon_builder_(filesystem_, catalogue_, context_), files_api_(filesystem_, availability_),
       maintenance_(MaintenanceDependencies{node_,
                                            local_,
                                            metadata_server_,
@@ -418,7 +418,7 @@ NodeServices::retain_metadata_publication(const MetadataPublicationContext& cont
     // Either namespace may be a tree, so reads go through the namespace
     // primitives. An entry missed here never gets liveness evidence and can be
     // collected while still referenced.
-    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
+    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(context_);
     {
         const bool merge = !context.proposed.merge_parents.empty();
         if (context.delta) {
@@ -519,14 +519,15 @@ NodeServices::retain_metadata_publication(const MetadataPublicationContext& cont
     // This node's own claims, asking no peer. Only an object this commit
     // brings in that is not held here is looked for on the nodes present.
     const auto data_started = Clock::now();
-    const auto elsewhere = store_.retain_data_here(data, dot);
+    const auto elsewhere = context_.claims().retain_data_here(data, dot);
     std::vector<ObjectId> sought;
     for (const auto& id : introduced)
         if (!carried.contains(id) && std::binary_search(elsewhere.begin(), elsewhere.end(), id))
             sought.push_back(id);
     if (!sought.empty()) {
-        const auto unheld = store_.retain_data(sought, dot);
-        if (!unheld.empty()) {
+        const auto evidence = context_.claims().retain(RetentionClass::data, std::move(sought), dot,
+                                                       {}, call_deadline::metadata);
+        if (!evidence.finished || !evidence.unheld.empty()) {
             data_ms = since_ms(data_started);
             report("data-unheld");
             throw MetadataNotReady(
@@ -536,7 +537,10 @@ NodeServices::retain_metadata_publication(const MetadataPublicationContext& cont
     data_ms = since_ms(data_started);
     const auto control_started = Clock::now();
     const bool control_ok =
-        control.empty() || store_.retain_control(control, dot, DistributedStore::ClaimScope::here);
+        control.empty() || context_.claims()
+                               .retain(RetentionClass::control, control, dot, {},
+                                       call_deadline::metadata, dagda::Context::Claims::Scope::here)
+                               .held_here;
     control_ms = since_ms(control_started);
     if (!control_ok) {
         report("control-claim-failed");
@@ -557,10 +561,16 @@ void NodeServices::retain_on_peers(const NodeId& origin, uint64_t sequence,
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t).count());
     };
     const auto started = Clock::now();
-    (void)store_.retain_data(claims.data, dot);
+    // A claim still running at the deadline may yet land; one that does not
+    // is owed, and repair finds what is unheld.
+    if (!claims.data.empty())
+        (void)context_.claims().retain(RetentionClass::data, claims.data, dot, {},
+                                       call_deadline::metadata);
     const auto data_ms = ms_since(started);
     if (!claims.control.empty())
-        (void)store_.retain_control(claims.control, dot, DistributedStore::ClaimScope::every_node);
+        (void)context_.claims().retain(RetentionClass::control, claims.control, dot, {},
+                                       call_deadline::metadata,
+                                       dagda::Context::Claims::Scope::every_node);
     const auto total_ms = ms_since(started);
     if (total_ms >= 250 && Log::enabled(LogLevel::debug))
         Log::debug("metadata claims on peers dot=" + to_string(origin).substr(0, 6) + ":" +

@@ -7,11 +7,14 @@
 
 #include <functional>
 
+namespace dagda {
+class Context;
+}
+
 // The horizon builder over the node's filesystem, catalogue and control
 // store, delegating to two builds that are pure functions of their inputs.
 namespace macha {
 
-class DistributedStore;
 class NodeRuntime;
 
 // Data is both live sets, control the catalogue's and the namespace tree's
@@ -32,8 +35,7 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
 
 class NodeHorizonBuilder final : public HorizonBuilder {
   public:
-    NodeHorizonBuilder(FileSystem&, CatalogueManager&, LocalStore& control,
-                       DistributedStore&) noexcept;
+    NodeHorizonBuilder(FileSystem&, CatalogueManager&, dagda::Context&) noexcept;
 
     std::shared_ptr<const MaintenanceObjects>
     namespace_objects(const std::function<void()>& pause) override;
@@ -44,8 +46,7 @@ class NodeHorizonBuilder final : public HorizonBuilder {
   private:
     FileSystem& filesystem_;
     CatalogueManager& catalogue_;
-    LocalStore& control_;
-    DistributedStore& store_;
+    dagda::Context& store_;
 };
 
 } // namespace macha

@@ -19,6 +19,10 @@
 #include <string_view>
 #include <thread>
 
+namespace dagda {
+class Context;
+}
+
 namespace macha {
 
 // Discovery incomplete: cluster forming, write floor unavailable, or divergent
@@ -32,8 +36,6 @@ class MetadataNotReady final : public std::runtime_error {
 // both would let the two disagree and every reader pick. The encoders refuse to
 // write that state; this refuses to hand it out. Throws MetadataNotReady.
 void require_coherent_namespace(const MetadataSnapshot&);
-
-class DistributedStore;
 
 const char* metadata_availability_name(MetadataAvailability) noexcept;
 
@@ -73,7 +75,8 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     NodeRuntime& node_;
     LocalState& local_;
     MetadataServer& metadata_server_;
-    DistributedStore& namespace_store_;
+    // The namespace tree's nodes, in the control store.
+    dagda::Context& namespace_store_;
     const TimeSource& time_;
     // Guards no state: serialises mutations, repair and history truncation.
     // A mutation holds it across its local commit only; repair holds it
@@ -230,7 +233,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     using PublicationRetention = MetadataPublicationRetention;
     // `time`: what the decoded cache's lifetime (config metadata_cache) is
     // measured by.
-    MetadataManager(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore& namespace_store,
+    MetadataManager(NodeRuntime&, LocalState&, MetadataServer&, dagda::Context& namespace_store,
                     PublicationRetention publication_retention = {},
                     const TimeSource& time = steady_time_source());
     ~MetadataManager() override;

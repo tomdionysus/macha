@@ -523,9 +523,9 @@ void Service::initialise_services(const std::stop_token& stop) {
         try {
             note_lifecycle("open store");
             store_node_->open_store();
-            local_ = std::make_unique<LocalServices>(node_.config(), node_.identity(), progress_,
-                                                     recovery_stage_hook_, stop, node_, resources_,
-                                                     routes_, durability_batch_window_);
+            local_ = std::make_unique<LocalServices>(
+                node_.config(), node_.identity(), progress_, recovery_stage_hook_, stop, node_,
+                store_node_->context(), resources_, routes_, durability_batch_window_);
         } catch (const RecoveryCancelled&) {
             return;
         }

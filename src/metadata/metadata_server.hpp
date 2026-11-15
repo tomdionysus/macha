@@ -15,7 +15,7 @@
 namespace macha {
 
 class NodeRuntime;
-class PersistentBlockCache;
+class MetadataSeed;
 
 // The serving side of this node's metadata replica: answers peers' metadata
 // requests, and accepts and imports commits.
@@ -26,7 +26,7 @@ class PersistentBlockCache;
 // refresher keeps the replica's generation advertised.
 class MetadataServer {
   public:
-    MetadataServer(NodeRuntime& node, MetadataReplica& replica, PersistentBlockCache& cache,
+    MetadataServer(NodeRuntime& node, MetadataReplica& replica, MetadataSeed& seed,
                    MessageRoutes& routes, std::chrono::milliseconds refresh_interval);
     ~MetadataServer();
     MetadataServer(const MetadataServer&) = delete;
@@ -49,7 +49,7 @@ class MetadataServer {
 
     NodeRuntime& node_;
     MetadataReplica& replica_;
-    PersistentBlockCache& cache_;
+    MetadataSeed& seed_;
     MessageRoutes& routes_;
     const std::chrono::milliseconds refresh_interval_;
     std::vector<MessageType> bound_;
