@@ -23,11 +23,12 @@ std::shared_ptr<MediaEngine> media_engine_for(const Config& config) {
 } // namespace
 
 NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalState& local,
-                           MetadataServer& metadata_server, MessageRoutes& routes,
-                           SubsystemRegistry& registry, MaintenancePort& port,
-                           NodeServicesInstruments instruments)
-    : node_(node), resources_(resources), local_(local), metadata_server_(metadata_server),
-      routes_(routes), registry_(registry), port_(port), instruments_(std::move(instruments)),
+                           dagda::Context& context, MetadataServer& metadata_server,
+                           MessageRoutes& routes, SubsystemRegistry& registry,
+                           MaintenancePort& port, NodeServicesInstruments instruments)
+    : node_(node), resources_(resources), local_(local), context_(context),
+      metadata_server_(metadata_server), routes_(routes), registry_(registry), port_(port),
+      instruments_(std::move(instruments)),
       store_(node_, local_, resources_.activity, resources_.data, resources_.memory,
              resources_.events,
              DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
@@ -259,6 +260,7 @@ void NodeServices::start() {
     context.retained_memory = &resources_.memory;
     context.routes = &routes_;
     context.local_state = &local_;
+    context.store = &context_;
     context.ingest = &ingest_;
     context.registry = &registry_;
     context.filesystem = &filesystem_;

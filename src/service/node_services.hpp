@@ -18,6 +18,7 @@
 #include "catalogue/media_information.hpp"
 #include "cluster/distributed_store.hpp"
 #include "cluster/node_resources.hpp"
+#include "dagda/context.h"
 #include "filesystem/filesystem.hpp"
 #include "filesystem/hydration.hpp"
 #include "ledger/node_horizon_builder.hpp"
@@ -84,8 +85,8 @@ struct NodeServicesInstruments {
 
 class NodeServices {
   public:
-    NodeServices(NodeRuntime&, NodeResources&, LocalState&, MetadataServer&, MessageRoutes&,
-                 SubsystemRegistry&, MaintenancePort&, NodeServicesInstruments);
+    NodeServices(NodeRuntime&, NodeResources&, LocalState&, dagda::Context&, MetadataServer&,
+                 MessageRoutes&, SubsystemRegistry&, MaintenancePort&, NodeServicesInstruments);
     ~NodeServices();
     NodeServices(const NodeServices&) = delete;
     NodeServices& operator=(const NodeServices&) = delete;
@@ -172,6 +173,8 @@ class NodeServices {
     NodeRuntime& node_;
     NodeResources& resources_;
     LocalState& local_;
+    // The store, through the contract Macha's code calls.
+    dagda::Context& context_;
     MetadataServer& metadata_server_;
     MessageRoutes& routes_;
     SubsystemRegistry& registry_;

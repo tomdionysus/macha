@@ -84,8 +84,12 @@ Service::Service(const Config& config, ClusterKeys keys,
                     return WorkClass::control;
             return WorkClass::foreground;
         });
-        catalogue_http_->set_activity(
-            [this](WorkClass work, uint64_t) { resources_.activity.note(work); });
+        // Every API request and draining body is a viewer present (law 2), on the clock the
+        // store, repair and DATA admission read; Macha's own clock too while its store remains.
+        catalogue_http_->set_activity([this](WorkClass work, uint64_t) {
+            store_node_->context().activity().note(work);
+            resources_.activity.note(work);
+        });
         // Liveness reads two atomics: answered by the reactor, so no worker,
         // on either lane, can delay it.
         catalogue_http_->set_inline_route("/api/v1/health", [this] { return health_response(); });
@@ -534,8 +538,8 @@ void Service::initialise_services(const std::stop_token& stop) {
             return;
 
         auto services = std::make_unique<NodeServices>(
-            node_, resources_, local_->state(), local_->metadata(), routes_, registry_,
-            maintenance_port_,
+            node_, resources_, local_->state(), store_node_->context(), local_->metadata(), routes_,
+            registry_, maintenance_port_,
             NodeServicesInstruments{clock_, maintenance_trace_, maintenance_stage_hook_, lifecycle_,
                                     constructed_});
         if (stop.stop_requested())
