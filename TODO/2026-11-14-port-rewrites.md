@@ -19,7 +19,8 @@ Dagda, then the harness and the migration rehearsal. Deps: Dannan 0.7.0 and Dagd
 `dannan::Nodes`, so 0.8.0's new pure virtuals touch nothing; a clean build directory was needed so CMake would not keep
 the 0.7.0 prefix. **Dannan 0.8.1** (2026-11-15, `53cc933`: TCP_NODELAY on accepted sockets, a
 `stop_accepting` that never hangs; ABI kept, custody tool unchanged): the pin's minimum 0.8.0 already accepts it;
-build the deploy's deps from 0.8.1.
+build the deploy's deps from the newest 0.8 patch: **0.8.2** (`20771a6`: placement copies only its answer, a
+listener's key refused for what is actually wrong; ABI 0.8.0's).
 
 **Owner surface (operator, 2026-11-15, relayed by Dagda):** Macha's composition root, which opens and owns the
 node, keeps `dagda::Node`'s owner surface: `open` / `OpenLater` and `open_store`, `stop`, `reconfigure`, and the
