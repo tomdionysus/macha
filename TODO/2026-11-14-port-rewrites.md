@@ -153,6 +153,41 @@ turns `NodeOptions::heads` on.
 - Out of Macha's maintenance pass: the claim walk, CONTROL collection, release and prune, the control ledger verify;
   Macha's pass calls the node's steps until 8c. Macha's CONTROL handlers in its storage server go.
 
+**R3's last piece, designed 2026-11-15 (the provider and the pass on Dagda's steps):** read against Dagda
+`6ea9d04` (`ledger/collector.h`, `store/repair.h`, `node.h:395-475`, `node.cpp:546-663, 1032-1121`, Dagda's own
+loop being the reference composition). The ruling stands: Macha's loop drives the steps until 8c
+(`MaintenanceOptions::automatic = false`); destructive sweeps stay off on the live nodes until the provider's
+answers match the namespace on both.
+1. **The provider.** `MachaReachability : dagda::contract::ReachabilityProvider`, replacing `NodeHorizonBuilder`:
+   `generation()` and `known_generation()` from the metadata view and server; `inventory(pause)` = the namespace's
+   counted views (Dagda's `ReferenceCounts::views()`), the catalogue's DATA and CONTROL sets, the counted tree
+   nodes, the tombstones as `Garbage` and their batches, `complete`, the generation, entries and extents;
+   `release_head()` / `release(head)` as `NodeHorizonBuilder::release` today; `control_epoch()` and
+   `within_control_epoch()` over the catalogue's root epoch and mutex (what `control_gc_step` read);
+   `collect_garbage()` = `maintain_garbage_metadata` (erase) plus stamping plus `maintain_tombstone_batches`
+   (matured batches). Registered by the root (`register_reachability(domain_v1, provider)` after `open_store()`,
+   unregistered before `Node::stop()`).
+2. **The census** counts into `Node::reference_counts()` (owner surface handed to FileSystem by the root), Macha's
+   census code kept (its tree is Macha's until 8c; `heads::ReferenceCensus` needs Dagda's `Tree<Value>`), its
+   vectors moved into `change`.
+3. **The pass.** `Maintenance` holds `dagda::Node&` (the owner surface). Kept: Macha's metadata repair, catalogue
+   repair, head repair, history truncation, the busy and quiet computations, the event wake. Replaced, in Macha's
+   order: repair's credit (`Repair::earn_credit(now, interval)`), gate (`paced_by`, `may_start`, `note_gate`),
+   `Collector::inventory_step(pause, may_rebuild)` (held back on a repair-only pass while metadata is not ready),
+   `Repair::survey(pause)`, the turn (`begin_turn(.., PeerReading::as_begun)`, `claim_walks`, `transfer(lists())`,
+   `settle`), then `tombstone_step`, `release_step`, `control_step`, `data_step` with Macha's `PassDue`
+   (garbage due: not busy and metadata clean; GC due: not busy and past the quiet window; `should_yield`; `pause`);
+   the local stages through `begin_local_stages({stop, busy, interval})`, `local_rebalance`, `retention_compact`,
+   Macha's head repair and history truncation, `compact_packs`, `local_scrub`, `ledger_verify`. The wake: metadata
+   and catalogue retries as now; GC's quiet window from `rebuilt` and the data step's deferral and earliest
+   retirement; repair from `settle` (`credit`: the credit's time to an extent at the rate `earn_credit` gave;
+   `yielded`/`more_work`: one interval; `quiescent`: an event) and `turn_wait`; Dagda's `maintenance_events()`
+   joined to Macha's event wait.
+4. **Leaves Macha** with this slice (code removed in R7): `RetentionLedger` use in the pass, the claim walks,
+   `catalogue_.control_gc_step`, the sightings files' handling, Macha's survey in the pass (Macha's
+   `AvailabilityService` keeps serving its API from its last survey until R6 moves the files path table and Status
+   onto Dagda's survey), the scrub schedule file (Dagda keeps `<state>/maintenance/scrub.next`, Macha's name).
+
 ## R4. The catalogue [catalogue 1-7]
 
 CONTROL calls onto `Context::Control`; `CatalogueManager::control_gc_step` and its state go (the provider answers
