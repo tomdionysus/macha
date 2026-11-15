@@ -25,7 +25,7 @@ class InformationInput final : public MediaInput {
         return size_;
     }
     size_t read(uint64_t offset, std::span<uint8_t> destination, Clock::time_point deadline,
-                std::atomic_bool* cancelled) override {
+                std::shared_ptr<std::atomic_bool> cancelled) override {
         if (offset >= size_)
             return 0;
         const auto wanted =

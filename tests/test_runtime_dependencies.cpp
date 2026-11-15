@@ -1162,7 +1162,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_probe_failure_reports_why_it_failed
         uint64_t size() const override {
             return 8ULL * 1024 * 1024;
         }
-        size_t read(uint64_t, std::span<uint8_t>, Clock::time_point, std::atomic_bool*) override {
+        size_t read(uint64_t, std::span<uint8_t>, Clock::time_point,
+                    std::shared_ptr<std::atomic_bool>) override {
             throw std::runtime_error("extent unavailable: no route to any replica");
         }
     };
@@ -1172,7 +1173,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_probe_failure_reports_why_it_failed
             return bytes.size();
         }
         size_t read(uint64_t offset, std::span<uint8_t> out, Clock::time_point,
-                    std::atomic_bool*) override {
+                    std::shared_ptr<std::atomic_bool>) override {
             if (offset >= bytes.size())
                 return 0;
             const auto n = std::min<size_t>(out.size(), bytes.size() - offset);

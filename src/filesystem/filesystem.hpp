@@ -4,6 +4,7 @@
 #include "cluster/distributed_store.hpp"
 #include "cluster/membership.hpp"
 #include "contract/thread_safety.hpp"
+#include "dagda/context.h"
 #include "ledger/object_trie.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/metadata_server.hpp"
@@ -142,7 +143,7 @@ struct FilesystemNamespaceBatchResult {
 };
 
 class ReadHandle {
-    DistributedStore& s_;
+    dagda::Context& c_;
     // e_, playback_ and playback_session_ are fixed at construction.
     const FsEntry e_;
     PlaybackTracker* const playback_{};
@@ -152,16 +153,20 @@ class ReadHandle {
     IoMutex m_;
     uint64_t last_ MACHA_GUARDED_BY(m_){};
     size_t cached_index_ MACHA_GUARDED_BY(m_){static_cast<size_t>(-1)};
-    DistributedStore::ObjectData cached_extent_ MACHA_GUARDED_BY(m_);
-    const Bytes& extent(size_t, Clock::time_point, std::atomic_bool*) MACHA_REQUIRES(m_);
+    // The store's own buffer, shared: kept until the next extent is wanted.
+    dagda::store::ObjectData cached_extent_ MACHA_GUARDED_BY(m_);
+    const Bytes& extent(size_t, Clock::time_point, const std::shared_ptr<std::atomic_bool>&)
+        MACHA_REQUIRES(m_);
 
   public:
-    ReadHandle(DistributedStore&, FsEntry, PlaybackTracker* = nullptr, std::string path = {},
+    ReadHandle(dagda::Context&, FsEntry, PlaybackTracker* = nullptr, std::string path = {},
                FrameType frame_type = FrameType::read_ahead);
     ~ReadHandle();
     void promote(FrameType) noexcept;
+    // Copies into `out` on the caller's thread, before returning. `cancelled` is co-owned
+    // with the store, which may check it after a read has returned.
     size_t read(uint64_t, std::span<uint8_t>, Clock::time_point deadline = {},
-                std::atomic_bool* cancelled = nullptr);
+                std::shared_ptr<std::atomic_bool> cancelled = {});
 };
 enum class WriteDurability : uint8_t {
     immediate,
@@ -396,6 +401,8 @@ class FileSystem final : public PublicationTarget {
     MetadataServer& metadata_server_;
     RetainedMemoryLedger& retained_memory_;
     DistributedStore& s_;
+    // The store, through the contract Macha's code calls.
+    dagda::Context& context_;
     MetadataView& m_;
     PlaybackTracker* playback_{};
     // Held across open_write()'s path resolution and getattr, and the rename
@@ -422,7 +429,8 @@ class FileSystem final : public PublicationTarget {
                                   MetadataDelta&);
     // Cooperative cancellation of mount I/O at shutdown; extent transfers carry
     // it into DistributedStore.
-    std::atomic_bool io_cancelled_{};
+    // Co-owned with the store's reads, which may check it after a call returns.
+    std::shared_ptr<std::atomic_bool> io_cancelled_ = std::make_shared<std::atomic_bool>(false);
     // Fixed process-lifetime executor for publication extents: a thread per
     // extent makes glibc's per-thread arenas retain gigabytes. The queue holds
     // two tasks per worker, matching the default per-publication pipeline.
@@ -516,7 +524,8 @@ class FileSystem final : public PublicationTarget {
     remove_abandoned_write_files(const std::filesystem::path& state_path, const NodeId& node);
     // Clears this node's abandoned write files first.
     FileSystem(const Config&, NodeId, const Membership&, LocalState&, MetadataServer&,
-               DistributedStore&, MetadataView&, RetainedMemoryLedger&, PlaybackTracker* = nullptr);
+               DistributedStore&, dagda::Context&, MetadataView&, RetainedMemoryLedger&,
+               PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
     void mkdir(const std::string&, uint32_t, uint32_t, uint32_t);
@@ -604,6 +613,9 @@ class FileSystem final : public PublicationTarget {
     // What the namespace of `snapshot` refers to, from the counts brought to
     // its tree. None for a namespace that is not a tree.
     std::optional<NamespaceReferences> namespace_references(const MetadataSnapshot& snapshot);
+    dagda::Context& context() {
+        return context_;
+    }
     DistributedStore& store() {
         return s_;
     }
@@ -622,18 +634,18 @@ class FileSystem final : public PublicationTarget {
         return s_.idle_for(work_class);
     }
     void reset_io_cancellation() {
-        io_cancelled_.store(false, std::memory_order_relaxed);
+        io_cancelled_->store(false, std::memory_order_relaxed);
     }
     void request_io_cancellation() {
-        io_cancelled_.store(true, std::memory_order_relaxed);
+        io_cancelled_->store(true, std::memory_order_relaxed);
         extent_tasks_cv_.notify_all();
     }
     bool io_cancellation_requested() const {
-        return io_cancelled_.load(std::memory_order_relaxed);
+        return io_cancelled_->load(std::memory_order_relaxed);
     }
     ExtentExecutorDiagnostics extent_executor_diagnostics() const;
     std::atomic_bool* io_cancellation_flag() {
-        return &io_cancelled_;
+        return io_cancelled_.get();
     }
     const Config& config() const {
         return config_;
