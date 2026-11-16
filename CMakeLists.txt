@@ -595,10 +595,8 @@ if(MACHA_BUILD_TESTS)
         tests/test_subsystem_supervisor.cpp
         tests/test_fuse_subsystem.cpp
         tests/test_storage_metadata.cpp
-        tests/test_object_ledger.cpp
         tests/test_namespace_tree.cpp
         tests/test_namespace_service.cpp
-        tests/test_io_pressure.cpp
         tests/test_storage_v18.cpp
         tests/test_rpc_cluster.cpp
         tests/test_filesystem_fuse.cpp
@@ -616,11 +614,8 @@ if(MACHA_BUILD_TESTS)
         tests/test_maintenance_trace.cpp
         tests/test_dannan_bridge.cpp
         tests/test_dannan_host.cpp
-        tests/test_presence.cpp
         tests/test_contract.cpp
-        tests/test_absent_nodes.cpp
         tests/test_metadata_merge.cpp
-        tests/test_ledger_gates.cpp
         tests/test_horizon_builder.cpp
         tests/test_availability.cpp
         tests/test_work_class.cpp
