@@ -78,7 +78,11 @@ Macha's to touch, we wait for Dagda's redesign):
    never calls `Objects::remove`) and `d2872de` (repair stage 3, the offer: 1131 ran, 1128 passed, 3 skipped). The
    offer binds nothing in Macha's tree: Macha builds no `StorageServer` (Dagda's node must pass `offers`; asked to
    confirmed by Dagda: `dagda::Node` builds its server with `&_store->offers()`, `d2872de`), and `Repair::transfer` debits the offer bytes itself. Status shows `bytes_transferred` without
-   `offer_bytes`; left until stage 4's shape.
+   `offer_bytes`; left until stage 4's shape. **Stage 4's shape reviewed 2026-11-16** (Dagda's
+   `2026-11-16-repair-redesign.md`, "Stage 4, the shape proposed"; nothing built): a window of transfers replaces the
+   16-call budget, `transfer()` returns before its I/O lands, `in_flight > 0` settles as `more_work`, the store raises
+   a storage event when the window drains to half; nothing in Macha relies on the old behaviour (the stop order leaves
+   in-flight transfers to `dagda::Node::stop`). The maintainer ruled `offer_bytes` and `in_flight` join Status at the cutover.
 5. The first suite run on a Pi; fix forward. It runs on Dagda's current repair, which has the live defect below, so
    the comparison with 0.94.2 stays like for like.
 
