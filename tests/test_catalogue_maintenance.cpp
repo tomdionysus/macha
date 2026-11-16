@@ -113,7 +113,6 @@ struct Node {
     macha::test_support::TestCluster cluster;
     Config config;
     std::optional<test_support::BareNode> node;
-    std::optional<DistributedStore> store;
     Node() {
         config = macha::test_support::config_for(cluster.path() / "node", cluster.keyfile(),
                                                  macha::test_support::free_port());
@@ -122,8 +121,6 @@ struct Node {
         node.emplace(config, cluster.keys());
         node->start();
         REQUIRE(node->wait_local_state_ready(10s));
-        store.emplace(*node, node->local_state(), node->resources.activity, node->resources.data,
-                      node->resources.memory, node->resources.events);
     }
 };
 

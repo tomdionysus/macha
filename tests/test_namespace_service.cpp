@@ -387,7 +387,7 @@ MACHA_TEST("namespace_service", test_tombstones_live_in_batches_in_a_tree_backed
                         batches_before.begin(), batches_before.end(), std::back_inserter(added));
     REQUIRE(added.size() == 1);
     CHECK(added.front().count == tree_extents.size());
-    const auto object = service.local_state().control().get(added.front().id);
+    const auto object = service.store_node().control().get(added.front().id);
     REQUIRE(object.has_value());
     CHECK(decode_tombstone_batch(*object).ids == tree_extents);
     // The head stays small: batches, not tombstones.
@@ -726,8 +726,7 @@ MACHA_TEST("namespace_service", test_a_catalogue_change_on_a_tree_leaves_the_tre
     REQUIRE(after.namespace_root.has_value());
     CHECK(*after.namespace_root == *root);
     REQUIRE(after.catalogue_root.has_value());
-    CHECK(
-        service.local_state().retention().retained(RetentionClass::control, *after.catalogue_root));
+    CHECK(service.store_node().claims().retained(RetentionClass::control, *after.catalogue_root));
     CHECK(service.filesystem().getattr("/Movies/film.mkv").size == 256 * 1024);
     service.stop();
 }
@@ -805,8 +804,8 @@ MACHA_HEAVY_TEST("namespace_service", test_the_control_collector_keeps_an_unclai
     REQUIRE(reachable_tree_nodes(s2) == tree);
     for (Service* service : {&s1, &s2})
         for (const auto& node : tree) {
-            REQUIRE(service->local_state().control().has(node));
-            REQUIRE(!service->local_state().retention().retained(RetentionClass::control, node));
+            REQUIRE(service->store_node().control().has(node));
+            REQUIRE(!service->store_node().claims().retained(RetentionClass::control, node));
         }
 
     // An orphan on each node: once the collector has swept it, it has swept
@@ -815,12 +814,12 @@ MACHA_HEAVY_TEST("namespace_service", test_the_control_collector_keeps_an_unclai
     for (Service* service : {&s1, &s2}) {
         Bytes orphan = pattern(4096, static_cast<uint8_t>(orphans.size() + 90));
         const auto id = object_id(orphan);
-        REQUIRE(service->local_state().control().put(id, orphan));
+        REQUIRE(service->store_node().control().put(id, orphan));
         orphans.emplace_back(service, id);
     }
     const auto swept = [&] {
         return std::none_of(orphans.begin(), orphans.end(), [](const auto& orphan) {
-            return orphan.first->local_state().control().has(orphan.second);
+            return orphan.first->store_node().control().has(orphan.second);
         });
     };
     // The collector deletes only across a catalogue root change, so each
@@ -837,7 +836,7 @@ MACHA_HEAVY_TEST("namespace_service", test_the_control_collector_keeps_an_unclai
 
     for (Service* service : {&s1, &s2}) {
         for (const auto& node : tree)
-            CHECK(service->local_state().control().has(node));
+            CHECK(service->store_node().control().has(node));
         CHECK(service->filesystem().readdir("/Shows").size() == 81);
         CHECK(read_file(*service, "/Shows/film.mkv", film.size()) == film);
     }
@@ -886,7 +885,7 @@ MACHA_TEST("namespace_service", test_a_merge_claims_what_it_introduces) {
     Service service(config, cluster.keys(), test_durability_window);
     service.start();
     REQUIRE(wait_metadata_writable(service));
-    auto& claims = service.local_state().retention();
+    auto& claims = service.store_node().claims();
     for (const auto* entry : {&first, &second})
         for (const auto& extent : entry->extents)
             REQUIRE(!claims.retained(RetentionClass::data, extent.id));

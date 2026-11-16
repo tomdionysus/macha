@@ -3949,7 +3949,7 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
         const auto entry = fs.getattr(path);
         REQUIRE(entry.extents.size() == 1);
         retired_ids.push_back(entry.extents.front().id);
-        REQUIRE(service.local_state().data().has(retired_ids.back()));
+        REQUIRE(service.store_node().data().has(retired_ids.back()));
     }
     settle_maintenance(service);
     REQUIRE(converged());
@@ -3972,18 +3972,17 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
                          [&](const GarbageRef& garbage) { return garbage.id == id; });
         REQUIRE(found != garbage.end());
         latest_retirement = std::max(latest_retirement, found->retired_at_ns);
-        CHECK(service.local_state().data().has(id));
+        CHECK(service.store_node().data().has(id));
     }
     repair_gate.open();
     settle_maintenance(service);
     const auto held = [&] {
-        return std::all_of(retired_ids.begin(), retired_ids.end(), [&](const ObjectId& id) {
-            return service.local_state().data().has(id);
-        });
+        return std::all_of(retired_ids.begin(), retired_ids.end(),
+                           [&](const ObjectId& id) { return service.store_node().data().has(id); });
     };
     const auto collected = [&] {
         return std::none_of(retired_ids.begin(), retired_ids.end(), [&](const ObjectId& id) {
-            return service.local_state().data().has(id);
+            return service.store_node().data().has(id);
         });
     };
 

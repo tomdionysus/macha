@@ -696,8 +696,8 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
 
     auto entry = s1.filesystem().getattr("/media/two-replicas.bin");
     REQUIRE(entry.extents.size() == 1);
-    CHECK(s1.local_state().data().has(entry.extents.front().id));
-    CHECK(s2.local_state().data().has(entry.extents.front().id));
+    CHECK(s1.store_node().data().has(entry.extents.front().id));
+    CHECK(s2.store_node().data().has(entry.extents.front().id));
 
     s2.stop();
     s1.stop();
@@ -1789,17 +1789,17 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_file_touch_commits_while_a_holder_is_away
     REQUIRE(entry.extents.size() == 1);
     const auto extent = entry.extents.front().id;
     REQUIRE(wait_until([&] {
-        return s1.local_state().data().valid(extent) && s2.local_state().data().valid(extent) &&
-               s3->local_state().data().valid(extent);
+        return s1.store_node().data().valid(extent) && s2.store_node().data().valid(extent) &&
+               s3->store_node().data().valid(extent);
     }));
     // The accepted file reference installed a DATA claim here at once, and
     // on the holders present once the commit reached them.
-    CHECK(s1.local_state().retention().retained(RetentionClass::data, extent));
+    CHECK(s1.store_node().claims().retained(RetentionClass::data, extent));
     REQUIRE(s1.metadata_manager().wait_replicated(20s));
     CHECK(wait_until(
-        [&] { return s2.local_state().retention().retained(RetentionClass::data, extent); }, 20s));
+        [&] { return s2.store_node().claims().retained(RetentionClass::data, extent); }, 20s));
     CHECK(wait_until(
-        [&] { return s3->local_state().retention().retained(RetentionClass::data, extent); }, 20s));
+        [&] { return s3->store_node().claims().retained(RetentionClass::data, extent); }, 20s));
 
     const auto before = s1.local_state().replica().committed();
     s3->stop();
@@ -1815,7 +1815,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_file_touch_commits_while_a_holder_is_away
     CHECK((s1.filesystem().getattr("/retained.bin").mode & 0777U) == 0600U);
     CHECK(s1.local_state().replica().committed().hash != before.hash);
     const auto dot = [&](Service& service) {
-        const auto claims = service.local_state().retention().claims(RetentionClass::data, extent);
+        const auto claims = service.store_node().claims().claims(RetentionClass::data, extent);
         const auto found = claims.adds.find(s1.node().node_id());
         return found == claims.adds.end() ? uint64_t{0} : found->second;
     };
@@ -1948,9 +1948,9 @@ MACHA_TEST("rpc_cluster", test_a_delete_is_reclaimed_while_a_node_is_away) {
     s1.filesystem().unlink("/partition-retain.bin");
     REQUIRE(wait_until(
         [&] {
-            return !s1.local_state().retention().retained(RetentionClass::data, extent) &&
-                   !s2.local_state().retention().retained(RetentionClass::data, extent) &&
-                   !s1.local_state().data().valid(extent) && !s2.local_state().data().valid(extent);
+            return !s1.store_node().claims().retained(RetentionClass::data, extent) &&
+                   !s2.store_node().claims().retained(RetentionClass::data, extent) &&
+                   !s1.store_node().data().valid(extent) && !s2.store_node().data().valid(extent);
         },
         20s));
 
@@ -1970,8 +1970,8 @@ MACHA_TEST("rpc_cluster", test_a_delete_is_reclaimed_while_a_node_is_away) {
         10s));
     REQUIRE(wait_until(
         [&] {
-            return !s3->local_state().retention().retained(RetentionClass::data, extent) &&
-                   !s3->local_state().data().valid(extent);
+            return !s3->store_node().claims().retained(RetentionClass::data, extent) &&
+                   !s3->store_node().data().valid(extent);
         },
         20s));
 
@@ -2227,7 +2227,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         REQUIRE(wait_until([&] {
             r1.repair_once(1024 * 1024);
             r2.repair_once(1024 * 1024);
-            return s1.local_state().data().has(object) && s2.local_state().data().has(object);
+            return s1.store_node().data().has(object) && s2.store_node().data().has(object);
         }));
 
         s2.stop();
@@ -2325,7 +2325,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     REQUIRE(wait_until([&] {
         initial_convergence.repair_once(16ULL * 1024 * 1024, objects);
         return std::all_of(objects.begin(), objects.end(),
-                           [&](const auto& id) { return s2->local_state().data().has(id); });
+                           [&](const auto& id) { return s2->store_node().data().has(id); });
     }));
 
     // One metadata pass makes node 2 a durable checkpoint witness first.
@@ -2387,7 +2387,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
         [&] {
             replacement_convergence.repair_once(16ULL * 1024 * 1024, objects);
             return std::all_of(objects.begin(), objects.end(), [&](const auto& id) {
-                return replacement->local_state().data().has(id);
+                return replacement->store_node().data().has(id);
             });
         },
         10s));
@@ -2684,7 +2684,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_ma
 
     const auto holds_all = [&] {
         return std::all_of(ids.begin(), ids.end(),
-                           [&](const ObjectId& id) { return n3.local_state().data().has(id); });
+                           [&](const ObjectId& id) { return n3.store_node().data().has(id); });
     };
     // Each step settles the pass, then moves its clock a second; bounded in steps.
     int steps = 0;
@@ -2870,10 +2870,10 @@ MACHA_TEST("rpc_cluster", test_a_commit_is_claimed_here_when_the_peer_never_answ
     // claim is the replicator's, and it gives up on a peer that never answers.
     const auto alone = s1.metadata_manager().snapshot().catalogue_root;
     REQUIRE(alone.has_value());
-    CHECK(s1.local_state().retention().retained(RetentionClass::control, *alone));
+    CHECK(s1.store_node().claims().retained(RetentionClass::control, *alone));
     REQUIRE(s1.metadata_manager().wait_replicated(30s));
     CHECK(wait_until([&] { return links->stalled_calls() >= 1; }, 10s));
-    CHECK(!s2.local_state().retention().retained(RetentionClass::control, *alone));
+    CHECK(!s2.store_node().claims().retained(RetentionClass::control, *alone));
 
     links->release(peer);
     item.title = "Claimed twice";
@@ -2881,11 +2881,10 @@ MACHA_TEST("rpc_cluster", test_a_commit_is_claimed_here_when_the_peer_never_answ
     const auto root = s1.metadata_manager().snapshot().catalogue_root;
     REQUIRE(root.has_value());
     CHECK(*root != *alone);
-    CHECK(s1.local_state().retention().retained(RetentionClass::control, *root));
+    CHECK(s1.store_node().claims().retained(RetentionClass::control, *root));
     REQUIRE(s1.metadata_manager().wait_replicated(30s));
     CHECK(wait_until(
-        [&] { return s2.local_state().retention().retained(RetentionClass::control, *root); },
-        30s));
+        [&] { return s2.store_node().claims().retained(RetentionClass::control, *root); }, 30s));
 
     s2.stop();
     s1.stop();

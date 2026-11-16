@@ -77,9 +77,6 @@ class CatalogueBench {
     MetadataManager& metadata() {
         return node_.metadata();
     }
-    DistributedStore& store() {
-        return node_.store();
-    }
     FileSystem& fs() {
         return node_.filesystem();
     }

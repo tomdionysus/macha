@@ -170,6 +170,11 @@ class Service {
         wait_services_ready();
         return local_->metadata();
     }
+    // The store node's own parts, for a test that reads them directly.
+    dagda::Node& store_node() {
+        wait_services_ready();
+        return *store_node_;
+    }
     // The store, through the contract Macha's code calls.
     dagda::Context& store_context() {
         wait_services_ready();

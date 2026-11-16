@@ -528,26 +528,27 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     MetadataServer& metadata_server() {
         return local("metadata replica").metadata();
     }
-    StoragePool& local_store() {
-        return local("data storage").state().data();
+    // The store node's parts, once its store is open (before recovery
+    // completes).
+    auto& local_store() {
+        (void)local("data storage");
+        return store_node_->data();
     }
-    LocalStore& control_store() {
-        return local("control storage").state().control();
+    auto& control_store() {
+        (void)local("control storage");
+        return store_node_->control();
     }
-    PersistentBlockCache& block_cache() {
-        return local("persistent cache").state().cache();
+    auto& block_cache() {
+        (void)local("persistent cache");
+        return store_node_->cache();
     }
-    ClaimStore& claims() {
-        return local("retention state").state().retention();
+    auto& claims() {
+        (void)local("retention state");
+        return store_node_->claims();
     }
-    // The ledger over this node's stores, built on first use.
-    ObjectLedger& ledger() {
-        auto& state = local("the ledger's stores").state();
-        std::lock_guard lock(ledger_mutex_);
-        if (!ledger_)
-            ledger_ =
-                std::make_unique<RetentionLedger>(state.retention(), state.data(), state.control());
-        return *ledger_;
+    auto& ledger() {
+        (void)local("the ledger's stores");
+        return store_node_->ledger();
     }
     MetadataReplica& metadata_replica() {
         return local("metadata replica").state().replica();
@@ -572,17 +573,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     std::unique_ptr<dagda::Node> store_node_;
     std::unique_ptr<LocalServices> local_;
     std::jthread recovery_;
-    std::mutex ledger_mutex_;
-    std::unique_ptr<RetentionLedger> ledger_;
 };
-
-// A DistributedStore over a bare node's own parts, built as Service builds
-// one: what a MetadataManager the test constructs keeps its namespace tree in.
-inline std::unique_ptr<DistributedStore> distributed_store_for(BareNode& node) {
-    return std::make_unique<DistributedStore>(node, node.local_state(), node.resources.activity,
-                                              node.resources.data, node.resources.memory,
-                                              node.resources.events);
-}
 
 // `snapshot` with `delta` applied to its namespace tree, the new nodes written
 // to `store`'s control store: a head built outside any manager, such as a
@@ -607,7 +598,6 @@ class TestNode {
     ClusterKeys keys_;
     Config config_;
     std::unique_ptr<BareNode> node_;
-    std::unique_ptr<DistributedStore> store_;
     std::function<void(const MetadataPublicationContext&)> publication_guard_;
     std::function<MetadataPublicationClaims(const MetadataPublicationContext&)> publication_claims_;
     std::function<void(const NodeId&, uint64_t, const MetadataPublicationClaims&)> peer_retention_;
@@ -685,10 +675,7 @@ class TestNode {
         REQUIRE(node_);
         REQUIRE(started_);
         REQUIRE(node_->wait_local_state_ready(std::chrono::seconds{10}));
-        if (!store_) {
-            store_ = std::make_unique<DistributedStore>(
-                *node_, node_->local_state(), node_->resources.activity, node_->resources.data,
-                node_->resources.memory, node_->resources.events);
+        if (!metadata_) {
             metadata_ = std::make_unique<MetadataManager>(
                 *node_, node_->local_state(), node_->metadata_server(), node_->store_context(),
                 MetadataPublicationRetention{[this](const MetadataPublicationContext& context) {
@@ -723,10 +710,6 @@ class TestNode {
     NodeResources& resources() {
         REQUIRE(node_);
         return node_->resources;
-    }
-    DistributedStore& store() {
-        REQUIRE(store_);
-        return *store_;
     }
     MetadataManager& metadata() {
         REQUIRE(metadata_);
