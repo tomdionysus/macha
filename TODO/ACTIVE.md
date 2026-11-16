@@ -42,8 +42,12 @@ word). build-3's `/home/maintainer/macha-store-2` holds the same sources (checke
   pushed. The deploy's Dagda is therefore a named commit of that branch until Dagda tags one. Dagda's word, ~17:00Z
   (not read here): its newest gated commit is `0d048e0` (its own loop reads the inventory before each repair turn;
   1120 ran, 1117 passed, 3 skipped), only `Node::maintenance_loop` changed, none of the steps Macha's pass calls;
-  the candidate for step 4. Its benchmark driver is `66a0b76`; Macha's half compiles on build-1 from 18:30Z, and
-  Macha reviews it once Dagda sends the commit that builds.
+  the candidate for step 4. Its benchmark driver built at `274053c` and was **reviewed by Macha the same evening**
+  (read, not run): accepted as Macha's repair as deployed; asked of Dagda: a longer bound or a partial figure for
+  the viewer scenario (repair on its 5 of 100 share there), elapsed compared as reference plus measure, prompt
+  replication's figures beside repair's, the raw WiFi link recorded each round. Left unverified: what production
+  passes as `Service`'s durability batch window (the driver uses the tests' 500 ms). Dagda sends the measured
+  results; Macha reads its side of them.
 
 **Next, in order: the port's code** (the operator, 2026-11-16: prepare for the Dagda replacement; repair is not
 Macha's to touch, we wait for Dagda's redesign):
