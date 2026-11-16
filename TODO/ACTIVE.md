@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-16 about 00:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-16 about 00:20Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-15-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
 `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
@@ -21,7 +21,8 @@ Dannan 0.9.0; ack levels are the stack standard (`persisted` = the disk that too
   `maintenance.collect_garbage` default false), R4 (the catalogue on Context; a store failure is `CatalogueUnavailable`),
   R5 (torrent admission and I/O through `Context::devices()`, ingest blocking on `FsStorageUnavailable` only), all on
   Dagda `6bfb5b2` with `ack_level`. Compiled green on build-3 (`/home/maintainer/macha-store-2`, `build/pi/macha_port_compile.sh`).
-- **Committed, not pushed, after `c176854`:** `NodeEvents` becomes Dannan's (R1's leftover and catalogue row 31), on
+- **Committed, not pushed:** `62f63f2`, R6 step 1 (Status and the observation gauges read the store node; new key
+  `data_resources.available` to announce). And after `c176854`: `NodeEvents` becomes Dannan's (R1's leftover and catalogue row 31), on
   Dannan 0.8.3 with develop's `fbcbb90` applied (`NodeEvents::wait_for_change` with a stop token, added at Macha's
   ask, offered for 0.8.4, the maintainer's call; develop is 0.9.0; prefix `prefix-dannan-083-stop`,
   `build/pi/deps_dannan_083_stop.sh`). Detail in the plan under R4. Compiled green on build-3.
@@ -29,7 +30,10 @@ Dannan 0.9.0; ack levels are the stack standard (`persisted` = the disk that too
   `build/pi/macha_port_compile.sh` with `S` and `R` set, against `prefix-dannan-083-stop` and `prefix-dagda-6bfb5b2`.
   Dagda has since gated `6adc5ed` (2026-11-15: synchronous ticket waits on the caller's thread, placement ranked once,
   the barrier's log lines; API unchanged): move the prefix to it at the next rebuild. Deploy deps from Dannan's newest 0.8 patch (0.8.3, or 0.8.4 if the maintainer cuts one with the stop-aware wait) and Dagda's tag.
-- **Next:** R6 (adverts from `dagda/capacity` and `store::figures_of`, telemetry and Status from Dagda's figures,
+- **Next:** the plan's "R6 and R7, the order", from step 2 (Macha's `DistributedStore` out of production). Step 2 cannot
+  compile alone: `Service::store()`, `FileSystem::store()` and the bench fixtures feed about 90 test sites in
+  `test_rpc_cluster.cpp` and `test_storage_v18.cpp`, whose subject is Macha's store, so it lands with step 7's test
+  retirement for those files (each case against the Dagda case the mapping names). Then R6 (adverts from `dagda/capacity` and `store::figures_of`, telemetry and Status from Dagda's figures,
   reload through Dagda, the files path table from Dagda's survey) together with R7 and the plan's "Before any suite
   can run" list (`LocalState`'s store parts, Macha's `DistributedStore` and `StorageServer`, Macha's survey, the
   trace clock into `MaintenanceOptions`), each Macha test retired against the Dagda case
