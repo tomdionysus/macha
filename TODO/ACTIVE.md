@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-16 about 03:30Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-16 about 04:30Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-15-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
 `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
@@ -15,46 +15,41 @@ Rulings: Macha calls `dagda::Context` only, no shims; the root keeps `dagda::Nod
 reconfigure, the reference counts, reachability registration, the maintenance steps until 8c); agreement waits for
 Dannan 0.9.0; ack levels are the stack standard (`persisted` = the disk that took it, this node's when it can).
 
-**Where it stands (2026-11-15, 23:30Z):**
-- Pushed to `25a37d3`, then `d35239d` (TODO). **Committed, not pushed:** `c176854`, R3's last piece (the provider
-  `MachaReachability`, the census on `Node::references()`, `Maintenance` on the node's steps, key
-  `maintenance.collect_garbage` default false), R4 (the catalogue on Context; a store failure is `CatalogueUnavailable`),
-  R5 (torrent admission and I/O through `Context::devices()`, ingest blocking on `FsStorageUnavailable` only), all on
-  Dagda `6bfb5b2` with `ack_level`. Compiled green on build-3 (`/home/maintainer/macha-store-2`, `build/pi/macha_port_compile.sh`).
-- **Committed, not pushed (origin at `25a37d3`):** `c176854` (R3 to R5), `ce205f1` (NodeEvents is Dannan's, on Dannan
-  0.8.3 with `fbcbb90` patched in; prefix `prefix-dannan-083-stop`, `build/pi/deps_dannan_083_stop.sh`; Dannan is
-  gating 0.8.4, move onto the tag when it lands), `62f63f2` (Status reads the store node), `e8c8794` (161 store cases
-  retired), `14d34b6` (Macha's DistributedStore out of production), `b0e2c61` (the tests read the store node's
-  parts), `bfd13ec` (artwork read bounded, 503; two more retired). 165 cases retired, case by case, in
-  `2026-11-16-test-retirement.md`; what was on Macha's store parts is listed in `2026-11-16-store-test-rewrites.md`.
-  All compile green on build-3. No suite has run.
-- **Since:** `cb13e34` (availability on Dagda's survey; the pass clock reaches the node), `dfedd6a` (reload and
-  hosting through the store node), `0a777a7` (the last store cases retired, 171 in all; `StoreBench` gone).
-- **Then, committed:** steps 3 and 4. `LocalState` keeps only the metadata
-  seed and replica; `LocalServices` loses the storage server; `node_info_from`, telemetry and `data_storage_degraded`
-  read Dagda's adverts (`dagda/capacity`, `store::figures_of`); `advertise_storage`, `advertise_storage_backends`,
-  `advertise_cache` and the `macha/capacity`, `macha/used` adverts go; deleted: `DistributedStore`, `StorageServer`,
-  `ControlObjectFetch`, `claim_walk`, `RetentionLedger`, `UnreferencedSince`, `StoragePool`, `PersistentBlockCache`,
-  Macha's `ledger/availability` (the survey types alias `dagda::ledger`'s). Pinned to Dannan 0.8.4 (released with the
-  stop-aware wait; 0.8.5 since, with a stop hang fixed, for the deploy's deps): prefix `prefix-0.8.4`,
-  `build/pi/deps_dannan_084.sh`. Still compiled and to go next: `LocalStore` and what it stands on
-  (`presence_index`, `durability_domain`, `held_ledger`, `sealed_journal`, the tries, `retention`,
-  `reference_counts`) and Macha's contract twins (`object_store`, `object_ledger`, `claim_store`, `horizon`,
-  `horizon_builder`); `tools/metadata_history_dump.cpp` reads a control store through `LocalStore` and moves to
-  Dagda's with them.
-- **Builds:** build-3 `/home/maintainer/macha-store-2` (the current tree; `/home/maintainer/macha-store` holds an older copy),
-  `build/pi/macha_port_compile.sh` with `S` and `R` set, against `prefix-dannan-083-stop` and `prefix-dagda-6bfb5b2`.
-  Dagda has since gated `6adc5ed` (2026-11-15: synchronous ticket waits on the caller's thread, placement ranked once,
-  the barrier's log lines; API unchanged): move the prefix to it at the next rebuild. Deploy deps from Dannan's newest 0.8 patch (0.8.3, or 0.8.4 if the maintainer cuts one with the stop-aware wait) and Dagda's tag.
-- **Next:** the plan's "R6 and R7, the order": steps 1 and 2 are in, and step 6's artwork deadline. Then steps 3 and
-  4 together, after the three retirements above: Macha's store code and `StoreBench` go, `StorageServer` and
-  `LocalState`'s store parts go, adverts and telemetry from Dagda's figures. Then step 5 (availability on Dagda's
-  survey), the trace clock (Macha's `MaintenanceClock` as Dannan's `TimeSource`/`WallClock` into
-  `MaintenanceOptions`, with the trace tests' rewrite). Then R6 (adverts from `dagda/capacity` and `store::figures_of`, telemetry and Status from Dagda's figures,
-  reload through Dagda, the files path table from Dagda's survey) together with R7 and the plan's "Before any suite
-  can run" list (`LocalState`'s store parts, Macha's `DistributedStore` and `StorageServer`, Macha's survey, the
-  trace clock into `MaintenanceOptions`), each Macha test retired against the Dagda case
-  `../dagda/TODO/2026-11-05-test-mapping.md` names; then the suites, fix forward, the harness, the migration rehearsal.
+**Where it stands (2026-11-16, 04:30Z): `port/dannan-dagda` at `deceac1`, pushed** (the maintainer: "You can push when you
+need to"; still no tag, merge or PR without his word). Every commit compiles on build-3 (GCC, warnings as errors);
+**no suite has run**, the gate is at the end. Summary of the branch's content (details in the plan, commit by commit):
+- R1 to R5 done: the root over `dagda::Node`, one lock and identity, readiness and `NodeEvents` from Dannan; reads,
+  the FUSE reply buffer, writes and publication on tickets, hydration and activity through Context; the namespace
+  tree, the claims barrier, the seed, the reachability provider `MachaReachability` and `Maintenance` driving the
+  node's steps (`maintenance.collect_garbage` default false, so the live nodes reclaim nothing until the provider's
+  answers are checked); the catalogue, torrent admission and I/O, and the ingest's classification through Context.
+- R6 done except the leftovers below: Status, the observation gauges, telemetry, `data_storage_degraded` and peers'
+  capacity and use from Dagda's figures and adverts; availability's path table over `Node::availability()`; reload
+  and the hosting advert through the store node; artwork reads bounded (30 s, then 503); `MaintenanceClock` is
+  Dannan's `TimeSource` and `WallClock`, handed to the node.
+- R7 mostly done: 171 cases retired against named Dagda (and one Dannan) cases (`2026-11-16-test-retirement.md`,
+  case by case); the rest read the store node's parts (`2026-11-16-store-test-rewrites.md`). Deleted:
+  `DistributedStore`, `StorageServer`, `ControlObjectFetch`, the claim walk, `RetentionLedger`, `UnreferencedSince`,
+  `StoragePool`, `PersistentBlockCache`, Macha's survey; `LocalState` keeps only the metadata seed and replica.
+- Deps: Dannan 0.8.4 pinned (`find_package(dannan 0.8.4)`; it carries the stop-aware `NodeEvents` wait; 0.8.5 is out
+  with a stop hang fixed, for the deploy), Dagda `6bfb5b2` (`6adc5ed` and `ab76b43` gated since; API unchanged).
+
+**Next, in order:**
+1. Macha's `LocalStore` and what stands on it (`presence_index`, `durability_domain`, `held_ledger`,
+   `sealed_journal`, the tries, `retention`, `reference_counts`) and its contract twins (`object_store`,
+   `object_ledger`, `claim_store`, `horizon`, `horizon_builder`) go; `tools/metadata_history_dump.cpp` reads its
+   control store through Dagda's `LocalStore` instead.
+2. R1's leftovers: Macha's `DataResourceArbiter` and `ActivityClocks` out of `NodeResources` (Dagda's admission and
+   activity are the node's), one `StartupProgress`, stage names.
+3. The maintenance trace tests rewritten over Dagda's maintenance (the mapping's REWRITE cases in
+   `test_maintenance_trace.cpp`); the GAP-HEADS cases stay on Macha's replica until 8c.
+4. Move the prefixes to Dannan 0.8.5 and Dagda's newest gated commit (or its tag).
+5. The first suite run on a Pi; fix forward. Then the side-by-side harness and the migration rehearsal (a gate, the maintainer
+   2026-11-14), then the port against the live baselines.
+
+**Builds:** build-3 `/home/maintainer/macha-store-2` (the current tree), `build/pi/macha_port_compile.sh` with
+`S=/home/maintainer/macha-store-2 R=/root/pi/port2`, prefixes `/home/maintainer/deps/prefix-0.8.4` (`deps_dannan_084.sh`) and
+`prefix-dagda-6bfb5b2` (`deps_dagda_6bfb5b2.sh`). Claim first, wait for "Taken", then build: never in one batch.
 
 **Parked by the operator (2026-11-14: port first, heap later):** the heap corruption P0. Findings so far: 125
 ASan-clean rounds of the crash workload; the FUSE read late-write (a timed-out read's worker writing into libfuse's
