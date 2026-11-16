@@ -133,6 +133,14 @@ until stage 2); the maintainer ruled a holder may offer ids to an owner at the m
 two Pis (`4f1aca6`); the benchmark is designed as workload 7 on **build-1 and build-2, both claimed whole**
 (`e6f6474`, not built), which takes two of the four Pis from the port's first suite run while it runs. Dagda's
 `ACTIVE.md` still lists Macha's port as "R3 in progress" and stage 0's benchmark as "reviewed by the Macha session".
+**The baseline ran 2026-11-16 evening** (Dagda `250ac68`; build-1 and build-4, unshaped WiFi at about 2.9 MB/s, a
+tenth of the plan's sizes, so no added round trip; figures in Dagda's
+`build/harness/results/2026-11-16/repair-baseline/repair.jsonl`). Macha's side, read from the raw rows: on a rejoin
+the holder pushes while the joiner pulls the same objects (large: a pushed 100 to 109 MB and b pulled 63 to 92 MB of
+109 MB needed; a's wire 176 to 208 MB), so the large rejoin took about 80 s where the bytes sent once would take about
+38 s; the small-object times are the 16-call budget at a step a second (410 objects, about 26 s at best; Macha
+38.9 s, Dagda 25.8 s); a viewer on the holder was not slowed (p50 10.5 ms alone and with repair) and the rejoin
+under it was no slower. Both are live on 0.94.2 until the cutover, under the ruling above.
 
 ## Waiting on the operator
 
