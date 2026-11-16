@@ -12,7 +12,7 @@ Two cases newer than the mapping were named by Dagda on request (2026-11-16, its
 `test_storage_v18.cpp` `test_a_store_tells_a_bad_record_from_a_failed_read` against
 `StoreLocalStore.AStoreTellsABadRecordFromAFailedRead`.
 
-163 cases.
+165 cases.
 
 ## test_absent_nodes.cpp
 
@@ -264,3 +264,10 @@ Two cases newer than the mapping were named by Dagda on request (2026-11-16, its
 | case | Dagda case |
 |---|---|
 | test_control_never_forms_data_work | StoreIoPressure.ControlCannotEnterTheDataArbiterAtAll |
+
+## Named by Dagda on request (2026-11-16, its `3ca592a`), cases already gated
+
+| file | case | Dagda case |
+|---|---|---|
+| test_rpc_cluster.cpp | test_store_control_objects_take_no_data_credit | DistributedStore.ALocalControlObjectIsFoundWithoutAskingAnyone (the same credit, a loader's extent and every DATA slot held; a superset) |
+| test_storage_metadata.cpp | test_storage_pool_and_persistent_cache (the mapping's GAP-HEADS:H25; its body is the pool and the cache) | StoreStoragePool.PoolsSpreadTraverseSweepAndRebalance (the pool half), StorePersistentCache.TheCacheEvictsTheLeastRecentlyUsedAndReopens (the cache half), HeadsSeed.TheSeedSurvivesReopenAndFollowsTheCache (the remembered metadata), and Dannan's NodeIdentity.TheNodeIdIsCreatedOnceAndKept (the node id kept) |

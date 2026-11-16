@@ -197,28 +197,6 @@ MACHA_FAST_TEST("rpc_cluster", test_a_pull_list_new_while_the_push_runs_is_not_p
     CHECK(bench.local.data().has(second));
 }
 
-// The control store is not on the DATA device: finding a local control
-// object never waits for DATA credit.
-MACHA_FAST_TEST("rpc_cluster", test_store_control_objects_take_no_data_credit) {
-    StoreBench bench([](Config& c) {
-        c.data_inflight_bytes = 2 * c.extent_size;
-        c.data_viewer_reserve_bytes = c.extent_size;
-        c.maintenance.background_concurrency = 1;
-    });
-    const auto extent = bench.config().extent_size;
-    const auto bytes = pattern(18 * 1024, 91);
-    const auto id = object_id(bytes);
-    REQUIRE(bench.local.control().put(id, bytes));
-    auto store = bench.store();
-    auto held = bench.resources.data.acquire(DataWorkContext(FrameType::loader, extent), extent);
-    REQUIRE(held.has_value());
-    auto found = std::async(std::launch::async, [&] { return store->ensure_control_local(id); });
-    const bool prompt = found.wait_for(scaled(2s)) == std::future_status::ready;
-    held.reset(); // lets a regressed build finish rather than hang the suite
-    CHECK(prompt);
-    CHECK(found.get());
-}
-
 // The startup gate fires on silence, never on slow progress: a reading that
 // moved restarts the no-progress window; a ceiling bounds the whole startup;
 // zero turns either off. Readings come at a quarter of a short window.

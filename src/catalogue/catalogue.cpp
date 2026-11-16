@@ -1018,6 +1018,9 @@ CatalogueManager::CatalogueManager(NodeRuntime& node, MetadataServer& metadata_s
 
 namespace {
 
+// How long an artwork request waits for its bytes before answering 503.
+constexpr std::chrono::milliseconds artwork_read_deadline{std::chrono::seconds(30)};
+
 // A store call: whatever the store throws is the store unavailable, never the
 // content's fault.
 template <class Call> auto store_call(std::string_view what, Call&& call) -> decltype(call()) {
@@ -1032,11 +1035,15 @@ template <class Call> auto store_call(std::string_view what, Call&& call) -> dec
 
 } // namespace
 
-std::optional<Bytes> CatalogueManager::read_data(const ObjectId& id, FrameType frame) {
+std::optional<Bytes> CatalogueManager::read_data(const ObjectId& id, FrameType frame,
+                                                 std::chrono::milliseconds deadline) {
     dagda::store::ReadOptions options;
     options.frame = frame;
+    options.deadline = deadline;
     auto result = store_call("catalogue DATA read failed",
                              [&] { return store_.objects().read(id, std::move(options)); });
+    if (result.end == dagda::store::ReadEnd::timed_out)
+        throw CatalogueUnavailable("catalogue DATA read timed out");
     if (result.end != dagda::store::ReadEnd::served || !result.object)
         return {};
     return result.object->bytes;
@@ -2518,8 +2525,9 @@ std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId&
     if (!mime_type)
         return {};
     // Reading DATA never makes the reader an owner: artwork is read from its
-    // owner like any remote extent, cached without using replica quota.
-    auto bytes = read_data(id, FrameType::foreground);
+    // owner like any remote extent, cached without using replica quota. A
+    // viewer is waiting, so the read is bounded: past it, the API says 503.
+    auto bytes = read_data(id, FrameType::foreground, artwork_read_deadline);
     if (!bytes)
         return {};
     return CatalogueArtworkContent{std::move(*mime_type), std::move(*bytes)};
