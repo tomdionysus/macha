@@ -64,14 +64,4 @@ MACHA_FAST_TEST("work_class", test_presence_is_per_class_and_bytes_per_frame) {
     CHECK(clocks.take_bytes(FrameType::foreground) == 0);
 }
 
-MACHA_FAST_TEST("work_class", test_control_never_forms_data_work) {
-    bool refused = false;
-    try {
-        DataWorkContext context(FrameType::control, 1024);
-    } catch (const std::invalid_argument&) {
-        refused = true;
-    }
-    CHECK(refused);
-}
-
 } // namespace

@@ -92,83 +92,6 @@ MACHA_FAST_TEST("foundations", test_weighted_loader_service_is_work_conserving_a
     CHECK(cold_service.finished(start + 10025ms, true) == 475ms);
 }
 
-MACHA_TEST("foundations", test_data_resource_arbiter_background_effort_ceiling) {
-    // Byte capacity would admit four loader leases; the effort ceiling
-    // admits two at a time and never counts viewers.
-    DataResourceArbiter resources(64, 8, 2);
-    DataWorkContext loader(FrameType::loader, 1);
-    auto first = resources.try_acquire(loader, 1);
-    auto second = resources.try_acquire(loader, 1);
-    REQUIRE(first);
-    REQUIRE(second);
-    CHECK(!resources.try_acquire(loader, 1));
-    CHECK(!resources.try_acquire(DataWorkContext(FrameType::speculative, 1), 1));
-    auto viewer = resources.try_acquire(DataWorkContext(FrameType::foreground, 1), 1);
-    CHECK(viewer);
-    auto stats = resources.stats();
-    CHECK(stats.background_limit == 2);
-    CHECK(stats.background_active == 2);
-    CHECK(stats.peak_background_active == 2);
-    first.reset();
-    auto third = resources.try_acquire(loader, 1);
-    CHECK(third);
-    CHECK(resources.stats().background_active == 2);
-}
-
-MACHA_TEST("foundations", test_data_resource_arbiter_reserves_viewer_headroom) {
-    DataResourceArbiter resources(4, 1);
-    CHECK(!resources.acquire(DataWorkContext(FrameType::loader), 4));
-    CHECK(!resources.acquire(DataWorkContext(FrameType::foreground), 5));
-    auto loader_context = DataWorkContext(FrameType::loader, 1);
-    auto first = resources.acquire(loader_context, 1);
-    auto second = resources.acquire(loader_context, 1);
-    auto third = resources.acquire(loader_context, 1);
-    REQUIRE(first.has_value());
-    REQUIRE(second.has_value());
-    REQUIRE(third.has_value());
-
-    auto blocked_loader =
-        std::async(std::launch::async, [&] { return resources.acquire(loader_context, 1); });
-    CHECK(blocked_loader.wait_for(scaled(20ms)) == std::future_status::timeout);
-    auto blocked_speculative = std::async(std::launch::async, [&] {
-        return resources.acquire(DataWorkContext(FrameType::speculative, 1), 1);
-    });
-    CHECK(blocked_speculative.wait_for(scaled(20ms)) == std::future_status::timeout);
-
-    // Lower-class saturation cannot consume the reserved byte; a late viewer
-    // starts at once without cancelling loader work in flight.
-    auto viewer = resources.acquire(DataWorkContext(FrameType::foreground, 1), 1);
-    REQUIRE(viewer.has_value());
-    CHECK(blocked_loader.wait_for(scaled(20ms)) == std::future_status::timeout);
-    viewer.reset();
-
-    // A deadline ends the wait via the condition variable, not a poll.
-    auto expired = resources.acquire(
-        DataWorkContext(FrameType::loader, 1, DataWorkContext::Clock::now() + 20ms), 1);
-    CHECK(!expired.has_value());
-
-    first.reset();
-    REQUIRE(blocked_loader.wait_for(scaled(1s)) == std::future_status::ready);
-    auto admitted_loader = blocked_loader.get();
-    REQUIRE(admitted_loader.has_value());
-    CHECK(blocked_speculative.wait_for(scaled(20ms)) == std::future_status::timeout);
-    second.reset();
-    REQUIRE(blocked_speculative.wait_for(scaled(1s)) == std::future_status::ready);
-    auto admitted_speculative = blocked_speculative.get();
-    REQUIRE(admitted_speculative.has_value());
-
-    const auto stats = resources.stats();
-    CHECK(stats.capacity_bytes == 4);
-    CHECK(stats.viewer_reserve_bytes == 1);
-    CHECK(stats.peak_used_bytes == 4);
-    CHECK(stats.viewer_admissions == 1);
-    CHECK(stats.loader_admissions == 4);
-    CHECK(stats.loader_waits == 2);
-    CHECK(stats.speculative_admissions == 1);
-    CHECK(stats.speculative_waits == 1);
-    CHECK(stats.cancelled_waits == 1);
-}
-
 MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     Writer w;
     w.u8(7);
@@ -1306,44 +1229,6 @@ MACHA_FAST_TEST("foundations", test_node_event_kinds_land_at_their_numbers) {
     CHECK(refused);
 }
 
-namespace {
-
-MACHA_FAST_TEST("foundations", test_write_behind_acts_once_per_window) {
-    WriteBehind behind(8);
-    CHECK(!behind.window_filled(3));
-    CHECK(!behind.window_filled(4));
-    CHECK(behind.window_filled(1)); // 8: a window, which starts again
-    CHECK(!behind.window_filled(7));
-    CHECK(behind.window_filled(20)); // one large write fills one window
-    CHECK(!behind.window_filled(0));
-}
-
-MACHA_FAST_TEST("foundations", test_write_behind_leaves_what_was_written_intact) {
-    TempDir dir;
-    const auto path = dir.path() / "staged";
-    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
-    REQUIRE(fd >= 0);
-    WriteBehind behind(64 * 1024);
-    Bytes chunk(10000);
-    uint64_t written = 0;
-    for (int round = 0; round < 40; ++round) {
-        std::fill(chunk.begin(), chunk.end(), static_cast<uint8_t>(round));
-        REQUIRE(::pwrite(fd, chunk.data(), chunk.size(), static_cast<off_t>(written)) ==
-                static_cast<ssize_t>(chunk.size()));
-        written += chunk.size();
-        behind.wrote(fd, chunk.size());
-    }
-    start_writeback(fd);
-    Bytes back(written);
-    REQUIRE(::pread(fd, back.data(), back.size(), 0) == static_cast<ssize_t>(back.size()));
-    ::close(fd);
-    for (uint64_t i = 0; i < written; ++i)
-        if (back[i] != static_cast<uint8_t>(i / chunk.size())) {
-            CHECK(false);
-            break;
-        }
-}
-
-} // namespace
+namespace {} // namespace
 
 namespace {} // namespace

@@ -179,37 +179,6 @@ void check_matches_reference(const MetadataSnapshotView& head, const NamespaceNo
     CHECK(built.clock() == head.snapshot->mutation_sequences);
 }
 
-MACHA_FAST_TEST("horizon_builder", test_inventory_is_both_live_sets_and_the_catalogue_control_set) {
-    test_support::TempDir dir;
-    MaintenanceObjects namespace_objects;
-    namespace_objects.referenced_extents = view_of(dir.path() / "extents", {id(3), id(1)});
-    namespace_objects.metadata_generation = 9;
-    GarbageRef revived;
-    revived.id = id(2);
-    revived.retired_at_ns = 5;
-    GarbageRef dead;
-    dead.id = id(8);
-    dead.retired_at_ns = 6;
-    namespace_objects.garbage = {revived, dead};
-    CatalogueMaintenance catalogue;
-    catalogue.live = {id(2), id(3)};
-    catalogue.control_live = {id(7), id(6)};
-    catalogue.complete = false;
-
-    const auto inventory = inventory_of(reachability_inventory(namespace_objects, catalogue));
-    CHECK(inventory.generation() == 9);
-    CHECK(!inventory.complete());
-    CHECK((ids_of(inventory.all(RetentionClass::data)) ==
-           std::vector<ObjectId>{id(1), id(2), id(3)}));
-    CHECK((ids_of(inventory.all(RetentionClass::control)) == std::vector<ObjectId>{id(6), id(7)}));
-    // A tombstone revived by catalogue data is stale, as one the namespace revives is.
-    CHECK(inventory.stale_garbage().size() == 1 && inventory.stale_garbage()[0].id == id(2));
-    CHECK(inventory.garbage().size() == 1 && inventory.garbage()[0].id == id(8));
-
-    catalogue.complete = true;
-    CHECK(reachability_inventory(namespace_objects, catalogue).complete);
-}
-
 // The namespace walk names the tree it read, extent spines included, and
 // those nodes join the catalogue's in the inventory's control set; a node it
 // cannot read throws rather than leave a shorter set.

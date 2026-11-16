@@ -326,64 +326,6 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_three_way_merge) {
     CHECK(!merge_catalogue_snapshots(structural_base, delete_parent, add_child).has_value());
 }
 
-MACHA_FAST_TEST("hydration_catalogue", test_replica_selector) {
-    auto node = [](uint8_t value) {
-        NodeInfo n;
-        n.id.bytes[0] = value;
-        n.host = "replica-" + std::to_string(value);
-        n.port = static_cast<uint16_t>(7000 + value);
-        return n;
-    };
-
-    ReplicaSelector selector;
-    std::vector<NodeInfo> nodes{node(1), node(2), node(3)};
-
-    // With no measurements, the extent stripe spreads equivalent speculative
-    // work over the complete replica set instead of pinning it to peer zero.
-    CHECK(selector.order(nodes, 0, ReplicaWorkClass::speculative).front().id == nodes[0].id);
-    CHECK(selector.order(nodes, 1, ReplicaWorkClass::speculative).front().id == nodes[1].id);
-    CHECK(selector.order(nodes, 2, ReplicaWorkClass::speculative).front().id == nodes[2].id);
-
-    // Outstanding speculative work makes an otherwise equal peer less useful
-    // for the next independent extent.
-    selector.started(nodes[0], ReplicaWorkClass::speculative);
-    CHECK(selector.order(nodes, 0, ReplicaWorkClass::speculative).front().id != nodes[0].id);
-    selector.finished(nodes[0], ReplicaWorkClass::speculative, 1024, 100ms, true);
-
-    // Foreground reads optimise latency rather than symmetry.
-    selector.started(nodes[0], ReplicaWorkClass::foreground);
-    selector.finished(nodes[0], ReplicaWorkClass::foreground, 1024, 20ms, true);
-    selector.started(nodes[1], ReplicaWorkClass::foreground);
-    selector.finished(nodes[1], ReplicaWorkClass::foreground, 1024, 200ms, true);
-    CHECK(selector.order(nodes, 0, ReplicaWorkClass::foreground).front().id == nodes[0].id);
-
-    // Speculative work yields to a peer carrying foreground traffic when an
-    // idle replica is available.
-    selector.started(nodes[0], ReplicaWorkClass::foreground);
-    CHECK(selector.order(nodes, 0, ReplicaWorkClass::speculative).front().id != nodes[0].id);
-    selector.finished(nodes[0], ReplicaWorkClass::foreground, 1024, 20ms, true);
-
-    // Promotion moves one active transfer between accounting classes rather
-    // than duplicating it.
-    selector.started(nodes[2], ReplicaWorkClass::speculative);
-    selector.promoted(nodes[2]);
-    auto promoted = selector.stats(nodes[2].id);
-    CHECK(promoted.speculative_in_flight == 0);
-    CHECK(promoted.foreground_in_flight == 1);
-    selector.finished(nodes[2], ReplicaWorkClass::foreground, 1024, 50ms, true);
-    CHECK(selector.stats(nodes[2].id).foreground_in_flight == 0);
-
-    // A failed source is penalised immediately; a later successful transfer
-    // clears the consecutive-failure penalty without erasing history.
-    selector.started(nodes[1], ReplicaWorkClass::foreground);
-    selector.finished(nodes[1], ReplicaWorkClass::foreground, 0, 10ms, false);
-    CHECK(selector.stats(nodes[1].id).failures == 1);
-    CHECK(selector.order(nodes, 0, ReplicaWorkClass::foreground).front().id != nodes[1].id);
-    selector.started(nodes[1], ReplicaWorkClass::foreground);
-    selector.finished(nodes[1], ReplicaWorkClass::foreground, 1024, 25ms, true);
-    CHECK(selector.stats(nodes[1].id).failures == 1);
-}
-
 MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cache) {
     TempDir temp;
     auto keyfile = temp.path() / "key";

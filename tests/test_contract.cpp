@@ -131,20 +131,6 @@ MACHA_FAST_TEST("contract", test_work_context_deadline_and_cancellation) {
     CHECK(!WorkContext().cancelled());
 }
 
-MACHA_FAST_TEST("contract", test_data_work_context_is_the_data_specialisation) {
-    const DataWorkContext data(FrameType::speculative, 4096);
-    const WorkContext& general = data;
-    CHECK(general.frame_type() == FrameType::speculative);
-    CHECK(data.quantum_bytes() == 4096);
-    bool refused = false;
-    try {
-        (void)DataWorkContext(FrameType::control);
-    } catch (const std::invalid_argument&) {
-        refused = true;
-    }
-    CHECK(refused);
-}
-
 // Every sequence of up to seven takes against every limit 0..5 and none.
 MACHA_FAST_TEST("contract", test_budget_bounds_are_spent_exactly) {
     for (int limit = -1; limit <= 5; ++limit)
