@@ -77,7 +77,7 @@ Macha's to touch, we wait for Dagda's redesign):
    (`maintenance.cpp:362`). Later, by Dagda's word: `5f3c458` (instant delete keeps a copy with no inventory; Macha
    never calls `Objects::remove`) and `d2872de` (repair stage 3, the offer: 1131 ran, 1128 passed, 3 skipped). The
    offer binds nothing in Macha's tree: Macha builds no `StorageServer` (Dagda's node must pass `offers`; asked to
-   confirm), and `Repair::transfer` debits the offer bytes itself. Status shows `bytes_transferred` without
+   confirmed by Dagda: `dagda::Node` builds its server with `&_store->offers()`, `d2872de`), and `Repair::transfer` debits the offer bytes itself. Status shows `bytes_transferred` without
    `offer_bytes`; left until stage 4's shape.
 5. The first suite run on a Pi; fix forward. It runs on Dagda's current repair, which has the live defect below, so
    the comparison with 0.94.2 stays like for like.
