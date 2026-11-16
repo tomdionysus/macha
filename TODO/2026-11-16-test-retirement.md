@@ -6,11 +6,13 @@ case retires only against a named library case, recorded case by case). Every na
 in `../dagda/dagda/test/` at `feature/macha-store-gaps` (1013 cases) before removal. The case bodies are in git history
 before the commit that removes them.
 
-Kept for want of a Dagda case (asked of Dagda 2026-11-16): `test_claim_walk.cpp`
-`test_a_delete_mark_lasts_until_the_last_delete_of_the_id_ends` and `test_storage_v18.cpp`
-`test_a_store_tells_a_bad_record_from_a_failed_read`, both newer than the mapping.
+Two cases newer than the mapping were named by Dagda on request (2026-11-16, its `156fea2`) and retired after it:
+`test_claim_walk.cpp` `test_a_delete_mark_lasts_until_the_last_delete_of_the_id_ends` against
+`StoreClaimLocks.ADeleteMarksItsObjectAndHoldsNoStripe` (both orders of two deletes of one id), and
+`test_storage_v18.cpp` `test_a_store_tells_a_bad_record_from_a_failed_read` against
+`StoreLocalStore.AStoreTellsABadRecordFromAFailedRead`.
 
-161 cases.
+163 cases.
 
 ## test_absent_nodes.cpp
 

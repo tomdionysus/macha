@@ -109,9 +109,6 @@ class NodeServices {
     // while a mount is published, the frontend's.
     std::map<std::string, uint64_t> observation_gauges();
 
-    DistributedStore& store() {
-        return store_;
-    }
     MetadataManager& metadata() {
         return metadata_;
     }
@@ -188,7 +185,6 @@ class NodeServices {
     bool stopped_{};
 
     PlaybackTracker playback_;
-    DistributedStore store_;
     MetadataManager metadata_;
     RetentionLedger ledger_;
     UnreferencedSince data_unreferenced_;

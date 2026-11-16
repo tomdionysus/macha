@@ -705,8 +705,8 @@ class TestNode {
                                              }});
             filesystem_ = std::make_unique<FileSystem>(
                 node_->config(), node_->node_id(), node_->membership(), node_->local_state(),
-                node_->metadata_server(), *store_, node_->store_context(),
-                node_->store_node().references(), *metadata_, node_->resources.memory);
+                node_->metadata_server(), node_->store_context(), node_->store_node().references(),
+                *metadata_, node_->resources.memory);
         }
         return *node_;
     }

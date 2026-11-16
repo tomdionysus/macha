@@ -538,7 +538,7 @@ struct ParkedPublication {
 };
 
 // Bounded local frontend for the kernel-facing filesystem. FUSE callbacks enter
-// here, never MetadataManager/DistributedStore directly; distributed namespace
+// here, never MetadataManager or the store directly; distributed namespace
 // and data publication queue behind the local inode/namespace state.
 //
 // FUSE traffic is loader traffic: mount reads use FrameType::loader and never

@@ -621,7 +621,6 @@ if(MACHA_BUILD_TESTS)
         tests/test_work_class.cpp
         tests/test_catalogue_maintenance.cpp
         tests/test_namespace_entries.cpp
-        tests/test_claim_walk.cpp
         tests/test_root_parts.cpp
         tests/test_service_root.cpp
         tests/test_node_services.cpp)

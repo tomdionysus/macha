@@ -39,8 +39,12 @@ class WritesOnStopSubsystem final : public macha::Subsystem {
         for (auto& byte : bytes)
             byte = static_cast<uint8_t>(random());
         try {
-            (void)filesystem_->store().put(bytes, macha::FrameType::loader);
-            record("ok");
+            dagda::store::WriteOptions options;
+            options.ack_level = dagda::store::Durability::persisted;
+            options.frame = macha::FrameType::loader;
+            const auto evidence = filesystem_->context().objects().write(macha::object_id(bytes),
+                                                                         bytes, std::move(options));
+            record(evidence.holders() > 0 && !evidence.cancelled ? "ok" : "failed: landed nowhere");
         } catch (const std::exception& error) {
             record(std::string("failed: ") + error.what());
         }

@@ -4365,7 +4365,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // plane owner has already decoded it locally. Repeated getattr therefore
     // leaves MetadataManager's available generation unchanged.
     FileSystem fs2(n2.config(), n2.node_id(), n2.membership(), n2.local_state(),
-                   n2.metadata_server(), store2, n2.store_context(), n2.store_node().references(),
+                   n2.metadata_server(), n2.store_context(), n2.store_node().references(),
                    metadata2, n2.resources.memory);
     FuseConfig fuse_config;
     fuse_config.commit_workers = 1;
