@@ -211,22 +211,6 @@ AvailabilitySnapshot decode_availability_paths(std::span<const uint8_t> bytes) {
     return snapshot;
 }
 
-namespace {
-
-// The store node's survey in Macha's terms.
-AvailabilitySurvey survey_of(const dagda::ledger::AvailabilitySurvey& from) {
-    AvailabilitySurvey out;
-    out.unavailable = from.unavailable;
-    out.unknown = from.unknown;
-    out.peers_asked = from.peers_asked;
-    out.peers_failed = from.peers_failed;
-    out.rounds = from.rounds;
-    out.nodes_asked = from.nodes_asked;
-    return out;
-}
-
-} // namespace
-
 AvailabilityService::AvailabilityService(dagda::Context& store,
                                          const dagda::contract::ObjectLedger& ledger,
                                          std::filesystem::path persisted)
@@ -263,7 +247,7 @@ bool AvailabilityService::refresh(
     AvailabilitySnapshot next;
     next.generation = head.generation;
     next.surveyed_unix_ms = survey->surveyed_unix_ms;
-    next.survey = survey_of(survey->survey);
+    next.survey = survey->survey;
     // With this node's holdings and the survey's answer unchanged, no
     // unchanged file's facts can differ: the table follows the tree.
     const bool same_answer = previous && previous->survey.unavailable == next.survey.unavailable &&

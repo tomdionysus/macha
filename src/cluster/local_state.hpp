@@ -21,14 +21,7 @@
 
 namespace macha {
 
-class ControlObjectFetch;
-class LocalStore;
 class MetadataReplica;
-class ClusterNode;
-class PersistentBlockCache;
-class RetentionStore;
-class ReferenceCounts;
-class StoragePool;
 
 // How far this node's local state has recovered: plane by plane, the first
 // failure, and completion once local state and the parts built from it
@@ -103,46 +96,22 @@ struct RecoveryCancelled : std::runtime_error {
     RecoveryCancelled() : std::runtime_error("local state recovery cancelled") {}
 };
 
-// This node's local stores, recovered by construction: the DATA pool, and
-// alongside it the control store, persistent cache, retention claims and the
-// metadata replica (which keeps its records in the cache). Construction
-// returns once both halves have recovered, marking each plane in `progress`
-// as it completes. It throws RecoveryCancelled when `stop` is requested
-// between stages, and otherwise, after recording the failure in `progress`,
-// the first failure of either half.
+// This node's own metadata state, recovered by construction: the metadata
+// replica and its sealed seed (the store's parts are the store node's).
+// Construction marks the metadata plane in `progress`. It throws
+// RecoveryCancelled when `stop` is requested before it starts, and otherwise,
+// after recording the failure in `progress`, the failure.
 class LocalState {
   public:
     using StageHook = std::function<void(std::string_view)>;
-    // `durability_batch_window` is how long a DATA commit that asks for
-    // durability waits so that others share its physical sync: latency for
-    // fewer syncs.
     // `apply_namespace`: how metadata replay brings a namespace tree to a
     // delta, writing its nodes where the owner keeps them.
-    LocalState(const Config&, const NodeIdentity&, ClusterNode&,
-               NamespaceDeltaApplier apply_namespace, RecoveryProgress&, const StageHook&,
-               std::stop_token, std::chrono::milliseconds durability_batch_window);
+    LocalState(const Config&, const NodeIdentity&, NamespaceDeltaApplier apply_namespace,
+               RecoveryProgress&, const StageHook&, const std::stop_token&);
     ~LocalState();
     LocalState(const LocalState&) = delete;
     LocalState& operator=(const LocalState&) = delete;
 
-    StoragePool& data() noexcept {
-        return *data_;
-    }
-    LocalStore& control() noexcept {
-        return *control_;
-    }
-    ControlObjectFetch& control_fetch() noexcept {
-        return *control_fetch_;
-    }
-    PersistentBlockCache& cache() noexcept {
-        return *cache_;
-    }
-    RetentionStore& retention() noexcept {
-        return *retention_;
-    }
-    ReferenceCounts& references() noexcept {
-        return *references_;
-    }
     MetadataSeed& seed() noexcept {
         return *seed_;
     }
@@ -150,23 +119,7 @@ class LocalState {
         return *replica_;
     }
 
-    // Applies a live reload's storage backends and cache settings.
-    void reconfigure(const Config&);
-
   private:
-    void recover_data(const Config&, const NodeIdentity&, RecoveryProgress&, const StageHook&,
-                      const std::stop_token&, std::chrono::milliseconds durability_batch_window);
-    void recover_state(const Config&, const NodeIdentity&, ClusterNode&,
-                       NamespaceDeltaApplier apply_namespace, RecoveryProgress&, const StageHook&,
-                       const std::stop_token&);
-
-    // The replica is declared after the cache it reads, so destroyed first.
-    std::unique_ptr<StoragePool> data_;
-    std::unique_ptr<LocalStore> control_;
-    std::unique_ptr<ControlObjectFetch> control_fetch_;
-    std::unique_ptr<PersistentBlockCache> cache_;
-    std::unique_ptr<RetentionStore> retention_;
-    std::unique_ptr<ReferenceCounts> references_;
     std::unique_ptr<MetadataSeed> seed_;
     std::unique_ptr<MetadataReplica> replica_;
 };

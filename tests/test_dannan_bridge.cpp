@@ -7,6 +7,8 @@
 #include "test_framework.hpp"
 #include "test_support.hpp"
 
+#include <dagda/store/placement.h>
+
 #include <dannan/identity/cluster_key.h>
 #include <dannan/membership/node_record.h>
 #include <dannan/net/routes.h>
@@ -161,8 +163,11 @@ MACHA_TEST("dannan_bridge", test_a_node_record_reads_as_node_info) {
     REQUIRE(node_inbound_capable(bare));
     REQUIRE(!node_hosts_extents(bare));
 
-    record.adverts[advert::capacity] = dannan::membership::u64_advert(9895604649984ULL);
-    record.adverts[advert::used] = dannan::membership::u64_advert(1835376108947ULL);
+    record.adverts[dagda::store::capacity_advert] =
+        dannan::membership::u64_advert(9895604649984ULL);
+    dagda::store::StoreFigures figures;
+    figures.used = 1835376108947ULL;
+    record.adverts[dagda::store::figures_advert] = dagda::store::encode_figures(figures);
     record.adverts[advert::metadata_generation] = dannan::membership::u64_advert(168518);
     record.adverts[advert::metadata_write_replicas] = dannan::membership::u64_advert(1);
     record.adverts[advert::hosts_extents] = dannan::membership::u64_advert(1);
@@ -176,7 +181,7 @@ MACHA_TEST("dannan_bridge", test_a_node_record_reads_as_node_info) {
     REQUIRE(node_hosts_extents(full));
 
     // An advert of another width is absent.
-    record.adverts[advert::capacity] = {1, 2, 3};
+    record.adverts[dagda::store::capacity_advert] = {1, 2, 3};
     REQUIRE(node_info_from(record).capacity == 0);
 }
 

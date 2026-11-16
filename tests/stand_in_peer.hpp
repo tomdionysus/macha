@@ -11,6 +11,8 @@
 #include "cluster/telemetry_bridge.hpp"
 #include "test_support.hpp"
 
+#include <dagda/store/placement.h>
+
 #include <dannan/identity/cluster_key.h>
 
 #include <fstream>
@@ -80,11 +82,13 @@ class StandInPeer {
         host_->stop();
     }
 
-    // Its storage figures, as Macha's adverts carry them.
+    // Its storage figures, as the store node's server advertises them.
     void advertise_storage(uint64_t capacity, uint64_t used) {
         auto& nodes = host_->node().nodes();
-        nodes.advertise(advert::capacity, dannan::membership::u64_advert(capacity));
-        nodes.advertise(advert::used, dannan::membership::u64_advert(used));
+        nodes.advertise(dagda::store::capacity_advert, dannan::membership::u64_advert(capacity));
+        dagda::store::StoreFigures figures;
+        figures.used = used;
+        nodes.advertise(dagda::store::figures_advert, dagda::store::encode_figures(figures));
     }
     // Any of Macha's u64 adverts (dannan_bridge.hpp's advert names).
     void advertise(const std::string& key, uint64_t value) {

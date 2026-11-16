@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-16 about 02:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-16 about 03:30Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-15-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
 `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
@@ -28,12 +28,20 @@ Dannan 0.9.0; ack levels are the stack standard (`persisted` = the disk that too
   parts), `bfd13ec` (artwork read bounded, 503; two more retired). 165 cases retired, case by case, in
   `2026-11-16-test-retirement.md`; what was on Macha's store parts is listed in `2026-11-16-store-test-rewrites.md`.
   All compile green on build-3. No suite has run.
-- **Waiting on Dagda's gate** (it named cases at `3ca592a`, not yet run, every Pi busy): retire
-  `test_the_repair_step_that_first_sees_a_new_pull_list_walks_it` (StoreRepair.TheStepThatFirstSeesANewListWalksIt),
-  `test_a_pull_list_new_while_the_push_runs_is_not_passed_over` (StoreRepair.APullListNewWhileThePushRunsIsNotPassedOver,
-  new; a failure is a real Dagda gap) and `test_a_failed_read_keeps_the_object_and_a_bad_record_is_removed`
-  (StoreStoragePool.AReadErrorKeepsTheObject). Those three are the last tests on Macha's store classes (`StoreBench`,
-  `StoragePool`); once they go, `StoreBench` and Macha's store code can go.
+- **Since:** `cb13e34` (availability on Dagda's survey; the pass clock reaches the node), `dfedd6a` (reload and
+  hosting through the store node), `0a777a7` (the last store cases retired, 171 in all; `StoreBench` gone).
+- **Then, committed:** steps 3 and 4. `LocalState` keeps only the metadata
+  seed and replica; `LocalServices` loses the storage server; `node_info_from`, telemetry and `data_storage_degraded`
+  read Dagda's adverts (`dagda/capacity`, `store::figures_of`); `advertise_storage`, `advertise_storage_backends`,
+  `advertise_cache` and the `macha/capacity`, `macha/used` adverts go; deleted: `DistributedStore`, `StorageServer`,
+  `ControlObjectFetch`, `claim_walk`, `RetentionLedger`, `UnreferencedSince`, `StoragePool`, `PersistentBlockCache`,
+  Macha's `ledger/availability` (the survey types alias `dagda::ledger`'s). Pinned to Dannan 0.8.4 (released with the
+  stop-aware wait; 0.8.5 since, with a stop hang fixed, for the deploy's deps): prefix `prefix-0.8.4`,
+  `build/pi/deps_dannan_084.sh`. Still compiled and to go next: `LocalStore` and what it stands on
+  (`presence_index`, `durability_domain`, `held_ledger`, `sealed_journal`, the tries, `retention`,
+  `reference_counts`) and Macha's contract twins (`object_store`, `object_ledger`, `claim_store`, `horizon`,
+  `horizon_builder`); `tools/metadata_history_dump.cpp` reads a control store through `LocalStore` and moves to
+  Dagda's with them.
 - **Builds:** build-3 `/home/maintainer/macha-store-2` (the current tree; `/home/maintainer/macha-store` holds an older copy),
   `build/pi/macha_port_compile.sh` with `S` and `R` set, against `prefix-dannan-083-stop` and `prefix-dagda-6bfb5b2`.
   Dagda has since gated `6adc5ed` (2026-11-15: synchronous ticket waits on the caller's thread, placement ranked once,

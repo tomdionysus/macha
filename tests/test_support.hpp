@@ -3,14 +3,12 @@
 
 #include "catalogue/catalogue.hpp"
 #include "cluster/call_deadline.hpp"
-#include "cluster/distributed_store.hpp"
 #include "cluster/store_node.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
 #include "errno_text.hpp"
 #include "filesystem/filesystem.hpp"
 #include "fuse/fuse_frontend.hpp"
-#include "ledger/retention_ledger.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "metadata/namespace_tree.hpp"
@@ -466,9 +464,9 @@ class BareNode : public BareNodeResources, public NodeRuntime {
                     follow_hosts_extents([server = &store_node_->server()](bool hosts) {
                         server->set_hosts_extents(hosts);
                     });
-                    local_ = std::make_unique<LocalServices>(
-                        config(), identity(), progress, stage_hook, stop, *this,
-                        store_node_->context(), resources, routes, durability_batch_window_);
+                    local_ = std::make_unique<LocalServices>(config(), identity(), progress,
+                                                             stage_hook, stop, *this,
+                                                             store_node_->context(), routes);
                 } catch (const std::exception&) {
                     // Cancelled, or recorded in `progress`.
                     return;

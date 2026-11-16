@@ -4,7 +4,6 @@
 #include "catalogue/catalogue.hpp"
 #include "catalogue/media_information.hpp"
 #include "cluster/cluster.hpp"
-#include "cluster/distributed_store.hpp"
 #include "cluster/node_events.hpp"
 #include "contract/horizon.hpp"
 #include "contract/horizon_builder.hpp"
@@ -16,7 +15,6 @@
 #include "service/availability_service.hpp"
 #include "service/convergence_demand.hpp"
 #include "service/maintenance_clock.hpp"
-#include "storage/unreferenced_since.hpp"
 
 #include <atomic>
 #include <condition_variable>

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "cluster/distributed_store.hpp"
 #include "contract/object_ledger.hpp"
 #include "contract/thread_safety.hpp"
 #include "dagda/context.h"
@@ -9,7 +8,6 @@
 #include "media/media_engine.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/metadata_server.hpp"
-#include "storage/unreferenced_since.hpp"
 
 #include <array>
 #include <condition_variable>

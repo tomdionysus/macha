@@ -90,10 +90,6 @@ class FakeClusterNode final : public ClusterNode {
     std::optional<std::chrono::milliseconds> peer_latency(const NodeId&) const override {
         return std::nullopt;
     }
-    void advertise_storage(uint64_t used, uint64_t capacity) override {
-        members_.storage(used, capacity);
-    }
-
     RpcReply call(const NodeInfo& peer, MessageType type, std::span<const uint8_t> payload,
                   FrameType frame_type, std::chrono::milliseconds) override {
         auto handler = place(peer, type, payload, frame_type);

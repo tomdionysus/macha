@@ -156,8 +156,9 @@ find_package(CURL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(yaml-cpp QUIET)
 # The cluster's transport and node: Dannan 0.8, any patch from the one reviewed
-# (a patch keeps the minor's ABI; a minor is a new API).
-find_package(dannan 0.8.0 CONFIG REQUIRED)
+# (a patch keeps the minor's ABI; a minor is a new API). 0.8.4 has the stop-aware
+# NodeEvents wait every Macha consumer uses.
+find_package(dannan 0.8.4 CONFIG REQUIRED)
 # The store: Dagda, the exact release, built on the same Dannan.
 find_package(dagda 0.2.0 CONFIG REQUIRED)
 
@@ -274,7 +275,6 @@ set(MACHA_CORE_SOURCES
     src/contract/horizon.cpp
     src/contract/gates.cpp
     src/ledger/macha_reachability.cpp
-    src/ledger/availability.cpp
     src/observation.cpp
     src/durable_file.cpp
     src/write_behind.cpp
@@ -285,7 +285,6 @@ set(MACHA_CORE_SOURCES
     src/storage/durability_domain.cpp
     src/storage/presence_index.cpp
     src/storage/local_store.cpp
-    src/storage/storage_pool.cpp
     src/storage/retention.cpp
     src/storage/sealed_journal.cpp
     src/ledger/object_trie.cpp
@@ -293,17 +292,12 @@ set(MACHA_CORE_SOURCES
     src/ledger/trie_union.cpp
     src/ledger/held_ledger.cpp
     src/ledger/reference_counts.cpp
-    src/storage/unreferenced_since.cpp
-    src/ledger/retention_ledger.cpp
-    src/storage/persistent_cache.cpp
     src/cluster/telemetry.cpp
     src/cluster/transcode_rates.cpp
     src/cluster/activity_clocks.cpp
     src/cluster/node_resources.cpp
     src/retained_memory.cpp
     src/cluster/node_identity.cpp
-    src/cluster/storage_server.cpp
-    src/cluster/control_objects.cpp
     src/cluster/local_state.cpp
     src/cluster/local_services.cpp
     src/cluster/placement.cpp
@@ -315,7 +309,6 @@ set(MACHA_CORE_SOURCES
     src/cluster/store_node.cpp
     src/cluster/telemetry_bridge.cpp
     src/cluster/cluster.cpp
-    src/cluster/distributed_store.cpp
     src/cluster/replica_selector.cpp
     src/metadata/metadata.cpp
     src/metadata/metadata_merge.cpp
@@ -368,7 +361,6 @@ set(MACHA_CORE_SOURCES
     src/torrent/torrent_common.cpp
     src/torrent/torrent_request.cpp
     src/service/maintenance_clock.cpp
-    src/service/claim_walk.cpp
     src/service/availability_service.cpp
     src/service/maintenance.cpp
     src/service/service.cpp

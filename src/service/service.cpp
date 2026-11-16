@@ -534,9 +534,9 @@ void Service::initialise_services(const std::stop_token& stop) {
             node_.follow_hosts_extents([server = &store_node_->server()](bool hosts) {
                 server->set_hosts_extents(hosts);
             });
-            local_ = std::make_unique<LocalServices>(
-                node_.config(), node_.identity(), progress_, recovery_stage_hook_, stop, node_,
-                store_node_->context(), resources_, routes_, durability_batch_window_);
+            local_ = std::make_unique<LocalServices>(node_.config(), node_.identity(), progress_,
+                                                     recovery_stage_hook_, stop, node_,
+                                                     store_node_->context(), routes_);
         } catch (const RecoveryCancelled&) {
             return;
         }

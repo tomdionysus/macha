@@ -48,8 +48,9 @@ class FilesystemNode {
     RetainedMemoryLedger& memory() {
         return node_.resources().memory;
     }
-    LocalState& local() {
-        return node_.node().local_state();
+    // The store node's own parts.
+    dagda::Node& store() {
+        return node_.node().store_node();
     }
     const Config& config() {
         return node_.config();
@@ -969,7 +970,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
         REQUIRE(!entry.extents.empty());
         for (const auto& stored : entry.extents)
             if (!stored.hole)
-                CHECK(node.local().cache().has(stored.id));
+                CHECK(node.store().cache().has(stored.id));
         frontend->stop();
     }
 
@@ -1064,8 +1065,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
 
             // erase_all() refuses to remove a retained live object, so remove
             // the local and cached copies to model its loss.
-            REQUIRE(node.local().data().remove(entry.extents.front().id));
-            (void)node.local().cache().remove(entry.extents.front().id);
+            REQUIRE(node.store().data().remove(entry.extents.front().id));
+            (void)node.store().cache().remove(entry.extents.front().id);
             Bytes second(4096);
             REQUIRE(frontend->read(handle, 8192, second) == second.size());
             CHECK(std::equal(second.begin(), second.end(), bytes.begin() + 8192));

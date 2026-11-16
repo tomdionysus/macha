@@ -5,11 +5,11 @@
 #include "contract/published.hpp"
 #include "contract/thread_safety.hpp"
 #include "contract/work.hpp"
-#include "ledger/availability.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "types.hpp"
 
 #include "dagda/contract/object_ledger.h"
+#include "dagda/ledger/availability.h"
 #include "dagda/store/availability.h"
 
 #include <chrono>
@@ -25,6 +25,11 @@ class Context;
 }
 
 namespace macha {
+
+// What the reachable nodes hold between them, and whether this node holds a
+// DATA extent: Dagda's.
+using AvailabilitySurvey = dagda::ledger::AvailabilitySurvey;
+using HeldFn = dagda::ledger::HeldFn;
 
 // What is known of one path's extents. A directory sums what is beneath it.
 struct PathAvailability {

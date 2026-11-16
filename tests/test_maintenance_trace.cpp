@@ -168,19 +168,19 @@ class TracedNode {
     // namespace tree), and for each named object whether it is held and
     // claimed.
     std::vector<std::string> state() {
-        auto& local = service_->local_state();
+        auto& store = service_->store_node();
         size_t control_claims = 0;
-        for (const auto& id : local.retention().retained_ids(RetentionClass::control))
-            if (!namespace_node(local.control().get(id)))
+        for (const auto& id : store.claims().retained_ids(RetentionClass::control))
+            if (!namespace_node(store.control().get(id)))
                 ++control_claims;
         std::vector<std::string> lines{
-            "state: data_objects=" + std::to_string(local.data().list().size()) + " data_claims=" +
-            std::to_string(local.retention().retained_ids(RetentionClass::data).size()) +
+            "state: data_objects=" + std::to_string(store.data().list().size()) + " data_claims=" +
+            std::to_string(store.claims().retained_ids(RetentionClass::data).size()) +
             " control_claims=" + std::to_string(control_claims)};
         for (const auto& [name, id] : watched_)
             lines.push_back(
-                "object " + name + ": held=" + (local.data().has(id) ? "1" : "0") +
-                " claimed=" + (local.retention().retained(RetentionClass::data, id) ? "1" : "0"));
+                "object " + name + ": held=" + (store.data().has(id) ? "1" : "0") +
+                " claimed=" + (store.claims().retained(RetentionClass::data, id) ? "1" : "0"));
         return lines;
     }
 
