@@ -12,7 +12,7 @@ Two cases newer than the mapping were named by Dagda on request (2026-11-16, its
 `test_storage_v18.cpp` `test_a_store_tells_a_bad_record_from_a_failed_read` against
 `StoreLocalStore.AStoreTellsABadRecordFromAFailedRead`.
 
-165 cases.
+171 cases.
 
 ## test_absent_nodes.cpp
 
@@ -271,3 +271,14 @@ Two cases newer than the mapping were named by Dagda on request (2026-11-16, its
 |---|---|---|
 | test_rpc_cluster.cpp | test_store_control_objects_take_no_data_credit | DistributedStore.ALocalControlObjectIsFoundWithoutAskingAnyone (the same credit, a loader's extent and every DATA slot held; a superset) |
 | test_storage_metadata.cpp | test_storage_pool_and_persistent_cache (the mapping's GAP-HEADS:H25; its body is the pool and the cache) | StoreStoragePool.PoolsSpreadTraverseSweepAndRebalance (the pool half), StorePersistentCache.TheCacheEvictsTheLeastRecentlyUsedAndReopens (the cache half), HeadsSeed.TheSeedSurvivesReopenAndFollowsTheCache (the remembered metadata), and Dannan's NodeIdentity.TheNodeIdIsCreatedOnceAndKept (the node id kept) |
+
+## Named by Dagda on request and gated (2026-11-16, its `ab76b43`: 1117 ran, 1114 passed, 3 skipped)
+
+| file | case | Dagda case |
+|---|---|---|
+| test_rpc_cluster.cpp | test_the_repair_step_that_first_sees_a_new_pull_list_walks_it | StoreRepair.TheStepThatFirstSeesANewListWalksIt (with pull_examined) |
+| test_rpc_cluster.cpp | test_a_pull_list_new_while_the_push_runs_is_not_passed_over | StoreRepair.APullListNewWhileThePushRunsIsNotPassedOver (the same shape: a push that sends nothing) |
+| test_invariants.cpp | test_a_failed_read_keeps_the_object_and_a_bad_record_is_removed | StoreStoragePool.AReadErrorKeepsTheObject (with the scrub half; a directory in the file's place stands for the failing device) |
+| test_availability.cpp | test_a_stop_during_the_diff_is_not_a_failed_peer | StoreRepair.AStopDuringTheDiffIsNotAFailedPeer |
+| test_availability.cpp | test_what_is_not_held_pauses_over_the_ids_beside_the_view | LedgerAvailability.WhatIsNotHeldPausesOverTheIdsBesideTheView |
+| test_availability.cpp | test_a_failed_diff_is_asked_again_on_a_timer | StoreRepair.AFailedDiffIsAskedAgainOnATimer |
