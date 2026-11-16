@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-16 about 00:20Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-16 about 02:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-15-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
 `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
@@ -21,19 +21,28 @@ Dannan 0.9.0; ack levels are the stack standard (`persisted` = the disk that too
   `maintenance.collect_garbage` default false), R4 (the catalogue on Context; a store failure is `CatalogueUnavailable`),
   R5 (torrent admission and I/O through `Context::devices()`, ingest blocking on `FsStorageUnavailable` only), all on
   Dagda `6bfb5b2` with `ack_level`. Compiled green on build-3 (`/home/maintainer/macha-store-2`, `build/pi/macha_port_compile.sh`).
-- **Committed, not pushed:** `62f63f2`, R6 step 1 (Status and the observation gauges read the store node; new key
-  `data_resources.available` to announce). And after `c176854`: `NodeEvents` becomes Dannan's (R1's leftover and catalogue row 31), on
-  Dannan 0.8.3 with develop's `fbcbb90` applied (`NodeEvents::wait_for_change` with a stop token, added at Macha's
-  ask, offered for 0.8.4, the maintainer's call; develop is 0.9.0; prefix `prefix-dannan-083-stop`,
-  `build/pi/deps_dannan_083_stop.sh`). Detail in the plan under R4. Compiled green on build-3.
+- **Committed, not pushed (origin at `25a37d3`):** `c176854` (R3 to R5), `ce205f1` (NodeEvents is Dannan's, on Dannan
+  0.8.3 with `fbcbb90` patched in; prefix `prefix-dannan-083-stop`, `build/pi/deps_dannan_083_stop.sh`; Dannan is
+  gating 0.8.4, move onto the tag when it lands), `62f63f2` (Status reads the store node), `e8c8794` (161 store cases
+  retired), `14d34b6` (Macha's DistributedStore out of production), `b0e2c61` (the tests read the store node's
+  parts), `bfd13ec` (artwork read bounded, 503; two more retired). 165 cases retired, case by case, in
+  `2026-11-16-test-retirement.md`; what was on Macha's store parts is listed in `2026-11-16-store-test-rewrites.md`.
+  All compile green on build-3. No suite has run.
+- **Waiting on Dagda's gate** (it named cases at `3ca592a`, not yet run, every Pi busy): retire
+  `test_the_repair_step_that_first_sees_a_new_pull_list_walks_it` (StoreRepair.TheStepThatFirstSeesANewListWalksIt),
+  `test_a_pull_list_new_while_the_push_runs_is_not_passed_over` (StoreRepair.APullListNewWhileThePushRunsIsNotPassedOver,
+  new; a failure is a real Dagda gap) and `test_a_failed_read_keeps_the_object_and_a_bad_record_is_removed`
+  (StoreStoragePool.AReadErrorKeepsTheObject). Those three are the last tests on Macha's store classes (`StoreBench`,
+  `StoragePool`); once they go, `StoreBench` and Macha's store code can go.
 - **Builds:** build-3 `/home/maintainer/macha-store-2` (the current tree; `/home/maintainer/macha-store` holds an older copy),
   `build/pi/macha_port_compile.sh` with `S` and `R` set, against `prefix-dannan-083-stop` and `prefix-dagda-6bfb5b2`.
   Dagda has since gated `6adc5ed` (2026-11-15: synchronous ticket waits on the caller's thread, placement ranked once,
   the barrier's log lines; API unchanged): move the prefix to it at the next rebuild. Deploy deps from Dannan's newest 0.8 patch (0.8.3, or 0.8.4 if the maintainer cuts one with the stop-aware wait) and Dagda's tag.
-- **Next:** the plan's "R6 and R7, the order", from step 2 (Macha's `DistributedStore` out of production). Step 2 cannot
-  compile alone: `Service::store()`, `FileSystem::store()` and the bench fixtures feed about 90 test sites in
-  `test_rpc_cluster.cpp` and `test_storage_v18.cpp`, whose subject is Macha's store, so it lands with step 7's test
-  retirement for those files (each case against the Dagda case the mapping names). Then R6 (adverts from `dagda/capacity` and `store::figures_of`, telemetry and Status from Dagda's figures,
+- **Next:** the plan's "R6 and R7, the order": steps 1 and 2 are in, and step 6's artwork deadline. Then steps 3 and
+  4 together, after the three retirements above: Macha's store code and `StoreBench` go, `StorageServer` and
+  `LocalState`'s store parts go, adverts and telemetry from Dagda's figures. Then step 5 (availability on Dagda's
+  survey), the trace clock (Macha's `MaintenanceClock` as Dannan's `TimeSource`/`WallClock` into
+  `MaintenanceOptions`, with the trace tests' rewrite). Then R6 (adverts from `dagda/capacity` and `store::figures_of`, telemetry and Status from Dagda's figures,
   reload through Dagda, the files path table from Dagda's survey) together with R7 and the plan's "Before any suite
   can run" list (`LocalState`'s store parts, Macha's `DistributedStore` and `StorageServer`, Macha's survey, the
   trace clock into `MaintenanceOptions`), each Macha test retired against the Dagda case
