@@ -12,11 +12,11 @@ int64_t system_wall_ns() {
 
 } // namespace
 
-Clock::time_point SystemMaintenanceClock::now() const {
+Clock::time_point SystemMaintenanceClock::now() const noexcept {
     return Clock::now();
 }
 
-int64_t SystemMaintenanceClock::wall_ns() const {
+int64_t SystemMaintenanceClock::wall_ns() const noexcept {
     return system_wall_ns();
 }
 
@@ -35,11 +35,11 @@ void ManualMaintenanceClock::advance(Clock::duration by) {
                        std::memory_order_acq_rel);
 }
 
-Clock::time_point ManualMaintenanceClock::now() const {
+Clock::time_point ManualMaintenanceClock::now() const noexcept {
     return Clock::time_point(Clock::duration(steady_.load(std::memory_order_acquire)));
 }
 
-int64_t ManualMaintenanceClock::wall_ns() const {
+int64_t ManualMaintenanceClock::wall_ns() const noexcept {
     return wall_ns_.load(std::memory_order_acquire);
 }
 

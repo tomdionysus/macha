@@ -362,10 +362,10 @@ void check_against_fixture(std::string_view name, const std::vector<std::string>
 // an advance, never by real time. A clock before the epoch reads wall_ms 0.
 MACHA_FAST_TEST("maintenance_trace", test_manual_clock_moves_and_wakes_only_when_told) {
     struct BeforeEpoch final : MaintenanceClock {
-        Clock::time_point now() const override {
+        Clock::time_point now() const noexcept override {
             return {};
         }
-        int64_t wall_ns() const override {
+        int64_t wall_ns() const noexcept override {
             return -5;
         }
         void wait_until(NodeEvents&, std::stop_token, Clock::time_point,
