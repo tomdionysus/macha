@@ -67,8 +67,14 @@ Macha's to touch, we wait for Dagda's redesign):
    activity are the node's), one `StartupProgress`, stage names.
 3. The maintenance trace tests rewritten over Dagda's maintenance (the mapping's REWRITE cases in
    `test_maintenance_trace.cpp`); the GAP-HEADS cases stay on Macha's replica until 8c. **Hold the cases that assert
-   push then pull within a step**: Dagda's redesign changes them at its stage 2 and names each one.
-4. Move the prefixes to Dannan 0.8.5 and Dagda's newest gated commit (or its tag).
+   push then pull within a step**: Dagda's redesign changes them at its stage 2 and names each one. **Dagda's word,
+   2026-11-16 evening (not read here): stage 2 is gated (`2a8d24b`) and none of the ported cases changed**, the
+   trace fixture with repair lines (claimed-objects-lost) keeping its order; so the hold has nothing left to wait
+   for once step 4 builds on that commit. Check it there, from the fixtures, before rewriting those cases.
+4. Move the prefixes to Dannan 0.8.5 and Dagda's newest gated commit (or its tag): by Dagda's word `2a8d24b`
+   (repair stages 1 and 2: 1125 ran, 1122 passed, 3 skipped; `repair_step`'s signature and `RepairResult` unchanged).
+   `RepairLists` gains a fifth member, `holds`, defaulted: check that Macha's pass hands repair
+   `AvailabilityService::peer_holds()`, as `Repair::lists()` does, or a pull's copies are unknown and it sorts first.
 5. The first suite run on a Pi; fix forward. It runs on Dagda's current repair, which has the live defect below, so
    the comparison with 0.94.2 stays like for like.
 
