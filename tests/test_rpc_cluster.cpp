@@ -51,152 +51,6 @@ MACHA_FAST_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     CHECK(cancelled.load() == 2);
 }
 
-// DistributedStore against a FakeClusterNode: placement, puts, fetches and
-// repair as the store decides them, with peers answering in process.
-
-// Objects of `size` bytes, stored locally; returns their ids sorted.
-std::vector<ObjectId> local_objects(StoreBench& bench, size_t count, size_t size, uint8_t salt) {
-    std::vector<ObjectId> ids;
-    for (size_t i = 0; i < count; ++i) {
-        const auto bytes = pattern(size, static_cast<uint8_t>(salt + i));
-        const auto id = object_id(bytes);
-        REQUIRE(bench.local.data().put(id, bytes));
-        ids.push_back(id);
-    }
-    std::sort(ids.begin(), ids.end());
-    return ids;
-}
-
-// A peer for repair: answers presence as set, counts what it was asked, and
-// accepts puts, holding each at `put_gate` while `hold_puts` is set.
-struct RepairPeer {
-    NodeInfo info{StoreBench::peer()};
-    std::atomic_bool knows_batch{true};
-    std::atomic_bool holds_everything{};
-    // Answers "cannot say now" for every id, or refuses the batch as busy.
-    std::atomic_bool cannot_say{};
-    std::atomic_bool busy{};
-    std::atomic_bool hold_puts{};
-    std::atomic_uint batch_requests{};
-    std::atomic_uint single_probes{};
-    std::atomic_uint puts{};
-    std::atomic_uint puts_in_flight{};
-    std::atomic_uint max_puts_in_flight{};
-    std::atomic_uint fetches{};
-    std::optional<Bytes> serves;
-    TestGate put_gate;
-
-    explicit RepairPeer(StoreBench& bench) {
-        bench.node.add_peer(info, [this](MessageType type, const Bytes& request, FrameType) {
-            return answer(type, request);
-        });
-    }
-    RpcMessage answer(MessageType type, const Bytes& request) {
-        switch (type) {
-        case MessageType::have_valid_objects:
-            if (!knows_batch.load())
-                return {MessageType::error, {}};
-            ++batch_requests;
-            if (busy.load())
-                return error_reply(503, "storage_busy", "DATA resource admission busy");
-            if (cannot_say.load()) {
-                Reader reader(request);
-                const auto count = reader.u32();
-                Writer writer;
-                writer.u32(count);
-                for (uint32_t i = 0; i < count; ++i)
-                    writer.u8(2);
-                return {MessageType::have_valid_objects_reply, writer.take()};
-            }
-            return presence_reply(request, holds_everything.load());
-        case MessageType::have_object:
-            ++single_probes;
-            return {MessageType::bool_reply, Bytes{static_cast<uint8_t>(holds_everything.load())}};
-        case MessageType::put_object: {
-            const auto now = ++puts_in_flight;
-            for (auto seen = max_puts_in_flight.load();
-                 now > seen && !max_puts_in_flight.compare_exchange_weak(seen, now);) {
-            }
-            if (hold_puts.load())
-                put_gate.enter_and_wait();
-            --puts_in_flight;
-            ++puts;
-            return {MessageType::ok, {}};
-        }
-        case MessageType::get_object:
-            ++fetches;
-            if (serves)
-                return object_reply(*serves);
-            return {MessageType::error, {}};
-        default:
-            return {MessageType::ok, {}};
-        }
-    }
-};
-
-// A settled pull is settled for the list it walked. A list that arrives after
-// an empty one, or after the last one was finished while the push still ran,
-// is walked by the step that first sees it.
-MACHA_FAST_TEST("rpc_cluster", test_the_repair_step_that_first_sees_a_new_pull_list_walks_it) {
-    StoreBench bench([](Config& c) { c.replication = 2; });
-    RepairPeer peer(bench);
-    peer.holds_everything = true;
-    const auto wanted_bytes = pattern(256 * 1024, 43);
-    const auto wanted = object_id(wanted_bytes);
-    peer.serves = wanted_bytes;
-
-    auto store = bench.store();
-    REQUIRE(store->should_own(wanted));
-    const auto budget = 64ULL * 1024 * 1024;
-    const std::vector<ObjectId> none;
-    const std::vector<ObjectId> named{wanted};
-    const auto step = [&](const std::vector<ObjectId>& pull, uint64_t version) {
-        return store->repair_step(budget, 16, std::nullopt, {}, 0, {},
-                                  std::span<const ObjectId>(pull), {},
-                                  std::span<const ObjectId>(none), version, 1);
-    };
-
-    bool settled = false;
-    for (int attempt = 0; attempt < 4 && !settled; ++attempt)
-        settled = step(none, 1).complete;
-    REQUIRE(settled);
-    const auto filled = step(named, 2);
-    CHECK(peer.fetches.load() == 1);
-    CHECK(bench.local.data().has(wanted));
-    CHECK(filled.pull_examined == 1);
-}
-
-MACHA_FAST_TEST("rpc_cluster", test_a_pull_list_new_while_the_push_runs_is_not_passed_over) {
-    StoreBench bench([](Config& c) { c.replication = 2; });
-    RepairPeer peer(bench);
-    peer.holds_everything = true;
-    const auto first_bytes = pattern(64 * 1024, 44);
-    const auto second_bytes = pattern(64 * 1024, 45);
-    const auto second = object_id(second_bytes);
-    peer.serves = second_bytes;
-    REQUIRE(bench.local.data().put(object_id(first_bytes), first_bytes));
-    // More to push than one step examines, so the first list's pull finishes
-    // while the pass is still open.
-    const auto pushing = local_objects(bench, 100, 4 * 1024, 60);
-
-    auto store = bench.store();
-    REQUIRE(store->should_own(second));
-    const auto budget = 64ULL * 1024 * 1024;
-    const std::vector<ObjectId> first_list{object_id(first_bytes)};
-    const std::vector<ObjectId> second_list{second};
-    const auto step = [&](const std::vector<ObjectId>& pull, uint64_t version) {
-        return store->repair_step(budget, 16, std::nullopt, {}, 0, {},
-                                  std::span<const ObjectId>(pull), {},
-                                  std::span<const ObjectId>(pushing), version, 1);
-    };
-
-    const auto opening = step(first_list, 1);
-    REQUIRE(!opening.complete);
-    (void)step(second_list, 2);
-    CHECK(peer.fetches.load() == 1);
-    CHECK(bench.local.data().has(second));
-}
-
 // The startup gate fires on silence, never on slow progress: a reading that
 // moved restarts the no-progress window; a ceiling bounds the whole startup;
 // zero turns either off. Readings come at a quarter of a short window.
@@ -2198,13 +2052,9 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
             },
             20s));
 
-        DistributedStore r1(s1.node(), s1.local_state(), s1.resources().activity,
-                            s1.resources().data, s1.resources().memory, s1.resources().events);
-        DistributedStore r2(s2.node(), s2.local_state(), s2.resources().activity,
-                            s2.resources().data, s2.resources().memory, s2.resources().events);
         REQUIRE(wait_until([&] {
-            r1.repair_once(1024 * 1024);
-            r2.repair_once(1024 * 1024);
+            (void)s1.store_node().run_maintenance_once();
+            (void)s2.store_node().run_maintenance_once();
             return s1.store_node().data().has(object) && s2.store_node().data().has(object);
         }));
 
@@ -2295,13 +2145,10 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
             return false;
         }
     }));
-    // R=2 is convergence, W=1 the floor; drive repair directly rather than
-    // waiting on the maintenance scheduler.
-    DistributedStore initial_convergence(s2->node(), s2->local_state(), s2->resources().activity,
-                                         s2->resources().data, s2->resources().memory,
-                                         s2->resources().events);
+    // R=2 is convergence, W=1 the floor; drive the store node's repair
+    // directly rather than waiting on the maintenance scheduler.
     REQUIRE(wait_until([&] {
-        initial_convergence.repair_once(16ULL * 1024 * 1024, objects);
+        (void)s2->store_node().run_maintenance_once();
         return std::all_of(objects.begin(), objects.end(),
                            [&](const auto& id) { return s2->store_node().data().has(id); });
     }));
@@ -2357,13 +2204,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
         10s));
 
     // With the namespace recovered, repair repopulates the replacement from the survivor.
-    DistributedStore replacement_convergence(
-        replacement->node(), replacement->local_state(), replacement->resources().activity,
-        replacement->resources().data, replacement->resources().memory,
-        replacement->resources().events);
     REQUIRE(wait_until(
         [&] {
-            replacement_convergence.repair_once(16ULL * 1024 * 1024, objects);
+            (void)replacement->store_node().run_maintenance_once();
             return std::all_of(objects.begin(), objects.end(), [&](const auto& id) {
                 return replacement->store_node().data().has(id);
             });

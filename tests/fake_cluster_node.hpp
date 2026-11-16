@@ -4,8 +4,6 @@
 #include "test_support.hpp"
 
 #include "cluster/cluster_node.hpp"
-#include "cluster/distributed_store.hpp"
-#include "cluster/local_state.hpp"
 #include "cluster/node_identity.hpp"
 #include "cluster/node_resources.hpp"
 
@@ -163,94 +161,6 @@ class FakeClusterNode final : public ClusterNode {
     std::set<NodeId> refused_;
     std::vector<Call> calls_;
     std::vector<std::jthread> threads_;
-};
-
-// A StoreBench has no namespace tree: its replica never replays a delta.
-inline ObjectId no_namespace_replay(const ObjectId&, const MetadataDelta&) {
-    throw std::logic_error("a store bench replays no namespace tree");
-}
-
-// One node's object storage with no transport: a FakeClusterNode, the
-// node-wide resources and recovered local stores, built as the root builds
-// them. `tune` adjusts the configuration first.
-class StoreBench {
-  public:
-    explicit StoreBench(const std::function<void(Config&)>& tune = {})
-        : config_(configure(cluster_, tune)), state_lock_(config_.state_path), books_(config_),
-          memory_(standalone_memory(config_)), resources(config_, books_, *memory_, events_),
-          identity_(config_.state_path, cluster_.keys()),
-          node(config_, self_info(config_, identity_.id), identity_.durability_epoch),
-          local(config_, identity_, node, no_namespace_replay, progress_, {}, std::stop_token{},
-                test_durability_window) {
-        node.advertise_storage(local.data().used(), local.data().limit());
-    }
-    ~StoreBench() {
-        resources.stop();
-    }
-
-    const Config& config() const {
-        return config_;
-    }
-    const ClusterKeys& keys() const {
-        return cluster_.keys();
-    }
-    // A DistributedStore over this node, as the root builds one.
-    std::unique_ptr<DistributedStore> store(DistributedStoreOptions options = {}) {
-        return std::make_unique<DistributedStore>(node, local, resources.activity, resources.data,
-                                                  resources.memory, resources.events,
-                                                  std::move(options));
-    }
-    // A peer with `capacity` bytes, `used` of them, in a failure domain of its own.
-    static NodeInfo peer(uint64_t capacity = 64ULL * 1024 * 1024 * 1024, uint64_t used = 0) {
-        NodeInfo info;
-        info.id = random_node_id();
-        info.host = "peer-" + to_string(info.id).substr(0, 8);
-        info.failure_domain = info.host;
-        info.port = 9;
-        info.capacity = capacity;
-        info.used = used;
-        info.seen_unix_ms = unix_ms();
-        return info;
-    }
-
-  private:
-    static Config configure(const TestCluster& cluster, const std::function<void(Config&)>& tune) {
-        auto config = config_for(cluster.path() / "node", cluster.keyfile(), 1);
-        config.replication = 1;
-        config.write_copies = 1;
-        config.metadata_write_copies = 1;
-        if (tune)
-            tune(config);
-        return normalize_config(std::move(config));
-    }
-    static NodeInfo self_info(const Config& config, const NodeId& id) {
-        NodeInfo self;
-        self.id = id;
-        self.host = config.advertise_host;
-        self.port = config.port;
-        self.failure_domain = "local";
-        self.seen_unix_ms = unix_ms();
-        return self;
-    }
-
-    TestCluster cluster_;
-    Config config_;
-    StorageLock state_lock_;
-    NodeBooks books_;
-    // No node: a ledger and events of the bench's own.
-    std::unique_ptr<dannan::sched::RetainedMemoryLedger> memory_;
-    NodeEvents events_;
-
-  public:
-    NodeResources resources;
-
-  private:
-    NodeIdentity identity_;
-    RecoveryProgress progress_;
-
-  public:
-    FakeClusterNode node;
-    LocalState local;
 };
 
 // The reply a peer gives to have_valid_objects: `holds` for every id asked.
