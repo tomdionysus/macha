@@ -39,7 +39,11 @@ word). build-3's `/home/maintainer/macha-store-2` holds the same sources (checke
   `ab76b43` is Dagda's last full gate, every commit after it notes or a disabled test). **No Dagda tag holds what
   the port needs** (checked 16:05Z): CMake asks `find_package(dagda 0.2.0)` and the branch reports 0.2.0, but the tag
   `0.2.0` (`9020281`, local only, held by the maintainer) does not contain `6bfb5b2`, and `feature/macha-store-gaps` is not
-  pushed. The deploy's Dagda is therefore a named commit of that branch until Dagda tags one.
+  pushed. The deploy's Dagda is therefore a named commit of that branch until Dagda tags one. Dagda's word, ~17:00Z
+  (not read here): its newest gated commit is `0d048e0` (its own loop reads the inventory before each repair turn;
+  1120 ran, 1117 passed, 3 skipped), only `Node::maintenance_loop` changed, none of the steps Macha's pass calls;
+  the candidate for step 4. Its benchmark driver is `66a0b76`; Macha's half compiles on build-1 from 18:30Z, and
+  Macha reviews it once Dagda sends the commit that builds.
 
 **Next, in order: the port's code** (the operator, 2026-11-16: prepare for the Dagda replacement; repair is not
 Macha's to touch, we wait for Dagda's redesign):
