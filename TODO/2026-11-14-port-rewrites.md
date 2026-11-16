@@ -282,6 +282,11 @@ gate and Macha's `ledger/availability` goes; then `AvailabilitySurvey`, `PeerDif
 `Service` hands it to the store node as `MaintenanceOptions::time` and `wall`.
 7. The tests: each case's fate from `../dagda/TODO/2026-11-05-test-mapping.md` (RETIRE against its named Dagda case,
    REWRITE over the node fixtures, KEEP), recorded case by case; then Macha's store code removed (plan S.1's list).
+Steps 3, 4 and 7 landed after the paragraph above: reload and hosting through the store node (`dfedd6a`), the last
+store cases retired and `StoreBench` gone (`0a777a7`), Macha's store deleted with adverts and telemetry Dagda's
+(`deceac1`); checked in the tree 2026-11-16 (`advertise_storage` and the `macha/*` adverts are gone, `Service` calls
+`set_hosts_extents`, `LocalState` holds the seed and the replica only). What remains is `ACTIVE.md`'s "Next, in
+order"; the deps this file's head names (Dannan 0.8.0, 0.8.3, Dagda `6ea9d04`) are superseded by the ones there.
 
 ## R7. Removal
 
