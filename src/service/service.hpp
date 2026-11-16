@@ -170,10 +170,6 @@ class Service {
         wait_services_ready();
         return local_->metadata();
     }
-    DistributedStore& store() {
-        wait_services_ready();
-        return services_->store();
-    }
     // The store, through the contract Macha's code calls.
     dagda::Context& store_context() {
         wait_services_ready();
@@ -253,9 +249,9 @@ class Service {
     ConvergenceDemandDiagnostics metadata_convergence_diagnostics() const noexcept {
         return maintenance_port_.metadata_convergence.diagnostics();
     }
-    DistributedStore::RepairDiagnostics repair_diagnostics() {
+    dagda::store::RepairDiagnostics repair_diagnostics() {
         wait_services_ready();
-        return services_->store().repair_diagnostics();
+        return store_node_->store().repair_diagnostics();
     }
     // Where subsystems publish what they provide. A test driving its own
     // FuseFrontend publishes here, as FuseSubsystem does.

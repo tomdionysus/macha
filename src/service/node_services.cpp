@@ -32,10 +32,6 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
     : node_(node), resources_(resources), local_(local), store_node_(store),
       context_(store.context()), metadata_server_(metadata_server), routes_(routes),
       registry_(registry), port_(port), instruments_(std::move(instruments)),
-      store_(node_, local_, resources_.activity, resources_.data, resources_.memory,
-             resources_.events,
-             DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
-                                     instruments_.trace}),
       // The guard reaches the catalogue, declared after this: it runs only
       // for a commit, which nothing makes before construction finishes.
       metadata_(node_, local_, metadata_server_, context_,
@@ -55,8 +51,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       catalogue_(node_, metadata_server_, context_, metadata_),
       catalogue_installer_(catalogue_, resources_.events),
       filesystem_(node_.config(), node_.node_id(), node_.membership(), local_, metadata_server_,
-                  store_, context_, store_node_.references(), metadata_, resources_.memory,
-                  &playback_),
+                  context_, store_node_.references(), metadata_, resources_.memory, &playback_),
       catalogue_hints_(node_.config().state_path), media_engine_(media_engine_for(node_.config())),
       media_information_(filesystem_, catalogue_, media_engine_, node_.config().state_path),
       scanner_(node_, metadata_server_, filesystem_, catalogue_, catalogue_hints_,

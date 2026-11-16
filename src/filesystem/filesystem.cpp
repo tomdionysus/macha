@@ -1410,13 +1410,12 @@ FileSystem::remove_abandoned_write_files(const std::filesystem::path& state_path
 }
 
 FileSystem::FileSystem(const Config& config, NodeId node_id, const Membership& membership,
-                       LocalState& local, MetadataServer& metadata_server, DistributedStore& s,
-                       dagda::Context& context, dagda::ledger::ReferenceCounts& references,
-                       MetadataView& m, RetainedMemoryLedger& retained_memory,
-                       PlaybackTracker* playback)
+                       LocalState& local, MetadataServer& metadata_server, dagda::Context& context,
+                       dagda::ledger::ReferenceCounts& references, MetadataView& m,
+                       RetainedMemoryLedger& retained_memory, PlaybackTracker* playback)
     : config_(config), node_id_(node_id), membership_(membership), local_(local),
-      metadata_server_(metadata_server), retained_memory_(retained_memory), s_(s),
-      context_(context), references_(references), m_(m), playback_(playback) {
+      metadata_server_(metadata_server), retained_memory_(retained_memory), context_(context),
+      references_(references), m_(m), playback_(playback) {
     const auto [files, bytes] = remove_abandoned_write_files(config_.state_path, node_id_);
     if (files)
         Log::info("filesystem removed abandoned write files files=" + std::to_string(files) +

@@ -414,7 +414,6 @@ class FileSystem final : public PublicationTarget {
     LocalState& local_;
     MetadataServer& metadata_server_;
     RetainedMemoryLedger& retained_memory_;
-    DistributedStore& s_;
     // The store, through the contract Macha's code calls.
     dagda::Context& context_;
     // The namespace's reference counts, the store node's: the census is their
@@ -445,7 +444,7 @@ class FileSystem final : public PublicationTarget {
     void apply_namespace_batch_to(QueuedNamespaceBatch&, NamespaceWorkingSet&, MetadataSnapshot&,
                                   MetadataDelta&);
     // Cooperative cancellation of mount I/O at shutdown; extent transfers carry
-    // it into DistributedStore.
+    // it into the store.
     // Co-owned with the store's reads, which may check it after a call returns.
     std::shared_ptr<std::atomic_bool> io_cancelled_ = std::make_shared<std::atomic_bool>(false);
     // One extent `id` through the Context under the mount's cancel: deferred
@@ -553,7 +552,7 @@ class FileSystem final : public PublicationTarget {
     remove_abandoned_write_files(const std::filesystem::path& state_path, const NodeId& node);
     // Clears this node's abandoned write files first.
     FileSystem(const Config&, NodeId, const Membership&, LocalState&, MetadataServer&,
-               DistributedStore&, dagda::Context&, dagda::ledger::ReferenceCounts&, MetadataView&,
+               dagda::Context&, dagda::ledger::ReferenceCounts&, MetadataView&,
                RetainedMemoryLedger&, PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
@@ -644,9 +643,6 @@ class FileSystem final : public PublicationTarget {
     std::optional<NamespaceReferences> namespace_references(const MetadataSnapshot& snapshot);
     dagda::Context& context() {
         return context_;
-    }
-    DistributedStore& store() {
-        return s_;
     }
     // Read-only view of the namespace tree nodes. Cheap, so made per call
     // rather than cached, which also prevents writing through it.

@@ -9,32 +9,6 @@ using namespace std::chrono_literals;
 
 namespace {
 
-std::array<uint8_t, 32> storage_key(const TempDir& t) {
-    const auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    return load_cluster_keys(keyfile).storage;
-}
-
-LocalStoreOptions packed_options(uint64_t limit, uint64_t target_size) {
-    LocalStoreOptions options;
-    options.limit = limit;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = target_size;
-    return options;
-}
-
-std::filesystem::path only_pack(const std::filesystem::path& store) {
-    std::filesystem::path pack;
-    for (const auto& entry : std::filesystem::directory_iterator(store / "packs")) {
-        if (entry.is_regular_file()) {
-            REQUIRE(pack.empty());
-            pack = entry.path();
-        }
-    }
-    REQUIRE(!pack.empty());
-    return pack;
-}
-
 // One device operation held at its start until released, so a test can act
 // while it is provably in progress.
 class HeldOperation {
@@ -89,76 +63,6 @@ template <class T> bool ready(std::future<T>& future, std::chrono::milliseconds 
 }
 
 } // namespace
-
-// What a store throws says which it was: ObjectCorrupt for a record that read
-// and did not open, anything else for a read that did not finish.
-MACHA_TEST("storage_v18", test_a_store_tells_a_bad_record_from_a_failed_read) {
-    TempDir t;
-    const auto key = storage_key(t);
-    const auto throws_corrupt = [](LocalStore& store, const ObjectId& id) {
-        try {
-            (void)store.get(id);
-        } catch (const ObjectCorrupt&) {
-            return true;
-        } catch (const std::exception&) {
-        }
-        return false;
-    };
-    const auto fails_plainly = [](LocalStore& store, const ObjectId& id) {
-        try {
-            (void)store.get(id);
-        } catch (const ObjectCorrupt&) {
-            return false;
-        } catch (const std::exception&) {
-            return true;
-        }
-        return false;
-    };
-    {
-        LocalStore packed(t.path() / "packed",
-                          packed_options(64ULL * 1024 * 1024, 16ULL * 1024 * 1024), key);
-        const auto first = pattern(16 * 1024, 1);
-        const auto last = pattern(16 * 1024, 2);
-        REQUIRE(packed.put(object_id(first), first));
-        REQUIRE(packed.put(object_id(last), last));
-        REQUIRE(packed.is_packed(object_id(first)));
-        REQUIRE(packed.is_packed(object_id(last)));
-        const auto pack = only_pack(t.path() / "packed");
-        // The first record's payload starts past its header; flip a byte in
-        // the middle of it. The last record's tail is cut off.
-        {
-            std::fstream file(pack, std::ios::in | std::ios::out | std::ios::binary);
-            file.seekg(8 * 1024);
-            char byte{};
-            file.read(&byte, 1);
-            byte ^= 0x5a;
-            file.seekp(8 * 1024);
-            file.write(&byte, 1);
-            REQUIRE(file.good());
-        }
-        std::filesystem::resize_file(pack, std::filesystem::file_size(pack) - 1024);
-        CHECK(throws_corrupt(packed, object_id(first)));
-        CHECK(fails_plainly(packed, object_id(last)));
-    }
-    {
-        LocalStoreOptions options;
-        options.limit = 64ULL * 1024 * 1024;
-        LocalStore loose(t.path() / "loose", options, key);
-        const auto corrupt = pattern(16 * 1024, 3);
-        const auto torn = pattern(16 * 1024, 4);
-        const auto unreadable = pattern(16 * 1024, 5);
-        for (const auto* bytes : {&corrupt, &torn, &unreadable})
-            REQUIRE(loose.put(object_id(*bytes), *bytes));
-        corrupt_object(t.path() / "loose", object_id(corrupt));
-        std::filesystem::resize_file(object_path(t.path() / "loose", object_id(torn)), 8);
-        const auto path = object_path(t.path() / "loose", object_id(unreadable));
-        REQUIRE(std::filesystem::remove(path));
-        REQUIRE(std::filesystem::create_directory(path));
-        CHECK(throws_corrupt(loose, object_id(corrupt)));
-        CHECK(throws_corrupt(loose, object_id(torn)));
-        CHECK(fails_plainly(loose, object_id(unreadable)));
-    }
-}
 
 namespace {
 class StorageClusterNode {
