@@ -73,8 +73,12 @@ Macha's to touch, we wait for Dagda's redesign):
    for once step 4 builds on that commit. Check it there, from the fixtures, before rewriting those cases.
 4. Move the prefixes to Dannan 0.8.5 and Dagda's newest gated commit (or its tag): by Dagda's word `2a8d24b`
    (repair stages 1 and 2: 1125 ran, 1122 passed, 3 skipped; `repair_step`'s signature and `RepairResult` unchanged).
-   `RepairLists` gains a fifth member, `holds`, defaulted: check that Macha's pass hands repair
-   `AvailabilityService::peer_holds()`, as `Repair::lists()` does, or a pull's copies are unknown and it sorts first.
+   `RepairLists` gains a fifth member, `holds`, defaulted: met, since Macha's pass passes `repair.lists()`
+   (`maintenance.cpp:362`). Later, by Dagda's word: `5f3c458` (instant delete keeps a copy with no inventory; Macha
+   never calls `Objects::remove`) and `d2872de` (repair stage 3, the offer: 1131 ran, 1128 passed, 3 skipped). The
+   offer binds nothing in Macha's tree: Macha builds no `StorageServer` (Dagda's node must pass `offers`; asked to
+   confirm), and `Repair::transfer` debits the offer bytes itself. Status shows `bytes_transferred` without
+   `offer_bytes`; left until stage 4's shape.
 5. The first suite run on a Pi; fix forward. It runs on Dagda's current repair, which has the live defect below, so
    the comparison with 0.94.2 stays like for like.
 
