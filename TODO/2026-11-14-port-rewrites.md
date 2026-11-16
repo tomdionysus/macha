@@ -253,6 +253,26 @@ goes, which retires the reload races found in the map); Status's `data_store`, `
 `data_resources` from Dagda with Macha's JSON keys kept; catalogue `ready` on CONTROL presence; artwork read with a
 deadline (timeout as 503); the files path table from Dagda's survey, persisted as now.
 
+**R6 and R7, the order (2026-11-16, from the map's rows A8, A16, A19-A24, B1-B4, B12b, B13, B16):** each step one
+commit that compiles; Macha's store stays compiled only while a step still needs it.
+1. Status through the store node: `StatusSources` carries `dagda::Node*` (the owner's figures: `data().diagnostics()`,
+   `store().repair_diagnostics()`, `repair().gates()`, `store().prompt_replication_stats()`, `credit()->stats()`) in
+   place of `local` and `store`; Macha's JSON keys kept (`viewer_*` from `foreground_*`, `paced_by` words);
+   `Service::repair_diagnostics()` and `store()` seams re-pointed or gone.
+2. Macha's `DistributedStore` out of `NodeServices`, `FileSystem` (`s_`, `store()`), the FUSE comment, `Service`.
+3. Adverts and telemetry (A23, A24, A8): `node_info_from` reads `dagda/capacity` and `store::used_of`; telemetry and
+   `data_storage_degraded` from the node's own record through `store::figures_of`; `advertise_storage`,
+   `advertise_storage_backends`, `advertise_cache` and the `macha/capacity`, `macha/used` adverts go; `follow_inbound`
+   tells Dagda's server (`set_hosts_extents`) and stops writing `dagda/extents` itself (A22).
+4. `StorageServer` and `LocalState`'s store parts go (the node answers the store messages); `LocalState` keeps the
+   replica and its seed; reload through `Node::reconfigure` (A19, which retires D1 and D2).
+5. `AvailabilityService` on Dagda's survey (`Node::availability()`), the path table built from it and persisted as
+   now (A16, B16); its `trie_diff` route goes.
+6. The trace clock into `MaintenanceOptions::time`/`wall`; CONTROL presence for catalogue `ready` (B12b); artwork
+   read with a deadline, timeout 503 (B13, an API change to announce).
+7. The tests: each case's fate from `../dagda/TODO/2026-11-05-test-mapping.md` (RETIRE against its named Dagda case,
+   REWRITE over the node fixtures, KEEP), recorded case by case; then Macha's store code removed (plan S.1's list).
+
 ## R7. Removal
 
 Macha's store code that Dagda now holds goes (plan S.1's list), each test retired against the Dagda case
@@ -262,7 +282,8 @@ Macha's store code that Dagda now holds goes (plan S.1's list), each test retire
 
 - **API changes announced to Core and every client before they ship** (operator: the `dagda.<name>` names at the
   cutover, not before): store `message_timings` keys, `startup.error` text, `retained_memory.owners` values, Status
-  figure age, artwork 503.
+  figure age, artwork 503, diagnostics `data_resources.available` (new: false until the store node's store is open,
+  its figures zero meanwhile; the section reads the store node's admission).
 - Custody: Dannan's installed tool (asked 2026-11-14), sealing with the host key, the unit's `LoadCredentialEncrypted=`,
   the backup of the plain root or the sealed root with `credential.secret`; at the next deploy (operator).
 - The gates (the maintainer, 2026-11-14): Macha's suites on Dagda; the side-by-side harness on the Pis; the migration rehearsal on

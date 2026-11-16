@@ -481,10 +481,8 @@ std::optional<NodeId> parse_node_id(std::string_view text) {
 
 ClusterStatusService::ClusterStatusService(NodeRuntime& node, Accounts& accounts,
                                            const ActivityClocks& activity,
-                                           const DataResourceArbiter& data_resources,
                                            const RetainedMemoryLedger& retained_memory)
-    : node_(node), accounts_(accounts), activity_(activity), data_resources_(data_resources),
-      retained_memory_(retained_memory) {}
+    : node_(node), accounts_(accounts), activity_(activity), retained_memory_(retained_memory) {}
 
 ClusterStatusService::~ClusterStatusService() {
     stop();
@@ -1024,16 +1022,20 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     transport_diagnostics["canonical_connections"] = transport.canonical_connections;
     diagnostics["rpc_transport"] = std::move(transport_diagnostics);
 
-    const auto data_resource = data_resources_.stats();
+    // The store node's DATA admission, once its store is open; its foreground
+    // class is the viewer's.
+    const auto* credit = sources.store_node ? sources.store_node->credit() : nullptr;
+    const auto data_resource = credit ? credit->stats() : dagda::store::DataResourceStats{};
     Json::Object data_resource_diagnostics;
+    data_resource_diagnostics["available"] = credit != nullptr;
     data_resource_diagnostics["capacity_bytes"] = data_resource.capacity_bytes;
-    data_resource_diagnostics["viewer_reserve_bytes"] = data_resource.viewer_reserve_bytes;
+    data_resource_diagnostics["viewer_reserve_bytes"] = data_resource.foreground_reserve_bytes;
     data_resource_diagnostics["used_bytes"] = data_resource.used_bytes;
     data_resource_diagnostics["peak_used_bytes"] = data_resource.peak_used_bytes;
-    data_resource_diagnostics["viewer_admissions"] = data_resource.viewer_admissions;
+    data_resource_diagnostics["viewer_admissions"] = data_resource.foreground_admissions;
     data_resource_diagnostics["loader_admissions"] = data_resource.loader_admissions;
     data_resource_diagnostics["speculative_admissions"] = data_resource.speculative_admissions;
-    data_resource_diagnostics["viewer_waits"] = data_resource.viewer_waits;
+    data_resource_diagnostics["viewer_waits"] = data_resource.foreground_waits;
     data_resource_diagnostics["loader_waits"] = data_resource.loader_waits;
     data_resource_diagnostics["speculative_waits"] = data_resource.speculative_waits;
     // Background effort ceiling (maintenance.background_concurrency) and use.
@@ -1095,9 +1097,9 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
 
     Json::Object data_store_diagnostics;
     data_store_diagnostics["available"] = false;
-    if (sources.local) {
+    if (sources.store_node) {
         try {
-            const auto data_store = sources.local->data().diagnostics();
+            const auto data_store = sources.store_node->data().diagnostics();
             data_store_diagnostics["available"] = true;
             data_store_diagnostics["loose_reaffirmation_fast_paths"] =
                 data_store.loose_reaffirmation_fast_paths;
@@ -1310,9 +1312,12 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     // read back: a failing disk.
     Json::Object repair_diagnostics;
     repair_diagnostics["available"] = false;
-    if (sources.store) {
+    if (sources.store_node) {
         try {
-            const auto values = sources.store->repair_diagnostics();
+            auto& node = *sources.store_node;
+            const auto values = node.store().repair_diagnostics();
+            const auto gates_seen = node.repair().gates();
+            const auto prompt_stats = node.store().prompt_replication_stats();
             repair_diagnostics["available"] = true;
             repair_diagnostics["unsourceable_objects"] = values.pull_unsourceable;
             repair_diagnostics["local_unreadable_objects"] = values.local_unreadable;
@@ -1329,37 +1334,37 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             repair_diagnostics["passes_completed"] = values.passes_completed;
             repair_diagnostics["push_phase_complete"] = values.push_phase_complete;
             Json::Object gates;
-            gates["ran"] = values.gate_ran;
-            gates["share"] = values.gate_share;
-            gates["quiescent"] = values.gate_quiescent;
-            gates["credit"] = values.gate_credit;
+            gates["ran"] = gates_seen.ran;
+            gates["share"] = gates_seen.share;
+            gates["quiescent"] = gates_seen.quiescent;
+            gates["credit"] = gates_seen.credit;
             repair_diagnostics["pass_gates"] = std::move(gates);
-            repair_diagnostics["last_credit_bytes"] = values.last_credit_bytes;
+            repair_diagnostics["last_credit_bytes"] = gates_seen.last_credit_bytes;
             // Repair under a higher class takes turns on a weighted share,
             // so one pass's gate does not say whether it is being held back:
             // the classes active at the latest pass do.
             Json::Array paced_by;
-            if (values.last_gate) {
-                if (values.paced_by & DistributedStore::paced_by_viewer)
+            if (gates_seen.last) {
+                if (gates_seen.paced_by & dagda::store::paced_by_foreground)
                     paced_by.emplace_back("viewer");
-                if (values.paced_by & DistributedStore::paced_by_loader)
+                if (gates_seen.paced_by & dagda::store::paced_by_loader)
                     paced_by.emplace_back("loader");
-                if (values.paced_by & DistributedStore::paced_by_peer_viewer)
+                if (gates_seen.paced_by & dagda::store::paced_by_peer_foreground)
                     paced_by.emplace_back("peer_viewer");
             }
             const char* pace = "unknown";
             if (!paced_by.empty()) {
                 pace = "paced";
-            } else if (values.last_gate) {
-                switch (*values.last_gate) {
-                case DistributedStore::RepairGate::ran:
-                case DistributedStore::RepairGate::share:
+            } else if (gates_seen.last) {
+                switch (*gates_seen.last) {
+                case dagda::store::RepairGate::ran:
+                case dagda::store::RepairGate::share:
                     pace = "running";
                     break;
-                case DistributedStore::RepairGate::quiescent:
+                case dagda::store::RepairGate::quiescent:
                     pace = "settling";
                     break;
-                case DistributedStore::RepairGate::credit:
+                case dagda::store::RepairGate::credit:
                     pace = "awaiting_credit";
                     break;
                 }
@@ -1368,11 +1373,11 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             repair_diagnostics["paced_by"] = std::move(paced_by);
             // The quick second copy of each new object.
             Json::Object prompt;
-            prompt["queued"] = values.prompt_queued;
-            prompt["copies"] = values.prompt_copies;
-            prompt["failures"] = values.prompt_failures;
-            prompt["skipped_no_room"] = values.prompt_skipped_no_room;
-            prompt["dropped"] = values.prompt_dropped;
+            prompt["queued"] = prompt_stats.queued;
+            prompt["copies"] = prompt_stats.copies;
+            prompt["failures"] = prompt_stats.failures;
+            prompt["skipped_no_room"] = prompt_stats.skipped_no_room;
+            prompt["dropped"] = prompt_stats.dropped;
             diagnostics["prompt_replication"] = std::move(prompt);
         } catch (const std::exception& error) {
             Log::debug("status repair diagnostics unavailable: " + std::string(error.what()));

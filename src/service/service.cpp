@@ -39,7 +39,7 @@ Service::Service(const Config& config, ClusterKeys keys,
       resources_(node_.config(), books_, node_.node().memory(), node_.events(),
                  [clock = clock_] { return clock->now(); }),
       accounts_(node_.config(), node_.identity(), node_, routes_),
-      cluster_status_(node_, accounts_, resources_.activity, resources_.data, resources_.memory),
+      cluster_status_(node_, accounts_, resources_.activity, resources_.memory),
       session_api_(node_, accounts_), users_api_(node_, accounts_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)),
@@ -103,12 +103,14 @@ StatusSources Service::status_sources() {
     sources.maintenance = &maintenance_port_;
     sources.registry = &registry_;
     sources.http = catalogue_http_.get();
-    if (progress_.complete())
+    if (progress_.complete()) {
         sources.local = &local_->state();
+        // Opened before local state completes.
+        sources.store_node = store_node_.get();
+    }
     if (services_ready_.load(std::memory_order_acquire)) {
         sources.metadata = &services_->metadata();
         sources.subsystems = &services_->subsystems();
-        sources.store = &services_->store();
     }
     return sources;
 }

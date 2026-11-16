@@ -5,7 +5,7 @@
 #include "contract/thread_safety.hpp"
 
 #include "auth/accounts.hpp"
-#include "cluster/distributed_store.hpp"
+#include "dagda/node.h"
 #include "fuse/fuse_frontend.hpp"
 #include "http/http.hpp"
 #include "metadata/metadata_manager.hpp"
@@ -32,10 +32,13 @@ struct StatusSources {
     const MaintenancePort* maintenance{};
     const SubsystemRegistry* registry{};
     const HttpServer* http{};
+    // The metadata replica's figures, once local state has recovered.
     LocalState* local{};
     MetadataView* metadata{};
     const SubsystemSupervisor* subsystems{};
-    const DistributedStore* store{};
+    // The store node's figures (its pool, repair, prompt replication and
+    // admission), once its store is open.
+    dagda::Node* store_node{};
 };
 
 // Reads the node it is built with; everything else arrives per request.
@@ -43,7 +46,6 @@ class ClusterStatusService {
     NodeRuntime& node_;
     Accounts& accounts_;
     const ActivityClocks& activity_;
-    const DataResourceArbiter& data_resources_;
     const RetainedMemoryLedger& retained_memory_;
     std::jthread persistence_;
     // Guards nothing; the observation thread waits on it.
@@ -62,7 +64,7 @@ class ClusterStatusService {
     HttpResponse connectivity_check(const std::optional<NodeId>& only);
 
   public:
-    ClusterStatusService(NodeRuntime&, Accounts&, const ActivityClocks&, const DataResourceArbiter&,
+    ClusterStatusService(NodeRuntime&, Accounts&, const ActivityClocks&,
                          const RetainedMemoryLedger&);
     ~ClusterStatusService();
     void start();
