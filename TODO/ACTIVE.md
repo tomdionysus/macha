@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-16 about 04:30Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-16 about 15:30Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-15-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
 `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
@@ -34,18 +34,40 @@ need to"; still no tag, merge or PR without his word). Every commit compiles on 
 - Deps: Dannan 0.8.4 pinned (`find_package(dannan 0.8.4)`; it carries the stop-aware `NodeEvents` wait; 0.8.5 is out
   with a stop hang fixed, for the deploy), Dagda `6bfb5b2` (`6adc5ed` and `ab76b43` gated since; API unchanged).
 
-**Next, in order:**
+**Next, in order: the port's code** (the operator, 2026-11-16: prepare for the Dagda replacement; repair is not
+Macha's to touch, we wait for Dagda's redesign):
 1. Macha's `LocalStore` and what stands on it (`presence_index`, `durability_domain`, `held_ledger`,
    `sealed_journal`, the tries, `retention`, `reference_counts`) and its contract twins (`object_store`,
    `object_ledger`, `claim_store`, `horizon`, `horizon_builder`) go; `tools/metadata_history_dump.cpp` reads its
-   control store through Dagda's `LocalStore` instead.
+   control store through Dagda's `LocalStore` instead. The largest item and depends on nothing: start here.
 2. R1's leftovers: Macha's `DataResourceArbiter` and `ActivityClocks` out of `NodeResources` (Dagda's admission and
    activity are the node's), one `StartupProgress`, stage names.
 3. The maintenance trace tests rewritten over Dagda's maintenance (the mapping's REWRITE cases in
-   `test_maintenance_trace.cpp`); the GAP-HEADS cases stay on Macha's replica until 8c.
+   `test_maintenance_trace.cpp`); the GAP-HEADS cases stay on Macha's replica until 8c. **Hold the cases that assert
+   push then pull within a step**: Dagda's redesign changes them at its stage 2 and names each one.
 4. Move the prefixes to Dannan 0.8.5 and Dagda's newest gated commit (or its tag).
-5. The first suite run on a Pi; fix forward. Then the side-by-side harness and the migration rehearsal (a gate, the maintainer
-   2026-11-14), then the port against the live baselines.
+5. The first suite run on a Pi; fix forward. It runs on Dagda's current repair, which has the live defect below, so
+   the comparison with 0.94.2 stays like for like.
+
+**Leave alone until Dagda's stage 4:** the Status code reading Repair's gates and step figures (`transfer`,
+`settle`, the gates): its shape changes, and Dagda brings the new one before building it. Keep it working, no more.
+
+**Prep for the flag day, alongside the code** (the gates, the maintainer 2026-11-14: Macha's suites on Dagda; the side-by-side
+harness on the Pis; the migration rehearsal on copies of real state; reliability under crash, restart and partition;
+then the port against the live baselines):
+- **Config:** check the port's mapping of every store key (`2026-11-13-store-cutover.md` step 2, plan S.3) against
+  both live `macha.yaml` files; a key that no longer applies is refused or dropped with a clear line, never silently.
+  Both files read 2026-11-16 (values under "Cluster state").
+- **The migration rehearsal:** copies of real state from live-a and live-b (control store, ledgers, a pack sample)
+  onto a claimed Pi, `dagda-migrate`, a verifier listing every id before and after, and a written rollback.
+- **Deploy and custody:** the package on the new deps (the tarball carries libdannan, libdagda and `dannan-node`);
+  custody at the next deploy, ahead of the cutover: `dannan-custody` from Dannan 0.8.x, roots sealed with the host key
+  (no TPM on the Pis), the unit's `LoadCredentialEncrypted=`, an off-node backup of the plain root or of the sealed
+  root with `credential.secret`, run between stop and start; each node's control store copied off-node first.
+- **API changes announced to Core and every client** before they ship (list in `2026-11-14-port-rewrites.md`,
+  "Before the flag day"); the repair figures marked provisional, since Dagda's redesign changes them again.
+- **Baselines:** the 0.94.2 results the port is compared against (`build/baselines/`, `2026-11-06-pi-baselines.md`)
+  lined up so "the port against the live baselines" is ready to run.
 
 **Builds:** build-3 `/home/maintainer/macha-store-2` (the current tree), `build/pi/macha_port_compile.sh` with
 `S=/home/maintainer/macha-store-2 R=/root/pi/port2`, prefixes `/home/maintainer/deps/prefix-0.8.4` (`deps_dannan_084.sh`) and
@@ -57,10 +79,6 @@ freed buffer) found and fixed by R2's reply buffer (`01eecf0`); libfuse's low-le
 Detail in `archive/2026-11-15-ACTIVE-before-rationalisation.md`, item 1. Macha defects the map review found are
 recorded there too; pack compaction's was Dagda's to fix (done, `7f14515`, reviewed).
 
-**Custody at the next deploy, ahead of the cutover** (operator): `dannan-custody` from Dannan 0.8.x, roots sealed
-with the host key (no TPM on the Pis), the unit's `LoadCredentialEncrypted=`, an off-node backup of the plain root or
-of the sealed root with `credential.secret`; run between stop and start.
-
 ## The shared build Pis
 
 build-1 `root@192.0.2.169`, build-2 `.170`, build-3 `.202`, build-4 `.228`: Pi 5, 16 GB,
@@ -70,16 +88,42 @@ ends); details in memory `project_build_host`. Macha's state there: build-3 `/ho
 `/home/maintainer/macha-store`, `/home/maintainer/macha-asan`, `/root/pi`, `/root/heap*`; build-2 `/home/maintainer/macha-asan`,
 `/home/maintainer/heap`, `/root/heap*`.
 
+## Known live defect until the cutover
+
+**Repair's pull starves under a sending push** (develop `distributed_store.cpp`, live on 0.94.2). Push and pull share
+one 16-call step budget (`:2530-2538`), so a push that sends every step holds a new pull list until its pass ends.
+A second path, read and not tested: a push that ends a step credit-limited skips the pull for that step (the
+`!result.credit_limited` guard at `:2939`). Delayed convergence, nothing lost. The maintainer's ruling, 2026-11-16: no patch in
+Macha or Dagda; repair is redesigned in Dagda (`TODO/2026-11-16-repair-redesign.md`, commit `877585c` on
+`feature/macha-store-gaps`): one queue of transfers ordered by copies left, either direction, a window against the
+byte credit, the call budget gone; stage 0 measures first. For the port: Dagda names each ported trace case that
+changes at its stage 2, and brings the new shape of Repair's public steps (which Status reads) before stage 4.
+
 ## Waiting on the operator
 
-- **Repair's pull starves under a sending push** (found by Dagda 2026-11-16 porting
-  `test_a_pull_list_new_while_the_push_runs_is_not_passed_over`, confirmed in Macha's code): one operation budget
-  serves the push and the pull (`distributed_store.cpp:2530-2538`, used at `:2991`, `:3069`), and the pull's only
-  own share is the scan budget (`:2941-2943`), so a push that sends every step holds a new pull list until its pass
-  ends, against the comment there. The live nodes (0.94.2) run it. The rule says fix in Macha first, which means a
-  develop change and release for code the port deletes; recommended instead: Dagda fixes it test-first (a share of
-  the operation budget kept for the pull while its list is new, at least one operation) and Macha records it as a
-  known live defect until the cutover. Dagda is holding its fix for the answer.
+- **Whether to answer Dagda's review request for its repair benchmark** (harness workload 7, two Pis; Dagda's
+  `TODO/2026-11-15-side-by-side-harness.md` last section, commit `e6f6474`). Asked 2026-11-16 ~15:00Z; the operator
+  said "We wait for Dagda", so nothing has been sent. Dagda asked: (1) how to drive Macha's repair at f0597a4 on its
+  harness node (referenced ids, survey, credit, share, step, at the deployed interval) and whether a fixture does it;
+  (2) the deployed values that pace repair; (3) whether two processes join with a shared key, listen/advertise set
+  and b's bootstrap naming a; (4) anything unfair to Macha. Found so far, not sent:
+  - Repair runs in `Maintenance::run` (f0597a4 `src/service/maintenance.cpp:560-857`): the gate on the share and
+    quiescence (:562-563), the survey `availability_.refresh` (:589-606), the claim walks, then
+    `store_.repair_step(byte_budget, operation_budget, ...)` with the pull list from `missing_here()` (or every
+    referenced id until the survey knows) and the push list from `peer_lacks()` (:729-806). The 16 is a `constexpr`
+    at :734, not config. Credit: `bandwidth * idle_bandwidth_fraction * cpu_scale` per second, banked to
+    `max(extent, 5 s of link)` (:417-437).
+  - Cadence: another step one `interval` after a step that did work (:1363-1364); the loop also wakes on storage and
+    claims events, the credit deadline, the share's next turn and the survey's due time (:1344-1369, :1396-1415).
+    Whether repair's own puts wake it at once through storage events was not checked.
+  - Live values (live-a and live-b, read 2026-11-16), where they differ from f0597a4's defaults:
+    `idle_bandwidth_fraction` 0.5 (default 0.10). The rest at default: `interval_ms` 1000, `foreground_quiet_ms`
+    2000, weights 95/5, `cpu_target` 0.10, `initial_bandwidth` 32M, `max_bandwidth` 0, `busy_bandwidth_fraction`
+    0.0, `background_concurrency` 0. Not in `maintenance` but pacing repair: `telemetry_interval_ms` 10000, so the
+    peer-viewer window is `max(3 x 10 s, 3 s)` = 30 s (:414-415), against the 3 s Dagda's `peer_window` comment
+    assumes.
+  - Fixture: `tests/test_maintenance_trace.cpp` exists at f0597a4; whether it drives repair without metadata was not
+    read. Question 3 not checked.
 - After the port: whether the heap chase resumes with media load (the 11-14 test-volume rule applies).
 - The Codecov token for the repository.
 - Carried, unchecked: the media-kind import hint; truncated pack records; the `*.pre-migration.*` archives; the
@@ -106,7 +150,7 @@ ends); details in memory `project_build_host`. Macha's state there: build-3 `/ho
 **Reopen on sight:** `credit wait abandoned`; `metadata merge recorded a conflict`; `RPC stalled (control)`; heap
 corruption.
 
-## Cluster state (read 2026-11-13; not reread since)
+## Cluster state (read 2026-11-13; configs reread 2026-11-16)
 
 - **Both on 0.94.2** since 2026-11-13 (live-b 15:30Z, live-a 15:31Z, `replicas=2/2`): the first optimised build
   (RelWithDebInfo), tarball sha256 `b6d1b65a...0d95`, installed by `build/install-0.94.2.sh`; rollback
@@ -117,7 +161,10 @@ corruption.
 - **live-b** (root@live-b.example.net, Pi 5, 16 GB, site-b, inbound capable at :7437): DATA
   `/mnt/diskB/data`, filling from live-a; API 203.0.113.50:7438 (inside only); persistent journal; power failures
   recur, no remote power control. Never build there.
-- **Both:** `maintenance.idle_bandwidth_fraction` 0.5; config backups beside `/etc/macha/macha.yaml`; cores to
+- **Both** (configs read 2026-11-16): `maintenance.idle_bandwidth_fraction` 0.5, every other maintenance key at its
+  default; `dht` replicas 2, write_copies 1, extent 4M; `telemetry_interval_ms` 10000, `dead_after_ms` 30000;
+  live-a listens on 192.0.2.50 and advertises `live-a.example.net`, live-b listens on 0.0.0.0 and advertises
+  `live-b.example.net`; live-a runs `libdannan.so.0.5.3`; config backups beside `/etc/macha/macha.yaml`; cores to
   `/mnt/diskB/crash`; torrent on; one tree-backed head, SM19.
 - **Access:** the API needs a session; live-a's genesis root password is in `/var/lib/macha/initial-root-password`
   (works on live-b too); scripts that read it are in `build/baselines/`.
@@ -158,7 +205,8 @@ corruption.
 - **Builds** only on the Pis, -j2 or -j3, nice 19, claimed. Never edit sources under a running build of the same
   tree (the Pi has its own copy, so editing on the Mac is fine). Format with clang-format 19; clang-tidy reports
   nothing; a suppression is a `NOLINTNEXTLINE(check)` with its reason beside it.
-- **Git**: commit on the branch as work lands; push only on the operator's word; stage named paths, never `-A`;
+- **Git**: commit on the branch as work lands; push `port/dannan-dagda` when needed (operator 2026-11-16), anything
+  else only on his word; no tag, merge or PR unasked; stage named paths, never `-A`;
   no attribution trailers; no em dashes in Macha.
 - **Text tools**: code lookups through basemind; a hook blocks grep, sed, awk, head, tail and cat on local files, so
   Python for text work. Scratch files and logs in `build/`, never `/tmp`.
