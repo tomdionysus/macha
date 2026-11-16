@@ -122,9 +122,18 @@ two Pis (`4f1aca6`); the benchmark is designed as workload 7 on **build-1 and bu
 
 ## Waiting on the operator
 
-- **Whether to answer Dagda's review request for its repair benchmark** (harness workload 7, two Pis; Dagda's
-  `TODO/2026-11-15-side-by-side-harness.md` last section, commit `e6f6474`). Asked 2026-11-16 ~15:00Z; the operator
-  said "We wait for Dagda", so nothing has been sent. Dagda asked: (1) how to drive Macha's repair at f0597a4 on its
+- **Answered, no longer waiting: Dagda's review request for its repair benchmark** (harness workload 7, two Pis;
+  Dagda's `TODO/2026-11-15-side-by-side-harness.md` last section, commit `e6f6474`). The operator, 2026-11-16 ~16:15Z:
+  finish the review, then send it; sent to the Dagda session ~16:25Z (the design only; the driver is reviewed when
+  built). What it said beyond the facts below: no fixture drives repair without metadata (the trace fixture holds a
+  whole `Service`), and Macha takes no referenced set from outside, so the fair driver is a `Service` in each process
+  writing files through `service.filesystem()`; the live cluster is the proof two machines join (shared key file,
+  live-a `bootstrap: []`, live-b naming live-a); live `metadata_write_copies` 1 and `heartbeat_ms` 5000 against
+  the harness's 2 and 1 s; scenario 1's clock charges Macha for metadata replication unless both start when b's
+  referenced set is complete; the viewer scenario's reader must read through the filesystem. Told Dagda as unchecked:
+  whether `Service` links from its extract's `macha_core` alone, whether repair's own puts wake the pass, packing of
+  64 KiB objects at deployed values, a's writes while b is away. Step 1 is **held on the operator's word** (same
+  exchange). Dagda asked: (1) how to drive Macha's repair at f0597a4 on its
   harness node (referenced ids, survey, credit, share, step, at the deployed interval) and whether a fixture does it;
   (2) the deployed values that pace repair; (3) whether two processes join with a shared key, listen/advertise set
   and b's bootstrap naming a; (4) anything unfair to Macha. Found so far, not sent:
