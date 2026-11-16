@@ -298,7 +298,9 @@ Macha's store code that Dagda now holds goes (plan S.1's list), each test retire
 - **API changes announced to Core and every client before they ship** (operator: the `dagda.<name>` names at the
   cutover, not before): store `message_timings` keys, `startup.error` text, `retained_memory.owners` values, Status
   figure age, artwork 503, diagnostics `data_resources.available` (new: false until the store node's store is open,
-  its figures zero meanwhile; the section reads the store node's admission).
+  its figures zero meanwhile; the section reads the store node's admission); and (the maintainer, 2026-11-16) repair's
+  `offer_bytes` and `in_flight` added to Status's repair section beside `bytes_transferred`, once Dagda's repair
+  stage 4 builds them (names from Dagda).
 - Custody: Dannan's installed tool (asked 2026-11-14), sealing with the host key, the unit's `LoadCredentialEncrypted=`,
   the backup of the plain root or the sealed root with `credential.secret`; at the next deploy (operator).
 - The gates (the maintainer, 2026-11-14): Macha's suites on Dagda; the side-by-side harness on the Pis; the migration rehearsal on
