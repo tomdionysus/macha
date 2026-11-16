@@ -69,6 +69,14 @@ ends); details in memory `project_build_host`. Macha's state there: build-3 `/ho
 
 ## Waiting on the operator
 
+- **Repair's pull starves under a sending push** (found by Dagda 2026-11-16 porting
+  `test_a_pull_list_new_while_the_push_runs_is_not_passed_over`, confirmed in Macha's code): one operation budget
+  serves the push and the pull (`distributed_store.cpp:2530-2538`, used at `:2991`, `:3069`), and the pull's only
+  own share is the scan budget (`:2941-2943`), so a push that sends every step holds a new pull list until its pass
+  ends, against the comment there. The live nodes (0.94.2) run it. The rule says fix in Macha first, which means a
+  develop change and release for code the port deletes; recommended instead: Dagda fixes it test-first (a share of
+  the operation budget kept for the pull while its list is new, at least one operation) and Macha records it as a
+  known live defect until the cutover. Dagda is holding its fix for the answer.
 - After the port: whether the heap chase resumes with media load (the 11-14 test-volume rule applies).
 - The Codecov token for the repository.
 - Carried, unchecked: the media-kind import hint; truncated pack records; the `*.pre-migration.*` archives; the

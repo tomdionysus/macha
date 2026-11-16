@@ -463,6 +463,9 @@ class BareNode : public BareNodeResources, public NodeRuntime {
             run_supervised_once("cluster-state-recovery", [this, stop] {
                 try {
                     store_node_->open_store();
+                    follow_hosts_extents([server = &store_node_->server()](bool hosts) {
+                        server->set_hosts_extents(hosts);
+                    });
                     local_ = std::make_unique<LocalServices>(
                         config(), identity(), progress, stage_hook, stop, *this,
                         store_node_->context(), resources, routes, durability_batch_window_);
@@ -485,6 +488,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     void stop() {
         resources.stop();
         accounts_.stop();
+        follow_hosts_extents({});
         store_node_->stop();
         NodeRuntime::stop();
         if (recovery_.joinable()) {

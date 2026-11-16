@@ -529,6 +529,11 @@ void Service::initialise_services(const std::stop_token& stop) {
         try {
             note_lifecycle("open store");
             store_node_->open_store();
+            // The store's server writes the hosting advert, following the
+            // node's inbound answer from here.
+            node_.follow_hosts_extents([server = &store_node_->server()](bool hosts) {
+                server->set_hosts_extents(hosts);
+            });
             local_ = std::make_unique<LocalServices>(
                 node_.config(), node_.identity(), progress_, recovery_stage_hook_, stop, node_,
                 store_node_->context(), resources_, routes_, durability_batch_window_);
@@ -651,6 +656,7 @@ void Service::stop() {
         services_->stop();
     // After everything that writes into the store, before the node beneath it.
     note_lifecycle("stop store");
+    node_.follow_hosts_extents({});
     store_node_->stop();
     request_stop();
     note_lifecycle("stop status");

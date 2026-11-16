@@ -91,6 +91,10 @@ class NodeRuntime : public ClusterNode {
     std::optional<uint64_t> roster_watch_;
     // The inbound answer last applied; the runtime thread's.
     std::optional<bool> inbound_applied_;
+    // Told whether this node hosts extents, each time the answer moves: the
+    // store's server, which alone writes the advert.
+    Mutex hosts_mutex_;
+    std::function<void(bool)> hosts_listener_ MACHA_GUARDED_BY(hosts_mutex_);
 
     std::atomic_uint64_t remote_metadata_generation_{};
     // Raises it to `generation` if higher, never lowers it: two readers that
@@ -175,6 +179,10 @@ class NodeRuntime : public ClusterNode {
     void set_call_fault(CallFault fault) {
         call_fault_ = std::move(fault);
     }
+    // Tells `listener` whether this node hosts extents now and each time the
+    // answer moves; an empty one stops. Thread-safe; the listener runs under
+    // a lock and must not call back.
+    void follow_hosts_extents(std::function<void(bool)> listener);
     void start();
     void request_stop();
     // Closes client routes and fails every pending synchronous call now, so
