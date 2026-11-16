@@ -387,10 +387,12 @@ class CatalogueManager {
     std::vector<NodeId> control_converged_nodes_ MACHA_GUARDED_BY(mutex_);
     Clock::time_point control_convergence_retry_ MACHA_GUARDED_BY(mutex_){};
 
-    // A DATA object's bytes, on the caller's thread with no deadline; none
-    // when it could not be read. Every store call here throws only
+    // A DATA object's bytes, on the caller's thread, by `deadline` (zero:
+    // none of its own); none when it could not be read, CatalogueUnavailable
+    // when the deadline passed. Every store call here throws only
     // CatalogueUnavailable: a store failure never spends a hint's attempt.
-    std::optional<Bytes> read_data(const ObjectId&, FrameType);
+    std::optional<Bytes> read_data(const ObjectId&, FrameType,
+                                   std::chrono::milliseconds deadline = {});
     // A CONTROL object's bytes, held here or fetched from a peer; none when
     // neither has it.
     std::optional<Bytes> control_object(const ObjectId&);
