@@ -22,6 +22,21 @@ dagda::store::StorageBackendOptions backend(const StorageBackendConfig& config) 
     return out;
 }
 
+std::vector<dagda::store::StorageBackendOptions> backends(const Config& config) {
+    std::vector<dagda::store::StorageBackendOptions> out;
+    for (const auto& configured : config.storage_backends)
+        out.push_back(backend(configured));
+    return out;
+}
+
+dagda::store::CacheOptions cache(const Config& config) {
+    dagda::store::CacheOptions out;
+    out.path = config.cache.path;
+    out.max_blocks = config.cache.max_blocks;
+    out.seed = config.cache.prefer_metadata;
+    return out;
+}
+
 } // namespace
 
 dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& keys,
@@ -37,8 +52,7 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
     // Macha's replica keeps the metadata until stage 8c.
     out.heads = false;
 
-    for (const auto& configured : config.storage_backends)
-        out.pool.backends.push_back(backend(configured));
+    out.pool.backends = backends(config);
     out.pool.durability_batch_window = durability_batch_window;
     out.pool.pack_threshold = config.storage_packing.threshold;
     out.pool.pack_target_size = config.storage_packing.target_size;
@@ -49,9 +63,7 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
     out.control.pack_threshold = config.metadata_store.packing.threshold;
     out.control.pack_target_size = config.metadata_store.packing.target_size;
 
-    out.cache.path = config.cache.path;
-    out.cache.max_blocks = config.cache.max_blocks;
-    out.cache.seed = config.cache.prefer_metadata;
+    out.cache = cache(config);
 
     dagda::AdmissionOptions admission;
     admission.data_inflight_bytes = config.data_inflight_bytes;
@@ -110,6 +122,10 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
     out.maintenance.scrub_interval = config.maintenance.scrub_interval;
     out.maintenance.cpu_target = config.maintenance.cpu_target;
     return out;
+}
+
+dagda::NodeReload store_node_reload(const Config& config) {
+    return {backends(config), cache(config)};
 }
 
 } // namespace macha

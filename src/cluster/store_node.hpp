@@ -20,4 +20,8 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
                                       bool hosts_extents,
                                       std::chrono::milliseconds durability_batch_window);
 
+// What a live reload changes on the store node: its DATA backends and its
+// cache, from the same keys as its options.
+dagda::NodeReload store_node_reload(const Config& config);
+
 } // namespace macha

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/service.hpp"
 
+#include "cluster/store_node.hpp"
 #include "log.hpp"
 #include "media/ffmpeg_log.hpp"
 
@@ -44,8 +45,9 @@ void Service::reload_config() {
     configure_ffmpeg_logging(updated.ffmpeg_log_level);
     if (!progress_.complete())
         throw std::runtime_error("node local state is still recovering");
-    local_->state().reconfigure(updated);
-    local_->storage().refresh();
+    // Refuses with nothing changed (a v18 backend, a root another process
+    // holds): the reload fails before anything else takes it.
+    store_node_->reconfigure(store_node_reload(updated));
     node_.reconfigure_local(updated);
     if (services_ready_.load(std::memory_order_acquire))
         services_->reconfigure(updated);

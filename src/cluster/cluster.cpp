@@ -540,12 +540,19 @@ void NodeRuntime::follow_inbound() {
         return;
     inbound_applied_ = capable;
     const bool hosts = resolve_hosts_extents(cfg_, capable);
-    if (hosts)
-        host_.node().nodes().advertise(advert::hosts_extents, dannan::net::Bytes{1});
-    else
-        host_.node().nodes().withdraw(advert::hosts_extents);
-    // Dannan raises membership for the capability and topology for the advert.
+    // Dannan raises membership for the capability, and topology for the
+    // store's advert, which its server writes.
     (void)members_.set_flags(capable, hosts);
+    Lock lock(hosts_mutex_);
+    if (hosts_listener_)
+        hosts_listener_(hosts);
+}
+
+void NodeRuntime::follow_hosts_extents(std::function<void(bool)> listener) {
+    Lock lock(hosts_mutex_);
+    hosts_listener_ = std::move(listener);
+    if (hosts_listener_)
+        hosts_listener_(hosts_extents());
 }
 
 // The highest generation heard of is only worth chasing while some node
