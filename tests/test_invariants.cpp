@@ -1432,7 +1432,7 @@ MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recov
         },
         10s));
 
-    ClusterStatusService status(peer, peer.accounts(), peer.resources.activity, peer.resources.data,
+    ClusterStatusService status(peer, peer.accounts(), peer.resources.activity,
                                 peer.resources.memory);
     auto response = status.handle(request_for("GET", "/api/v1/status"));
     REQUIRE(response.status == 200);
@@ -1468,7 +1468,7 @@ MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recov
 MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_own_route) {
     TestCluster cluster;
     BareNode node(cluster.node_config("status-split"), cluster.keys());
-    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data,
+    ClusterStatusService status(node, node.accounts(), node.resources.activity,
                                 node.resources.memory);
 
     const auto body_of = [](const HttpResponse& response) {
@@ -1598,10 +1598,11 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
                              node.store_context());
     REQUIRE(metadata.snapshot().metadata_voters.empty());
 
-    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data,
+    ClusterStatusService status(node, node.accounts(), node.resources.activity,
                                 node.resources.memory);
     StatusSources sources;
     sources.local = &node.local_state();
+    sources.store_node = &node.store_node();
     sources.metadata = &metadata;
     const auto get = [&](std::string path) {
         auto response = status.handle(request_for("GET", std::move(path)), sources);
@@ -1909,7 +1910,7 @@ MACHA_TEST("invariants", test_status_follows_a_peer_through_telemetry_and_depart
         10s));
 
     ClusterStatusService status(first, first.accounts(), first.resources.activity,
-                                first.resources.data, first.resources.memory);
+                                first.resources.memory);
     const auto root = [&] {
         auto response = status.handle(request_for("GET", "/api/v1/status"));
         REQUIRE(response.status == 200);

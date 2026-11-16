@@ -198,17 +198,20 @@ std::map<std::string, uint64_t> NodeServices::observation_gauges() {
     }
     gauges["viewer_idle_ms"] = idle_ms(context_.activity().idle_for(WorkClass::foreground));
     gauges["loader_idle_ms"] = idle_ms(context_.activity().idle_for(WorkClass::loader));
-    const auto repair = store_.repair_diagnostics();
+    // Repair's figures are the store node's.
+    const auto repair = store_node_.store().repair_diagnostics();
+    const auto gates = store_node_.repair().gates();
     gauges["repair_push_examined"] = repair.push_examined;
     gauges["repair_pull_examined"] = repair.pull_examined;
     gauges["repair_bytes_transferred"] = repair.bytes_transferred;
     gauges["repair_passes_completed"] = repair.passes_completed;
     gauges["repair_pull_unsourceable"] = repair.pull_unsourceable;
-    gauges["repair_gate_ran"] = repair.gate_ran;
-    gauges["repair_gate_share"] = repair.gate_share;
-    gauges["repair_gate_credit"] = repair.gate_credit;
-    gauges["repair_prompt_copies"] = repair.prompt_copies;
-    gauges["repair_estimated_network_bps"] = static_cast<uint64_t>(store_.estimated_network_bps());
+    gauges["repair_gate_ran"] = gates.ran;
+    gauges["repair_gate_share"] = gates.share;
+    gauges["repair_gate_credit"] = gates.credit;
+    gauges["repair_prompt_copies"] = store_node_.store().prompt_replication_stats().copies;
+    gauges["repair_estimated_network_bps"] =
+        static_cast<uint64_t>(store_node_.store().estimated_network_bps());
     // Held for the call, so a subsystem restart cannot pull the frontend out
     // from under it.
     if (auto frontend = registry_.fuse()) {

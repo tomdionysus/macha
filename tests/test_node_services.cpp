@@ -321,17 +321,20 @@ MACHA_TEST("node_services", test_observation_gauges_follow_activity_repair_and_t
     CHECK(written.at("loader_idle_ms") < never);
     CHECK(written.at("viewer_idle_ms") == never);
 
-    // Repair's figures are the store's own.
-    const auto repair = services.store().repair_diagnostics();
+    // Repair's figures are the store node's own.
+    auto& store_node = bench.node->store_node();
+    const auto repair = store_node.store().repair_diagnostics();
+    const auto gates = store_node.repair().gates();
     CHECK(written.at("repair_push_examined") == repair.push_examined);
     CHECK(written.at("repair_pull_examined") == repair.pull_examined);
     CHECK(written.at("repair_bytes_transferred") == repair.bytes_transferred);
     CHECK(written.at("repair_passes_completed") == repair.passes_completed);
     CHECK(written.at("repair_pull_unsourceable") == repair.pull_unsourceable);
-    CHECK(written.at("repair_gate_ran") == repair.gate_ran);
-    CHECK(written.at("repair_gate_share") == repair.gate_share);
-    CHECK(written.at("repair_gate_credit") == repair.gate_credit);
-    CHECK(written.at("repair_prompt_copies") == repair.prompt_copies);
+    CHECK(written.at("repair_gate_ran") == gates.ran);
+    CHECK(written.at("repair_gate_share") == gates.share);
+    CHECK(written.at("repair_gate_credit") == gates.credit);
+    CHECK(written.at("repair_prompt_copies") ==
+          store_node.store().prompt_replication_stats().copies);
 
     // A published mount adds what it has published; withdrawn, it is gone.
     auto fuse = bench.config.fuse;
