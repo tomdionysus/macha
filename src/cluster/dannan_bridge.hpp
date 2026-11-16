@@ -27,10 +27,9 @@
 
 namespace macha {
 
-// The adverts Macha puts in its node record; Dannan carries them unread.
+// The adverts Macha puts in its node record; Dannan carries them unread. The
+// store's figures are the store node's adverts (dagda/store/placement.h).
 namespace advert {
-inline const std::string capacity = "macha/capacity";
-inline const std::string used = "macha/used";
 inline const std::string metadata_generation = "macha/metadata-generation";
 inline const std::string metadata_write_replicas = "macha/metadata-write-replicas";
 // Present while the node hosts extents, whatever its value: Dagda's name, which the
@@ -61,9 +60,9 @@ dannan::net::Message dannan_message(const RpcMessage& message);
 RpcMessage macha_message(dannan::net::Message message);
 
 // A node record as Macha's NodeInfo: place and identity from the record, the storage
-// figures, metadata generation and write floor from Macha's adverts (zero when
-// absent), inbound capability from the record's capability bit, hosts_extents from
-// the extents advert's presence.
+// capacity and use from the store's adverts, metadata generation and write floor from
+// Macha's (each zero when absent), inbound capability from the record's capability
+// bit, hosts_extents from the extents advert's presence.
 NodeInfo node_info_from(const dannan::membership::NodeRecord& record);
 
 // Macha's types with their wire rules (first cutover, section 7.2), registered before

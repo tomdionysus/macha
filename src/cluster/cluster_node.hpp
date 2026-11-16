@@ -64,11 +64,6 @@ class ClusterNode {
     static constexpr Waits peer_latency_waits = Waits::none;
     static constexpr ThreadSafety peer_latency_safety = ThreadSafety::thread_safe;
     virtual std::optional<std::chrono::milliseconds> peer_latency(const NodeId& peer) const = 0;
-
-    // The DATA pool's figures, published to peers with this node's info.
-    static constexpr Waits advertise_storage_waits = Waits::none;
-    static constexpr ThreadSafety advertise_storage_safety = ThreadSafety::thread_safe;
-    virtual void advertise_storage(uint64_t used, uint64_t capacity) = 0;
 };
 
 } // namespace macha

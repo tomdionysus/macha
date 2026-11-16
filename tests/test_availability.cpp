@@ -4,7 +4,6 @@
 
 #include "api/item_availability.hpp"
 #include "filesystem/filesystem.hpp"
-#include "ledger/availability.hpp"
 #include "metadata/namespace_tree.hpp"
 
 #include <algorithm>

@@ -3,7 +3,6 @@
 // The catalogue's maintenance inventory (head, repair, read) against a fake
 // metadata view, so no metadata manager is needed behind it.
 #include "catalogue/catalogue.hpp"
-#include "cluster/distributed_store.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "test_support.hpp"
 

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "cluster/data_work.hpp"
-#include "cluster/distributed_store.hpp"
 #include "cluster/membership.hpp"
 #include "contract/thread_safety.hpp"
 #include "dagda/context.h"

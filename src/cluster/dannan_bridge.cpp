@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/dannan_bridge.hpp"
 
+#include <dagda/store/placement.h>
+
 #include "log.hpp"
 
 #include <algorithm>
@@ -255,8 +257,8 @@ NodeInfo node_info_from(const dannan::membership::NodeRecord& record) {
     node.port = record.port;
     node.failure_domain = record.failure_domain;
     node.seen_unix_ms = record.seen_unix_ms;
-    node.capacity = record.advert_u64(advert::capacity).value_or(0);
-    node.used = record.advert_u64(advert::used).value_or(0);
+    node.capacity = record.advert_u64(dagda::store::capacity_advert).value_or(0);
+    node.used = dagda::store::used_of(record);
     node.metadata_generation = record.advert_u64(advert::metadata_generation).value_or(0);
     node.metadata_write_replicas_required =
         static_cast<uint32_t>(record.advert_u64(advert::metadata_write_replicas).value_or(0));

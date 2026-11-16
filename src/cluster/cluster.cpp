@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/cluster.hpp"
+
 #include "cluster/call_deadline.hpp"
 #include "cluster/dannan_bridge.hpp"
 #include "cluster/rpc_wait.hpp"
 #include "cluster/telemetry_bridge.hpp"
 #include "diagnostics.hpp"
+#include <dagda/store/placement.h>
 
 #include "codec.hpp"
 #include "log.hpp"
@@ -143,22 +145,25 @@ dannan::NodeConfig NodeRuntime::node_config() {
 }
 
 void NodeRuntime::write_telemetry(dannan::status::Telemetry& record) const {
-    // Telemetry runs during recovery: unready planes report zero capacity and
-    // usage rather than the node vanishing from the cluster.
+    // The store's figures from this node's own record, as its server last
+    // advertised them. Telemetry runs during recovery: a store not yet open
+    // reports zero capacity and usage rather than the node vanishing.
+    const auto self = host_.node().nodes().self();
+    const auto figures = dagda::store::figures_of(self).value_or(dagda::store::StoreFigures{});
     HostedTelemetry hosted;
-    hosted.storage_capacity = advertised_storage_capacity_.load(std::memory_order_relaxed);
-    hosted.storage_used = advertised_storage_used_.load(std::memory_order_relaxed);
-    hosted.cache_capacity = advertised_cache_capacity_.load(std::memory_order_relaxed);
-    hosted.cache_used = advertised_cache_used_.load(std::memory_order_relaxed);
+    hosted.storage_capacity = self.advert_u64(dagda::store::capacity_advert).value_or(0);
+    hosted.storage_used = figures.used;
+    hosted.cache_capacity = figures.cache_capacity;
+    hosted.cache_used = figures.cache_used;
     hosted.metadata_generation = advertised_metadata_generation_.load(std::memory_order_relaxed);
-    hosted.storage_backends_online = advertised_backends_online_.load(std::memory_order_relaxed);
+    hosted.storage_backends_online = static_cast<uint32_t>(figures.backends_online);
     hosted.api_endpoint = advertised_api_endpoint(cfg_.catalogue.api, members_.self().host);
     hosted.playback = enforced_playback_budgets(cfg_.streaming);
     if (cfg_.streaming.enabled)
         hosted.playback.transcode_rates = transcode_rates_.summary();
-    hosted.cache.hits = advertised_cache_hits_.load(std::memory_order_relaxed);
-    hosted.cache.misses = advertised_cache_misses_.load(std::memory_order_relaxed);
-    hosted.cache.evictions = advertised_cache_evictions_.load(std::memory_order_relaxed);
+    hosted.cache.hits = figures.cache_hits;
+    hosted.cache.misses = figures.cache_misses;
+    hosted.cache.evictions = figures.cache_evictions;
     write_hosted_telemetry(record, hosted);
 }
 
@@ -172,8 +177,10 @@ NodeReadiness NodeRuntime::readiness() const {
     // The store's planes, as the store node marks them on the node's readiness.
     const auto& planes = readable_node().readiness();
     out.data_storage_ready = planes.has("data_storage");
+    // No disk online, as the store's server last advertised its figures.
+    const auto figures = dagda::store::figures_of(host_.node().nodes().self());
     out.data_storage_degraded = out.data_storage_ready && !cfg_.storage_backends.empty() &&
-                                advertised_backends_online_.load(std::memory_order_relaxed) == 0;
+                                figures && figures->backends_online == 0;
     out.control_storage_ready = planes.has("control_storage");
     out.cache_ready = planes.has("cache");
     out.retention_ready = planes.has("retention");
@@ -187,28 +194,10 @@ NodeReadiness NodeRuntime::readiness() const {
 }
 
 void NodeRuntime::publish_self() {
-    auto& nodes = host_.node().nodes();
-    nodes.advertise(advert::capacity,
-                    dannan::membership::u64_advert(
-                        advertised_storage_capacity_.load(std::memory_order_relaxed)));
-    nodes.advertise(advert::used, dannan::membership::u64_advert(
-                                      advertised_storage_used_.load(std::memory_order_relaxed)));
-    nodes.advertise(advert::metadata_generation,
-                    dannan::membership::u64_advert(
-                        advertised_metadata_generation_.load(std::memory_order_relaxed)));
-}
-
-void NodeRuntime::advertise_storage(uint64_t used, uint64_t capacity) {
-    members_.storage(used, capacity);
-    advertised_storage_used_.store(used, std::memory_order_relaxed);
-    advertised_storage_capacity_.store(capacity, std::memory_order_relaxed);
-    auto& nodes = host_.node().nodes();
-    nodes.advertise(advert::capacity, dannan::membership::u64_advert(capacity));
-    nodes.advertise(advert::used, dannan::membership::u64_advert(used));
-}
-
-void NodeRuntime::advertise_storage_backends(uint32_t online) {
-    advertised_backends_online_.store(online, std::memory_order_relaxed);
+    host_.node().nodes().advertise(
+        advert::metadata_generation,
+        dannan::membership::u64_advert(
+            advertised_metadata_generation_.load(std::memory_order_relaxed)));
 }
 
 void NodeRuntime::advertise_metadata_generation(uint64_t generation) {
@@ -216,14 +205,6 @@ void NodeRuntime::advertise_metadata_generation(uint64_t generation) {
     advertised_metadata_generation_.store(generation, std::memory_order_relaxed);
     host_.node().nodes().advertise(advert::metadata_generation,
                                    dannan::membership::u64_advert(generation));
-}
-
-void NodeRuntime::advertise_cache(uint64_t capacity, uint64_t used, const CacheActivity& activity) {
-    advertised_cache_capacity_.store(capacity, std::memory_order_relaxed);
-    advertised_cache_used_.store(used, std::memory_order_relaxed);
-    advertised_cache_hits_.store(activity.hits, std::memory_order_relaxed);
-    advertised_cache_misses_.store(activity.misses, std::memory_order_relaxed);
-    advertised_cache_evictions_.store(activity.evictions, std::memory_order_relaxed);
 }
 
 bool NodeRuntime::wait_local_state_ready(std::chrono::milliseconds timeout) {

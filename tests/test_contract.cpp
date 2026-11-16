@@ -4,7 +4,6 @@
 // cursor, budget, page. Each is tested over its whole phase space.
 #include "catalogue/catalogue.hpp"
 #include "cluster/data_work.hpp"
-#include "cluster/distributed_store.hpp"
 #include "contract/published.hpp"
 #include "contract/walk.hpp"
 #include "contract/work.hpp"
