@@ -78,6 +78,8 @@ struct MaintenanceDependencies {
     MetadataView& metadata;
     MetadataMaintenance& metadata_upkeep;
     CatalogueManager& catalogue;
+    // Its path table follows each survey of the store node's.
+    AvailabilityService& availability;
     // Pruned when metadata changes.
     MediaInformationService& media_information;
     // Wakes the pass; it turns what it sees into work.
@@ -135,6 +137,7 @@ class Maintenance final {
     MetadataView& metadata_;
     MetadataMaintenance& metadata_upkeep_;
     CatalogueManager& catalogue_;
+    AvailabilityService& availability_;
     MediaInformationService& media_information_;
     NodeEvents& events_;
     MaintenancePort& port_;

@@ -41,8 +41,8 @@ Maintenance::Maintenance(MaintenanceDependencies dependencies)
       metadata_server_(dependencies.metadata_server), store_node_(dependencies.store_node),
       context_(dependencies.store_node.context()), metadata_(dependencies.metadata),
       metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
-      media_information_(dependencies.media_information), events_(dependencies.events),
-      port_(dependencies.port), clock_(std::move(dependencies.clock)),
+      availability_(dependencies.availability), media_information_(dependencies.media_information),
+      events_(dependencies.events), port_(dependencies.port), clock_(std::move(dependencies.clock)),
       maintenance_trace_(std::move(dependencies.trace)),
       maintenance_stage_hook_(std::move(dependencies.stage_hook)),
       constructed_(dependencies.constructed) {}
@@ -119,6 +119,19 @@ void Maintenance::run(std::stop_token stop) {
         port_.wakeups.fetch_add(1, std::memory_order_relaxed);
         const auto enter_stage = [this](const char* name) {
             port_.stage.store(name, std::memory_order_release);
+        };
+        // The store's survey, then the path table over it at this node's head.
+        const auto survey_and_table = [&] {
+            enter_stage("availability");
+            try {
+                (void)repair.survey(pause);
+                (void)availability_.refresh(metadata_.local(),
+                                            store_node_.availability().snapshot(), pause);
+            } catch (const MaintenanceStopping&) {
+                throw;
+            } catch (const std::exception& error) {
+                Log::debug("availability survey deferred: " + std::string(error.what()));
+            }
         };
         enter_stage("pass-begin");
         auto now = clock_->now();
@@ -335,14 +348,7 @@ void Maintenance::run(std::stop_token stop) {
                     if (inventory->rebuilt)
                         gc_quiescent_until = clock_->now() + policy.foreground_quiet;
                 }
-                enter_stage("availability");
-                try {
-                    (void)repair.survey(pause);
-                } catch (const MaintenanceStopping&) {
-                    throw;
-                } catch (const std::exception& error) {
-                    Log::debug("availability survey deferred: " + std::string(error.what()));
-                }
+                survey_and_table();
 
                 if (network_due) {
                     if (maintenance_stage_hook_)
@@ -402,14 +408,7 @@ void Maintenance::run(std::stop_token stop) {
                                                                  : Clock::time_point::max();
                 }
             } else {
-                enter_stage("availability");
-                try {
-                    (void)repair.survey(pause);
-                } catch (const MaintenanceStopping&) {
-                    throw;
-                } catch (const std::exception& error) {
-                    Log::debug("availability survey deferred: " + std::string(error.what()));
-                }
+                survey_and_table();
             }
 
             // The store's local stages, each behind its own gate and credit,

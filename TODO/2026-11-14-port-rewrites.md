@@ -270,6 +270,16 @@ commit that compiles; Macha's store stays compiled only while a step still needs
    now (A16, B16); its `trie_diff` route goes.
 6. The trace clock into `MaintenanceOptions::time`/`wall`; CONTROL presence for catalogue `ready` (B12b); artwork
    read with a deadline, timeout 503 (B13, an API change to announce).
+Done so far (2026-11-16): step 1 (`62f63f2`), step 2 (`14d34b6`, with the tests on the store node's parts
+`b0e2c61`), step 6's artwork deadline (`bfd13ec`; catalogue `ready` was already on CONTROL presence through Context),
+step 5 and step 6's trace clock (below). Step 5: `AvailabilityService` no longer surveys; each pass, after the store
+node's survey (`Repair::survey`), it builds the path table over `Node::availability().snapshot()` and this node's
+holdings from the store node's ledger, kept, followed through the tree's change, or walked, and persisted as before;
+its `trie_diff` route and the sightings files' `UnreferencedSince` and Macha's `RetentionLedger` leave `NodeServices`.
+The survey type is still Macha's twin, converted (`survey_of`), until the three survey cases retire with Dagda's
+gate and Macha's `ledger/availability` goes; then `AvailabilitySurvey`, `PeerDiff` and `HeldFn` alias
+`dagda::ledger`'s (Dagda agreed). The trace clock: `MaintenanceClock` is Dannan's `TimeSource` and `WallClock`, and
+`Service` hands it to the store node as `MaintenanceOptions::time` and `wall`.
 7. The tests: each case's fate from `../dagda/TODO/2026-11-05-test-mapping.md` (RETIRE against its named Dagda case,
    REWRITE over the node fixtures, KEEP), recorded case by case; then Macha's store code removed (plan S.1's list).
 

@@ -43,10 +43,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                                                  retain_on_peers(origin, sequence, claims);
                                              }},
                 steady_time_source()),
-      ledger_(local_.retention(), local_.data(), local_.control()),
-      data_unreferenced_(node_.config().state_path / "retention" / "unreferenced-data.bin"),
-      control_unreferenced_(node_.config().state_path / "retention" / "unreferenced-control.bin"),
-      availability_(node_, context_, ledger_, resources_.events, routes_,
+      availability_(context_, store_node_.ledger(),
                     node_.config().state_path / "availability" / "last-survey.bin"),
       catalogue_(node_, metadata_server_, context_, metadata_),
       catalogue_installer_(catalogue_, resources_.events),
@@ -132,8 +129,8 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       files_api_(filesystem_, availability_),
       maintenance_(MaintenanceDependencies{
           node_, local_, metadata_server_, store_node_, metadata_, metadata_, catalogue_,
-          media_information_, resources_.events, port_, instruments_.clock, instruments_.trace,
-          instruments_.maintenance_stage_hook, instruments_.constructed}) {
+          availability_, media_information_, resources_.events, port_, instruments_.clock,
+          instruments_.trace, instruments_.maintenance_stage_hook, instruments_.constructed}) {
     routes_.bind(MessageType::get_ingest_jobs,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return RpcMessage{MessageType::ingest_jobs_reply,

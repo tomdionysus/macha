@@ -49,10 +49,14 @@ Service::Service(const Config& config, ClusterKeys keys,
     // The node holds the state path's lock from here.
     books_.transcode_rates.open();
     // Registers the store's message types and declares its planes; opens nothing.
-    store_node_ = std::make_unique<dagda::Node>(
-        node_.node(),
-        store_node_options(node_.config(), keys, node_.hosts_extents(), durability_batch_window_),
-        dagda::Node::OpenLater{});
+    // The node's maintenance steps run on the pass's clock, which a trace
+    // fixture moves by hand.
+    auto store_options =
+        store_node_options(node_.config(), keys, node_.hosts_extents(), durability_batch_window_);
+    store_options.maintenance.time = clock_.get();
+    store_options.maintenance.wall = clock_.get();
+    store_node_ = std::make_unique<dagda::Node>(node_.node(), std::move(store_options),
+                                                dagda::Node::OpenLater{});
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,

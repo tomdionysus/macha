@@ -186,9 +186,6 @@ class NodeServices {
 
     PlaybackTracker playback_;
     MetadataManager metadata_;
-    RetentionLedger ledger_;
-    UnreferencedSince data_unreferenced_;
-    UnreferencedSince control_unreferenced_;
     AvailabilityService availability_;
     CatalogueManager catalogue_;
     CatalogueInstaller catalogue_installer_;
