@@ -584,7 +584,7 @@ MACHA_TEST("availability", test_what_only_a_host_out_of_reach_holds_is_unavailab
     REQUIRE(wait_until(
         [&] {
             return std::all_of(ids.begin(), ids.end(), [&](const ObjectId& id) {
-                return second->local_state().data().has(id);
+                return second->store_node().data().has(id);
             });
         },
         20s));
@@ -602,7 +602,7 @@ MACHA_TEST("availability", test_what_only_a_host_out_of_reach_holds_is_unavailab
     second.reset();
     REQUIRE(wait_until([&] { return first.node().membership().active().size() == 1; }, 20s));
     for (const auto& id : ids)
-        REQUIRE(first.local_state().data().remove(id));
+        REQUIRE(first.store_node().data().remove(id));
     REQUIRE(retry_while_not_ready(
         [&] { write_file(first.filesystem(), "/after.bin", pattern(extent, 3)); }));
     const auto kept = [&] {
@@ -680,7 +680,7 @@ MACHA_TEST("availability", test_a_failed_diff_is_asked_again_on_a_timer) {
     // tell whether the first node holds it.
     refusing->store(true);
     const auto lost = first.filesystem().getattr("/kept.bin").extents.at(0).id;
-    REQUIRE(second.local_state().data().remove(lost));
+    REQUIRE(second.store_node().data().remove(lost));
     REQUIRE(wait_until(
         [&] {
             const auto snapshot = second.availability().snapshot();
@@ -760,8 +760,8 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
     // One extent of one file leaves both nodes; the next commit moves the
     // namespace, and both nodes survey again.
     const auto lost = first.filesystem().getattr("/dir/holed.bin").extents.at(1).id;
-    REQUIRE(first.local_state().data().remove(lost));
-    REQUIRE(second.local_state().data().remove(lost));
+    REQUIRE(first.store_node().data().remove(lost));
+    REQUIRE(second.store_node().data().remove(lost));
     write_file(first.filesystem(), "/later.bin", pattern(extent, 3));
 
     for (auto* service : {&first, &second}) {
@@ -1010,14 +1010,14 @@ MACHA_TEST("availability", test_a_disk_coming_back_is_surveyed_without_a_namespa
     auto away = backend;
     away += ".away";
     std::filesystem::rename(backend, away);
-    service.local_state().data().refresh();
-    REQUIRE(service.local_state().data().online_backends() == 0);
+    service.store_node().data().refresh();
+    REQUIRE(service.store_node().data().online_backends() == 0);
     REQUIRE(wait_until([&] { return local() == 0u; }, 20s));
 
     const auto head = service.metadata_manager().snapshot_view().hash;
     std::filesystem::rename(away, backend);
-    service.local_state().data().refresh();
-    REQUIRE(service.local_state().data().online_backends() == 1);
+    service.store_node().data().refresh();
+    REQUIRE(service.store_node().data().online_backends() == 1);
     CHECK(wait_until([&] { return local() == 2u; }, 20s));
     CHECK(service.metadata_manager().snapshot_view().hash == head);
     service.stop();

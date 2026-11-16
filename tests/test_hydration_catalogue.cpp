@@ -122,9 +122,6 @@ class CatalogueNode {
     MetadataManager& metadata() {
         return node_.metadata();
     }
-    DistributedStore& store() {
-        return node_.store();
-    }
     CatalogueManager& catalogue() {
         return *catalogue_;
     }
@@ -4198,7 +4195,7 @@ MACHA_TEST("hydration_catalogue", test_ingest_blocks_while_storage_is_unavailabl
     CatalogueNode node("ingest-storage");
     constexpr size_t file_bytes = 512 * 1024;
     const auto roots = make_import_roots(node.path(), 1, file_bytes);
-    auto& data = node.node().local_state().data();
+    auto& data = node.node().store_node().data();
     const auto backend = node.config().storage_backends.front().path;
     auto away = backend;
     away += ".away";
@@ -4311,8 +4308,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // genesis while its bootstrap peer has not yet entered active membership.
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
-    DistributedStore store1(n1, n1.local_state(), n1.resources.activity, n1.resources.data,
-                            n1.resources.memory, n1.resources.events);
     MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server(), n1.store_context());
     CatalogueManager catalogue1(n1, n1.metadata_server(), n1.store_context(), metadata1);
 
@@ -4324,8 +4319,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
 
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
-    DistributedStore store2(n2, n2.local_state(), n2.resources.activity, n2.resources.data,
-                            n2.resources.memory, n2.resources.events);
     MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), n2.store_context());
     CatalogueManager catalogue2(n2, n2.metadata_server(), n2.store_context(), metadata2);
 
@@ -5592,9 +5585,9 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     // potentially unseen accepted branch.
     REQUIRE(wait_until(
         [&] {
-            return !s1.local_state().data().has(first_art.id) &&
-                   !s2.local_state().data().has(first_art.id) &&
-                   !s3.local_state().data().has(first_art.id);
+            return !s1.store_node().data().has(first_art.id) &&
+                   !s2.store_node().data().has(first_art.id) &&
+                   !s3.store_node().data().has(first_art.id);
         },
         10s));
 
@@ -5900,7 +5893,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
 
     const auto unreclaimed = [&] {
         return std::none_of(superseded.begin(), superseded.end(), [&](const ObjectId& id) {
-            return s1.local_state().data().has(id) || s2.local_state().data().has(id);
+            return s1.store_node().data().has(id) || s2.store_node().data().has(id);
         });
     };
     const auto gc_started = Clock::now();
@@ -5917,8 +5910,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         // Name what is left and on which node.
         std::string remaining;
         for (const auto& id : superseded) {
-            const bool on1 = s1.local_state().data().has(id);
-            const bool on2 = s2.local_state().data().has(id);
+            const bool on1 = s1.store_node().data().has(id);
+            const bool on2 = s2.store_node().data().has(id);
             if (!on1 && !on2)
                 continue;
             if (!remaining.empty())
@@ -5937,12 +5930,10 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
                 claims += ' ';
             claims += to_string(id).substr(0, 12);
             claims += ":s1=";
-            claims +=
-                s1.local_state().retention().retained(RetentionClass::data, id) ? "held" : "free";
+            claims += s1.store_node().claims().retained(RetentionClass::data, id) ? "held" : "free";
             claims += ",s2=";
-            claims +=
-                s2.local_state().retention().retained(RetentionClass::data, id) ? "held" : "free";
-            const auto state = s2.local_state().retention().claims(RetentionClass::data, id);
+            claims += s2.store_node().claims().retained(RetentionClass::data, id) ? "held" : "free";
+            const auto state = s2.store_node().claims().claims(RetentionClass::data, id);
             claims += "(adds:";
             for (const auto& [origin, sequence] : state.adds)
                 claims += to_string(origin).substr(0, 6) + "=" + std::to_string(sequence) + ";";

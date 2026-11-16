@@ -1151,8 +1151,8 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
                       [&](const auto& art) { return art.id == embedded_id; }));
     CHECK(std::any_of(music_album->artwork.begin(), music_album->artwork.end(),
                       [&](const auto& art) { return art.id == provider_id; }));
-    CHECK(service.local_state().data().has(embedded_id));
-    CHECK(service.local_state().data().has(provider_id));
+    CHECK(service.store_node().data().has(embedded_id));
+    CHECK(service.store_node().data().has(provider_id));
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_probe_failure_reports_why_it_failed) {

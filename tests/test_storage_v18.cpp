@@ -69,7 +69,6 @@ class StorageClusterNode {
     Config config_;
     const ClusterKeys& keys_;
     std::unique_ptr<BareNode> node_;
-    std::unique_ptr<DistributedStore> store_;
     std::unique_ptr<MetadataManager> metadata_;
     std::unique_ptr<CatalogueManager> catalogue_;
     bool started_{};
@@ -102,9 +101,6 @@ class StorageClusterNode {
         node_->start();
         started_ = true;
         REQUIRE(node_->wait_local_state_ready(10s));
-        store_ = std::make_unique<DistributedStore>(
-            *node_, node_->local_state(), node_->resources.activity, node_->resources.data,
-            node_->resources.memory, node_->resources.events);
         metadata_ = std::make_unique<MetadataManager>(
             *node_, node_->local_state(), node_->metadata_server(), node_->store_context());
         catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->metadata_server(),
@@ -122,7 +118,6 @@ class StorageClusterNode {
         REQUIRE(node_);
         catalogue_.reset();
         metadata_.reset();
-        store_.reset();
         if (started_)
             node_->stop();
         node_.reset();
@@ -131,14 +126,6 @@ class StorageClusterNode {
     BareNode& node() {
         REQUIRE(node_);
         return *node_;
-    }
-    LocalState& local_state() {
-        REQUIRE(node_);
-        return node_->local_state();
-    }
-    DistributedStore& store() {
-        REQUIRE(store_);
-        return *store_;
     }
     MetadataManager& metadata() {
         REQUIRE(metadata_);
@@ -197,7 +184,7 @@ Bytes preferred_for(NodeRuntime& observer, const NodeId& preferred, size_t bytes
     throw std::runtime_error("could not find object preferring requested node");
 }
 
-void fill_data_store(StoragePool& store, size_t object_bytes = 96 * 1024) {
+template <class Pool> void fill_data_store(Pool& store, size_t object_bytes = 96 * 1024) {
     for (unsigned i = 0; i < 4096; ++i) {
         auto data = pattern(object_bytes, static_cast<uint8_t>(i));
         data[0] ^= static_cast<uint8_t>(i * 17U);
@@ -211,9 +198,10 @@ void fill_data_store(StoragePool& store, size_t object_bytes = 96 * 1024) {
 // Kept integrated: placement across two real nodes' memberships and the
 // catalogue's split between control and DATA storage on both.
 //
-// A full preferred node: an r=1 DATA put spills to the next candidate, and
-// artwork follows it; the catalogue's control objects ignore the DATA quota
-// and land on both metadata replicas; the small node reads the artwork back.
+// A full preferred node: artwork staged on the large node stays off the full
+// one; the catalogue's control objects ignore the DATA quota and land on both
+// metadata replicas; the small node reads the artwork back. The store's own
+// spill of an r=1 put is Dagda's DistributedStore.AFullPreferredNodeSpillsDataButNotControl.
 MACHA_TEST("storage_v18", test_a_full_preferred_node_spills_data_but_not_control) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto small_port = free_port();
@@ -237,13 +225,7 @@ MACHA_TEST("storage_v18", test_a_full_preferred_node_spills_data_but_not_control
         }
     }));
 
-    fill_data_store(small.local_state().data());
-    const auto data = preferred_for(large.node(), small.node().node_id(), 128 * 1024, 77);
-    const auto id = object_id(data);
-    REQUIRE(large.store().put(id, data));
-    CHECK(!small.local_state().data().has(id));
-    CHECK(large.local_state().data().has(id));
-    CHECK(large.store().get(id) == std::optional<Bytes>{data});
+    fill_data_store(small.node().local_store());
 
     const auto art_bytes = preferred_for(large.node(), small.node().node_id(), 128 * 1024, 123);
     auto art = large.catalogue().stage_artwork("poster", "image/jpeg", art_bytes);

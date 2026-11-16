@@ -540,13 +540,13 @@ MACHA_TEST("maintenance_trace", test_trace_backend_offline_and_back) {
     auto away = node.backend();
     away += ".away";
     std::filesystem::rename(node.backend(), away);
-    REQUIRE(wait_until([&] { return service.local_state().data().online_backends() == 0; }, 5s));
+    REQUIRE(wait_until([&] { return service.store_node().data().online_backends() == 0; }, 5s));
     node.advance(100ms);
     node.step("backend offline");
     node.advance(10min);
     node.step("offline past the back-off");
     std::filesystem::rename(away, node.backend());
-    REQUIRE(wait_until([&] { return service.local_state().data().online_backends() == 1; }, 5s));
+    REQUIRE(wait_until([&] { return service.store_node().data().online_backends() == 1; }, 5s));
     node.advance(100ms);
     node.step("backend back");
     check_against_fixture("backend-offline", node.trace());
@@ -566,8 +566,8 @@ MACHA_TEST("maintenance_trace", test_trace_claimed_objects_lost) {
     }
     node.advance(100ms);
     node.step("three files written");
-    for (const auto& id : service.local_state().retention().retained_ids(RetentionClass::data))
-        REQUIRE(service.local_state().data().remove(id));
+    for (const auto& id : service.store_node().claims().retained_ids(RetentionClass::data))
+        REQUIRE(service.store_node().data().remove(id));
     node.advance(10min);
     // Nothing is walked: repair waits for an event, and a lost file is not one.
     node.step("their objects lost");
@@ -682,16 +682,16 @@ MACHA_TEST("maintenance_trace",
         },
         10s));
     node.advance(100ms);
-    REQUIRE(!peer->local_state().data().has(id));
+    REQUIRE(!peer->store_node().data().has(id));
     // A pass that begins with no viewer present and meets one in its step.
     node.advance_exactly(node.config().maintenance.foreground_quiet * 4);
-    REQUIRE(!peer->local_state().data().has(id));
+    REQUIRE(!peer->store_node().data().has(id));
 
     // The viewer has gone. Nothing else is due, so only repair's own wake can
     // deliver the copy.
     viewer_arrives = false;
     node.advance_exactly(node.config().maintenance.interval * 3);
-    REQUIRE(wait_until([&] { return peer->local_state().data().has(id); }, 5s));
+    REQUIRE(wait_until([&] { return peer->store_node().data().has(id); }, 5s));
     peer->stop();
 }
 
@@ -714,7 +714,7 @@ MACHA_TEST("maintenance_trace", test_trace_incomplete_catalogue_and_release_hori
     node.step("catalogue item and a file added");
     const auto root = service.metadata_manager().snapshot().catalogue_root;
     REQUIRE(root.has_value());
-    REQUIRE(service.local_state().control().remove(*root));
+    REQUIRE(service.store_node().control().remove(*root));
     fs.unlink("/claimed.bin");
     node.advance(100ms);
     node.step("catalogue root lost, file deleted");

@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// In-suite microbenchmarks for the claim walk's per-object cost, has() on the
-// DATA store, and the probes' own cost. Each prints one line,
+// In-suite microbenchmarks for the observation probes' own cost. Each prints one line,
 // "BENCH name=<name> ns_per_op=<n> ops=<n>"; run with
 // `--filter baseline --verbose`. They assert only that the timed operation
 // did its work.
-#include "ledger/retention_ledger.hpp"
 #include "observation.hpp"
-#include "service/claim_walk.hpp"
-#include "storage/retention.hpp"
-#include "storage/storage_pool.hpp"
 #include "test_backend_support.hpp"
 
-#include <cstring>
 #include <iostream>
 #include <limits>
 
@@ -22,51 +16,12 @@ using namespace macha::test_support;
 
 namespace {
 
-constexpr size_t object_count = 2000;
-
-// 4 KiB of pattern with its first eight bytes replaced by n, so every n
-// names a distinct object.
-Bytes numbered(uint64_t n) {
-    auto bytes = pattern(4096);
-    std::memcpy(bytes.data(), &n, sizeof(n));
-    return bytes;
-}
-
 void report(std::string_view name, Clock::duration elapsed, uint64_t ops) {
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
     std::cout << "BENCH name=" << name
               << " ns_per_op=" << (ops ? ns / static_cast<int64_t>(ops) : 0) << " ops=" << ops
               << '\n';
 }
-
-// A one-backend DATA pool holding object_count small objects, and the ids of
-// as many objects it does not hold.
-struct Populated {
-    TempDir dir;
-    std::unique_ptr<StoragePool> pool;
-    std::vector<ObjectId> present;
-    std::vector<ObjectId> absent;
-    ClusterKeys keys;
-
-    Populated() {
-        const auto keyfile = dir.path() / "key";
-        write_key(keyfile);
-        keys = load_cluster_keys(keyfile);
-        const auto backend = dir.path() / "data";
-        std::filesystem::create_directories(backend);
-        pool = std::make_unique<StoragePool>(
-            dir.path() / "pool-state", random_node_id(),
-            std::vector<StorageBackendConfig>{{backend, 1ULL << 30}}, keys.storage);
-        REQUIRE(wait_until([&] { return pool->online_backends() == 1; }));
-        for (size_t i = 0; i < object_count; ++i) {
-            const auto bytes = numbered(i);
-            const auto id = object_id(bytes);
-            REQUIRE(pool->put(id, bytes));
-            present.push_back(id);
-            absent.push_back(object_id(numbered(i + object_count)));
-        }
-    }
-};
 
 MACHA_FAST_TEST("baseline", test_baseline_observation_probe_costs) {
     constexpr uint64_t ops = 1'000'000;
