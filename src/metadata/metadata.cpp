@@ -1960,7 +1960,7 @@ MetadataReplica::MetadataReplica(const std::filesystem::path& r, std::array<uint
       namespace_applier_(std::move(namespace_applier)),
       accept_pristine_genesis_authority_(accept_pristine_genesis_authority),
       materialized_history_limit_bytes_(materialization_cache_limit_bytes) {
-    std::filesystem::create_directories(checkpoint_p_.parent_path());
+    durable_create_directories(checkpoint_p_.parent_path());
 
     auto valid_seed = [&]() -> std::optional<MetadataRecord> {
         if (!recovery_seed || !valid_metadata_record(*recovery_seed))

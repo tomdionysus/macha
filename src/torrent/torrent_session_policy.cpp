@@ -95,7 +95,6 @@ std::optional<lt::add_torrent_params> load_torrent_resume(const std::filesystem:
 
 void store_torrent_resume(const std::filesystem::path& path, const lt::add_torrent_params& params) {
     const auto buffer = lt::write_resume_data_buf(params);
-    std::filesystem::create_directories(path.parent_path());
     durable_replace_file(path, std::string_view(buffer.data(), buffer.size()));
 }
 
