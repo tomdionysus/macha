@@ -86,8 +86,11 @@ Macha's to touch, we wait for Dagda's redesign):
    **`d2872de` carries a regression under load** (Dagda's word, 2026-11-17; its redesign document, "What stage 3
    measured"): each copy now moves once and unpaced rejoins are a third to a half faster, but a rejoin with a viewer
    on the holder took 127-163 s against 38-64 s, all three rounds. Suspected, not proven: the joiner promises a whole
-   offered batch, then waits on the paced holder with a doubling backoff. Dagda's proposed fix is with the maintainer. Until it
-   lands, step 4 builds on `2a8d24b` (stage 2), or on `d2872de` only for compiling, never for a measurement under load.
+   offered batch, then waits on the paced holder with a doubling backoff. **Fixed at `d119d14`** (Dagda's word,
+   2026-11-17; gate on build-1 1133 ran, 1130 passed, 3 skipped): a holder offers only what it will send now, and a
+   promised pull is rechecked every second; under a viewer 32.5-38.3 s against 34.4-37.9 s before stage 3, unpaced
+   large rejoin 20.6-29.3 s against 36.2-52.5 s. No ported case changed, nothing new to bind. `d119d14` is now
+   step 4's candidate; `d2872de` alone is not.
 5. The first suite run on a Pi; fix forward. It runs on Dagda's current repair, which has the live defect below, so
    the comparison with 0.94.2 stays like for like.
 
