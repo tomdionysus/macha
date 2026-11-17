@@ -17,6 +17,8 @@
 #include "test_framework.hpp"
 #include "types.hpp"
 
+#include <dannan/identity/key_custody.h>
+
 #include <arpa/inet.h>
 #include <atomic>
 #include <cerrno>
@@ -256,6 +258,29 @@ inline void write_key(const std::filesystem::path& path) {
     REQUIRE(out.good());
 }
 
+// Key custody for a test node, made as an operator makes it: the root sealed in the state
+// directory and handed back as the systemd credential `macha-custody`, read from a
+// directory beside the state. The store keeps its ledgers under the node-local key custody
+// derives, so a node without custody cannot open its store. Kept across restarts.
+inline void give_custody(Config& c) {
+    const auto credentials =
+        c.state_path.parent_path() / (c.state_path.filename().string() + ".credentials");
+    std::filesystem::create_directories(c.state_path);
+    std::filesystem::create_directories(credentials);
+    c.custody.credential = "macha-custody";
+    c.custody.credentials_directory = credentials;
+    if (dannan::identity::KeyCustody::exists(c.state_path))
+        return;
+    const auto root = dannan::identity::KeyCustody::create(
+        c.state_path,
+        dannan::identity::KeySource::systemd_credential("macha-custody", credentials));
+    REQUIRE(root.has_value());
+    std::ofstream out(credentials / "macha-custody", std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(root->reveal().data()),
+              static_cast<std::streamsize>(root->size()));
+    REQUIRE(out.good());
+}
+
 inline Config config_for(const std::filesystem::path& path, const std::filesystem::path& key,
                          uint16_t port, std::vector<Endpoint> bootstrap = {},
                          ConfigProfile profile = ConfigProfile::functional) {
@@ -307,6 +332,7 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
         c.torrent.enabled = false;
         c.heartbeat = 50ms;
     }
+    give_custody(c);
     return c;
 }
 
