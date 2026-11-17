@@ -83,6 +83,9 @@ class Service {
     // registered before node_ starts, its store opened on the startup thread, stopped after the
     // services and before node_.
     std::unique_ptr<dagda::Node> store_node_;
+    // Set once store_node_'s store is open, by the startup thread: its activity clock is
+    // valid from then until store_node_ goes.
+    std::atomic_bool store_open_{};
     // After the node, whose ledger they charge; stopped before it.
     NodeResources resources_;
     // After the node, whose transport carries its gossip; started after the
@@ -125,6 +128,9 @@ class Service {
     std::map<std::string, uint64_t> observation_gauges();
 
     void initialise_services(const std::stop_token&);
+    // How long since a viewer was last present, on the store node's clock; 24 h before its
+    // store is open.
+    std::chrono::milliseconds viewer_idle_for();
     void wait_services_ready();
     std::string describe_readiness_stall() const;
     HttpResponse handle_http(const HttpRequest&);

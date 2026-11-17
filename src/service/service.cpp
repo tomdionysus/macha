@@ -59,7 +59,8 @@ Service::Service(const Config& config, ClusterKeys keys,
           make_store_node(node_, keys, *clock_, durability_batch_window, recovery_stage_hook_)),
       resources_(books_, node_.node().memory(), node_.events()),
       accounts_(node_.config(), node_.identity(), node_, routes_),
-      cluster_status_(node_, accounts_, store_node_->context().activity(), resources_.memory),
+      cluster_status_(
+          node_, accounts_, [this] { return viewer_idle_for(); }, resources_.memory),
       session_api_(node_, accounts_), users_api_(node_, accounts_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)),
@@ -100,9 +101,12 @@ Service::Service(const Config& config, ClusterKeys keys,
             return WorkClass::foreground;
         });
         // Every API request and draining body is a viewer present (law 2), on the clock the
-        // store, repair and DATA admission read.
-        catalogue_http_->set_activity(
-            [this](WorkClass work, uint64_t) { store_node_->context().activity().note(work); });
+        // store, repair and DATA admission read: the store node's, which exists once its
+        // store is open. Nothing paces by it before then.
+        catalogue_http_->set_activity([this](WorkClass work, uint64_t) {
+            if (store_open_.load(std::memory_order_acquire))
+                store_node_->context().activity().note(work);
+        });
         // Liveness reads two atomics: answered by the reactor, so no worker,
         // on either lane, can delay it.
         catalogue_http_->set_inline_route("/api/v1/health", [this] { return health_response(); });
@@ -533,11 +537,19 @@ void Service::wait_services_ready() {
     std::_Exit(1);
 }
 
+std::chrono::milliseconds Service::viewer_idle_for() {
+    // The store node's clock exists once its store is open; before then no viewer is served.
+    if (!store_open_.load(std::memory_order_acquire))
+        return std::chrono::hours(24);
+    return store_node_->context().activity().idle_for(WorkClass::foreground);
+}
+
 void Service::initialise_services(const std::stop_token& stop) {
     try {
         try {
             note_lifecycle("open store");
             store_node_->open_store();
+            store_open_.store(true, std::memory_order_release);
             // The store's server writes the hosting advert, following the
             // node's inbound answer from here.
             node_.follow_hosts_extents([server = &store_node_->server()](bool hosts) {

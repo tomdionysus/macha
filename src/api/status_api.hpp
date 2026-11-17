@@ -45,7 +45,7 @@ struct StatusSources {
 class ClusterStatusService {
     NodeRuntime& node_;
     Accounts& accounts_;
-    const dagda::Context::Activity& activity_;
+    std::function<std::chrono::milliseconds()> viewer_idle_for_;
     const RetainedMemoryLedger& retained_memory_;
     std::jthread persistence_;
     // Guards nothing; the observation thread waits on it.
@@ -64,8 +64,10 @@ class ClusterStatusService {
     HttpResponse connectivity_check(const std::optional<NodeId>& only);
 
   public:
-    // `activity`: the store node's clock, which the store and admission read.
-    ClusterStatusService(NodeRuntime&, Accounts&, const dagda::Context::Activity& activity,
+    // `viewer_idle_for`: how long since a viewer was last present, on the clock the store
+    // and admission read.
+    ClusterStatusService(NodeRuntime&, Accounts&,
+                         std::function<std::chrono::milliseconds()> viewer_idle_for,
                          const RetainedMemoryLedger&);
     ~ClusterStatusService();
     void start();
