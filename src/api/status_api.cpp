@@ -1333,6 +1333,10 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             repair_diagnostics["push_examined"] = values.push_examined;
             repair_diagnostics["pull_examined"] = values.pull_examined;
             repair_diagnostics["bytes_transferred"] = values.bytes_transferred;
+            // The offers' own bytes, which the credit pays for and which move no
+            // object; and the bytes of transfers started and not yet landed.
+            repair_diagnostics["offer_bytes"] = values.offer_bytes;
+            repair_diagnostics["in_flight"] = values.in_flight;
             repair_diagnostics["passes_completed"] = values.passes_completed;
             repair_diagnostics["push_phase_complete"] = values.push_phase_complete;
             Json::Object gates;
