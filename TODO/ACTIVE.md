@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-17 about 20:45Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-17 about 22:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-17-ACTIVE-before-rationalisation.md` (the Dagda review exchanges of 11-16
 and 11-17 in full). Alongside: `BACKLOG.md`, `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not
@@ -15,29 +15,18 @@ day); the call-by-call map: `store-map-callers/`. Rulings: Macha calls `dagda::C
 keeps `dagda::Node`'s owner surface; agreement waits for Dannan; ack levels are the stack standard (`persisted` = the
 disk that took it, this node's when it can).
 
-**Where it stands (2026-11-17 20:45Z):** the maintainer released the port ("Complete the port please", 2026-11-17). `port/dannan-dagda`
-at `8b40c4a`, pushed, built on **Dannan 0.8.5 and Dagda `d119d14`** (prefixes `/home/maintainer/deps/prefix-0.8.5`,
-`prefix-dagda-d119d14`, `build/pi/deps_085_d119d14.sh`; CMake asks dannan 0.8.5). Compiles on build-3 (GCC, warnings
-as errors).
-- Steps 1, 2 and 4 done in `c5fbbb4`: Macha's `LocalStore` and everything on it gone (presence index, durability
-  domain, held ledger, sealed journal, tries, retention store, reference counts, contract twins, gates, horizon,
-  `io_pressure`); `macha-metadata-dump` reads the control store through Dagda's `LocalStore`; `NodeResources` lost
-  `ActivityClocks` and `DataResourceArbiter`; one startup progress (Dannan's, handed to the store node) and the store
-  node's stage names through the root's hook; Macha no longer registers the store's message types (the "type 515
-  already registered" failure, which refused every node). `8b40c4a`: an API request during startup crashed the HTTP
-  reactor on the store node's activity clock; now noted only once the store is open.
-- Retirements: 172 (one more, `StoreClaimLocks.ADeleteMarksItsObjectAndHoldsNoStripe`), recorded in
-  `2026-11-16-test-retirement.md`.
-- **Step 5, first full suite (build-3, 20:11Z, `/root/pi/suite1.log`): 368 passed, 177 failed. The port is paused on a
-  Dagda defect** (reported to Dagda 20:45Z): `open_state_layout` begins a store only in an empty state directory,
-  but a Macha node's one state directory already holds Dannan's and Macha's files before `open_store()`, so every
-  fresh node fails at start (173 of the 177). Dagda's fixtures give Dannan and the store separate directories. A
-  migrated state (v19 marker in place) is unaffected. The other four were Macha's, fixed in `8b40c4a` and rerun
-  green. Nothing else can be judged until nodes start.
-- Step 3 (the trace cases) waits on the same: they are Service fixtures.
+**Where it stands (2026-11-17 22:00Z):** the maintainer released the port ("Complete the port please", 2026-11-17).
+`port/dannan-dagda` at `71e69e1` plus this TODO, pushed, built on **Dannan 0.8.5 and Dagda `8b544d6`** (its state-layout
+fix and repair stage 4; prefix `/home/maintainer/deps/prefix-dagda-8b544d6`, `build/pi/deps_dagda_8b544d6.sh`; run the compile
+script with `DAGDA=prefix-dagda-8b544d6`).
+- Steps 1, 2 and 4 done (`c5fbbb4`, `8b40c4a`); Status shows repair's `offer_bytes` and `in_flight` (`b26fb55`, an API
+  change to announce); test nodes keep key custody (`71e69e1`). Retirements: 172.
+- **Step 5: the suite on build-3 is 514 passed, 31 failed.** The 31, grouped with first checks, are in
+  [`2026-11-17-port-suite-triage.md`](2026-11-17-port-suite-triage.md). Step 3's six trace cases are among them.
+- Dagda: `82e5201` (no API change) is gated; its large-rejoin slowdown is open on Dagda's side.
 
-**Next, in order:** Dagda's fix (and which commit to build on: its branch has stage 4 work past `d119d14`), new
-prefix, rerun the suite, fix forward; then the flag-day prep below.
+**Next, in order:** the triage's groups, each mechanism proved before a change (a Dagda cause pauses the port for
+Dagda's fix); then the flag-day prep below.
 
 **Leave alone until Dagda's repair stage 4 is built:** the Status code reading Repair's gates and step figures. Its
 shape is agreed (2026-11-16, Dagda's `TODO/2026-11-16-repair-redesign.md`, "Stage 4, the shape proposed"): a window
