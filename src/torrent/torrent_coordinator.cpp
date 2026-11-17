@@ -862,7 +862,6 @@ void TorrentCoordinator::save_intents_locked() const {
         root[id] = std::move(item);
     }
     try {
-        std::filesystem::create_directories(intents_path_.parent_path());
         durable_replace_file(intents_path_, Json(std::move(root)).dump());
     } catch (const std::exception& e) {
         Log::warn("torrent intent journal not written: " + std::string(e.what()));

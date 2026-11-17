@@ -171,6 +171,35 @@ MACHA_FAST_TEST("foundations", test_durable_replace_file_matrix) {
     }
 }
 
+MACHA_FAST_TEST("foundations",
+                test_durable_replace_file_syncs_each_directory_it_made_into_its_parent) {
+    TempDir t;
+    const auto outer = t.path() / "outer";
+    const auto inner = outer / "inner";
+    const auto path = inner / "state.json";
+    std::vector<std::filesystem::path> synced;
+    const DirectorySync record = [&](const std::filesystem::path& directory) {
+        synced.push_back(directory);
+        durable_sync_directory(directory);
+    };
+
+    // Two directories made: each synced into its parent as it is made, then the
+    // file's own directory once the file is in it.
+    durable_replace_file(path, "one", record);
+    CHECK((synced == std::vector<std::filesystem::path>{t.path(), outer, inner}));
+
+    // Nothing made: only the file's own directory.
+    synced.clear();
+    durable_replace_file(path, "two", record);
+    CHECK((synced == std::vector<std::filesystem::path>{inner}));
+
+    // A directory made ahead of any file is synced into its parent too.
+    synced.clear();
+    durable_create_directories(t.path() / "later", record);
+    CHECK((synced == std::vector<std::filesystem::path>{t.path()}));
+    CHECK(std::filesystem::is_directory(t.path() / "later"));
+}
+
 MACHA_FAST_TEST("foundations", test_torrent_uri_safety_matrix) {
     struct UrlCase {
         std::string_view value;

@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 namespace macha {
 namespace {
@@ -36,12 +37,54 @@ void write_all(int fd, std::string_view contents) {
     }
 }
 
+std::filesystem::path directory_of(const std::filesystem::path& path) {
+    return path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+}
+
 } // namespace
 
+void durable_sync_directory(const std::filesystem::path& directory) {
+    const int dir = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dir < 0)
+        throw std::runtime_error("cannot open durable state directory " + directory.string() +
+                                 ": " + errno_text(errno));
+    try {
+        fsync_checked(dir, "cannot sync durable state directory");
+    } catch (...) {
+        ::close(dir);
+        throw;
+    }
+    if (::close(dir) != 0)
+        throw std::runtime_error("cannot close durable state directory: " +
+                                 std::string(errno_text(errno)));
+}
+
+void durable_create_directories(const std::filesystem::path& directory) {
+    durable_create_directories(directory, durable_sync_directory);
+}
+
+void durable_create_directories(const std::filesystem::path& directory, const DirectorySync& sync) {
+    std::vector<std::filesystem::path> missing;
+    for (auto at = directory; !at.empty() && at != at.root_path(); at = at.parent_path()) {
+        if (std::filesystem::exists(at))
+            break;
+        missing.push_back(at);
+    }
+    for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+        // Another writer may make it first; its entry is synced here all the same.
+        std::filesystem::create_directory(*it);
+        sync(directory_of(*it));
+    }
+}
+
 void durable_replace_file(const std::filesystem::path& path, std::string_view contents) {
-    const auto directory =
-        path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
-    std::filesystem::create_directories(directory);
+    durable_replace_file(path, contents, durable_sync_directory);
+}
+
+void durable_replace_file(const std::filesystem::path& path, std::string_view contents,
+                          const DirectorySync& sync) {
+    const auto directory = directory_of(path);
+    durable_create_directories(directory, sync);
     const auto temp =
         path.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
     int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -57,20 +100,7 @@ void durable_replace_file(const std::filesystem::path& path, std::string_view co
         if (::rename(temp.c_str(), path.c_str()) != 0)
             throw std::runtime_error("cannot replace durable state " + path.string() + ": " +
                                      errno_text(errno));
-
-        const int dir = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
-        if (dir < 0)
-            throw std::runtime_error("cannot open durable state directory " + directory.string() +
-                                     ": " + errno_text(errno));
-        try {
-            fsync_checked(dir, "cannot sync durable state directory");
-        } catch (...) {
-            ::close(dir);
-            throw;
-        }
-        if (::close(dir) != 0)
-            throw std::runtime_error("cannot close durable state directory: " +
-                                     std::string(errno_text(errno)));
+        sync(directory);
     } catch (...) {
         if (fd >= 0)
             ::close(fd);

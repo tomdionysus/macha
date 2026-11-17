@@ -212,7 +212,7 @@ void CatalogueHintQueue::changed_locked() {
 
 CatalogueHintQueue::CatalogueHintQueue(const std::filesystem::path& state_path)
     : state_file_(state_path / "catalogue" / "hints.json") {
-    std::filesystem::create_directories(state_file_.parent_path());
+    durable_create_directories(state_file_.parent_path());
     load_state();
     requeue_processing();
 }

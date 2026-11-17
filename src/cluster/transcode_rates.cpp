@@ -117,7 +117,6 @@ void TranscodeRateBook::persist_locked() const {
                                           {"observations", Json(std::move(observations))}});
     }
     try {
-        std::filesystem::create_directories(path_.parent_path());
         durable_replace_file(
             path_, Json(Json::Object{{"schema_version", 1}, {"classes", Json(std::move(classes))}})
                        .dump());
