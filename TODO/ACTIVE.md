@@ -83,6 +83,11 @@ Macha's to touch, we wait for Dagda's redesign):
    16-call budget, `transfer()` returns before its I/O lands, `in_flight > 0` settles as `more_work`, the store raises
    a storage event when the window drains to half; nothing in Macha relies on the old behaviour (the stop order leaves
    in-flight transfers to `dagda::Node::stop`). The maintainer ruled `offer_bytes` and `in_flight` join Status at the cutover.
+   **`d2872de` carries a regression under load** (Dagda's word, 2026-11-17; its redesign document, "What stage 3
+   measured"): each copy now moves once and unpaced rejoins are a third to a half faster, but a rejoin with a viewer
+   on the holder took 127-163 s against 38-64 s, all three rounds. Suspected, not proven: the joiner promises a whole
+   offered batch, then waits on the paced holder with a doubling backoff. Dagda's proposed fix is with the maintainer. Until it
+   lands, step 4 builds on `2a8d24b` (stage 2), or on `d2872de` only for compiling, never for a measurement under load.
 5. The first suite run on a Pi; fix forward. It runs on Dagda's current repair, which has the live defect below, so
    the comparison with 0.94.2 stays like for like.
 
