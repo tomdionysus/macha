@@ -25,6 +25,10 @@ script with `DAGDA=prefix-dagda-8b544d6`).
   [`2026-11-17-port-suite-triage.md`](2026-11-17-port-suite-triage.md). Step 3's six trace cases are among them.
 - Dagda: `82e5201` (no API change) is gated; its large-rejoin slowdown is open on Dagda's side.
 
+**The maintainer's rulings (2026-11-17 22:10Z, interactive):** fix forward group by group, each mechanism proved first (a Dagda
+cause pauses the port); build on Dagda `82e5201` from now; only the tests about reclaiming set
+`maintenance.collect_garbage` true, the default stays false for the live nodes until the cutover check.
+
 **Next, in order:** the triage's groups, each mechanism proved before a change (a Dagda cause pauses the port for
 Dagda's fix); then the flag-day prep below.
 

@@ -186,10 +186,12 @@ NodeReadiness NodeRuntime::readiness() const {
     out.retention_ready = planes.has("retention");
     out.metadata_ready = progress_.has(RecoveryProgress::metadata);
     out.local_state_ready = all_local_state_ready();
-    out.failed = progress_.failed();
+    // A store plane's failure is marked on the node's readiness as it happens, while
+    // the other planes may still be recovering; Macha's own, when its recovery ends.
+    out.failed = progress_.failed() || planes.failed();
     out.started_unix_ms = startup_unix_ms_;
     out.ready_unix_ms = progress_.ready_unix_ms();
-    out.error = progress_.error();
+    out.error = progress_.failed() ? progress_.error() : planes.error();
     return out;
 }
 

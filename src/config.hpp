@@ -60,9 +60,10 @@ struct MaintenanceConfig {
     // still find what its branch refers to; a node unheard of for this long
     // is forgotten.
     std::chrono::milliseconds garbage_grace{std::chrono::hours(24 * 30)};
-    // Whether this node reclaims anything: the tombstone gate, retention
-    // release and the CONTROL and DATA sweeps. Off, the store removes nothing
-    // and repair, the survey and the local stages run as ever.
+    // Whether the maintenance pass sweeps: the tombstone gate, retention
+    // release and the CONTROL and DATA sweeps. Off, the pass reclaims nothing;
+    // a file's delete still removes the copies no claim holds and Macha's state
+    // no longer names, and repair, the survey and the local stages run as ever.
     bool collect_garbage{false};
     // Rebalance and scrub only; repair always earns credit at the idle fraction
     // and shares time by the weights below.
