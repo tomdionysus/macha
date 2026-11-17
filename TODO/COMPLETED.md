@@ -1,6 +1,21 @@
 # Completed and tested
 
-Last updated: 2026-11-12
+Last updated: 2026-11-17
+
+## 2026-11-14 to 11-17 -- the store port on `port/dannan-dagda` (compiles; no full suite yet)
+
+- R1 to R6 and most of R7: Macha's root over `dagda::Node`; reads, writes, publication, hydration, metadata, the
+  claims barrier, the reachability provider, catalogue, torrent and ingest through `dagda::Context`; Status, adverts
+  and telemetry from Dagda's figures. Macha's distributed store, storage server, pool, cache, survey, claim walk and
+  retention ledger deleted (`deceac1`); 171 cases retired against named library cases
+  (`2026-11-16-test-retirement.md`). Every commit compiled on build-3, GCC, warnings as errors.
+- `46c61ba` (2026-11-17, on the maintainer's ruling): each directory a durable write makes is synced into its parent
+  (`durable_create_directories`); the hint queue and metadata replica make theirs the same way. Found by Dannan in
+  its copy. Its case and the existing durable-file case pass on build-3.
+- Reviews for Dagda's repair redesign (2026-11-16 and 11-17): the benchmark design and driver, Macha's side of the
+  baseline (the holder pushes while the joiner pulls the same objects; small objects bound by the 16-call budget),
+  the inventory timing in Macha's pass, stages 3 and 4 against the port. Detail in
+  `archive/2026-11-17-ACTIVE-before-rationalisation.md`.
 
 ## 2026-11-12 -- 0.94.0: the cluster transport is Dannan's
 
