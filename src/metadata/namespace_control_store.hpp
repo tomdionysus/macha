@@ -2,13 +2,15 @@
 #pragma once
 
 #include "metadata/namespace_tree.hpp"
-#include "storage/local_store.hpp"
 
 #include <stdexcept>
 
 namespace dagda {
 class Context;
+namespace store {
+class LocalStore;
 }
+} // namespace dagda
 
 namespace macha {
 
@@ -63,7 +65,7 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
 // peers.
 class LocalNamespaceNodeStore final : public NamespaceNodeStore {
   public:
-    explicit LocalNamespaceNodeStore(LocalStore& store) : store_(store) {}
+    explicit LocalNamespaceNodeStore(dagda::store::LocalStore& store) : store_(store) {}
 
     ObjectId put(std::span<const uint8_t> node) override;
     std::optional<Bytes> get(const ObjectId& id) const override;
@@ -76,7 +78,7 @@ class LocalNamespaceNodeStore final : public NamespaceNodeStore {
     }
 
   private:
-    LocalStore& store_;
+    dagda::store::LocalStore& store_;
     std::vector<ObjectId> written_;
     uint64_t bytes_written_{};
 };

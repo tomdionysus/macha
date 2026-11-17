@@ -8,7 +8,6 @@
 #include "crypto.hpp"
 #include "filesystem/hydration.hpp"
 #include "filesystem/macos_unicode.hpp"
-#include "ledger/reference_counts.hpp"
 #include "log.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include <algorithm>

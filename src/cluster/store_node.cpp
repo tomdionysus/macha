@@ -2,6 +2,7 @@
 #include "cluster/store_node.hpp"
 
 #include "cluster/dannan_bridge.hpp"
+#include "startup_progress.hpp"
 
 #include <algorithm>
 #include <memory>
@@ -51,6 +52,8 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
     out.ledger_cache_bytes = config.ledger_cache;
     // Macha's replica keeps the metadata until stage 8c.
     out.heads = false;
+    // The stores' recovery ticks the process's one progress, which the root's stall gate reads.
+    out.startup_progress = &startup_progress_counter();
 
     out.pool.backends = backends(config);
     out.pool.durability_batch_window = durability_batch_window;

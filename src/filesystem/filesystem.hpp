@@ -2,10 +2,11 @@
 #pragma once
 #include "cluster/data_work.hpp"
 #include "cluster/membership.hpp"
+#include "contract/retention_class.hpp"
 #include "contract/thread_safety.hpp"
 #include "dagda/context.h"
+#include "dagda/ledger/object_trie.h"
 #include "dagda/ledger/reference_counts.h"
-#include "ledger/object_trie.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/metadata_server.hpp"
 #include "metadata/namespace_control_store.hpp"

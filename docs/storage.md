@@ -118,7 +118,7 @@ ObjectId C --+
 ObjectId D ------> loose object file
 ```
 
-No distributed metadata records pack coordinates. Reads still ask `LocalStore` for an `ObjectId`; `LocalStore` chooses the physical representation.
+No distributed metadata records pack coordinates. Reads still ask the store (Dagda's `LocalStore`) for an `ObjectId`; it chooses the physical representation.
 
 Each packed PUT record is independently authenticated and contains enough identity/size information to rebuild the index. A logical removal appends a tombstone. Touch/age state used by GC is likewise represented without changing the logical object.
 

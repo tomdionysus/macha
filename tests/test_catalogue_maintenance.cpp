@@ -562,24 +562,26 @@ MACHA_TEST("catalogue_maintenance", test_artwork_is_staged_in_the_class_of_whoev
     metadata.view = empty_head(fixture.node->known_metadata_generation());
     CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
                                fixture.node->store_context(), metadata);
-    auto& data = fixture.node->resources.data;
+    // The store node's DATA admission, open once the node's store is.
+    auto* credit = fixture.node->store_node().credit();
+    REQUIRE(credit != nullptr);
     (void)catalogue.upsert(movie("movie:one", "One"));
 
     // A person in the editor: viewer admission.
-    auto before = data.stats();
+    auto before = credit->stats();
     (void)catalogue.put_artwork("movie:one", "poster", "image/jpeg",
                                 test_support::pattern(4096, 11), std::nullopt,
                                 FrameType::foreground);
-    auto after = data.stats();
-    CHECK(after.viewer_admissions > before.viewer_admissions);
+    auto after = credit->stats();
+    CHECK(after.foreground_admissions > before.foreground_admissions);
     CHECK(after.speculative_admissions == before.speculative_admissions);
 
     // The scanner: speculative admission.
     before = after;
     (void)catalogue.stage_artwork("cover", "image/jpeg", test_support::pattern(4096, 12));
-    after = data.stats();
+    after = credit->stats();
     CHECK(after.speculative_admissions > before.speculative_admissions);
-    CHECK(after.viewer_admissions == before.viewer_admissions);
+    CHECK(after.foreground_admissions == before.foreground_admissions);
 }
 
 } // namespace

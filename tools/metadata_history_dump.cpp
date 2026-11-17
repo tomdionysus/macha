@@ -17,13 +17,19 @@
 // visits exactly what the whole-pass walk visits, in order. --merge-deltas
 // (with --objects) lists each merge commit stored whole with the size of the
 // delta against its primary parent that would say the same.
+#include "cluster/dannan_bridge.hpp"
 #include "codec.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
 #include "metadata/metadata.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "metadata/namespace_tree.hpp"
-#include "storage/local_store.hpp"
+
+#include "dagda/domain/storage_key.h"
+#include "dagda/store/local_store.h"
+#include "dannan/status/observation.h"
+#include "dannan/supervise/startup.h"
+#include "dannan/supervise/supervised.h"
 
 #include <algorithm>
 #include <chrono>
@@ -91,7 +97,7 @@ static void nodes_read_probe(const NamespaceNodeStore& nodes, const ObjectId& ro
 // so a diagnostic run never adds objects to a live node's store.
 class ReplayNodeStore final : public NamespaceNodeStore {
   public:
-    explicit ReplayNodeStore(const LocalStore& disk) : disk_(disk) {}
+    explicit ReplayNodeStore(const dagda::store::LocalStore& disk) : disk_(disk) {}
 
     ObjectId put(std::span<const uint8_t> node) override {
         const auto id = object_id(node);
@@ -106,8 +112,35 @@ class ReplayNodeStore final : public NamespaceNodeStore {
     }
 
   private:
-    const LocalStore& disk_;
+    const dagda::store::LocalStore& disk_;
     std::map<ObjectId, Bytes> memory_;
+};
+
+// A node's control store at `path`, opened as the store node opens it: the
+// cluster's storage key, no limit, no held ledger (the store walks its objects).
+class ControlObjects {
+  public:
+    ControlObjects(const std::filesystem::path& path, const ClusterKeys& keys)
+        : store(path, options(),
+                std::make_shared<const dagda::domain::StorageKey>(
+                    dagda::domain::StorageKey::derive_v1(dannan_cluster_key(keys))),
+                {threads_, observations_, progress_,
+                 dannan::status::ScopedLogger(macha_log_sink(), "control store")}) {}
+
+  private:
+    static dagda::store::LocalStoreOptions options() {
+        dagda::store::LocalStoreOptions out;
+        out.limit = std::numeric_limits<uint64_t>::max();
+        out.pack_threshold = StoragePackingConfig{}.threshold;
+        out.pack_target_size = StoragePackingConfig{}.target_size;
+        return out;
+    }
+    dannan::supervise::SupervisedThreads threads_;
+    dannan::status::Observations observations_;
+    dannan::supervise::StartupProgress progress_;
+
+  public:
+    dagda::store::LocalStore store;
 };
 
 int main(int argc, char** argv) {
@@ -149,7 +182,8 @@ int main(int argc, char** argv) {
         } else
             heads_path = argv[i];
     }
-    const auto key = load_cluster_keys(argv[1]).storage;
+    const auto keys = load_cluster_keys(argv[1]);
+    const auto key = keys.storage;
     const std::filesystem::path history_path = argv[2];
 
     std::map<Hash256, Frame> index;
@@ -250,12 +284,8 @@ int main(int argc, char** argv) {
             envelope.finish();
             return decode_metadata_history_entry(aes_gcm_open(key, nonce, tag, ciphertext, MH));
         };
-        LocalStore store(objects,
-                         LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0,
-                                           StoragePackingConfig{}.threshold,
-                                           StoragePackingConfig{}.target_size},
-                         key);
-        ReplayNodeStore nodes(store);
+        ControlObjects control(objects, keys);
+        ReplayNodeStore nodes(control.store);
         const NamespaceDeltaApplier applier = [&](const ObjectId& root,
                                                   const MetadataDelta& delta) {
             return apply_delta_to_namespace_tree(root, nodes, delta);
@@ -416,13 +446,9 @@ int main(int argc, char** argv) {
         // hash on replay; this replays the chain and names the first diverging frame.
         if (ok && !objects.empty() && !chain.empty()) {
             try {
-                LocalStore store(objects,
-                                 LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0,
-                                                   StoragePackingConfig{}.threshold,
-                                                   StoragePackingConfig{}.target_size},
-                                 key);
-                ReplayNodeStore overlay(store);
-                LocalNamespaceNodeStore writing(store);
+                ControlObjects control(objects, keys);
+                ReplayNodeStore overlay(control.store);
+                LocalNamespaceNodeStore writing(control.store);
                 NamespaceDeltaApplier applier = [&](const ObjectId& root,
                                                     const MetadataDelta& delta) {
                     if (replay_write)
@@ -496,16 +522,12 @@ int main(int argc, char** argv) {
         // With --objects, a tree-backed head materialises as a replica does it:
         // deltas applied through the control store, written nodes kept in memory
         // (ReplayNodeStore). The walk below reads the same overlay.
-        std::optional<LocalStore> stats_store;
+        std::optional<ControlObjects> stats_store;
         std::optional<ReplayNodeStore> stats_nodes;
         NamespaceDeltaApplier stats_applier;
         if (!objects.empty()) {
-            stats_store.emplace(objects,
-                                LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0,
-                                                  StoragePackingConfig{}.threshold,
-                                                  StoragePackingConfig{}.target_size},
-                                key);
-            stats_nodes.emplace(*stats_store);
+            stats_store.emplace(objects, keys);
+            stats_nodes.emplace(stats_store->store);
             stats_applier = [&](const ObjectId& root, const MetadataDelta& delta) {
                 return apply_delta_to_namespace_tree(root, *stats_nodes, delta);
             };

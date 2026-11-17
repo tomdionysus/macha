@@ -437,15 +437,15 @@ class BareNode : public BareNodeResources, public NodeRuntime {
         : BareNodeResources(config, hook),
           NodeRuntime(std::move(config), std::move(keys), progress, books.transcode_rates, routes,
                       std::move(hook)),
-          resources(NodeRuntime::config(), books, node().memory(), events()),
+          resources(books, node().memory(), events()),
           durability_batch_window_(durability_batch_window) {
         // The node holds the state path's lock from here.
         books.transcode_rates.open();
-        store_node_ = std::make_unique<dagda::Node>(
-            node(),
-            store_node_options(NodeRuntime::config(), NodeRuntime::keys(), hosts_extents(),
-                               durability_batch_window_),
-            dagda::Node::OpenLater{});
+        auto options = store_node_options(NodeRuntime::config(), NodeRuntime::keys(),
+                                          hosts_extents(), durability_batch_window_);
+        options.startup_stage = stage_hook;
+        store_node_ =
+            std::make_unique<dagda::Node>(node(), std::move(options), dagda::Node::OpenLater{});
     }
     ~BareNode() {
         stop();

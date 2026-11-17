@@ -158,7 +158,7 @@ Artwork is ordinary DATA. The catalogue stores only its content `ObjectId`, MIME
 
 ## Physical small-object packing
 
-Packing is entirely below `LocalStore`:
+Packing is entirely below the store (Dagda's `LocalStore`):
 
 ```text
 logical ObjectId

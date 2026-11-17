@@ -1,68 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "interposed_local_store_files.hpp"
 #include "test_backend_support.hpp"
-#include <limits>
 
 using namespace macha;
 using namespace macha::test_support;
 using namespace std::chrono_literals;
-
-namespace {
-
-// One device operation held at its start until released, so a test can act
-// while it is provably in progress.
-class HeldOperation {
-    std::promise<void> entered_;
-    std::future<void> entered_future_ = entered_.get_future();
-    std::promise<void> release_;
-    std::shared_future<void> released_ = release_.get_future().share();
-    std::atomic_uint64_t calls_{};
-    std::atomic_bool released_once_{};
-    InterposedLocalStoreFiles* files_{};
-
-  public:
-    HeldOperation() = default;
-    HeldOperation(const HeldOperation&) = delete;
-    HeldOperation& operator=(const HeldOperation&) = delete;
-    // Releases a holder a failed check left waiting, and detaches from the device.
-    ~HeldOperation() {
-        release();
-        if (files_)
-            files_->before({});
-    }
-
-    // Holds the first call matching `op` (and `path`, if given); counts every
-    // matching call.
-    void hold(InterposedLocalStoreFiles& files, InterposedLocalStoreFiles::Op op,
-              std::filesystem::path path = {}) {
-        files_ = &files;
-        files.before(
-            [this, op, path](InterposedLocalStoreFiles::Op seen, const std::filesystem::path& at) {
-                if (seen != op || (!path.empty() && at != path))
-                    return;
-                if (calls_.fetch_add(1) == 0) {
-                    entered_.set_value();
-                    released_.wait();
-                }
-            });
-    }
-    bool entered() {
-        return entered_future_.wait_for(scaled(2s)) == std::future_status::ready;
-    }
-    void release() {
-        if (!released_once_.exchange(true))
-            release_.set_value();
-    }
-    uint64_t calls() const {
-        return calls_.load();
-    }
-};
-
-template <class T> bool ready(std::future<T>& future, std::chrono::milliseconds within = 2s) {
-    return future.wait_for(within) == std::future_status::ready;
-}
-
-} // namespace
 
 namespace {
 class StorageClusterNode {

@@ -5,7 +5,6 @@
 #include "metadata/namespace_control_store.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "service/service.hpp"
-#include "storage/local_store.hpp"
 
 #include <algorithm>
 #include <filesystem>

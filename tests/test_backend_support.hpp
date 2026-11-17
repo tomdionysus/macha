@@ -25,7 +25,6 @@
 #include "metadata/metadata.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "service/service.hpp"
-#include "storage/local_store.hpp"
 #include "test_framework.hpp"
 #include "test_support.hpp"
 #include "torrent/torrent.hpp"

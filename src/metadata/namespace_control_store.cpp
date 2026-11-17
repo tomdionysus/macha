@@ -3,6 +3,7 @@
 
 #include "crypto.hpp"
 #include "dagda/context.h"
+#include "dagda/store/local_store.h"
 #include "metadata/metadata_manager.hpp"
 
 #include <stdexcept>

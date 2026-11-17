@@ -3,7 +3,6 @@
 
 #include "auth/session.hpp"
 #include "auth/users.hpp"
-#include "cluster/activity_clocks.hpp"
 #include "cluster/cluster_node.hpp"
 #include "cluster/dannan_host.hpp"
 #include "cluster/data_work.hpp"
@@ -18,11 +17,10 @@
 #include "cluster/telemetry.hpp"
 #include "cluster/transcode_rates.hpp"
 #include "config.hpp"
+#include "contract/retention_class.hpp"
 #include "contract/thread_safety.hpp"
 #include "metadata/metadata.hpp"
 #include "retained_memory.hpp"
-#include "storage/local_store.hpp"
-#include "storage/retention.hpp"
 #include "supervised.hpp"
 
 #include <boost/asio/strand.hpp>

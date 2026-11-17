@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "cluster/activity_clocks.hpp"
-#include "cluster/data_work.hpp"
 #include "cluster/node_events.hpp"
 #include "cluster/transcode_rates.hpp"
 #include "config.hpp"
@@ -29,15 +27,11 @@ struct NodeBooks {
 // the owner calls stop() before stopping anything that waits on them.
 class NodeResources {
   public:
-    NodeResources(const Config&, NodeBooks&, dannan::sched::RetainedMemoryLedger& node_memory,
-                  NodeEvents& node_events, ActivityClocks::Source activity_clock = {});
+    NodeResources(NodeBooks&, dannan::sched::RetainedMemoryLedger& node_memory,
+                  NodeEvents& node_events);
     NodeResources(const NodeResources&) = delete;
     NodeResources& operator=(const NodeResources&) = delete;
 
-    ActivityClocks activity;
-    // Law 3: viewer presence reads `activity` over maintenance.foreground_quiet,
-    // since playback holds no byte credit between extents.
-    DataResourceArbiter data;
     RetainedMemoryLedger memory;
     TranscodeRateBook& transcode_rates;
     // The node's, counted by its Dannan node.

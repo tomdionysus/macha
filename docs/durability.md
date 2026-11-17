@@ -10,7 +10,7 @@ Cache never counts.
 
 ## DATA durability domains
 
-Authoritative DATA backends on the same physical filesystem share a `DurabilityDomain`. The domain tracks monotonically increasing mutation generations and a durable frontier. A DATA placement is represented by a ticket containing the current process epoch, physical durability domain, mutation generation and backend incarnation.
+Authoritative DATA backends on the same physical filesystem share a `DurabilityDomain` (Dagda's store). The domain tracks monotonically increasing mutation generations and a durable frontier. A DATA placement is represented by a ticket containing the current process epoch, physical durability domain, mutation generation and backend incarnation.
 
 Those fences prevent a ticket from an old process or a removed/reopened backend from satisfying a current publication.
 
@@ -20,7 +20,7 @@ On Linux the domain barrier uses `syncfs()` on a representative backend path. Pl
 
 ## Strict and deferred writes
 
-`LocalStore::put()` is strict: it returns success only after the local durability requirement has been met.
+Dagda's `LocalStore::put()` is strict: it returns success only after the local durability requirement has been met.
 
 Distributed publication uses the deferred path where appropriate:
 

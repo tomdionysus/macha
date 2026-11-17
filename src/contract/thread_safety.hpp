@@ -22,7 +22,7 @@
 //   touches guarded state under the lock.
 // - A mutex that guards nothing (a wait or ordering lock) says so.
 //
-// A no-I/O region refuses IoMutex::lock() and ObjectLock. It cannot refuse a
+// A no-I/O region refuses IoMutex::lock(). It cannot refuse a
 // scoped lock on an IoMutex: Clang folds a scoped lock's constructor
 // attributes into what the lock manages, so excluding no_io there breaks
 // unlock(). Review holds that case, as it does across contracts.
@@ -206,21 +206,6 @@ class MACHA_SCOPED_CAPABILITY ReadLock {
     ~ReadLock() MACHA_RELEASE() {}
     ReadLock(const ReadLock&) = delete;
     ReadLock& operator=(const ReadLock&) = delete;
-};
-
-// A per-object mutex a writer holds across its device I/O (LocalStore's
-// object_mutex), so waiting for it is waiting on that I/O. Keeps the mutex
-// alive and held for the guard's lifetime.
-class ObjectLock {
-    std::shared_ptr<IoMutex> mutex_;
-    std::lock_guard<std::mutex> guard_;
-
-  public:
-    explicit ObjectLock(std::shared_ptr<IoMutex> mutex) MACHA_EXCLUDES(no_io)
-        : mutex_(std::move(mutex)), guard_(mutex_->native()) {}
-    ~ObjectLock() = default;
-    ObjectLock(const ObjectLock&) = delete;
-    ObjectLock& operator=(const ObjectLock&) = delete;
 };
 
 } // namespace macha

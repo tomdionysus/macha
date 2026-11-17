@@ -1423,7 +1423,7 @@ MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recov
         },
         10s));
 
-    ClusterStatusService status(peer, peer.accounts(), peer.resources.activity,
+    ClusterStatusService status(peer, peer.accounts(), peer.store_context().activity(),
                                 peer.resources.memory);
     auto response = status.handle(request_for("GET", "/api/v1/status"));
     REQUIRE(response.status == 200);
@@ -1459,7 +1459,7 @@ MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recov
 MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_own_route) {
     TestCluster cluster;
     BareNode node(cluster.node_config("status-split"), cluster.keys());
-    ClusterStatusService status(node, node.accounts(), node.resources.activity,
+    ClusterStatusService status(node, node.accounts(), node.store_context().activity(),
                                 node.resources.memory);
 
     const auto body_of = [](const HttpResponse& response) {
@@ -1589,7 +1589,7 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
                              node.store_context());
     REQUIRE(metadata.snapshot().metadata_voters.empty());
 
-    ClusterStatusService status(node, node.accounts(), node.resources.activity,
+    ClusterStatusService status(node, node.accounts(), node.store_context().activity(),
                                 node.resources.memory);
     StatusSources sources;
     sources.local = &node.local_state();
@@ -1900,7 +1900,7 @@ MACHA_TEST("invariants", test_status_follows_a_peer_through_telemetry_and_depart
         },
         10s));
 
-    ClusterStatusService status(first, first.accounts(), first.resources.activity,
+    ClusterStatusService status(first, first.accounts(), first.store_context().activity(),
                                 first.resources.memory);
     const auto root = [&] {
         auto response = status.handle(request_for("GET", "/api/v1/status"));
@@ -2291,52 +2291,6 @@ MACHA_TEST("invariants", test_http_connections_are_bounded_and_reused) {
         server->stop();
     }
 }
-
-namespace {
-// The device, failing every read of the objects named as a disk does: the file
-// is there and its size known, the bytes do not come.
-class FailingReads final : public LocalStoreFiles {
-    LocalStoreFiles& device_{posix_local_store_files()};
-    mutable std::mutex mutex_;
-    std::set<std::filesystem::path> failing_;
-
-    void check(const std::filesystem::path& path) const {
-        std::lock_guard lock(mutex_);
-        if (failing_.contains(path))
-            throw std::runtime_error("cannot read object: Input/output error");
-    }
-
-  public:
-    void fail(const std::filesystem::path& path) {
-        std::lock_guard lock(mutex_);
-        failing_.insert(path);
-    }
-    void install(const std::filesystem::path& path, std::span<const uint8_t> head,
-                 std::span<const uint8_t> body) override {
-        device_.install(path, head, body);
-    }
-    Bytes read(const std::filesystem::path& path) override {
-        check(path);
-        return device_.read(path);
-    }
-    std::optional<Bytes> read_at(const std::filesystem::path& path, uint64_t offset,
-                                 size_t size) override {
-        check(path);
-        return device_.read_at(path, offset, size);
-    }
-    void append(const std::filesystem::path& path, std::span<const uint8_t> head,
-                std::span<const uint8_t> body) override {
-        device_.append(path, head, body);
-    }
-    bool truncate(const std::filesystem::path& path, uint64_t size) override {
-        return device_.truncate(path, size);
-    }
-    std::vector<std::pair<std::filesystem::path, uint64_t>>
-    list(const std::filesystem::path& dir) override {
-        return device_.list(dir);
-    }
-};
-} // namespace
 
 // A burst of commits against peers that take their claims slowly: what is
 // owed is each commit's claim ids, bounded in bytes, not its snapshot. Past

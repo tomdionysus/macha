@@ -32,7 +32,6 @@ class FileSystem;
 class HydrationManager;
 class IngestManager;
 class NodeRuntime;
-class DataResourceArbiter;
 class RetainedMemoryLedger;
 class MessageRoutes;
 class LocalState;
@@ -45,7 +44,6 @@ class SubsystemRegistry;
 struct SubsystemContext {
     const Config* config{};
     NodeRuntime* node{};
-    DataResourceArbiter* data_resources{};
     RetainedMemoryLedger* retained_memory{};
     MessageRoutes* routes{};
     LocalState* local_state{};

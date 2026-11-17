@@ -254,7 +254,6 @@ void NodeServices::start() {
     SubsystemContext context;
     context.config = &node_.config();
     context.node = &node_;
-    context.data_resources = &resources_.data;
     context.retained_memory = &resources_.memory;
     context.routes = &routes_;
     context.local_state = &local_;
