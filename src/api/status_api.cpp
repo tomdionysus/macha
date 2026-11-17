@@ -479,10 +479,12 @@ std::optional<NodeId> parse_node_id(std::string_view text) {
 
 } // namespace
 
-ClusterStatusService::ClusterStatusService(NodeRuntime& node, Accounts& accounts,
-                                           const dagda::Context::Activity& activity,
-                                           const RetainedMemoryLedger& retained_memory)
-    : node_(node), accounts_(accounts), activity_(activity), retained_memory_(retained_memory) {}
+ClusterStatusService::ClusterStatusService(
+    NodeRuntime& node, Accounts& accounts,
+    std::function<std::chrono::milliseconds()> viewer_idle_for,
+    const RetainedMemoryLedger& retained_memory)
+    : node_(node), accounts_(accounts), viewer_idle_for_(std::move(viewer_idle_for)),
+      retained_memory_(retained_memory) {}
 
 ClusterStatusService::~ClusterStatusService() {
     stop();
@@ -515,7 +517,7 @@ void ClusterStatusService::persist_local_status() {
     // lock or enter publication CAS. The small durable write (with its fsync) is
     // deferred while viewer-critical work is active.
     constexpr auto idle_before_persist = std::chrono::seconds(30);
-    if (activity_.idle_for(WorkClass::foreground) < idle_before_persist)
+    if (viewer_idle_for_() < idle_before_persist)
         return;
     node_.telemetry().persist();
     accounts_.sessions().persist();

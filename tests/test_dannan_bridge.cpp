@@ -46,12 +46,15 @@ MACHA_TEST("dannan_bridge", test_every_macha_type_is_registered_once_under_its_n
         REQUIRE(static_cast<uint16_t>(entry.type) >= dannan::net::first_user_type);
         REQUIRE(entry.registration.name == message_type_name(entry.type));
     }
-    // 512 + every number Macha used, less the four retired.
+    // 512 + every number Macha used, less the four retired and the store's, which
+    // Dagda's node registers.
+    const std::set<uint16_t> store{515, 516, 517, 525, 531, 532, 534, 535, 544, 552,
+                                   557, 559, 561, 615, 616, 619, 630, 633, 635, 637};
     for (uint16_t number = 512; number < 640; ++number) {
         const auto type = static_cast<MessageType>(number);
         const bool retired = number == 549 || number == 550 || number == 560 || number == 636;
         const bool named = std::string(message_type_name(type)) != "unknown";
-        REQUIRE(types.contains(type) == (named && !retired));
+        REQUIRE(types.contains(type) == (named && !retired && !store.contains(number)));
     }
 }
 
