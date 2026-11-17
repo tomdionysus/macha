@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-17 about 23:05Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-18 about 00:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-17-ACTIVE-before-rationalisation.md` (the Dagda review exchanges of 11-16
 and 11-17 in full). Alongside: `BACKLOG.md`, `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not
@@ -29,14 +29,15 @@ script with `DAGDA=prefix-dagda-8b544d6`).
 cause pauses the port); build on Dagda `82e5201` from now; only the tests about reclaiming set
 `maintenance.collect_garbage` true, the default stays false for the live nodes until the cutover check.
 
-**Paused (the maintainer, 2026-11-17 ~23:05Z, interactive: "Pause the whole port")** until Dagda's readiness fix is gated:
-a failed recovery plane was marked failed only after the other plane's recovery ended (Macha marked it at once).
-Dagda confirmed it, case `ac96a5a`, fix `97a5bed`, gating on build-3; it sends the commit when green. At `592caf5`
-(build-2, Dagda `82e5201`, before the provider change): 518 passed, 27 failed; the GC configs cleared group 3;
-`592caf5` registers the provider always (the maintainer: repair must survey with `collect_garbage` off) and is compiled, not yet
-run. build-2 holds the prefixes for `82e5201` (`build/pi/port_build_2.sh`, tree `/home/maintainer/macha-port`).
+**Paused again (the maintainer's rule: a Dagda cause pauses the port), 2026-11-18 00:00Z.** On Dagda `97a5bed` (readiness fix,
+gated; local in Dagda, not pushed) the suite at `59599b2` is **525 passed, 20 failed** (`build/port-suite5-2026-11-17.log`):
+the readiness fix and the always-registered provider cleared seven. New: `dannan_host/test_job_traffic_travels_as_its_own_class`
+crashes intermittently (2 of 3 serial runs) inside `dagda::Node::open()`, building the StorageServer, in
+`StoragePool::snapshot()`; it passed on every earlier Dagda commit. Reported to Dagda 00:00Z with the backtrace.
+Also seen: `rpc_cluster/test_replacement_node_recovers_namespace_and_replication` now fails on custody (the test
+replaces a node's state, which takes its custody; the fixture must make it again), Macha's to fix.
 
-**Next, in order, once Dagda's commit arrives:** its prefix, the whole suite, then the triage's groups, each mechanism proved before a change (a Dagda cause pauses the port for
+**Next, in order, once Dagda's crash fix arrives:** its prefix, the whole suite, then the triage's groups, each mechanism proved before a change (a Dagda cause pauses the port for
 Dagda's fix); then the flag-day prep below.
 
 **Leave alone until Dagda's repair stage 4 is built:** the Status code reading Repair's gates and step figures. Its
