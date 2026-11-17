@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-17 about 19:30Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-17 about 20:45Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-17-ACTIVE-before-rationalisation.md` (the Dagda review exchanges of 11-16
 and 11-17 in full). Alongside: `BACKLOG.md`, `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not
@@ -15,43 +15,29 @@ day); the call-by-call map: `store-map-callers/`. Rulings: Macha calls `dagda::C
 keeps `dagda::Node`'s owner surface; agreement waits for Dannan; ack levels are the stack standard (`persisted` = the
 disk that took it, this node's when it can).
 
-**Where it stands (2026-11-17 19:30Z):** `port/dannan-dagda` at `46c61ba` plus TODO commits, pushed. The port's code
-is `deceac1` and one fix since, `46c61ba` (each directory a durable write makes is synced into its parent; the maintainer
-ruled it onto the port branch, 2026-11-17; found by Dannan in its own copy, live on 0.94.2 until the cutover).
-Every commit compiles on build-3 (GCC, warnings as errors). **No full suite has run**; a filtered run on 11-17 passed
-both durable-file cases and showed one port case failing at start (step 5 below).
-- R1 to R5 done; R6 done except R1's leftovers; R7 mostly done: 171 cases retired against named library cases
-  (`2026-11-16-test-retirement.md`), Macha's distributed store, storage server, pool, cache, survey, claim walk and
-  retention ledger deleted; `LocalState` keeps only the metadata seed and replica.
-- Deps: Dannan 0.8.4 pinned (0.8.5 tagged, for the deploy); Dagda `6bfb5b2` on `feature/macha-store-gaps`. **No
-  Dagda tag holds what the port needs**: CMake asks `dagda 0.2.0`, but tag `0.2.0` (local, held by the maintainer) does not
-  contain the branch's commits and the branch is not pushed.
+**Where it stands (2026-11-17 20:45Z):** the maintainer released the port ("Complete the port please", 2026-11-17). `port/dannan-dagda`
+at `8b40c4a`, pushed, built on **Dannan 0.8.5 and Dagda `d119d14`** (prefixes `/home/maintainer/deps/prefix-0.8.5`,
+`prefix-dagda-d119d14`, `build/pi/deps_085_d119d14.sh`; CMake asks dannan 0.8.5). Compiles on build-3 (GCC, warnings
+as errors).
+- Steps 1, 2 and 4 done in `c5fbbb4`: Macha's `LocalStore` and everything on it gone (presence index, durability
+  domain, held ledger, sealed journal, tries, retention store, reference counts, contract twins, gates, horizon,
+  `io_pressure`); `macha-metadata-dump` reads the control store through Dagda's `LocalStore`; `NodeResources` lost
+  `ActivityClocks` and `DataResourceArbiter`; one startup progress (Dannan's, handed to the store node) and the store
+  node's stage names through the root's hook; Macha no longer registers the store's message types (the "type 515
+  already registered" failure, which refused every node). `8b40c4a`: an API request during startup crashed the HTTP
+  reactor on the store node's activity clock; now noted only once the store is open.
+- Retirements: 172 (one more, `StoreClaimLocks.ADeleteMarksItsObjectAndHoldsNoStripe`), recorded in
+  `2026-11-16-test-retirement.md`.
+- **Step 5, first full suite (build-3, 20:11Z, `/root/pi/suite1.log`): 368 passed, 177 failed. The port is paused on a
+  Dagda defect** (reported to Dagda 20:45Z): `open_state_layout` begins a store only in an empty state directory,
+  but a Macha node's one state directory already holds Dannan's and Macha's files before `open_store()`, so every
+  fresh node fails at start (173 of the 177). Dagda's fixtures give Dannan and the store separate directories. A
+  migrated state (v19 marker in place) is unaffected. The other four were Macha's, fixed in `8b40c4a` and rerun
+  green. Nothing else can be judged until nodes start.
+- Step 3 (the trace cases) waits on the same: they are Service fixtures.
 
-**Step 1 is held on the operator's word (2026-11-16).** Nothing below starts without it.
-
-**Next, in order, once released:**
-1. Macha's `LocalStore` and what stands on it (`presence_index`, `durability_domain`, `held_ledger`,
-   `sealed_journal`, the tries, `retention`, `reference_counts`) and its contract twins (`object_store`,
-   `object_ledger`, `claim_store`, `horizon`, `horizon_builder`) go; `tools/metadata_history_dump.cpp` reads its
-   control store through Dagda's `LocalStore`. Includers to reach (checked 11-16): `cluster/cluster.hpp`,
-   `cluster/node_identity.cpp`, `metadata/namespace_control_store.hpp`, `catalogue/catalogue.hpp`,
-   `contract/gates.hpp`, `service/maintenance.hpp`, `filesystem/filesystem.cpp` and `.hpp`, `storage/io_pressure.hpp`,
-   `config_base.cpp`; tests `test_backend_support.hpp`, `interposed_local_store_files.hpp`,
-   `test_namespace_service.cpp`, `test_storage_metadata.cpp`, `test_storage_v18.cpp:204`.
-2. R1's leftovers: `DataResourceArbiter` and `ActivityClocks` out of `NodeResources`, one `StartupProgress`, stage
-   names.
-3. The maintenance trace tests rewritten over Dagda's maintenance (the REWRITE cases in `test_maintenance_trace.cpp`;
-   GAP-HEADS stay on Macha's replica until 8c). Dagda reports none of the ported cases changed through its repair
-   stages 1 to 3; check that from the fixtures at the commit step 4 builds on, and take the names Dagda sends for
-   stage 4.
-4. Prefixes to Dannan 0.8.5 and Dagda's newest gated commit: **`d119d14`** (repair stages 1 to 3 and the viewer
-   fix; gate 1133 ran, 1130 passed, 3 skipped, by Dagda's word). Not `d2872de` alone (it regresses a rejoin under a
-   viewer). Nothing new binds in Macha: its pass passes `repair.lists()` (stage 2's `holds`), `Repair::transfer`
-   debits the offer bytes, and `dagda::Node` gives its server the offer book (Dagda confirmed).
-5. The first suite run on a Pi; fix forward. **Seen already:**
-   `rpc_cluster/test_a_durable_trio_founds_commits_and_reads_through_every_node` fails at start with "Dagda's message
-   types are registered already ... message type 515 is already registered as have_object" (two store nodes
-   registering on one Dannan node in that fixture). Not diagnosed.
+**Next, in order:** Dagda's fix (and which commit to build on: its branch has stage 4 work past `d119d14`), new
+prefix, rerun the suite, fix forward; then the flag-day prep below.
 
 **Leave alone until Dagda's repair stage 4 is built:** the Status code reading Repair's gates and step figures. Its
 shape is agreed (2026-11-16, Dagda's `TODO/2026-11-16-repair-redesign.md`, "Stage 4, the shape proposed"): a window
@@ -99,7 +85,7 @@ Both are the maintainer's rulings to leave on 0.94.2 and fix through the port.
 
 ## Waiting on the operator
 
-- Step 1's release (held 2026-11-16).
+- The Dagda tag for the port's commits (`0.2.0` is held locally and lacks them); CI waits on it.
 - After the port: whether the heap chase resumes with media load.
 - The Codecov token for the repository.
 - Carried, unchecked: the media-kind import hint; truncated pack records; the `*.pre-migration.*` archives; the
