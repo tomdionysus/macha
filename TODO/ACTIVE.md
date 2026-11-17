@@ -91,7 +91,10 @@ Macha's to touch, we wait for Dagda's redesign):
    promised pull is rechecked every second; under a viewer 32.5-38.3 s against 34.4-37.9 s before stage 3, unpaced
    large rejoin 20.6-29.3 s against 36.2-52.5 s. No ported case changed, nothing new to bind. `d119d14` is now
    step 4's candidate; `d2872de` alone is not.
-5. The first suite run on a Pi; fix forward. It runs on Dagda's current repair, which has the live defect below, so
+5. The first suite run on a Pi; fix forward. Seen already (2026-11-17, a filtered run of five cases on build-3 for
+   the durable-directory fix `46c61ba`): `rpc_cluster/test_a_durable_trio_founds_commits_and_reads_through_every_node`
+   fails at start, "Dagda's message types are registered already ... message type 515 is already registered as
+   have_object": two store nodes registering on one Dannan node in the test's fixture. Not diagnosed. It runs on Dagda's current repair, which has the live defect below, so
    the comparison with 0.94.2 stays like for like.
 
 **Leave alone until Dagda's stage 4:** the Status code reading Repair's gates and step figures (`transfer`,
