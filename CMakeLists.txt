@@ -157,8 +157,9 @@ find_package(ZLIB REQUIRED)
 find_package(yaml-cpp QUIET)
 # The cluster's transport and node: Dannan 0.8, any patch from the one reviewed
 # (a patch keeps the minor's ABI; a minor is a new API). 0.8.4 has the stop-aware
-# NodeEvents wait every Macha consumer uses.
-find_package(dannan 0.8.4 CONFIG REQUIRED)
+# NodeEvents wait every Macha consumer uses; 0.8.5 lets a node stopped once be
+# destroyed after its io has stopped without hanging.
+find_package(dannan 0.8.5 CONFIG REQUIRED)
 # The store: Dagda, the exact release, built on the same Dannan.
 find_package(dagda 0.2.0 CONFIG REQUIRED)
 
@@ -272,8 +273,6 @@ set(MACHA_CORE_SOURCES
     src/coverage.cpp
     src/diagnostics.cpp
     src/contract/work.cpp
-    src/contract/horizon.cpp
-    src/contract/gates.cpp
     src/ledger/macha_reachability.cpp
     src/observation.cpp
     src/durable_file.cpp
@@ -282,19 +281,8 @@ set(MACHA_CORE_SOURCES
     src/subsystem/subsystem.cpp
     src/subsystem/subsystem_registry.cpp
     src/subsystem/subsystem_supervisor.cpp
-    src/storage/durability_domain.cpp
-    src/storage/presence_index.cpp
-    src/storage/local_store.cpp
-    src/storage/retention.cpp
-    src/storage/sealed_journal.cpp
-    src/ledger/object_trie.cpp
-    src/ledger/trie_diff.cpp
-    src/ledger/trie_union.cpp
-    src/ledger/held_ledger.cpp
-    src/ledger/reference_counts.cpp
     src/cluster/telemetry.cpp
     src/cluster/transcode_rates.cpp
-    src/cluster/activity_clocks.cpp
     src/cluster/node_resources.cpp
     src/retained_memory.cpp
     src/cluster/node_identity.cpp

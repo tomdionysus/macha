@@ -77,19 +77,17 @@ MACHA_TEST("dannan_bridge", test_the_registrations_carry_section_seven_two_rules
         REQUIRE(!rule.no_progress.has_value());
         REQUIRE(!rule.stall_notice.has_value());
     }
-    const std::set<MessageType> want_data{
-        MessageType::get_object, MessageType::put_object, MessageType::put_object_deferred,
-        MessageType::object_durability_barrier, MessageType::object_reply};
+    // The DATA types are the store's, registered by Dagda's node.
+    const std::set<MessageType> want_data{};
     const std::set<MessageType> want_ordered{MessageType::put_metadata_history_entry,
                                              MessageType::put_metadata_commit,
                                              MessageType::accept_metadata_commit};
     const std::set<MessageType> want_notifications{
         MessageType::metadata_notice, MessageType::session_sync, MessageType::user_sync};
     const std::set<MessageType> want_control_only{
-        MessageType::metadata_notice,      MessageType::get_committed_metadata,
-        MessageType::session_sync,         MessageType::user_sync,
-        MessageType::have_control_objects, MessageType::session_sync_reply,
-        MessageType::user_sync_reply,      MessageType::have_control_objects_reply};
+        MessageType::metadata_notice,    MessageType::get_committed_metadata,
+        MessageType::session_sync,       MessageType::user_sync,
+        MessageType::session_sync_reply, MessageType::user_sync_reply};
     REQUIRE(data == want_data);
     REQUIRE(ordered == want_ordered);
     REQUIRE(notifications == want_notifications);

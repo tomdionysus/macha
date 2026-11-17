@@ -480,7 +480,7 @@ std::optional<NodeId> parse_node_id(std::string_view text) {
 } // namespace
 
 ClusterStatusService::ClusterStatusService(NodeRuntime& node, Accounts& accounts,
-                                           const ActivityClocks& activity,
+                                           const dagda::Context::Activity& activity,
                                            const RetainedMemoryLedger& retained_memory)
     : node_(node), accounts_(accounts), activity_(activity), retained_memory_(retained_memory) {}
 

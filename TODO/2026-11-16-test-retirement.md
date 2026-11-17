@@ -12,7 +12,13 @@ Two cases newer than the mapping were named by Dagda on request (2026-11-16, its
 `test_storage_v18.cpp` `test_a_store_tells_a_bad_record_from_a_failed_read` against
 `StoreLocalStore.AStoreTellsABadRecordFromAFailedRead`.
 
-171 cases.
+One more on 2026-11-17, with Macha's `RetentionStore` (port step 1): `test_storage_metadata.cpp`
+`test_a_delete_marks_its_object_and_holds_no_stripe` against `StoreClaimLocks.ADeleteMarksItsObjectAndHoldsNoStripe`
+(the same three checks: a delete's mark with the stripe free, a moved deletion keeping the mark, a standing claim
+refusing the delete). `test_work_class.cpp` `test_presence_is_per_class_and_bytes_per_frame` is KEEP in Dagda's
+mapping and stays, rewritten over Dannan's `ActivityClocks` when Macha's went (port step 2).
+
+172 cases.
 
 ## test_absent_nodes.cpp
 

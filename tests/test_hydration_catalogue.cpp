@@ -2962,7 +2962,6 @@ MACHA_TEST("hydration_catalogue",
     SubsystemContext context;
     context.config = &plugin_config;
     context.node = &fixture.node();
-    context.data_resources = &fixture.node().resources.data;
     context.retained_memory = &fixture.node().resources.memory;
     context.routes = &fixture.node().routes;
     context.local_state = &fixture.node().local_state();

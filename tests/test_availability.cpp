@@ -242,47 +242,6 @@ MACHA_FAST_TEST("availability", test_the_path_table_follows_a_change_to_the_tree
     }
 }
 
-// --- The survey by trie diff -------------------------------------------------
-
-std::unique_ptr<ObjectTrie> held_trie(const std::filesystem::path& dir,
-                                      const std::set<ObjectId>& ids) {
-    auto trie = std::make_unique<ObjectTrie>(dir, std::array<uint8_t, 32>{}, ObjectTrie::Options{});
-    std::vector<ObjectTrie::Change> changes;
-    for (const auto& id : ids)
-        changes.push_back({id, Bytes{0, 0, 0, 0, 0, 0, 0, 1}});
-    trie->apply(changes);
-    return trie;
-}
-
-ObjectId numbered_id(uint32_t n) {
-    ObjectId id;
-    for (size_t i = 0; i < 4; ++i)
-        id.bytes[i] = static_cast<uint8_t>(n >> (8 * (3 - i)));
-    id.bytes[31] = 1;
-    return id;
-}
-
-// One peer's trie as a source that fails after a few questions.
-class FailingSource final : public TrieSource {
-  public:
-    explicit FailingSource(ObjectTrie::Snapshot trie) : inner_(std::move(trie)) {}
-    ObjectTrie::Summary root() override {
-        return inner_.root();
-    }
-    std::vector<ObjectTrie::Children> children(std::span<const ObjectTrie::Prefix> p) override {
-        throw std::runtime_error("peer went away");
-        return inner_.children(p);
-    }
-    std::vector<std::vector<ObjectTrie::Record>>
-    records(std::span<const ObjectTrie::Prefix> p) override {
-        throw std::runtime_error("peer went away");
-        return inner_.records(p);
-    }
-
-  private:
-    SnapshotSource inner_;
-};
-
 MACHA_FAST_TEST("availability", test_a_files_code_follows_its_extent_counts) {
     CHECK(availability_of(nullptr) == Availability::unknown);
     PathAvailability facts;

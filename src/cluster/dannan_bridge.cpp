@@ -288,6 +288,8 @@ Registration rule(std::string name, Lanes lanes, Frames frames, bool notificatio
     return out;
 }
 
+// The store's types (objects, presence, claims, deletes, trie questions and their
+// replies, bool_reply among them) are the store node's, registered by Dagda's node.
 std::vector<MachaRegistration> build_registrations() {
     std::vector<MachaRegistration> out;
     const auto control = [&](MessageType type, Frames frames = Frames::any,
@@ -295,13 +297,6 @@ std::vector<MachaRegistration> build_registrations() {
         out.push_back(
             {type, rule(message_type_name(type), Lanes::control, frames, notification, ordered)});
     };
-    const auto data = [&](MessageType type) {
-        out.push_back({type, rule(message_type_name(type), Lanes::data, Frames::not_control)});
-    };
-
-    control(MessageType::have_object);
-    data(MessageType::get_object);
-    data(MessageType::put_object);
     control(MessageType::get_metadata);
     control(MessageType::cas_metadata);
     control(MessageType::seed_metadata);
@@ -315,41 +310,28 @@ std::vector<MachaRegistration> build_registrations() {
     }
     control(MessageType::get_committed_metadata, Frames::control_only);
     control(MessageType::checkpoint_metadata);
-    control(MessageType::delete_object);
     control(MessageType::commit_metadata);
     control(MessageType::cas_metadata_delta);
-    control(MessageType::get_control_object);
-    control(MessageType::put_control_object);
     control(MessageType::get_metadata_identity);
-    data(MessageType::put_object_deferred);
-    data(MessageType::object_durability_barrier);
     control(MessageType::get_metadata_history_entry);
     control(MessageType::has_metadata_history_entry);
     control(MessageType::put_metadata_history_entry, Frames::any, false, true);
     control(MessageType::get_metadata_heads);
     control(MessageType::put_metadata_commit, Frames::any, false, true);
     control(MessageType::accept_metadata_commit, Frames::any, false, true);
-    control(MessageType::retain_objects);
     control(MessageType::get_ingest_jobs);
     control(MessageType::ingest_job_action);
     control(MessageType::get_torrent_jobs);
     control(MessageType::torrent_job_action);
     control(MessageType::session_sync, Frames::control_only, true);
-    control(MessageType::have_objects);
     control(MessageType::get_metadata_history_record);
     control(MessageType::user_sync, Frames::control_only, true);
-    control(MessageType::have_control_objects, Frames::control_only);
     control(MessageType::torrent_intent);
-    control(MessageType::have_valid_objects);
-    control(MessageType::trie_diff);
     control(MessageType::get_unmatched_hints);
     control(MessageType::submit_ingest_job);
 
-    control(MessageType::bool_reply);
-    data(MessageType::object_reply);
     control(MessageType::metadata_reply);
     control(MessageType::cas_reply);
-    control(MessageType::control_object_reply);
     control(MessageType::metadata_identity_reply);
     control(MessageType::metadata_history_entry_reply);
     control(MessageType::metadata_heads_reply);
@@ -358,12 +340,8 @@ std::vector<MachaRegistration> build_registrations() {
     control(MessageType::torrent_jobs_reply);
     control(MessageType::torrent_job_action_reply);
     control(MessageType::session_sync_reply, Frames::control_only);
-    control(MessageType::have_objects_reply);
     control(MessageType::user_sync_reply, Frames::control_only);
-    control(MessageType::have_control_objects_reply, Frames::control_only);
     control(MessageType::torrent_intent_reply);
-    control(MessageType::have_valid_objects_reply);
-    control(MessageType::trie_diff_reply);
     control(MessageType::unmatched_hints_reply);
     control(MessageType::ingest_submit_reply);
     return out;

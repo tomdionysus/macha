@@ -1,30 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/node_resources.hpp"
 
-#include <algorithm>
-#include <thread>
-
 namespace macha {
 
 NodeBooks::NodeBooks(const Config& cfg)
     : transcode_rates(cfg.state_path / "playback" / "transcode-rates.json") {}
 
-NodeResources::NodeResources(const Config& cfg, NodeBooks& books,
-                             dannan::sched::RetainedMemoryLedger& node_memory,
-                             NodeEvents& node_events, ActivityClocks::Source activity_clock)
-    : activity(std::move(activity_clock)),
-      data(cfg.data_inflight_bytes, cfg.data_viewer_reserve_bytes,
-           cfg.maintenance.background_concurrency
-               ? cfg.maintenance.background_concurrency
-               : std::max<size_t>(1, std::thread::hardware_concurrency() / 2),
-           cfg.data_credit_no_progress_deadline,
-           [this, window = cfg.maintenance.foreground_quiet] {
-               return activity.viewer_recently_active(window);
-           }),
-      memory(node_memory), transcode_rates(books.transcode_rates), events(node_events) {}
+NodeResources::NodeResources(NodeBooks& books, dannan::sched::RetainedMemoryLedger& node_memory,
+                             NodeEvents& node_events)
+    : memory(node_memory), transcode_rates(books.transcode_rates), events(node_events) {}
 
 void NodeResources::stop() {
-    data.stop();
     memory.stop();
 }
 

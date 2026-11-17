@@ -56,7 +56,7 @@ MACHA_FAST_TEST("rpc_cluster", test_async_rpc_move_ownership) {
 // zero turns either off. Readings come at a quarter of a short window.
 MACHA_FAST_TEST("rpc_cluster", test_startup_gate_fires_on_silence_not_on_slow_progress) {
     using Gate = StartupStallGate;
-    const auto t0 = Gate::Clock::time_point{} + 1h;
+    const auto t0 = Clock::time_point{} + 1h;
     Gate gate(1200ms, 0ms, t0, 7);
     uint64_t progress = 7;
     for (auto at = 100ms; at <= 3000ms; at += 100ms)

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "contract/object_ledger.hpp"
 #include "contract/thread_safety.hpp"
 #include "dagda/context.h"
 #include "dagda/contract/reachability.h"

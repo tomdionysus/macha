@@ -23,6 +23,25 @@
 #include <thread>
 
 namespace macha {
+namespace {
+
+// The store node over `node`'s Dannan node: registers the store's message types and
+// declares its planes; opens nothing. Its maintenance steps run on the pass's clock,
+// which a trace fixture moves by hand.
+std::unique_ptr<dagda::Node> make_store_node(NodeRuntime& node, const ClusterKeys& keys,
+                                             MaintenanceClock& clock,
+                                             std::chrono::milliseconds durability_batch_window,
+                                             const LocalState::StageHook& stage_hook) {
+    auto options =
+        store_node_options(node.config(), keys, node.hosts_extents(), durability_batch_window);
+    // Its planes' recovery stages, in Macha's names, through the root's hook.
+    options.startup_stage = stage_hook;
+    options.maintenance.time = &clock;
+    options.maintenance.wall = &clock;
+    return std::make_unique<dagda::Node>(node.node(), std::move(options), dagda::Node::OpenLater{});
+}
+
+} // namespace
 
 Service::Service(const Config& config, ClusterKeys keys,
                  std::chrono::milliseconds durability_batch_window,
@@ -36,10 +55,11 @@ Service::Service(const Config& config, ClusterKeys keys,
       durability_batch_window_(durability_batch_window), books_(config),
       node_(config, keys, progress_, books_.transcode_rates, routes_,
             std::move(startup_stage_hook)),
-      resources_(node_.config(), books_, node_.node().memory(), node_.events(),
-                 [clock = clock_] { return clock->now(); }),
+      store_node_(
+          make_store_node(node_, keys, *clock_, durability_batch_window, recovery_stage_hook_)),
+      resources_(books_, node_.node().memory(), node_.events()),
       accounts_(node_.config(), node_.identity(), node_, routes_),
-      cluster_status_(node_, accounts_, resources_.activity, resources_.memory),
+      cluster_status_(node_, accounts_, store_node_->context().activity(), resources_.memory),
       session_api_(node_, accounts_), users_api_(node_, accounts_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)),
@@ -48,15 +68,6 @@ Service::Service(const Config& config, ClusterKeys keys,
         node_.set_call_fault(std::move(instruments.call_fault));
     // The node holds the state path's lock from here.
     books_.transcode_rates.open();
-    // Registers the store's message types and declares its planes; opens nothing.
-    // The node's maintenance steps run on the pass's clock, which a trace
-    // fixture moves by hand.
-    auto store_options =
-        store_node_options(node_.config(), keys, node_.hosts_extents(), durability_batch_window_);
-    store_options.maintenance.time = clock_.get();
-    store_options.maintenance.wall = clock_.get();
-    store_node_ = std::make_unique<dagda::Node>(node_.node(), std::move(store_options),
-                                                dagda::Node::OpenLater{});
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
@@ -89,11 +100,9 @@ Service::Service(const Config& config, ClusterKeys keys,
             return WorkClass::foreground;
         });
         // Every API request and draining body is a viewer present (law 2), on the clock the
-        // store, repair and DATA admission read; Macha's own clock too while its store remains.
-        catalogue_http_->set_activity([this](WorkClass work, uint64_t) {
-            store_node_->context().activity().note(work);
-            resources_.activity.note(work);
-        });
+        // store, repair and DATA admission read.
+        catalogue_http_->set_activity(
+            [this](WorkClass work, uint64_t) { store_node_->context().activity().note(work); });
         // Liveness reads two atomics: answered by the reactor, so no worker,
         // on either lane, can delay it.
         catalogue_http_->set_inline_route("/api/v1/health", [this] { return health_response(); });
