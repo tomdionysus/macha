@@ -267,13 +267,12 @@ void NodeServices::start() {
     subsystems_.start(context);
     for (const auto& subsystem : subsystems_.statuses())
         note("subsystem " + subsystem.name);
-    // The store node reclaims only what Macha's state no longer refers to,
-    // and only when this node is set to: with no provider it removes nothing.
-    if (node_.config().maintenance.collect_garbage) {
-        note("register reachability");
-        store_node_.register_reachability(dagda::domain::domain_v1, reachability_);
-        reachability_registered_ = true;
-    }
+    // What Macha's state refers to: the inventory repair surveys and the
+    // collector judges by. The pass sweeps only on a node set to reclaim
+    // (maintenance.collect_garbage).
+    note("register reachability");
+    store_node_.register_reachability(dagda::domain::domain_v1, reachability_);
+    reachability_registered_ = true;
     note("start maintenance");
     maintenance_.start();
 }

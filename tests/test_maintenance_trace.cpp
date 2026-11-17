@@ -204,6 +204,7 @@ class TracedNode {
         // On the manual clock; the fixture steps past it explicitly.
         config.maintenance.foreground_quiet = 50ms;
         config.maintenance.garbage_grace = 1h;
+        config.maintenance.collect_garbage = true;
         config.maintenance.no_progress_backoff = 5min;
         // Traces compare decisions, not retry timing: a convergence retry
         // runs on its first trigger, as the steps expect.

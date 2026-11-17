@@ -1733,6 +1733,7 @@ MACHA_TEST("rpc_cluster", test_a_delete_is_reclaimed_while_a_node_is_away) {
         config->maintenance.foreground_quiet = 10ms;
         config->maintenance.no_progress_backoff = 500ms;
         config->maintenance.garbage_grace = 0ms;
+        config->maintenance.collect_garbage = true;
     }
 
     Service s1(c1, keys, test_durability_window);

@@ -3923,6 +3923,7 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
     config.replication = 1;
     config.metadata_write_copies = 1;
     config.maintenance.garbage_grace = 750ms;
+    config.maintenance.collect_garbage = true;
     config.maintenance.foreground_quiet = 10ms;
     config.maintenance.no_progress_backoff = 500ms;
 

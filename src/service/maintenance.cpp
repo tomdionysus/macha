@@ -330,9 +330,11 @@ void Maintenance::run(std::stop_token stop) {
             const bool garbage_due = !busy && !metadata_dirty;
             const bool gc_due = !busy && now >= gc_quiescent_until;
             gc_due_this_pass = gc_due;
-            // Nothing destructive without a provider: none, the collector is
-            // null and the store removes nothing.
+            // The provider is always registered, so the inventory exists for
+            // repair's survey; the sweeps run only on a node set to reclaim
+            // (maintenance.collect_garbage).
             auto* collector = store_node_.collector();
+            const bool collect_garbage = node_.config().maintenance.collect_garbage;
 
             if (network_due || garbage_due || gc_due) {
                 // One inventory for repair, tombstones and both sweeps,
@@ -384,7 +386,7 @@ void Maintenance::run(std::stop_token stop) {
                     }
                 }
 
-                if (collector && inventory) {
+                if (collector && inventory && collect_garbage) {
                     dagda::ledger::PassDue due;
                     due.garbage_due = garbage_due;
                     due.gc_due = gc_due;

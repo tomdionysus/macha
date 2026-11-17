@@ -5425,8 +5425,11 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     c1.replication = c2.replication = c3.replication = 1;
     c1.metadata_write_copies = c2.metadata_write_copies = c3.metadata_write_copies = 1;
     c1.maintenance.garbage_grace = 0ms;
+    c1.maintenance.collect_garbage = true;
     c2.maintenance.garbage_grace = 0ms;
+    c2.maintenance.collect_garbage = true;
     c3.maintenance.garbage_grace = 0ms;
+    c3.maintenance.collect_garbage = true;
     // Production defaults back settled maintenance off for 30 seconds. This
     // fixture deliberately exercises cluster GC at the scheduler's 5-second
     // minimum so its 10-second convergence assertion does not depend on the
@@ -5666,6 +5669,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         config->replication = 1;
         config->metadata_write_copies = 1;
         config->maintenance.garbage_grace = 0ms;
+        config->maintenance.collect_garbage = true;
         config->maintenance.foreground_quiet = 10ms;
         config->maintenance.no_progress_backoff = 500ms;
         // This case tests burst coalescing and GC, not failure detection: keep

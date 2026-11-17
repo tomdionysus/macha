@@ -362,6 +362,7 @@ MACHA_TEST("namespace_service", test_tombstones_live_in_batches_in_a_tree_backed
     }
     // Longer than the first passes take, so the batches are still there to see.
     config.maintenance.garbage_grace = 20s;
+    config.maintenance.collect_garbage = true;
     Service service(config, cluster.keys(), test_durability_window);
     service.start();
     REQUIRE(wait_metadata_writable(service));
@@ -430,6 +431,7 @@ MACHA_TEST("namespace_service", test_a_stale_tombstone_in_a_batch_is_erased_once
     };
     // Nothing matures: only staleness erases a tombstone here.
     config.maintenance.garbage_grace = 1h;
+    config.maintenance.collect_garbage = true;
     Service service(config, cluster.keys(), test_durability_window);
     service.start();
     REQUIRE(wait_metadata_writable(service));
@@ -747,6 +749,7 @@ MACHA_HEAVY_TEST("namespace_service", test_the_control_collector_keeps_an_unclai
         config->ingest.enabled = false;
         config->torrent.enabled = false;
         config->maintenance.garbage_grace = 0ms;
+        config->maintenance.collect_garbage = true;
         config->maintenance.foreground_quiet = 200ms;
         config->maintenance.no_progress_backoff = 1000ms;
     }
