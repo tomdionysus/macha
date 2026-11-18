@@ -529,7 +529,9 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
     auto entry = s1.filesystem().getattr("/media/two-replicas.bin");
     REQUIRE(entry.extents.size() == 1);
     CHECK(s1.store_node().data().has(entry.extents.front().id));
-    CHECK(s2.store_node().data().has(entry.extents.front().id));
+    // The write is answered at `persisted`, one disk; the second copy follows by prompt
+    // replication.
+    CHECK(wait_until([&] { return s2.store_node().data().has(entry.extents.front().id); }, 20s));
 
     s2.stop();
     s1.stop();
