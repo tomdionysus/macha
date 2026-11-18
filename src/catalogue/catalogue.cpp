@@ -1018,18 +1018,17 @@ CatalogueManager::CatalogueManager(NodeRuntime& node, MetadataServer& metadata_s
 
 namespace {
 
-// How long an artwork request waits for its bytes before answering 503.
-constexpr std::chrono::milliseconds artwork_read_deadline{std::chrono::seconds(30)};
-
 // A store call: whatever the store throws is the store unavailable, never the
-// content's fault.
+// content's fault. The message is the store's own, as 0.94.2 answered; `what`
+// names the call for the debug log only.
 template <class Call> auto store_call(std::string_view what, Call&& call) -> decltype(call()) {
     try {
         return call();
     } catch (const CatalogueUnavailable&) {
         throw;
     } catch (const std::exception& e) {
-        throw CatalogueUnavailable(std::string(what) + ": " + e.what());
+        Log::debug(std::string(what) + ": " + e.what());
+        throw CatalogueUnavailable(e.what());
     }
 }
 
@@ -2525,9 +2524,12 @@ std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId&
     if (!mime_type)
         return {};
     // Reading DATA never makes the reader an owner: artwork is read from its
-    // owner like any remote extent, cached without using replica quota. A
-    // viewer is waiting, so the read is bounded: past it, the API says 503.
-    auto bytes = read_data(id, FrameType::foreground, artwork_read_deadline);
+    // owner like any remote extent, cached without using replica quota. No
+    // deadline of its own, as 0.94.2: the store's admission and each peer's
+    // no-progress bound end it. The intent is a bounded read answering 503 on
+    // timeout (Dagda's ReadOptions::deadline) once Macha's functional fidelity on
+    // the store node is shown; until then the API does not move.
+    auto bytes = read_data(id, FrameType::foreground);
     if (!bytes)
         return {};
     return CatalogueArtworkContent{std::move(*mime_type), std::move(*bytes)};
