@@ -155,11 +155,11 @@ find_package(CURL REQUIRED)
 # because src/http/http_compression.cpp calls deflate() itself.
 find_package(ZLIB REQUIRED)
 find_package(yaml-cpp QUIET)
-# The cluster's transport and node: Dannan 0.8, any patch from the one reviewed
-# (a patch keeps the minor's ABI; a minor is a new API). 0.8.4 has the stop-aware
-# NodeEvents wait every Macha consumer uses; 0.8.5 lets a node stopped once be
-# destroyed after its io has stopped without hanging.
-find_package(dannan 0.8.5 CONFIG REQUIRED)
+# The cluster's transport and node: Dannan 0.9, any patch from the one reviewed
+# (a patch keeps the minor's ABI; a minor is a new API). 0.9.0 fixes the 0.8 retained
+# memory ledger's double free and syncs the directories a durable write makes; 0.9.2
+# delivers adverts and subscriptions to a peer on time.
+find_package(dannan 0.9.2 CONFIG REQUIRED)
 # The store: Dagda, the exact release, built on the same Dannan.
 find_package(dagda 0.2.0 CONFIG REQUIRED)
 

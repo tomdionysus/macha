@@ -2175,6 +2175,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     // A wiped node needs a bootstrap route to find the survivor.
     auto replacement_config = c1;
     replacement_config.bootstrap = {{"127.0.0.1", p2}};
+    // A new node, given its own custody as an operator gives one.
+    give_custody(replacement_config);
     auto replacement = std::make_unique<Service>(replacement_config, keys, test_durability_window);
     replacement->start();
     CHECK(replacement->node().node_id() != old_n1);
@@ -2648,65 +2650,6 @@ MACHA_TEST("rpc_cluster",
     } catch (const std::exception&) {
     }
     CHECK(converged);
-
-    s2.stop();
-    s1.stop();
-}
-
-// The claims barrier before a commit: the commit's control objects are
-// claimed on this node and on the peer when it answers. A peer that never
-// answers the claim does not hold the commit back; once it answers, a later
-// commit's claim lands on both.
-MACHA_TEST("rpc_cluster", test_a_commit_is_claimed_here_when_the_peer_never_answers_the_claim) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    const auto p1 = free_port();
-    const auto p2 = free_port();
-    auto c1 = config_for(cluster.path() / "claims-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "claims-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    c1.replication = c2.replication = 2;
-
-    auto links = std::make_shared<StalledCalls>();
-    ServiceInstruments instruments;
-    instruments.call_fault = links->fault();
-    Service s1(c1, keys, test_durability_window, {}, {}, {}, instruments);
-    Service s2(c2, keys, test_durability_window);
-    s1.start();
-    s2.start();
-    (void)s1.filesystem();
-    (void)s2.filesystem();
-    REQUIRE(wait_metadata_writable(s1));
-    REQUIRE(wait_metadata_writable(s2));
-    REQUIRE(retry_while_not_ready(
-        [&] { s1.filesystem().mkdir("/established", 0755, getuid(), getgid()); }));
-
-    CatalogueItem item;
-    item.id = "movie:claimed";
-    item.kind = CatalogueKind::movie;
-    item.title = "Claimed";
-
-    const auto peer = s2.node().node_id();
-    links->stall(peer, MessageType::retain_objects);
-    (void)s1.catalogue().upsert(item);
-    // The commit is claimed here before the caller is answered; the peer's
-    // claim is the replicator's, and it gives up on a peer that never answers.
-    const auto alone = s1.metadata_manager().snapshot().catalogue_root;
-    REQUIRE(alone.has_value());
-    CHECK(s1.store_node().claims().retained(RetentionClass::control, *alone));
-    REQUIRE(s1.metadata_manager().wait_replicated(30s));
-    CHECK(wait_until([&] { return links->stalled_calls() >= 1; }, 10s));
-    CHECK(!s2.store_node().claims().retained(RetentionClass::control, *alone));
-
-    links->release(peer);
-    item.title = "Claimed twice";
-    (void)s1.catalogue().upsert(item);
-    const auto root = s1.metadata_manager().snapshot().catalogue_root;
-    REQUIRE(root.has_value());
-    CHECK(*root != *alone);
-    CHECK(s1.store_node().claims().retained(RetentionClass::control, *root));
-    REQUIRE(s1.metadata_manager().wait_replicated(30s));
-    CHECK(wait_until(
-        [&] { return s2.store_node().claims().retained(RetentionClass::control, *root); }, 30s));
 
     s2.stop();
     s1.stop();

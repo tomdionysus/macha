@@ -197,7 +197,7 @@ namespace {
 void settle(std::promise<RpcReply>& promise, dannan::net::CallOutcome outcome) {
     if (outcome.reply) {
         promise.set_value(
-            RpcReply{node_info_from(outcome.peer), macha_message(std::move(*outcome.reply))});
+            RpcReply{node_info_from(*outcome.peer), macha_message(std::move(*outcome.reply))});
         return;
     }
     promise.set_exception(std::make_exception_ptr(std::runtime_error(outcome.failure)));
