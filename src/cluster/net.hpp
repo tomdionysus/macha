@@ -184,8 +184,7 @@ struct RpcServerWorkStats {
     size_t data_pending_bytes{};
     uint64_t rejected_jobs{};
     std::map<FrameType, Timing> frame_timings;
-    // By registered name: one entry per type, never merged.
-    std::map<std::string, Timing> message_timings;
+    std::map<MessageType, Timing> message_timings;
 };
 
 class AsyncRpc {

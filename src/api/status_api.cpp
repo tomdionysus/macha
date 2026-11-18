@@ -1007,7 +1007,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     rpc_diagnostics["frame_timings"] = std::move(frame_timings);
     Json::Object message_timings;
     for (const auto& [message, timing] : rpc.message_timings)
-        message_timings[message] = rpc_timing_json(timing);
+        message_timings[message_type_name(message)] = rpc_timing_json(timing);
     rpc_diagnostics["message_timings"] = std::move(message_timings);
     diagnostics["rpc_server"] = std::move(rpc_diagnostics);
 
@@ -1024,12 +1024,14 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     transport_diagnostics["canonical_connections"] = transport.canonical_connections;
     diagnostics["rpc_transport"] = std::move(transport_diagnostics);
 
-    // The store node's DATA admission, once its store is open; its foreground
-    // class is the viewer's.
+    // The store node's DATA admission; its foreground class is the viewer's. The
+    // keys are 0.94.2's: until the store is open the figures read zero, where
+    // 0.94.2's own arbiter had them from the process's start. The intent is an
+    // `available` key saying so once Macha's functional fidelity on the store node is
+    // shown; until then the API does not move.
     const auto* credit = sources.store_node ? sources.store_node->credit() : nullptr;
     const auto data_resource = credit ? credit->stats() : dagda::store::DataResourceStats{};
     Json::Object data_resource_diagnostics;
-    data_resource_diagnostics["available"] = credit != nullptr;
     data_resource_diagnostics["capacity_bytes"] = data_resource.capacity_bytes;
     data_resource_diagnostics["viewer_reserve_bytes"] = data_resource.foreground_reserve_bytes;
     data_resource_diagnostics["used_bytes"] = data_resource.used_bytes;
@@ -1314,7 +1316,9 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     // read back: a failing disk.
     Json::Object repair_diagnostics;
     repair_diagnostics["available"] = false;
-    if (sources.store_node) {
+    // Once services are ready, as 0.94.2 showed it, though the store node has the
+    // figures from local recovery.
+    if (sources.store_node && sources.metadata) {
         try {
             auto& node = *sources.store_node;
             const auto values = node.store().repair_diagnostics();
@@ -1332,11 +1336,11 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             // what this node lacks.
             repair_diagnostics["push_examined"] = values.push_examined;
             repair_diagnostics["pull_examined"] = values.pull_examined;
+            // 0.94.2's keys only. The intent is to add Dagda's offer_bytes (the
+            // offers' own bytes, paid by the credit, moving no object) and in_flight
+            // (transfers started, not yet landed) once Macha's functional fidelity on
+            // the store node is shown; until then the API does not move.
             repair_diagnostics["bytes_transferred"] = values.bytes_transferred;
-            // The offers' own bytes, which the credit pays for and which move no
-            // object; and the bytes of transfers started and not yet landed.
-            repair_diagnostics["offer_bytes"] = values.offer_bytes;
-            repair_diagnostics["in_flight"] = values.in_flight;
             repair_diagnostics["passes_completed"] = values.passes_completed;
             repair_diagnostics["push_phase_complete"] = values.push_phase_complete;
             Json::Object gates;

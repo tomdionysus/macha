@@ -7,8 +7,6 @@
 #include "log.hpp"
 
 #include <algorithm>
-#include <stdexcept>
-#include <string_view>
 
 #include <unistd.h>
 
@@ -170,76 +168,30 @@ RpcServerWorkStats::Timing macha_timing(const dannan::net::Timing& timing) {
     return out;
 }
 
-// Takes only the names a registrar gives its types; registers nothing.
-class RegisteredNames final : public dannan::Routes {
-  public:
-    std::map<dannan::net::MessageType, std::string> names;
-
-    void add(dannan::net::MessageType type, dannan::net::Registration registration,
-             dannan::net::RequestHandler) override {
-        names.emplace(type, std::move(registration.name));
-    }
-    void retire(dannan::net::MessageType) override {}
-    void bind(dannan::net::MessageType, dannan::net::RequestHandler) override {
-        refuse();
-    }
-    void bind_deferred(dannan::net::MessageType, dannan::net::DeferringHandler) override {
-        refuse();
-    }
-    void unbind(dannan::net::MessageType) override {
-        refuse();
-    }
-    std::shared_ptr<dannan::net::CallHandle>
-    call(const dannan::membership::NodeRecord&, dannan::net::MessageType, dannan::net::Bytes,
-         dannan::sched::FrameType, std::chrono::milliseconds, boost::asio::any_io_executor, Done,
-         dannan::net::CallWatch) override {
-        refuse();
-    }
-    std::shared_ptr<dannan::net::CallHandle>
-    call(const dannan::net::Endpoint&, dannan::net::MessageType, dannan::net::Bytes,
-         dannan::sched::FrameType, std::chrono::milliseconds, boost::asio::any_io_executor, Done,
-         dannan::net::CallWatch) override {
-        refuse();
-    }
-    dannan::net::CallOutcome call_and_wait(const dannan::membership::NodeRecord&,
-                                           dannan::net::MessageType, dannan::net::Bytes,
-                                           dannan::sched::FrameType, std::chrono::milliseconds,
-                                           dannan::net::CallWatch) override {
-        refuse();
-    }
-    dannan::net::CallOutcome call_and_wait(const dannan::net::Endpoint&, dannan::net::MessageType,
-                                           dannan::net::Bytes, dannan::sched::FrameType,
-                                           std::chrono::milliseconds,
-                                           dannan::net::CallWatch) override {
-        refuse();
-    }
-
-  private:
-    [[noreturn]] static void refuse() {
-        throw std::logic_error("RegisteredNames only names types");
-    }
-};
-
-// Every type by the name its registrar gave it: Macha's own and the store node's
-// (`dagda.<name>`).
-const std::map<dannan::net::MessageType, std::string>& registered_names() {
-    static const auto names = [] {
-        RegisteredNames table;
-        dagda::store::message::register_types(table);
-        for (const auto& entry : macha_registrations())
-            table.names.emplace(dannan_type(entry.type), entry.registration.name);
-        return std::move(table.names);
-    }();
-    return names;
-}
 } // namespace
 
-std::string registered_type_name(dannan::net::MessageType type) {
-    const auto& names = registered_names();
-    if (const auto found = names.find(type); found != names.end())
-        return found->second;
-    const std::string_view known = message_type_name(macha_type(type));
-    return known != "unknown" ? std::string(known) : std::to_string(static_cast<unsigned>(type));
+// Status keeps 0.94.2's message_timings keys: Macha's name for each number. The store
+// node's types kept their numbers, so they read as before. Dagda's own types, which
+// 0.94.2 never sent, are counted under the type whose work they took over, so no key is
+// added or renamed. The intent is Dagda's registered names (`dagda.<name>`) once Macha's
+// functional fidelity on the store node is shown; until then the API does not move.
+MessageType status_message_type(dannan::net::MessageType type) {
+    namespace store = dagda::store::message;
+    if (type == store::durability_covered)
+        return MessageType::object_durability_barrier;
+    if (type == store::remove_objects)
+        return MessageType::delete_object;
+    if (type == store::offer_objects)
+        return MessageType::have_objects;
+    if (type == store::offer_objects_reply)
+        return MessageType::have_objects_reply;
+    if (type == store::get_objects)
+        return MessageType::get_object;
+    if (type == store::get_objects_reply)
+        return MessageType::object_reply;
+    if (type == store::remove_objects_reply)
+        return MessageType::bool_reply;
+    return macha_type(type);
 }
 
 RpcServerWorkStats macha_work_stats(const dannan::net::WorkStats& stats) {
@@ -254,8 +206,16 @@ RpcServerWorkStats macha_work_stats(const dannan::net::WorkStats& stats) {
     out.rejected_jobs = stats.rejected;
     for (const auto& [frame, timing] : stats.frame_timings)
         out.frame_timings[frame] = macha_timing(timing);
-    for (const auto& [type, timing] : stats.message_timings)
-        out.message_timings[registered_type_name(type)] = macha_timing(timing);
+    // Several types can share a key (status_message_type): their timings add.
+    for (const auto& [type, timing] : stats.message_timings) {
+        auto& into = out.message_timings[status_message_type(type)];
+        const auto add = macha_timing(timing);
+        into.requests += add.requests;
+        into.queue_wait_us_total += add.queue_wait_us_total;
+        into.queue_wait_us_max = std::max(into.queue_wait_us_max, add.queue_wait_us_max);
+        into.handler_us_total += add.handler_us_total;
+        into.handler_us_max = std::max(into.handler_us_max, add.handler_us_max);
+    }
     return out;
 }
 

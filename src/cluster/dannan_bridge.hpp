@@ -91,9 +91,9 @@ IdentityAssociationReset macha_identity_reset(const dannan::membership::Identity
 
 PublicConnectivityStatus macha_connectivity(const dannan::reach::PublicConnectivityStatus& status);
 RpcStats macha_rpc_stats(const dannan::net::ClientStats& stats);
-// A type by the name its registrar gave it (`dagda.<name>` for the store node's), else
-// Macha's name for the number, else the number in decimal.
-std::string registered_type_name(dannan::net::MessageType type);
+// The type Status counts a message under: 0.94.2's, with Dagda's own types folded into
+// the type whose work they took over.
+MessageType status_message_type(dannan::net::MessageType type);
 RpcServerWorkStats macha_work_stats(const dannan::net::WorkStats& stats);
 
 // The node's inbound answer with Macha's configured modes beside it, and hosts_extents

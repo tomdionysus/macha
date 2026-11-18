@@ -188,7 +188,7 @@ void Maintenance::run(std::stop_token stop) {
     uint64_t observed_event = events_now();
     auto gc_quiescent_until = Clock::time_point{};
     // The store's repair: credit, its share against the classes above it, the
-    // survey and the transfers. Its own clock is the store node's, real time.
+    // survey and the transfers, on this pass's clock.
     auto& repair = store_node_.repair();
     // Quiet after a turn with nothing to do, until an event or the survey's new lists.
     bool repair_quiescent = false;
@@ -389,7 +389,8 @@ void Maintenance::run(std::stop_token stop) {
             // when its share against the classes above lets one start. It is
             // paced, never switched off: a node that is always busy still
             // repairs.
-            const auto repair_now = Clock::now();
+            // On the pass's clock, as the store node's Repair is (MaintenanceOptions::time).
+            const auto repair_now = now;
             const auto credit = repair.earn_credit(repair_now, policy.interval);
             const auto paced = repair.paced_by();
             const bool allow_network_repair = repair.may_start(repair_now, paced);
@@ -399,7 +400,7 @@ void Maintenance::run(std::stop_token stop) {
                                                      : dagda::store::RepairGate::quiescent,
                              paced);
             if (!allow_network_repair)
-                repair_wake = Clock::now() + repair.turn_wait(repair_now, paced);
+                repair_wake = repair_now + repair.turn_wait(repair_now, paced);
             if (!cluster_stable_observed_ && node_.membership().all_known_reachable() &&
                 metadata_.status().stable) {
                 // Recovery after a restart: every known node reached and
@@ -455,7 +456,7 @@ void Maintenance::run(std::stop_token stop) {
                                 0.0, static_cast<double>(node_.config().extent_size) -
                                          static_cast<double>(repair.credit()));
                             repair_wake =
-                                Clock::now() +
+                                clock_->now() +
                                 std::chrono::duration_cast<Clock::duration>(
                                     std::chrono::duration<double>(short_by / credit.rate));
                         }
@@ -607,8 +608,7 @@ void Maintenance::run(std::stop_token stop) {
             deadline = std::min(deadline, now_after_work);
         }
         if (repair_wake)
-            deadline = std::min(
-                deadline, std::max(now_after_work, now_after_work + (*repair_wake - Clock::now())));
+            deadline = std::min(deadline, std::max(now_after_work, *repair_wake));
         // The local stages' credit, the scrub's next campaign: the store node's.
         if (const auto due = store_node_.local_due())
             deadline = std::min(deadline, std::max(*due, now_after_work));
