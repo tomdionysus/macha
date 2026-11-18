@@ -3874,6 +3874,11 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
             if (!parked)
                 clock->advance(std::chrono::milliseconds(next));
         }
+        if (!parked)
+            for (auto* service : services)
+                std::cerr << "not parked: " << service->maintenance_sleep_diagnostic()
+                          << ", wait_ms " << parked_wait_ms(*service) << ", stage "
+                          << service->maintenance_stage() << "\n";
         REQUIRE(parked);
         std::vector<std::pair<uint64_t, std::string>> before;
         for (auto* service : services)
