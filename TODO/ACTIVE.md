@@ -85,6 +85,11 @@ Both are the maintainer's rulings to leave on 0.94.2 and fix through the port.
   2.9 MB/s, a tenth of the plan's sizes): a large rejoin took about 80 s where the bytes sent once take about 38 s;
   small objects are bound by the call budget (410 objects in 38.9 s); a viewer on the holder was not slowed. Nothing
   is lost. The maintainer, 2026-11-16: no patch; Dagda's redesign replaces it (stages 1 to 3 built; stage 4 next).
+- **A loader refused for device pressure waits for the next release** (develop `data_work.hpp:239-247`): the
+  refusal ends with time (the viewer goes quiet, the pressure eases), but nothing wakes the waiter, so a loader
+  yielding to a viewer on a slow disk resumes only at the next DATA release, unbounded when the holders are long-lived.
+  Found by Dagda 2026-11-18 (its copy of the arbiter); Macha's arbiter is gone on the port branch, so Dagda fixes it
+  there and the cutover carries it.
 - **Durable writes into new directories** (`src/durable_file.cpp`): a crash just after the write returns can lose a
   directory it made, and the file in it. Fixed on the port branch (`46c61ba`).
 
