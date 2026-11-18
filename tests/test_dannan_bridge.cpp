@@ -107,6 +107,30 @@ MACHA_TEST("dannan_bridge", test_the_registrations_carry_section_seven_two_rules
         }
 }
 
+// Status's message timings carry each type under its registrar's name: Macha's own,
+// the store node's as `dagda.<name>` (its newer types too), and a number nobody
+// registered in decimal; no two types share a key.
+MACHA_TEST("dannan_bridge", test_message_timings_keep_every_type_under_its_registered_name) {
+    REQUIRE(registered_type_name(dannan_type(MessageType::get_metadata)) == "get_metadata");
+    REQUIRE(registered_type_name(dannan_type(MessageType::get_object)) == "dagda.get_object");
+    REQUIRE(registered_type_name(dannan::net::MessageType{773}) == "dagda.get_objects");
+    REQUIRE(registered_type_name(dannan::net::MessageType{769}) == "dagda.remove_objects");
+    REQUIRE(registered_type_name(dannan_type(MessageType::ping)) == "ping");
+    REQUIRE(registered_type_name(dannan::net::MessageType{999}) == "999");
+
+    dannan::net::WorkStats stats;
+    for (const uint16_t number : {768, 769, 771, 773, 774}) {
+        dannan::net::Timing timing;
+        timing.requests = number;
+        stats.message_timings[dannan::net::MessageType{number}] = timing;
+    }
+    const auto out = macha_work_stats(stats);
+    REQUIRE(out.message_timings.size() == 5);
+    REQUIRE(out.message_timings.at("dagda.durability_covered").requests == 768);
+    REQUIRE(out.message_timings.at("dagda.get_objects_reply").requests == 774);
+    REQUIRE(!out.message_timings.contains("unknown"));
+}
+
 // The whole table goes into Dannan's route table, and the retired numbers are refused
 // from then on.
 MACHA_TEST("dannan_bridge", test_dannan_takes_the_table_and_refuses_the_retired_numbers) {
