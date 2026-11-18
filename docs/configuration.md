@@ -61,10 +61,20 @@ reads it from another directory instead (a node run outside systemd). The store
 keeps its ledgers under a key custody derives, so a node without `custody` does not
 open its store and fails its start saying so.
 
-Custody is made once per node, before the first start that names it:
-`dannan-node --state <state_path> --init-custody --custody-credential macha-custody`
-writes the custody file and prints the new root, which is sealed with
-`systemd-creds encrypt` and never kept in clear. Custody is never replaced; a node
+Custody is made once per node, with the node stopped, before the first start that
+names it, by Dannan's `dannan-custody(1)`:
+
+```sh
+dannan-custody init --state <state_path> --credential macha-custody \
+  | systemd-creds encrypt --name=macha-custody - /etc/credstore.encrypted/macha-custody
+systemd-run --wait --pipe -p LoadCredentialEncrypted=macha-custody \
+  dannan-custody show --state <state_path> --credential macha-custody
+```
+
+`init` writes the custody file and prints the new root straight into
+`systemd-creds encrypt`, so it is never kept in clear; `show` proves the sealed
+credential opens custody as the unit will read it. The unit names the same
+credential in `LoadCredentialEncrypted=`. Custody is never replaced; a node
 whose custody or credential is missing, or whose root does not open it, refuses to
 start and says which. Back up the custody file and the sealed root off the node.
 Changing `custody` needs a restart.

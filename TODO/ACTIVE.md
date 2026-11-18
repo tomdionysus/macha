@@ -24,7 +24,32 @@ than 18:50Z and `rc=0`; at 19:00Z it still read `rc=0 17:40:31`, the build at 26
 which counts only if it is newer than that result (the log of 18:51Z, 539 and 5, is a stale binary's). If the
 session's background command died with the clear, run the suite by hand. **Release the build-3 claim** when done.
 
-**The four, and what the run should show:**
+**2026-11-18 19:50Z, after suite10 (545 cases: 538 pass, 7 fail) and per-case runs:**
+- Fixed in `src/service/maintenance.cpp`, uncommitted: (a) the tombstone and garbage-batch exact wake `main` had
+  (earliest retirement plus grace), lost in the port: the trace cases `tombstones_maturing`, `peer_unreachable_and_back`
+  and `tombstones_live_in_batches` pass; (b) repair's quiescence now ends when the survey's lists name other work
+  (`new_repair_work`, by content: inventory generation, the pull list, each peer's lacks): Macha's flag cleared only on a
+  store event, so a turn that settled quiet before the survey saw a new peer's lack parked the pass for the garbage
+  grace (30 days). Proved with per-node wait traces. Pointer identity (what Dagda's own `Repair::pass` uses) was tried
+  first and re-ran a futile CONTROL claim walk on a survey that changed nothing
+  (`trace_incomplete_catalogue_and_release_horizon`); `repair_resumes_after_yielding` 8/8 (was about 1 in 2), and `two_node_mutual_bootstrap`
+  (failing since before the port) passes.
+- `message_timings` keyed by registered name (`registered_type_name`, `dannan_bridge.cpp`; test in
+  `test_dannan_bridge.cpp`): Dagda's new types had all merged under "unknown".
+- **Sent to Dagda (19:50Z):** `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`, about
+  1 in 5: s1's read of an object only s2 holds ends `ReadEnd::unavailable` at once; s1's last survey was generation 4
+  with `peers=0`. Mechanism (Dagda's, proved here 19:59Z): a DATA read asks only active peers carrying the
+  `dagda/extents` advert; s2 was active in s1's roster with no extents advert yet, so the read asked nobody and
+  answered unavailable at once. Fix is the maintainer's choice, which Dagda is putting to him: (A) a read also asks the other
+  active peers when hosting candidates are exhausted (Dagda and Macha both recommend), (B) test-only wait for adverts.
+- **For the maintainer:** `filesystem_fuse/test_coalesced_delete_burst_wakes_at_exact_garbage_grace` counts 3 convergence runs, not
+  2. Proved: three unlinks are three commits, so three tombstone batches stamped about 1 ms apart; the case steps the
+  clock to 1 ms before the latest batch's grace, which matures the first two, and erasing them is a commit, so an event
+  and a run. The grace boundary and the collection checks pass. Not proved: whether `main` group-committed the two
+  unlinks made while the convergence run was held into one batch. Question: is per-batch erasure on each batch's own
+  grace right (the case's count changes), or must a burst share one batch?
+
+**The four, as they stood at 19:00Z:**
 1. `filesystem_fuse/test_disconnected_maintenance_sleeps_until_peer_event` and
    `test_coalesced_delete_burst_wakes_at_exact_garbage_grace`: the port's pass woke every interval (an R3 interim).
    Fixed in `src/service/maintenance.cpp` (**uncommitted at the clear if the run had not finished; commit it once it
