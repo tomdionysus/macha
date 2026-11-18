@@ -1,5 +1,30 @@
 # Current release
 
+## 0.95.0: the store is Dagda's
+
+The store cutover. Macha's object store, its repair, availability survey, retention
+claims, garbage collection and their local stages are Dagda's store node, running on
+Dannan 0.9.2 beneath Macha; Macha's own store code is gone. Macha keeps its namespace,
+metadata, catalogue and the maintenance pass, which drives the store node's steps in
+Macha's order and parks until a real deadline: retries, the GC quiet window, a busy
+class going quiet, repair's turn and credit on the pass's clock, the store node's local
+stages and survey, and the earliest tombstone or garbage batch to mature. Repair ends
+its quiet spell when the survey names other work.
+
+A node's disks move to Dagda's layout before its first start: the node is stopped and
+`dagda-migrate` converts the store in place, with a before-and-after manifest compare;
+`dagda-migrate --reverse` returns it to 0.94.2's layout. Key custody is required: each
+node's key and seal root live in `<state>/identity/custody` under a systemd credential
+(`custody.credential`, made with `dannan-custody init`); a node without it does not
+open its store. `maintenance.collect_garbage` (default false) gates the pass's sweeps:
+repair and the survey run regardless, and nothing is reclaimed until it is set.
+
+The API is 0.94.2's: Status keys, codes and messages are unchanged, Dagda's own message
+types counted under the 0.94.2 types whose work they took over.
+
+A durable write now syncs each directory it makes into its parent, so a crash after it
+returns cannot lose a new directory and the file in it.
+
 ## 0.94.2: the availability survey asks again after any failure
 
 Availability: a survey read a peer whose telemetry had not yet arrived as one too
