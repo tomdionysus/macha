@@ -27,9 +27,10 @@ namespace {
 
 // The store node over `node`'s Dannan node: registers the store's message types and
 // declares its planes; opens nothing. Its maintenance steps run on the pass's clock,
-// which a trace fixture moves by hand.
+// which a trace fixture moves by hand, and tell their decisions to the pass's trace.
 std::unique_ptr<dagda::Node> make_store_node(NodeRuntime& node, const ClusterKeys& keys,
                                              MaintenanceClock& clock,
+                                             const MaintenanceTraceHook& trace,
                                              std::chrono::milliseconds durability_batch_window,
                                              const LocalState::StageHook& stage_hook) {
     auto options =
@@ -38,6 +39,7 @@ std::unique_ptr<dagda::Node> make_store_node(NodeRuntime& node, const ClusterKey
     options.startup_stage = stage_hook;
     options.maintenance.time = &clock;
     options.maintenance.wall = &clock;
+    options.maintenance.trace = trace;
     return std::make_unique<dagda::Node>(node.node(), std::move(options), dagda::Node::OpenLater{});
 }
 
@@ -55,8 +57,8 @@ Service::Service(const Config& config, ClusterKeys keys,
       durability_batch_window_(durability_batch_window), books_(config),
       node_(config, keys, progress_, books_.transcode_rates, routes_,
             std::move(startup_stage_hook)),
-      store_node_(
-          make_store_node(node_, keys, *clock_, durability_batch_window, recovery_stage_hook_)),
+      store_node_(make_store_node(node_, keys, *clock_, maintenance_trace_, durability_batch_window,
+                                  recovery_stage_hook_)),
       resources_(books_, node_.node().memory(), node_.events()),
       accounts_(node_.config(), node_.identity(), node_, routes_),
       cluster_status_(

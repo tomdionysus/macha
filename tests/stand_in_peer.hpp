@@ -11,6 +11,7 @@
 #include "cluster/telemetry_bridge.hpp"
 #include "test_support.hpp"
 
+#include <dagda/store/messages.h>
 #include <dagda/store/placement.h>
 
 #include <dannan/identity/cluster_key.h>
@@ -64,6 +65,26 @@ class StandInPeer {
         node.log = macha_log_sink();
         host_ =
             std::make_unique<DannanHost>(std::move(node), routes, 2, DannanHost::MetadataNotice{});
+        // The store's types, registered as a store node registers them, answered by the
+        // handlers the test binds in `routes` (501 for any it does not).
+        auto& node_routes = host_->node().routes();
+        dagda::store::message::register_types(node_routes);
+        namespace m = dagda::store::message;
+        for (const auto type :
+             {m::have_object, m::get_object, m::put_object, m::delete_object, m::get_control_object,
+              m::put_control_object, m::put_object_deferred, m::object_durability_barrier,
+              m::retain_objects, m::have_objects, m::have_control_objects, m::have_valid_objects,
+              m::trie_diff, m::durability_covered, m::remove_objects, m::offer_objects})
+            node_routes.bind(type, [this](const dannan::membership::NodeRecord& peer,
+                                          dannan::sched::FrameType frame,
+                                          const dannan::net::Message& request) {
+                dannan::net::Message copy;
+                copy.type = request.type;
+                copy.payload = request.payload;
+                auto reply =
+                    routes.dispatch(node_info_from(peer), frame, macha_message(std::move(copy)));
+                return dannan::net::Handled::processed(dannan_message(reply));
+            });
         if (options.hosts_extents)
             host_->node().nodes().advertise(advert::hosts_extents, dannan::net::Bytes{1});
     }

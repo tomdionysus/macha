@@ -18,7 +18,14 @@ One more on 2026-11-17, with Macha's `RetentionStore` (port step 1): `test_stora
 refusing the delete). `test_work_class.cpp` `test_presence_is_per_class_and_bytes_per_frame` is KEEP in Dagda's
 mapping and stays, rewritten over Dannan's `ActivityClocks` when Macha's went (port step 2).
 
-172 cases.
+One more on 2026-11-18 (the port's fix-forward): `test_rpc_cluster.cpp`
+`test_a_commit_is_claimed_here_when_the_peer_never_answers_the_claim` against
+`HeadsExchange.ACommitIsClaimedHereWhenThePeerNeverAnswersTheClaim` (Dagda's `heads_exchange_test.cpp:796`, named by
+Dagda): the same case, the peer's `retain_objects` stalled, the commit claimed here before the caller is answered,
+`wait_replicated` returning with the peer's claim unanswered, and the next commit claimed on both once it answers.
+Macha's version stalled the claim through Macha's call fault, which Context::Claims no longer passes through.
+
+173 cases.
 
 ## test_absent_nodes.cpp
 

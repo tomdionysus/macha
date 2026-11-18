@@ -91,6 +91,9 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
 
     out.server.extent_size = config.extent_size;
     out.server.hosts_extents = hosts_extents;
+    // A disk that comes or goes is seen at the server's refresh: every heartbeat, as
+    // Macha's storage server refreshed.
+    out.server.refresh_interval = config.heartbeat;
 
     out.store.replication = config.replication;
     out.store.write_copies = config.write_copies;

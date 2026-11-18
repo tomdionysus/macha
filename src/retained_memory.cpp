@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "retained_memory.hpp"
 
+#include <dagda/store/distributed_store.h>
+
 namespace macha {
 
 dannan::sched::MemoryOwner dannan_owner(MemoryOwner owner) noexcept {
+    // One owner each on the node's ledger: a frame is Dannan's, object bytes Dagda's
+    // (what a read or a queued copy holds), and Macha's own after both, clear of the
+    // numbers Dagda takes from hosted_first.
     if (owner == MemoryOwner::rpc_frame)
         return dannan::sched::MemoryOwner::rpc_frame;
+    if (owner == MemoryOwner::object_payload)
+        return dagda::store::object_payload_owner;
+    constexpr uint16_t macha_first = 16;
     return static_cast<dannan::sched::MemoryOwner>(
-        static_cast<uint16_t>(dannan::sched::MemoryOwner::hosted_first) +
+        static_cast<uint16_t>(dannan::sched::MemoryOwner::hosted_first) + macha_first +
         static_cast<uint16_t>(owner));
 }
 
