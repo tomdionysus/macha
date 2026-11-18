@@ -37,7 +37,11 @@ its recovery thread was still in `open_store` (all-thread backtrace, Dagda's rea
 three backend-loss, two maintenance-wake, and singles (the replacement-node case needs custody made again after it
 replaces the state). build-3 holds the `97a5bed` prefix and a current build (`/home/maintainer/macha-store-2`).
 
-**Next, in order, on the maintainer's word to resume:** its prefix, the whole suite, then the triage's groups, each mechanism proved before a change (a Dagda cause pauses the port for
+Dagda since (2026-11-18 ~00:45Z): `fbdd50a` guards a stop during `open_store()` (the stop waits; the open ends
+`NodeRefused` at its next stage), gated 1148 ran, 1145 passed, 3 skipped; no Macha change; local in Dagda until the maintainer
+says push. The next rebuild takes it.
+
+**Next, in order, on the maintainer's word to resume (and once Miach posts that the cluster is clear):** its prefix, the whole suite, then the triage's groups, each mechanism proved before a change (a Dagda cause pauses the port for
 Dagda's fix); then the flag-day prep below.
 
 **Leave alone until Dagda's repair stage 4 is built:** the Status code reading Repair's gates and step figures. Its
