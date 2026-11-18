@@ -24,6 +24,17 @@ than 18:50Z and `rc=0`; at 19:00Z it still read `rc=0 17:40:31`, the build at 26
 which counts only if it is newer than that result (the log of 18:51Z, 539 and 5, is a stale binary's). If the
 session's background command died with the clear, run the suite by hand. **Release the build-3 claim** when done.
 
+**2026-11-18 23:40Z: the suite is green.** On Dannan 0.9.2 and Dagda `053ee6e`: 545/545 (suite13). On Dagda `053ee6e`
+plus Dagda's gated, uncommitted read fix (`../dagda/build/read-asks-active-peers.patch`, sha256 `b3187110...c71`,
+The maintainer chose option A): 545/545 (suite14) and the catalogue case 20/20 serially. Release commit 0.95.0 made, untagged.
+Since 19:50Z: the API is 0.94.2's (the maintainer: fidelity first, native forms later, intents as code comments; record in
+[`2026-11-18-port-api-announcement.md`](2026-11-18-port-api-announcement.md), nothing to announce); repair runs on the
+pass's clock as `main`'s did (proved against a `main` build: the delete-burst case now counts 2 runs, as `main`).
+The Pis were wiped 20:30Z and rebuilt; build-3 has `prefix-0.9.2`, `prefix-dagda-053ee6e`, `prefix-dagda-053ee6e-read`
+and Macha's packages (all three build Pis, the maintainer's approval). Next: Dagda commits the fix and proposes a tag (the maintainer's
+word); `docs/install-linux.md` names its versions; the tarball by `build/pi/macha_package.sh` from that tag; then the maintainer's
+decisions on the migration downtime and the cutover, live-b first.
+
 **2026-11-18 19:50Z, after suite10 (545 cases: 538 pass, 7 fail) and per-case runs:**
 - Fixed in `src/service/maintenance.cpp`, uncommitted: (a) the tombstone and garbage-batch exact wake `main` had
   (earliest retirement plus grace), lost in the port: the trace cases `tombstones_maturing`, `peer_unreachable_and_back`
