@@ -34,6 +34,87 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
     Log::trace("DIAG maintenance-stage stage=" + std::string(stage) + " elapsed_ms=" +
                std::to_string(ms) + (detail.empty() ? std::string{} : " " + detail));
 }
+
+// Whether the survey's lists name other work than those repair went quiet on. A
+// survey that publishes the same lists afresh is not new work: a quiet repair
+// retries nothing on it.
+bool new_repair_work(const dagda::store::RepairLists& quiet, const dagda::store::RepairLists& now) {
+    const auto inventory_moved = [&] {
+        if (quiet.inventory == now.inventory)
+            return false;
+        if (!quiet.inventory || !now.inventory)
+            return true;
+        return quiet.inventory->generation() != now.inventory->generation() ||
+               quiet.inventory->complete() != now.inventory->complete();
+    };
+    const auto pull_moved = [&] {
+        if (quiet.pull == now.pull)
+            return false;
+        const bool was_empty = !quiet.pull || quiet.pull->empty();
+        const bool is_empty = !now.pull || now.pull->empty();
+        if (was_empty || is_empty)
+            return was_empty != is_empty;
+        return *quiet.pull != *now.pull;
+    };
+    const auto lacks_moved = [&] {
+        if (quiet.lacks == now.lacks)
+            return false;
+        if (!quiet.lacks || !now.lacks)
+            return true;
+        const auto& was = *quiet.lacks;
+        const auto& is = *now.lacks;
+        if (was.generation != is.generation || was.complete != is.complete ||
+            was.lacks.size() != is.lacks.size())
+            return true;
+        for (auto a = was.lacks.begin(), b = is.lacks.begin(); a != was.lacks.end(); ++a, ++b) {
+            if (a->first != b->first)
+                return true;
+            const bool a_empty = !a->second || a->second->empty();
+            const bool b_empty = !b->second || b->second->empty();
+            if (a_empty != b_empty || (!a_empty && *a->second != *b->second))
+                return true;
+        }
+        return false;
+    };
+    return inventory_moved() || pull_moved() || lacks_moved();
+}
+
+// How long until the earliest stamped retirement, or garbage batch, has stood its
+// grace on the wall clock; none while nothing is waiting to mature.
+std::optional<Clock::duration> earliest_maturity(const dagda::contract::InventoryHorizon& inventory,
+                                                 std::chrono::milliseconds grace,
+                                                 int64_t wall_now_ns) {
+    const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(grace).count();
+    if (grace_ns <= 0)
+        return std::nullopt;
+    std::optional<int64_t> earliest_ns;
+    const auto consider = [&](int64_t retired_at_ns) {
+        if (retired_at_ns <= 0)
+            return;
+        int64_t remaining_ns{};
+        if (wall_now_ns < retired_at_ns) {
+            // Stamped ahead of this clock: matures the grace after the stamp.
+            const auto until = retired_at_ns - wall_now_ns;
+            if (until > std::numeric_limits<int64_t>::max() - grace_ns)
+                return;
+            remaining_ns = until + grace_ns;
+        } else {
+            const auto elapsed = wall_now_ns - retired_at_ns;
+            if (elapsed >= grace_ns)
+                return;
+            remaining_ns = grace_ns - elapsed;
+        }
+        if (!earliest_ns || remaining_ns < *earliest_ns)
+            earliest_ns = remaining_ns;
+    };
+    for (const auto& candidate : inventory.garbage())
+        consider(candidate.retired_at_ns);
+    for (const auto& batch : inventory.batches())
+        consider(batch.retired_at_ns);
+    if (!earliest_ns)
+        return std::nullopt;
+    return std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(*earliest_ns));
+}
 } // namespace
 
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
@@ -109,7 +190,9 @@ void Maintenance::run(std::stop_token stop) {
     // The store's repair: credit, its share against the classes above it, the
     // survey and the transfers. Its own clock is the store node's, real time.
     auto& repair = store_node_.repair();
+    // Quiet after a turn with nothing to do, until an event or the survey's new lists.
     bool repair_quiescent = false;
+    dagda::store::RepairLists quiescent_lists;
     const auto pause = [&stop] {
         if (stop.stop_requested())
             throw MaintenanceStopping{};
@@ -361,7 +444,8 @@ void Maintenance::run(std::stop_token stop) {
                     enter_stage("retention-repair");
                     const auto walks = repair.claim_walks(turn);
                     enter_stage("network-repair");
-                    const auto step = repair.transfer(turn, repair.lists());
+                    const auto lists = repair.lists();
+                    const auto step = repair.transfer(turn, lists);
                     switch (repair.settle(walks, step)) {
                     case dagda::store::RepairSettled::credit:
                     case dagda::store::RepairSettled::waiting_for_credit:
@@ -382,6 +466,7 @@ void Maintenance::run(std::stop_token stop) {
                         break;
                     case dagda::store::RepairSettled::quiescent:
                         repair_quiescent = true;
+                        quiescent_lists = lists;
                         break;
                     }
                 }
@@ -408,6 +493,19 @@ void Maintenance::run(std::stop_token stop) {
                     if (data.gate.permitted && !data.swept.yielded && data.swept.complete)
                         gc_quiescent_until = data.swept.deferred ? clock_->now() + data.orphan_grace
                                                                  : Clock::time_point::max();
+                    // An immature retirement is future work the sweep cannot see: once a
+                    // GC pass has read this inventory, one exact wake for the earliest to
+                    // mature, or the pass would sleep past it.
+                    if (gc_due && !busy && inventory->inventory) {
+                        if (const auto matures = earliest_maturity(
+                                *inventory->inventory, policy.garbage_grace, clock_->wall_ns())) {
+                            // Kept with a deferred orphan's wake if that is sooner.
+                            const auto at = clock_->now() + *matures;
+                            gc_quiescent_until = gc_quiescent_until > clock_->now()
+                                                     ? std::min(gc_quiescent_until, at)
+                                                     : at;
+                        }
+                    }
                 }
             } else {
                 survey_and_table();
@@ -467,9 +565,9 @@ void Maintenance::run(std::stop_token stop) {
 
         cpu_reporter.tick();
         const auto now_after_work = clock_->now();
-        // The store's stages keep their own credit and rest, re-evaluated on
-        // its cadence: at most one interval between passes.
-        auto deadline = now_after_work + policy.interval;
+        // Parked until an event or the earliest real deadline below: nothing wakes a
+        // node with no work to do.
+        auto deadline = Clock::time_point::max();
         // `complete()` can turn an in-flight burst into one pending follow-up without
         // another external event, so a dirty owner with no retry delay is runnable
         // now; sleeping would lose the edge and strand metadata and its catalogue
@@ -492,11 +590,31 @@ void Maintenance::run(std::stop_token stop) {
             else if (!gc_due_this_pass && !busy)
                 deadline = std::min(deadline, now_after_work);
         }
+        if (busy) {
+            // A busy pass held back GC, repair and the local stages; it runs again as soon
+            // as the foreground quiet window is met, not on an unrelated event.
+            const auto idle = std::min(context_.activity().idle_for(WorkClass::foreground),
+                                       context_.activity().idle_for(WorkClass::loader));
+            deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
+                                                                ? policy.foreground_quiet - idle
+                                                                : Clock::duration{}));
+        }
         if (repair_continue)
             deadline = std::min(deadline, now_after_work + policy.interval);
+        // The survey this pass ran may have found work repair went quiet without.
+        if (repair_quiescent && new_repair_work(quiescent_lists, repair.lists())) {
+            repair_quiescent = false;
+            deadline = std::min(deadline, now_after_work);
+        }
         if (repair_wake)
             deadline = std::min(
                 deadline, std::max(now_after_work, now_after_work + (*repair_wake - Clock::now())));
+        // The local stages' credit, the scrub's next campaign: the store node's.
+        if (const auto due = store_node_.local_due())
+            deadline = std::min(deadline, std::max(*due, now_after_work));
+        // A deferred survey, or a peer to ask again.
+        if (const auto due = store_node_.availability().due())
+            deadline = std::min(deadline, std::max(*due, now_after_work));
 
         // A maintenance action can itself commit metadata (retiring a matured garbage
         // marker, say); that event must not be lost for arriving before the wait.

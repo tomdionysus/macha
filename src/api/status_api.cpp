@@ -1007,7 +1007,7 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     rpc_diagnostics["frame_timings"] = std::move(frame_timings);
     Json::Object message_timings;
     for (const auto& [message, timing] : rpc.message_timings)
-        message_timings[message_type_name(message)] = rpc_timing_json(timing);
+        message_timings[message] = rpc_timing_json(timing);
     rpc_diagnostics["message_timings"] = std::move(message_timings);
     diagnostics["rpc_server"] = std::move(rpc_diagnostics);
 

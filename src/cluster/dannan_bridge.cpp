@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/dannan_bridge.hpp"
 
+#include <dagda/store/messages.h>
 #include <dagda/store/placement.h>
 
 #include "log.hpp"
 
 #include <algorithm>
+#include <stdexcept>
+#include <string_view>
 
 #include <unistd.h>
 
@@ -166,7 +169,78 @@ RpcServerWorkStats::Timing macha_timing(const dannan::net::Timing& timing) {
     out.handler_us_max = timing.handler_us_max;
     return out;
 }
+
+// Takes only the names a registrar gives its types; registers nothing.
+class RegisteredNames final : public dannan::Routes {
+  public:
+    std::map<dannan::net::MessageType, std::string> names;
+
+    void add(dannan::net::MessageType type, dannan::net::Registration registration,
+             dannan::net::RequestHandler) override {
+        names.emplace(type, std::move(registration.name));
+    }
+    void retire(dannan::net::MessageType) override {}
+    void bind(dannan::net::MessageType, dannan::net::RequestHandler) override {
+        refuse();
+    }
+    void bind_deferred(dannan::net::MessageType, dannan::net::DeferringHandler) override {
+        refuse();
+    }
+    void unbind(dannan::net::MessageType) override {
+        refuse();
+    }
+    std::shared_ptr<dannan::net::CallHandle>
+    call(const dannan::membership::NodeRecord&, dannan::net::MessageType, dannan::net::Bytes,
+         dannan::sched::FrameType, std::chrono::milliseconds, boost::asio::any_io_executor, Done,
+         dannan::net::CallWatch) override {
+        refuse();
+    }
+    std::shared_ptr<dannan::net::CallHandle>
+    call(const dannan::net::Endpoint&, dannan::net::MessageType, dannan::net::Bytes,
+         dannan::sched::FrameType, std::chrono::milliseconds, boost::asio::any_io_executor, Done,
+         dannan::net::CallWatch) override {
+        refuse();
+    }
+    dannan::net::CallOutcome call_and_wait(const dannan::membership::NodeRecord&,
+                                           dannan::net::MessageType, dannan::net::Bytes,
+                                           dannan::sched::FrameType, std::chrono::milliseconds,
+                                           dannan::net::CallWatch) override {
+        refuse();
+    }
+    dannan::net::CallOutcome call_and_wait(const dannan::net::Endpoint&, dannan::net::MessageType,
+                                           dannan::net::Bytes, dannan::sched::FrameType,
+                                           std::chrono::milliseconds,
+                                           dannan::net::CallWatch) override {
+        refuse();
+    }
+
+  private:
+    [[noreturn]] static void refuse() {
+        throw std::logic_error("RegisteredNames only names types");
+    }
+};
+
+// Every type by the name its registrar gave it: Macha's own and the store node's
+// (`dagda.<name>`).
+const std::map<dannan::net::MessageType, std::string>& registered_names() {
+    static const auto names = [] {
+        RegisteredNames table;
+        dagda::store::message::register_types(table);
+        for (const auto& entry : macha_registrations())
+            table.names.emplace(dannan_type(entry.type), entry.registration.name);
+        return std::move(table.names);
+    }();
+    return names;
+}
 } // namespace
+
+std::string registered_type_name(dannan::net::MessageType type) {
+    const auto& names = registered_names();
+    if (const auto found = names.find(type); found != names.end())
+        return found->second;
+    const std::string_view known = message_type_name(macha_type(type));
+    return known != "unknown" ? std::string(known) : std::to_string(static_cast<unsigned>(type));
+}
 
 RpcServerWorkStats macha_work_stats(const dannan::net::WorkStats& stats) {
     RpcServerWorkStats out;
@@ -181,7 +255,7 @@ RpcServerWorkStats macha_work_stats(const dannan::net::WorkStats& stats) {
     for (const auto& [frame, timing] : stats.frame_timings)
         out.frame_timings[frame] = macha_timing(timing);
     for (const auto& [type, timing] : stats.message_timings)
-        out.message_timings[macha_type(type)] = macha_timing(timing);
+        out.message_timings[registered_type_name(type)] = macha_timing(timing);
     return out;
 }
 
