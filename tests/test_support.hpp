@@ -509,16 +509,19 @@ class BareNode : public BareNodeResources, public NodeRuntime {
         if (recovery_.joinable())
             recovery_.request_stop();
     }
+    // As Service stops: the recovery thread, which may be opening the store node, ends
+    // first; then the store node; then the node beneath it.
     void stop() {
         resources.stop();
         accounts_.stop();
+        if (recovery_.joinable()) {
+            recovery_.request_stop();
+            NodeRuntime::request_stop();
+            recovery_.join();
+        }
         follow_hosts_extents({});
         store_node_->stop();
         NodeRuntime::stop();
-        if (recovery_.joinable()) {
-            recovery_.request_stop();
-            recovery_.join();
-        }
     }
 
     Accounts& accounts() {
