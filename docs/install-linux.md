@@ -101,7 +101,7 @@ pkg-config --exists 'libavformat >= 60' 'libavcodec >= 60' 'libavutil >= 58' \
 
 ## Build Dannan and Dagda
 
-Macha builds against Dannan 0.6 and Dagda 0.1.5, each from its tag, Dannan
+Macha builds against Dannan 0.9.2 and Dagda 0.2.0, each from its tag, Dannan
 first:
 
 ```bash

@@ -36,16 +36,24 @@ every byte); nothing has measured it on that disk.
 4. **Check the transport files**: `dannan-import-macha --dry-run /var/lib/macha`. Expect "already" or "absent" for
    `membership/known-nodes.bin`, `connectivity/inbound.bin`, `telemetry/last-known.bin`. Any "imported": stop and
    send it to Dannan.
-5. **Custody** (Dannan's procedure): `dannan-custody init --state /var/lib/macha --credential dannan-root | tee
-   <operator's offline copy> | systemd-creds encrypt --name=dannan-root - /etc/credstore.encrypted/dannan-root`.
-   Keeps `node-id`. Prove the seal: decrypt to a private directory, `dannan-custody show ... --credentials-dir`,
-   delete the directory. **The backup is the hex root plus `identity/custody`, held by the operator offline**;
-   losing it after the migration loses the node's ledgers.
+5. **Custody** (Dannan's procedure, corrected 2026-11-18 to `dannan-custody(1)`): `dannan-custody init --state
+   /var/lib/macha --credential dannan-root | systemd-creds encrypt --name=dannan-root -
+   /etc/credstore.encrypted/dannan-root`. Keeps `node-id`. **Never pipe init's output to a file or `tee`**: that is
+   the root in clear. Prove the seal as the unit will read it: `systemd-run --wait --pipe -p
+   LoadCredentialEncrypted=dannan-root dannan-custody show --state /var/lib/macha --credential dannan-root` prints
+   `{"id":...,"public_key":...}`. If `init` printed and `systemd-creds encrypt` failed, remove
+   `/var/lib/macha/identity/custody` and run init again (nothing has used it). **The off-node backup is three files
+   kept together, offline, operator-held, one set per node**: `/etc/credstore.encrypted/dannan-root`, that host's
+   `/var/lib/systemd/credential.secret` (a Pi 5 has no TPM, so the seal is the host key alone), and
+   `/var/lib/macha/identity/custody`. Losing them after the migration loses the node's ledgers.
 6. **Migrate** (Dagda's procedure, `docs/migration.md`), node stopped throughout, manifests on another disk (about
    1.2 GB for the two):
    - `dagda-migrate --state /var/lib/macha --node-state /var/lib/macha --cluster-key /etc/macha/cluster.key
      --credential dannan-root --credentials-dir <dir> --backend /mnt/diskB/data --control /var/lib/macha/metadata-objects
      --cache /var/cache/macha --write-manifest <disk>/before`
+     (`--credentials-dir` wants the root readable outside the unit; ask Dagda whether the tool runs under
+     `systemd-run -p LoadCredentialEncrypted=dannan-root` instead, as Dannan's `show` does, so the root is never
+     decrypted to a directory. Not settled.)
    - the same without `--write-manifest` (the migration)
    - the same with `--write-manifest <disk>/after`, before the node starts
    - `dagda-migrate --compare-before <disk>/before --compare-after <disk>/after`: exit 0 and "RESULT: PASS".
@@ -61,8 +69,7 @@ included; then `/root/pre-V/` (0.94.2's binaries, unit and `macha.yaml`). Custod
 
 ## Before the first node (not yet done)
 
-- The suite green on the final libraries (four left on 2026-11-18: two wait on Dagda's claims fix and a
-  local-stages due time; see `ACTIVE.md`).
+- The suite green on the final libraries (see `ACTIVE.md`).
 - API changes announced to Core and every client (`2026-11-14-port-rewrites.md`, "Before the flag day", plus
   repair's `offer_bytes` and `in_flight`).
 - The maintainer's word on: the Dagda tag, the migration's downtime (no rehearsal on a copy is possible; the first live

@@ -288,6 +288,10 @@ store cases retired and `StoreBench` gone (`0a777a7`), Macha's store deleted wit
 `set_hosts_extents`, `LocalState` holds the seed and the replica only). What remains is `ACTIVE.md`'s "Next, in
 order"; the deps this file's head names (Dannan 0.8.0, 0.8.3, Dagda `6ea9d04`) are superseded by the ones there.
 
+**After R7 (2026-11-17 and 11-18):** the remaining removal (`LocalStore` and its twins), R1's leftovers and the
+move to Dannan 0.9.2 are done; the record is `COMPLETED.md`, the state `ACTIVE.md`, the cutover
+`2026-11-18-cutover-runbook.md`. The dependency versions named above are superseded.
+
 ## R7. Removal
 
 Macha's store code that Dagda now holds goes (plan S.1's list), each test retired against the Dagda case

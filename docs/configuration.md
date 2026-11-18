@@ -57,8 +57,9 @@ from, sealed in `<state_path>/identity/custody`. `credential` names the systemd
 credential holding the root that file is sealed under; the unit loads it with
 `LoadCredentialEncrypted=` and the node reads it from `$CREDENTIALS_DIRECTORY` at
 each start, so a node restarts unattended after a power cut. `credentials_directory`
-reads it from another directory instead (a node run outside systemd). Without
-`custody` the node has none.
+reads it from another directory instead (a node run outside systemd). The store
+keeps its ledgers under a key custody derives, so a node without `custody` does not
+open its store and fails its start saying so.
 
 Custody is made once per node, before the first start that names it:
 `dannan-node --state <state_path> --init-custody --custody-credential macha-custody`
