@@ -1,6 +1,27 @@
 # Completed and tested
 
-Last updated: 2026-11-17
+Last updated: 2026-11-18
+
+## 2026-11-17 to 11-18 -- the port's steps 1 to 4 and the suite down to four (`port/dannan-dagda`)
+
+- Released by the maintainer 2026-11-17. `c5fbbb4`: Macha's `LocalStore` and all that stood on it deleted, with the contract
+  twins, `ActivityClocks`, `DataResourceArbiter` and the device monitor; `macha-metadata-dump` on Dagda's
+  `LocalStore`; one startup progress (Dannan's, handed to the store node); the store's message types registered by
+  Dagda's node alone. `8b40c4a`: an API request during startup no longer crashes the HTTP reactor on the store
+  node's activity clock. `b26fb55`: Status's repair section shows `offer_bytes` and `in_flight`. `71e69e1`: test
+  nodes keep key custody. `592caf5`: the reachability provider always registered, `collect_garbage` gating only the
+  sweeps (the maintainer's ruling); a failed plane read from the node's readiness. `f096f3c`: `BareNode` ends its recovery
+  before it stops the store node. `7b259bd`: Dannan 0.9.2; the decision trace handed to the store node (the six
+  trace fixtures pass unchanged); the server's refresh at the heartbeat; memory owners clear of Dagda's; the
+  stand-in peer registering the store's types. `b93e4bf`: two test waits.
+- The suite on a Pi: 177 failed on the first run, 4 on the last valid one (540 passed), by fixes on both sides.
+  Dagda's, each with a case seen failing first: the state layout beside its host's files (`8b544d6`), a failed
+  plane marked as it fails (`97a5bed`), a stop during an open (`fbdd50a`), claims on `write_copies` holders
+  (`8398ec4`), `Node::local_due()` (`e6418ce`), the arbiter's pressure wait (`053ee6e`). The first triage is
+  `archive/2026-11-17-port-suite-triage.md`.
+- 173 cases retired against named library cases (`2026-11-16-test-retirement.md`).
+- Both live `macha.yaml` files load under the port's loader with no unknown key (`build/cutover/config_check.cpp`);
+  the cutover runbook written (`2026-11-18-cutover-runbook.md`).
 
 ## 2026-11-14 to 11-17 -- the store port on `port/dannan-dagda` (compiles; no full suite yet)
 

@@ -46,7 +46,7 @@ brew install --cask macfuse
 prefix on both `/usr/local` Intel installations and `/opt/homebrew` Apple
 Silicon installations; it does not need to be force-linked.
 
-Build and install Dannan 0.6.0 and then Dagda 0.1.5 from their tags, then
+Build and install Dannan 0.9.2 and then Dagda 0.2.0 from their tags, then
 configure and build Macha as your normal user:
 
 ```bash
