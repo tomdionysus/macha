@@ -27,8 +27,13 @@ intents left as code comments).
 4. Done: **The maintainer's cutover decisions** (2026-11-19): both nodes stopped together; live-a migrates and comes up first,
    then live-b; backups and custody copies in other directories on each node itself. `dagda-migrate`'s crash
    coverage asked of Dagda and recorded (a real power cut is not proven; hence live-a first).
-5. **Waiting: the maintainer's word to start.** Then the runbook's steps A to D; after both, the cutover check, garbage collection,
-   the 0.95.0 tag, merges and pushes, each on his word.
+5. **First attempt aborted 2026-11-19 15:00Z** (runbook, "The first attempt"): `dagda-migrate` reads at about 64 MiB/s,
+   so about 24 h per pass over live-a's 5.9T and four passes in the plan. Both nodes back on 0.94.2, nothing
+   written. **Waiting on Dagda**: a faster tool (overlap reads and computation, use the cores, fewer passes) and a
+   measured rate; then the runbook's downtime replanned and the maintainer's word to start again.
+6. Small: the build Pis need no approval to install tooling, only a claim (the coordinating session's correction,
+   2026-11-19); Dagda's develop has a repair change (idle repair at the whole link) for a possible 0.3.1, which
+   changes the meaning of `maintenance.idle_bandwidth_fraction` if Macha takes it.
 
 **Rulings in force** (the maintainer, interactive; the rest in "Standing rules"):
 - 2026-11-18/19: the API stays 0.94.2's; Dannan's and Dagda's native forms come after Macha's functional fidelity is
@@ -128,7 +133,7 @@ corruption.
 build-1 `root@192.0.2.169`, build-2 `.170`, build-3 `.202`, build-4 `.228` (light work
 only): Pi 5, 16 GB, Debian 13 arm64, shared by every session. No builds on the Mac. Claim cores on the board (claim,
 gate on "Taken"; `claim-board wait ... --for 90m` as a background command when none are free; release when the job
-ends). Ask the maintainer before installing packages.
+ends). Installing tooling needs only a claim.
 
 ## Standing rules
 
