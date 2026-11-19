@@ -615,6 +615,15 @@ class FileSystem final : public PublicationTarget {
     MetadataSnapshot local_snapshot() const;
     MetadataSnapshotView local_snapshot_view();
     std::optional<MetadataSnapshotView> available_snapshot_view() const;
+    // The latest mutation this node authored and accepted: a view lacking it
+    // is behind this node's own writes.
+    std::optional<MetadataDot> own_latest_mutation() const {
+        return local_.replica().author_accepted();
+    }
+    // Whether this node holds several heads to read, so a fold is coming.
+    bool metadata_fold_pending() const {
+        return local_.replica().usable_head_identities().size() > 1;
+    }
     uint64_t available_snapshot_generation() const noexcept {
         return m_.current_generation();
     }

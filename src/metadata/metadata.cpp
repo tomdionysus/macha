@@ -2236,6 +2236,13 @@ void MetadataReplica::note_author_accepted(const MetadataDot& dot) {
         author_.accepted = std::max(author_.accepted, dot.sequence);
 }
 
+std::optional<MetadataDot> MetadataReplica::author_accepted() const {
+    Lock lock(m_);
+    if (!author_loaded_ || !author_.accepted)
+        return {};
+    return MetadataDot{author_.id, author_.accepted};
+}
+
 std::vector<NodeId> MetadataReplica::author_ids(const NodeId& node_id,
                                                 const std::map<NodeId, uint64_t>& head_clock) {
     Lock lock(m_);

@@ -281,15 +281,26 @@ std::vector<NodeInfo> MetadataManager::replica_nodes(const std::vector<NodeId>& 
 }
 
 MetadataRecord MetadataManager::cache_record(const MetadataRecord& record,
-                                             std::shared_ptr<const MetadataSnapshot> decoded) {
+                                             std::shared_ptr<const MetadataSnapshot> decoded,
+                                             bool sole_usable_head) {
     // Durable management tombstones are operational constraints once decoded.
     for (const auto& [_, reset] : decoded->identity_resets)
         node_.apply_identity_reset(reset);
+    const auto own = local_.replica().author_accepted();
 
     Lock lock(cache_mutex_);
+    const bool cache_decoded = cache_ && decoded_cache_ && decoded_hash_ == cache_->hash;
     // Reads can complete out of order; never move the cache back to an older
-    // record.
-    if (cache_ && newer_than(*cache_, record))
+    // record. The sole usable head displaces a cached record not in its past.
+    const bool displaced =
+        sole_usable_head && cache_decoded &&
+        !clock_covers(decoded_cache_->mutation_sequences, decoded->mutation_sequences);
+    if (cache_ && !displaced && newer_than(*cache_, record))
+        return *cache_;
+    // Nor to one lacking this node's latest commit when the cache holds it,
+    // whatever its generation: the fold that the new head set wakes brings both.
+    if (cache_decoded && own && clock_covers(decoded_cache_->mutation_sequences, *own) &&
+        !clock_covers(decoded->mutation_sequences, *own))
         return *cache_;
     cache_ = record;
     cache_until_ = time_.now() + node_.config().metadata_cache;
@@ -316,12 +327,13 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
         Lock lock(cache_mutex_);
         if (cache_ && newer_than(*cache_, record))
             return *cache_;
-        cache_ = record;
-        cache_until_ = time_.now() + node_.config().metadata_cache;
-        cache_remote_epoch_ = node_.remote_metadata_epoch();
         if (decoded_cache_ && decoded_generation_ == record.generation &&
-            decoded_hash_ == record.hash)
+            decoded_hash_ == record.hash) {
+            cache_ = record;
+            cache_until_ = time_.now() + node_.config().metadata_cache;
+            cache_remote_epoch_ = node_.remote_metadata_epoch();
             return record;
+        }
     }
 
     // Decode only when the canonical record changes: rebuilding every
@@ -1139,7 +1151,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             // A cluster-wide configuration change may leave the accepted branch on
             // the old write floor; maybe_reconfigure() commits the transition at
             // max(old_floor, new_floor) before any write.
-            return cache_record(selected, materialized->snapshot);
+            return cache_record(selected, materialized->snapshot, true);
         }
 
         if (!reconciliation_lock) {

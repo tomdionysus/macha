@@ -162,8 +162,11 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     MetadataRecord maybe_reconfigure(const MetadataRecord&);
     MetadataRecord read_record_uncached();
     MetadataRecord cache_record(const MetadataRecord&);
+    // `sole_usable_head`: the record is the one head this node reads, which a
+    // cached record outside its history (set aside or dropped) gives way to.
     MetadataRecord cache_record(const MetadataRecord&,
-                                std::shared_ptr<const MetadataSnapshot> decoded);
+                                std::shared_ptr<const MetadataSnapshot> decoded,
+                                bool sole_usable_head = false);
     std::optional<MetadataRecord> cached_record();
     std::optional<MetadataSnapshotView> cached_snapshot_view();
     bool import_history_from_peer(const NodeInfo&, const Hash256&, FrameType);

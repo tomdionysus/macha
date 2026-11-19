@@ -42,6 +42,15 @@ inline bool clock_covers(const std::map<NodeId, uint64_t>& clock, const Metadata
     const auto found = clock.find(dot.author);
     return found != clock.end() && found->second >= dot.sequence;
 }
+// Whether a head with `clock` has incorporated every mutation `other` has.
+inline bool clock_covers(const std::map<NodeId, uint64_t>& clock,
+                         const std::map<NodeId, uint64_t>& other) {
+    for (const auto& [author, sequence] : other) {
+        if (!clock_covers(clock, MetadataDot{author, sequence}))
+            return false;
+    }
+    return true;
+}
 
 // Where an entry came from, which is what lets two heads be merged without
 // their common ancestor. An entry written before provenance was kept has
@@ -705,6 +714,8 @@ class MetadataReplica {
                                      const std::map<NodeId, uint64_t>& head_clock);
     // A commit carrying this dot was accepted here.
     void note_author_accepted(const MetadataDot&);
+    // The latest dot this node authored and accepted; none before its first.
+    std::optional<MetadataDot> author_accepted() const;
     // This node's author ids, the current one first.
     std::vector<NodeId> author_ids(const NodeId& node_id,
                                    const std::map<NodeId, uint64_t>& head_clock);
