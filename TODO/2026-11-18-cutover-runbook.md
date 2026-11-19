@@ -50,6 +50,19 @@ designed with the maintainer; to propose, smallest first:
    figures (below) until the cutover's first pass. If far off them, that pass is stopped: a manifest pass writes
    nothing to the disk.
 
+**Results (2026-11-19 evening, build-3 and build-4, kit `build/rehearsal/`, the 0.3.1 tarball, the scripts as written):**
+- R1, one node end to end (3.1 GB, 3,620 files, 1,092 loose objects): steps 1 to 9 pass; passes 22 s, migration 2 s,
+  after 22 s (147 MiB/s on NVMe), `RESULT: PASS`; 0.95.0 reads every file back; a new write reads back.
+- R2, kills (5.6 GB, 5,010 files, 3,244 loose): before pass killed, resumed with `RESUME=1`; migration killed part
+  way (marker `going-forward`, progress file present), 0.94.2 refused the disk, rerun finished it (2,585 already v19,
+  915 moved, 0 unreadable); after pass killed and resumed; `RESULT: PASS`; 0.95.0 reads every file back.
+- R3, rollback after step 7: a write on 0.95.0, then `--reverse` (3 s, 0 unreadable, marker v18), `/root/pre-0.95.0`
+  restored, 0.94.2 healthy, every file back including those written on 0.95.0.
+- R4, two nodes (the new order): **stopped before the migration** on a 0.94.2 defect: on a fresh 0.94.2 pair, one of
+  six 96 MiB files copied into A's mount committed short (84,410,368 of 100,663,296 bytes, the bytes it has correct),
+  on both nodes, with no error, nothing parked, every publication counted complete. Not seen in R1 or R2 (one node).
+  Under diagnosis, reported to the maintainer; the pair is left running on build-3 and build-4.
+
 ## Downtime (estimates from the live disks, 2026-11-19; the released tool not yet run on them)
 
 | Phase | live-a (5.9T, 1.54 M loose 4 MiB objects) | live-b (3.3T, 0.90 M) | Cluster |
