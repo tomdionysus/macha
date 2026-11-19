@@ -99,9 +99,13 @@ metadata writable with `replicas=2/2`; no WARN or ERROR line on either (accounts
 connections made once and reused about 500 times on each, so no session ended; server rejections 0; prompt
 replication 0 failures both ways; both data directories hold the same 19 large objects, so every write reached both
 nodes. A answered 26 requests of types it does not know (Dagda's 768 to 774, answered 501 as Dagda predicted) without
-any session ending. A's repair moved 22 MB, so some of B's objects may have reached A by A's pull rather than B's
-puts: Dagda's prediction that B's puts and claims to A fail on trailing bytes is neither confirmed nor ruled out by
-this run, and the end state does not depend on it. Not exercised: a promoted request, deletes reaching the other
+any session ending. Settled by Dagda from code afterwards: B's prompt copies to A carry no writer, so they are
+protocol 23's payload exactly and succeed (the 0 failures is real); B's write fan-out and its claims always carry its
+writer, so those to A fail on the trailing bytes (500 from 0.94.2's dispatch, logged by Dagda at DEBUG only; the
+server's `rejected_jobs` counts queue refusals, not handler errors, which is why it read 0). With write copies 1 the
+writer's own copy meets the write, so nothing surfaced. During the window, then, live-a holds copies of live-b's
+new objects with no claim from live-b; with `collect_garbage` false nothing collects them, and once live-a runs
+0.95.0 its claims are its own. The window stays minutes. Not exercised: a promoted request, deletes reaching the other
 node's store (garbage collection off). Logs in `build/smoke/logs/`; configs and scripts in `build/smoke/`.
 
 **The plan for the window (recommended; the maintainer's choice at the go):** keep the mixed time to minutes. live-b migrates
