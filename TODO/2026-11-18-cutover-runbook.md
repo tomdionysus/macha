@@ -11,13 +11,13 @@ copy); the API stays 0.94.2's; `maintenance.collect_garbage` stays false until t
 
 | Gate | State |
 |---|---|
-| Macha suite green on the deployed libraries | 545/545 at `fe74e9b` on Dagda `053ee6e` + the read fix (patch); rerun on the 0.3.0 tag pending |
-| Macha release commit | `fe74e9b` 0.95.0 on `port/dannan-dagda`, pushed; tag 0.95.0 on the maintainer's word |
+| Macha suite green on the deployed libraries | **done**: 545/545 at `8ef9496` on Dannan 0.9.2 and Dagda 0.3.0 (build-3, 2026-11-19 04:28Z) |
+| Macha release | 0.95.0, `8ef9496` on `port/dannan-dagda` (release commit `fe74e9b`, then the Dagda 0.3.0 requirement), pushed; tag 0.95.0 on the maintainer's word |
 | Dannan | 0.9.2 tag |
-| Dagda | 0.3.0: release gate running (Release, ASan+UBSan, TSan) on `4a4b322`; tag after it passes |
+| Dagda | **done**: 0.3.0 tagged (local, `2a58202`, tree `af09d301` = the gated `4a4b322`): Release, ASan+UBSan, TSan gate passed |
 | Mixed-version window | transports proved by Dannan's run (one cluster with the key; islands with a certificate alone); stores must not mix for long (Dagda and Macha, from code); plan: minutes of mixing (below) |
 | Two-version smoke test | **not run**: a 0.94.2 node and a 0.95.0 node on one key, on two build Pis: handshake, members, telemetry; each side's store calls (the five differing types in every frame class its code uses, puts and claims) and Macha's metadata calls each way; record every session ended and every error; neither node crashes |
-| Deploy tarball | `build/pi/macha_package.sh` from the 0.3.0 prefix, sha256 recorded; not built |
+| Deploy tarball | **done**: `build/release-0.95.0/macha-0.95.0-arm64.tgz`, sha256 `7d9d1e0fef5b0875dc3c6b819de5709b8d6c8b0ceda04fe16adf492d1126a062`, 76 MB, from `8ef9496` on Dagda 0.3.0; binaries resolve inside it (`dagda-migrate --version` 0.3.0 on dannan 0.9.2) |
 | Install script | `build/install-0.95.0.sh` (written; read it before the first use) |
 | API announcement | none needed: 0.95.0 sends 0.94.2's API (`2026-11-18-port-api-announcement.md`) |
 | 0.94.2 baselines | `build/baselines/results-0.94.2`; the comparison runs after each node is on 0.95.0 |

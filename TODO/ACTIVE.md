@@ -13,22 +13,17 @@ for it. The plan is [`2026-11-18-cutover-runbook.md`](2026-11-18-cutover-runbook
 mixed-version window, rollback); its history [`2026-11-14-port-rewrites.md`](2026-11-14-port-rewrites.md); done work
 in `COMPLETED.md`.
 
-**Where it stands:** `port/dannan-dagda` at `fe74e9b`, the 0.95.0 release commit, pushed, untagged. The suite is
-green: 545/545 on Dannan 0.9.2 with Dagda `053ee6e`, and 545/545 with `053ee6e` plus Dagda's read fix, the catalogue
-case 20/20 serially. The API is 0.94.2's; nothing to announce
+**Where it stands (2026-11-19 04:30Z):** `port/dannan-dagda` at `8ef9496` (0.95.0), pushed, untagged. The suite is
+green on the deployed libraries: 545/545 on Dannan 0.9.2 and Dagda 0.3.0 (tagged, gated). The deploy tarball is
+built: `build/release-0.95.0/macha-0.95.0-arm64.tgz`, sha256 `7d9d1e0f...a062` (full hash in the runbook). The API is 0.94.2's; nothing to announce
 ([`2026-11-18-port-api-announcement.md`](2026-11-18-port-api-announcement.md) records what was mapped back and the
 intents left as code comments).
 
 **To be cutover-ready, in order:**
-1. **Dagda 0.3.0** (the maintainer approved in Dagda's session): the read fix committed `b997ba1`; release commit `4a4b322`;
-   its release gate (Release, ASan+UBSan, TSan) running; then the tag. On the tag: `git -C ../dagda archive 0.3.0` to
-   `/root/pi/dagda-0.3.0.tar`, `TAG=0.3.0 J=3 sh build/pi/deps_dagda_tag.sh` on a claimed Pi, the Macha suite on
-   `DAGDA=prefix-dagda-0.3.0` (log on the Pi), then `docs/install-linux.md` names Dannan 0.9.2 and Dagda 0.3.0.
-2. **The deploy tarball**: `S=... V=0.95.0 DAGDA=prefix-dagda-0.3.0 sh build/pi/macha_package.sh` on the Pi that ran
-   the suite; record its sha256 in the runbook.
-3. **The mixed-version window**: Dannan answered from code (the transports admit each other if live-b keeps the
-   cluster key and no certificate); five store types' lane or frame rules differ between 0.94.2 and Dagda (runbook);
-   Dagda's answer on the stores mixing is awaited. Then the **two-version smoke test**: Macha `main` (0.94.2, on
+1. Done: **Dagda 0.3.0** tagged and gated; Macha builds on it (`8ef9496`); the install guides name the versions.
+2. Done: **the deploy tarball** (above).
+3. **The mixed-version window**: answered (runbook): the transports form one cluster (Dannan's run), the stores must
+   not mix for long, so the plan keeps the mixing to minutes. Still to run: the **two-version smoke test**: Macha `main` (0.94.2, on
    Dannan 0.5.3; build-1 has `prefix-0.5.3` and a `main` tree from 2026-11-18) and 0.95.0 on two build Pis, one cluster
    key: handshake, members, telemetry, a store call and a Macha call each way, no session ended.
 4. **The maintainer's decisions**, asked interactively once 1 to 3 are done, each with a recommendation: the off-node backup
