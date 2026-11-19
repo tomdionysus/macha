@@ -9,8 +9,8 @@ this rationalisation is `archive/2026-11-19-ACTIVE-before-rationalisation.md`. A
 
 **The port: Macha onto Dannan and Dagda, the only work until the cutover.** the maintainer, 2026-11-18: "Work autonomously until
 you're ready to do the cutover on live-a and live-b." the maintainer, 2026-11-19: **do not begin the cutover**; get ready
-for it. The plan is [`2026-11-18-cutover-runbook.md`](2026-11-18-cutover-runbook.md) (gates, per-node steps, the
-mixed-version window, rollback); its history [`2026-11-14-port-rewrites.md`](2026-11-14-port-rewrites.md); done work
+for it. The plan is [`2026-11-18-cutover-runbook.md`](2026-11-18-cutover-runbook.md) (rulings, gates, downtime,
+crash handling, the steps, rollback); its history [`2026-11-14-port-rewrites.md`](2026-11-14-port-rewrites.md); done work
 in `COMPLETED.md`.
 
 **Where it stands (2026-11-19 04:30Z):** `port/dannan-dagda` at `8ef9496` (0.95.0), pushed, untagged. The suite is
@@ -22,20 +22,19 @@ intents left as code comments).
 **To be cutover-ready, in order:**
 1. Done: **Dagda 0.3.0** tagged and gated; Macha builds on it (`8ef9496`); the install guides name the versions.
 2. Done: **the deploy tarball** (above).
-3. Done: **the mixed-version window**: the transports form one cluster (Dannan's run), the stores must not mix for
-   long, so the plan keeps the mixing to minutes; the **two-version smoke test passed** 2026-11-19 (runbook: about 9
-   minutes mixed, every write on both nodes, no session ended, no error). It was: Macha `main` (0.94.2, on
-   Dannan 0.5.3; build-1 has `prefix-0.5.3` and a `main` tree from 2026-11-18) and 0.95.0 on two build Pis, one cluster
-   key: handshake, members, telemetry, a store call and a Macha call each way, no session ended.
-4. **The maintainer's decisions**, asked interactively once 1 to 3 are done, each with a recommendation: the off-node backup
-   destination for each node's `/var/lib/macha` and `/etc/macha` (and who holds the custody files); mixed cluster
-   or islands for the window, from the smoke test; the go for live-b; separately, the go for live-a; the 0.95.0
-   tag, merges and pushes after both.
+3. Done: **the mixed-version window** analysed and smoke-tested (passed), then made moot: the maintainer ruled both nodes down
+   together ([`archive/2026-11-19-cutover-mixed-version-window.md`](archive/2026-11-19-cutover-mixed-version-window.md)).
+4. Done: **The maintainer's cutover decisions** (2026-11-19): both nodes stopped together; live-a migrates and comes up first,
+   then live-b; backups and custody copies in other directories on each node itself. `dagda-migrate`'s crash
+   coverage asked of Dagda and recorded (a real power cut is not proven; hence live-a first).
+5. **Waiting: the maintainer's word to start.** Then the runbook's steps A to D; after both, the cutover check, garbage collection,
+   the 0.95.0 tag, merges and pushes, each on his word.
 
 **Rulings in force** (the maintainer, interactive; the rest in "Standing rules"):
 - 2026-11-18/19: the API stays 0.94.2's; Dannan's and Dagda's native forms come after Macha's functional fidelity is
   shown, each intent left as a code comment where it applies. Tombstone timing matches `main` (repair on the pass's
-  clock). Dagda's read fix is option A (a read asks the other active peers). The cutover is not begun until he says.
+  clock). Dagda's read fix is option A (a read asks the other active peers). The cutover is not begun until he says;
+  its own rulings are at the head of the runbook.
 - Fix forward, each mechanism proved before a change; a Dannan or Dagda cause goes to its session with the
   mechanism and waits for its gated fix. A library's release follows that library's rules (Dagda acts on the maintainer's word
   in its own session only).
