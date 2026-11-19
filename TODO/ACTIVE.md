@@ -15,15 +15,18 @@ rehearsals, downtime, the steps, rollback); the port's history
 
 **Do not start the cutover. Nothing touches live-a or live-b without the maintainer's word.** the maintainer, 2026-11-19 evening, the
 order from here:
-1. **Dagda is tagged and released first; the maintainer is doing this himself** in Dagda's session. The fast migration (his
-   option B: header-only moves between two independent manifest passes, reads in device order) is built, gated and
-   merged on Dagda develop `fb48fce`, untagged. Wait for the tag from Dagda or the maintainer; do not ask Dagda to tag.
-2. **On the tag, Macha's side** (autonomous, on a claimed Pi): archive the tag to `build/pi/dagda-<tag>.tar`,
-   `TAG=<tag> J=3 sh deps_dagda_tag.sh`, compile and the whole suite on `DAGDA=prefix-dagda-<tag>`; then
-   `find_package(dagda <tag>)` in `CMakeLists.txt`, both install guides, `docs/configuration.md` if the release
-   changes `maintenance.idle_bandwidth_fraction`'s meaning (Dagda's idle-repair change), the CHANGELOG entry; commit;
-   push; rebuild the tarball with `macha_package.sh` and record its sha256 in the runbook. (`build/pi/dagda-fb48fce.tar`
-   is the untagged develop head, archived 2026-11-19; nothing was built from it.)
+1. Done: **Dagda 0.3.1 tagged and pushed** (the maintainer's word, 2026-11-19; main `2793458`): the fast migration (option B:
+   header-only moves with `<state>/migration-progress`, manifest passes in device order, no dry run) and the
+   large-rejoin repair work (`maintenance.idle_bandwidth_fraction` now applies only while a higher class is present;
+   an idle node's repair uses the whole link, `max_bandwidth` bounds it). Gate: 1172 ran, 1169 passed, 3 skipped;
+   TSan clean; ASan+UBSan one test fault, fixed in the test.
+2. **Next, Macha on 0.3.1** (autonomous, on a claimed Pi; not started): `git -C ../dagda archive 0.3.1 >
+   build/pi/dagda-0.3.1.tar`, copy to the Pi's `/root/pi/`, `TAG=0.3.1 J=3 sh deps_dagda_tag.sh`, compile and the
+   whole suite on `DAGDA=prefix-dagda-0.3.1` (log on the Pi); then `find_package(dagda 0.3.1 ...)` in
+   `CMakeLists.txt`, both install guides, `docs/configuration.md` (the changed meaning of
+   `maintenance.idle_bandwidth_fraction`), the CHANGELOG's 0.95.0 entry; commit; push; rebuild the tarball with
+   `macha_package.sh` and record its sha256 in the runbook; read Dagda's `docs/migration.md` at 0.3.1 ("How a run
+   moves records") against `build/cutover/migrate-0.95.0.sh` and the runbook's step 6.
 3. **Small rehearsals** (runbook, "Small rehearsals"): propose their shape to the maintainer interactively, smallest first, then
    run them. Not designed with him yet.
 4. **The cutover**, on the maintainer's word: both nodes down together, live-a migrates and comes up first, then live-b;
@@ -50,8 +53,7 @@ rules"):
 
 **The libraries (read their repositories before relying on this):**
 - **Dannan** 0.9.2 tagged. Custody by `dannan-custody(1)`; `dannan-import-macha --dry-run` is a check at the cutover.
-- **Dagda** 0.3.0 tagged (local, `2a58202`); develop `fb48fce` adds the fast migration and, earlier (`4a1c855`), idle
-  repair at the whole link estimate (`idle_bandwidth_fraction` then applies only while a higher class is present).
+- **Dagda** 0.3.1 tagged and pushed (`2793458`); Macha still builds on 0.3.0 until step 2 above.
   Dagda holds off the live nodes until the cutover is reported done.
 
 **Builds:** the Pis were wiped 2026-11-18 and rebuilt; Macha's packages are on build-1, build-2 and build-3; installing
@@ -81,7 +83,7 @@ All stay on 0.94.2 and are fixed by the port.
 
 ## Waiting on the operator
 
-- The cutover decisions (Resume here, step 4).
+- The rehearsals' shape (to be proposed once Macha is rebuilt on Dagda 0.3.1); then the word to start the cutover.
 - Dagda's and Dannan's branches pushed (both local on the maintainer's word).
 - After the port: whether the heap chase resumes with media load.
 - The Codecov token for the repository.

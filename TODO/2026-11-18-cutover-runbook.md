@@ -1,8 +1,8 @@
 # The cutover: live-a and live-b onto Dagda (runbook)
 
 Rationalised 2026-11-19 evening. Macha's store moves to Dagda's on both live nodes. **Not started; do not start.**
-Order of work (the maintainer, 2026-11-19): (1) Dagda is tagged and released first, by the maintainer himself in Dagda's session; (2) small
-rehearsals of the migration; (3) the cutover, on his word, asked interactively.
+Order of work (the maintainer, 2026-11-19): (1) Dagda tagged and released first (done: 0.3.1); (2) Macha rebuilt and tested on
+it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked interactively.
 
 **The maintainer's rulings for the cutover:**
 - **Both nodes down together**: stop Macha on both, do the cutover, bring them back. No mixed-version window (this
@@ -21,8 +21,8 @@ rehearsals of the migration; (3) the cutover, on his word, asked interactively.
 
 | Gate | State |
 |---|---|
-| Dagda release with the fast migration | **waiting on the maintainer**: built, gated (1172 ran, 1169 passed, 3 skipped) and merged on Dagda develop `fb48fce`; CMake still says 0.3.0; the tag (0.3.1) is the maintainer's, in Dagda's session |
-| Macha on that release | to do on the tag: `git -C ../dagda archive <tag>`, `TAG=<tag> sh build/pi/deps_dagda_tag.sh`, compile, suite; `find_package(dagda ...)` in `CMakeLists.txt`, both install guides, the CHANGELOG's 0.95.0 entry if the version text changes; commit; push |
+| Dagda release with the fast migration | done: **0.3.1** tagged and pushed 2026-11-19 (the maintainer's word; main `2793458`); gate 1172 ran, 1169 passed, 3 skipped, TSan clean |
+| Macha on that release | **next, not started**: prefix from `git archive 0.3.1`, compile, suite; `find_package(dagda 0.3.1)`, both install guides, `docs/configuration.md` (`idle_bandwidth_fraction`), the CHANGELOG entry; commit; push |
 | Deploy tarball | to rebuild on that release (`build/pi/macha_package.sh`); the one in `build/release-0.95.0/` (sha256 `7d9d1e0f...a062`) is Dagda 0.3.0, the slow tool: **do not deploy it** |
 | Small rehearsals | to do after the release (below) |
 | Macha suite | 545/545 at `8ef9496` on Dannan 0.9.2 and Dagda 0.3.0; to rerun on the release |
