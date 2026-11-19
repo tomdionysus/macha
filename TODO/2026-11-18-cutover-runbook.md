@@ -15,6 +15,21 @@ interactively.
 - Standing: proof on the live nodes; the API stays 0.94.2's; `maintenance.collect_garbage` stays false until the
   cutover check below.
 
+## The first attempt (2026-11-19, aborted on the maintainer's word)
+
+Steps A and B on both (staged 14:09Z; both stopped and disabled 14:10:59Z), then live-a's steps 3 to 5 (backup
+5.6 GB to `/root/backup-0.95.0/` in 5 minutes; transport files all "already"; custody made and sealed, id
+`ce442e68...`, copied to `/root/custody-0.95.0/`). Step 6's dry run (14:17Z) read at a steady 64 to 65 MiB/s: one
+thread at about 50% CPU, in D state the rest, the disk delivering about 73 MB/s. That is about 24 h per pass over
+5.9T, and the plan made four passes: about 4 days with live-a down. The maintainer: "Abort and replan". The dry run (which
+writes nothing) was stopped at 196 GiB; both markers still read v18. Both nodes back on 0.94.2 and re-enabled,
+live-a healthy 15:08:11Z, live-b 15:08:42Z, metadata `replicas=2/2`. Downtime 57 minutes, nothing changed on disk.
+Left on live-a: its custody (sealed; 0.94.2 ignores it; step 5 next time proves it with `show` and does not run
+`init`), `/root/backup-0.95.0/` (stale from the moment 0.94.2 ran again: delete before the next attempt and take a
+fresh one), `/root/migrate-0.95.0/run.log`. **Gate added**: Dagda's answer on the tool's speed (overlapping reads
+with computation, using the other cores, fewer full passes) and the per-pass rate on this hardware; the downtime
+table below is replaced by measured figures once Dagda answers.
+
 ## Gates
 
 | Gate | State |
