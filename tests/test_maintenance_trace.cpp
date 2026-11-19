@@ -651,8 +651,9 @@ MACHA_TEST("maintenance_trace",
     auto config_b = cluster.node_config("yield-b", port_b, {{"127.0.0.1", port_a}});
     TracedNode::apply_trace_settings(config_b);
     config_b.replication = 2;
-    // B never pulls: only A's push can deliver the copy.
-    config_b.maintenance.idle_bandwidth_fraction = 0.0;
+    // B never pulls: at a byte a second its credit never covers an extent, so
+    // only A's push can deliver the copy.
+    config_b.maintenance.max_bandwidth = 1;
     TracedNode node(cluster.node_config("yield-a", port_a), cluster.keys());
     node.config().replication = 2;
     std::atomic<bool> viewer_arrives{false};

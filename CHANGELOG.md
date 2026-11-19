@@ -13,11 +13,16 @@ its quiet spell when the survey names other work.
 
 A node's disks move to Dagda's layout before its first start: the node is stopped and
 `dagda-migrate` converts the store in place, with a before-and-after manifest compare;
-`dagda-migrate --reverse` returns it to 0.94.2's layout. Key custody is required: each
+`dagda-migrate --reverse` returns it to 0.94.2's layout. Built on Dagda 0.3.1, whose
+migration rewrites only each record's header, visits the disk in device order, and
+resumes from its own progress file after a crash. Key custody is required: each
 node's key and seal root live in `<state>/identity/custody` under a systemd credential
 (`custody.credential`, made with `dannan-custody init`); a node without it does not
 open its store. `maintenance.collect_garbage` (default false) gates the pass's sweeps:
 repair and the survey run regardless, and nothing is reclaimed until it is set.
+`maintenance.idle_bandwidth_fraction` now holds repair to that fraction of the link
+only while a higher class is present, here or at a peer; with none, repair uses the
+whole link, bounded by `max_bandwidth`.
 
 The API is 0.94.2's: Status keys, codes and messages are unchanged, Dagda's own message
 types counted under the 0.94.2 types whose work they took over.
