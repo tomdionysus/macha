@@ -5,11 +5,14 @@ Order of work (the maintainer, 2026-11-19): (1) Dagda tagged and released first 
 it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked interactively.
 
 **The maintainer's rulings for the cutover:**
-- **Both nodes down together**: stop Macha on both, do the cutover, bring them back. No mixed-version window (this
-  overrides "never both nodes down" for the cutover only). The window's analysis and the two-version smoke test are in
+- **live-b serves while live-a migrates** (the maintainer, 2026-11-19 evening, replacing "both nodes down together"):
+  live-a stops and migrates while live-b stays up on 0.94.2; live-b stops just before live-a starts on
+  0.95.x, then migrates; live-b comes up and joins; then the release fidelity checks. Still no mixed-version window:
+  the two never serve different versions at once. The window's analysis is in
   [`archive/2026-11-19-cutover-mixed-version-window.md`](archive/2026-11-19-cutover-mixed-version-window.md).
 - **live-a first, and up first**: live-a migrates and starts on 0.95.x alone; then live-b migrates and joins.
-  live-a can be power-cycled by hand; live-b cannot.
+  live-a can be power-cycled by hand; live-b cannot. What live-b takes in while live-a is down is migrated
+  with live-b and reaches live-a by repair once both serve.
 - **Backups on the node itself**, in other directories ("We don't expect system disk failure"); the custody files the
   same.
 - **The migration is Dagda's option B**: a header-only migration between two independent full manifest passes (the
@@ -119,6 +122,12 @@ If Dagda's release carries its repair change (idle repair at the whole link), `m
 | Present | `/root/stop-with-stacks.sh`, `/etc/macha/cluster.key`, `/var/cache/macha` | the same |
 
 ## The steps
+
+**Order changed 2026-11-19 evening (rulings above); the text below is to be rewritten to it after rehearsal R4:**
+step 2 stops live-a only; live-b keeps serving through live-a's steps 3 to 6; live-b is stopped and disabled
+just before live-a's step 7; then live-b's steps 3 to 9. Downtime: live-b serves alone through live-a's
+passes (about 29 h), then live-a alone through live-b's (about 16 h); the cluster is never fully down except
+for the minutes between live-b's stop and live-a's health.
 
 `T=/root/stage-0.95.0/root/usr/local` on each node. `M` is
 `systemd-run --wait --pipe -p LoadCredentialEncrypted=dannan-root:/etc/credstore.encrypted/dannan-root
