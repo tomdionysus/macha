@@ -1,73 +1,73 @@
 # Active tasks
 
-Last updated: 2026-11-19 about 01:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-19 about 18:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
-this rationalisation is `archive/2026-11-19-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
+this rationalisation is `archive/2026-11-19b-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
 `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
 
 ## Resume here
 
-**The port: Macha onto Dannan and Dagda, the only work until the cutover.** the maintainer, 2026-11-18: "Work autonomously until
-you're ready to do the cutover on live-a and live-b." the maintainer, 2026-11-19: **do not begin the cutover**; get ready
-for it. The plan is [`2026-11-18-cutover-runbook.md`](2026-11-18-cutover-runbook.md) (rulings, gates, downtime,
-crash handling, the steps, rollback); its history [`2026-11-14-port-rewrites.md`](2026-11-14-port-rewrites.md); done work
-in `COMPLETED.md`.
+**The goal:** Macha's store moved onto Dagda (on Dannan) on both live nodes, live-a and live-b, working as well
+as it did; the only work until it is done. Functional fidelity first: the API stays 0.94.2's, Dannan's and Dagda's
+native forms later. The plan is [`2026-11-18-cutover-runbook.md`](2026-11-18-cutover-runbook.md) (rulings, gates,
+rehearsals, downtime, the steps, rollback); the port's history
+[`2026-11-14-port-rewrites.md`](2026-11-14-port-rewrites.md); done work in `COMPLETED.md`.
 
-**Where it stands (2026-11-19 04:30Z):** `port/dannan-dagda` at `8ef9496` (0.95.0), pushed, untagged. The suite is
-green on the deployed libraries: 545/545 on Dannan 0.9.2 and Dagda 0.3.0 (tagged, gated). The deploy tarball is
-built: `build/release-0.95.0/macha-0.95.0-arm64.tgz`, sha256 `7d9d1e0f...a062` (full hash in the runbook). The API is 0.94.2's; nothing to announce
-([`2026-11-18-port-api-announcement.md`](2026-11-18-port-api-announcement.md) records what was mapped back and the
-intents left as code comments).
+**Do not start the cutover. Nothing touches live-a or live-b without the maintainer's word.** the maintainer, 2026-11-19 evening, the
+order from here:
+1. **Dagda is tagged and released first; the maintainer is doing this himself** in Dagda's session. The fast migration (his
+   option B: header-only moves between two independent manifest passes, reads in device order) is built, gated and
+   merged on Dagda develop `fb48fce`, untagged. Wait for the tag from Dagda or the maintainer; do not ask Dagda to tag.
+2. **On the tag, Macha's side** (autonomous, on a claimed Pi): archive the tag to `build/pi/dagda-<tag>.tar`,
+   `TAG=<tag> J=3 sh deps_dagda_tag.sh`, compile and the whole suite on `DAGDA=prefix-dagda-<tag>`; then
+   `find_package(dagda <tag>)` in `CMakeLists.txt`, both install guides, `docs/configuration.md` if the release
+   changes `maintenance.idle_bandwidth_fraction`'s meaning (Dagda's idle-repair change), the CHANGELOG entry; commit;
+   push; rebuild the tarball with `macha_package.sh` and record its sha256 in the runbook. (`build/pi/dagda-fb48fce.tar`
+   is the untagged develop head, archived 2026-11-19; nothing was built from it.)
+3. **Small rehearsals** (runbook, "Small rehearsals"): propose their shape to the maintainer interactively, smallest first, then
+   run them. Not designed with him yet.
+4. **The cutover**, on the maintainer's word: both nodes down together, live-a migrates and comes up first, then live-b;
+   backups and custody copies on each node. Estimated about 29 h fully down, then about 16 h on one node.
+5. After both, each on his word: the cutover check and garbage collection, the Macha tag, merges, pushes.
 
-**To be cutover-ready, in order:**
-1. Done: **Dagda 0.3.0** tagged and gated; Macha builds on it (`8ef9496`); the install guides name the versions.
-2. Done: **the deploy tarball** (above).
-3. Done: **the mixed-version window** analysed and smoke-tested (passed), then made moot: the maintainer ruled both nodes down
-   together ([`archive/2026-11-19-cutover-mixed-version-window.md`](archive/2026-11-19-cutover-mixed-version-window.md)).
-4. Done: **The maintainer's cutover decisions** (2026-11-19): both nodes stopped together; live-a migrates and comes up first,
-   then live-b; backups and custody copies in other directories on each node itself. `dagda-migrate`'s crash
-   coverage asked of Dagda and recorded (a real power cut is not proven; hence live-a first).
-5. **First attempt aborted 2026-11-19 15:00Z** (runbook, "The first attempt"): `dagda-migrate` reads at about 64 MiB/s,
-   so about 24 h per pass over live-a's 5.9T and four passes in the plan. Both nodes back on 0.94.2, nothing
-   written. **Waiting on Dagda**: a faster tool (overlap reads and computation, use the cores, fewer passes) and a
-   measured rate; then the runbook's downtime replanned and the maintainer's word to start again.
-6. Small: the build Pis need no approval to install tooling, only a claim (the coordinating session's correction,
-   2026-11-19); Dagda's develop has a repair change (idle repair at the whole link) for a possible 0.3.1, which
-   changes the meaning of `maintenance.idle_bandwidth_fraction` if Macha takes it.
+**Where it stands:** `port/dannan-dagda` pushed, untagged; code at `8ef9496` (0.95.0), 545/545 on Dannan 0.9.2 and
+Dagda 0.3.0. Both nodes serve 0.94.2 (restarted 2026-11-19 15:08Z after the aborted first attempt: 57 minutes down,
+nothing written; what it left on the nodes is listed in the runbook). The tarball in `build/release-0.95.0/` carries
+Dagda 0.3.0's slow tool: not for deployment. No Pi claims held, nothing running.
 
-**Rulings in force** (the maintainer, interactive; the rest in "Standing rules"):
-- 2026-11-18/19: the API stays 0.94.2's; Dannan's and Dagda's native forms come after Macha's functional fidelity is
-  shown, each intent left as a code comment where it applies. Tombstone timing matches `main` (repair on the pass's
-  clock). Dagda's read fix is option A (a read asks the other active peers). The cutover is not begun until he says;
-  its own rulings are at the head of the runbook.
+**Rulings in force** (the maintainer, interactive; the cutover's own are at the head of the runbook; the rest in "Standing
+rules"):
+- The API stays 0.94.2's; native forms come after Macha's functional fidelity is shown, each intent left as a code
+  comment ([`2026-11-18-port-api-announcement.md`](2026-11-18-port-api-announcement.md)). Tombstone timing matches
+  `main` (repair on the pass's clock). Dagda's read asks the other active peers (option A).
 - Fix forward, each mechanism proved before a change; a Dannan or Dagda cause goes to its session with the
-  mechanism and waits for its gated fix. A library's release follows that library's rules (Dagda acts on the maintainer's word
-  in its own session only).
+  mechanism and waits for its gated fix. A library's release is that library's and the maintainer's: Dagda acts on the maintainer's word in
+  its own session only, never on a relay.
 - Macha's reachability provider is always registered; `maintenance.collect_garbage` (default false) gates only the
-  sweeps; the live nodes keep it false until the cutover check (runbook).
+  sweeps; the live nodes keep it false until the cutover check.
 - Writes name `ack_level` `persisted`; agreement waits for Dannan; no shims: Macha calls `dagda::Context`, the root
   keeps `dagda::Node`'s owner surface. Dannan 0.9.2 for the cutover.
 
 **The libraries (read their repositories before relying on this):**
-- **Dannan** 0.9.2 tagged. Custody by `dannan-custody(1)`; `dannan-import-macha --dry-run` is a check at the cutover,
-  not a conversion.
-- **Dagda** 0.3.0 in its release gate (above). Since `053ee6e`: the read asks the other active peers when hosting
-  candidates are exhausted (`b997ba1`). Open on Dagda's side: stage 4's unpaced large rejoin is slower than stage 3's
-  (18 to 25 s against 15 to 16 s for 26 x 4 MiB); no large-object repair comparison is settled.
+- **Dannan** 0.9.2 tagged. Custody by `dannan-custody(1)`; `dannan-import-macha --dry-run` is a check at the cutover.
+- **Dagda** 0.3.0 tagged (local, `2a58202`); develop `fb48fce` adds the fast migration and, earlier (`4a1c855`), idle
+  repair at the whole link estimate (`idle_bandwidth_fraction` then applies only while a higher class is present).
+  Dagda holds off the live nodes until the cutover is reported done.
 
-**Builds:** the Pis were wiped to bare OS 2026-11-18 20:30Z and rebuilt; Macha's packages (FFmpeg, FUSE, libtorrent,
-curl, zlib, clang-format-19, libmobi-tools, ffmpeg) are on build-1, build-2 and build-3 (the maintainer's approval), not build-4
-(light work only). build-3: `/home/maintainer/deps/prefix-0.9.2`, `prefix-dagda-053ee6e`, `prefix-dagda-053ee6e-read`, the
-tree `/home/maintainer/macha-store-2`. build-1: `prefix-0.5.3`, `prefix-0.9.2`, `prefix-dagda-053ee6e-read`,
-`/home/maintainer/macha-main` (0.94.2, a temporary diagnostic patch applied: rebuild from `git archive main` before the smoke
-test). Scripts in `build/pi/`: `macha_port_compile.sh` (`S`, `R`, `J`, `DANNAN`, `DAGDA`; writes only `$R.result`, so
-capture its output to see an error), `deps_dagda_tag.sh`, `deps_092_053ee6e.sh`, `main_0942_build.sh`,
-`macha_package.sh`. Run logs from before the wipe: `build/pi-logs-2026-11-18/`.
-Sync with the rsync line below, then format changed files with `clang-format-19` on the Pi and copy them back;
-**rsync never deletes**. Tests: `build-port/macha-tests --jobs 3`, or `--serial [--verbose] --filter NAME`
-(`--verbose` shows a passing case's output); `MACHA_TEST_LOG_LEVEL=DEBUG` or `ALL` for the log. **Tee every result
-into a log on the Pi**: a background command's output lands outside the boundary. Claim first; release when done.
-Temporary diagnostics go on the Pi's copy only, never into Macha; the next rsync with `--checksum` removes them.
+**Builds:** the Pis were wiped 2026-11-18 and rebuilt; Macha's packages are on build-1, build-2 and build-3; installing
+tooling needs only a claim. build-4 is light work only. build-3: `/home/maintainer/deps/prefix-0.9.2`,
+`prefix-dagda-053ee6e`, `prefix-dagda-053ee6e-read`, `prefix-dagda-0.3.0`, the tree `/home/maintainer/macha-store-2`.
+build-1: `prefix-0.5.3`, `prefix-0.9.2`, `/home/maintainer/macha-main` (0.94.2, clean, all targets). Shared machines:
+check what is there before relying on it. Scripts in `build/pi/`: `macha_port_compile.sh` (`S`, `R`, `J`, `DANNAN`,
+`DAGDA`; writes only `$R.result`, so capture its output to see an error), `deps_dagda_tag.sh`, `main_0942_build.sh`
+(`TARGET=all` for the daemon), `macha_package.sh`. Smoke-test kit: `build/smoke/`. Cutover scripts and disk
+measurement: `build/cutover/`. Sync with the rsync line below, then format changed files with `clang-format-19` on
+the Pi and copy them back; **rsync never deletes**. Tests: `build-port/macha-tests --jobs 3`, or `--serial
+[--verbose] --filter NAME` (`--verbose` shows a passing case's output; `--repeat N` measures a flake);
+`MACHA_TEST_LOG_LEVEL=DEBUG` or `ALL`. **Tee every result into a log on the Pi**: a background command's output lands
+outside the boundary. Claim first, wait for "taken", then build; release when done. Temporary diagnostics go on the
+Pi's copy only, never into Macha; the next rsync with `--checksum` removes them. A Macha mount point is immutable
+while unmounted (`chattr -i` before removing a test node's directory).
 
 ## Known live defects until the cutover
 
