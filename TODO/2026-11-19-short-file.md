@@ -54,7 +54,10 @@ real Dagda property but not this defect; Dagda withdrew its repin recommendation
 
 ## Next
 
-1. The deterministic test of `adopt_entry`'s dirty clause against an older view (failing test first).
+1. The deterministic test of `adopt_entry`'s dirty clause against an older view (failing test first). For any further
+   run on the pair, log in the replace branch the adopted snapshot's generation beside this node's own committed
+   generation, and the entry and base versions (Dagda's suggestion: a peer's head arriving at a higher generation as
+   the data lane comes up would show there).
 2. If it fails as expected: the mechanism report to the maintainer, with the fix's shape (a lagging view, one that does not
    include the inode's last commit, keeps the inode; only a newer, different entry is a replacement; and the
    no-path branch must never retire unpublished writes silently).
