@@ -15,12 +15,18 @@ rehearsals, downtime, the steps, rollback); the port's history
 
 **Do not start the cutover. Nothing touches live-a or live-b without the maintainer's word.**
 
-**Next: the short file** ([`2026-11-19-short-file.md`](2026-11-19-short-file.md)). A large file written through the
-mount of a two-node cluster can commit short, silently; seen once on 0.94.2 (live) and once on 0.95.0, both as peer
-metadata started arriving. Dagda's candidate (checked against the code, unproven): `adopt_entry`'s dirty clause takes a
-lagging view as a replacement and detaches the writing inode, whose later writes are then retired by
-`replay_data_quantum`'s no-path branch without being published. Next step: the deterministic test of that clause
-(failing test first), then the mechanism report to the maintainer before any fix. Whether the cutover waits on it is the maintainer's call.
+**The short file is fixed** (`b0b037c`, pushed; [`2026-11-19-short-file.md`](2026-11-19-short-file.md)). The
+mechanism was proven by a deterministic failing test, and the fix follows the maintainer's rulings (2026-11-19, interactive): both
+layers, "never go backwards, and guard FUSE". Suite 547/547 on Dagda 0.3.1.
+
+**Next (the maintainer's ruling): a new Macha version on Dagda 0.3.2, then the rehearsals from the start.** Dagda is gating 0.3.2
+(0.3.1 plus `Space::covers`) and sends its tag commit. Then:
+1. Build the prefix on build-3 and rebuild Macha on it.
+2. Bump the version (CMake and the README line together) and the CHANGELOG.
+3. Run the suite and package the tarball.
+4. Update the runbook's version checks (`dagda-migrate --version` reports `0.3.2 (dannan 0.9.2)`).
+5. Rerun rehearsals R1 to R4 and the two-writer round on the pair.
+6. The cutover, on the maintainer's word.
 
 **Done 2026-11-19** (details in the runbook): Dagda 0.3.1 (the maintainer's tag, `2793458`); Macha rebuilt on it (`b4f864d`,
 545/545; `idle_bandwidth_fraction` docs; tarball sha256 `5673bfc4...0002`); rehearsals R1 to R4 all pass (end to end,
