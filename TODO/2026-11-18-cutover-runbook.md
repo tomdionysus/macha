@@ -32,8 +32,12 @@ the proof still two independent full manifest passes with a read-ahead pipeline.
 live, read-only)**: almost all loose 4 MiB objects (live-a 1.54 M, live-b 0.90 M; about 30 packs each); raw
 sequential 147 to 229 MB/s (live-a) and 171 to 234 MB/s (live-b) across the disk; loose objects read whole at
 84 to 108 MiB/s on live-a (1 to 8 in flight) and about 100 on live-b (worse with concurrency); inode order no
-better than id order. So a full pass is about 16 h on live-a and 9 h on live-b unless physical ordering helps:
-B's total about 35 h for live-a. **Gate added**: Dagda's answer on the tool's speed (overlapping reads
+better than id order. Then physical order (FIEMAP; every object one extent): with caches cold no gain (each file
+costs a cold inode read), but with inodes warm 122 to 158 MiB/s whole on live-a and 127 to 148 on live-b, and a
+header-only read 6.3 ms a file (live-a) and 5.0 ms (live-b). Sent to Dagda for 0.3.1: walk first, then visit by
+physical start. Estimates: a full pass about 13 h (live-a) and 7 h (live-b); the header-only migration about
+2.7 h and 1.3 h; B in total about 29 h for live-a and 16 h for live-b (measured on live nodes; probably a little
+better stopped). Scripts: `build/cutover/phys_map.py`, `build/cutover/phys_reads.py`. **Gate added**: Dagda's answer on the tool's speed (overlapping reads
 with computation, using the other cores, fewer full passes) and the per-pass rate on this hardware; the downtime
 table below is replaced by measured figures once Dagda answers.
 
