@@ -20,23 +20,18 @@ order from here:
    large-rejoin repair work (`maintenance.idle_bandwidth_fraction` now applies only while a higher class is present;
    an idle node's repair uses the whole link, `max_bandwidth` bounds it). Gate: 1172 ran, 1169 passed, 3 skipped;
    TSan clean; ASan+UBSan one test fault, fixed in the test.
-2. **Next, Macha on 0.3.1** (autonomous, on a claimed Pi; not started): `git -C ../dagda archive 0.3.1 >
-   build/pi/dagda-0.3.1.tar`, copy to the Pi's `/root/pi/`, `TAG=0.3.1 J=3 sh deps_dagda_tag.sh`, compile and the
-   whole suite on `DAGDA=prefix-dagda-0.3.1` (log on the Pi); then `find_package(dagda 0.3.1 ...)` in
-   `CMakeLists.txt`, both install guides, `docs/configuration.md` (the changed meaning of
-   `maintenance.idle_bandwidth_fraction`), the CHANGELOG's 0.95.0 entry; commit; push; rebuild the tarball with
-   `macha_package.sh` and record its sha256 in the runbook; read Dagda's `docs/migration.md` at 0.3.1 ("How a run
-   moves records") against `build/cutover/migrate-0.95.0.sh` and the runbook's step 6.
-3. **Small rehearsals** (runbook, "Small rehearsals"): propose their shape to the maintainer interactively, smallest first, then
-   run them. Not designed with him yet.
+2. Done 2026-11-19: **Macha on 0.3.1**: 545/545 on build-3 (`prefix-dagda-0.3.1`); docs, CHANGELOG, one test's
+   setup (B held off by `max_bandwidth`, since an idle node now ignores its fraction); tarball rebuilt, sha256 in
+   the runbook; the migration script read against Dagda's `docs/migration.md` at 0.3.1, no change.
+3. **Next, small rehearsals** (runbook, "Small rehearsals"): propose their shape to the maintainer interactively, smallest
+   first, then run them.
 4. **The cutover**, on the maintainer's word: both nodes down together, live-a migrates and comes up first, then live-b;
    backups and custody copies on each node. Estimated about 29 h fully down, then about 16 h on one node.
 5. After both, each on his word: the cutover check and garbage collection, the Macha tag, merges, pushes.
 
-**Where it stands:** `port/dannan-dagda` pushed, untagged; code at `8ef9496` (0.95.0), 545/545 on Dannan 0.9.2 and
-Dagda 0.3.0. Both nodes serve 0.94.2 (restarted 2026-11-19 15:08Z after the aborted first attempt: 57 minutes down,
-nothing written; what it left on the nodes is listed in the runbook). The tarball in `build/release-0.95.0/` carries
-Dagda 0.3.0's slow tool: not for deployment. No Pi claims held, nothing running.
+**Where it stands:** `port/dannan-dagda` pushed, untagged; 0.95.0 on Dannan 0.9.2 and Dagda 0.3.1, 545/545. Both nodes serve 0.94.2 (restarted 2026-11-19 15:08Z after the aborted first attempt: 57 minutes down,
+nothing written; what it left on the nodes is listed in the runbook). The tarball in `build/release-0.95.0/` is the 0.3.1
+build (sha256 in the runbook).
 
 **Rulings in force** (the maintainer, interactive; the cutover's own are at the head of the runbook; the rest in "Standing
 rules"):
@@ -53,12 +48,12 @@ rules"):
 
 **The libraries (read their repositories before relying on this):**
 - **Dannan** 0.9.2 tagged. Custody by `dannan-custody(1)`; `dannan-import-macha --dry-run` is a check at the cutover.
-- **Dagda** 0.3.1 tagged and pushed (`2793458`); Macha still builds on 0.3.0 until step 2 above.
+- **Dagda** 0.3.1 tagged and pushed (`2793458`); Macha builds on it.
   Dagda holds off the live nodes until the cutover is reported done.
 
 **Builds:** the Pis were wiped 2026-11-18 and rebuilt; Macha's packages are on build-1, build-2 and build-3; installing
 tooling needs only a claim. build-4 is light work only. build-3: `/home/maintainer/deps/prefix-0.9.2`,
-`prefix-dagda-053ee6e`, `prefix-dagda-053ee6e-read`, `prefix-dagda-0.3.0`, the tree `/home/maintainer/macha-store-2`.
+`prefix-dagda-053ee6e`, `prefix-dagda-053ee6e-read`, `prefix-dagda-0.3.0`, `prefix-dagda-0.3.1`, the tree `/home/maintainer/macha-store-2`.
 build-1: `prefix-0.5.3`, `prefix-0.9.2`, `/home/maintainer/macha-main` (0.94.2, clean, all targets). Shared machines:
 check what is there before relying on it. Scripts in `build/pi/`: `macha_port_compile.sh` (`S`, `R`, `J`, `DANNAN`,
 `DAGDA`; writes only `$R.result`, so capture its output to see an error), `deps_dagda_tag.sh`, `main_0942_build.sh`

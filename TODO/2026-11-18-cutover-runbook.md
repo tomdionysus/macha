@@ -22,10 +22,11 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 | Gate | State |
 |---|---|
 | Dagda release with the fast migration | done: **0.3.1** tagged and pushed 2026-11-19 (the maintainer's word; main `2793458`); gate 1172 ran, 1169 passed, 3 skipped, TSan clean |
-| Macha on that release | **next, not started**: prefix from `git archive 0.3.1`, compile, suite; `find_package(dagda 0.3.1)`, both install guides, `docs/configuration.md` (`idle_bandwidth_fraction`), the CHANGELOG entry; commit; push |
-| Deploy tarball | to rebuild on that release (`build/pi/macha_package.sh`); the one in `build/release-0.95.0/` (sha256 `7d9d1e0f...a062`) is Dagda 0.3.0, the slow tool: **do not deploy it** |
-| Small rehearsals | to do after the release (below) |
-| Macha suite | 545/545 at `8ef9496` on Dannan 0.9.2 and Dagda 0.3.0; to rerun on the release |
+| Macha on that release | done 2026-11-19: `find_package(dagda 0.3.1)`, install guides, `docs/configuration.md` (`idle_bandwidth_fraction` applies only while a higher class is present), CHANGELOG; one test's B held off by `max_bandwidth` (its fraction 0 no longer stops an idle pull) |
+| Deploy tarball | `build/release-0.95.0/macha-0.95.0-arm64.tgz`, sha256 `5673bfc4ad0d44357813107dca2f6c6ce08094d5e87289315f47e09bf7dc0002`, Dagda 0.3.1 (`dagda-migrate --version`: `0.3.1 (dannan 0.9.2)`); the 0.3.0 one is replaced |
+| Small rehearsals | to propose and run (below) |
+| Macha suite | 545/545 on build-3 on Dannan 0.9.2 and Dagda 0.3.1 (2026-11-19 19:42Z) |
+| Migration script vs Dagda 0.3.1 `docs/migration.md` | read 2026-11-19: flags, `--resume`, rerun-to-finish, compare and `RESULT: PASS` all match; no change |
 | Dannan | 0.9.2 tag |
 | Install script | `build/install-0.95.0.sh` (written, never run; read it before the first use) |
 | Migration script | `build/cutover/migrate-0.95.0.sh` (ran its first step once; updated to three passes; check its flags against Dagda's `docs/migration.md` at the tag) |
