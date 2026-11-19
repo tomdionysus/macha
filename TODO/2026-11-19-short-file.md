@@ -1,7 +1,47 @@
 # A file written through the mount commits short, silently (found 2026-11-19 in rehearsal R4)
 
-**Open. Mechanism not proven. Present on 0.94.2 (live) and 0.95.0.** Nothing is fixed or changed; the maintainer decides any
-fix once the mechanism is proved ("Report findings before fixing").
+**Open. Mechanism proven 2026-11-19 22:53Z by a deterministic failing test. Present on 0.94.2 (live) and 0.95.0.**
+Nothing is fixed; the maintainer decides the fix ("Report findings before fixing").
+
+## Proven (2026-11-19 22:53Z)
+
+`tests/test_filesystem_fuse.cpp` `test_lagging_view_keeps_a_writing_inode` (uncommitted), on build-3
+`/home/maintainer/macha-store-2` (0.95.0 on Dagda 0.3.1). One node: create `/short.bin`, write 2 MiB, `fsync` (G1). The
+publication guard, inside G1's `mutate_delta` before `accept_locally`, accepts a peer's branch three commits long from
+G1's parent (stamped entries `/peer-0..2`) and lets `local()` cache it. Result, every run:
+- G1 is accepted but `cache_record` refuses it: the peer's head is at a higher generation (`newer_than`,
+  `metadata_manager.cpp:26`). The decoded view is the peer's head, which lacks G1.
+- The next namespace request adopts that view. `/short.bin` holds the pre-G1 entry, `adopt_entry`'s dirty clause
+  fires (`unconfirmed_data_entry` alone is enough), and the path moves to a fresh inode.
+- The remaining 2 MiB is retired by `replay_data_quantum`'s no-path branch: no publication, no log.
+- The heads merge cleanly (conflicts 0, the peer's directories kept) and the file stands at G1: **2,097,152 of
+  4,194,304 bytes**, no error anywhere.
+
+**The maintainer's rulings (2026-11-19, interactive):** the fix in both layers, then a new Macha version on Dagda 0.3.2 (Dannan
+0.9.2) and the rehearsals R1 to R4 (plus the two-writer round) from the start. Layer (a) amended after Dagda's review,
+because "own head wins" would move the view back below a peer's commits: "never go backwards, and guard FUSE". The fix:
+- (a) `MetadataManager::cache_record`: a view holding this node's latest accepted commit
+  (`MetadataReplica::author_accepted()`) is never replaced by one lacking it. A concurrent head is kept out of the view;
+  the head-set change already wakes maintenance's fold (`announce_metadata_generation`, node event `metadata`).
+- (b) FUSE: each inode records this node's latest mutation when it publishes (`published_dot`, read after the commit
+  returns). In `adopt_entry`, a view that does not cover it is behind the inode: the inode keeps its path and state.
+- (b2) FUSE adoption only moves forward: a view whose clock does not cover the last adopted view's clock is deferred
+  (`view-behind`).
+- (c) The no-path branch logs `code=fuse_writes_retired_unlinked` with the counts. There is no error to the writer,
+  because a local `rm` of an open file must not fail its `close`.
+- After Dagda's review: a set-aside or expired peer head would have wedged (b2), and before this fix it already held
+  the view. Since 0.94.2, `newer_than` refused the own head after `aside()`.
+  - Now `read_group`'s sole usable head displaces a cached record not in its past (`cache_record(..., true)`).
+  - FUSE defers `view-behind` only while `metadata_fold_pending()` (several usable heads). Otherwise it warns
+    `code=fuse_view_behind_adopted` and walks the namespace whole.
+  - Case: `test_a_set_aside_head_leaves_the_view`.
+  - **The one place the view goes backwards, by design:** when a fold cannot be made and the peer head is set aside,
+    the peer's new paths leave the mount, and local inodes on them are detached, until a later merge brings them back.
+    The warn line marks it.
+
+In the field, a peer's branch arrives in bulk as the data lane comes up, and any reader caches it (`local()`,
+`read_group` with one head) while a data publication is between `usable_heads()` and `accept_locally`. That matches both
+cases and explains why steady rounds, once the heads have folded, do not reproduce it.
 
 ## What was seen
 

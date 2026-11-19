@@ -804,6 +804,167 @@ MACHA_TEST("filesystem_fuse", test_publication_writer_failure_stays_invisible) {
     CHECK(fs.getattr("/pipeline-failure.bin").size == 0);
 }
 
+// A peer's longer branch accepted while this node commits a file's data
+// leaves the decoded view on the peer's head, which lacks that commit. The
+// file still being written keeps its path through that lagging view, and
+// every byte written to it is published.
+MACHA_TEST("filesystem_fuse", test_lagging_view_keeps_a_writing_inode) {
+    FilesystemNode node("lagging-view-writer", [](Config& config) {
+        config.metadata_cache = std::chrono::milliseconds(0);
+    });
+    auto& fs = node.fs();
+    auto& metadata = node.node().metadata();
+    auto& bare = node.node().node();
+    const auto extent = node.config().extent_size;
+
+    // At the armed commit, a peer's branch three commits long grows from the
+    // same parent and becomes the decoded view before the commit is accepted.
+    std::atomic_bool armed{false};
+    std::atomic_bool injected{false};
+    std::optional<MetadataRecord> peer_head;
+    node.node().set_publication_guard([&](const MetadataPublicationContext& context) {
+        if (!armed.exchange(false))
+            return;
+        const auto peer = random_node_id();
+        auto head = context.parent;
+        for (int step = 0; step < 3; ++step) {
+            FsEntry entry;
+            entry.type = EntryType::directory;
+            entry.mode = 0755;
+            entry.uid = getuid();
+            entry.gid = getgid();
+            auto snapshot = decode_snapshot(head.payload);
+            if (!snapshot.legacy_clock)
+                snapshot.legacy_clock = snapshot.mutation_sequences;
+            const MetadataDot dot{peer, ++snapshot.mutation_sequences[peer]};
+            const auto path = "/peer-" + std::to_string(step);
+            stamp_entry_provenance(entry, path, nullptr, dot);
+            MetadataDelta delta;
+            delta.upsert_entries[path] = entry;
+            snapshot = with_namespace_delta(std::move(snapshot), bare.store_context(), delta);
+            snapshot.merge_parents.clear();
+            MetadataRecord next;
+            next.generation = head.generation + 1;
+            next.previous = head.hash;
+            next.payload = encode_snapshot_v14(snapshot);
+            next.hash = metadata_hash(next.generation, next.previous, next.payload);
+            if (!bare.metadata_replica().store_commit(next))
+                return;
+            MetadataAcceptance acceptance;
+            acceptance.generation = next.generation;
+            acceptance.hash = next.hash;
+            acceptance.required = 1;
+            acceptance.replicas = {bare.node_id()};
+            if (!bare.metadata_server().accept_commit(acceptance))
+                return;
+            head = std::move(next);
+        }
+        (void)metadata.local();
+        peer_head = head;
+        injected = true;
+    });
+
+    auto frontend = node.frontend(node.fuse("lagging-view"));
+    (void)frontend->getattr("/");
+    auto handle = frontend->create("/short.bin", 0644, getuid(), getgid(), true, true, false);
+    const auto input = pattern(4 * extent, 0x5c);
+    const std::span<const uint8_t> bytes(input);
+    REQUIRE(frontend->write(handle.inode, 0, bytes.first(2 * extent)) == 2 * extent);
+    REQUIRE(wait_until([&] { return !frontend->status().pending_namespace; }, 10s));
+
+    // G1: the first two extents, committed while the peer's branch arrives.
+    armed = true;
+    frontend->fsync(handle.inode);
+    REQUIRE(injected.load());
+    const auto view = metadata.available_snapshot_view();
+    REQUIRE(view.has_value());
+    REQUIRE(view->hash == peer_head->hash);
+
+    // The rest of the file, then a namespace request that adopts the view.
+    REQUIRE(frontend->write(handle.inode, 2 * extent, bytes.subspan(2 * extent)) == 2 * extent);
+    (void)frontend->readdir("/");
+    CHECK(frontend->inode_for_path("/short.bin") == handle.inode);
+
+    frontend->release(handle.inode, true);
+    // The two heads merge on the next read; the frontend confirms on a request.
+    (void)metadata.read_record();
+    CHECK(wait_until(
+        [&] {
+            (void)frontend->getattr("/");
+            return frontend->wait_for_idle(100ms);
+        },
+        20s));
+    CHECK(fs.getattr("/peer-2").type == EntryType::directory);
+    CHECK(frontend->inode_for_path("/peer-2").has_value());
+    CHECK(fs.getattr("/short.bin").size == input.size());
+    CHECK(read_back(fs, "/short.bin", input.size()) == input);
+    frontend->stop();
+}
+
+// A peer's head this node cannot merge is set aside, and the view leaves it
+// for this node's own head, though the peer's is generations ahead.
+MACHA_TEST("filesystem_fuse", test_a_set_aside_head_leaves_the_view) {
+    FilesystemNode node("set-aside-view", [](Config& config) {
+        config.metadata_cache = std::chrono::milliseconds(0);
+    });
+    auto& fs = node.fs();
+    auto& metadata = node.node().metadata();
+    auto& bare = node.node().node();
+
+    // At the armed commit, a peer's branch three commits long whose tree no
+    // node here holds grows from the same parent and becomes the view.
+    std::atomic_bool armed{false};
+    std::atomic_bool injected{false};
+    std::optional<MetadataRecord> peer_head;
+    node.node().set_publication_guard([&](const MetadataPublicationContext& context) {
+        if (!armed.exchange(false))
+            return;
+        const auto peer = random_node_id();
+        auto head = context.parent;
+        for (uint8_t step = 0; step < 3; ++step) {
+            auto snapshot = decode_snapshot(head.payload);
+            snapshot.namespace_root = object_id(pattern(64, static_cast<uint8_t>(90 + step)));
+            snapshot.merge_parents.clear();
+            ++snapshot.mutation_sequences[peer];
+            MetadataRecord next;
+            next.generation = head.generation + 1;
+            next.previous = head.hash;
+            next.payload = encode_snapshot_v14(snapshot);
+            next.hash = metadata_hash(next.generation, next.previous, next.payload);
+            if (!bare.metadata_replica().store_commit(next))
+                return;
+            MetadataAcceptance acceptance;
+            acceptance.generation = next.generation;
+            acceptance.hash = next.hash;
+            acceptance.required = 1;
+            acceptance.replicas = {bare.node_id()};
+            if (!bare.metadata_server().accept_commit(acceptance))
+                return;
+            head = std::move(next);
+        }
+        (void)metadata.local();
+        peer_head = head;
+        injected = true;
+    });
+
+    armed = true;
+    fs.mkdir("/mine", 0755, getuid(), getgid());
+    REQUIRE(injected.load());
+    REQUIRE(metadata.available_snapshot_view()->hash == peer_head->hash);
+
+    // The fold cannot read the peer's tree: its head is set aside and this
+    // node's own is the one it reads.
+    (void)metadata.read_record();
+    CHECK(metadata.head_standing().set_aside == 1);
+    const auto usable = bare.metadata_replica().usable_heads();
+    REQUIRE(usable.size() == 1);
+    CHECK(usable.front().generation < peer_head->generation);
+    const auto view = metadata.available_snapshot_view();
+    REQUIRE(view.has_value());
+    CHECK(view->hash == usable.front().hash);
+    CHECK(fs.getattr("/mine").type == EntryType::directory);
+}
+
 // Before the metadata write floor forms, the local snapshot view reflects the
 // local replica alone and never enters MetadataManager, which would throw
 // MetadataNotReady.
