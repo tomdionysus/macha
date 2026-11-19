@@ -26,7 +26,14 @@ writes nothing) was stopped at 196 GiB; both markers still read v18. Both nodes 
 live-a healthy 15:08:11Z, live-b 15:08:42Z, metadata `replicas=2/2`. Downtime 57 minutes, nothing changed on disk.
 Left on live-a: its custody (sealed; 0.94.2 ignores it; step 5 next time proves it with `show` and does not run
 `init`), `/root/backup-0.95.0/` (stale from the moment 0.94.2 ran again: delete before the next attempt and take a
-fresh one), `/root/migrate-0.95.0/run.log`. **Gate added**: Dagda's answer on the tool's speed (overlapping reads
+fresh one), `/root/migrate-0.95.0/run.log`. **The maintainer chose Dagda's option B** (Dagda 0.3.1, in progress): a header-only
+migration with a durable progress record (about 1.5 M records, seek-bound, estimated 2 to 4 h), the dry run dropped,
+the proof still two independent full manifest passes with a read-ahead pipeline. **Disk measured 2026-11-19 (both
+live, read-only)**: almost all loose 4 MiB objects (live-a 1.54 M, live-b 0.90 M; about 30 packs each); raw
+sequential 147 to 229 MB/s (live-a) and 171 to 234 MB/s (live-b) across the disk; loose objects read whole at
+84 to 108 MiB/s on live-a (1 to 8 in flight) and about 100 on live-b (worse with concurrency); inode order no
+better than id order. So a full pass is about 16 h on live-a and 9 h on live-b unless physical ordering helps:
+B's total about 35 h for live-a. **Gate added**: Dagda's answer on the tool's speed (overlapping reads
 with computation, using the other cores, fewer full passes) and the per-pass rate on this hardware; the downtime
 table below is replaced by measured figures once Dagda answers.
 
