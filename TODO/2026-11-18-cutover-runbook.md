@@ -27,7 +27,7 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 | Dagda release with the fast migration | done: **0.3.1** tagged and pushed 2026-11-19 (the maintainer's word; main `2793458`); gate 1172 ran, 1169 passed, 3 skipped, TSan clean |
 | Macha on that release | done 2026-11-19: `find_package(dagda 0.3.1)`, install guides, `docs/configuration.md` (`idle_bandwidth_fraction` applies only while a higher class is present), CHANGELOG; one test's B held off by `max_bandwidth` (its fraction 0 no longer stops an idle pull) |
 | Deploy tarball | `build/release-0.95.0/macha-0.95.0-arm64.tgz`, sha256 `5673bfc4ad0d44357813107dca2f6c6ce08094d5e87289315f47e09bf7dc0002`, Dagda 0.3.1 (`dagda-migrate --version`: `0.3.1 (dannan 0.9.2)`); the 0.3.0 one is replaced |
-| Small rehearsals | to propose and run (below) |
+| Small rehearsals | R1 to R4 pass, 2026-11-19 (below); R4's first load found a short file on 0.94.2, to diagnose |
 | Macha suite | 545/545 on build-3 on Dannan 0.9.2 and Dagda 0.3.1 (2026-11-19 19:42Z) |
 | Migration script vs Dagda 0.3.1 `docs/migration.md` | read 2026-11-19: flags, `--resume`, rerun-to-finish, compare and `RESULT: PASS` all match; no change |
 | Dannan | 0.9.2 tag |
@@ -37,18 +37,12 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 | 0.94.2 baselines | `build/baselines/results-0.94.2`; compared after each node is on 0.95.x |
 | The maintainer's word | the start |
 
-## Small rehearsals (after Dagda's release, before the cutover)
+## Small rehearsals: R1 to R4 run 2026-11-19 (the maintainer chose the full set)
 
-Purpose: the three passes' real rates and the resume path, with the released tool, before the nodes go down. Not yet
-designed with the maintainer; to propose, smallest first:
-1. **On a build Pi**: a fresh 0.94.2 node (`main`, build-1 has `prefix-0.5.3`), a few GB of 4 MiB files written
-   through it, stopped; then custody, before manifest, migration, after manifest, compare; start 0.95.x on it and read
-   every file back. Then the same with the migration killed part way and rerun, and a manifest pass killed and
-   `--resume`d. Proves the released tool end to end against a real 0.94.2 state and the scripts as written.
-2. **On the real disks, read-only, while serving** (if the maintainer wants the rate before the downtime): a before-manifest pass
-   cannot run on a live node (the store's lock), so the rate there is known only from `build/cutover/phys_reads.py`'s
-   figures (below) until the cutover's first pass. If far off them, that pass is stopped: a manifest pass writes
-   nothing to the disk.
+Each from a fresh 0.94.2 node (build-1's `macha-main` build) at the live nodes' paths on a build Pi, files written
+through the mount and checked by sha256 after a cache drop, then the runbook's steps by `build/rehearsal/cutover-node.sh`
+(the tarball, `migrate-0.95.0.sh` and `install-0.95.0.sh` unedited). The rate on the real disks is still known only
+from `build/cutover/phys_reads.py` until the cutover's first pass.
 
 **Results (2026-11-19 evening, build-3 and build-4, kit `build/rehearsal/`, the 0.3.1 tarball, the scripts as written):**
 - R1, one node end to end (3.1 GB, 3,620 files, 1,092 loose objects): steps 1 to 9 pass; passes 22 s, migration 2 s,
@@ -58,22 +52,31 @@ designed with the maintainer; to propose, smallest first:
   915 moved, 0 unreadable); after pass killed and resumed; `RESULT: PASS`; 0.95.0 reads every file back.
 - R3, rollback after step 7: a write on 0.95.0, then `--reverse` (3 s, 0 unreadable, marker v18), `/root/pre-0.95.0`
   restored, 0.94.2 healthy, every file back including those written on 0.95.0.
-- R4, two nodes (the new order): **stopped before the migration** on a 0.94.2 defect: on a fresh 0.94.2 pair, one of
-  six 96 MiB files copied into A's mount committed short (84,410,368 of 100,663,296 bytes, the bytes it has correct),
-  on both nodes, with no error, nothing parked, every publication counted complete. Not seen in R1 or R2 (one node).
-  Under diagnosis, reported to the maintainer; the pair is left running on build-3 and build-4.
+- R4, two nodes in the new order (A build-3 as live-a, B build-4 as live-b, replicas 2): passes. 0.94.2 pair
+  converged (both 3,406,351,460 bytes, 1,491 loose), sets r4x and r4a read back on both; A stopped and migrated
+  (`RESULT: PASS`) while B served alone and took a new set r4b (702 files, read back on B); B stopped and disabled;
+  A installed, up alone on 0.95.0, read back everything it held; B's steps 3 to 7 (custody `init`), `RESULT: PASS`;
+  both 0.95.0, active in each other's Status, metadata 2/2; r4b reached A by merge and repair within about 2
+  minutes; all three sets read back on both nodes. One extra loose object on B (a 3 MiB extent written during r4b's
+  load, no r4b file has that shape; repair unsourceable 0 on both): likely unreferenced; not examined.
+- **A 0.94.2 defect found on R4's first load (the maintainer: finish R4, diagnose after):** on the fresh 0.94.2 pair, one of six
+  96 MiB files copied into A's mount (`r4/big/f2.bin`) committed short, 84,410,368 of 100,663,296 bytes (the bytes it
+  has correct), on both nodes, with no error, nothing parked, every publication counted complete. Not seen in R1 or
+  R2 (one node), nor in the 14 large files loaded afterwards. 0.95.0 shares the FUSE write path (unverified whether it
+  has the defect). The pair is left running on 0.95.0 with the short file, for diagnosis.
 
 ## Downtime (estimates from the live disks, 2026-11-19; the released tool not yet run on them)
 
 | Phase | live-a (5.9T, 1.54 M loose 4 MiB objects) | live-b (3.3T, 0.90 M) | Cluster |
 |---|---|---|---|
-| Before manifest | about 13 h | stopped | down |
-| Migration (headers only) | about 2.7 h plus syncs | stopped | down |
-| After manifest, compare | about 13 h | stopped | down |
-| live-a serving, live-b's three passes | 0.95.x alone | about 7 + 1.3 + 7 h | up, one node: what only live-b holds is unavailable |
+| Before manifest | about 13 h | 0.94.2 alone | up, one node: what only live-a holds is unavailable |
+| Migration (headers only) | about 2.7 h plus syncs | 0.94.2 alone | the same |
+| After manifest, compare | about 13 h | 0.94.2 alone | the same |
+| live-b stopped, live-a installed | starting 0.95.x | stopped | down: minutes |
+| live-b's three passes | 0.95.x alone | about 7 + 1.3 + 7 h | up, one node: what only live-b holds (its 0.94.2 writes since live-a stopped among it) is unavailable |
 | Both on 0.95.x | serving | serving | up; repair converges them |
 
-So about 29 h fully down, then about 16 h on one node. Measurements behind it (both nodes live, read-only): raw
+So about 29 h on live-b alone, minutes fully down, then about 16 h on live-a alone (R4 rehearsed this order). Measurements behind it (both nodes live, read-only): raw
 sequential 147 to 234 MB/s; every loose object is one extent; with inodes warm and files visited in physical order,
 whole files read at 122 to 158 MiB/s (live-a) and 127 to 148 (live-b), a header-only read 6.3 ms and 5.0 ms a
 file; with cold inodes or in id order about 80 to 100 MiB/s. The released tool walks first (FIEMAP), then visits in
@@ -136,11 +139,9 @@ If Dagda's release carries its repair change (idle repair at the whole link), `m
 
 ## The steps
 
-**Order changed 2026-11-19 evening (rulings above); the text below is to be rewritten to it after rehearsal R4:**
-step 2 stops live-a only; live-b keeps serving through live-a's steps 3 to 6; live-b is stopped and disabled
-just before live-a's step 7; then live-b's steps 3 to 9. Downtime: live-b serves alone through live-a's
-passes (about 29 h), then live-a alone through live-b's (about 16 h); the cluster is never fully down except
-for the minutes between live-b's stop and live-a's health.
+**The order (rulings above, rehearsed as R4):** A on both; B stops live-a only; C runs live-a's steps 3 to 6
+while live-b serves 0.94.2; then live-b is stopped and disabled (step 2 on live-b) just before live-a's step 7;
+live-a's 7 to 9; then D, live-b's steps 3 to 9.
 
 `T=/root/stage-0.95.0/root/usr/local` on each node. `M` is
 `systemd-run --wait --pipe -p LoadCredentialEncrypted=dannan-root:/etc/credstore.encrypted/dannan-root
@@ -157,9 +158,9 @@ names its check; a failed check stops there and is reported before anything else
    install and migrate scripts beside it. Check: `LD_LIBRARY_PATH=$T/lib $T/bin/dagda-migrate --version` names the
    release (on dannan 0.9.2).
 
-**B. Stop both:**
-2. On each: `/root/stop-with-stacks.sh`, then `systemctl disable macha`. Check: `is-active` `inactive` and
-   `is-enabled` `disabled` on both.
+**B. Stop live-a (live-b keeps serving 0.94.2):**
+2. On live-a: `/root/stop-with-stacks.sh`, then `systemctl disable macha`. Check: `is-active` `inactive` and
+   `is-enabled` `disabled`. The same on live-b just before live-a's step 7, once live-a's step 6 has passed.
 
 **C. live-a (then D, live-b, the same steps 3 to 9 once live-a serves):**
 3. **Back up on the node**: `/var/lib/macha` and `/etc/macha` to `/root/backup-0.95.0/` (one tarball and its sha256;

@@ -23,10 +23,13 @@ order from here:
 2. Done 2026-11-19: **Macha on 0.3.1**: 545/545 on build-3 (`prefix-dagda-0.3.1`); docs, CHANGELOG, one test's
    setup (B held off by `max_bandwidth`, since an idle node now ignores its fraction); tarball rebuilt, sha256 in
    the runbook; the migration script read against Dagda's `docs/migration.md` at 0.3.1, no change.
-3. **Next, small rehearsals** (runbook, "Small rehearsals"): propose their shape to the maintainer interactively, smallest
-   first, then run them.
-4. **The cutover**, on the maintainer's word: both nodes down together, live-a migrates and comes up first, then live-b;
-   backups and custody copies on each node. Estimated about 29 h fully down, then about 16 h on one node.
+3. Done 2026-11-19: **small rehearsals R1 to R4 pass** (runbook, "Small rehearsals": end to end, kills and resume,
+   rollback, two nodes in the new order). **Open from R4's first load, the maintainer: diagnose after R4:** a file copied into a
+   fresh two-node 0.94.2 cluster's mount committed short, silently (runbook); the pair (build-3, build-4) is left
+   running on 0.95.0 with the short file, claims 0 cores to 2026-11-20 09:02Z; `/root/rehearsal/clean.sh` removes it.
+4. **The cutover**, on the maintainer's word: live-b serves 0.94.2 while live-a migrates; live-b stops just before
+   live-a starts on 0.95.0, then migrates and joins; then the fidelity checks. About 29 h on live-b alone,
+   minutes fully down, about 16 h on live-a alone.
 5. After both, each on his word: the cutover check and garbage collection, the Macha tag, merges, pushes.
 
 **Where it stands:** `port/dannan-dagda` pushed, untagged; 0.95.0 on Dannan 0.9.2 and Dagda 0.3.1, 545/545. Both nodes serve 0.94.2 (restarted 2026-11-19 15:08Z after the aborted first attempt: 57 minutes down,
