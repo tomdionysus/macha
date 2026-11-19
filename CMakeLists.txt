@@ -161,7 +161,7 @@ find_package(yaml-cpp QUIET)
 # delivers adverts and subscriptions to a peer on time.
 find_package(dannan 0.9.2 CONFIG REQUIRED)
 # The store: Dagda, the exact release, built on the same Dannan.
-find_package(dagda 0.2.0 CONFIG REQUIRED)
+find_package(dagda 0.3.0 CONFIG REQUIRED)
 
 # Some environments expose a static CURL::libcurl without its transitive link
 # dependencies. Prefer pkg-config's complete imported target when available.
