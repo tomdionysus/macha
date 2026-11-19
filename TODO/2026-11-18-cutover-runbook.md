@@ -15,7 +15,7 @@ copy); the API stays 0.94.2's; `maintenance.collect_garbage` stays false until t
 | Macha release commit | `fe74e9b` 0.95.0 on `port/dannan-dagda`, pushed; tag 0.95.0 on the maintainer's word |
 | Dannan | 0.9.2 tag |
 | Dagda | 0.3.0: release gate running (Release, ASan+UBSan, TSan) on `4a4b322`; tag after it passes |
-| Mixed-version window | answered from code (Dannan, Dagda, Macha's decoders): transports admit each other, stores must not mix for long; plan: minutes of mixing (below) |
+| Mixed-version window | transports proved by Dannan's run (one cluster with the key; islands with a certificate alone); stores must not mix for long (Dagda and Macha, from code); plan: minutes of mixing (below) |
 | Two-version smoke test | **not run**: a 0.94.2 node and a 0.95.0 node on one key, on two build Pis: handshake, members, telemetry; each side's store calls (the five differing types in every frame class its code uses, puts and claims) and Macha's metadata calls each way; record every session ended and every error; neither node crashes |
 | Deploy tarball | `build/pi/macha_package.sh` from the 0.3.0 prefix, sha256 recorded; not built |
 | Install script | `build/install-0.95.0.sh` (written; read it before the first use) |
@@ -62,8 +62,11 @@ the store answer still awaited from Dagda and on a two-version smoke test:
   Two conditions: live-b keeps the cluster key and gets no certificate (a certificate without `use_cluster_key`
   offers only wire v2 and the pair refuse each other); live-b's advertise-with-deadline reports live-a `missed`
   until gossip carries the record (harmless unless Macha waits on it). Not checked by Dannan: the client's dialling and
-  relay changes, the scheduler. Dannan's recommendation: a smoke test of a 0.5.3 and a 0.9.2 node with one key
-  (handshake, members, telemetry, a hosted call each way) before the cutover.
+  relay changes, the scheduler. **Run by Dannan 2026-11-19** (build-1, `dannan-node` 0.5.3 and 0.9.2 from their tags,
+  loopback, 60 s each, logs in `../dannan/build/mixed-version-2026-11-19/`): with the cluster key on both and custody
+  on 0.9.2, either side dialling, both lanes up, each lists the other active, echo on control and data both ways, no
+  session ended; with a certificate alone on 0.9.2 they never became peers. Not covered: telemetry contents, advert
+  pushes, Macha's and Dagda's types; those are this plan's smoke test.
 - **Routes (checked here):** each hosted type's lane and frame rules must agree, or the receiver ends the session.
   Macha's own types are unchanged. Five store types differ between 0.94.2's registration and Dagda's: `delete_object`
   and `have_valid_objects` (0.94.2 any frame, Dagda not control), `bool_reply` (0.94.2 control lane, Dagda both
