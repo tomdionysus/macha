@@ -27,7 +27,8 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 | Dagda release with the fast migration | done: **0.3.1** tagged and pushed 2026-11-19 (the maintainer's word; main `2793458`); gate 1172 ran, 1169 passed, 3 skipped, TSan clean |
 | Macha on that release | done 2026-11-19: `find_package(dagda 0.3.1)`, install guides, `docs/configuration.md` (`idle_bandwidth_fraction` applies only while a higher class is present), CHANGELOG; one test's B held off by `max_bandwidth` (its fraction 0 no longer stops an idle pull) |
 | Deploy tarball | `build/release-0.95.0/macha-0.95.0-arm64.tgz`, sha256 `5673bfc4ad0d44357813107dca2f6c6ce08094d5e87289315f47e09bf7dc0002`, Dagda 0.3.1 (`dagda-migrate --version`: `0.3.1 (dannan 0.9.2)`); the 0.3.0 one is replaced |
-| Small rehearsals | R1 to R4 pass, 2026-11-19 (below); R4's first load found a short file on 0.94.2, to diagnose |
+| Small rehearsals | R1 to R4 pass, 2026-11-19 (below) |
+| The short file | open: [`2026-11-19-short-file.md`](2026-11-19-short-file.md); in 0.94.2 and 0.95.0's FUSE frontend, not the migration; whether it gates the cutover is the maintainer's call |
 | Macha suite | 545/545 on build-3 on Dannan 0.9.2 and Dagda 0.3.1 (2026-11-19 19:42Z) |
 | Migration script vs Dagda 0.3.1 `docs/migration.md` | read 2026-11-19: flags, `--resume`, rerun-to-finish, compare and `RESULT: PASS` all match; no change |
 | Dannan | 0.9.2 tag |
@@ -62,8 +63,8 @@ from `build/cutover/phys_reads.py` until the cutover's first pass.
 - **A 0.94.2 defect found on R4's first load (the maintainer: finish R4, diagnose after):** on the fresh 0.94.2 pair, one of six
   96 MiB files copied into A's mount (`r4/big/f2.bin`) committed short, 84,410,368 of 100,663,296 bytes (the bytes it
   has correct), on both nodes, with no error, nothing parked, every publication counted complete. Not seen in R1 or
-  R2 (one node), nor in the 14 large files loaded afterwards. 0.95.0 shares the FUSE write path (unverified whether it
-  has the defect). The pair is left running on 0.95.0 with the short file, for diagnosis.
+  R2 (one node), nor in the 14 large files loaded afterwards. Reproduced once on 0.95.0 too. Its own file:
+  [`2026-11-19-short-file.md`](2026-11-19-short-file.md).
 
 ## Downtime (estimates from the live disks, 2026-11-19; the released tool not yet run on them)
 
@@ -123,8 +124,8 @@ Both live `macha.yaml` files load under the port with no unknown key (checked 20
 live-b 9 TiB; 4 GiB reserve), cache `/var/cache/macha` (4096 blocks), replication 2, write copies 1, metadata write
 copies 1, extent 4 MiB, refresh 5 s, garbage grace 30 days, ledger cache 64 MiB, `maintenance.collect_garbage` false.
 The install script adds `custody: { credential: dannan-root }`. Both keep the cluster key and no certificate.
-If Dagda's release carries its repair change (idle repair at the whole link), `maintenance.idle_bandwidth_fraction`
-(0.5 on both) applies only while a higher class is present: document it in `docs/configuration.md` with that release.
+On Dagda 0.3.1, `maintenance.idle_bandwidth_fraction` (0.5 on both) applies only while a higher class is present;
+an idle node's repair uses the whole link (documented in `docs/configuration.md`).
 
 ## The nodes (read 2026-11-19)
 

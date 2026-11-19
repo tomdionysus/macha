@@ -1,6 +1,16 @@
 # Completed and tested
 
-Last updated: 2026-11-18
+Last updated: 2026-11-19
+
+## 2026-11-19 -- Macha on Dagda 0.3.1, and the cutover rehearsed (`port/dannan-dagda`)
+
+- `b4f864d`: `find_package(dagda 0.3.1)`; install guides, `docs/configuration.md` (`idle_bandwidth_fraction` applies
+  only while a higher class is present), CHANGELOG. The yield test's peer held off by `max_bandwidth`, since an idle
+  node no longer heeds its fraction. 545/545 on build-3. Deploy tarball rebuilt (sha256 `5673bfc4...0002`).
+- Rehearsals R1 to R4 on build-3 and build-4 with the tarball and the cutover scripts unedited, every file checked by
+  sha256: one node end to end; kills of each pass and of the migration, finished by rerunning; rollback by
+  `--reverse` after the install; two nodes in the maintainer's new order (live-b serving while live-a migrates). All pass.
+  Results in the runbook. They found the short file (`2026-11-19-short-file.md`), a FUSE defect older than the port.
 
 ## 2026-11-17 to 11-18 -- the port's steps 1 to 4 and the suite down to four (`port/dannan-dagda`)
 

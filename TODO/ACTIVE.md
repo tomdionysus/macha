@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-19 about 18:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-19 about 22:40Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note** (operator: "We can't afford drift like this."). The version before
 this rationalisation is `archive/2026-11-19b-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md`,
 `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not requirements).
@@ -13,28 +13,29 @@ native forms later. The plan is [`2026-11-18-cutover-runbook.md`](2026-11-18-cut
 rehearsals, downtime, the steps, rollback); the port's history
 [`2026-11-14-port-rewrites.md`](2026-11-14-port-rewrites.md); done work in `COMPLETED.md`.
 
-**Do not start the cutover. Nothing touches live-a or live-b without the maintainer's word.** the maintainer, 2026-11-19 evening, the
-order from here:
-1. Done: **Dagda 0.3.1 tagged and pushed** (the maintainer's word, 2026-11-19; main `2793458`): the fast migration (option B:
-   header-only moves with `<state>/migration-progress`, manifest passes in device order, no dry run) and the
-   large-rejoin repair work (`maintenance.idle_bandwidth_fraction` now applies only while a higher class is present;
-   an idle node's repair uses the whole link, `max_bandwidth` bounds it). Gate: 1172 ran, 1169 passed, 3 skipped;
-   TSan clean; ASan+UBSan one test fault, fixed in the test.
-2. Done 2026-11-19: **Macha on 0.3.1**: 545/545 on build-3 (`prefix-dagda-0.3.1`); docs, CHANGELOG, one test's
-   setup (B held off by `max_bandwidth`, since an idle node now ignores its fraction); tarball rebuilt, sha256 in
-   the runbook; the migration script read against Dagda's `docs/migration.md` at 0.3.1, no change.
-3. Done 2026-11-19: **small rehearsals R1 to R4 pass** (runbook, "Small rehearsals": end to end, kills and resume,
-   rollback, two nodes in the new order). **Open from R4's first load, the maintainer: diagnose after R4:** a file copied into a
-   fresh two-node 0.94.2 cluster's mount committed short, silently (runbook); the pair (build-3, build-4) is left
-   running on 0.95.0 with the short file, claims 0 cores to 2026-11-20 09:02Z; `/root/rehearsal/clean.sh` removes it.
-4. **The cutover**, on the maintainer's word: live-b serves 0.94.2 while live-a migrates; live-b stops just before
-   live-a starts on 0.95.0, then migrates and joins; then the fidelity checks. About 29 h on live-b alone,
-   minutes fully down, about 16 h on live-a alone.
-5. After both, each on his word: the cutover check and garbage collection, the Macha tag, merges, pushes.
+**Do not start the cutover. Nothing touches live-a or live-b without the maintainer's word.**
 
-**Where it stands:** `port/dannan-dagda` pushed, untagged; 0.95.0 on Dannan 0.9.2 and Dagda 0.3.1, 545/545. Both nodes serve 0.94.2 (restarted 2026-11-19 15:08Z after the aborted first attempt: 57 minutes down,
-nothing written; what it left on the nodes is listed in the runbook). The tarball in `build/release-0.95.0/` is the 0.3.1
-build (sha256 in the runbook).
+**Next: the short file** ([`2026-11-19-short-file.md`](2026-11-19-short-file.md)). A large file written through the
+mount of a two-node cluster can commit short, silently; seen once on 0.94.2 (live) and once on 0.95.0, both as peer
+metadata started arriving. Dagda's candidate (checked against the code, unproven): `adopt_entry`'s dirty clause takes a
+lagging view as a replacement and detaches the writing inode, whose later writes are then retired by
+`replay_data_quantum`'s no-path branch without being published. Next step: the deterministic test of that clause
+(failing test first), then the mechanism report to the maintainer before any fix. Whether the cutover waits on it is the maintainer's call.
+
+**Done 2026-11-19** (details in the runbook): Dagda 0.3.1 (the maintainer's tag, `2793458`); Macha rebuilt on it (`b4f864d`,
+545/545; `idle_bandwidth_fraction` docs; tarball sha256 `5673bfc4...0002`); rehearsals R1 to R4 all pass (end to end,
+kills and resume, rollback, two nodes in the maintainer's new order); the runbook's steps rewritten to that order.
+
+**Then, on the maintainer's word:** the cutover (live-b serves 0.94.2 while live-a migrates; live-b stops just before
+live-a starts on 0.95.0, then migrates and joins; then the fidelity checks: about 29 h on live-b alone, minutes
+fully down, about 16 h on live-a alone); after both, each on his word, the cutover check and garbage collection, the
+Macha tag, merges, pushes.
+
+**Where it stands:** `port/dannan-dagda` pushed, untagged; 0.95.0 on Dannan 0.9.2 and Dagda 0.3.1, 545/545. Both live
+nodes serve 0.94.2 (since 2026-11-19 15:08Z; what the aborted first attempt left on them is in the runbook). The
+rehearsal pair (build-3 A, build-4 B) runs 0.95.0 holding the short files as evidence, claims at 0 cores to
+2026-11-20 22:34Z; kit `build/rehearsal/` (gitignored), on each Pi `/root/rehearsal/` (`clean.sh` removes everything
+the rehearsals installed; build-4 also got FFmpeg's runtime libraries, which stay).
 
 **Rulings in force** (the maintainer, interactive; the cutover's own are at the head of the runbook; the rest in "Standing
 rules"):
@@ -51,12 +52,15 @@ rules"):
 
 **The libraries (read their repositories before relying on this):**
 - **Dannan** 0.9.2 tagged. Custody by `dannan-custody(1)`; `dannan-import-macha --dry-run` is a check at the cutover.
-- **Dagda** 0.3.1 tagged and pushed (`2793458`); Macha builds on it.
-  Dagda holds off the live nodes until the cutover is reported done.
+- **Dagda** 0.3.1 tagged and pushed (`2793458`); Macha builds on it. Dagda holds off the live nodes until the
+  cutover is reported done. Dagda's heads view can lack a node's own commit while several heads exist (its finding,
+  2026-11-19); Macha does not use heads, so it does not touch 0.95.0; its `covers()` helper is on a Dagda branch,
+  uncommitted, and Dagda withdrew its repin recommendation to the maintainer.
 
 **Builds:** the Pis were wiped 2026-11-18 and rebuilt; Macha's packages are on build-1, build-2 and build-3; installing
 tooling needs only a claim. build-4 is light work only. build-3: `/home/maintainer/deps/prefix-0.9.2`,
-`prefix-dagda-053ee6e`, `prefix-dagda-053ee6e-read`, `prefix-dagda-0.3.0`, `prefix-dagda-0.3.1`, the tree `/home/maintainer/macha-store-2`.
+`prefix-dagda-053ee6e`, `prefix-dagda-053ee6e-read`, `prefix-dagda-0.3.0`, `prefix-dagda-0.3.1`, the tree
+`/home/maintainer/macha-store-2` (built on 0.3.1). `fuse_frontend.cpp` builds into `libmacha_core.so`, not the FUSE plugin.
 build-1: `prefix-0.5.3`, `prefix-0.9.2`, `/home/maintainer/macha-main` (0.94.2, clean, all targets). Shared machines:
 check what is there before relying on it. Scripts in `build/pi/`: `macha_port_compile.sh` (`S`, `R`, `J`, `DANNAN`,
 `DAGDA`; writes only `$R.result`, so capture its output to see an error), `deps_dagda_tag.sh`, `main_0942_build.sh`
@@ -71,7 +75,9 @@ while unmounted (`chattr -i` before removing a test node's directory).
 
 ## Known live defects until the cutover
 
-All stay on 0.94.2 and are fixed by the port.
+All stay on 0.94.2 and are fixed by the port, except the first.
+- **A file written through the mount can commit short, silently** (two nodes; `2026-11-19-short-file.md`). Not fixed
+  by the port: the FUSE frontend is the same code on 0.95.0.
 - **Repair** (develop `distributed_store.cpp`): push and pull share one 16-call step budget; a large rejoin took about
   80 s where the bytes once take about 38 s (2026-11-16). Nothing is lost. Dagda's redesign replaces it.
 - **A loader refused for device pressure waits for the next release** (develop `data_work.hpp:239-247`). Fixed in
@@ -81,7 +87,8 @@ All stay on 0.94.2 and are fixed by the port.
 
 ## Waiting on the operator
 
-- The rehearsals' shape (to be proposed once Macha is rebuilt on Dagda 0.3.1); then the word to start the cutover.
+- The short file: the mechanism report once proved, its fix, and whether the cutover waits on it; then the word to
+  start the cutover.
 - Dagda's and Dannan's branches pushed (both local on the maintainer's word).
 - After the port: whether the heap chase resumes with media load.
 - The Codecov token for the repository.
