@@ -22,8 +22,9 @@ intents left as code comments).
 **To be cutover-ready, in order:**
 1. Done: **Dagda 0.3.0** tagged and gated; Macha builds on it (`8ef9496`); the install guides name the versions.
 2. Done: **the deploy tarball** (above).
-3. **The mixed-version window**: answered (runbook): the transports form one cluster (Dannan's run), the stores must
-   not mix for long, so the plan keeps the mixing to minutes. Still to run: the **two-version smoke test**: Macha `main` (0.94.2, on
+3. Done: **the mixed-version window**: the transports form one cluster (Dannan's run), the stores must not mix for
+   long, so the plan keeps the mixing to minutes; the **two-version smoke test passed** 2026-11-19 (runbook: about 9
+   minutes mixed, every write on both nodes, no session ended, no error). It was: Macha `main` (0.94.2, on
    Dannan 0.5.3; build-1 has `prefix-0.5.3` and a `main` tree from 2026-11-18) and 0.95.0 on two build Pis, one cluster
    key: handshake, members, telemetry, a store call and a Macha call each way, no session ended.
 4. **The maintainer's decisions**, asked interactively once 1 to 3 are done, each with a recommendation: the off-node backup

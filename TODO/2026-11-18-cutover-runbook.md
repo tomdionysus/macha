@@ -16,7 +16,7 @@ copy); the API stays 0.94.2's; `maintenance.collect_garbage` stays false until t
 | Dannan | 0.9.2 tag |
 | Dagda | **done**: 0.3.0 tagged (local, `2a58202`, tree `af09d301` = the gated `4a4b322`): Release, ASan+UBSan, TSan gate passed |
 | Mixed-version window | transports proved by Dannan's run (one cluster with the key; islands with a certificate alone); stores must not mix for long (Dagda and Macha, from code); plan: minutes of mixing (below) |
-| Two-version smoke test | **not run**: a 0.94.2 node and a 0.95.0 node on one key, on two build Pis: handshake, members, telemetry; each side's store calls (the five differing types in every frame class its code uses, puts and claims) and Macha's metadata calls each way; record every session ended and every error; neither node crashes |
+| Two-version smoke test | **passed** 2026-11-19 13:54 to 14:03Z (below) |
 | Deploy tarball | **done**: `build/release-0.95.0/macha-0.95.0-arm64.tgz`, sha256 `7d9d1e0fef5b0875dc3c6b819de5709b8d6c8b0ceda04fe16adf492d1126a062`, 76 MB, from `8ef9496` on Dagda 0.3.0; binaries resolve inside it (`dagda-migrate --version` 0.3.0 on dannan 0.9.2) |
 | Install script | `build/install-0.95.0.sh` (written; read it before the first use) |
 | API announcement | none needed: 0.95.0 sends 0.94.2's API (`2026-11-18-port-api-announcement.md`) |
@@ -88,6 +88,21 @@ the store answer still awaited from Dagda and on a two-version smoke test:
   trailing bytes (`src/codec.cpp:109`, checked here): **every put and claim from live-b to live-a fails**.
   Macha's metadata types are unchanged and do cross; reads across (`get_object`) work. Not checked: trie_diff
   answers across v18 and v19 ledgers. `dagda-migrate` is purely local.
+
+**The two-version smoke test (2026-11-19, the maintainer's go; fresh test nodes, a few MB, nothing from the live nodes):** node A
+Macha 0.94.2 (`main`, Dannan 0.5.3) on build-1 founding the cluster, as live-a; node B the 0.95.0 deploy tarball
+itself (Dannan 0.9.2, Dagda 0.3.0, test custody from a credentials directory) on build-2, bootstrapping to A, as
+live-b; replicas 2, write copies 1, metadata write copies 1, `collect_garbage` false. About 9 minutes mixed: each
+wrote 8 files (1 to 6 MiB) through its FUSE mount, each read the other's back (16 of 16 sha256 match), each deleted 2,
+then 3 minutes idle. Result: both online and healthy throughout, each lists the other `online` with its version;
+metadata writable with `replicas=2/2`; no WARN or ERROR line on either (accounts' first-start notice aside); transport
+connections made once and reused about 500 times on each, so no session ended; server rejections 0; prompt
+replication 0 failures both ways; both data directories hold the same 19 large objects, so every write reached both
+nodes. A answered 26 requests of types it does not know (Dagda's 768 to 774, answered 501 as Dagda predicted) without
+any session ending. A's repair moved 22 MB, so some of B's objects may have reached A by A's pull rather than B's
+puts: Dagda's prediction that B's puts and claims to A fail on trailing bytes is neither confirmed nor ruled out by
+this run, and the end state does not depend on it. Not exercised: a promoted request, deletes reaching the other
+node's store (garbage collection off). Logs in `build/smoke/logs/`; configs and scripts in `build/smoke/`.
 
 **The plan for the window (recommended; the maintainer's choice at the go):** keep the mixed time to minutes. live-b migrates
 while live-a serves alone on 0.94.2 (single-copy writes, accepted). live-b starts on 0.95.0 and is proved serving
