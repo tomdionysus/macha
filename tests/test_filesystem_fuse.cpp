@@ -2593,8 +2593,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_failures_back_off_and_park) 
     }
 
     // A recovered write whose path was removed while the node was down (a
-    // cluster generation accepted meanwhile) fails once, terminally, and is
-    // not readmitted as an unbounded recovery retry.
+    // cluster generation accepted meanwhile) is a remote unlink: the first
+    // adoption drops the path and the writes retire as unlinked, with no
+    // backend failure and no retry.
     {
         auto fuse = node.fuse("terminal-recovery");
         fuse.commit_workers = 1;
@@ -2610,15 +2611,22 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_failures_back_off_and_park) 
             frontend->stop();
         }
         fs.unlink("/removed-before-replay.bin");
+        auto logger = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+        Log::set_logger(logger);
         auto recovered = node.frontend(fuse);
-        REQUIRE(wait_until([&] { return recovered->status().backend_failures >= 1; }, 10s));
-        REQUIRE(recovered->wait_for_idle(5s));
+        REQUIRE(recovered->wait_for_idle(10s));
         const auto settled = recovered->status();
-        CHECK(settled.backend_failures == 1);
+        CHECK(settled.backend_failures == 0);
         CHECK(settled.pending_data == 0);
         CHECK(settled.active_data == 0);
         CHECK(recovered->getattr("/healthy.bin").type == EntryType::file);
+        CHECK(!recovered->inode_for_path("/removed-before-replay.bin").has_value());
         recovered->stop();
+        Log::set_logger(std::make_shared<ConsoleLogger>());
+        const auto records = logger->records();
+        CHECK(std::any_of(records.begin(), records.end(), [](const auto& record) {
+            return record.second.find("fuse_writes_retired_unlinked") != std::string::npos;
+        }));
     }
 }
 
@@ -2805,6 +2813,67 @@ void admit_unpublished(FilesystemNode& node, const FuseConfig& fuse,
     auto frontend = held_frontend(node, fuse);
     operations(*frontend.frontend);
     frontend->stop();
+}
+
+// A file written and renamed before a crash that published nothing reads at
+// its written size from recovery alone, before its recovered publication runs,
+// then publishes whole.
+MACHA_TEST("filesystem_fuse", test_a_recovered_file_reads_its_size_before_it_publishes) {
+    FilesystemNode node("recovered-size");
+    auto& fs = node.fs();
+    fs.mkdir("/recovered", 0755, getuid(), getgid());
+    auto fuse = node.fuse("recovered-size");
+    const auto payload = pattern(32 * 1024, 91);
+    admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+        auto handle =
+            frontend.create("/recovered/.film.tmp", 0600, getuid(), getgid(), true, true, false);
+        REQUIRE(frontend.write(handle.inode, 0, payload) == payload.size());
+        frontend.release(handle.inode, true);
+        frontend.rename("/recovered/.film.tmp", "/recovered/film.mkv", false);
+    });
+    CHECK(absent(fs, "/recovered/film.mkv"));
+
+    // Publication held: the size comes from the recovered journal and spool.
+    auto recovered = held_frontend(node, fuse);
+    CHECK(recovered->getattr("/recovered/film.mkv").size == payload.size());
+    CHECK(fuse_read(*recovered.frontend, *recovered->inode_for_path("/recovered/film.mkv"),
+                    payload.size()) == payload);
+    recovered.loader->release();
+    REQUIRE(recovered->wait_for_idle(20s));
+    CHECK(fs.getattr("/recovered/film.mkv").size == payload.size());
+    CHECK(read_back(fs, "/recovered/film.mkv", payload.size()) == payload);
+    CHECK(absent(fs, "/recovered/.film.tmp"));
+    recovered->stop();
+}
+
+// A create and its writes recovered with neither published: the create is
+// absent from the view, yet the first adoption waits for it to publish and
+// does not take the absence for a remote unlink. Both publish.
+MACHA_TEST("filesystem_fuse", test_a_recovered_unpublished_create_is_not_dropped) {
+    FilesystemNode node("recovered-create");
+    auto& fs = node.fs();
+    fs.mkdir("/created", 0755, getuid(), getgid());
+    auto fuse = node.fuse("recovered-create");
+    const auto payload = pattern(48 * 1024, 37);
+    admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+        auto handle =
+            frontend.create("/created/new.bin", 0600, getuid(), getgid(), true, true, false);
+        REQUIRE(frontend.write(handle.inode, 0, payload) == payload.size());
+        frontend.release(handle.inode, true);
+    });
+    CHECK(absent(fs, "/created/new.bin"));
+
+    auto logger = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+    Log::set_logger(logger);
+    auto recovered = node.frontend(fuse);
+    REQUIRE(recovered->wait_for_idle(20s));
+    CHECK(recovered->status().backend_failures == 0);
+    recovered->stop();
+    Log::set_logger(std::make_shared<ConsoleLogger>());
+    CHECK(fs.getattr("/created/new.bin").size == payload.size());
+    CHECK(read_back(fs, "/created/new.bin", payload.size()) == payload);
+    for (const auto& [level, message] : logger->records())
+        CHECK(message.find("fuse_writes_retired_unlinked") == std::string::npos);
 }
 
 // Recovery of the FUSE namespace journal over one node, case by case: each
@@ -3138,9 +3207,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_journal_recovery) {
         restore_directory(crash_image, *fuse.spool_path);
 
         auto recovered = node.frontend(fuse);
-        // Operations recovered by identity retire at the next namespace-facing
-        // request, as every confirmation does.
-        CHECK(recovered->status().pending_namespace == 2);
+        // Operations recovered by identity retire at the first adoption, which
+        // startup runs before any recovered publication: no request is needed.
+        CHECK(wait_until([&] { return recovered->status().pending_namespace == 0; }, 10s));
         CHECK(recovered->getattr(root + "/film.mkv").size == payload.size());
         REQUIRE(recovered->wait_for_idle(20s));
         CHECK(recovered->status().namespace_publication_attempts == 0);
@@ -3691,9 +3760,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_data_journal_recovery) {
         recovered->stop();
     }
 
-    // A recovered publication whose file has left the namespace is abandoned
-    // (journalled) on the first boot, freeing its spool and the journal; the
-    // second boot sees nothing.
+    // A recovered publication whose file left the namespace while the node was
+    // down is a remote unlink: its writes retire as unlinked on the first boot,
+    // freeing its spool and the journal; the second boot sees nothing.
     {
         auto fuse = node.fuse("removed-file");
         fuse.commit_workers = 1;
@@ -3711,14 +3780,23 @@ MACHA_TEST("filesystem_fuse", test_fuse_data_journal_recovery) {
         REQUIRE(std::filesystem::file_size(*fuse.operation_journal_path) > 8);
         fs.unlink("/gone.bin");
         {
+            auto logger = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+            Log::set_logger(logger);
             auto recovered = node.frontend(fuse);
             REQUIRE(recovered->wait_for_idle(10s));
             const auto diagnostics = recovered->diagnostics();
-            CHECK(diagnostics.publications_abandoned == 1);
+            CHECK(diagnostics.publications_abandoned == 0);
             CHECK(diagnostics.parked_publications == 0);
+            CHECK(recovered->status().backend_failures == 0);
             CHECK(recovered->status().pending_data == 0);
+            CHECK(recovered->status().active_data == 0);
             CHECK(!recovered->inode_for_path("/gone.bin").has_value());
             recovered->stop();
+            Log::set_logger(std::make_shared<ConsoleLogger>());
+            const auto records = logger->records();
+            CHECK(std::any_of(records.begin(), records.end(), [](const auto& record) {
+                return record.second.find("fuse_writes_retired_unlinked") != std::string::npos;
+            }));
         }
         CHECK(!std::filesystem::exists(spool) || std::filesystem::file_size(spool) == 0);
         CHECK(std::filesystem::file_size(*fuse.operation_journal_path) == 8);
