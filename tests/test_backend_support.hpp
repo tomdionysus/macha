@@ -742,6 +742,8 @@ inline HttpReply http_request(uint16_t port, std::string_view method, std::strin
 // always admitted, as with no viewer. Starts released.
 class HeldLoaderAdmission final : public LoaderAdmission {
     std::atomic_bool held_{};
+    // Namespace publication alone, held apart from data.
+    std::atomic_bool namespace_held_{};
     Mutex wake_mutex_;
     std::function<void()> wake_ MACHA_GUARDED_BY(wake_mutex_);
 
@@ -763,12 +765,20 @@ class HeldLoaderAdmission final : public LoaderAdmission {
     void release() {
         set(false);
     }
+    void hold_namespace() {
+        namespace_held_.store(true, std::memory_order_release);
+    }
+    void release_namespace() {
+        namespace_held_.store(false, std::memory_order_release);
+        set(held_.load(std::memory_order_acquire));
+    }
 
     bool can_start(TimePoint) override {
         return !held_.load(std::memory_order_acquire);
     }
     bool namespace_can_start(TimePoint) override {
-        return !held_.load(std::memory_order_acquire);
+        return !held_.load(std::memory_order_acquire) &&
+               !namespace_held_.load(std::memory_order_acquire);
     }
     void started(TimePoint, bool) override {}
     void service_started(TimePoint) override {}
