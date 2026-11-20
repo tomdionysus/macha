@@ -26,11 +26,11 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 |---|---|
 | Dagda | **0.3.2** (tag), Dannan **0.9.2** (tag) |
 | Macha | **0.95.1**, port/dannan-dagda; the deployed code is the short-file fix line's last commit (it was `66c7ef4` before the 2026-11-20 history rewrites); later commits change no code |
-| Deploy tarball | `build/release-0.95.1/macha-0.95.1-66c7ef4-arm64.tgz`, sha256 `c2041995386c483546dd423fee2a71c803e039a16021e065dde04cca9f474086` (Dagda 0.3.2, Dannan 0.9.2); the one every rehearsal below ran |
+| Deploy tarball | `build/release-0.95.1/macha-0.95.1-906aeba-arm64.tgz`, sha256 `a6e2e151f84ab8d04f7092452075918d4484d4de3516cd2eff0381361528ec98` (Dagda 0.3.2, Dannan 0.9.2): the rehearsed code plus the shutdown fix (`906aeba`). The rehearsals ran `c2041995...4086`, the same code without that fix |
 | Small rehearsals | R1 to R4 and the two-writer round pass on that tarball, 2026-11-20 (below) |
 | The short file | fixed in 0.95.1 ([`2026-11-19-short-file.md`](2026-11-19-short-file.md)); 0.94.2 still commits short at times, and the migration carries such files unchanged |
-| Macha suite | 554/554 on build-3 on Dannan 0.9.2 and Dagda 0.3.2 (2026-11-20) |
-| Sanitizer gate | **open**: ASan/UBSan then TSan, Macha and instrumented Dannan and Dagda (`build/pi/macha_sanitize.sh`), asked for by the maintainer before the word; running 2026-11-20 |
+| Macha suite | 555/555 on build-3 on Dannan 0.9.2 and Dagda 0.3.2, with the shutdown fix (2026-11-20) |
+| Sanitizer gate | done as the maintainer ruled: ASan/UBSan with instrumented Dannan and Dagda found one heap-use-after-free at node stop (the store freed while peers' requests still reached it through Macha's routes), fixed in `906aeba`; the case passes 5 of 5 under ASan with no report. TSan not run (the maintainer: "it's just a test") |
 | Install script | `build/install-0.95.1.sh` (run in R1 to R4 through `build/rehearsal/cutover-node.sh`) |
 | Migration script | `build/cutover/migrate-0.95.1.sh` (run in R1 to R4, kills and resumes in R2) |
 | API announcement | none: 0.95.1 sends 0.94.2's API |
