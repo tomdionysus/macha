@@ -1,5 +1,7 @@
 # Contributing
 
+Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
+
 ## Read first
 
 The [governing laws and self-healing disciplines](docs/principles-and-laws.md)
