@@ -19,14 +19,30 @@ rehearsals, downtime, the steps, rollback); the port's history
 mechanism was proven by a deterministic failing test, and the fix follows the maintainer's rulings (2026-11-19, interactive): both
 layers, "never go backwards, and guard FUSE". Suite 547/547 on Dagda 0.3.1.
 
-**Next (the maintainer's ruling): a new Macha version on Dagda 0.3.2, then the rehearsals from the start.** Dagda is gating 0.3.2
-(0.3.1 plus `Space::covers`) and sends its tag commit. Then:
-1. Build the prefix on build-3 and rebuild Macha on it.
-2. Bump the version (CMake and the README line together) and the CHANGELOG.
-3. Run the suite and package the tarball.
-4. Update the runbook's version checks (`dagda-migrate --version` reports `0.3.2 (dannan 0.9.2)`).
-5. Rerun rehearsals R1 to R4 and the two-writer round on the pair.
-6. The cutover, on the maintainer's word.
+**0.95.1 is cut** (`2fb804e`, on Dagda 0.3.2 and Dannan 0.9.2, 547/547). The tarball is
+`build/release-0.95.1/macha-0.95.1-arm64.tgz` (sha256 `dd25f12c...6416`). The kit is updated: `build/install-0.95.1.sh`,
+`build/cutover/migrate-0.95.1.sh`, and `build/rehearsal/*` now say 0.95.1.
+
+**Rehearsals paused (2026-11-20 01:10Z).** R1's fresh single 0.94.2 node on build-3 committed `r1/big/f0.bin` short,
+with no peer (see the short-file note). **The maintainer: "this is a Dagda problem. Assist Dagda to diagnose and fix it."**
+- Dagda leads; Macha assists, with the node and its evidence (`/root/evidence-r1-0942/` on build-3) and builds.
+- The rehearsals R1 to R4 and the two-writer round restart when Dagda's fix lands; the cutover is on the maintainer's word.
+
+**GitHub CI (the maintainer 2026-11-20: "If you have public github repos, fix and maintain github CI"):**
+- `main` is green at 0.94.2.
+- `develop` has been red since `7f88fe6` (2026-11-13): its ASan stage crashes in
+  `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node` (an ASan thread-registry CHECK,
+  signal 6 or 11, every run), and `test_failed_convergence_retries_once_per_burst_of_events` failed once. That is the
+  heap corruption parked "port first".
+- CI runs only on `main`, `develop` and pull requests, so the port branch has had none. Its stale Dagda pin is fixed
+  (0.1.5 to 0.3.2, `e7d4503`).
+- Plan, settled by the maintainer's rules: before the port's squash onto `develop`, run `tools/ci.sh --local` (with ASan) once on
+  a Pi as the pre-merge gate. If the ingest/torrent crash is still there on the port's code, the heap corruption is
+  fixed before the merge. Then `develop` goes green on GitHub and stays green.
+
+**The stack audits (2026-11-20):** the reports are in `2026-11-20-duplication-audit.md` and
+`2026-11-20-no-special-node-audit.md`. The converged plan is the coordinating session's `TODO/2026-11-20-cluster-stack-placement.md`
+-> Macha (agreed), and all of it starts after the cutover. Negotiation goes through the coordinating session.
 
 **Done 2026-11-19** (details in the runbook): Dagda 0.3.1 (the maintainer's tag, `2793458`); Macha rebuilt on it (`b4f864d`,
 545/545; `idle_bandwidth_fraction` docs; tarball sha256 `5673bfc4...0002`); rehearsals R1 to R4 all pass (end to end,
