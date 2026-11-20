@@ -4,9 +4,11 @@
 
 *v0.95.1*
 
+[![Release](https://img.shields.io/github/v/tag/tomdionysus/macha?sort=semver&label=release)](https://github.com/tomdionysus/macha/tags)
 [![CI](https://github.com/tomdionysus/macha/actions/workflows/ci.yml/badge.svg)](https://github.com/tomdionysus/macha/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/tomdionysus/macha/graph/badge.svg)](https://codecov.io/gh/tomdionysus/macha)
 [![CodeQL](https://github.com/tomdionysus/macha/actions/workflows/codeql.yml/badge.svg)](https://github.com/tomdionysus/macha/actions/workflows/codeql.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 *Macha - Old Irish /ˈmˠaxə/ - approximately “MAKH-uh”*
 
