@@ -7,10 +7,10 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 **The maintainer's rulings for the cutover:**
 - **live-b serves while live-a migrates** (the maintainer, 2026-11-19 evening, replacing "both nodes down together"):
   live-a stops and migrates while live-b stays up on 0.94.2; live-b stops just before live-a starts on
-  0.95.x, then migrates; live-b comes up and joins; then the release fidelity checks. Still no mixed-version window:
+  0.95.1, then migrates; live-b comes up and joins; then the release fidelity checks. Still no mixed-version window:
   the two never serve different versions at once. The window's analysis is in
   [`archive/2026-11-19-cutover-mixed-version-window.md`](archive/2026-11-19-cutover-mixed-version-window.md).
-- **live-a first, and up first**: live-a migrates and starts on 0.95.x alone; then live-b migrates and joins.
+- **live-a first, and up first**: live-a migrates and starts on 0.95.1 alone; then live-b migrates and joins.
   live-a can be power-cycled by hand; live-b cannot. What live-b takes in while live-a is down is migrated
   with live-b and reaches live-a by repair once both serve.
 - **Backups on the node itself**, in other directories ("We don't expect system disk failure"); the custody files the
@@ -35,7 +35,7 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 | Install script | `build/install-0.95.0.sh` (written, never run; read it before the first use) |
 | Migration script | `build/cutover/migrate-0.95.0.sh` (ran its first step once; updated to three passes; check its flags against Dagda's `docs/migration.md` at the tag) |
 | API announcement | none: 0.95.0 sends 0.94.2's API |
-| 0.94.2 baselines | `build/baselines/results-0.94.2`; compared after each node is on 0.95.x |
+| 0.94.2 baselines | `build/baselines/results-0.94.2`; compared after each node is on 0.95.1 |
 | The maintainer's word | the start |
 
 ## Rehearsals on 0.95.1 at 66c7ef4, 2026-11-20 (all pass)
@@ -103,9 +103,9 @@ from `build/cutover/phys_reads.py` until the cutover's first pass.
 | Before manifest | about 13 h | 0.94.2 alone | up, one node: what only live-a holds is unavailable |
 | Migration (headers only) | about 2.7 h plus syncs | 0.94.2 alone | the same |
 | After manifest, compare | about 13 h | 0.94.2 alone | the same |
-| live-b stopped, live-a installed | starting 0.95.x | stopped | down: minutes |
-| live-b's three passes | 0.95.x alone | about 7 + 1.3 + 7 h | up, one node: what only live-b holds (its 0.94.2 writes since live-a stopped among it) is unavailable |
-| Both on 0.95.x | serving | serving | up; repair converges them |
+| live-b stopped, live-a installed | starting 0.95.1 | stopped | down: minutes |
+| live-b's three passes | 0.95.1 alone | about 7 + 1.3 + 7 h | up, one node: what only live-b holds (its 0.94.2 writes since live-a stopped among it) is unavailable |
+| Both on 0.95.1 | serving | serving | up; repair converges them |
 
 So about 29 h on live-b alone, minutes fully down, then about 16 h on live-a alone (R4 rehearsed this order). Measurements behind it (both nodes live, read-only): raw
 sequential 147 to 234 MB/s; every loose object is one extent; with inodes warm and files visited in physical order,
@@ -142,7 +142,7 @@ the disk. The `macha` unit is disabled for the cutover, so a reboot does not sta
 
 ## What is deployed
 
-Macha 0.95.x at the commit that passes on Dagda's release, RelWithDebInfo; Dannan 0.9.2 (`libdannan`,
+Macha 0.95.1 at the commit that passes on Dagda's release, RelWithDebInfo; Dannan 0.9.2 (`libdannan`,
 `dannan-custody`, `dannan-import-macha`, `dannan-version`); Dagda's release (`libdagda`, `dagda-migrate`). One tarball
 under `/usr/local`, with its sha256.
 

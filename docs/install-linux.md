@@ -119,7 +119,7 @@ sudo ldconfig
 ```
 
 `dannan/build/dannan-import-macha` converts an existing node's state at the
-upgrade to 0.94 (see the CHANGELOG); install it beside Macha on such a node.
+upgrade to 0.94.0 (see the CHANGELOG); install it beside Macha on such a node.
 
 ## Build and test
 
