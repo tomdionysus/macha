@@ -1,5 +1,23 @@
 # Current release
 
+## 0.95.1: a file being written keeps its name through a lagging view
+
+FUSE: a large file copied into the mount of a two-node cluster could commit short,
+with no error. A peer's longer metadata branch accepted while this node committed
+the file's data left the node's view on the peer's head, which lacked that commit;
+the mount took the view's older entry as a replacement of the file, detached the
+inode being written, and dropped the rest of its writes. Present since before 0.94.2.
+
+The view no longer gives up this node's own latest commit for a concurrent head; the
+fold the new head set wakes brings both. A peer head this node cannot merge is set
+aside and no longer holds the view: this node's own head does, though the peer's is
+generations ahead. The mount keeps an inode whose last publication a view lacks, and
+adopts views only forward while a fold is pending; with none coming it walks the
+view whole and logs `fuse_view_behind_adopted`. Writes dropped because their name is
+gone are logged with `fuse_writes_retired_unlinked`.
+
+Built on Dagda 0.3.2 (0.3.1 with `Space::covers`; nothing else changes beneath Macha).
+
 ## 0.95.0: the store is Dagda's
 
 The store cutover. Macha's object store, its repair, availability survey, retention
