@@ -3369,6 +3369,10 @@ struct FuseFrontend::State {
                 namespace_inflight_operations = 0;
             }
             namespace_cv.notify_all();
+            // A deferred adoption that waited behind this batch runs now, not
+            // at the next request.
+            if (deferred_adoption_ready.load(std::memory_order_acquire))
+                refresh_namespace_if_stale();
         }
     }
 

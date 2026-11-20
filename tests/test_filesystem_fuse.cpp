@@ -1147,6 +1147,79 @@ MACHA_TEST("filesystem_fuse", test_a_change_during_a_publication_is_adopted_afte
     }
 }
 
+// A deferred adoption whose re-adoption found the namespace queue busy is not
+// left waiting for an unrelated request: the queue's drain runs it.
+MACHA_TEST("filesystem_fuse", test_a_deferred_adoption_runs_when_the_namespace_queue_drains) {
+    FilesystemNode node("deferred-after-queue");
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+    auto frontend = held_frontend(node, node.fuse("deferred-queue"), false);
+    const std::string path = "/queued-replace.bin";
+    (void)frontend->getattr("/");
+    auto handle = frontend->create(path, 0644, getuid(), getgid(), true, true, false);
+    REQUIRE(wait_until([&] { return !frontend->status().pending_namespace; }, 10s));
+    REQUIRE(wait_until(
+        [&] {
+            (void)frontend->getattr("/");
+            const auto now = frontend->diagnostics();
+            return now.namespace_refreshed_revision == now.namespace_available_revision;
+        },
+        10s));
+    const auto input = pattern(extent, 0x13);
+    REQUIRE(frontend->write(handle.inode, 0, input) == extent);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool committed = false;
+    bool released = false;
+    std::atomic_bool armed{true};
+    frontend->set_publication_committed([&](uint64_t inode) {
+        if (inode != handle.inode || !armed.exchange(false))
+            return;
+        std::unique_lock lock(mutex);
+        committed = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return released; });
+    });
+    std::thread publish([&] { frontend->fsync(handle.inode); });
+    bool held = false;
+    {
+        std::unique_lock lock(mutex);
+        held = cv.wait_for(lock, 10s, [&] { return committed; });
+    }
+    // An adopted replacement inserts a new inode; counted from after the mkdir,
+    // whose own inode is new too.
+    uint64_t baseline = 0;
+    if (held) {
+        // A real replacement, seen while the publication is in flight: deferred.
+        write_file(fs, "/queued-other.bin", pattern(extent / 2, 0x55));
+        fs.rename("/queued-other.bin", path);
+        (void)frontend->getattr("/");
+        CHECK(frontend->inode_for_path(path) == handle.inode);
+        // A namespace operation queued behind a held namespace queue, so the
+        // publication's own re-adoption finds the queue busy.
+        frontend.loader->hold_namespace();
+        frontend->mkdir("/queued-dir", 0755, getuid(), getgid());
+        baseline = frontend->status().inode_count;
+    }
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+    }
+    cv.notify_all();
+    publish.join();
+    frontend->set_publication_committed({});
+    REQUIRE(held);
+    // The publication has finished, its re-adoption found the queue busy, and
+    // no request follows: the queue's drain alone adopts the replacement.
+    std::this_thread::sleep_for(200ms);
+    CHECK(frontend->status().inode_count == baseline);
+    frontend.loader->release_namespace();
+    CHECK(wait_until([&] { return frontend->status().inode_count == baseline + 1; }, 10s));
+    frontend->release(handle.inode, true);
+    frontend->stop();
+}
+
 // A peer's head this node cannot merge is set aside, and the view leaves it
 // for this node's own head, though the peer's is generations ahead.
 MACHA_TEST("filesystem_fuse", test_a_set_aside_head_leaves_the_view) {
