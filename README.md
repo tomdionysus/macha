@@ -162,6 +162,7 @@ start the service ([Linux](docs/install-linux.md) has the details). Uninstall
 | [Architecture](ARCHITECTURE.md) | [Security](SECURITY.md) |
 | [Release notes](CHANGELOG.md) | [Roadmap](ROADMAP.md) |
 | [Validation](VALIDATION.md) | [Contributing](CONTRIBUTING.md) |
+| [Code of conduct](CODE_OF_CONDUCT.md) | |
 
 Developed with substantial use of AI-assisted implementation. If this troubles you
 greatly, there are [many alternatives](https://pinggy.io/blog/best_self_hosted_media_servers).
