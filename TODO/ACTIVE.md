@@ -15,22 +15,22 @@ rehearsals, downtime, the steps, rollback); the port's history
 
 **Do not start the cutover. Nothing touches live-a or live-b without the maintainer's word.**
 
-**The short file is fixed** (`b0b037c`, pushed; [`2026-11-19-short-file.md`](2026-11-19-short-file.md)). The
-mechanism was proven by a deterministic failing test, and the fix follows the maintainer's rulings (2026-11-19, interactive): both
-layers, "never go backwards, and guard FUSE". Suite 547/547 on Dagda 0.3.1.
+Commit hashes in this directory written before 2026-11-20 18:10Z name commits from before the two history rewrites
+of that day; the maintainer's backups hold the maps from old to new.
 
-**0.95.1 is cut** (`2fb804e`, on Dagda 0.3.2 and Dannan 0.9.2, 547/547). The tarball is
-`build/release-0.95.1/macha-0.95.1-arm64.tgz` (sha256 `dd25f12c...6416`). The kit is updated: `build/install-0.95.1.sh`,
-`build/cutover/migrate-0.95.1.sh`, and `build/rehearsal/*` now say 0.95.1.
-
-**Cutover-ready, 2026-11-20 10:40Z: the cutover waits only on the maintainer's word.** Branch `port/dannan-dagda` at `66c7ef4`;
-tarball `build/release-0.95.1/macha-0.95.1-66c7ef4-arm64.tgz` (sha256 `c2041995...4086`). Dagda approved the
-diffs and Macha made the changes (the maintainer: "a Dagda problem; assist Dagda"):
-- `f9a6b51`: the leading race on a file's first publication.
-- `61ab98d`: a deferred adoption runs when the namespace queue drains.
-- `87045d3`: recovered publications start after the first namespace adoption. A recovered write to a file removed
-  while the node was down retires as unlinked.
-- `66c7ef4`: a refresh no request asked for logs a failure and retries; startup no longer refreshes.
+**Prepared for the cutover, 2026-11-20 18:15Z: waiting on the sanitizer gate, then the maintainer's word.** The runbook
+([`2026-11-18-cutover-runbook.md`](2026-11-18-cutover-runbook.md)) names 0.95.1 throughout. The staging kit is
+`build/cutover/stage-0.95.1/`: the tarball every rehearsal ran (sha256 `c2041995...4086`, Dagda 0.3.2, Dannan 0.9.2),
+its sha256, `install-0.95.1.sh` and `migrate-0.95.1.sh`. Later commits change no code. The short file's fixes, Dagda's
+diagnosis and design with Macha's changes:
+- the leading race on a file's first publication;
+- a deferred adoption runs when the namespace queue drains;
+- recovered publications start after the first namespace adoption, and a recovered write to a file removed while the
+  node was down retires as unlinked;
+- a refresh no request asked for logs a failure and retries, and startup no longer refreshes.
+- The sanitizer gate (the maintainer: "Yes do that first"): ASan/UBSan then TSan, with Dannan 0.9.2 and Dagda 0.3.2
+  instrumented (`build/pi/macha_sanitize.sh`), running on build-3. It is for the catalogue SIGSEGV, the burst-rmdir
+  heap corruption and the ingest/torrent crash; a crash in a cutover path is fixed before the cutover.
 - Suite 554/554. Nine fresh single-node rounds clean. R1 to R4 and the two-writer round pass (the runbook's
   "Rehearsals on 0.95.1"), and a 0.95.1 node rode through a power loss with every file intact.
 - Fresh 0.94.2 loads still commit short at times (the known 0.94.2 defect). The migration carries such files

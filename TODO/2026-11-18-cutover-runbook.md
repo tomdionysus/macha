@@ -24,17 +24,16 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 
 | Gate | State |
 |---|---|
-| Dagda release with the fast migration | done: **0.3.1** tagged and pushed 2026-11-19 (the maintainer's word; main `2793458`); gate 1172 ran, 1169 passed, 3 skipped, TSan clean |
-| Macha on that release | done 2026-11-19: `find_package(dagda 0.3.1)`, install guides, `docs/configuration.md` (`idle_bandwidth_fraction` applies only while a higher class is present), CHANGELOG; one test's B held off by `max_bandwidth` (its fraction 0 no longer stops an idle pull) |
-| Deploy tarball | `build/release-0.95.0/macha-0.95.0-arm64.tgz`, sha256 `5673bfc4ad0d44357813107dca2f6c6ce08094d5e87289315f47e09bf7dc0002`, Dagda 0.3.1 (`dagda-migrate --version`: `0.3.1 (dannan 0.9.2)`); the 0.3.0 one is replaced |
-| Small rehearsals | R1 to R4 and the two-writer round pass on 0.95.1 at 66c7ef4, 2026-11-20 (below) |
-| The short file | open: [`2026-11-19-short-file.md`](2026-11-19-short-file.md); in 0.94.2 and 0.95.0's FUSE frontend, not the migration; whether it gates the cutover is the maintainer's call |
-| Macha suite | 545/545 on build-3 on Dannan 0.9.2 and Dagda 0.3.1 (2026-11-19 19:42Z) |
-| Migration script vs Dagda 0.3.1 `docs/migration.md` | read 2026-11-19: flags, `--resume`, rerun-to-finish, compare and `RESULT: PASS` all match; no change |
-| Dannan | 0.9.2 tag |
-| Install script | `build/install-0.95.0.sh` (written, never run; read it before the first use) |
-| Migration script | `build/cutover/migrate-0.95.0.sh` (ran its first step once; updated to three passes; check its flags against Dagda's `docs/migration.md` at the tag) |
-| API announcement | none: 0.95.0 sends 0.94.2's API |
+| Dagda | **0.3.2** (tag), Dannan **0.9.2** (tag) |
+| Macha | **0.95.1**, port/dannan-dagda; the deployed code is the short-file fix line's last commit (it was `66c7ef4` before the 2026-11-20 history rewrites); later commits change no code |
+| Deploy tarball | `build/release-0.95.1/macha-0.95.1-66c7ef4-arm64.tgz`, sha256 `c2041995386c483546dd423fee2a71c803e039a16021e065dde04cca9f474086` (Dagda 0.3.2, Dannan 0.9.2); the one every rehearsal below ran |
+| Small rehearsals | R1 to R4 and the two-writer round pass on that tarball, 2026-11-20 (below) |
+| The short file | fixed in 0.95.1 ([`2026-11-19-short-file.md`](2026-11-19-short-file.md)); 0.94.2 still commits short at times, and the migration carries such files unchanged |
+| Macha suite | 554/554 on build-3 on Dannan 0.9.2 and Dagda 0.3.2 (2026-11-20) |
+| Sanitizer gate | **open**: ASan/UBSan then TSan, Macha and instrumented Dannan and Dagda (`build/pi/macha_sanitize.sh`), asked for by the maintainer before the word; running 2026-11-20 |
+| Install script | `build/install-0.95.1.sh` (run in R1 to R4 through `build/rehearsal/cutover-node.sh`) |
+| Migration script | `build/cutover/migrate-0.95.1.sh` (run in R1 to R4, kills and resumes in R2) |
+| API announcement | none: 0.95.1 sends 0.94.2's API |
 | 0.94.2 baselines | `build/baselines/results-0.94.2`; compared after each node is on 0.95.1 |
 | The maintainer's word | the start |
 
@@ -174,19 +173,19 @@ an idle node's repair uses the whole link (documented in `docs/configuration.md`
 while live-b serves 0.94.2; then live-b is stopped and disabled (step 2 on live-b) just before live-a's step 7;
 live-a's 7 to 9; then D, live-b's steps 3 to 9.
 
-`T=/root/stage-0.95.0/root/usr/local` on each node. `M` is
+`T=/root/stage-0.95.1/root/usr/local` on each node. `M` is
 `systemd-run --wait --pipe -p LoadCredentialEncrypted=dannan-root:/etc/credstore.encrypted/dannan-root
 --setenv=LD_LIBRARY_PATH=$T/lib $T/bin/dagda-migrate --state /var/lib/macha --node-state /var/lib/macha --cluster-key
 /etc/macha/cluster.key --credential dannan-root --backend /mnt/diskB/data --control /var/lib/macha/metadata-objects
 --cache /var/cache/macha` (no `--credentials-dir`, no `--heads`: the metadata stays Macha's; `--wait` passes the exit
-code through). Step 6 runs detached as a systemd unit by `build/cutover/migrate-0.95.0.sh`, which logs each pass's
-start, end and exit code to `/root/migrate-0.95.0/run.log` and its state to `/root/migrate-0.95.0/status`. Each step
+code through). Step 6 runs detached as a systemd unit by `build/cutover/migrate-0.95.1.sh`, which logs each pass's
+start, end and exit code to `/root/migrate-0.95.1/run.log` and its state to `/root/migrate-0.95.1/status`. Each step
 names its check; a failed check stops there and is reported before anything else runs.
 
 **A. Both nodes, while still serving:**
-1. **Stage**: remove the old `/root/stage-0.95.0/`, `/root/backup-0.95.0/`, `/root/migrate-0.95.0/`; the new tarball
-   and its sha256 to `/root/stage-0.95.0/`; `sha256sum -c`; extract to `/root/stage-0.95.0/root/` (not `/`); the
-   install and migrate scripts beside it. Check: `LD_LIBRARY_PATH=$T/lib $T/bin/dagda-migrate --version` names the
+1. **Stage**: remove the old `/root/stage-0.95.0/`, `/root/backup-0.95.0/`, `/root/migrate-0.95.0/`; the kit
+   `build/cutover/stage-0.95.1/` (the tarball, its sha256, the install and migrate scripts) to `/root/stage-0.95.1/`;
+   `sha256sum -c`; extract to `/root/stage-0.95.1/root/` (not `/`). Check: `LD_LIBRARY_PATH=$T/lib $T/bin/dagda-migrate --version` names the
    release (on dannan 0.9.2).
 
 **B. Stop live-a (live-b keeps serving 0.94.2):**
@@ -194,7 +193,7 @@ names its check; a failed check stops there and is reported before anything else
    `is-enabled` `disabled`. The same on live-b just before live-a's step 7, once live-a's step 6 has passed.
 
 **C. live-a (then D, live-b, the same steps 3 to 9 once live-a serves):**
-3. **Back up on the node**: `/var/lib/macha` and `/etc/macha` to `/root/backup-0.95.0/` (one tarball and its sha256;
+3. **Back up on the node**: `/var/lib/macha` and `/etc/macha` to `/root/backup-0.95.1/` (one tarball and its sha256;
    5 minutes on live-a). Check: `sha256sum -c`.
 4. **Check the transport files**: `LD_LIBRARY_PATH=$T/lib $T/bin/dannan-import-macha --dry-run /var/lib/macha`.
    Expect "already" or "absent" for all three. Any "imported": stop and send it to Dannan.
@@ -205,15 +204,16 @@ names its check; a failed check stops there and is reported before anything else
    dannan-root | systemd-creds encrypt --name=dannan-root - /etc/credstore.encrypted/dannan-root` (never pipe init's
    output anywhere else; refuse if `/var/lib/macha/identity/custody` exists), `chmod 600` the sealed file, then the
    same `show`; then the three files (`/etc/credstore.encrypted/dannan-root`, `/var/lib/systemd/credential.secret`,
-   `/var/lib/macha/identity/custody`) copied to `/root/custody-0.95.0/` (700, files 600) and compared.
-6. **Migrate**, node stopped throughout, manifests in `/root/migrate-0.95.0/`:
-   - `M --write-manifest /root/migrate-0.95.0/before`. Check: exit 0; its rate in the first hour near 125 MiB/s, or
+   `/var/lib/macha/identity/custody`) copied to `/root/custody-0.95.1/` (700, files 600) and compared. live-a's
+   copies are already in `/root/custody-0.95.0/` from 2026-11-19.
+6. **Migrate**, node stopped throughout, manifests in `/root/migrate-0.95.1/`:
+   - `M --write-manifest /root/migrate-0.95.1/before`. Check: exit 0; its rate in the first hour near 125 MiB/s, or
      stop and report (nothing has been written).
    - `M` (headers only). Check: exit 0.
-   - `M --write-manifest /root/migrate-0.95.0/after`. Check: exit 0.
+   - `M --write-manifest /root/migrate-0.95.1/after`. Check: exit 0.
    - `dagda-migrate --compare-before .../before --compare-after .../after`. Check: exit 0 and `RESULT: PASS`.
-7. **Install and start**: `TARBALL=/root/stage-0.95.0/<tarball> HEALTH=<api>/api/v1/health bash
-   /root/stage-0.95.0/install-0.95.0.sh`. It refuses a running node or missing custody, proves the seal, installs,
+7. **Install and start**: `TARBALL=/root/stage-0.95.1/macha-0.95.1-arm64.tgz HEALTH=<api>/api/v1/health bash
+   /root/stage-0.95.1/install-0.95.1.sh`. It refuses a running node or missing custody, proves the seal, installs,
    adds the unit drop-in and the `custody` key, starts, and waits up to 300 s for health as the new version; a node
    that fails is left stopped (see Rollback).
 8. **Prove it serves**: health ok as the new version; Status's store figures match the disk; `startup.phase` ready; a
@@ -229,16 +229,16 @@ names its check; a failed check stops there and is reported before anything else
   namespace (every referenced object present in the inventory, nothing live in the garbage); only then
   `maintenance.collect_garbage: true`, on the maintainer's word.
 - On the maintainer's word: tag Macha, merge to develop and main, push; Dagda's and Dannan's pushes are theirs.
-- Once both have run cleanly for as long as the maintainer wants: remove `/root/backup-0.95.0/`, `/root/migrate-0.95.0/`,
-  `/root/stage-0.95.0/`, `/root/phys/`. `/root/custody-0.95.0/` stays.
+- Once both have run cleanly for as long as the maintainer wants: remove `/root/backup-0.95.1/`, `/root/migrate-0.95.1/`,
+  `/root/stage-0.95.1/`, `/root/pre-0.95.1/`, `/root/phys/`. The custody copies stay.
 
 ## Rollback (per node)
 
 - **Before the migration pass ran** (a manifest pass writes nothing to the disk): `systemctl enable --now macha`
   starts 0.94.2. Custody stays; 0.94.2 ignores it. Done once, 2026-11-19.
 - **After the migration pass started, before or after step 7**: stop the node; `M --reverse` returns the disk to v18
-  (finished by rerunning after a crash); restore `/root/pre-0.95.0/` (0.94.2's binaries, unit and `macha.yaml`, saved
-  by the install script) if step 7 ran; `systemctl enable --now macha`. `/root/backup-0.95.0/` restores
+  (finished by rerunning after a crash); restore `/root/pre-0.95.1/` (0.94.2's binaries, unit and `macha.yaml`, saved
+  by the install script) if step 7 ran; `systemctl enable --now macha`. `/root/backup-0.95.1/` restores
   `/var/lib/macha` and `/etc/macha` if the state itself is in doubt.
 - **If live-a must go back after live-b started its migration**, live-b goes back too or both finish forward:
   never one of each serving.
