@@ -813,6 +813,10 @@ struct FuseFrontend::State {
     // by the same rules, once a publication on one of them has finished.
     std::set<std::string, std::less<>> deferred_adoptions MACHA_GUARDED_BY(namespace_mutex);
     std::atomic_bool deferred_adoption_ready{false};
+    // Recovered publications start after the first adoption since start, so it
+    // judges each recovered inode against the view before any of them runs.
+    std::atomic_bool recovered_data_waits{false};
+    std::atomic_bool recovered_data_wait_logged{false};
     std::atomic_bool namespace_view_diverged{true};
     // Last revision whose deferred adoption was logged; logs once per view.
     std::atomic_uint64_t namespace_refresh_deferred_logged_revision{};
@@ -3092,15 +3096,33 @@ struct FuseFrontend::State {
     }
 
     void namespace_loop(const std::stop_token& stop) {
+        // While recovered publications wait for the first adoption and no
+        // namespace work ends in a refresh, the refresh is tried on a backoff.
+        auto first_adoption_retry = std::chrono::milliseconds(100);
         while (!stop.stop_requested() && !stopping.load()) {
             std::vector<NamespaceOp> batch;
             {
                 Lock lock(namespace_queue_mutex);
-                namespace_cv.wait(lock.native(), stop, [&]() MACHA_REQUIRES(namespace_queue_mutex) {
+                const auto ready = [&]() MACHA_REQUIRES(namespace_queue_mutex) {
                     return !namespace_queue.empty() || stopping.load();
-                });
+                };
+                bool retry_first_adoption = false;
+                if (recovered_data_waits.load(std::memory_order_acquire)) {
+                    if (!namespace_cv.wait_for(lock.native(), stop, first_adoption_retry, ready)) {
+                        first_adoption_retry =
+                            std::min(first_adoption_retry * 2, std::chrono::milliseconds(5000));
+                        retry_first_adoption = true;
+                    }
+                } else {
+                    namespace_cv.wait(lock.native(), stop, ready);
+                }
                 if (stop.stop_requested() || stopping.load())
                     break;
+                if (retry_first_adoption) {
+                    lock.unlock();
+                    refresh_namespace_if_stale();
+                    continue;
+                }
                 batch.push_back(namespace_queue.front());
                 namespace_queue.pop_front();
                 size_t encoded_bytes = encoded_namespace_op_size(batch.front());
@@ -3371,7 +3393,8 @@ struct FuseFrontend::State {
             namespace_cv.notify_all();
             // A deferred adoption that waited behind this batch runs now, not
             // at the next request.
-            if (deferred_adoption_ready.load(std::memory_order_acquire))
+            if (deferred_adoption_ready.load(std::memory_order_acquire) ||
+                recovered_data_waits.load(std::memory_order_acquire))
                 refresh_namespace_if_stale();
         }
     }
@@ -5053,7 +5076,8 @@ struct FuseFrontend::State {
         const auto current_revision = refreshed_namespace_revision.load(std::memory_order_acquire);
         const bool pending_confirmation = have_unconfirmed_namespace();
         const auto available_revision = fs.available_namespace_revision();
-        const bool revisit = deferred_adoption_ready.load(std::memory_order_acquire);
+        const bool revisit = deferred_adoption_ready.load(std::memory_order_acquire) ||
+                             recovered_data_waits.load(std::memory_order_acquire);
         if (available_revision <= current_revision && !pending_confirmation && !revisit)
             return;
 
@@ -5319,6 +5343,12 @@ struct FuseFrontend::State {
             confirm_data_from_snapshot(snapshot);
         for (auto id : detached)
             reclaim_inode_if_quiescent(id);
+        if (recovered_data_waits.exchange(false, std::memory_order_acq_rel)) {
+            if (recovered_data_wait_logged.load(std::memory_order_acquire))
+                Log::info("FUSE recovered publications resume after the first namespace adoption "
+                          "code=fuse_recovered_data_resumed");
+            resume_recovered_data();
+        }
         if (Log::enabled(LogLevel::debug))
             Log::debug(
                 "FUSE namespace adopted revision=" + std::to_string(view.namespace_revision) +
@@ -5373,9 +5403,15 @@ struct FuseFrontend::State {
         }
 
         // Recovered state is complete before workers start; publication
-        // resumes once they all run.
-        resume_recovered_data();
+        // resumes after the first adoption, which this starts.
+        recovered_data_waits.store(true, std::memory_order_release);
         namespace_cv.notify_all();
+        refresh_namespace_if_stale();
+        if (recovered_data_waits.load(std::memory_order_acquire)) {
+            recovered_data_wait_logged.store(true, std::memory_order_release);
+            Log::info("FUSE recovered publications wait for the first namespace adoption "
+                      "code=fuse_recovered_data_waiting");
+        }
     }
 
     void interrupt_waits() {

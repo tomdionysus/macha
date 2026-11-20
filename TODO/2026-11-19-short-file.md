@@ -3,6 +3,24 @@
 **Open. Mechanism proven 2026-11-19 22:53Z by a deterministic failing test. Present on 0.94.2 (live) and 0.95.0.**
 Nothing is fixed; the maintainer decides the fix ("Report findings before fixing").
 
+## f9a6b51 regressed journal recovery (found 2026-11-20 04:45Z; fixed 06:00Z, Dagda's option 3)
+
+`test_fuse_namespace_journal_recovery`, batch-identity block, failed 4 of 8 with the `data_running` deferral.
+- Proven without changing timing: the deferral fired for `film.mkv` with `recovered=yes`, base 0, visible 0, view
+  32 KiB; getattr answered 0. The zero sizes were that block's own state; recovery rebuilds visible correctly
+  (`test_a_recovered_file_reads_its_size_before_it_publishes`).
+- Fix: recovered publications start after the first adoption since start. The namespace loop retries it on a
+  100 ms to 5 s backoff while they wait. INFO `fuse_recovered_data_waiting` / `fuse_recovered_data_resumed`.
+- Safe because recovered unpublished namespace ops are queued before the first refresh, which defers on a busy
+  queue or unconfirmed ops (`test_a_recovered_unpublished_create_is_not_dropped`).
+- A recovered write to a file removed while the node was down now retires as unlinked, not abandoned or a backend
+  failure; two cases assert that. 8/8 recovery runs, suite 553/553.
+- The drain trigger is committed separately (61ab98d).
+
+In the same suite run, `test_removing_empty_directories_in_a_burst_keeps_the_node_up` crashed once ("corrupted
+double-linked list") and passed twice alone. That fits the parked FUSE rm crash and heap corruption; P0 under the
+no-flake rule, to chase.
+
 ## The second door, fixed (2026-11-20 04:00Z; Dagda's diagnosis and design, Macha's change)
 
 The f18 and f0 histories show one mechanism: the **leading race on the file's first publication**.
