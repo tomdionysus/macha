@@ -17,9 +17,10 @@ namespace macha {
 // Where the node's RPC server sends each inbound request: one handler per
 // message type, bound by whoever constructs the part that answers it and
 // unbound before that part is destroyed. unbind() waits for calls in flight,
-// so no call reaches a destroyed part. A request whose type is unbound, or
-// whose handler throws, gets an error reply. Thread-safe; a handler runs under
-// the route lock and must not bind or unbind.
+// so no call reaches a destroyed part. A stopping node closes them before it
+// stops anything a handler reaches. A request whose type is unbound, or whose
+// handler throws, gets an error reply. Thread-safe; a handler runs under the
+// route lock and must not bind, unbind or close.
 class MessageRoutes {
   public:
     using Handler =
@@ -34,9 +35,17 @@ class MessageRoutes {
         WriteLock lock(mutex_);
         handlers_.erase(type);
     }
+    // Refuses every request from here (503 node_stopping, which a peer asks
+    // again later) and waits for calls in flight.
+    void close() {
+        WriteLock lock(mutex_);
+        closed_ = true;
+    }
     RpcMessage dispatch(const NodeInfo& peer, FrameType frame_type,
                         const RpcMessage& request) const {
         ReadLock lock(mutex_);
+        if (closed_)
+            return error_reply(503, "node_stopping", "this node is stopping");
         const auto found = handlers_.find(request.type);
         if (found == handlers_.end() || !found->second)
             return error_reply(501, "not_implemented",
@@ -53,6 +62,7 @@ class MessageRoutes {
     // Held shared across each handler call, which may do any I/O.
     mutable IoSharedMutex mutex_;
     std::map<MessageType, Handler> handlers_ MACHA_GUARDED_BY(mutex_);
+    bool closed_ MACHA_GUARDED_BY(mutex_){};
 };
 
 } // namespace macha

@@ -15,8 +15,10 @@
 #include <dannan/identity/key_custody.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <fstream>
 #include <mutex>
+#include <thread>
 
 using namespace macha;
 using namespace macha::test_support;
@@ -91,6 +93,55 @@ MACHA_TEST("dannan_host", test_custody_from_the_named_credential) {
     config.state_path = dir.path() / "none";
     config.port = free_port();
     REQUIRE(!dannan_node_config(config, dannan::identity::load_cluster_key(key)).custody);
+}
+
+// A stopping node closes its routes before it stops what they reach: close() waits for a
+// call in flight, and every request after it is refused 503 node_stopping, which a peer
+// asks again later, without reaching a handler.
+MACHA_TEST("dannan_host", test_closed_routes_refuse_and_wait_for_calls_in_flight) {
+    MessageRoutes routes;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool released = false;
+    std::atomic_int calls{0};
+    routes.bind(MessageType::get_metadata, [&](const NodeInfo&, FrameType, const RpcMessage&) {
+        ++calls;
+        std::unique_lock lock(mutex);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return released; });
+        return RpcMessage{MessageType::get_metadata, {}};
+    });
+    const RpcMessage request{MessageType::get_metadata, {}};
+
+    std::thread call([&] { (void)routes.dispatch(NodeInfo{}, FrameType::control, request); });
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE(cv.wait_for(lock, 10s, [&] { return entered; }));
+    }
+    std::atomic_bool closed{false};
+    std::thread closer([&] {
+        routes.close();
+        closed = true;
+    });
+    std::this_thread::sleep_for(200ms);
+    CHECK(!closed);
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+    }
+    cv.notify_all();
+    call.join();
+    closer.join();
+    CHECK(closed);
+
+    const auto refusal = rpc_refusal(routes.dispatch(NodeInfo{}, FrameType::control, request));
+    REQUIRE(refusal.has_value());
+    CHECK(refusal->status == 503);
+    CHECK(refusal->code == "node_stopping");
+    CHECK(rpc_try_later(*refusal));
+    CHECK(calls == 1);
 }
 
 MACHA_TEST("dannan_host", test_a_call_reaches_the_peers_route_and_answers) {

@@ -668,6 +668,11 @@ void Service::stop() {
         }
         startup_.join();
     }
+    // Peers' requests reach the services and the store through the routes,
+    // which stay bound until their owners are destroyed: closed here, before
+    // anything a handler reaches stops.
+    note_lifecycle("close routes");
+    routes_.close();
     // The HTTP server routes requests into the services, so it stops before
     // them; Status reads them only through providers, detached first, and
     // stays until the node goes.
