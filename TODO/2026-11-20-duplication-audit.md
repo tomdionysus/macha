@@ -1,6 +1,6 @@
 # Macha: the stack duplication audit (2026-11-20)
 
-The maintainer, relayed by the coordinating session, who correlates the eight reports: "Any functionality that is required by two
+The maintainer, relayed by the coordinating session, which correlates the eight reports: "Any functionality that is required by two
 or more projects that share a project dependency, that functionality goes into the shared dependency." Read-only; **nothing
 moves until the maintainer decides.** Read on `port/dannan-dagda` at `92c7d3d` against Dannan 0.9.2 (tag; its tree is on
 `feature/advert-push`), Dagda 0.3.2 (and its develop, 13 past the tag), Lugh, Louhi, Kvasir, Mimir; Lir has no code
