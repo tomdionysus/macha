@@ -81,8 +81,8 @@ thread-safe `errno_text`.
 
 The transport cutover. Every node runs Dannan 0.5.3's node beneath Macha: its
 transport, roster, telemetry, public connectivity and inbound answer, with Macha's
-message types on its routes (Macha's types numbered from 512). Nodes on 0.93 and on
-0.94 cannot talk to each other, so every node changes together. Before the first
+message types on its routes (Macha's types numbered from 512). Nodes before 0.94.0 and
+nodes on 0.94.0 or later cannot talk to each other, so every node changes together. Before the first
 start, `dannan-import-macha <state>` converts the roster, the inbound answer and the
 last-known telemetry, keeping each original as `<name>.macha`; restoring those and
 reinstalling 0.93.6 is the rollback. A node hosts extents while it carries the
