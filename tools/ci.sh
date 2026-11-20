@@ -4,8 +4,9 @@
 # The merge gate: format and SPDX checks, the release build with every test
 # binary, clang-tidy over the sources, the ASan and UBSan build with the same
 # tests, and the coverage build with its report (coverage/coverage.info in
-# build-coverage). Dannan must be installed where CMake finds it, or named by
-# CMAKE_PREFIX_PATH.
+# build-coverage). Dannan and Dagda must be installed where CMake finds them,
+# or named by CMAKE_PREFIX_PATH. The ASan build compiles both again from source,
+# instrumented: MACHA_DANNAN_SRC and MACHA_DAGDA_SRC name their source trees.
 #
 #   tools/ci.sh                  run here
 #   tools/ci.sh --remote HOST    copy this working tree to HOST over SSH and
@@ -57,7 +58,7 @@ if [ -n "$remote" ]; then
         rsync -a --no-owner --no-group --from0 --files-from=- ./ "$remote:$dest/"
     rsync -a --no-owner --no-group .git/ "$remote:$dest/.git/"
     exec ssh -o BatchMode=yes "$remote" \
-        "cd $dest && git update-index -q --refresh >/dev/null 2>&1; CMAKE_PREFIX_PATH='${CMAKE_PREFIX_PATH:-}' sh tools/ci.sh --local"
+        "cd $dest && git update-index -q --refresh >/dev/null 2>&1; CMAKE_PREFIX_PATH='${CMAKE_PREFIX_PATH:-}' MACHA_DANNAN_SRC='${MACHA_DANNAN_SRC:-}' MACHA_DAGDA_SRC='${MACHA_DAGDA_SRC:-}' sh tools/ci.sh --local"
 fi
 
 jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
@@ -84,9 +85,36 @@ else
 fi
 
 step "ASan and UBSan build and tests"
-cmake --preset asan >/dev/null
+# Dannan and Dagda are built from source with the same flags into their own
+# prefixes: a sanitizer build never links a plain-built library.
+[ -n "${MACHA_DANNAN_SRC:-}" ] && [ -n "${MACHA_DAGDA_SRC:-}" ] || {
+    echo "ci: MACHA_DANNAN_SRC and MACHA_DAGDA_SRC must name Dannan's and Dagda's source trees" >&2
+    exit 1
+}
+san_flags="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+deps="$top/build-asan-deps"
+san_lib() {
+    src=$1 prefix=$2
+    shift 2
+    cmake -S "$src" -B "$prefix-build" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_C_FLAGS="$san_flags" -DCMAKE_CXX_FLAGS="$san_flags" \
+        -DCMAKE_EXE_LINKER_FLAGS="$san_flags" -DCMAKE_SHARED_LINKER_FLAGS="$san_flags" \
+        -DCMAKE_INSTALL_PREFIX="$prefix" "$@" >/dev/null
+    cmake --build "$prefix-build" -j "$jobs"
+    cmake --install "$prefix-build" >/dev/null
+}
+san_lib "$MACHA_DANNAN_SRC" "$deps/dannan" -DDANNAN_BUILD_TESTING=OFF
+san_lib "$MACHA_DAGDA_SRC" "$deps/dagda" -DDAGDA_BUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$deps/dannan"
+for so in "$deps/dannan/lib/libdannan.so" "$deps/dagda/lib/libdagda.so"; do
+    n=$(nm -D "$so" | grep -c __asan_ || true)
+    echo "$(basename "$so"): $n __asan_ symbols"
+    [ "$n" -gt 0 ] || { echo "ci: $so is not instrumented" >&2; exit 1; }
+done
+cmake --preset asan -U dannan_DIR -U dagda_DIR -DCMAKE_PREFIX_PATH="$deps/dannan;$deps/dagda" >/dev/null
 cmake --build --preset asan -j "$jobs"
-ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+ldd build-asan/macha-tests | grep -E "libdannan|libdagda"
+LD_LIBRARY_PATH="$deps/dannan/lib:$deps/dagda/lib" \
+    ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
     sh run-tests.sh build-asan --jobs "$jobs"
 
 step "coverage"
