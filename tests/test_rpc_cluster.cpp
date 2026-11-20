@@ -466,7 +466,10 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
         while (!go.load(std::memory_order_acquire))
             std::this_thread::yield();
         try {
-            s1.filesystem().mkdir("/from-node-1", 0755, getuid(), getgid());
+            // A forming set refuses with MetadataNotReady; callers retry it.
+            if (!retry_while_not_ready(
+                    [&] { s1.filesystem().mkdir("/from-node-1", 0755, getuid(), getgid()); }))
+                throw std::runtime_error("node 1's first write never left formation");
         } catch (...) {
             first_error = std::current_exception();
         }
@@ -476,7 +479,9 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
         while (!go.load(std::memory_order_acquire))
             std::this_thread::yield();
         try {
-            s2.filesystem().mkdir("/from-node-2", 0755, getuid(), getgid());
+            if (!retry_while_not_ready(
+                    [&] { s2.filesystem().mkdir("/from-node-2", 0755, getuid(), getgid()); }))
+                throw std::runtime_error("node 2's first write never left formation");
         } catch (...) {
             second_error = std::current_exception();
         }
