@@ -23,17 +23,20 @@ layers, "never go backwards, and guard FUSE". Suite 547/547 on Dagda 0.3.1.
 `build/release-0.95.1/macha-0.95.1-arm64.tgz` (sha256 `dd25f12c...6416`). The kit is updated: `build/install-0.95.1.sh`,
 `build/cutover/migrate-0.95.1.sh`, and `build/rehearsal/*` now say 0.95.1.
 
-**Rehearsals paused (2026-11-20 01:10Z).** R1's fresh single 0.94.2 node on build-3 committed `r1/big/f0.bin` short,
-with no peer (see the short-file note). **The maintainer: "this is a Dagda problem. Assist Dagda to diagnose and fix it."**
-- Dagda leads; Macha assists with builds and runs. R1's evidence is in `build/evidence/r1-0942.tgz` (sha256
-  `5285baeb...5233`: state, journal, sums, listing, FUSE journal, yaml, rehearsal key). The node itself was cleaned
-  under the maintainer's rule "You may NOT hold cluster cores idle for any reason. Copy evidence off if needed."
-- f0's history (2a): created at gen 4, published once at gen 7 with 23 of its 24 extents, never again. This matches
-  the stale-snapshot detach.
-- **0.95.1 also commits short** (round 8 of the measurement, `f18.bin`, 2026-11-20 01:55Z; the retire line
-  fired). A second way in, probably the reverse race: the view holds the inode's next commit before its base does.
-  The evidence is in `build/evidence/r8-0951.tgz`, and Dagda has it. 0.95.1 is not cutover-ready.
-- The rehearsals R1 to R4 and the two-writer round restart when Dagda's fix lands; the cutover is on the maintainer's word.
+**Cutover-ready, 2026-11-20 10:40Z: the cutover waits only on the maintainer's word.** Branch `port/dannan-dagda` at `66c7ef4`;
+tarball `build/release-0.95.1/macha-0.95.1-66c7ef4-arm64.tgz` (sha256 `c2041995...4086`). Dagda approved the
+diffs and Macha made the changes (the maintainer: "a Dagda problem; assist Dagda"):
+- `f9a6b51`: the leading race on a file's first publication.
+- `61ab98d`: a deferred adoption runs when the namespace queue drains.
+- `87045d3`: recovered publications start after the first namespace adoption. A recovered write to a file removed
+  while the node was down retires as unlinked.
+- `66c7ef4`: a refresh no request asked for logs a failure and retries; startup no longer refreshes.
+- Suite 554/554. Nine fresh single-node rounds clean. R1 to R4 and the two-writer round pass (the runbook's
+  "Rehearsals on 0.95.1"), and a 0.95.1 node rode through a power loss with every file intact.
+- Fresh 0.94.2 loads still commit short at times (the known 0.94.2 defect). The migration carries such files
+  unchanged.
+- The rehearsal kit installs from a manifest and cleans only what it installed (`build/rehearsal/manifest.sh`). The
+  old snapshot-diff clean deleted other sessions' installs on the shared Pis.
 
 **GitHub CI (the maintainer 2026-11-20: "If you have public github repos, fix and maintain github CI"):**
 - `main` is green at 0.94.2.

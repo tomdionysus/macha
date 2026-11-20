@@ -27,7 +27,7 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 | Dagda release with the fast migration | done: **0.3.1** tagged and pushed 2026-11-19 (the maintainer's word; main `2793458`); gate 1172 ran, 1169 passed, 3 skipped, TSan clean |
 | Macha on that release | done 2026-11-19: `find_package(dagda 0.3.1)`, install guides, `docs/configuration.md` (`idle_bandwidth_fraction` applies only while a higher class is present), CHANGELOG; one test's B held off by `max_bandwidth` (its fraction 0 no longer stops an idle pull) |
 | Deploy tarball | `build/release-0.95.0/macha-0.95.0-arm64.tgz`, sha256 `5673bfc4ad0d44357813107dca2f6c6ce08094d5e87289315f47e09bf7dc0002`, Dagda 0.3.1 (`dagda-migrate --version`: `0.3.1 (dannan 0.9.2)`); the 0.3.0 one is replaced |
-| Small rehearsals | R1 to R4 pass, 2026-11-19 (below) |
+| Small rehearsals | R1 to R4 and the two-writer round pass on 0.95.1 at 66c7ef4, 2026-11-20 (below) |
 | The short file | open: [`2026-11-19-short-file.md`](2026-11-19-short-file.md); in 0.94.2 and 0.95.0's FUSE frontend, not the migration; whether it gates the cutover is the maintainer's call |
 | Macha suite | 545/545 on build-3 on Dannan 0.9.2 and Dagda 0.3.1 (2026-11-19 19:42Z) |
 | Migration script vs Dagda 0.3.1 `docs/migration.md` | read 2026-11-19: flags, `--resume`, rerun-to-finish, compare and `RESULT: PASS` all match; no change |
@@ -37,6 +37,36 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 | API announcement | none: 0.95.0 sends 0.94.2's API |
 | 0.94.2 baselines | `build/baselines/results-0.94.2`; compared after each node is on 0.95.x |
 | The maintainer's word | the start |
+
+## Rehearsals on 0.95.1 at 66c7ef4, 2026-11-20 (all pass)
+
+Tarball sha256 `c2041995386c483546dd423fee2a71c803e039a16021e065dde04cca9f474086` (Dannan 0.9.2, Dagda 0.3.2). Logs in
+`build/evidence/rehearsals-66c7ef4/`.
+- Nine fresh single-node rounds of the R1 load (build-4): 18 of 18 checks match, at once and after 180 s; no
+  `fuse_writes_retired_unlinked`.
+- R1 (build-4, 3,620 files): `RESULT: PASS`. Every file reads back on 0.95.1, and a new write reads back.
+- R2, kills (build-4, 5,040 files):
+  - killed in the before manifest, then resumed;
+  - killed 0.5 s into the migration: 0.94.2 then refused the disk ("incompatible Macha storage layout"), and a rerun
+    finished it;
+  - killed in the after manifest, then resumed;
+  - `RESULT: PASS`. 0.95.1 reads back exactly what 0.94.2 stored.
+  - The fresh 0.94.2 load itself committed `r2/big/f9.bin` short (98,304,000 of 100,663,296 bytes). That is the known
+    0.94.2 defect, carried faithfully: the live nodes may hold such files, and the cutover keeps them as they are.
+- R3, rollback after a 404-file write on 0.95.1: reverse in 4 s, 0 unreadable. 0.94.2 is healthy and reads back all
+  5,040 plus the 404.
+- R4, two nodes in the runbook's order (build-1 as live-a, build-2 as live-b):
+  - the 0.94.2 pair converged, with r4x and r4a read back on both;
+  - A was migrated (`RESULT: PASS`) while B served alone and took r4b;
+  - A came up alone on 0.95.1 and read back what it held;
+  - B's steps passed (`RESULT: PASS`);
+  - r4b reached A, and all three sets read back on both.
+  The first attempt, with build-4 as B, stopped when build-4 lost power mid-load. It was rerun on build-2.
+- Two writers (build-3 and build-1, fresh 0.95.1 pair): 502 files written into each mount at once. Both sets read back
+  on both nodes, at once and after a 193 s settle. No retired writes and no failed refreshes.
+- A crash ridden through: build-1 lost power about two minutes after 1,008 files were written into its 0.95.1 mount,
+  during the first two-writer attempt. On restart the node came back by itself, recovery found nothing pending, and all
+  4,334 files it held read back.
 
 ## Small rehearsals: R1 to R4 run 2026-11-19 (the maintainer chose the full set)
 
