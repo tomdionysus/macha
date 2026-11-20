@@ -2876,6 +2876,124 @@ MACHA_TEST("filesystem_fuse", test_a_recovered_unpublished_create_is_not_dropped
         CHECK(message.find("fuse_writes_retired_unlinked") == std::string::npos);
 }
 
+// A refresh no request asked for fails once: at a publication's completion,
+// and at the namespace batch that precedes a restart's first adoption. Each
+// failure is logged with its code, the work it was for stays pending, and it
+// completes when the refresh next succeeds.
+MACHA_TEST("filesystem_fuse", test_a_failed_refresh_off_a_request_retries) {
+    FilesystemNode node("background-refresh");
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+    auto logger = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+    Log::set_logger(logger);
+    const auto test_thread = std::this_thread::get_id();
+    const auto throw_once_off_test_thread = [test_thread](std::atomic_bool& armed) {
+        return [&armed, test_thread] {
+            if (std::this_thread::get_id() != test_thread && armed.exchange(false))
+                throw FsError(EIO, "injected refresh failure");
+        };
+    };
+    const auto failures = [&] {
+        size_t count = 0;
+        for (const auto& [level, message] : logger->records())
+            count += message.find("fuse_background_refresh_failed") != std::string::npos;
+        return count;
+    };
+
+    // The completion's re-adoption of a path deferred behind its publication.
+    {
+        auto frontend = node.frontend(node.fuse("completion"));
+        (void)frontend->getattr("/");
+        auto handle =
+            frontend->create("/completion.bin", 0644, getuid(), getgid(), true, true, false);
+        REQUIRE(wait_until([&] { return !frontend->status().pending_namespace; }, 10s));
+        const auto input = pattern(3 * extent, 0x21);
+        const std::span<const uint8_t> bytes(input);
+        REQUIRE(frontend->write(handle.inode, 0, bytes.first(extent)) == extent);
+        frontend->fsync(handle.inode);
+        REQUIRE(frontend->write(handle.inode, extent, bytes.subspan(extent, extent)) == extent);
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool committed = false;
+        bool released = false;
+        std::atomic_bool held_armed{true};
+        frontend->set_publication_committed([&](uint64_t inode) {
+            if (inode != handle.inode || !held_armed.exchange(false))
+                return;
+            std::unique_lock lock(mutex);
+            committed = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return released; });
+        });
+        std::thread publish([&] { frontend->fsync(handle.inode); });
+        bool held = false;
+        {
+            std::unique_lock lock(mutex);
+            held = cv.wait_for(lock, 10s, [&] { return committed; });
+        }
+        // Adopted while the publication runs: the path is deferred to it.
+        std::atomic_bool refresh_armed{true};
+        if (held) {
+            (void)frontend->getattr("/");
+            CHECK(frontend->write(handle.inode, 2 * extent, bytes.subspan(2 * extent)) == extent);
+            frontend->set_refresh_view_taken(throw_once_off_test_thread(refresh_armed));
+        }
+        {
+            std::lock_guard lock(mutex);
+            released = true;
+        }
+        cv.notify_all();
+        publish.join();
+        frontend->set_publication_committed({});
+        REQUIRE(held);
+        CHECK(wait_until([&] { return failures() == 1; }, 10s));
+        frontend->set_refresh_view_taken({});
+        CHECK(frontend->inode_for_path("/completion.bin") == handle.inode);
+        frontend->release(handle.inode, true);
+        CHECK(wait_until(
+            [&] {
+                (void)frontend->getattr("/");
+                return frontend->wait_for_idle(100ms);
+            },
+            20s));
+        frontend->stop();
+        CHECK(fs.getattr("/completion.bin").size == input.size());
+        CHECK(read_back(fs, "/completion.bin", input.size()) == input);
+    }
+
+    // A restart with a recovered create and its writes: the refresh after
+    // the create's batch fails, and the recovered data waits until the
+    // first-adoption retry succeeds.
+    {
+        fs.mkdir("/recovered", 0755, getuid(), getgid());
+        auto fuse = node.fuse("recovered");
+        const auto payload = pattern(40 * 1024, 59);
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            auto handle =
+                frontend.create("/recovered/new.bin", 0600, getuid(), getgid(), true, true, false);
+            REQUIRE(frontend.write(handle.inode, 0, payload) == payload.size());
+            frontend.release(handle.inode, true);
+        });
+        auto admission = std::make_unique<HeldLoaderAdmission>();
+        auto* loader = admission.get();
+        loader->hold_namespace();
+        auto recovered = node.frontend(fuse, std::move(admission));
+        std::atomic_bool refresh_armed{true};
+        recovered->set_refresh_view_taken(throw_once_off_test_thread(refresh_armed));
+        loader->release_namespace();
+        REQUIRE(wait_until([&] { return failures() == 2; }, 10s));
+        REQUIRE(recovered->wait_for_idle(20s));
+        recovered->set_refresh_view_taken({});
+        CHECK(recovered->status().backend_failures == 0);
+        recovered->stop();
+        CHECK(fs.getattr("/recovered/new.bin").size == payload.size());
+        CHECK(read_back(fs, "/recovered/new.bin", payload.size()) == payload);
+    }
+    Log::set_logger(std::make_shared<ConsoleLogger>());
+    CHECK(failures() == 2);
+}
+
 // Recovery of the FUSE namespace journal over one node, case by case: each
 // case admits operations whose publication is held, then changes the backend
 // or the journal as a crash or the cluster would, then recovers. Batching and

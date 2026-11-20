@@ -3098,7 +3098,7 @@ struct FuseFrontend::State {
     void namespace_loop(const std::stop_token& stop) {
         // While recovered publications wait for the first adoption and no
         // namespace work ends in a refresh, the refresh is tried on a backoff.
-        auto first_adoption_retry = std::chrono::milliseconds(100);
+        auto first_adoption_retry = std::chrono::milliseconds(0);
         while (!stop.stop_requested() && !stopping.load()) {
             std::vector<NamespaceOp> batch;
             {
@@ -3110,17 +3110,28 @@ struct FuseFrontend::State {
                 if (recovered_data_waits.load(std::memory_order_acquire)) {
                     if (!namespace_cv.wait_for(lock.native(), stop, first_adoption_retry, ready)) {
                         first_adoption_retry =
-                            std::min(first_adoption_retry * 2, std::chrono::milliseconds(5000));
+                            std::clamp(first_adoption_retry * 2, std::chrono::milliseconds(100),
+                                       std::chrono::milliseconds(5000));
                         retry_first_adoption = true;
                     }
                 } else {
-                    namespace_cv.wait(lock.native(), stop, ready);
+                    // Woken too when recovered publications start waiting.
+                    namespace_cv.wait(
+                        lock.native(), stop, [&]() MACHA_REQUIRES(namespace_queue_mutex) {
+                            return ready() || recovered_data_waits.load(std::memory_order_acquire);
+                        });
                 }
                 if (stop.stop_requested() || stopping.load())
                     break;
+                if (!retry_first_adoption && namespace_queue.empty())
+                    continue;
                 if (retry_first_adoption) {
                     lock.unlock();
-                    refresh_namespace_if_stale();
+                    refresh_namespace_off_request("first-adoption");
+                    if (recovered_data_waits.load(std::memory_order_acquire) &&
+                        !recovered_data_wait_logged.exchange(true, std::memory_order_acq_rel))
+                        Log::info("FUSE recovered publications wait for the first namespace "
+                                  "adoption code=fuse_recovered_data_waiting");
                     continue;
                 }
                 batch.push_back(namespace_queue.front());
@@ -3395,7 +3406,20 @@ struct FuseFrontend::State {
             // at the next request.
             if (deferred_adoption_ready.load(std::memory_order_acquire) ||
                 recovered_data_waits.load(std::memory_order_acquire))
-                refresh_namespace_if_stale();
+                refresh_namespace_off_request("namespace-batch");
+        }
+    }
+
+    // A refresh no request asked for: a failure is logged and its trigger
+    // (deferred_adoption_ready, recovered_data_waits) stays set, so the next
+    // trigger or the first-adoption retry tries again.
+    void refresh_namespace_off_request(std::string_view caller) {
+        try {
+            refresh_namespace_if_stale();
+        } catch (const std::exception& error) {
+            Log::warn("FUSE namespace refresh off a request failed "
+                      "code=fuse_background_refresh_failed caller=" +
+                      std::string(caller) + " error=" + error.what());
         }
     }
 
@@ -4254,7 +4278,7 @@ struct FuseFrontend::State {
             // Its deferred path is adopted now, not at some later change.
             if (readopt) {
                 deferred_adoption_ready.store(true, std::memory_order_release);
-                refresh_namespace_if_stale();
+                refresh_namespace_off_request("publication");
             }
             reclaim_inode_if_quiescent(inode->id);
         }
@@ -5325,13 +5349,22 @@ struct FuseFrontend::State {
             // deferred).
             if (deferred_adoption_ready.exchange(false, std::memory_order_acq_rel)) {
                 auto pending = std::exchange(deferred_adoptions, {});
-                for (const auto& path : pending) {
-                    if (const auto entry = namespace_entry(snapshot, &adopt_nodes, path)) {
-                        adopt_entry(path, *entry);
-                        continue;
+                auto next = pending.begin();
+                try {
+                    for (; next != pending.end(); ++next) {
+                        const auto& path = *next;
+                        if (const auto entry = namespace_entry(snapshot, &adopt_nodes, path)) {
+                            adopt_entry(path, *entry);
+                            continue;
+                        }
+                        if (auto it = paths.find(canonical_path(path)); it != paths.end())
+                            drop_path(it);
                     }
-                    if (auto it = paths.find(canonical_path(path)); it != paths.end())
-                        drop_path(it);
+                } catch (...) {
+                    // The paths not yet adopted wait for the next refresh.
+                    deferred_adoptions.insert(next, pending.end());
+                    deferred_adoption_ready.store(true, std::memory_order_release);
+                    throw;
                 }
             }
             adopted_namespace_root = snapshot.namespace_root;
@@ -5403,15 +5436,12 @@ struct FuseFrontend::State {
         }
 
         // Recovered state is complete before workers start; publication
-        // resumes after the first adoption, which this starts.
-        recovered_data_waits.store(true, std::memory_order_release);
-        namespace_cv.notify_all();
-        refresh_namespace_if_stale();
-        if (recovered_data_waits.load(std::memory_order_acquire)) {
-            recovered_data_wait_logged.store(true, std::memory_order_release);
-            Log::info("FUSE recovered publications wait for the first namespace adoption "
-                      "code=fuse_recovered_data_waiting");
+        // resumes after the first adoption, which the namespace loop runs.
+        {
+            Lock queue_lock(namespace_queue_mutex);
+            recovered_data_waits.store(true, std::memory_order_release);
         }
+        namespace_cv.notify_all();
     }
 
     void interrupt_waits() {
@@ -6758,17 +6788,21 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
 }
 
 bool FuseFrontend::wait_for_idle(std::chrono::milliseconds timeout) {
+    // Recovered publications waiting for the first adoption are not yet
+    // queued, so status() does not count them.
+    const auto idle = [this] {
+        const auto current = status();
+        return !current.broker_pending && !current.pending_namespace && !current.pending_data &&
+               !current.active_data &&
+               !state_->recovered_data_waits.load(std::memory_order_acquire);
+    };
     const auto end = Clock::now() + timeout;
     while (Clock::now() < end) {
-        auto current = status();
-        if (!current.broker_pending && !current.pending_namespace && !current.pending_data &&
-            !current.active_data)
+        if (idle())
             return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    auto current = status();
-    return !current.broker_pending && !current.pending_namespace && !current.pending_data &&
-           !current.active_data;
+    return idle();
 }
 
 std::optional<BlockedNamespaceOperation> FuseFrontend::blocked_namespace_operation() const {
