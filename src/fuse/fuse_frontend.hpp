@@ -682,6 +682,15 @@ class FuseFrontend final : public HydrationHintProvider {
     }
     std::vector<HydrationHint> hints() override;
     void set_wake_callback(std::function<void()> callback) override;
+    // Called by a namespace refresh after it takes its metadata view and before
+    // it confirms or adopts it, on the refreshing thread: a test holds a refresh
+    // there. Unset by default.
+    void set_refresh_view_taken(std::function<void()> stage);
+    // Called by a data publication after its metadata commit returns and before
+    // the inode takes the committed entry as its base, on the publishing
+    // thread, with the inode's id: a test holds a publication there. Unset by
+    // default.
+    void set_publication_committed(std::function<void(uint64_t inode)> stage);
 
     std::chrono::milliseconds absolute_timeout() const;
     const FuseConfig& config() const;

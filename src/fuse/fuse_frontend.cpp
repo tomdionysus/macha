@@ -448,6 +448,9 @@ struct FuseFrontend::State {
         // This node's latest mutation when the inode last published: a view
         // that lacks it is behind the inode, never a replacement of it.
         MetadataDot published_dot MACHA_GUARDED_BY(mutex);
+        // An adoption of this inode's path waited for its publication in flight;
+        // the path is looked at again when the publication finishes.
+        bool adoption_deferred MACHA_GUARDED_BY(mutex){};
 
         ~Inode() {
             if (spool_fd >= 0)
@@ -793,6 +796,9 @@ struct FuseFrontend::State {
     // Serialises namespace refreshes; guards no state. Held across journal
     // appends and namespace node reads.
     IoMutex refresh_mutex;
+    Mutex refresh_stage_mutex;
+    std::function<void()> refresh_view_taken MACHA_GUARDED_BY(refresh_stage_mutex);
+    std::function<void(uint64_t)> publication_committed MACHA_GUARDED_BY(refresh_stage_mutex);
     std::atomic_uint64_t refreshed_namespace_revision{};
     // The tree `paths` was last brought into line with. A refresh applies
     // what differs between it and the new tree, unless the view may have
@@ -802,6 +808,11 @@ struct FuseFrontend::State {
     // The clock of the view last adopted. Adoption only moves forward: a view
     // lacking any of it would read another node's changes as undone.
     std::map<NodeId, uint64_t> adopted_clock MACHA_GUARDED_BY(namespace_mutex);
+    // Paths whose adoption waited for a publication in flight on their inode:
+    // the view may hold its commit before the inode's base does. Adopted again,
+    // by the same rules, once a publication on one of them has finished.
+    std::set<std::string, std::less<>> deferred_adoptions MACHA_GUARDED_BY(namespace_mutex);
+    std::atomic_bool deferred_adoption_ready{false};
     std::atomic_bool namespace_view_diverged{true};
     // Last revision whose deferred adoption was logged; logs once per view.
     std::atomic_uint64_t namespace_refresh_deferred_logged_revision{};
@@ -3748,6 +3759,13 @@ struct FuseFrontend::State {
             throw;
         }
         auto committed = publication->writer->committed_entry();
+        std::function<void(uint64_t)> committed_stage;
+        {
+            Lock lock(refresh_stage_mutex);
+            committed_stage = publication_committed;
+        }
+        if (committed_stage)
+            committed_stage(inode->id);
 
         // Journaled before the in-memory watermark moves; a crash before it
         // replays idempotently.
@@ -4169,9 +4187,11 @@ struct FuseFrontend::State {
                     completed = true; // the generation is gone; nothing to run.
             }
 
+            bool readopt = false;
             {
                 Lock lock(inode->mutex);
                 inode->data_running = false;
+                readopt = std::exchange(inode->adoption_deferred, false);
                 // Yields and retryable failures keep the writer and cursor (a
                 // failed extent stays at the queue head, so retry leaves no
                 // hole); completion and terminal errors discard them.
@@ -4204,6 +4224,11 @@ struct FuseFrontend::State {
             }
             data_cv.notify_all();
             admit_deferred();
+            // Its deferred path is adopted now, not at some later change.
+            if (readopt) {
+                deferred_adoption_ready.store(true, std::memory_order_release);
+                refresh_namespace_if_stale();
+            }
             reclaim_inode_if_quiescent(inode->id);
         }
     }
@@ -5024,7 +5049,8 @@ struct FuseFrontend::State {
         const auto current_revision = refreshed_namespace_revision.load(std::memory_order_acquire);
         const bool pending_confirmation = have_unconfirmed_namespace();
         const auto available_revision = fs.available_namespace_revision();
-        if (available_revision <= current_revision && !pending_confirmation)
+        const bool revisit = deferred_adoption_ready.load(std::memory_order_acquire);
+        if (available_revision <= current_revision && !pending_confirmation && !revisit)
             return;
 
         // Log why a newer view is not adopted, once per revision, so a stalled
@@ -5061,6 +5087,13 @@ struct FuseFrontend::State {
         }
         const auto& view = *available;
         const auto& snapshot = *view.snapshot;
+        std::function<void()> view_taken;
+        {
+            Lock lock(refresh_stage_mutex);
+            view_taken = refresh_view_taken;
+        }
+        if (view_taken)
+            view_taken();
 
         // Publications retire only once observed in the decoded view, so an
         // older view cannot resurrect a rename/unlink or hide a mkdir/create.
@@ -5071,7 +5104,8 @@ struct FuseFrontend::State {
             return;
         }
         if (view.namespace_revision <=
-            refreshed_namespace_revision.load(std::memory_order_acquire)) {
+                refreshed_namespace_revision.load(std::memory_order_acquire) &&
+            !revisit) {
             deferred("view-not-newer", view.namespace_revision);
             return;
         }
@@ -5097,6 +5131,9 @@ struct FuseFrontend::State {
         }
 
         std::vector<uint64_t> detached;
+        // An inode lost its name: its publication left unconfirmed against that
+        // name is confirmed below, against this same view.
+        bool replaced_any = false;
         size_t adopted_new = 0;
         // Counted during the walk; a tree-backed snapshot has no size.
         size_t walked = 0;
@@ -5141,6 +5178,15 @@ struct FuseFrontend::State {
                     inode->published_path = path;
                     return;
                 }
+                // A view may hold the commit of a publication in flight before
+                // the inode's base does: the inode keeps its path until the
+                // publication finishes, then the path is adopted again.
+                if (inode->data_running) {
+                    inode->published_path = path;
+                    inode->adoption_deferred = true;
+                    deferred_adoptions.insert(path);
+                    return;
+                }
                 const bool content_changed = !same_file_content(inode->base, entry);
                 // Snapshots carry no stable inode id. A dirty or open inode whose
                 // path now holds replacement content is detached, so old writes
@@ -5153,6 +5199,7 @@ struct FuseFrontend::State {
                      inode->unconfirmed_data_entry ||
                      (inode->open_handles != 0 && entry.version <= inode->base.version));
                 if (replaced_open_inode && path != "/") {
+                    replaced_any = true;
                     inode->published_path.reset();
                     auto replacement = std::make_shared<Inode>();
                     Lock replacement_lock(replacement->mutex);
@@ -5185,7 +5232,15 @@ struct FuseFrontend::State {
                     if (inode->published_dot &&
                         !clock_covers(snapshot.mutation_sequences, inode->published_dot))
                         return std::next(it);
+                    // Nor while a publication on it is in flight: looked at
+                    // again once it finishes.
+                    if (inode->data_running) {
+                        inode->adoption_deferred = true;
+                        deferred_adoptions.insert(it->first);
+                        return std::next(it);
+                    }
                     inode->published_path.reset();
+                    replaced_any = true;
                     // Reclaimed after namespace_mutex is released.
                     detached.push_back(inode->id);
                     return paths.erase(it);
@@ -5237,11 +5292,27 @@ struct FuseFrontend::State {
                         it = drop_path(it);
                 }
             }
+            // Paths deferred for a publication in flight, again, through the
+            // same rules (a path whose publication is still running stays
+            // deferred).
+            if (deferred_adoption_ready.exchange(false, std::memory_order_acq_rel)) {
+                auto pending = std::exchange(deferred_adoptions, {});
+                for (const auto& path : pending) {
+                    if (const auto entry = namespace_entry(snapshot, &adopt_nodes, path)) {
+                        adopt_entry(path, *entry);
+                        continue;
+                    }
+                    if (auto it = paths.find(canonical_path(path)); it != paths.end())
+                        drop_path(it);
+                }
+            }
             adopted_namespace_root = snapshot.namespace_root;
             adopted_clock = snapshot.mutation_sequences;
             namespace_view_diverged.store(false, std::memory_order_release);
             refreshed_namespace_revision.store(view.namespace_revision, std::memory_order_release);
         }
+        if (replaced_any)
+            confirm_data_from_snapshot(snapshot);
         for (auto id : detached)
             reclaim_inode_if_quiescent(id);
         if (Log::enabled(LogLevel::debug))
@@ -6807,6 +6878,16 @@ std::vector<HydrationHint> FuseFrontend::hints() {
 void FuseFrontend::set_wake_callback(std::function<void()> callback) {
     Lock lock(state_->hint_mutex);
     state_->hint_wake_callback = std::move(callback);
+}
+
+void FuseFrontend::set_refresh_view_taken(std::function<void()> stage) {
+    Lock lock(state_->refresh_stage_mutex);
+    state_->refresh_view_taken = std::move(stage);
+}
+
+void FuseFrontend::set_publication_committed(std::function<void(uint64_t)> stage) {
+    Lock lock(state_->refresh_stage_mutex);
+    state_->publication_committed = std::move(stage);
 }
 
 void FuseFrontend::interrupt_waits() {

@@ -3,6 +3,71 @@
 **Open. Mechanism proven 2026-11-19 22:53Z by a deterministic failing test. Present on 0.94.2 (live) and 0.95.0.**
 Nothing is fixed; the maintainer decides the fix ("Report findings before fixing").
 
+## The second door, fixed (2026-11-20 04:00Z; Dagda's diagnosis and design, Macha's change)
+
+The f18 and f0 histories show one mechanism: the **leading race on the file's first publication**.
+- The refresh adopts the view holding G1 before the inode has taken G1 as its base.
+- The base is still the create entry and `published_dot` is unset, so the entry differs and the dirty inode is
+  detached.
+
+The fix:
+- An inode whose publication is in flight (`data_running`) is never replaced or dropped by an adoption. Its path
+  enters `deferred_adoptions`.
+- When that publication finishes, the publishing thread runs a refresh that re-adopts each deferred path through the
+  same rules (`adopt_entry` or `drop_path`, with their guards).
+- After any adoption that replaced or dropped an inode, `confirm_data_from_snapshot` runs once against the same view,
+  so a detached inode's unconfirmed publication retires at once.
+- Test seams: `set_refresh_view_taken`, `set_publication_committed`.
+
+Cases:
+- `test_a_stale_refresh_keeps_a_writing_inode`
+- `test_a_refresh_ahead_of_a_publication_keeps_its_inode`
+- `test_a_change_during_a_publication_is_adopted_after_it`
+
+Guard-removed runs:
+- Without the deferral, the leading case fails.
+- Without b0b037c's `published_dot` guard, the stale and lagging cases fail.
+- Each guard is necessary for its own path.
+
+Suite: 551/551 on build-3. Still to do: the nine single-node rounds.
+
+Found on the way, a separate commit to come (Dagda agreed): a file created here and removed elsewhere before this node
+adopts any view holding it keeps its local name. The diff of the two roots never names it.
+
+## A fourth case, on 0.95.1 (2026-11-20 01:55Z, measurement round 8 for Dagda)
+
+On a fresh single 0.95.1 node on build-4 (b0b037c in), round 8 of R1's load committed `r1/big/f18.bin` short:
+99,090,432 of 100,663,296 bytes, everything present correct. f18 was the 19th large file, not the first.
+
+The new line fired, so the writer was detached and its tail retired:
+`FUSE writes retired unpublished code=fuse_writes_retired_unlinked inode=22 operations=6 through_sequence=384`.
+Rounds 1 to 7 were clean.
+
+**b0b037c does not cover this path.** The reading, unproven: a refresh adopts a view that already holds the inode's
+*next* commit (G2) before `replay_data_quantum` sets `base = G2`. The view covers `published_dot`, its entry differs
+from base, and the inode is dirty, so it is taken as a replacement.
+
+The evidence is `build/evidence/r8-0951.tgz` (sha256 `248e4515...1659`). The node is cleaned, and Dagda has it.
+**0.95.1 is not cutover-ready.**
+
+## A third case, on one node (2026-11-20 01:00Z, rehearsal R1 on 0.95.1's kit, the node still 0.94.2)
+
+A fresh single 0.94.2 node on build-3, with no peer, committed `r1/big/f0.bin` short: 95,420,416 of 100,663,296
+bytes. Its bytes are correct, and it was the first large file of the load; the other 19 large files are whole. The
+history is linear (1,568 frames, one head, no merges), so the peer-head path does not apply.
+
+Evidence is in `/root/evidence-r1-0942/` on build-3: the state copy, the journal, the sums and the listing.
+
+Dagda's reading, checked against the code:
+- `refresh_namespace_if_stale` takes the view once (`fs.available_snapshot_view()`), then confirms, then adopts
+  under `namespace_mutex`. Nothing orders that against a data publication.
+- A publication that commits G1 in between sets `base = G1` under the inode lock.
+- The adoption then compares the older view's entry with G1, takes the dirty inode as replaced, and detaches it.
+  This is the same detach and retire as before, entered through a stale snapshot.
+
+In 0.95.1, `published_dot` is set in the same critical section as `base`. The adoption checks it under the same
+inode lock, and the older view lacks G1's dot, so the inode is kept. Covered by the code; not yet shown by a test.
+
 ## Proven (2026-11-19 22:53Z)
 
 `tests/test_filesystem_fuse.cpp` `test_lagging_view_keeps_a_writing_inode` (uncommitted), on build-3
