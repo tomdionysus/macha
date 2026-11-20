@@ -901,6 +901,252 @@ MACHA_TEST("filesystem_fuse", test_lagging_view_keeps_a_writing_inode) {
     frontend->stop();
 }
 
+// One node and no peer: a namespace refresh takes its view, the open file's
+// data then commits, and the refresh adopts the older view. The file being
+// written keeps its name, and every byte written to it is published.
+MACHA_TEST("filesystem_fuse", test_a_stale_refresh_keeps_a_writing_inode) {
+    FilesystemNode node("stale-refresh-writer");
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+    auto logger = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+    Log::set_logger(logger);
+
+    auto frontend = node.frontend(node.fuse("stale-refresh"));
+    // The last adoption predates the file, so the held view names it.
+    (void)frontend->getattr("/");
+    auto handle = frontend->create("/stale.bin", 0644, getuid(), getgid(), true, true, false);
+    REQUIRE(wait_until([&] { return !frontend->status().pending_namespace; }, 10s));
+    const auto input = pattern(4 * extent, 0x3a);
+    const std::span<const uint8_t> bytes(input);
+    REQUIRE(frontend->write(handle.inode, 0, bytes.first(extent)) == extent);
+
+    // The next refresh is held once it has taken its view.
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool taken = false;
+    bool released = false;
+    std::atomic_bool armed{true};
+    frontend->set_refresh_view_taken([&] {
+        if (!armed.exchange(false))
+            return;
+        std::unique_lock lock(mutex);
+        taken = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return released; });
+    });
+    // A change outside the mount, for the refresh to take a newer view of.
+    fs.mkdir("/newer", 0755, getuid(), getgid());
+    std::thread refresh([&] { (void)frontend->getattr("/newer"); });
+    bool held = false;
+    {
+        std::unique_lock lock(mutex);
+        held = cv.wait_for(lock, 10s, [&] { return taken; });
+    }
+    // G1 commits while the refresh holds the older view; more is written after it.
+    if (held) {
+        frontend->fsync(handle.inode);
+        CHECK(frontend->write(handle.inode, extent, bytes.subspan(extent)) == 3 * extent);
+    }
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+    }
+    cv.notify_all();
+    refresh.join();
+    frontend->set_refresh_view_taken({});
+    REQUIRE(held);
+    CHECK(frontend->inode_for_path("/stale.bin") == handle.inode);
+
+    frontend->release(handle.inode, true);
+    CHECK(wait_until(
+        [&] {
+            (void)frontend->getattr("/");
+            return frontend->wait_for_idle(100ms);
+        },
+        20s));
+    frontend->stop();
+    Log::set_logger(std::make_shared<ConsoleLogger>());
+    CHECK(fs.getattr("/stale.bin").size == input.size());
+    CHECK(read_back(fs, "/stale.bin", input.size()) == input);
+    for (const auto& [level, message] : logger->records())
+        CHECK(message.find("fuse_writes_retired_unlinked") == std::string::npos);
+}
+
+// One node and no peer: the open file's data commits (G2), and a namespace
+// refresh adopts the view holding G2 before the inode has taken G2 as its
+// base. The file being written keeps its name, and every byte written to it is
+// published.
+MACHA_TEST("filesystem_fuse", test_a_refresh_ahead_of_a_publication_keeps_its_inode) {
+    FilesystemNode node("leading-refresh-writer");
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+    auto logger = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+    Log::set_logger(logger);
+
+    auto frontend = node.frontend(node.fuse("leading-refresh"));
+    // The last adoption predates the file, so the refresh's view names it.
+    (void)frontend->getattr("/");
+    auto handle = frontend->create("/leading.bin", 0644, getuid(), getgid(), true, true, false);
+    REQUIRE(wait_until([&] { return !frontend->status().pending_namespace; }, 10s));
+    const auto input = pattern(4 * extent, 0x5e);
+    const std::span<const uint8_t> bytes(input);
+    // G1, then more written: the inode is dirty when G2 commits.
+    REQUIRE(frontend->write(handle.inode, 0, bytes.first(extent)) == extent);
+    frontend->fsync(handle.inode);
+    REQUIRE(frontend->write(handle.inode, extent, bytes.subspan(extent, extent)) == extent);
+
+    // G2's publication is held once its commit has returned.
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool committed = false;
+    bool released = false;
+    std::atomic_bool armed{true};
+    frontend->set_publication_committed([&](uint64_t inode) {
+        if (inode != handle.inode || !armed.exchange(false))
+            return;
+        std::unique_lock lock(mutex);
+        committed = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return released; });
+    });
+    std::thread publish([&] { frontend->fsync(handle.inode); });
+    bool held = false;
+    {
+        std::unique_lock lock(mutex);
+        held = cv.wait_for(lock, 10s, [&] { return committed; });
+    }
+    // The refresh adopts the view holding G2 while the inode's base is G1, and
+    // more is written meanwhile.
+    if (held) {
+        (void)frontend->getattr("/");
+        CHECK(frontend->write(handle.inode, 2 * extent, bytes.subspan(2 * extent)) == 2 * extent);
+    }
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+    }
+    cv.notify_all();
+    publish.join();
+    frontend->set_publication_committed({});
+    REQUIRE(held);
+    CHECK(frontend->inode_for_path("/leading.bin") == handle.inode);
+
+    frontend->release(handle.inode, true);
+    CHECK(wait_until(
+        [&] {
+            (void)frontend->getattr("/");
+            return frontend->wait_for_idle(100ms);
+        },
+        20s));
+    frontend->stop();
+    Log::set_logger(std::make_shared<ConsoleLogger>());
+    CHECK(fs.getattr("/leading.bin").size == input.size());
+    CHECK(read_back(fs, "/leading.bin", input.size()) == input);
+    for (const auto& [level, message] : logger->records())
+        CHECK(message.find("fuse_writes_retired_unlinked") == std::string::npos);
+}
+
+// A real change to a path while a publication on its inode is in flight is
+// not lost to the deferral: once the publication finishes, a replacement is
+// adopted as one, and an unlink takes the name and retires the writer's tail.
+MACHA_TEST("filesystem_fuse", test_a_change_during_a_publication_is_adopted_after_it) {
+    FilesystemNode node("deferred-adoption");
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+
+    for (const bool unlink : {false, true}) {
+        auto logger = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+        Log::set_logger(logger);
+        const std::string path = unlink ? "/unlinked.bin" : "/replaced.bin";
+        auto frontend = node.frontend(node.fuse(unlink ? "deferred-unlink" : "deferred-replace"));
+        (void)frontend->getattr("/");
+        auto handle = frontend->create(path, 0644, getuid(), getgid(), true, true, false);
+        REQUIRE(wait_until([&] { return !frontend->status().pending_namespace; }, 10s));
+        // A view holding the new file is adopted first, so the change below is a
+        // difference from it.
+        REQUIRE(wait_until(
+            [&] {
+                (void)frontend->getattr("/");
+                const auto now = frontend->diagnostics();
+                return now.namespace_refreshed_revision == now.namespace_available_revision;
+            },
+            10s));
+        const auto input = pattern(2 * extent, unlink ? 0x21 : 0x42);
+        const std::span<const uint8_t> bytes(input);
+        REQUIRE(frontend->write(handle.inode, 0, bytes.first(extent)) == extent);
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool committed = false;
+        bool released = false;
+        std::atomic_bool armed{true};
+        frontend->set_publication_committed([&](uint64_t inode) {
+            if (inode != handle.inode || !armed.exchange(false))
+                return;
+            std::unique_lock lock(mutex);
+            committed = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return released; });
+        });
+        std::thread publish([&] { frontend->fsync(handle.inode); });
+        bool held = false;
+        {
+            std::unique_lock lock(mutex);
+            held = cv.wait_for(lock, 10s, [&] { return committed; });
+        }
+        const auto replacement = pattern(extent / 2, 0x77);
+        if (held) {
+            // The change, outside the mount, and a refresh that sees it while
+            // the publication is still in flight.
+            if (unlink) {
+                fs.unlink(path);
+            } else {
+                write_file(fs, "/other.bin", replacement);
+                fs.rename("/other.bin", path);
+            }
+            (void)frontend->getattr("/");
+            CHECK(frontend->inode_for_path(path) == handle.inode);
+        }
+        {
+            std::lock_guard lock(mutex);
+            released = true;
+        }
+        cv.notify_all();
+        publish.join();
+        frontend->set_publication_committed({});
+        REQUIRE(held);
+
+        // Once it has finished, the change is adopted.
+        CHECK(wait_until(
+            [&] {
+                (void)frontend->getattr("/");
+                return frontend->inode_for_path(path) != std::optional<uint64_t>(handle.inode);
+            },
+            10s));
+        (void)frontend->write(handle.inode, extent, bytes.subspan(extent));
+        frontend->release(handle.inode, true);
+        CHECK(wait_until(
+            [&] {
+                (void)frontend->getattr("/");
+                return frontend->wait_for_idle(100ms);
+            },
+            20s));
+        frontend->stop();
+        Log::set_logger(std::make_shared<ConsoleLogger>());
+        const auto records = logger->records();
+        const bool retired = std::any_of(records.begin(), records.end(), [](const auto& record) {
+            return record.second.find("fuse_writes_retired_unlinked") != std::string::npos;
+        });
+        if (unlink) {
+            CHECK(error_code_of([&] { (void)fs.getattr(path); }) == ENOENT);
+            CHECK(retired);
+        } else {
+            CHECK(fs.getattr(path).size == replacement.size());
+            CHECK(read_back(fs, path, replacement.size()) == replacement);
+        }
+    }
+}
+
 // A peer's head this node cannot merge is set aside, and the view leaves it
 // for this node's own head, though the peer's is generations ahead.
 MACHA_TEST("filesystem_fuse", test_a_set_aside_head_leaves_the_view) {
