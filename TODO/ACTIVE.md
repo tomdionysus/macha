@@ -25,7 +25,14 @@ layers, "never go backwards, and guard FUSE". Suite 547/547 on Dagda 0.3.1.
 
 **Rehearsals paused (2026-11-20 01:10Z).** R1's fresh single 0.94.2 node on build-3 committed `r1/big/f0.bin` short,
 with no peer (see the short-file note). **The maintainer: "this is a Dagda problem. Assist Dagda to diagnose and fix it."**
-- Dagda leads; Macha assists, with the node and its evidence (`/root/evidence-r1-0942/` on build-3) and builds.
+- Dagda leads; Macha assists with builds and runs. R1's evidence is in `build/evidence/r1-0942.tgz` (sha256
+  `5285baeb...5233`: state, journal, sums, listing, FUSE journal, yaml, rehearsal key). The node itself was cleaned
+  under the maintainer's rule "You may NOT hold cluster cores idle for any reason. Copy evidence off if needed."
+- f0's history (2a): created at gen 4, published once at gen 7 with 23 of its 24 extents, never again. This matches
+  the stale-snapshot detach.
+- **0.95.1 also commits short** (round 8 of the measurement, `f18.bin`, 2026-11-20 01:55Z; the retire line
+  fired). A second way in, probably the reverse race: the view holds the inode's next commit before its base does.
+  The evidence is in `build/evidence/r8-0951.tgz`, and Dagda has it. 0.95.1 is not cutover-ready.
 - The rehearsals R1 to R4 and the two-writer round restart when Dagda's fix lands; the cutover is on the maintainer's word.
 
 **GitHub CI (the maintainer 2026-11-20: "If you have public github repos, fix and maintain github CI"):**
@@ -39,6 +46,16 @@ with no peer (see the short-file note). **The maintainer: "this is a Dagda probl
 - Plan, settled by the maintainer's rules: before the port's squash onto `develop`, run `tools/ci.sh --local` (with ASan) once on
   a Pi as the pre-merge gate. If the ingest/torrent crash is still there on the port's code, the heap corruption is
   fixed before the merge. Then `develop` goes green on GitHub and stays green.
+
+**Coverage (the maintainer 2026-11-20: "You will maintain ~100% code coverage on all code"):** every change brings tests
+reaching its lines. The coverage build runs at each branch's pre-merge gate. Macha's whole-tree figure is not yet
+measured: take it at the port's pre-merge gate, then close the gaps.
+
+**GoogleTest (the maintainer 2026-11-20: "GoogleTest is our standard test framework, and you must move all tests to it"):**
+Macha's 576 `MACHA_TEST` cases in 39 files move on their own branch after the cutover.
+- Keep one process per case, parallel slots, the filter, failure logs, the timeouts and the fixtures.
+- GoogleTest comes from Dannan's `dannan::testing` export.
+- The case count matches before and after.
 
 **The stack audits (2026-11-20):** the reports are in `2026-11-20-duplication-audit.md` and
 `2026-11-20-no-special-node-audit.md`. The converged plan is the coordinating session's `TODO/2026-11-20-cluster-stack-placement.md`
@@ -113,7 +130,6 @@ All stay on 0.94.2 and are fixed by the port, except the first.
   start the cutover.
 - Dagda's and Dannan's branches pushed (both local on the maintainer's word).
 - After the port: whether the heap chase resumes with media load.
-- The Codecov token for the repository.
 - Carried, unchecked: the media-kind import hint; truncated pack records; the `*.pre-migration.*` archives; the
   replica journal reader with no writer left.
 
