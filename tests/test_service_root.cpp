@@ -85,7 +85,8 @@ MACHA_TEST("service_root", test_a_service_never_started_stops_in_order_once) {
     auto config = cluster.node_config("never-started");
     enable_api(config);
     Lifecycle lifecycle;
-    const std::vector<std::string> expected{"stop catalogue-http",
+    const std::vector<std::string> expected{"close routes",
+                                            "stop catalogue-http",
                                             "stop store",
                                             "request_stop status",
                                             "request_stop catalogue-http",
