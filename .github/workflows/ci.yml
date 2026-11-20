@@ -63,6 +63,10 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Build and test
+        env:
+          # The ASan build compiles both again from these, instrumented.
+          MACHA_DANNAN_SRC: /opt/dannan-src
+          MACHA_DAGDA_SRC: /opt/dagda-src
         run: sh tools/ci.sh --local
 
       - name: Upload coverage
