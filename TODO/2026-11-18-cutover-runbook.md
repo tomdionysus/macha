@@ -20,6 +20,29 @@ it; (3) small rehearsals of the migration; (4) the cutover, on his word, asked i
 - Standing: proof on the live nodes; the API stays 0.94.2's; `maintenance.collect_garbage` stays false until the
   cutover check below.
 
+## Done, 2026-11-20 to 2026-11-21
+
+Started on the maintainer's word, 2026-11-20 19:31Z, with the tarball `a6e2e151...ec98`.
+- **live-a:** stopped 19:36Z.
+  - The before manifest ran 19:37Z to 12:33Z, rc 0: 6.2 TB at about 102 MiB/s, nothing unreadable.
+  - The migration ran 12:33Z to 17:12Z, rc 0: 1,554,581 loose objects and 494,751 pack records, 0 unreadable, 9 ledgers
+    re-sealed, layout v19.
+- **The maintainer dropped the after manifest, and both full passes on live-b** ("there's little point in a full
+  second pass"; the originals are kept elsewhere). In their place:
+  - a read sample through the mount on each node (live-a: 94 files, 149 GiB; live-b: 37 files, 99 GiB, much of it
+    across the WAN), 0 failed, 0 authentication failures;
+  - the journals checked.
+- **live-b:** stopped 17:13Z, just before live-a started on 0.95.1 (healthy 17:14Z, re-enabled after its sample).
+  - The migration only ran 17:49Z to 20:02Z, rc 0: 976,677 loose objects and 480,652 pack records, 0 unreadable.
+  - Started on 0.95.1 at 20:04Z and re-enabled 22:01Z.
+- **The merge:** the two histories reconciled at generation 176332 with one recorded conflict, `catalogue_root`. Both
+  nodes moved the root while apart. A later catalogue root supersedes it; the maintainer can resolve it at
+  `/api/v1/manage/metadata/conflicts`.
+- **Still to do:**
+  - the 0.94.2 baseline comparison once repair has settled;
+  - the cutover check, then `maintenance.collect_garbage`, on the maintainer's word;
+  - removing the 0.95.1 kit, backups and `/root/phys` when he says.
+
 ## Gates
 
 | Gate | State |

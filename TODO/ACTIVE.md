@@ -18,6 +18,11 @@ rehearsals, downtime, the steps, rollback); the port's history
 Commit hashes in this directory written before 2026-11-20 18:10Z name commits from before the two history rewrites
 of that day; the maintainer's backups hold the maps from old to new.
 
+**The cutover is done (2026-11-21 22:01Z): both live nodes serve 0.95.1 on Dagda 0.3.2 and Dannan 0.9.2**, both
+enabled; the record is in the runbook's "Done" section. Left: the 0.94.2 baseline comparison once repair settles, the
+`catalogue_root` merge conflict (superseded by the next catalogue root, or the maintainer resolves it), the cutover
+check and garbage collection on the maintainer's word, then the release.
+
 **Prepared for the cutover, 2026-11-20 18:15Z: waiting on the sanitizer gate, then the maintainer's word.** The runbook
 ([`2026-11-18-cutover-runbook.md`](2026-11-18-cutover-runbook.md)) names 0.95.1 throughout. The staging kit is
 `build/cutover/stage-0.95.1/`: the tarball every rehearsal ran (sha256 `c2041995...4086`, Dagda 0.3.2, Dannan 0.9.2),
