@@ -9,6 +9,12 @@ gone from here, and the old file with its full reasoning is
 [`archive/2026-10-06-BACKLOG-before-verification.md`](archive/2026-10-06-BACKLOG-before-verification.md).
 `ACTIVE.md` outranks everything here. Grouped by area, not ordered.
 
+## Status and clients
+
+- **Report the underlying Dannan and Dagda versions** (the maintainer, 2026-11-21; after the cutover): the status
+  API names each node's Dannan and Dagda versions beside Macha's, in full x.y.z, and the clients show them. It changes
+  what the API sends, so it is announced to Core and every client session first.
+
 ## Playback
 
 - **A stale session for the same media may produce a 503 on the next create**
