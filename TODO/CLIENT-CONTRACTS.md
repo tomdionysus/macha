@@ -11,7 +11,8 @@ or runs a release that does not report them. Additive; nothing else changes. The
 (2026-11-21): the clients show them beside `version`. **0.95.4**, same announcement: each `nodes[]` entry
 also gains `control_storage` (`available`, `capacity_bytes`, `used_bytes`, `free_bytes`, null figures when not
 fresh), and `cluster.conditions` can carry `N node's control storage is nearly full` (health `degraded`).
-0.95.3 is live on both nodes since 2026-11-22 18:18Z.
+0.95.3 went live 2026-11-22 18:18Z and 0.95.4 at 21:32Z, both on the maintainer's word, before Core or a client
+session could be told: announce both when one next runs.
 
 **0.90.87 (announced 2026-10-12 to Core, which checked core and all three
 clients; no conflict).** A torrent job's `catalogue.state` follows the ingest

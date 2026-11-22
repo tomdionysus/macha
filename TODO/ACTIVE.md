@@ -34,8 +34,10 @@ two history rewrites; the maintainer's backups hold the maps.
    - the cutover check on live-a, read-only as root on-box (`build/cutover/diag-keys.py`): the namespace's
      1,624,424 extents all held by a reachable node, 0 unavailable, 0 unknown; repair 0 unsourceable, 0 unreadable.
      `collect_garbage: true` on live-a from 18:27Z (a restart: a SIGHUP does not reload maintenance keys).
-     live-b not checked through its own API (signing in there from live-a was refused); its GC waits on the
-     maintainer;
+     live-b not checked through its own API (signing in there from live-a was refused); the maintainer turned its
+     GC on anyway (same replicated namespace), from 21:32Z;
+   - 0.95.4 on both nodes from 21:31Z (live-a) and 21:32Z (live-b): Status shows each node's `control_storage`
+     (live-a 4.74 of 8.59 GB, live-b 4.48) and the nearly-full condition; a failed catalogue install backs off;
    - the baseline comparison against `2026-11-06-pi-baselines.md` (state each node's replication state with it);
    - the `catalogue_root` merge conflict: superseded by the next catalogue root, or the maintainer resolves it at
      `/api/v1/manage/metadata/conflicts`;
