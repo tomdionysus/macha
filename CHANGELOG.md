@@ -13,6 +13,8 @@ and a push step read every object it planned before sending any.
   never less than an extent (96 MiB at the default 768 MiB). Resident, that is the window queued
   to send plus about one extent being read.
 - `maintenance.max_bandwidth` is not needed for this and stays a limit on the link's rate only.
+- The shipped `macha.service` loads the `macha-custody` credential itself, so a node using that name
+  needs no drop-in. A missing credential does not stop the unit; Macha refuses to start and says why.
 
 ## 0.95.1: a file being written keeps its name through a lagging view
 

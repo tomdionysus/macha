@@ -14,6 +14,9 @@ KillSignal=SIGTERM
 TimeoutStopSec=60
 LimitNOFILE=65536
 UMask=0027
+# The root sealing the node's key custody, read from /etc/credstore.encrypted/macha-custody (or the other
+# credstore directories). Named without a path, so a node with no such credential still starts and says why.
+LoadCredentialEncrypted=macha-custody
 
 [Install]
 WantedBy=multi-user.target

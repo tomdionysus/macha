@@ -73,13 +73,14 @@ systemd-run --wait --pipe -p LoadCredentialEncrypted=macha-custody \
 
 `init` writes the custody file and prints the new root straight into
 `systemd-creds encrypt`, so it is never kept in clear; `show` proves the sealed
-credential opens custody as the unit will read it. The unit names the same
-credential in `LoadCredentialEncrypted=`; the shipped `macha.service` names
-none, so add it in a drop-in (`sudo systemctl edit macha.service`):
+credential opens custody as the unit will read it. The shipped `macha.service`
+loads `macha-custody` with `LoadCredentialEncrypted=`, searching systemd's
+credstore directories. To use another name, set it in `custody.credential` and
+load it in a drop-in (`sudo systemctl edit macha.service`):
 
 ```ini
 [Service]
-LoadCredentialEncrypted=macha-custody
+LoadCredentialEncrypted=<name>
 ```
 
 Without systemd (macOS, or a node run by hand), `credentials_directory` names a

@@ -215,14 +215,9 @@ custody:
   credential: macha-custody
 ```
 
-and load it in the unit with a drop-in (`sudo systemctl edit macha.service`):
-
-```ini
-[Service]
-LoadCredentialEncrypted=macha-custody
-```
-
-A node without custody does not start. Back up the custody file
+The shipped unit loads `macha-custody` from `/etc/credstore.encrypted/`; a
+credential of another name needs a `LoadCredentialEncrypted=` drop-in
+([Key custody](configuration.md#key-custody)). A node without custody does not start. Back up the custody file
 (`<state_path>/identity/custody`) and the sealed root off the node; see
 [Key custody](configuration.md#key-custody).
 
