@@ -3346,6 +3346,7 @@ MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_fil
 
     // Copied, the job waits on the catalogue; the hint's outcome completes it.
     {
+        const auto revision = node.hints().revision();
         const auto id = ingest.submit_path(external);
         REQUIRE(wait_until(
             [&] {
@@ -3353,6 +3354,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_fil
                 return job && job->state == IngestJobState::cataloguing;
             },
             10s));
+        // Each file's hint is submitted once, as it lands; the job's end submits none again.
+        CHECK(node.hints().revision() == revision + 1);
         const auto summary = node.hints().summary("ingest", id);
         REQUIRE(summary.total == 1);
         REQUIRE(summary.pending == 1);

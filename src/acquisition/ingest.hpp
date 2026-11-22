@@ -274,7 +274,11 @@ class IngestManager {
     void refresh_progress(IngestJob&, uint64_t sample_bytes = 0,
                           std::chrono::steady_clock::duration sample_time = {});
     void refresh_catalogue_jobs();
+    // A job with no hints in the queue (its hints lost or cleared) submits them again.
     void enqueue_catalogue_hints(IngestJob&);
+    // A landed file's hint, before the file is recorded complete: a submit that throws
+    // leaves the file to be finished again.
+    void submit_file_hint(const IngestJob&, const IngestFileProgress&);
     void cleanup_source(const IngestJob&);
     // `kind`, when a destination is chosen, is what the file probed as.
     std::string choose_destination(const std::filesystem::path&, uint64_t, MediaProbeKind& kind);

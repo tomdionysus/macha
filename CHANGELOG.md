@@ -1,5 +1,20 @@
 # Current release
 
+## 0.95.3: an import submits each file's catalogue hint once
+
+A large import submitted every file's catalogue hint twice: once as the file landed, and again
+for every file when the last copy finished. Each submission rewrote the whole hint store, so
+the second pass held a core for minutes on a job of thousands of files, after the job read
+100% and while cancelling it did not stop it.
+
+- A file's hint goes in as the file lands, before the file is recorded complete, so a failed
+  submission leaves the file to finish again rather than complete with no hint. The job's end
+  submits nothing more.
+- A job found cataloguing with no hints in the queue submits them again in one write.
+- The genesis administrator's password file, `initial-root-password`, is synced with its
+  directory before the node goes on: a crash just after the founding no longer loses the only
+  copy of the password.
+
 ## 0.95.2: repair's memory is bounded by the node's budget
 
 Repair could take a node past its memory: a node of 8 GB was killed for memory twice while

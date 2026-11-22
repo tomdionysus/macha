@@ -1399,13 +1399,27 @@ void IngestManager::refresh_catalogue_jobs() {
 }
 
 void IngestManager::enqueue_catalogue_hints(IngestJob& job) {
-    for (const auto& file : job.files) {
-        if (!file.completed || !file.catalogue_candidate || file.destination_path.empty())
-            continue;
-        (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
-        if (media_information_)
-            (void)media_information_->request_path(file.destination_path);
-    }
+    // One submission for the job: the queue writes its state once.
+    std::vector<CatalogueHintSubmission> submissions;
+    for (const auto& file : job.files)
+        if (file.completed && file.catalogue_candidate && !file.destination_path.empty())
+            submissions.push_back(
+                {file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest});
+    if (submissions.empty())
+        return;
+    (void)hints_.submit_many(std::move(submissions));
+    if (media_information_)
+        for (const auto& file : job.files)
+            if (file.completed && file.catalogue_candidate && !file.destination_path.empty())
+                (void)media_information_->request_path(file.destination_path);
+}
+
+void IngestManager::submit_file_hint(const IngestJob& job, const IngestFileProgress& file) {
+    if (!file.catalogue_candidate || file.destination_path.empty())
+        return;
+    (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
+    if (media_information_)
+        (void)media_information_->request_path(file.destination_path);
 }
 
 std::string IngestManager::select_job_locked() const {
@@ -1562,7 +1576,6 @@ void IngestManager::process_job(const std::string& id, const std::stop_token& st
             job.state == IngestJobState::blocked)
             return;
 
-        enqueue_catalogue_hints(job);
         const auto summary = hints_.summary("ingest", job.id);
         job.catalogue_total = summary.total;
         job.catalogue_pending = summary.pending;
@@ -2061,13 +2074,8 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file,
             const auto final = fs_.getattr(file.destination_path);
             if (final.type == EntryType::file && final.size == file.size) {
                 file.copied = file.size;
+                submit_file_hint(job, file);
                 file.completed = true;
-                if (file.catalogue_candidate) {
-                    (void)hints_.submit(file.destination_path, "ingest", job.id,
-                                        CatalogueHintPriority::ingest);
-                    if (media_information_)
-                        (void)media_information_->request_path(file.destination_path);
-                }
                 refresh_progress(job);
                 return true;
             }
@@ -2093,16 +2101,11 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file,
                 fs_.commit_file(file.temporary_path, partial, file.size, *extents, nullptr);
                 fs_.rename(file.temporary_path, file.destination_path, true);
                 file.copied = file.size;
-                file.completed = true;
                 Log::info("ingest adopted published extents path=" + file.destination_path +
                           " extents=" + std::to_string(extents->size()) +
                           " bytes=" + std::to_string(file.size));
-                if (file.catalogue_candidate) {
-                    (void)hints_.submit(file.destination_path, "ingest", job.id,
-                                        CatalogueHintPriority::ingest);
-                    if (media_information_)
-                        (void)media_information_->request_path(file.destination_path);
-                }
+                submit_file_hint(job, file);
+                file.completed = true;
                 ++job.files_completed;
                 refresh_progress(job);
                 return true;
@@ -2283,12 +2286,8 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file,
         throw IngestFileError("destination_conflict",
                               "ingest destination appeared during the copy");
     }
+    submit_file_hint(job, file);
     file.completed = true;
-    if (file.catalogue_candidate) {
-        (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
-        if (media_information_)
-            (void)media_information_->request_path(file.destination_path);
-    }
     ++job.files_completed;
     refresh_progress(job);
     return true;

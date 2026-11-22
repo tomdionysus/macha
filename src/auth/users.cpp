@@ -690,22 +690,10 @@ std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const C
     contents += "in, reset it on any node, with the node stopped:\n\n";
     contents += "  macha-users <state_path> <cluster.key> passwd root\n";
     try {
-        std::filesystem::create_directories(state_path);
-        // Narrowed to 0600 before anything is written into it.
-        std::filesystem::path temporary = path;
-        temporary += ".new";
-        {
-            std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-            if (!out)
-                throw std::runtime_error("cannot open " + temporary.string());
-            std::filesystem::permissions(
-                temporary, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                std::filesystem::perm_options::replace);
-            out << contents;
-            if (!out)
-                throw std::runtime_error("cannot write " + temporary.string());
-        }
-        std::filesystem::rename(temporary, path);
+        // Created 0600 and synced with its directory: the accounts it names are durable, so
+        // a crash must not leave them without it.
+        durable_create_directories(state_path);
+        durable_replace_file(path, contents);
     } catch (const std::exception& error) {
         // The account exists regardless; without the file the password is
         // unknowable, so say so.
