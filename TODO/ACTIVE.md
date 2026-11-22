@@ -51,9 +51,15 @@ two history rewrites; the maintainer's backups hold the maps.
    among them.
    - The status race was the test's (`test_status_renders_each_node_from_what_it_knows`, 22 of 30 under ASan):
      fixed in `d7929ad`, 60 of 60 since.
-   - Not reproduced: the catalogue SIGSEGV (`test_catalogue_sync_search_and_artwork_gc`, 90 of 90 under ASan,
-     one at a time) and the burst-rmdir heap corruption (`test_removing_empty_directories_in_a_burst_keeps_the_node_up`,
-     30 of 30). Each failed once in a full run under `--jobs 2`; next, repeats of the full suite under load.
+   - The catalogue SIGSEGV (`test_catalogue_sync_search_and_artwork_gc`) not reproduced: 90 of 90 under ASan,
+     and 7 full plain runs under `--jobs 3` clean for it.
+   - **Heap corruption, reproduced under load (plain build, 0.95.4, `--jobs 3`):** the burst-rmdir case
+     (`test_removing_empty_directories_in_a_burst_keeps_the_node_up`) SIGSEGV in 2 of 7 full runs, and
+     `test_publication_writer_failure_stays_invisible` aborted once with `malloc(): unaligned tcache chunk
+     detected` inside `dannan::net::RequestScheduler::stop` at the test node's stop (core read; evidence in
+     `build/evidence/heap-2026-11-22/`). Glibc caught it late, so the stop is where it surfaced, not the cause.
+     Alone, under ASan, both pass. Next: the ASan suite under load (`build/pi/heap-chase.sh`) for the first bad
+     access.
    - Live: found-issues 1 and 2 (heap corruption, the FUSE `rm` crash) are still open.
 5. **Repin onto Dannan 0.10.1 and Dagda 0.4.0** (0.4.0 carries 0.3.3's repair fix): read each release's notes and
    changelog, drop workarounds, use new APIs, record it in the repin commit.
