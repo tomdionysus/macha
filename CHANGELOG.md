@@ -1,5 +1,14 @@
 # Current release
 
+## 0.95.4: Status shows each node's control store, and says when one is nearly full
+
+- API: each `nodes[]` entry in `GET /api/v1/status` gains `control_storage` (`available`,
+  `capacity_bytes`, `used_bytes`, `free_bytes`): that node's control store against its limit,
+  from fresh telemetry (fields 1048 and 1049; a node on an earlier release reports nothing). A
+  node within 5% of its limit adds the condition `1 node's control storage is nearly full` and
+  makes the cluster `degraded`: a full control store refuses every metadata write on its node,
+  and Status said nothing of it.
+
 ## 0.95.3: an import submits each file's catalogue hint once; Status names each node's libraries
 
 A large import submitted every file's catalogue hint twice: once as the file landed, and again

@@ -1649,12 +1649,14 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
     // A peer met over the transport: its storage figures in its adverts, its telemetry
     // held back until asked for.
     constexpr uint64_t peer_capacity = 4ULL * 1024 * 1024 * 1024;
+    constexpr uint64_t peer_control_capacity = 8ULL << 30;
+    std::atomic_uint64_t peer_control_used{1ULL << 30};
     StandInPeer stand_in(cluster, "status-peer",
                          {.bootstrap = {{"127.0.0.1", config.port}},
                           .failure_domain = "test-lab",
                           .node_name = "Test Peer",
                           .telemetry =
-                              [](dannan::status::Telemetry& record) {
+                              [&peer_control_used](dannan::status::Telemetry& record) {
                                   HostedTelemetry hosted;
                                   hosted.storage_capacity = peer_capacity;
                                   // A measured zero differs from a missing observation.
@@ -1665,6 +1667,8 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
                                   hosted.api_endpoint = "http://192.0.2.51:7438";
                                   hosted.dannan_version = "0.9.2";
                                   hosted.dagda_version = "0.3.3";
+                                  hosted.control_storage_capacity = peer_control_capacity;
+                                  hosted.control_storage_used = peer_control_used.load();
                                   hosted.playback.startup_timeout_ms = 9000;
                                   hosted.playback.segment_timeout_ms = 3000;
                                   write_hosted_telemetry(record, hosted);
@@ -1827,6 +1831,29 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(cache->find("free_bytes")->asUInt64() == 1024);
         CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() ==
               sent->u64(dannan::status::field::rss_bytes));
+        const auto* control = entry->find("control_storage");
+        CHECK(control->find("available")->asBool());
+        CHECK(control->find("capacity_bytes")->asUInt64() == peer_control_capacity);
+        CHECK(control->find("used_bytes")->asUInt64() == (1ULL << 30));
+        const auto& conditions = root.find("cluster")->find("conditions")->asArray();
+        for (const auto& condition : conditions)
+            CHECK(condition.asString().find("control storage") == std::string::npos);
+    }
+
+    {
+        // A control store within 5% of its limit refuses writes soon: a condition, and
+        // the cluster degraded.
+        peer_control_used = peer_control_capacity - peer_control_capacity / 50;
+        stand_in.node().telemetry().refresh();
+        REQUIRE(wait_until(
+            [&] {
+                const auto root = get("/api/v1/status");
+                for (const auto& condition : root.find("cluster")->find("conditions")->asArray())
+                    if (condition.asString() == "1 node's control storage is nearly full")
+                        return root.find("cluster")->find("health")->asString() == "degraded";
+                return false;
+            },
+            15s));
     }
 
     {

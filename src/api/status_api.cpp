@@ -71,6 +71,13 @@ void merge_membership(PersistedNodeStatus& out, const NodeInfo& member) {
     out.metadata_generation = std::max(out.metadata_generation, member.metadata_generation);
 }
 
+// Within 5% of its limit: the store refuses a put it has no room for, and every
+// metadata write on that node with it.
+bool control_storage_full(const NodeTelemetry& telemetry) {
+    const auto capacity = telemetry.control_storage_capacity;
+    return capacity && telemetry.control_storage_used >= capacity - capacity / 20;
+}
+
 Json bytes_pair(uint64_t used, uint64_t capacity) {
     return Json::Object{{"available", true},
                         {"capacity_bytes", capacity},
@@ -323,6 +330,12 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     node["storage_backends_online"] =
         telemetry_available ? Json(static_cast<uint64_t>(effective.storage_backends_online))
                             : Json(nullptr);
+    // The control store (metadata objects) against its limit, from fresh telemetry only:
+    // a full one refuses every metadata write on that node.
+    node["control_storage"] =
+        live && !stale && live->control_storage_capacity
+            ? bytes_pair(live->control_storage_used, live->control_storage_capacity)
+            : unavailable_bytes();
 
     Json::Array roles;
     if (storage_capacity_for_roles)
@@ -632,6 +645,7 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
     size_t inbound_incapable_nodes = 0, known_hosting_nodes = 0, online_hosting_nodes = 0;
     size_t online_capable_hosting_nodes = 0;
     bool online_node_recovering = false;
+    size_t control_storage_full_nodes = 0;
     const auto local_resolution = node_.inbound_resolution();
     Json::Array nodes;
     for (const auto& [id, durable] : known) {
@@ -722,6 +736,8 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
             // telemetry can lag it; this signal surfaces remote peers' recovery only.
             if (id != node_.node_id() && current && !stale && current->phase != NodePhase::ready)
                 online_node_recovering = true;
+            if (current && !stale && control_storage_full(*current))
+                ++control_storage_full_nodes;
         }
         nodes.push_back(node_json(id, durable, member, current, age, online, stale, false,
                                   telemetry_available, metadata_replica, identity_reset,
@@ -777,6 +793,12 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
     if (online_node_recovering) {
         escalate(health, HealthSeverity::degraded);
         conditions.emplace_back("one or more online nodes are still recovering");
+    }
+    if (control_storage_full_nodes) {
+        escalate(health, HealthSeverity::degraded);
+        conditions.emplace_back(std::to_string(control_storage_full_nodes) + " node" +
+                                (control_storage_full_nodes == 1 ? "'s" : "s'") +
+                                " control storage is nearly full");
     }
     if (online_capacity < known_capacity) {
         escalate(health, HealthSeverity::degraded);

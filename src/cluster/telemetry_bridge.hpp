@@ -2,7 +2,7 @@
 #pragma once
 
 // Macha's telemetry in Dannan's record: the core fields Dannan fills, and Macha's own as
-// hosted fields 1024 to 1047, written here and read back into
+// hosted fields 1024 to 1049, written here and read back into
 // NodeTelemetry for Status and the views.
 
 #include "cluster/telemetry.hpp"
@@ -41,6 +41,8 @@ inline constexpr uint16_t playback_start_failed_retention_ms = 1044;
 inline constexpr uint16_t playback_transcode_rates = 1045;
 inline constexpr uint16_t dannan_version = 1046;
 inline constexpr uint16_t dagda_version = 1047;
+inline constexpr uint16_t control_storage_capacity = 1048;
+inline constexpr uint16_t control_storage_used = 1049;
 } // namespace hosted_field
 
 // The hosted fields in their order: NodeConfig::telemetry_layout.
@@ -52,6 +54,8 @@ struct HostedTelemetry {
     uint64_t storage_used{};
     uint64_t cache_capacity{};
     uint64_t cache_used{};
+    uint64_t control_storage_capacity{};
+    uint64_t control_storage_used{};
     uint64_t metadata_generation{};
     uint32_t storage_backends_online{};
     std::string api_endpoint;

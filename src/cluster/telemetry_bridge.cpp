@@ -14,7 +14,7 @@ namespace df = dannan::status::field;
 const std::vector<uint16_t>& hosted_telemetry_layout() {
     static const std::vector<uint16_t> layout = [] {
         std::vector<uint16_t> out;
-        for (uint16_t id = hf::storage_capacity; id <= hf::dagda_version; ++id)
+        for (uint16_t id = hf::storage_capacity; id <= hf::control_storage_used; ++id)
             out.push_back(id);
         return out;
     }();
@@ -31,6 +31,8 @@ void write_hosted_telemetry(dannan::status::Telemetry& record, const HostedTelem
     record.set_text(hf::api_endpoint, hosted.api_endpoint);
     record.set_text(hf::dannan_version, hosted.dannan_version);
     record.set_text(hf::dagda_version, hosted.dagda_version);
+    record.set_u64(hf::control_storage_capacity, hosted.control_storage_capacity);
+    record.set_u64(hf::control_storage_used, hosted.control_storage_used);
     const auto& p = hosted.playback;
     record.set_u32(hf::playback_startup_timeout_ms, p.startup_timeout_ms);
     record.set_u32(hf::playback_segment_timeout_ms, p.segment_timeout_ms);
@@ -143,6 +145,8 @@ std::optional<NodeTelemetry> node_telemetry_from(const dannan::status::Telemetry
         out.api_endpoint = record.text(hf::api_endpoint);
         out.dannan_version = record.text(hf::dannan_version);
         out.dagda_version = record.text(hf::dagda_version);
+        out.control_storage_capacity = record.u64(hf::control_storage_capacity);
+        out.control_storage_used = record.u64(hf::control_storage_used);
         out.playback_startup_timeout_ms = record.u32(hf::playback_startup_timeout_ms);
         out.playback_segment_timeout_ms = record.u32(hf::playback_segment_timeout_ms);
         out.playback_pipeline_idle_ms = record.u32(hf::playback_pipeline_idle_ms);

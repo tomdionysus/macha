@@ -317,9 +317,9 @@ MACHA_TEST("dannan_bridge", test_the_node_config_is_macha_config_key_by_key) {
 // writes them, hosted fields 1024 to 1045 in their order, nothing written for a zero, at
 // most 256 transcode rates, and one unreadable field drops that record alone.
 MACHA_TEST("dannan_bridge", test_telemetry_goes_into_the_record_and_back) {
-    REQUIRE(hosted_telemetry_layout().size() == 24);
+    REQUIRE(hosted_telemetry_layout().size() == 26);
     REQUIRE(hosted_telemetry_layout().front() == 1024);
-    REQUIRE(hosted_telemetry_layout().back() == 1047);
+    REQUIRE(hosted_telemetry_layout().back() == 1049);
 
     dannan::status::Telemetry record;
     dannan::identity::NodeId id;
@@ -342,6 +342,8 @@ MACHA_TEST("dannan_bridge", test_telemetry_goes_into_the_record_and_back) {
     hosted.api_endpoint = "http://192.0.2.50:7438";
     hosted.dannan_version = "0.9.2";
     hosted.dagda_version = "0.3.3";
+    hosted.control_storage_capacity = 8ULL << 30;
+    hosted.control_storage_used = 4764729344ULL;
     hosted.playback.startup_timeout_ms = 30000;
     hosted.playback.max_transcodes_per_account = 2;
     hosted.playback.start_failed_retention_ms = 60000;
@@ -377,6 +379,8 @@ MACHA_TEST("dannan_bridge", test_telemetry_goes_into_the_record_and_back) {
     REQUIRE(back->api_endpoint == "http://192.0.2.50:7438");
     REQUIRE(back->dannan_version == "0.9.2");
     REQUIRE(back->dagda_version == "0.3.3");
+    REQUIRE(back->control_storage_capacity == 8ULL << 30);
+    REQUIRE(back->control_storage_used == 4764729344ULL);
     REQUIRE(back->playback_startup_timeout_ms == 30000);
     REQUIRE(back->playback_max_transcodes_per_account == 2);
     REQUIRE(back->playback_start_failed_retention_ms == 60000);

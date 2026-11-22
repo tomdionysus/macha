@@ -157,6 +157,14 @@ void NodeRuntime::write_telemetry(dannan::status::Telemetry& record) const {
     hosted.storage_used = figures.used;
     hosted.cache_capacity = figures.cache_capacity;
     hosted.cache_used = figures.cache_used;
+    {
+        Lock lock(control_storage_mutex_);
+        if (control_storage_) {
+            const auto control = control_storage_();
+            hosted.control_storage_capacity = control.capacity;
+            hosted.control_storage_used = control.used;
+        }
+    }
     hosted.metadata_generation = advertised_metadata_generation_.load(std::memory_order_relaxed);
     hosted.storage_backends_online = static_cast<uint32_t>(figures.backends_online);
     hosted.api_endpoint = advertised_api_endpoint(cfg_.catalogue.api, members_.self().host);
@@ -533,6 +541,11 @@ void NodeRuntime::follow_inbound() {
     Lock lock(hosts_mutex_);
     if (hosts_listener_)
         hosts_listener_(hosts);
+}
+
+void NodeRuntime::follow_control_storage(std::function<ControlStorageFigures()> reader) {
+    Lock lock(control_storage_mutex_);
+    control_storage_ = std::move(reader);
 }
 
 void NodeRuntime::follow_hosts_extents(std::function<void(bool)> listener) {

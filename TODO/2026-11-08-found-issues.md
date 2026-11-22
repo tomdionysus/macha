@@ -38,7 +38,11 @@ Ordered by what they cost a user.
    and repair runs as on live-b.
 2. **`rm` in the FUSE mount with a filter can crash macha** (operator's report, 2026-11-06). Not reproduced
    here; may be item 1.
-3. **A full control store is silent and costly** (run). live-a's `metadata-objects` reached its 4G limit at
+3. **A full control store is silent and costly** (run). **2026-11-22, 0.95.4:** Status shows each node's
+   `control_storage` and a condition within 5% of the limit (the silent half). The retry half is unproven on the
+   ported code: a catalogue hint whose commit the store refuses defers a fixed `provider_batch_delay` (30 s) and
+   never backs off further; the several-a-second loop below was on Macha's own store. Next: a case with a tiny
+   control limit that counts put attempts, then bounded exponential backoff where it spins, and on the hints. live-a's `metadata-objects` reached its 4G limit at
    about 21:16Z on 2026-11-06. Every control put was refused (`LocalStore::physical_space_available_locked`),
    namespace writes on live-a failed (`namespace node could not be written locally`), and two catalogue
    shards were retried several times a second with no backoff: 73,842 warnings, about 18% of a core, which also

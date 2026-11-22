@@ -467,6 +467,15 @@ set it came in.
 full (`0.9.2`) as the loaded library reports itself. They come from the node's
 telemetry alone: `null` when the node has sent none or does not report them.
 
+`nodes[].control_storage` is that node's control store (metadata objects,
+`storage.metadata`) against its limit: `{available, capacity_bytes, used_bytes,
+free_bytes}`, from fresh telemetry only (`available` false and the figures
+`null` otherwise). A full control store refuses every metadata write on its
+node, so a node within 5% of its limit adds the condition `N node's control
+storage is nearly full` (or `nodes'`) and makes the cluster `degraded`. Room
+comes back as maintenance collects garbage (`maintenance.collect_garbage`) or
+when the limit is raised.
+
 `nodes[].traffic` is each node's own cluster traffic by frame class:
 `{as_of_unix_ms, window_ms, classes}`, where `classes` has one entry per class
 with `class` (`control`, `foreground`, `read_ahead`, `speculative`, `loader`;

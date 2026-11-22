@@ -557,6 +557,9 @@ void Service::initialise_services(const std::stop_token& stop) {
             node_.follow_hosts_extents([server = &store_node_->server()](bool hosts) {
                 server->set_hosts_extents(hosts);
             });
+            node_.follow_control_storage([control = &store_node_->control()] {
+                return ControlStorageFigures{control->limit(), control->used()};
+            });
             local_ = std::make_unique<LocalServices>(node_.config(), node_.identity(), progress_,
                                                      recovery_stage_hook_, stop, node_,
                                                      store_node_->context(), routes_);
@@ -685,6 +688,7 @@ void Service::stop() {
     // After everything that writes into the store, before the node beneath it.
     note_lifecycle("stop store");
     node_.follow_hosts_extents({});
+    node_.follow_control_storage({});
     store_node_->stop();
     request_stop();
     note_lifecycle("stop status");

@@ -67,6 +67,10 @@ struct NodeTelemetry {
     uint64_t storage_used{};
     uint64_t cache_capacity{};
     uint64_t cache_used{};
+    // The control store (metadata objects): its limit and the bytes it holds. Zero
+    // capacity: not reported.
+    uint64_t control_storage_capacity{};
+    uint64_t control_storage_used{};
     // Block-cache activity, monotonic since start; consumers diff them.
     // cache_used reflects writes only; these show whether the cache serves,
     // which is all an edge node (hosts_extents false) serves from.

@@ -52,6 +52,12 @@ struct NodeReadiness {
     std::string error;
 };
 
+// A node's control store, as its telemetry reports it: the limit and the bytes held.
+struct ControlStorageFigures {
+    uint64_t capacity{};
+    uint64_t used{};
+};
+
 // The client API URL a node advertises: the configured endpoint as given (it
 // may sit behind a TLS proxy), else http on the advertised RPC host and the
 // API port, never the usually undialable listen address; empty with no API.
@@ -91,6 +97,10 @@ class NodeRuntime : public ClusterNode {
     // store's server, which alone writes the advert.
     Mutex hosts_mutex_;
     std::function<void(bool)> hosts_listener_ MACHA_GUARDED_BY(hosts_mutex_);
+    // Reads the control store's figures for telemetry: the store node's, once open.
+    mutable Mutex control_storage_mutex_;
+    std::function<ControlStorageFigures()>
+        control_storage_ MACHA_GUARDED_BY(control_storage_mutex_);
 
     std::atomic_uint64_t remote_metadata_generation_{};
     // Raises it to `generation` if higher, never lowers it: two readers that
@@ -170,6 +180,10 @@ class NodeRuntime : public ClusterNode {
     // answer moves; an empty one stops. Thread-safe; the listener runs under
     // a lock and must not call back.
     void follow_hosts_extents(std::function<void(bool)> listener);
+    // What this node's telemetry reports of its control store, read at each refresh; an
+    // empty reader reports nothing. Thread-safe; the reader runs under a lock and must
+    // not call back.
+    void follow_control_storage(std::function<ControlStorageFigures()> reader);
     void start();
     void request_stop();
     // Closes client routes and fails every pending synchronous call now, so
