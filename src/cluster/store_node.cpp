@@ -114,6 +114,7 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
     out.repair.idle_bandwidth_fraction = config.maintenance.idle_bandwidth_fraction;
     out.repair.initial_bandwidth = config.maintenance.initial_bandwidth;
     out.repair.max_bandwidth = config.maintenance.max_bandwidth;
+    out.repair.max_window_bytes = repair_window_bytes(config);
     out.repair.cpu_target = config.maintenance.cpu_target;
     out.repair.extent_size = config.extent_size;
 
@@ -128,6 +129,10 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
     out.maintenance.scrub_interval = config.maintenance.scrub_interval;
     out.maintenance.cpu_target = config.maintenance.cpu_target;
     return out;
+}
+
+uint64_t repair_window_bytes(const Config& config) {
+    return std::max<uint64_t>(config.runtime.retained_memory_bytes / 8, config.extent_size);
 }
 
 dagda::NodeReload store_node_reload(const Config& config) {

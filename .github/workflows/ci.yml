@@ -17,7 +17,7 @@ permissions:
 
 env:
   DANNAN_VERSION: "0.9.2"
-  DAGDA_VERSION: "0.3.2"
+  DAGDA_VERSION: "0.3.3"
 
 jobs:
   build-and-test:

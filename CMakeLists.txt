@@ -8,7 +8,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.95.1 LANGUAGES CXX)
+project(macha VERSION 0.95.2 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -159,7 +159,7 @@ find_package(yaml-cpp QUIET)
 # minor (a patch keeps the minor's ABI; a minor is a new API).
 find_package(dannan 0.9.2 CONFIG REQUIRED)
 # The store: Dagda, the exact release, built on the same Dannan.
-find_package(dagda 0.3.2 CONFIG REQUIRED)
+find_package(dagda 0.3.3 CONFIG REQUIRED)
 
 # Some environments expose a static CURL::libcurl without its transitive link
 # dependencies. Prefer pkg-config's complete imported target when available.

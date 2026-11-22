@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/public_connectivity.hpp"
+#include "cluster/store_node.hpp"
 #include "coverage.hpp"
 #include "fuse/fuse_mountpoint.hpp"
 #include "macha_version.hpp"
@@ -25,6 +26,26 @@ using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
+
+// Repair's in-flight bytes are bounded by the memory budget, not by what it
+// takes the link to be: an eighth of the retained-memory budget, never less
+// than an extent, and the store's repair is given that bound.
+MACHA_TEST("foundations", test_repairs_window_follows_the_memory_budget) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("repair-window");
+    config.extent_size = 4ULL * 1024 * 1024;
+    config.runtime.retained_memory_bytes = 768ULL * 1024 * 1024;
+    CHECK(repair_window_bytes(config) == 96ULL * 1024 * 1024);
+    CHECK(store_node_options(config, cluster.keys(), true, 10ms).repair.max_window_bytes ==
+          96ULL * 1024 * 1024);
+    // No cap on the link's rate is needed for the bound to hold.
+    CHECK(store_node_options(config, cluster.keys(), true, 10ms).repair.max_bandwidth == 0);
+
+    config.runtime.retained_memory_bytes = 16ULL * 1024 * 1024;
+    CHECK(repair_window_bytes(config) == config.extent_size);
+    CHECK(store_node_options(config, cluster.keys(), true, 10ms).repair.max_window_bytes ==
+          config.extent_size);
+}
 
 MACHA_FAST_TEST("foundations", test_spool_retirement_rate_is_aggregate) {
     SpoolRetirementRateEstimator rate;
@@ -940,8 +961,8 @@ MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorre
     // and it may resolve to a NATed address the node does not hold.
     config.listen_interfaces.clear();
     config.listen_port = 6881;
-    for (const auto* name : {"live-b.example.net", "live-a.example.net", "localhost",
-                             "node-1", "example.com."}) {
+    for (const auto* name :
+         {"live-b.example.net", "live-a.example.net", "localhost", "node-1", "example.com."}) {
         CHECK(torrent_listen_interfaces(config, name) == "0.0.0.0:6881,[::]:6881");
     }
 

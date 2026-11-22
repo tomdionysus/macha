@@ -719,6 +719,8 @@ Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control conver
 
 The credit rate is the node's measured throughput to its peers, or `idle_bandwidth_fraction` of it while a higher class is present. Only transfers of at least half an extent are measured: a smaller one is mostly a round trip and the far end's write, and counting it put the estimate at a few percent of the real link.
 
+**Repair's memory follows the node's budget, not the link.** The bytes repair has in flight are at most an eighth of `runtime.retained_memory_bytes`, never less than one extent, however fast the link is measured to be. Resident, that is the window queued to send plus about one extent being read.
+
 **A peer's viewers pace repair too.** When another node reports foreground or read-ahead cluster traffic (`nodes[].traffic` in Status) in its latest telemetry, repair takes its weighted turns exactly as it does for this node's own viewers: its transfers share those viewers' links. It is paced, never stopped. A node is usually serving someone, and a copy not restored now makes a later viewer wait.
 
 `diagnostics.repair.pass_gates` counts steps that `ran`, passes turned away by `share` or a `quiescent` wait, and steps that stopped for `credit`.

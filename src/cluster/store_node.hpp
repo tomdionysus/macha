@@ -20,6 +20,11 @@ dagda::NodeOptions store_node_options(const Config& config, const ClusterKeys& k
                                       bool hosts_extents,
                                       std::chrono::milliseconds durability_batch_window);
 
+// The bytes repair may have in flight, whatever it takes the link to be: an
+// eighth of the retained-memory budget, at least one extent. Resident, that is
+// the window queued to send plus about an extent being read.
+uint64_t repair_window_bytes(const Config& config);
+
 // What a live reload changes on the store node: its DATA backends and its
 // cache, from the same keys as its options.
 dagda::NodeReload store_node_reload(const Config& config);

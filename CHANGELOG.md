@@ -1,5 +1,19 @@
 # Current release
 
+## 0.95.2: repair's memory is bounded by the node's budget
+
+Repair could take a node past its memory: a node of 8 GB was killed for memory twice while
+pushing copies to its peer. The store's estimate of the link jumped a thousandfold on a bad
+sample (about 20 GiB/s on a 10 MiB/s link), repair's window is five seconds of that estimate,
+and a push step read every object it planned before sending any.
+
+- Built on Dagda 0.3.3, which fixes the sample, sends each object as it is read, and bounds the
+  window by a number the host sets.
+- Macha sets that bound from its memory budget: an eighth of `runtime.retained_memory_bytes`,
+  never less than an extent (96 MiB at the default 768 MiB). Resident, that is the window queued
+  to send plus about one extent being read.
+- `maintenance.max_bandwidth` is not needed for this and stays a limit on the link's rate only.
+
 ## 0.95.1: a file being written keeps its name through a lagging view
 
 FUSE: a large file copied into the mount of a two-node cluster could commit short,
