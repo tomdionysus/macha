@@ -1751,19 +1751,31 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
     }
 
     stand_in.node().telemetry().refresh();
+    // What the peer measured of itself, as it sent it, and the status that shows it. The
+    // peer may measure again (a phase change refreshes it), so the two are read together:
+    // the status whose sample is the peer's latest.
+    using Sample = std::decay_t<decltype(*stand_in.node().telemetry().local())>;
+    std::optional<Sample> sent;
+    std::optional<Json> fresh;
     REQUIRE(wait_until(
         [&] {
-            const auto root = get("/api/v1/status");
+            auto root = get("/api/v1/status");
             const auto* entry = node_entry(root, peer.id);
-            return entry && entry->find("telemetry_freshness")->asString() == "live";
+            if (!entry || entry->find("telemetry_freshness")->asString() != "live")
+                return false;
+            auto local = *stand_in.node().telemetry().local();
+            if (entry->find("traffic")->find("as_of_unix_ms")->asUInt64() !=
+                local.observed_unix_ms())
+                return false;
+            sent = std::move(local);
+            fresh = std::move(root);
+            return true;
         },
         15s));
-    // What the peer measured of itself, as it sent it.
-    const auto sent = *stand_in.node().telemetry().local();
 
     {
         // Fresh telemetry.
-        const auto root = get("/api/v1/status");
+        const auto& root = *fresh;
         const auto* entry = node_entry(root, peer.id);
         REQUIRE(entry != nullptr);
         CHECK(entry->find("telemetry_freshness")->asString() == "live");
@@ -1778,7 +1790,7 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(entry->find("playback")->find("segment_timeout_ms")->asInt64() == 3000);
         const auto* traffic = entry->find("traffic");
         REQUIRE(traffic != nullptr);
-        CHECK(traffic->find("as_of_unix_ms")->asUInt64() == sent.observed_unix_ms());
+        CHECK(traffic->find("as_of_unix_ms")->asUInt64() == sent->observed_unix_ms());
         CHECK(traffic->find("window_ms")->asUInt64() == 10000);
         const auto& classes = traffic->find("classes")->asArray();
         REQUIRE(classes.size() == 1);
@@ -1799,12 +1811,19 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(cache->find("used_bytes")->asUInt64() == 0);
         CHECK(cache->find("free_bytes")->asUInt64() == 1024);
         CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() ==
-              sent.u64(dannan::status::field::rss_bytes));
+              sent->u64(dannan::status::field::rss_bytes));
     }
 
     {
-        // Past the fixed 5 s freshness floor: the peer gone quiet, still a member.
+        // Past the fixed 5 s freshness floor: the peer gone quiet, still a member. Its last
+        // sample is the one the status holds once it has stopped sending, which need not be
+        // the last it measured.
         stand_in.stop();
+        const auto held = get("/api/v1/status");
+        const auto* held_entry = node_entry(held, peer.id);
+        REQUIRE(held_entry != nullptr);
+        const auto held_rss = held_entry->find("runtime")->find("rss_bytes")->asUInt64();
+        const auto held_uptime = held_entry->find("runtime")->find("uptime_ms")->asUInt64();
         std::this_thread::sleep_for(5200ms);
         const auto root = get("/api/v1/status");
         const auto* entry = node_entry(root, peer.id);
@@ -1817,10 +1836,9 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(!root.find("cluster")->find("storage_online")->find("available")->asBool());
         // Runtime figures survive: nothing aggregates them and the entry
         // states their age.
-        CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() ==
-              sent.u64(dannan::status::field::rss_bytes));
-        CHECK(entry->find("runtime")->find("uptime_ms")->asUInt64() ==
-              sent.u64(dannan::status::field::uptime_ms));
+        CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() == held_rss);
+        CHECK(entry->find("runtime")->find("uptime_ms")->asUInt64() == held_uptime);
+        CHECK(held_rss > 0);
         CHECK(entry->find("live_age_ms")->asUInt64() >= 5000);
     }
 
