@@ -133,7 +133,7 @@ Deleting an unreachable object is less safety-critical than publishing a new ref
 Namespace deletion completion is not physical deletion completion. The accepted
 metadata mutation and grouped FUSE journal markers establish the namespace
 result; physical DATA reclamation occurs later, after grace and retention
-fences, through a resumable cursor capped at 64 examined objects per maintenance
+fences and only while `maintenance.collect_garbage` is set, through a resumable cursor capped at 64 examined objects per maintenance
 slice. Foreground playback, mounted-filesystem or loader activity makes the slice yield.
 This bound affects reclamation latency, not namespace publication latency.
 

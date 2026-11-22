@@ -94,7 +94,7 @@ Metadata may reference a new DATA object once a node present holds it. Before th
 
 ## Local backend selection
 
-Within a node, `StoragePool` ranks configured backends by the same stable capacity-aware principle. A full/offline preferred backend falls through to another local backend. The node advertises the aggregate eligible configured DATA capacity, not the smallest backend.
+Within a node, the store's `StoragePool` ranks configured backends by the same stable capacity-aware principle. A full/offline preferred backend falls through to another local backend. The node advertises the aggregate eligible configured DATA capacity, not the smallest backend.
 
 ## Physical representation
 
@@ -169,7 +169,7 @@ The cache may retain a useful fetched copy independently, but that cache copy do
 
 Committed metadata is reachability authority. MachaDFS file extents and catalogue artwork contribute to the DATA live set. Catalogue manifests/shards, and every namespace tree node reachable from a tree-backed root, contribute to a separate CONTROL live set, both in the maintenance inventory the collector sweeps against and in the release horizon claims are released against. A tree node that cannot be read leaves the inventory unbuilt and the release horizon incomplete, so nothing is collected or released against a partial set.
 
-Collection reads this node's own state only: it waits for no other node. What protects another node's references is time. An object's bytes go only once this node has itself seen the object unreferenced and unclaimed for `maintenance.garbage_grace_ms` (the absence horizon, 30 days by default), measured on its own clock from its own first sighting. The sightings are kept in `<state_path>/retention/unreferenced-data.bin` and `unreferenced-control.bin`, so a restart does not restart the wait, and a node back from a long absence removes nothing before its own grace has run. This also protects failed publications, convergence lag and recently retired references. DATA and CONTROL are swept separately.
+Nothing is reclaimed unless `maintenance.collect_garbage` is true (see [Configuration](configuration.md#maintenance)). Collection reads this node's own state only: it waits for no other node. What protects another node's references is time. An object's bytes go only once this node has itself seen the object unreferenced and unclaimed for `maintenance.garbage_grace_ms` (the absence horizon, 30 days by default), measured on its own clock from its own first sighting. The sightings are kept in `<state_path>/retention/unreferenced-data.bin` and `unreferenced-control.bin`, so a restart does not restart the wait, and a node back from a long absence removes nothing before its own grace has run. This also protects failed publications, convergence lag and recently retired references. DATA and CONTROL are swept separately.
 
 The cost is stated: if an object is deleted on one side of a separation and still used on the other, and the separation outlasts the horizon, the merged file may have extents nobody holds. The availability survey reports such a file as incomplete (see [Files and availability](files.md)).
 
@@ -177,6 +177,8 @@ Packed logical deletion does not rewrite neighboring live objects immediately; d
 
 ## Fresh-storage boundary
 
-The storage implementation is intentionally not a live migration layer. A fresh state namespace is marked `macha-state-layout-v18`; DATA backends are marked `macha-backend-v18`. Non-empty unversioned state or DATA is refused.
+The store is Dagda's, and it opens its own layout alone. A state directory is marked `dagda-state-layout-v19` in `<state_path>/storage-layout`; each DATA backend carries a `dagda-backend-v19` marker in `.macha.backend` at its root, mirrored under `<state_path>/backend-identities/`. A state directory holding a store's files without the marker is refused, as is a backend directory holding files without one; a new store begins only beside the node's own files (key custody, Dannan's state), and a new backend only in an empty directory.
+
+A state or backend in Macha's earlier layout v18 is refused with a reason naming `dagda-migrate`, which converts it in place with the node stopped and proves with before-and-after manifests that nothing was lost. See Dagda's [migration guide](https://github.com/tomdionysus/dagda/blob/main/docs/migration.md) and `dagda-migrate(1)`.
 
 This prevents an older physical representation from being silently accepted under new durability/placement semantics.

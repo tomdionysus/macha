@@ -35,7 +35,7 @@ When disconnected branches meet, replicas exchange accepted heads and merge them
 
 Reconciliation itself is an ordinary immutable commit with multiple parents, accepted like any other. Values changed on both branches that are not namespace entries (policy scalars, conflict records) join deterministically, so they never fail a merge.
 
-A second accepted head whose namespace cannot be fetched from any node present is set aside until the membership changes. Meanwhile reads serve the node's own head, writes extend it and claim release follows it. A head that has been set aside for `maintenance.garbage_grace_ms` is dropped, since whatever held its content is not coming back; the times are kept in `<state_path>/metadata/set-aside.meta`, so a restart does not restart the wait. `diagnostics.metadata.heads_set_aside` in `GET /api/v1/status` counts the heads set aside.
+A second accepted head whose namespace cannot be fetched from any node present is set aside until the membership changes. Meanwhile reads serve the node's own head, writes extend it and claim release follows it. A head that has been set aside for `maintenance.garbage_grace_ms` is dropped, since whatever held its content is not coming back; the times are kept in `<state_path>/metadata/set-aside.meta`, so a restart does not restart the wait. `diagnostics.metadata.heads_set_aside` in `GET /api/v1/status/diagnostics` counts the heads set aside.
 
 ## Authors and provenance
 
@@ -171,7 +171,7 @@ A snapshot also carries `torrent_requests`: the torrents the cluster has been as
 
 Reconciliation joins the collection per request instead of recording conflicts: every field has a deterministic merge (cancel is final; a later claim epoch wins; within one epoch a request never moves backwards; removal wins), so the merge is commutative, associative and idempotent and never needs an operator. Removed requests stay as tombstones for seven days so a branch that has not seen the removal cannot bring one back.
 
-SM17, SM19, DLT10 and DLT11 belong to cluster protocol 23, which every node in the cluster must run.
+Every node in the cluster must read SM17, SM19, DLT10 and DLT11.
 
 ## Clocks and dots in the encodings
 

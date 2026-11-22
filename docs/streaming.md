@@ -189,7 +189,7 @@ playback[a1b2c3d4] first fragment ready elapsed_ms=...
 playback[a1b2c3d4] session create complete ... elapsed_ms=...
 ```
 
-`probe_timeout_ms` places one wall-clock bound on the complete representation-selection pass; candidate media IDs share the remaining budget. The same deadline is propagated through `ReadHandle` into remote DHT object fetches, where an outstanding media RPC is cancelled when it expires. `startup_timeout_ms` independently bounds the wait for the first transformed fragment. A 503 therefore identifies whether inspection or transformed-output startup failed instead of presenting as one long opaque request.
+`probe_timeout_ms` places one wall-clock bound on the complete representation-selection pass; candidate media IDs share the remaining budget. The same deadline is propagated through `ReadHandle` into the store's object reads, so a fetch from a peer still outstanding when it expires is cancelled. `startup_timeout_ms` independently bounds the wait for the first transformed fragment. A 503 therefore identifies whether inspection or transformed-output startup failed instead of presenting as one long opaque request.
 
 Playback/probe/seek object reads are foreground traffic. Foreground demand is
 recorded before storage access begins and lower-priority DATA RPC execution

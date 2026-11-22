@@ -1,7 +1,7 @@
 # Ebooks as a media class
 
 Status: design, for the operator's review (2026-11-04). Supersedes the
-general proposal in `docs/macha-ebooks-proposal.md` for the server side; that
+general proposal in `archive/2026-09-macha-ebooks-proposal.md` for the server side; that
 document still holds the user experience, the provider references and the
 client reader choice.
 

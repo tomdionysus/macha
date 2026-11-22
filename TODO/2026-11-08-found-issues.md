@@ -1,8 +1,8 @@
 # Issues found, 2026-11-06 to 2026-11-08
 
 Everything found while answering the port question, taking the Pi baselines and reviewing the libraries'
-work. Each item says how it was found (run, or read only), where it stands, and who owns it. Macha's code is
-frozen until the port starts; "after the freeze" means fix it in Macha then, under the operator's rule that a
+work. Each item says how it was found (run, or read only), where it stands, and who owns it. Macha's code was
+frozen for the port, which is now live; "after the freeze" means now, under the operator's rule that a
 genuine Macha defect is fixed in Macha first and the libraries match the fix.
 
 ## Fixed
@@ -51,6 +51,8 @@ Ordered by what they cost a user.
    restarted (2026-11-06 15:51Z). Hints not yet submitted were lost, so some imported files may not be catalogued.
    The rewrite per submission is the import-end defect already in `BACKLOG.md`.
 5. **Claims on peers are best effort, and nothing restores a lost one** (read, Dagda's trace, citations checked).
+   **Closed in Macha by 0.95.0**: claims are Dagda's (`retain_on` and `distributed_store.cpp` are gone); whether Dagda
+   restores a lost claim is Dagda's question.
    `MetadataManager::replication_loop` drops claims at stop (`metadata_manager.cpp:131`), on a failed call
    (`:136`) and over the byte cap (`:101`); `retain_on` swallows failures (`distributed_store.cpp:840-843`),
    discarded at `node_services.cpp:549`; `ClaimWalk::step` reads only claims a node already has. The data is
@@ -90,6 +92,8 @@ Ordered by what they cost a user.
     everywhere is one rule: change the state under M, or take and release M before notifying (Dannan's
     `wake_loops`); wait for a stop through the `stop_token` overload; a predicate must read what its notifier
     changes; a time-based predicate needs a timed wait.
+    The `distributed_store.cpp`, `net.cpp` and `durability_domain.cpp` sites below are closed by 0.94.0 and 0.95.0,
+    which removed those files; the FUSE, torrent, hydration, media-information and cluster sites stand.
     - **Stop can hang until systemd's kill** (plain wait whose predicate reads the jthread stop token; `request_stop`
       and notify outside M): `~DistributedStore` local writer (`distributed_store.cpp:1185-1187` vs `:3159`);
       `RpcServer::stop`'s four worker pools (`net.cpp:4140-4148` vs `:4498`, `:4518`, `:4539`, `:4628`);
@@ -120,7 +124,8 @@ Ordered by what they cost a user.
       with no notify (`data_work.hpp`, bounded by the no-progress window if non-zero); cancels into
       `retained_memory.hpp:263`; `finish_loader_admission`/`wait_for_loader_admission`, possibly dead code.
     - Clean: about 150 sites. The connectivity loop is clean. These may bear on past slow stops; not shown.
-15. **Found by Dagda in Macha's code, 2026-11-08 and 09** (Dagda's reading and tests, cited lines not re-read here;
+15. **Closed in Macha by 0.95.0** (`local_store.cpp`, `storage_pool.cpp` and the old sweep are gone; the store is
+    Dagda's, which fixed the first in its own tree). **Found by Dagda in Macha's code, 2026-11-08 and 09** (Dagda's reading and tests, cited lines not re-read here;
     the operator ruled fixed in Dagda now, in Macha after the freeze):
     - **A pack compaction can lose an object** (Dagda pinned it with a test that failed first). A packed put's record is in the
       active pack but not yet indexed; compaction counts it dead, can take the active pack as its victim and unlink it,
@@ -143,8 +148,8 @@ Ordered by what they cost a user.
 
 18. **The async playback start leaks its candidate session** (run: the CI gate's ASan stage, 2026-11-12). A
     `shared_ptr` cycle between the start and its candidate, `playback.cpp` `create`, since `63642c8` (2026-09-28):
-    one session and all it holds per async transcode start, on both nodes since. Defect, checked plan and
-    verification: `2026-11-12-playback-start-leak.md`. Waiting on the operator's go; fixed in Macha before 0.94.1.
+    one session and all it holds per async transcode start. **Fixed in 0.94.1**
+    (`archive/2026-11-12-playback-start-leak.md`).
 
 ## The live cluster
 

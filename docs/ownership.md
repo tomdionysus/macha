@@ -53,20 +53,18 @@ or dropping its byte accounting.
   may enter the bounded materialization cache.
 - Hydration owns one fixed worker set and at most `max_inflight` queued/running
   tasks. It never creates a thread per object.
-- RPC owns queued request payloads in separate metadata, fast-control, control
-  and DATA byte pools. Dequeue, cancellation and shutdown transfer or release
-  the corresponding byte ownership. Each peer/session writer also owns a
-  128 MiB-bounded outbound queue (plus at most its one currently-written
-  message), and pending reply identities are count-bounded and erased by reply,
-  cancellation, disconnect or shutdown. A reply the queue or the retained-memory
-  budget cannot take is replaced by a `503 transport_busy` refusal; those
-  refusals may exceed the queue's message limit by one per reply a caller can
-  await (512), and beyond that the connection is closed, so every admitted
-  request is answered.
-- Retention-before-metadata object checks and claim batches use a bounded
-  ordinary-control call. Fast health success cannot leave one of these callers
-  waiting forever behind a wedged control worker: the `dead_after` deadline
-  aborts the exact route and releases its request/promise ownership.
+- The transport's queues are [Dannan's](https://github.com/tomdionysus/dannan):
+  queued request payloads in separate ordered (metadata), fast-control,
+  control and DATA byte pools; a 128 MiB-bounded outbound queue per session;
+  count-bounded pending replies erased by reply, cancellation, disconnect or
+  shutdown; and a `transport_busy` refusal in place of a reply the queue cannot
+  take, so every admitted request is answered. Macha's messages carry their
+  retained-memory leases across every executor handoff.
+- Retention claims made before a metadata commit are the store's, through a
+  call with the metadata deadline. Every cluster call names its own deadline
+  (control 2 min, metadata 5 min, object transfer 30 min, presence probe 2
+  min); a call that passes it is cancelled and its request and promise
+  released.
 - Playback probe and subtitle caches have independent count/byte ceilings.
   Provider response caches have a conservative resident-byte ceiling.
 - Failed media-profile publication owns at most 128 results / 4 MiB in each

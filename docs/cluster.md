@@ -2,11 +2,14 @@
 
 ## Membership
 
-Each node has a persistent random node ID, advertised endpoint, configured failure domain and DATA capacity. Bootstrap endpoints are discovery seeds, not masters. Once connected, peers exchange membership and maintain separate CONTROL and DATA transport lanes. Every peer socket asks the kernel for BBR congestion control: a loss-based sender keeps the bottleneck's buffer full, and control frames on their own lane would wait in that queue behind DATA; BBR sends at the measured bottleneck rate and keeps it near empty, and an idle control socket resumes at that rate rather than in slow start. Where the kernel does not offer BBR the node logs one warning and uses the system default.
+Each node has a persistent random node ID, advertised endpoint, configured failure domain and DATA capacity. Its node key is held in key custody (see [Configuration](configuration.md#key-custody)). Bootstrap endpoints are discovery seeds, not masters. Once connected, peers exchange membership and maintain separate CONTROL and DATA transport lanes. Every peer socket asks the kernel for BBR congestion control: a loss-based sender keeps the bottleneck's buffer full, and control frames on their own lane would wait in that queue behind DATA; BBR sends at the measured bottleneck rate and keeps it near empty, and an idle control socket resumes at that rate rather than in slow start. Where the kernel does not offer BBR the node logs one warning and uses the system default.
 
-The cluster protocol version is 23. Mixed-version operation is rejected at the
-handshake rather than negotiated down, so every node in a cluster runs the same
-version and a protocol change is a rolling upgrade of the whole cluster.
+The transport, roster, telemetry and inbound reachability are
+[Dannan](https://github.com/tomdionysus/dannan)'s, and the object store beneath
+the namespace is [Dagda](https://github.com/tomdionysus/dagda)'s; their own
+documentation covers their internals. Run the same Macha release on every node:
+a release whose nodes cannot talk to the one before it says so in the
+[CHANGELOG](../CHANGELOG.md), and is an upgrade of the whole cluster together.
 
 Each node's gossiped record carries two self-declared bits, `inbound_capable`
 and `hosts_extents` (see `network.inbound_capable` and
@@ -45,14 +48,15 @@ When a node or backend cannot admit a preferred object, writers can use the next
 
 Recovery is layered rather than global:
 
-1. **state identity** - reject non-empty state that does not carry the fresh storage-layout marker;
-2. **mount preflight** - before services start, verify the configured mountpoint; optionally remove only a stale Macha/FUSE mount;
-3. **DATA backends** - validate backend identity, rebuild accounting after unclean shutdown, reconstruct pack indexes;
-4. **namespace metadata** - recover the local checkpoint/history and accepted-head certificates, then discover/reconcile additional accepted heads from peers;
-5. **FUSE journal** - reconstruct accepted local mutations and resume publication;
-6. **catalogue control** - fetch missing manifest/shards from metadata peers and converge them;
-7. **DATA repair** - restore desired placement/replica count from an accepted live metadata view;
-8. **cache** - rebuild/discard opportunistically.
+1. **key custody** - open the node's custody with its credential, or refuse to start saying which part is missing;
+2. **state identity** - reject a state directory holding a store without Dagda's layout v19 marker; a layout v18 state names `dagda-migrate` (see [Storage](storage.md#fresh-storage-boundary));
+3. **mount preflight** - before services start, verify the configured mountpoint; optionally remove only a stale Macha/FUSE mount;
+4. **DATA backends** - validate backend identity, rebuild accounting after unclean shutdown, reconstruct pack indexes, read the held ledgers;
+5. **namespace metadata** - recover the local checkpoint/history and accepted-head certificates, then discover/reconcile additional accepted heads from peers;
+6. **FUSE journal** - reconstruct accepted local mutations and resume publication;
+7. **catalogue control** - fetch missing manifest/shards from metadata peers and converge them;
+8. **DATA repair** - restore desired placement/replica count from an accepted live metadata view;
+9. **cache** - rebuild/discard opportunistically.
 
 No external catalogue provider is required for correctness recovery.
 

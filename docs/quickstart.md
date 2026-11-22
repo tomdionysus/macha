@@ -30,15 +30,15 @@ brew install --cask macfuse
 
 libtorrent-rasterbar (2.0 or later) is optional: without it the BitTorrent acquisition plugin is simply not built. FUSE 3 or macFUSE builds the mount plugin; without it the node runs with no mount. Everything else is required. Do not install a second Boost alongside the one your libtorrent-rasterbar was built with: the torrent plugin compiled against mismatched Boost headers can crash at runtime. Debian 12 and Ubuntu 22.04 ship FFmpeg versions that are too old. For Arch, MacPorts, the FFmpeg version check and the full installation procedure, see [install-linux.md](install-linux.md) and [install-macos.md](install-macos.md).
 
-Then build and install [Dannan](https://github.com/tomdionysus/dannan) 0.6.0, the cluster transport (UPnP port mapping comes with it), then [Dagda](https://github.com/tomdionysus/dagda) 0.1.5, the store, and Macha against them:
+Then build and install [Dannan](https://github.com/tomdionysus/dannan) 0.9.2, the cluster transport (UPnP port mapping and `dannan-custody` come with it), then [Dagda](https://github.com/tomdionysus/dagda) 0.3.3, the store, and Macha against them. Both are shared libraries, installed under `/usr/local` (on Linux, run `sudo ldconfig` after each):
 
 ```bash
-git clone --branch 0.6.0 https://github.com/tomdionysus/dannan.git
+git clone --branch 0.9.2 https://github.com/tomdionysus/dannan.git
 cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release
 cmake --build dannan/build --parallel
 sudo cmake --install dannan/build --prefix /usr/local
 
-git clone --branch 0.1.5 https://github.com/tomdionysus/dagda.git
+git clone --branch 0.3.3 https://github.com/tomdionysus/dagda.git
 cmake -S dagda -B dagda/build -DCMAKE_BUILD_TYPE=Release
 cmake --build dagda/build --parallel
 sudo cmake --install dagda/build --prefix /usr/local
@@ -65,6 +65,10 @@ Create `demo/node1.yaml`:
 ```yaml
 state_path: demo/node1/state
 key_file: demo/cluster.key
+
+custody:
+  credential: macha-custody
+  credentials_directory: demo/node1/credentials
 
 storage:
   data:
@@ -119,6 +123,10 @@ Create `demo/node2.yaml`:
 state_path: demo/node2/state
 key_file: demo/cluster.key
 
+custody:
+  credential: macha-custody
+  credentials_directory: demo/node2/credentials
+
 storage:
   data:
     backends:
@@ -171,6 +179,19 @@ Create the paths explicitly:
 
 ```bash
 mkdir -p demo/node{1,2}/{state,data,control,cache,mount}
+mkdir -p -m 700 demo/node{1,2}/credentials
+```
+
+Each node needs its own key custody before its first start. A production
+node seals the root as a systemd credential (see
+[Key custody](configuration.md#key-custody)); this demo keeps it in a plain
+file instead, which `custody.credentials_directory` names:
+
+```bash
+for n in 1 2; do
+  (umask 077 && dannan-custody init --state demo/node$n/state \
+    --credential macha-custody > demo/node$n/credentials/macha-custody)
+done
 ```
 
 Start node 1, then node 2 in separate terminals:

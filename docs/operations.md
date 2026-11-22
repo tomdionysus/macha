@@ -2,9 +2,9 @@
 
 ## Starting a fresh cluster
 
-Create the configured state, DATA backend, cache and FUSE spool parent directories on the intended filesystems. Do not point Macha at a populated unversioned state/backend: the storage contract deliberately refuses it.
+Create the configured state, DATA backend, cache and FUSE spool parent directories on the intended filesystems. Do not point Macha at a populated state or backend it did not create: the store refuses it. A store in an older layout is converted in place, with the node stopped, by Dagda's `dagda-migrate` ([Dagda's migration guide](https://github.com/tomdionysus/dagda/blob/main/docs/migration.md)).
 
-Copy the same cluster key to every node. Configure reachable advertised addresses and consistent DHT policy. The founding node commits namespace/catalogue mutations as soon as it is up; a joining node does so once it has the namespace from a peer.
+Copy the same cluster key to every node, and make each node's key custody before its first start ([Key custody](configuration.md#key-custody)): a node without it does not open its store. Configure reachable advertised addresses and consistent DHT policy. The founding node commits namespace/catalogue mutations as soon as it is up; a joining node does so once it has the namespace from a peer.
 
 ## Capacity
 
@@ -21,7 +21,7 @@ CONTROL/METADATA uses a separate store/quota and must be monitored independently
 
 ## When a DATA backend fills
 
-A full backend stops admitting new DATA. Local `StoragePool` tries another ranked backend if configured. Distributed placement tries another ranked node when necessary. Existing objects remain readable.
+A full backend stops admitting new DATA. The store tries another of the node's backends if configured. Distributed placement tries another ranked node when necessary. Existing objects remain readable.
 
 Do not increase metadata/control quota merely to work around a full DATA disk; those are intentionally different resources.
 
@@ -39,17 +39,19 @@ A node not heard of for `maintenance.garbage_grace_ms` (never sooner than twice 
 
 ## Maintenance
 
-Maintenance is bounded and low priority. It performs:
+Maintenance is bounded and low priority. One pass drives Macha's own upkeep and the store's steps in Macha's order:
 
-- missing DATA replica repair;
-- local backend rebalance toward preferred placement;
-- DATA reachability GC;
-- catalogue control-object convergence and CONTROL GC;
-- scheduled physical integrity scrub.
+- metadata convergence and catalogue control-object convergence;
+- missing DATA replica repair and the availability survey;
+- tombstone collection and CONTROL and DATA reachability GC, only on a node with `maintenance.collect_garbage` set;
+- the store's local stages: backend rebalance toward preferred placement, retention compaction, pack compaction, scheduled integrity scrub and ledger verification;
+- repair of an accepted metadata head this node cannot replay, and metadata history truncation.
 
-A complete no-progress pass backs off instead of repeatedly scanning a settled store. Foreground playback, mounted MachaDFS activity and loader (ingest) activity suppress speculative work according to policy.
+The store's steps are [Dagda's](https://github.com/tomdionysus/dagda); Macha sets their pacing from its configuration. A pass with nothing to do parks until an event or the earliest real deadline (a retry, the GC quiet window, a busy class going quiet, repair's next turn or credit, a local stage or survey falling due, a tombstone or garbage batch maturing) instead of scanning a settled store. Foreground playback, mounted MachaDFS activity and loader (ingest) activity pace speculative work according to policy.
 
 ## Garbage collection
+
+Nothing is reclaimed unless `maintenance.collect_garbage` is set (default false); repair and the availability survey run regardless.
 
 Reachability from committed metadata is authority. The three destructive gates (tombstones, CONTROL, DATA) read this node's own state only: collection is due, the inventory was not rebuilt in this pass, the catalogue's inventory is complete and, for CONTROL and DATA, the node has a sole usable accepted head and an inventory at or past the metadata generation it knows of. No gate waits for another node.
 
@@ -60,8 +62,8 @@ The cost is stated: if an object is deleted on one side of a separation and stil
 Namespace deletion and physical reclamation are deliberately separate. Once a
 namespace batch is durably accepted and its operation journal is confirmed, the
 FUSE operation can complete without waiting for DATA objects to be unlinked.
-Physical GC later walks a persistent local-store cursor in slices of at most 64
-objects. A slice yields as soon as playback, mounted-filesystem or loader
+Physical GC later walks a persistent local-store cursor in bounded slices.
+A slice yields as soon as playback, mounted-filesystem or loader
 activity appears; destructive work is also fenced on a sole usable accepted
 head, catalogue liveness, retention claims, and the configured grace period. A completed no-progress sweep parks until a real event or an exact grace
 deadline rather than polling the settled object store.
@@ -70,7 +72,7 @@ DATA and CONTROL live sets are separate. Packed dead records become reclaimable 
 
 ## Pack recovery
 
-Pack indexes are not authoritative files. Startup scans pack records to reconstruct the index. A torn final record is truncated. If a compaction crash leaves both old and replacement packs, later replacement records win and old duplicate bytes can be reclaimed.
+Packs are the store's, and so is their recovery: pack indexes are not authoritative, startup rebuilds them from the pack records, and a torn final record is truncated. `diagnostics.data_store` counts what recovery truncated and skipped (`pack_recovery_truncated_tails`, `pack_recovery_skipped_regions`, `pack_recovery_skipped_bytes`).
 
 Unexpected authenticated-record corruption is an integrity fault and should be investigated rather than skipped.
 
@@ -97,7 +99,7 @@ Recovery never refuses to start over the *contents* of the journal; only a
 missing or unreadable journal header is fatal. Everything else has a
 deterministic resolution, is applied once, journaled so the next start does
 not see it again, logged at `WARN` with one line per situation, and counted
-under `diagnostics.filesystem` in `GET /api/v1/status`:
+under `diagnostics.filesystem` in `GET /api/v1/status/diagnostics`:
 
 | situation | resolution | counter |
 |---|---|---|
@@ -180,8 +182,9 @@ Repeated recovery/catalogue mutation should not produce monotonic namespace-size
 
 A DATA failure should be diagnosed as placement/admission/durability; a metadata failure as metadata/control durability. Keeping those failure domains distinct is intentional and should be preserved in logs and tooling.
 
-`GET /api/v1/status` includes local, process-lifetime aggregate diagnostics
-under `diagnostics`:
+`GET /api/v1/status/diagnostics` returns local, process-lifetime aggregate
+diagnostics under `diagnostics` (`GET /api/v1/status` names this route in
+`diagnostics_endpoint`):
 
 - `metadata` reports historical reconstruction/cache totals and accepted-head
   persistence writes, encoded bytes, and failures; `head_holders` (how many of
@@ -194,23 +197,29 @@ under `diagnostics`:
   microseconds, grouped by wire message and frame class;
 - `filesystem` reports lock-free FUSE operation, publication, DATA durability,
   and operation-journal append/barrier totals when this process owns a mounted
-  frontend; and
+  frontend;
 - `convergence` reports semantic events, scheduled/completed runs, requested and
   completed epochs, the diagnostic generation high-water mark, and whether a
   run is currently scheduled;
-- `data_resources` reports DATA admission by class (viewer, loader,
-  speculative), the background lease ceiling and its use, and the disk
-  pressure monitor (below);
+- `data_resources` reports the store's DATA admission by class (viewer,
+  loader, speculative), the background lease ceiling and its use, and the
+  disk pressure monitor (below); its figures read zero until the store is
+  open;
 - `repair` reports objects repair could not source from any peer and local
   copies that could not be read, and how repair stood at the latest
-  maintenance pass. `paced_by` lists the higher classes active then:
+  maintenance pass; `available` is false until the node's services are
+  ready. `paced_by` lists the higher classes active then:
   `viewer` (playback, the mount), `loader`, `peer_viewer` (a viewer on
   another node, whose links repair shares). While any is, repair takes
   turns on its share and `pace` is `paced`. With none, `pace` is `running`,
   `settling` (the quiet period after such activity), `awaiting_credit` (its
   transfer credit does not yet cover an extent) or `unknown` (no pass yet).
-  These are this node's own; each node answers for itself; and
-- `data_store` reports local store presence-index and pack-recovery counters.
+  These are this node's own; each node answers for itself;
+- `prompt_replication` counts the quick second copy of each new object
+  (`queued`, `copies`, `failures`, `skipped_no_room`, `dropped`); and
+- `data_store` reports the local store's presence-index, loose-object
+  reaffirmation and pack-recovery counters, with `available` false until the
+  store is open.
 
 `rpc_transport`, `retained_memory`, `http` and `auth` sit beside them.
 
@@ -223,8 +232,8 @@ metadata request increments the rejection counter but is not counted as
 executed handler work.
 
 `filesystem.available` is false on a process without the mounted frontend and
-during mount startup/teardown. `convergence.available` is true as soon as the
-Service exists, including while storage recovery is still in progress. An equal
+during mount startup/teardown. `convergence.available` is true once the
+maintenance pass exists. An equal
 `runs_scheduled`/`runs_completed`, equal requested/completed epoch, and
 `scheduled: false` describe a drained edge-triggered scheduler.
 
@@ -261,18 +270,16 @@ the RPC path: control traffic stays answerable whatever else the node is doing,
 because it is how the cluster and the operator find out anything at all. A node
 that cannot answer `ping` under load is indistinguishable from a dead one.
 
-The fast-control executor has a deliberately closed allow-list: only CONTROL-frame
-`ping` and `members` requests may run there. These handlers must remain bounded,
-in-memory operations: they may read already-published state, but must not perform
-filesystem access, durability barriers, network fan-out, metadata reconstruction,
-or other work whose latency depends on backlog size.
-
-Adding a message to the fast-control allow-list requires a test which blocks the
-ordinary and metadata executors and proves the handler completes from published
-memory alone. Metadata mutations (`put_metadata_history_entry`,
-`put_metadata_commit`, and `accept_metadata_commit`) always use the bounded,
-dedicated metadata executor. All other CONTROL messages use the ordinary control
-executor; object work remains on the priority-aware DATA executors.
+The transport and its executors are Dannan's
+([Dannan](https://github.com/tomdionysus/dannan)): its own liveness and
+membership exchanges run on a fast-control path that no Macha work can queue
+behind, and every pair of nodes has separate CONTROL and DATA lanes. Macha's
+metadata mutations (`put_metadata_history_entry`, `put_metadata_commit` and
+`accept_metadata_commit`) run on the bounded, ordered executor counted as
+`metadata_*` under `diagnostics.rpc_server`; `metadata_notice` is read on the
+session as it arrives; all other Macha CONTROL messages use the ordinary
+control executor. Object work is the store's, on the priority-aware DATA
+executors.
 
 DATA execution priority is viewer foreground, viewer read-ahead, user loader,
 then speculative maintenance - laws 2 and 3 as an execution order. Durable FUSE
@@ -332,7 +339,7 @@ The practical consequences for an operator:
 - **A thread that faults is on record, and runs again when it is a service
   loop.** Every thread Macha starts runs under one of three
   supervisions, chosen per thread (`src/supervised.hpp`): a *service loop*
-  (ingest, hydration, the RPC workers, maintenance, ...) that throws is run
+  (ingest, hydration, the cluster I/O threads, maintenance, ...) that throws is run
   again after a backoff of 1 s doubling to 60 s; a *task* (a connection, a
   transcode, a start-up phase, a storage scan) that throws ends, and its
   owner decides what that means; a thread of a plugin subsystem (the torrent
@@ -361,21 +368,18 @@ in its most load-bearing form: the durability contract treats "present after a
 restart" as durable, justified by the store's pack validation on open plus an
 explicit flush inside the probe.
 
-A publication proves that its extents are durably held with placement
-tokens: `(node, durability epoch, domain, generation, backend instance)`. The
-epoch is fresh for every process and the backend instance for every reopen,
-so a token can only be *checked* by the incarnation that issued it. A token
-that outlived its incarnation is not a failure: the writer's barrier sends the
-object ids to the peer, the peer answers from its disk - an object present
-after a restart is durable, because the pack index is rebuilt from the packs
-on open and the probe flushes the current incarnation before replying - and
+A publication proves that its extents are durably held with the store's
+placement tokens, each checkable only by the process incarnation that issued
+it. A token that outlived its incarnation is not a failure: the writer's
+barrier sends the object ids to the peer, the peer answers from its disk and
 hands out fresh tokens. Journal evidence on the writer:
 `object durability re-derived after incarnation change reasserted=N absent=M
 peers=P`; on the peer: `object durability re-derived after epoch change
-present=N/M`. Only `absent` objects cost anything: they are re-put from a
-local copy if one exists, otherwise the generation is replayed from the FUSE
-spool (`FUSE async data publication replay …`). Restarting a node therefore
-does not strand publications in flight on other nodes.
+present=N/M`. Only `absent` objects cost anything: they are put again from a
+local copy if one exists, otherwise the generation is published again from the
+FUSE spool. Restarting a node therefore does not strand publications in flight
+on other nodes. The tokens and the barrier are
+[Dagda's](https://github.com/tomdionysus/dagda).
 
 ## Nodes behind CGNAT, and edge nodes
 
@@ -392,7 +396,9 @@ needs a lane the node has not opened, it sends a `dial_request` over the
 CONTROL session and the node dials. Every transport socket keeps TCP keepalive
 probing at 60 s (15 s apart, four probes), and the health probe covers the
 DATA lane as well as CONTROL, so a NAT mapping that expires underneath an idle
-lane is noticed and redialled before a viewer needs it.
+lane is noticed and redialled before a viewer needs it. The sessions, the dial
+request, the dial-back and the keepalives are
+[Dannan's](https://github.com/tomdionysus/dannan); Macha runs no relay.
 
 The shape rules:
 
@@ -419,10 +425,10 @@ resolution (`inbound_capable`, `inbound_capable_source` -- `configured`,
 `dial_back`). `cluster.conditions` reports `N node accepts` / `N nodes accept
 no inbound connections` (information), `no inbound-capable node hosts extents`
 (critical) and `replication N requires N extent-hosting nodes; M known`
-(degraded). A `DEBUG` line is logged for every `dial_request` round trip and
-every dial-back probe.
+(degraded). A `DEBUG` line is logged for every dial request sent.
 
-Every node in a cluster must run the same protocol version.
+Every node in a cluster must run a Macha release that can talk to the others;
+the changelog names the releases that cannot.
 
 An `auto` resolution is sticky: it is persisted under
 `state_path/connectivity/inbound.bin`, changes only after two consecutive
@@ -444,17 +450,16 @@ telemetry is gossiped with boot-incarnation and sequence ordering and is not
 journalled as a metrics history. An authenticated peer connection triggers a
 coalesced telemetry dissemination event; periodic local metrics sampling also
 provides bounded eventual retry. Delivery is best-effort and may be dropped
-under useful load. Received notifications enter the bounded speculative RPC
-executor, so decoding and telemetry-store mutation do not occupy socket-reader
-threads. The last-known cache is periodically replaced only after a long
+under useful load. The last-known cache is periodically replaced only after a long
 interactive-idle interval and never mutates the MachaDFS namespace or enters
 metadata publication. Each node's `telemetry_freshness` is `live`, `stale`,
 `last_known` or `unavailable`, so an online node cannot disappear merely
 because optional telemetry was dropped.
 
-The wire format is `TEL3`: every field tagged and length-delimited, and a
-default-valued field omitted, so a newer node can add a field an older one
-skips.
+The telemetry record is Dannan's: every field tagged, Macha's own figures
+(storage, cache, metadata generation, API endpoint, playback budgets) carried
+as hosted fields, and a zero or empty value not written. A record with a field
+that cannot be read is dropped alone, never the set it came in.
 
 `nodes[].traffic` is each node's own cluster traffic by frame class:
 `{as_of_unix_ms, window_ms, classes}`, where `classes` has one entry per class
@@ -546,8 +551,7 @@ diverges), and a stat timed against it.
 A node authors its metadata mutations under an author id and a sequence kept
 in `<state_path>/metadata/author.meta`, and no sequence may be used twice.
 After restoring a node's state from a backup, delete `metadata/author.meta`
-before starting it (and `metadata/mutation-sequence.meta`, if that file is
-present): a node that has authored before then takes a new
+before starting it: a node that has authored before then takes a new
 author id and starts again at 1, logged as `metadata author record missing;
 authoring as a new author`.
 

@@ -17,7 +17,7 @@ fuse:
 
 `state_path` contains node identity, namespace metadata state, maintenance state and-unless overridden-the metadata control-object store. `key_file` must contain the same secret material on every node in a cluster. `fuse.mount_path` is optional; omit it to run without a FUSE mount.
 
-A `state_path` holding Macha state with no layout marker is refused; start from an empty directory.
+`state_path` is the node's one state directory: Macha's, Dannan's and the store's. A `state_path` holding a store with no layout marker is refused, and one in Macha's earlier layout v18 is refused naming `dagda-migrate` (see [Storage](storage.md#fresh-storage-boundary)); start from an empty directory, in which only key custody is made before the first start.
 
 ```yaml
 service_startup_no_progress_ms: 120000
@@ -74,7 +74,18 @@ systemd-run --wait --pipe -p LoadCredentialEncrypted=macha-custody \
 `init` writes the custody file and prints the new root straight into
 `systemd-creds encrypt`, so it is never kept in clear; `show` proves the sealed
 credential opens custody as the unit will read it. The unit names the same
-credential in `LoadCredentialEncrypted=`. Custody is never replaced; a node
+credential in `LoadCredentialEncrypted=`; the shipped `macha.service` names
+none, so add it in a drop-in (`sudo systemctl edit macha.service`):
+
+```ini
+[Service]
+LoadCredentialEncrypted=macha-custody
+```
+
+Without systemd (macOS, or a node run by hand), `credentials_directory` names a
+directory holding a file called after the credential, containing the root as
+`init` prints it. That keeps the root on disk in clear: make the directory
+readable by the node's user alone. Custody is never replaced; a node
 whose custody or credential is missing, or whose root does not open it, refuses to
 start and says which. Back up the custody file and the sealed root off the node.
 Changing `custody` needs a restart.
@@ -107,9 +118,11 @@ minute: `memory_limit_bytes`, `memory_budget_bytes` (the parts' total),
 
 `retained_memory_bytes` is the process-wide admission budget for heap objects
 which survive an asynchronous boundary, including FUSE write/operation state,
-RPC queues and active playback fragment stores.
+RPC queues and active playback fragment stores. Dannan's transport draws on the
+same budget and reserves, and repair's window is an eighth of it (see
+[Maintenance](#maintenance)).
 
-The reserves are headroom within that total: each must be non-zero, and together they must fit in `retained_memory_bytes`, or the node refuses to start. The control, viewer and loader reserves are and they are the
+The reserves are headroom within that total: each must be non-zero, and together they must fit in `retained_memory_bytes`, or the node refuses to start. The control, viewer and loader reserves are the
 [governing laws](principles-and-laws.md#scheduling-laws) expressed as memory: durable
 loader work cannot consume viewer or control headroom (laws 1 and 2), and
 speculative work preserves a loader floor beneath it (law 3). Reconstructible
@@ -181,9 +194,9 @@ The metadata store has an independent limit and never consumes DATA quota.
 Each store keeps a held ledger under `<state_path>/ledger/`: which objects it
 holds, loose or packed, journaled before they change and checkpointed into a
 trie on disk, so a restart knows what it holds without walking its disk (`data-<disk token>`
-per DATA backend, named by the disk's own identity, and `control`). The
-first start on a version that keeps one walks the store once to seed it, in
-the background; every later start reads it, and lists any packed object it
+per DATA backend, named by the disk's own identity, and `control`). A store
+whose ledger is not yet seeded walks itself once to seed it, in the
+background; every later start reads it, and lists any packed object it
 does not yet (packs are replayed at every start). Maintenance checks each held
 ledger against its disk a pass a day, `objects/xx/yy` directories at four a
 second (one every four seconds while viewers or loaders are active): a file
@@ -715,7 +728,7 @@ Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control conver
 
 `busy_bandwidth_fraction` governs rebalance and scrub only. Repair earns credit at `idle_bandwidth_fraction` of the link only while a higher class is present, here or at a peer, and shares time by the weights; with none present it earns at the whole link, bounded by `max_bandwidth`.
 
-**Credit pays for transfers, not for finding them.** A repair step runs whenever its share allows. It takes up to 64 of its own objects at a time and asks each peer about them together (`have_valid_objects`, 16 objects a request, every request in flight at once), and the peer checks each copy by reading, decrypting and hashing it, so a corrupt copy counts as missing and is replaced. A push is charged the object's own size and a pull a full extent (its size is not known until it arrives); a step stops at the first transfer its credit cannot yet cover and resumes there when the credit is due. Pushes go out in batches of up to 8 objects and two extents of payload, all in flight at once. A pass keeps its place when the live set changes (another pass follows one that spanned a change) and across a restart (`<state_path>/repair/push-position`).
+**Credit pays for transfers, not for finding them.** A repair step runs whenever its share allows. It works from what the availability survey learns, by difference, of what each peer holds: an object a preferred owner lacks is offered to that owner before it is sent, so each copy moves once, and an object this node should hold and lacks is pulled from a node that has it. A copy found corrupt, by scrub or a read, is removed and then repaired as missing. A step stops at the first transfer its credit or its window cannot yet cover and resumes there when the credit is due. A pass whose lists change under it is followed by another. Repair is Dagda's; see its [documentation](https://github.com/tomdionysus/dagda) for the mechanism.
 
 The credit rate is the node's measured throughput to its peers, or `idle_bandwidth_fraction` of it while a higher class is present. Only transfers of at least half an extent are measured: a smaller one is mostly a round trip and the far end's write, and counting it put the estimate at a few percent of the real link.
 
@@ -988,6 +1001,6 @@ A node configured with a `root` that does not exist, or one with no index docume
 
 ## Logging
 
-`log_level` accepts `ALL`, `DEBUG`, `INFO`, `WARN`, or `ERROR`. `ffmpeg_log_level` is an independent libav threshold and can be more verbose than the Macha application threshold.
+`log_level` accepts `ALL`, `DEBUG`, `INFO`, `WARN`, or `ERROR`. `ffmpeg_log_level` is an independent libav threshold and can be more verbose than the Macha application threshold. Dannan's and Dagda's own lines go through the same log under `log_level`, each led by its scope (for example `dagda.gc:`).
 
 `torrent.log_level` is the same kind of independent threshold for the libtorrent alert stream. `INFO` (the default) keeps the explicit lines -- listen results, DHT bootstrap, port mapping, every warning -- and drops the per-alert chatter. `DEBUG` bridges every alert the session subscribes to (tracker announces, DHT traffic, peer errors), which on a busy node is well over a thousand journal lines a minute and will evict the rest of the journal within hours. `ALL` additionally subscribes libtorrent's internal tracker, peer, session, torrent and DHT log categories. It applies live on reconfigure.

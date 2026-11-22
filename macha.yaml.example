@@ -10,6 +10,14 @@
 state_path: /var/lib/macha
 key_file: /etc/macha.key
 
+# Key custody: the node key and the root its node-local keys derive from,
+# sealed in <state_path>/identity/custody by `dannan-custody init`. The unit
+# loads the named systemd credential with LoadCredentialEncrypted=; a node
+# without custody does not open its store. See docs/configuration.md.
+custody:
+  credential: macha-custody
+  # credentials_directory: /run/macha-credentials   # a node run outside systemd
+
 # Where subsystem plugins (.so/.dylib) are found. Default: this build's
 # plugin directory, e.g. /usr/lib/macha/plugins.
 # plugin_path: /opt/macha/plugins
@@ -342,6 +350,9 @@ maintenance:
   # what its branch refers to. A node unheard of for this long is forgotten,
   # and retirement tombstones are pruned after it.
   garbage_grace_ms: 2592000000  # 30 days
+  # Reclaims nothing unless true: retiring tombstones, releasing claims and the
+  # CONTROL and DATA sweeps. Repair, scrub and compaction run either way.
+  collect_garbage: false
 
 # The media catalogue. Its structure is metadata, committed locally and
 # replicated to every node; artwork is DATA. Each scan provider classifies the

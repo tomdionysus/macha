@@ -954,7 +954,7 @@ No API or on-disk changes. Wire: new cluster message `trie_diff` (49) and
 reply (125), sent only to peers at 0.90.72 or later.
 
 Replication by diff, stages 1 and 2
-([proposal](TODO/2026-10-09-replication-by-diff.md)). The trie gains a diff
+([proposal](TODO/archive/2026-10-09-replication-by-diff.md)). The trie gains a diff
 surface: `ObjectTrie::Prefix` and `Summary`, and a snapshot answers, for a
 batch of prefixes, the count and hash of each of the 256 subtrees one byte
 below (computed from the records inside a leaf, which is what any trie
@@ -985,7 +985,7 @@ diff once each knows the other's version.
 No API, wire or protocol changes. On disk: the held ledgers list packed
 objects; `availability/holdings.bin` is no longer kept (removed at start).
 
-Replication by diff, stage 0 ([proposal](TODO/2026-10-09-replication-by-diff.md)).
+Replication by diff, stage 0 ([proposal](TODO/archive/2026-10-09-replication-by-diff.md)).
 What a store holds is now read as a frozen view of its held ledgers with an
 identity: per disk the ledger trie's root hash, for the pool a hash over
 (disk token, root) of every online seeded disk, and a count of ids that

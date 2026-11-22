@@ -120,7 +120,10 @@ what differs between the nodes, not the size of the library. What a peer
 holds that this node lacks is available; what this node lacks and no peer
 holds is unavailable; what this node holds and a peer lacks is what repair
 sends it. A peer that cannot answer leaves what only it might hold
-`unknown`, and the node asks it again after a backoff.
+`unknown`, and the node asks it again after a backoff (1 s, doubling to 5
+minutes); an answer clears it. The held ledger, the trie comparison and the
+survey are [Dagda's](https://github.com/tomdionysus/dagda); Macha lays the
+survey over its namespace as the per-path counts above.
 
 The survey runs in the maintenance pass, as background work, and none runs
 while a disk is still being seeded. It is repeated when something could
@@ -131,8 +134,8 @@ storage grows while something is unavailable. A gain alone asks no peer:
 what this node gained was already available. Requests read the last result
 and never wait for a survey.
 
-Each node keeps its last survey on disk and answers from it after a restart
-until its first new survey. A survey that cannot ask a peer leaves a file's
+Each node keeps its last per-path counts on disk and answers from them after
+a restart until its first new survey. A survey that cannot ask a peer leaves a file's
 counts to its last decided survey, matched by content identity: the answer
 is the best this node knows, and `surveyed_unix_ms` says when the survey
 ran.

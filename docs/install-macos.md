@@ -12,7 +12,7 @@ Install Apple's command-line developer tools first:
 xcode-select --install
 ```
 
-Macha requires CMake 3.20 or later, a C++20 compiler, OpenSSL, libcurl,
+Macha requires CMake 3.24 or later (Dannan's and Dagda's floor), a C++20 compiler, OpenSSL, libcurl,
 zlib, yaml-cpp, Boost 1.83 or later (Asio) and FFmpeg 6 or later development
 libraries, [Dannan](https://github.com/tomdionysus/dannan) 0.9.2, the cluster
 transport, and [Dagda](https://github.com/tomdionysus/dagda) 0.3.3, the store,
@@ -152,11 +152,36 @@ cluster, remove the sample `bootstrap` list, since only a node with no
 bootstrap peers founds the cluster). Every node uses the same secret
 cluster-key file: create it once on the first node
 (`umask 077 && openssl rand -hex 32 > macha.key`) and copy it to the others.
-Create `state_path` as an empty directory and create nothing inside it; Macha
-creates the metadata store, cache, spool and mount directories. Create each
-DATA backend `path` as an empty directory, normally a subdirectory of the
-disk's volume: a non-empty directory without Macha's marker is refused. See
-[Configuration](configuration.md) for the complete schema.
+Create `state_path` as an empty directory and create nothing inside it but key
+custody (below); Macha creates the metadata store, cache, spool and mount
+directories. Create each DATA backend `path` as an empty directory, normally a
+subdirectory of the disk's volume: a non-empty directory without the store's
+backend marker is refused. See [Configuration](configuration.md) for the
+complete schema.
+
+Every node needs its own key custody, made once before its first start with
+Dannan's `dannan-custody`. macOS has no systemd credentials, so the root is
+kept in a file named after the credential, in a directory only root can read,
+which `custody.credentials_directory` names. That file holds the root in
+clear; keep the disk encrypted (FileVault) and back the file up off the node
+with `<state_path>/identity/custody`. For the Homebrew layout:
+
+```bash
+sudo mkdir -p -m 700 /usr/local/etc/macha/credentials
+sudo sh -c 'umask 077 && dannan-custody init --state /var/lib/macha \
+  --credential macha-custody > /usr/local/etc/macha/credentials/macha-custody'
+sudo dannan-custody show --state /var/lib/macha --credential macha-custody \
+  --credentials-dir /usr/local/etc/macha/credentials
+```
+
+```yaml
+custody:
+  credential: macha-custody
+  credentials_directory: /usr/local/etc/macha/credentials
+```
+
+A node without custody does not start; see
+[Key custody](configuration.md#key-custody).
 
 ## Run interactively
 
@@ -215,7 +240,10 @@ sudo launchctl bootout system /Library/LaunchDaemons/macha.plist
 
 Reconfigure and rebuild as your normal user, run the tests, then repeat the
 appropriate `sudo cmake --install` command. Restart the launchd service if it
-is in use.
+is in use. When a release moves to a new Dannan or Dagda version, build and
+install those first; a release that changes the on-disk layout says so in the
+[CHANGELOG](../CHANGELOG.md), and a store in an earlier layout is refused
+until `dagda-migrate` has converted it.
 
 To remove the installed programs, libraries, plugins, `macha.yaml.example`
 and documentation while preserving `macha.yaml` and runtime data:

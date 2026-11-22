@@ -1,13 +1,9 @@
 # Backlog
 
-Last touched 2026-10-09 (items moot after the object ledger, tombstone
-batches and the memory limit removed or moved to ACTIVE). Verified against
-the code at 0.90.24 on 2026-10-06: what is still to do from
-the sections written 2026-09-05..22. Each section of the old file was checked
-against the code, the CHANGELOG and COMPLETED; what was done or superseded is
-gone from here, and the old file with its full reasoning is
-[`archive/2026-10-06-BACKLOG-before-verification.md`](archive/2026-10-06-BACKLOG-before-verification.md).
-`ACTIVE.md` outranks everything here. Grouped by area, not ordered.
+Last rationalised 2026-11-22, after the store cutover. `ACTIVE.md` outranks everything here; Macha's defects are in
+`2026-11-08-found-issues.md`. Grouped by area, not ordered. Items whose subject the port moved into Dannan or Dagda
+are gone (the version before is `archive/2026-11-22-BACKLOG-before-rationalisation.md`). **Line references were
+written before the port; re-read the code before acting on one.**
 
 ## Status and clients
 
@@ -43,8 +39,7 @@ gone from here, and the old file with its full reasoning is
 
 ## Storage, caches and memory
 
-- **A cache's floor** moved to ACTIVE section 3 (the memory limit can now
-  shrink caches). Still here: catch-up logs no progress and ignores a stop
+- Catch-up logs no progress and ignores a stop
   token, and `startup.phase` reads `ready` whatever the lag
   (`status_api.cpp:818`).
 - **The namespace tree's Stage D**: `file_media_id` is derived on every call
@@ -66,10 +61,9 @@ gone from here, and the old file with its full reasoning is
 
 ## Catalogue
 
-- **The catalogue's cost and residency**: ACTIVE section 4's
-  [plan](2026-10-06-catalogue-materialised-view.md); holdings for catalogue
-  DATA, and `catalogue/status` asking the store for every artwork, are
-  ACTIVE section 2's stage 4 (replication by diff).
+- **The catalogue's cost and residency**: the
+  [plan](2026-10-06-catalogue-materialised-view.md) (stages below); `catalogue/status`
+  asks the store for every artwork.
 - **Clear Metadata is synchronous.** (Its descendant scan goes with the
   plan's derived parent index.)
 - **Opaque work ids**: items are still `tmdb:movie:`/`tmdb:tv:`.
@@ -135,24 +129,17 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
 - Duplicates: `fixed_vod_durations` in `media_engine.cpp:378` and
   `media_engine_common.cpp:17`; `catalogue_api.cpp`'s own `json_escape` and
   `url_decode`.
-- About 32 empty `catch (...) {}` (net.cpp, storage_pool.cpp).
+- Empty `catch (...) {}` blocks: count again on the ported tree (the files once counted are gone).
 - `catalogue_api` answers 503 for some client errors.
-- A dead citation in `archive/2026-09-03-playback-resilience-and-av-sync-plan.md:83`;
-  unticked boxes in the namespace-publication archive doc; COMPLETED's note
-  that 0.24.1 to 0.35.0 is not ledgered.
 
-## Parked for after the refactor (operator, 2026-11-05)
+## Parked for the maintainer (2026-11-05, until after the port; the port is now live)
 
-- The replication-by-diff proposal's three open questions.
 - **Lost posters on the viewer's path**: the artwork route could answer 404
   at once for an object the last survey found no node holding (442 catalogue
   objects today), saving 1 to 2 s per showing; the cost is that a poster a
   peer gained since that survey is refused until the next one. Or the
   catalogue re-fetches lost artwork from its provider and nothing changes on
   the read path.
-- The bootstrap test (`test_two_node_mutual_bootstrap_metadata_write_floor`): the first write waits for the bootstrap
-  checkpoint survey (not the availability survey), or the test retries the
-  refusal.
 - The memory limit to set on each node (section 3, Memory).
 - CPU priority for background work: `nice` or `SCHED_IDLE` for repair,
   scrub, transcode and libtorrent threads, a cap on encoder threads, or a
@@ -174,7 +161,7 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
 - From the backlog: anonymous access; whether a client should know a
   playback generation existed anywhere in the cluster.
 
-## Import (operator 2026-11-06: not part of the port)
+## Import
 
 - **Fix: a large import submits every file's catalogue hint twice, the second time as a slow
   no-op pass.** Each file's hint goes in when that file lands (`src/acquisition/ingest.cpp:1872`,
@@ -195,22 +182,14 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
   files: clearing it removes a failed file's bytes, per the docs and a review of the code, so
   the file cannot be retried. Not traced by hand. Core has been told to warn.
 
-## Moved from ACTIVE, 2026-11-08
+## Larger work
 
-These were ACTIVE's numbered sections; nothing in them is in progress while Macha is frozen for the port.
-The dated plans they name are still in `TODO/`.
+The dated plans named here are in `TODO/`.
 
-### Replication by diff
+### Left from replication by diff
 
-[`2026-10-09-replication-by-diff.md`](2026-10-09-replication-by-diff.md). Stages 0 to
-4 built (0.90.71 to 0.90.77), the survey half of 5 built (0.90.96). Left: repair's
-store walk, push cursor, `repair_position` and `have_*` probes, about 75 test call
-sites. Dagda dropped these by decision, so this work may fall to the second cutover
-rather than Macha. Measure again on the current pair: repair was last measured over
-a 1.39 MB/s path that no longer exists.
-
-Also here: a torrent can land on a node away from where it is watched; per-peer down
-state in the transport; `fsync` without a deadline; say why a node counts itself busy.
+The proposal (`archive/2026-10-09-replication-by-diff.md`) is overtaken: repair, holdings and the survey are Dagda's.
+Still Macha's: a torrent can land on a node away from where it is watched; say why a node counts itself busy.
 
 ### Memory
 
@@ -238,8 +217,7 @@ Stages 1 to 5 are done (0.90.27 to 0.90.33). Next: stage 6, the conflict
 merge per shard; then derived indexes for list, search and the descendant
 scan; the manifest change (per-family shards, growable count); batched
 profile publication; measure again. Stage 10 (holdings for catalogue DATA)
-is the replication-by-diff plan's stage 4; if that needs per-family shards, stage 8 comes
-first. Its residency (about 16 MiB) is now a gauge.
+was the replication-by-diff plan's stage 4, now a question for Dagda's holdings. Its residency (about 16 MiB) is now a gauge.
 
 ### Matching
 
@@ -258,10 +236,6 @@ The control audits are done (lock audit 0.90.45 to 0.90.49 and 0.90.68;
 CPU and memory audit 2026-10-08; control lane fixes 0.90.61, 0.90.64 to
 0.90.66). The head record is 87,546 bytes (0.90.67), so whole-record copies
 on control threads no longer grow with deletes. Left:
-- DNS (`getaddrinfo`, net.cpp) has no timeout of its own. node-f dials
-  node-c by name (`live-a.example.net`): 4 to 6 ms through its router,
-  and no `resolve failed` in its journal (2026-10-12). Build only on
-  evidence.
 - A dial's peer observer can wait on another thread's roster fsync
   (`persist_m_`): `Membership::observe` writes the roster on the caller's
   thread when it changes. The fix is a combining writer (a caller finding a
@@ -285,7 +259,7 @@ on control threads no longer grow with deletes. Left:
 - **Core's request**: `providers/artwork` taking `item_id`.
 - **Per-file readability**: designed; the operator chooses where it goes.
   Two of its three uses are wire changes; its answer (held by nobody
-  reachable) comes from the replication-by-diff plan's stage 2, so it follows that.
+  reachable) comes from Dagda's availability survey.
 - **A media-type context on torrent add** (operator, 2026-09-25).
 - **People on catalogue items**: approved, with a backfill.
 - **Placement API asks**: the target `node_id` and a viewer-facing detail on
@@ -293,8 +267,7 @@ on control threads no longer grow with deletes. Left:
   optional node `name` (operator's call).
 - **Movie sets**: later; needs a proposal first.
 - **Ebooks**: stages 1 and 2 of `TODO/2026-11-04-ebooks-design.md` are
-  merged. Stage 3, the per-user media state, waits on the freeze; OPDS is not
-  started.
+  merged. Stage 3, the per-user media state, is next; OPDS is not started.
   **Audiobooks** (operator, 2026-11-04): a separate media class of their
   own, designed after ebooks; they share the per-user media state.
 - Measured small, not now: ingest and data publications commit one
@@ -302,7 +275,7 @@ on control threads no longer grow with deletes. Left:
   per change (266 KB with 409 hints); the head record's largest part is now
   its 72 torrent requests (only if they grow).
 
-## FUSE: libfuse's low-level API (operator, 2026-11-14: the way to go, after the Dagda port, done once)
+## FUSE: libfuse's low-level API (operator, 2026-11-14: the way to go, done once, now the port is live)
 
 Macha's adapter (`src/fuse/fuse_adapter.cpp`) uses libfuse's high-level, path-based API while `FuseFrontend`
 keeps its own inode table, so every request is resolved twice and libfuse's node table, path cache, forget counts
@@ -320,11 +293,10 @@ read, write and viewer phases before and after.
   supported; readdirplus delivery not documented; fd-based zero-copy replies not documented on macOS. Linux nodes run
   libfuse 3.17.2, macFUSE 5.5.0 ships 3.18.3: target the common API. Require macFUSE 5.x. macFUSE 5.5.0 notes its FSKit
   backend on macOS 26/27 rejects an empty FUSE_READ reply with EIO; Macha answers EOF with an empty read.
-- **Fixes by design** the read late-write defect found in the heap chase (ACTIVE, item 1): `dispatch` returns
+- **Fixes by design** the read late-write defect found in the heap chase (found-issues 1): `dispatch` returns
   ETIMEDOUT for a running read while the worker still writes into libfuse's buffer. With Macha owning the reply
   buffer it cannot happen; no interim patch unless the heap chase implicates it.
-- **Not twice:** the libfuse-facing adapter is separate from `FuseFrontend`'s store calls, which the Dagda port's map
-  covers (Macha's half). Do this after the port lands, on the ported frontend.
+- The libfuse-facing adapter is separate from `FuseFrontend`'s store calls; the move is on the ported frontend.
 - **Told to Dagda 2026-11-14 for the port's map:** the read API Macha's file reads use must never write caller
   memory after returning (owned results, or a cancel that waits for the copy), cancel promptly at fetch boundaries
   with the outcome told, offer an async form on a caller's executor, and carry the read class per call.

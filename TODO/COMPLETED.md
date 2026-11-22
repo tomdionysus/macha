@@ -1,6 +1,19 @@
 # Completed and tested
 
-Last updated: 2026-11-19
+Last updated: 2026-11-22. Documents named below without a path are in `archive/`.
+
+## 2026-11-20 to 11-22 -- the cutover, and the repair OOM fixed (`port/dannan-dagda`)
+
+- 0.95.1 (`906aeba`): the short file fixed in Macha and Dagda; a stopping node closes its routes before it stops what
+  they reach (a use-after-free the sanitizer gate found). Suite 554/554; the sanitizer gate run once, on the
+  maintainer's word.
+- The store cutover, 2026-11-20 to 21 (`2026-11-18-cutover-runbook.md`, "Done"): both live nodes migrated to layout
+  v19 and serve 0.95.1 on Dagda 0.3.2 and Dannan 0.9.2; read samples of 149 GiB and 99 GiB, no failures.
+- The OOM on live-a, 2026-11-21 22:21Z and 2026-11-22 01:08Z: repair's burst followed a network estimate misread to
+  15 to 20 GiB/s and read every planned object before sending. Stopgap `max_bandwidth: 16M` on both nodes. Fixed by
+  Dagda 0.3.3 (the estimate's sampling, a bounded push window) and Macha 0.95.2 (`ffee93e`: the window is an eighth of
+  the retained-memory budget; 556/556). Deployed 2026-11-22, live-a 12:23Z, live-b 14:28Z; the stopgaps removed.
+  live-a held 0.97 to 1.20 GB through 76 GB of repair.
 
 ## 2026-11-19 -- Macha on Dagda 0.3.1, and the cutover rehearsed (`port/dannan-dagda`)
 
@@ -10,7 +23,7 @@ Last updated: 2026-11-19
 - Rehearsals R1 to R4 on build-3 and build-4 with the tarball and the cutover scripts unedited, every file checked by
   sha256: one node end to end; kills of each pass and of the migration, finished by rerunning; rollback by
   `--reverse` after the install; two nodes in the maintainer's new order (live-b serving while live-a migrates). All pass.
-  Results in the runbook. They found the short file (`2026-11-19-short-file.md`), a FUSE defect older than the port.
+  Results in the runbook. They found the short file (`archive/2026-11-19-short-file.md`), a FUSE defect older than the port.
 
 ## 2026-11-17 to 11-18 -- the port's steps 1 to 4 and the suite down to four (`port/dannan-dagda`)
 

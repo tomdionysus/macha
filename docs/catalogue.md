@@ -144,7 +144,7 @@ The committing node holding the objects is enough to commit. Maintenance separat
 
 If an active metadata replica loses a control object, the missing immutable object is fetched from another active replica. The committed root remains valid meanwhile; maintenance subsequently converges control objects to all active replicas.
 
-Control garbage collection uses its own live set and grace period. It does not interact with DATA placement.
+Control garbage collection uses its own live set and grace period. It does not interact with DATA placement. It is the store's sweep, driven by the maintenance pass, and runs only on a node with `maintenance.collect_garbage` set (see [Garbage collection](operations.md#garbage-collection)).
 
 ## Artwork
 

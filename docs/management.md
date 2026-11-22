@@ -122,8 +122,8 @@ on it sooner.
 - `POST /api/v1/manage/filesystem/parked-publications/{inode}/abandon` - drop the unpublished generation from the spool, exactly as a corrupt spool record is dropped (`204`; `409 not_parked` if not parked).
 
 `diagnostics.filesystem.parked_publications` and
-`diagnostics.filesystem.publication_retries_backed_off` in `GET /api/v1/status`
-carry the counts.
+`diagnostics.filesystem.publication_retries_backed_off` in
+`GET /api/v1/status/diagnostics` carry the counts.
 
 ## Metadata conflicts
 
@@ -143,7 +143,7 @@ head that has not seen it does not bring the conflict back.
 - `POST /api/v1/manage/metadata/conflicts/{id}/resolve?choice=left|right|base` - installs that alternative for the subject and drops the record in one metadata commit; `choice=base` on a record whose `base` is `null` removes the path, or clears the catalogue root (`204`; `409 not_standing` if the conflict is no longer standing; `400 bad_choice`). Both routes answer `503 metadata_unavailable` while no metadata snapshot is available.
 
 `diagnostics.metadata.{conflicts, namespace_conflicts, catalogue_conflicts}`
-in `GET /api/v1/status` are the standing counts;
+in `GET /api/v1/status/diagnostics` are the standing counts;
 `conflicts_superseded` and `conflicts_resolved` count the ones that left the
 snapshot since this process started. `diagnostics.metadata.tombstones` is
 the retirement-tombstone count carried in the snapshot.
@@ -208,7 +208,7 @@ A password change, a role change or a deletion retires every session that accoun
 
 A node founding a new cluster creates both accounts on first start and writes root's generated password to `<state_path>/initial-root-password`, mode 0600.
 
-A node with bootstrap peers is joining rather than founding, so it creates neither. If the cluster it joins holds no accounts, it starts with an empty user table, which means nothing can sign in - the node says so at startup and reports `accounts_initialised: false` in `GET /api/v1/status`. Stop one node and run:
+A node with bootstrap peers is joining rather than founding, so it creates neither. If the cluster it joins holds no accounts, it starts with an empty user table, which means nothing can sign in - the node says so at startup and reports `diagnostics.auth.accounts_initialised: false` in `GET /api/v1/status/diagnostics`. Stop one node and run:
 
 ```
 macha-users <state_path> <cluster.key> init

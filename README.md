@@ -132,6 +132,11 @@ versions, systemd setup, upgrades and removal:
 [Linux](docs/install-linux.md) · [macOS](docs/install-macos.md) ·
 [Quick start](docs/quickstart.md).
 
+Macha runs on two shared libraries, [Dannan](https://github.com/tomdionysus/dannan)
+0.9.2 (the cluster transport) and [Dagda](https://github.com/tomdionysus/dagda)
+0.3.3 (the object store). Build and install them first, under `/usr/local`,
+then Macha:
+
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build build --parallel
@@ -143,7 +148,8 @@ and plugins under `lib/macha`, a `macha.service` unit, the documentation and an
 initial `/etc/macha/macha.yaml` - copied from
 [`macha.yaml.example`](macha.yaml.example) only when no configuration exists,
 so upgrades never overwrite operator changes. Edit it, create the cluster
-key, an empty `state_path` and an empty directory for each DATA backend, then
+key, an empty `state_path`, the node's key custody (`dannan-custody`, sealed
+as a systemd credential) and an empty directory for each DATA backend, then
 start the service ([Linux](docs/install-linux.md) has the details). Uninstall
 (`sudo cmake --build build --target uninstall`) deliberately preserves
 `macha.yaml`, keys, state, cache, spool, mounts and media data.

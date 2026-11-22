@@ -8,7 +8,8 @@ systemd service.
 
 Macha requires:
 
-- CMake 3.20 or later and a C++20 compiler
+- CMake 3.24 or later (Dannan's and Dagda's floor; Macha's own is 3.20) and a
+  C++20 compiler
 - OpenSSL, libcurl, zlib and yaml-cpp development files
 - FFmpeg 6 or later development libraries (`libavformat` and `libavcodec`
   60, `libavutil` 58, `libswscale` 7 and `libswresample` 4, or later)
@@ -118,8 +119,12 @@ sudo cmake --install dagda/build --prefix /usr/local
 sudo ldconfig
 ```
 
-`dannan/build/dannan-import-macha` converts an existing node's state at the
-upgrade to 0.94.0 (see the CHANGELOG); install it beside Macha on such a node.
+Both are shared libraries, so the installed Macha needs them under
+`/usr/local` at run time as well as at build time. Dannan's install includes
+`dannan-custody`, which makes every node's key custody (below); Dagda's
+includes `dagda-migrate`, which converts a store in an earlier layout. On
+Debian 13 Dannan is also packaged in the tomcully.com apt repository; see
+[its README](https://github.com/tomdionysus/dannan#install-and-link).
 
 ## Build and test
 
@@ -187,9 +192,39 @@ to every other node:
 sudo sh -c 'umask 077 && openssl rand -hex 32 > /etc/macha.key'
 ```
 
-Create `state_path` as an empty directory: a non-empty one without Macha's
-layout marker is refused. Create nothing inside it; Macha creates the metadata
-store, cache, spool and mount directories itself.
+Create `state_path` as an empty directory. Create nothing inside it but key
+custody (below); Macha creates the metadata store, cache, spool and mount
+directories itself, and a state directory holding a store without its layout
+marker is refused.
+
+Every node needs its own key custody, made once with the node stopped, before
+its first start. Make it, seal its root as a systemd credential, and check it:
+
+```bash
+sudo mkdir -p /etc/credstore.encrypted
+sudo dannan-custody init --state /var/lib/macha --credential macha-custody \
+  | sudo systemd-creds encrypt --name=macha-custody - /etc/credstore.encrypted/macha-custody
+sudo systemd-run --wait --pipe -p LoadCredentialEncrypted=macha-custody \
+  dannan-custody show --state /var/lib/macha --credential macha-custody
+```
+
+Name the credential in `macha.yaml`:
+
+```yaml
+custody:
+  credential: macha-custody
+```
+
+and load it in the unit with a drop-in (`sudo systemctl edit macha.service`):
+
+```ini
+[Service]
+LoadCredentialEncrypted=macha-custody
+```
+
+A node without custody does not start. Back up the custody file
+(`<state_path>/identity/custody`) and the sealed root off the node; see
+[Key custody](configuration.md#key-custody).
 
 Create each DATA backend `path` as an empty directory, normally a subdirectory
 of the disk's mount point such as `/mnt/disk1/data`. A disk's root is refused,
@@ -251,6 +286,13 @@ ctest --test-dir build --output-on-failure
 sudo cmake --install build
 sudo systemctl restart macha.service
 ```
+
+When a release moves to a new Dannan or Dagda version, install those first,
+as above. A release that changes the on-disk layout or the cluster protocol
+says so in the [CHANGELOG](../CHANGELOG.md), with what to run before the
+node's next start; a store in an earlier layout is refused until
+`dagda-migrate` has converted it (Dagda's
+[migration guide](https://github.com/tomdionysus/dagda/blob/main/docs/migration.md)).
 
 ## Uninstall
 

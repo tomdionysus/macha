@@ -13,16 +13,18 @@ dht:
   metadata_write_copies: 2
 
 network:
-  advertise: 10.0.0.11       # this node's reachable address
+  advertise: 192.0.2.11      # this node's reachable address
   failure_domain: site-a     # what could fail together
 
 bootstrap:
-  - 10.0.0.12:7437
-  - 10.0.0.13:7437
+  - 192.0.2.12:7437
+  - 192.0.2.13:7437
 ```
 
 Change `advertise` and `failure_domain` for each node. Keep the `dht` policy
-and cluster key the same everywhere.
+and cluster key the same everywhere. Each node also has its own key custody
+(see [Configuration](configuration.md#key-custody)); custody is per node and
+is never copied between them.
 
 ## What those settings buy you
 
@@ -58,8 +60,9 @@ uses the same cluster key.
 
 ## A few practical cautions
 
-- Two copies on two disks in one machine protect against a disk failure, not a
-  machine or site failure. Name failure domains honestly.
+- Copies are placed on nodes, not disks: two backends on one node hold one
+  copy between them. Two nodes on one machine protect against a disk failure,
+  not a machine or site failure. Name failure domains honestly.
 - A cache is convenient but is not an authoritative replica.
 - Enough free capacity must remain in at least two suitable domains for repair
   and continued writes.
