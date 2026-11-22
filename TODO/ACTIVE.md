@@ -58,8 +58,11 @@ two history rewrites; the maintainer's backups hold the maps.
      `test_publication_writer_failure_stays_invisible` aborted once with `malloc(): unaligned tcache chunk
      detected` inside `dannan::net::RequestScheduler::stop` at the test node's stop (core read; evidence in
      `build/evidence/heap-2026-11-22/`). Glibc caught it late, so the stop is where it surfaced, not the cause.
-     Alone, under ASan, both pass. Next: the ASan suite under load (`build/pi/heap-chase.sh`) for the first bad
-     access.
+     Alone, under ASan, both pass. The ASan suite under `--jobs 2` (3 runs) never failed those two; run 3 failed
+     the ingest/torrent case on ASan's own thread-registry CHECK (as on `develop`'s CI): ASan's bookkeeping
+     overwritten, which uninstrumented code (libtorrent) could do, but the plain crashes run with torrent off.
+     A race under load fits both; next, TSan with Dannan and Dagda instrumented (running on build-3,
+     `build/pi/macha_sanitize.sh`, PASSES=tsan).
    - Live: found-issues 1 and 2 (heap corruption, the FUSE `rm` crash) are still open.
 5. **Repin onto Dannan 0.10.1 and Dagda 0.4.0** (0.4.0 carries 0.3.3's repair fix): read each release's notes and
    changelog, drop workarounds, use new APIs, record it in the repin commit.
