@@ -151,6 +151,11 @@ Ordered by what they cost a user.
     one session and all it holds per async transcode start. **Fixed in 0.94.1**
     (`archive/2026-11-12-playback-start-leak.md`).
 
+19. **A SIGHUP reload leaves maintenance keys unchanged, silently** (run, 2026-11-22): `NodeRuntime::reconfigure_local`
+    copies storage backends, cache, hydration and read-ahead only, and the reload's INFO line lists what it reloaded
+    without saying a changed maintenance key (`collect_garbage` here) waits for a restart. Fix: apply them, or refuse
+    or WARN as `reload_config` does for other restart-only keys.
+
 ## The live cluster
 
 - **Replication is slow by policy, not stalled.** Repair's credit is `bandwidth x idle_bandwidth_fraction x

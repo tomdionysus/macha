@@ -27,7 +27,15 @@ two history rewrites; the maintainer's backups hold the maps.
 1. **Close out the OOM.** Watch live-a through an estimate misread on 0.95.2 (Dagda's line: RSS above about 1.3 GB, or
    the estimate more than quadrupling in one step, is a finding to send Dagda). Then stop the samplers on live-a
    (`/root/oom-watch/sampler.pid`; Dagda's `arena.pid` is Dagda's to stop) and report.
-2. **Post-cutover, each on the maintainer's word:**
+2. **Post-cutover** (the maintainer, 2026-11-22: check then GC; deploy 0.95.3; stop the samplers; clear the kits):
+   - done 2026-11-22: 0.95.3 on both nodes (live-a 18:17Z, live-b 18:18Z; Status shows each on Dannan 0.9.2,
+     Dagda 0.3.3); samplers stopped, logs in `build/evidence/oom-2026-11-22/`; the cutover kits removed (custody
+     copies and `pre-0.95.3` kept);
+   - the cutover check on live-a, read-only as root on-box (`build/cutover/diag-keys.py`): the namespace's
+     1,624,424 extents all held by a reachable node, 0 unavailable, 0 unknown; repair 0 unsourceable, 0 unreadable.
+     `collect_garbage: true` on live-a from 18:27Z (a restart: a SIGHUP does not reload maintenance keys).
+     live-b not checked through its own API (signing in there from live-a was refused); its GC waits on the
+     maintainer;
    - the baseline comparison against `2026-11-06-pi-baselines.md` (state each node's replication state with it);
    - the `catalogue_root` merge conflict: superseded by the next catalogue root, or the maintainer resolves it at
      `/api/v1/manage/metadata/conflicts`;
