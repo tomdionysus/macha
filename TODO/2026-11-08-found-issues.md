@@ -46,7 +46,7 @@ Ordered by what they cost a user.
    at 94%. What filled the store was not measured; the TV import's tree and extent nodes held for CONTROL GC's
    30-day grace is the guess. Fix: a condition in Status when a store refuses puts; back off work that cannot
    complete; measure what the store holds.
-4. **Cancelling an ingest job does not stop its worker** (run). `enqueue_catalogue_hints` (`ingest.cpp:1270`)
+4. **Fixed in 0.95.3** (`3f28e08`: the job's end no longer resubmits every hint). **Cancelling an ingest job did not stop its worker** (run). `enqueue_catalogue_hints` (`ingest.cpp:1270`)
    checks neither cancel nor stop; the TV job kept rewriting a 5 MB `hints.json` after `cancel` until macha was
    restarted (2026-11-06 15:51Z). Hints not yet submitted were lost, so some imported files may not be catalogued.
    The rewrite per submission is the import-end defect already in `BACKLOG.md`.

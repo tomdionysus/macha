@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-22 about 15:30Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-22 about 17:45Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note.** The version before this rationalisation is
 `archive/2026-11-22-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md` (not ordered),
 `2026-11-08-found-issues.md` (Macha's defects), `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not
@@ -18,7 +18,8 @@ two history rewrites; the maintainer's backups hold the maps.
   bounds the push window; Macha 0.95.2 sets that window to an eighth of the retained-memory budget (96 MiB). On it,
   live-a held 0.97 to 1.20 GB through 76 GB of repair, the estimate steady at 10 to 12 MiB/s. The stopgaps
   (`maintenance.max_bandwidth: 16M`, a glibc `MALLOC_MMAP_THRESHOLD_` drop-in) are removed from both nodes.
-- **The branch:** `port/dannan-dagda`, head `ffee93e` (0.95.2), pushed, untagged, not merged. `develop` and `main`
+- **The branch:** `port/dannan-dagda`, 0.95.3 (`3f28e08`: the import submits each hint once; the genesis password
+  file durable), pushed, untagged, not merged; the live nodes run 0.95.2. `develop` and `main`
   are 0.94.2 and older; merges, tags and the release go on the maintainer's word.
 
 ## Now, in order
@@ -35,9 +36,15 @@ two history rewrites; the maintainer's backups hold the maps.
 3. **The release** (`project_release_procedure`): the pre-merge gate on a Pi (`tools/ci.sh --local` with ASan, and the
    coverage build, which gives Macha's first whole-tree figure); squash the port onto `develop`; GitHub CI green on
    `develop` (red since 2026-11-13 on the ingest/torrent ASan crash, item 4 below); debs; tag; merge to `main`.
-4. **P0 failures, never tolerated as flakes:** the catalogue SIGSEGV; the status race; the burst-rmdir heap
-   corruption (found-issues 1, with the FUSE `rm` crash, 2); the ingest/torrent ASan crash
-   (`rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`).
+4. **P0 failures, never tolerated as flakes.** 2026-11-22, on 0.95.2 with Dannan 0.9.2 and Dagda 0.3.3 both
+   instrumented: the whole suite passes under ASan (556/556), the ingest/torrent case that keeps `develop` red
+   among them.
+   - The status race was the test's (`test_status_renders_each_node_from_what_it_knows`, 22 of 30 under ASan):
+     fixed in `d7929ad`, 60 of 60 since.
+   - Not reproduced: the catalogue SIGSEGV (`test_catalogue_sync_search_and_artwork_gc`, 90 of 90 under ASan,
+     one at a time) and the burst-rmdir heap corruption (`test_removing_empty_directories_in_a_burst_keeps_the_node_up`,
+     30 of 30). Each failed once in a full run under `--jobs 2`; next, repeats of the full suite under load.
+   - Live: found-issues 1 and 2 (heap corruption, the FUSE `rm` crash) are still open.
 5. **Repin onto Dannan 0.10.1 and Dagda 0.4.0** (0.4.0 carries 0.3.3's repair fix): read each release's notes and
    changelog, drop workarounds, use new APIs, record it in the repin commit.
 6. **Report the Dannan and Dagda versions** in Status and the clients (`BACKLOG.md`, "Status and clients"); an API
@@ -48,10 +55,12 @@ two history rewrites; the maintainer's backups hold the maps.
    placement plan is the coordinating session's; negotiation goes through it.
 9. **The deferred API intents** (`2026-11-18-port-api-announcement.md`): Dannan's and Dagda's native forms, once
    fidelity is shown and the maintainer says.
-10. **Macha's defects**, `2026-11-08-found-issues.md` in its order: a full control store is silent (3), cancelling an
-    ingest leaves its worker running (4), import filing (9), then the rest; and from the old list: the stop not
-    checked by the release horizon's census or the tree diff under `census_follow`; books as the web client reported
-    at 0.92.2; the genesis root-password file written with no fsync (`auth/users.cpp`).
+10. **Macha's defects**, `2026-11-08-found-issues.md` in its order: a full control store is silent (3; Status
+    reports no control-store use, and with `collect_garbage` false nothing is reclaimed: 4,544 MiB of 8 GiB on
+    live-a, 4,298 on live-b, 2026-11-22, growth logged in `build/cutover/control-store.log`), import filing (9),
+    then the rest; and from the old list: the stop not checked by the release horizon's census or the tree diff
+    under `census_follow`; books as the web client reported at 0.92.2. Done in 0.95.3: cancelling an ingest (4) and
+    the genesis password file's fsync.
 
 **Reopen on sight:** `credit wait abandoned`; `metadata merge recorded a conflict`; `RPC stalled (control)`; heap
 corruption; a Macha restart on either live node.
