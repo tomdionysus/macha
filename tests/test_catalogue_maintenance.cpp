@@ -3,11 +3,14 @@
 // The catalogue's maintenance inventory (head, repair, read) against a fake
 // metadata view, so no metadata manager is needed behind it.
 #include "catalogue/catalogue.hpp"
+#include "catalogue/catalogue_installer.hpp"
+#include "cluster/node_events.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "test_support.hpp"
 
 #include <set>
 #include <stdexcept>
+#include <thread>
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -585,3 +588,29 @@ MACHA_TEST("catalogue_maintenance", test_artwork_is_staged_in_the_class_of_whoev
 }
 
 } // namespace
+
+MACHA_TEST("catalogue_maintenance", test_a_failed_install_is_not_retried_for_every_object_stored) {
+    // An install that cannot complete (here no metadata; live, a control store too full to
+    // take the shards it fetches) is tried again on a storage change, and an import or
+    // repair raises one for every object stored: a burst of them costs one retry, not one
+    // each. A new head is tried at once.
+    Node fixture;
+    FakeMetadataView metadata;
+    CatalogueManager catalogue(*fixture.node, fixture.node->metadata_server(),
+                               fixture.node->store_context(), metadata);
+    NodeEvents events;
+    node_event::name_kinds(events);
+    CatalogueInstaller installer(catalogue, events);
+    installer.start();
+    REQUIRE(macha::test_support::wait_until([&] { return installer.attempts() == 1; }, 5s));
+    for (int i = 0; i < 50; ++i) {
+        events.notify(node_event::storage);
+        std::this_thread::sleep_for(10ms);
+    }
+    std::this_thread::sleep_for(1500ms);
+    CHECK(installer.attempts() <= 3);
+    const auto before = installer.attempts();
+    events.notify(node_event::metadata);
+    CHECK(macha::test_support::wait_until([&] { return installer.attempts() == before + 1; }, 5s));
+    installer.stop();
+}

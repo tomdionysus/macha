@@ -45,8 +45,10 @@ Ordered by what they cost a user.
    not run: `CatalogueInstaller::loop` (`catalogue_installer.cpp:30-56`) retries a failed `follow_head` on every
    membership or storage event, and Dagda raises a storage event for every object a node newly holds
    (`distributed_store.cpp:1126`), so under repair or an import a refused install retries once per object landed.
-   Next: a case with a tiny control limit and objects landing that counts install attempts; then bounded
-   exponential backoff there (still woken by an event that could change the answer), and on the hints. live-a's `metadata-objects` reached its 4G limit at
+   **Proven and fixed in 0.95.4:** the case `test_a_failed_install_is_not_retried_for_every_object_stored` failed
+   on the old loop (more than 3 installs for a burst of 50 storage changes) and passes on the new one: a storage
+   change waits out 1 s doubling to 5 min, a new head or membership change still retries at once. The hints'
+   fixed 30 s deferral stays: bounded, not a spin. live-a's `metadata-objects` reached its 4G limit at
    about 21:16Z on 2026-11-06. Every control put was refused (`LocalStore::physical_space_available_locked`),
    namespace writes on live-a failed (`namespace node could not be written locally`), and two catalogue
    shards were retried several times a second with no backoff: 73,842 warnings, about 18% of a core, which also

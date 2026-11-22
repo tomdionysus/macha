@@ -1,6 +1,6 @@
 # Current release
 
-## 0.95.4: Status shows each node's control store, and says when one is nearly full
+## 0.95.4: Status shows each node's control store; a failed catalogue install backs off
 
 - API: each `nodes[]` entry in `GET /api/v1/status` gains `control_storage` (`available`,
   `capacity_bytes`, `used_bytes`, `free_bytes`): that node's control store against its limit,
@@ -8,6 +8,11 @@
   node within 5% of its limit adds the condition `1 node's control storage is nearly full` and
   makes the cluster `degraded`: a full control store refuses every metadata write on its node,
   and Status said nothing of it.
+- A catalogue install that fails (a shard no node present can supply, or a control store too
+  full to take one) is no longer tried again for every object the node stores: an import or
+  repair raises a storage change for each, and each retry fetched the shards again. A storage
+  change now waits out a backoff of 1 s doubling to 5 minutes; a new head or a membership change
+  is still tried at once.
 
 ## 0.95.3: an import submits each file's catalogue hint once; Status names each node's libraries
 
