@@ -8,6 +8,9 @@
 #include "supervised.hpp"
 #include "test_backend_support.hpp"
 
+#include <dagda/version.h>
+#include <dannan/version.h>
+
 #if defined(__linux__)
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -1660,6 +1663,8 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
                                   hosted.metadata_generation = 25723;
                                   hosted.storage_backends_online = 1;
                                   hosted.api_endpoint = "http://192.0.2.51:7438";
+                                  hosted.dannan_version = "0.9.2";
+                                  hosted.dagda_version = "0.3.3";
                                   hosted.playback.startup_timeout_ms = 9000;
                                   hosted.playback.segment_timeout_ms = 3000;
                                   write_hosted_telemetry(record, hosted);
@@ -1713,6 +1718,9 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         CHECK(entry->find("port")->asUInt64() == peer.port);
         // Without telemetry the advertised API address is unknown: omitted.
         CHECK(entry->find("api_endpoint") == nullptr);
+        // And so are the libraries it runs.
+        CHECK(entry->find("dannan_version")->isNull());
+        CHECK(entry->find("dagda_version")->isNull());
         const auto* storage = entry->find("storage");
         CHECK(!storage->find("available")->asBool());
         CHECK(storage->find("capacity_bytes")->asUInt64() == peer.capacity);
@@ -1786,6 +1794,13 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
         // The operator's display name travels beside host, never in place of it.
         CHECK(entry->find("node_name")->asString() == "Test Peer");
         CHECK(entry->find("host")->asString() == peer.host);
+        // The libraries the peer runs, as it reported them; this node's, as each reports itself.
+        CHECK(entry->find("dannan_version")->asString() == "0.9.2");
+        CHECK(entry->find("dagda_version")->asString() == "0.3.3");
+        const auto* self = node_entry(root, node.node_id());
+        REQUIRE(self != nullptr);
+        CHECK(self->find("dannan_version")->asString() == dannan::library_version());
+        CHECK(self->find("dagda_version")->asString() == dagda::library_version());
         CHECK(entry->find("playback")->find("startup_timeout_ms")->asInt64() == 9000);
         CHECK(entry->find("playback")->find("segment_timeout_ms")->asInt64() == 3000);
         const auto* traffic = entry->find("traffic");

@@ -4,6 +4,12 @@ Contracts settled with the client sessions (from 2026-09-13), kept here
 because they were agreed across sessions and exist nowhere else in this
 repository. A server change that breaks one breaks four clients at once.
 
+**0.95.3 (not yet announced: no Core or client session was running on 2026-11-22; announce before it
+ships to the live nodes).** Each `nodes[]` entry in `GET /api/v1/status` gains `dannan_version` and
+`dagda_version`, strings in full x.y.z (`0.9.2`, `0.3.3`), or `null` when that node has sent no telemetry
+or runs a release that does not report them. Additive; nothing else changes. The maintainer's request
+(2026-11-21): the clients show them beside `version`.
+
 **0.90.87 (announced 2026-10-12 to Core, which checked core and all three
 clients; no conflict).** A torrent job's `catalogue.state` follows the ingest
 rule. `GET /api/v1/ingest/jobs/{id}` for a job another node owns asks the

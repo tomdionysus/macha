@@ -56,6 +56,10 @@ struct NodeTelemetry {
     uint64_t sequence{};
     uint64_t observed_unix_ms{};
     std::string version;
+    // The Dannan and Dagda libraries the node runs, as each reports itself; empty when
+    // the node did not say.
+    std::string dannan_version;
+    std::string dagda_version;
     std::string host;
     std::string failure_domain;
     uint16_t port{};

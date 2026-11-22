@@ -262,6 +262,13 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
                                 : (member ? member->seen_unix_ms : durable.observed_unix_ms));
     node["live_age_ms"] = live ? Json(live_age_ms) : Json(nullptr);
     node["version"] = live ? live->version : durable.version;
+    // The libraries the node runs, from its telemetry only: null when it has none, or a
+    // node that does not report them.
+    const auto library = [&](const std::string NodeTelemetry::* field) {
+        return live && !(live->*field).empty() ? Json(live->*field) : Json(nullptr);
+    };
+    node["dannan_version"] = library(&NodeTelemetry::dannan_version);
+    node["dagda_version"] = library(&NodeTelemetry::dagda_version);
     // The operator's display name for the node; null when it has none.
     {
         const auto& name = live ? live->node_name : durable.node_name;

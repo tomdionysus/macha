@@ -1,6 +1,6 @@
 # Current release
 
-## 0.95.3: an import submits each file's catalogue hint once
+## 0.95.3: an import submits each file's catalogue hint once; Status names each node's libraries
 
 A large import submitted every file's catalogue hint twice: once as the file landed, and again
 for every file when the last copy finished. Each submission rewrote the whole hint store, so
@@ -14,6 +14,10 @@ the second pass held a core for minutes on a job of thousands of files, after th
 - The genesis administrator's password file, `initial-root-password`, is synced with its
   directory before the node goes on: a crash just after the founding no longer loses the only
   copy of the password.
+- API: each `nodes[]` entry in `GET /api/v1/status` gains `dannan_version` and `dagda_version`,
+  the libraries that node runs, in full (`0.9.2`), from its telemetry; `null` when it has sent
+  none or runs an earlier release. Each node reports them in two new telemetry fields (1046 and
+  1047); a node on an earlier release ignores them.
 
 ## 0.95.2: repair's memory is bounded by the node's budget
 

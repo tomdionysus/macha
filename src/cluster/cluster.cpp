@@ -13,7 +13,9 @@
 #include "macha_version.hpp"
 #include "supervised.hpp"
 
+#include <dagda/version.h>
 #include <dannan/reach/upnp.h>
+#include <dannan/version.h>
 
 #include <algorithm>
 #include <array>
@@ -94,7 +96,7 @@ PlaybackBudgets enforced_playback_budgets(const StreamingConfig& streaming) {
 NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, RecoveryProgress& progress,
                          TranscodeRateBook& transcode_rates, MessageRoutes& routes,
                          StartupStageHook startup_stage_hook)
-    : cfg_(normalize_config(std::move(config))), keys_(std::move(keys)), progress_(progress),
+    : cfg_(normalize_config(std::move(config))), keys_(keys), progress_(progress),
       transcode_rates_(transcode_rates), startup_stage_hook_(std::move(startup_stage_hook)),
       startup_unix_ms_(unix_ms()),
       host_(node_config(), routes, 2,
@@ -158,6 +160,8 @@ void NodeRuntime::write_telemetry(dannan::status::Telemetry& record) const {
     hosted.metadata_generation = advertised_metadata_generation_.load(std::memory_order_relaxed);
     hosted.storage_backends_online = static_cast<uint32_t>(figures.backends_online);
     hosted.api_endpoint = advertised_api_endpoint(cfg_.catalogue.api, members_.self().host);
+    hosted.dannan_version = dannan::library_version();
+    hosted.dagda_version = dagda::library_version();
     hosted.playback = enforced_playback_budgets(cfg_.streaming);
     if (cfg_.streaming.enabled)
         hosted.playback.transcode_rates = transcode_rates_.summary();

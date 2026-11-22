@@ -457,9 +457,15 @@ metadata publication. Each node's `telemetry_freshness` is `live`, `stale`,
 because optional telemetry was dropped.
 
 The telemetry record is Dannan's: every field tagged, Macha's own figures
-(storage, cache, metadata generation, API endpoint, playback budgets) carried
-as hosted fields, and a zero or empty value not written. A record with a field
-that cannot be read is dropped alone, never the set it came in.
+(storage, cache, metadata generation, API endpoint, playback budgets, the
+library versions) carried as hosted fields, and a zero or empty value not
+written. A record with a field that cannot be read is dropped alone, never the
+set it came in.
+
+`nodes[].version` is the Macha release a node runs. `nodes[].dannan_version` and
+`nodes[].dagda_version` are the Dannan and Dagda libraries it runs, each in
+full (`0.9.2`) as the loaded library reports itself. They come from the node's
+telemetry alone: `null` when the node has sent none or does not report them.
 
 `nodes[].traffic` is each node's own cluster traffic by frame class:
 `{as_of_unix_ms, window_ms, classes}`, where `classes` has one entry per class
