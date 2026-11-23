@@ -80,8 +80,6 @@ class RetainedMemoryLedger {
                                      bool reclaimable = false, std::function<void()> shed = {});
     // Ownership of work already acknowledged, reconstructed at recovery; never refused.
     Lease restore(WorkClass, MemoryOwner, uint64_t bytes);
-    // Wakes every waiter to re-check its cancellation flag.
-    void wake();
     void stop();
     RetainedMemoryStats stats() const;
 

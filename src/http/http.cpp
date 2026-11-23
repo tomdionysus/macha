@@ -625,37 +625,6 @@ void HttpWaker::arm(std::function<void()> wake) {
         wake();
 }
 
-HttpResponse http_resolve(const std::function<HttpResponse(const HttpRequest&)>& handler,
-                          HttpRequest request) {
-    struct Flag {
-        Mutex mutex;
-        std::condition_variable cv;
-        bool woken MACHA_GUARDED_BY(mutex){};
-    };
-    while (true) {
-        auto response = handler(request);
-        if (!response.defer)
-            return response;
-        auto deferral = std::move(*response.defer);
-        auto flag = std::make_shared<Flag>();
-        if (deferral.waker)
-            deferral.waker->arm([flag] {
-                Lock lock(flag->mutex);
-                flag->woken = true;
-                flag->cv.notify_all();
-            });
-        {
-            Lock lock(flag->mutex);
-            while (!flag->woken && Clock::now() < deferral.deadline)
-                flag->cv.wait_for(lock.native(), 1s,
-                                  [&]() MACHA_REQUIRES(flag->mutex) { return flag->woken; });
-        }
-        request.resumed = true;
-        request.resumed_state = std::move(deferral.state);
-        request.resume_deadline = deferral.deadline;
-    }
-}
-
 struct HttpServer::Impl {
     CatalogueApiConfig config;
     std::function<HttpResponse(const HttpRequest&)> handler;
@@ -1553,10 +1522,6 @@ void HttpServer::set_inline_route(std::string path, std::function<HttpResponse()
 
 void HttpServer::set_reactor_pass_hook(std::function<void()> hook) {
     impl_->pass_hook = std::move(hook);
-}
-
-bool HttpServer::running() const {
-    return impl_->running.load();
 }
 
 uint16_t HttpServer::bound_port() const {

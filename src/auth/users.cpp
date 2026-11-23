@@ -504,51 +504,6 @@ std::optional<UserRecord> UserStore::remove(std::string_view user_id, const Node
         by);
 }
 
-std::optional<RecoveryEnvelope> UserStore::root_recovery() const {
-    auto root = find_by_username(root_username);
-    if (!root || !root->recovery.present())
-        return std::nullopt;
-    return root->recovery;
-}
-
-bool UserStore::set_root_recovery(const RecoveryEnvelope& envelope, const NodeId& by) {
-    auto root = find_by_username(root_username);
-    if (!root)
-        return false;
-    return mutate(
-               root->id,
-               [&](UserRecord& user) {
-                   user.recovery = envelope;
-                   return true;
-               },
-               by)
-        .has_value();
-}
-
-std::optional<UserRecord> UserStore::reset_root_password(std::string_view new_password,
-                                                         const NodeId& by) {
-    if (new_password.empty())
-        return std::nullopt;
-    auto root = find_by_username(root_username);
-    if (!root)
-        return std::nullopt;
-    const auto credential = hash_password(new_password);
-    return mutate(
-        root->id,
-        [&](UserRecord& user) {
-            user.salt = credential.salt;
-            user.kdf = 1;
-            user.kdf_n = default_kdf_n;
-            user.kdf_r = default_kdf_r;
-            user.kdf_p = default_kdf_p;
-            user.password_hash = credential.hash;
-            // Retires every root session, including any held by an intruder.
-            ++user.credential_generation;
-            return true;
-        },
-        by);
-}
-
 bool UserStore::apply_locked(UserRecord incoming) {
     auto found = by_id_.find(incoming.id);
     if (found != by_id_.end()) {
@@ -705,16 +660,6 @@ std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const C
 
     return InitialAccounts{std::move(*root), std::move(anonymous.value()), std::move(password),
                            recovery_key, path};
-}
-
-void UserStore::persist() const {
-    Lock persisting(persist_mutex_);
-    std::vector<UserRecord> records;
-    {
-        ReadLock lock(mutex_);
-        records = records_locked();
-    }
-    write(records);
 }
 
 std::vector<UserRecord> UserStore::records_locked() const {

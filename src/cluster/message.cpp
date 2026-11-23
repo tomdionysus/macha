@@ -189,18 +189,13 @@ FrameType default_frame_type(MessageType type) noexcept {
 }
 
 AsyncRpc::AsyncRpc(std::future<RpcReply> future, std::function<void()> cancel,
-                   std::function<void()> abort, std::function<void(FrameType)> promote,
                    std::function<std::chrono::milliseconds()> idle)
-    : future_(std::move(future)), cancel_(std::move(cancel)), abort_(std::move(abort)),
-      promote_(std::move(promote)), idle_(std::move(idle)) {}
+    : future_(std::move(future)), cancel_(std::move(cancel)), idle_(std::move(idle)) {}
 
 AsyncRpc::AsyncRpc(AsyncRpc&& other) noexcept
     : future_(std::move(other.future_)), cancel_(std::move(other.cancel_)),
-      abort_(std::move(other.abort_)), promote_(std::move(other.promote_)),
       idle_(std::move(other.idle_)) {
     other.cancel_ = {};
-    other.abort_ = {};
-    other.promote_ = {};
     other.idle_ = {};
 }
 
@@ -210,12 +205,8 @@ AsyncRpc& AsyncRpc::operator=(AsyncRpc&& other) noexcept {
     cancel();
     future_ = std::move(other.future_);
     cancel_ = std::move(other.cancel_);
-    abort_ = std::move(other.abort_);
-    promote_ = std::move(other.promote_);
     idle_ = std::move(other.idle_);
     other.cancel_ = {};
-    other.abort_ = {};
-    other.promote_ = {};
     other.idle_ = {};
     return *this;
 }
@@ -224,18 +215,12 @@ AsyncRpc::~AsyncRpc() {
     cancel();
 }
 
-bool AsyncRpc::valid() const {
-    return future_.valid();
-}
-
 std::future_status AsyncRpc::wait_for(std::chrono::milliseconds timeout) {
     return future_.wait_for(timeout);
 }
 
 RpcReply AsyncRpc::get() {
     cancel_ = {};
-    abort_ = {};
-    promote_ = {};
     idle_ = {};
     return future_.get();
 }
@@ -243,28 +228,9 @@ RpcReply AsyncRpc::get() {
 void AsyncRpc::cancel() {
     if (cancel_) {
         auto cancel = std::move(cancel_);
-        abort_ = {};
-        promote_ = {};
         idle_ = {};
         cancel();
     }
-}
-
-void AsyncRpc::abort() {
-    if (abort_) {
-        auto abort = std::move(abort_);
-        cancel_ = {};
-        promote_ = {};
-        idle_ = {};
-        abort();
-    } else {
-        cancel();
-    }
-}
-
-void AsyncRpc::promote(FrameType type) {
-    if (promote_)
-        promote_(type);
 }
 
 std::chrono::milliseconds AsyncRpc::idle_for() const {

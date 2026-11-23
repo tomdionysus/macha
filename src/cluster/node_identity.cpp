@@ -4,6 +4,6 @@
 namespace macha {
 
 NodeIdentity::NodeIdentity(ClusterKeys cluster_keys, const dannan::Identity& node)
-    : keys(std::move(cluster_keys)), id(node.id()), durability_epoch(node.durability_epoch()) {}
+    : keys(std::move(cluster_keys)), id(node.id()) {}
 
 } // namespace macha

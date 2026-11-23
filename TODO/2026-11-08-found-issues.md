@@ -169,6 +169,11 @@ Ordered by what they cost a user.
     without saying a changed maintenance key (`collect_garbage` here) waits for a restart. Fix: apply them, or refuse
     or WARN as `reload_config` does for other restart-only keys.
 
+20. **Nothing wakes a retained-memory waiter on cancel** (read, 2026-11-23): `RetainedMemoryLedger::acquire`'s
+    contract says a waiter returns when `cancelled` is set "and the ledger woken", but Macha's `wake` wrapper had no
+    caller and is removed; a cancelled waiter returns only on a release or its deadline. Check whether any waiter
+    passes `cancelled` and needs it prompt.
+
 ## The live cluster
 
 - **Replication is slow by policy, not stalled.** Repair's credit is `bandwidth x idle_bandwidth_fraction x

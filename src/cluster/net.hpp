@@ -190,29 +190,21 @@ struct RpcServerWorkStats {
 class AsyncRpc {
     std::future<RpcReply> future_;
     std::function<void()> cancel_;
-    std::function<void()> abort_;
-    std::function<void(FrameType)> promote_;
     std::function<std::chrono::milliseconds()> idle_;
 
   public:
     AsyncRpc() = default;
-    AsyncRpc(std::future<RpcReply>, std::function<void()>, std::function<void()>,
-             std::function<void(FrameType)> = {}, std::function<std::chrono::milliseconds()> = {});
+    AsyncRpc(std::future<RpcReply>, std::function<void()>,
+             std::function<std::chrono::milliseconds()> = {});
     ~AsyncRpc();
     AsyncRpc(AsyncRpc&&) noexcept;
     AsyncRpc& operator=(AsyncRpc&&) noexcept;
     AsyncRpc(const AsyncRpc&) = delete;
     AsyncRpc& operator=(const AsyncRpc&) = delete;
 
-    bool valid() const;
     std::future_status wait_for(std::chrono::milliseconds);
     RpcReply get();
     void cancel();
-    void abort();
-    void promote(FrameType);
-    std::function<void(FrameType)> promotion_callback() const {
-        return promote_;
-    }
     std::chrono::milliseconds idle_for() const;
 };
 

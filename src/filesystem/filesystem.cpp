@@ -105,13 +105,6 @@ ReadHandle::~ReadHandle() {
         playback_->close(playback_session_);
 }
 
-void ReadHandle::promote(FrameType requested) noexcept {
-    auto current = frame_type_.load(std::memory_order_relaxed);
-    while (frame_type_priority(requested) < frame_type_priority(current) &&
-           !frame_type_.compare_exchange_weak(current, requested, std::memory_order_relaxed)) {
-    }
-}
-
 const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
                                 const std::shared_ptr<std::atomic_bool>& cancelled) {
     if (cached_index_ == i) {
@@ -169,7 +162,7 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
 }
 
 size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point deadline,
-                        std::shared_ptr<std::atomic_bool> cancelled) {
+                        const std::shared_ptr<std::atomic_bool>& cancelled) {
     Lock g(m_);
     if (off >= e_.size || out.empty())
         return 0;
@@ -212,7 +205,7 @@ WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bo
                          WriteDurability durability, uint64_t publication_pipeline_bytes,
                          DataWorkContext work_context)
     : fs_(f), path_(std::move(p)), base_(std::move(b)), expected_(base_.version), sequential_(true),
-      cache_puts_(cache_puts), durability_(durability), work_context_(work_context),
+      cache_puts_(cache_puts), durability_(durability), work_context_(std::move(work_context)),
       publication_pipeline_bytes_(publication_pipeline_bytes), logical_(trunc ? 0 : base_.size),
       staged_(trunc ? 0 : base_.size),
       diagnostic_id_(next_write_handle_diagnostic_id.fetch_add(1, std::memory_order_relaxed)) {
@@ -2260,7 +2253,7 @@ std::shared_ptr<PublicationWriter> FileSystem::open_publication(const std::strin
 std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc,
                                                     bool cache_puts, WriteDurability durability,
                                                     uint64_t publication_pipeline_bytes,
-                                                    DataWorkContext work_context) {
+                                                    const DataWorkContext& work_context) {
     // open_writes_mutex_ serialises lookup/registration with rename's handle
     // fix-up, so an opening writer cannot miss a rename. Never held across a
     // metadata mutation, which would serialise every publication on the node.
@@ -2319,31 +2312,6 @@ std::optional<uint64_t> FileSystem::active_write_size(const std::string& p) {
             visible = size;
     }
     return visible;
-}
-
-std::vector<WriteHandleDiagnostics> FileSystem::active_write_diagnostics(const std::string& p) {
-    const auto q = resolve_existing_path(p).value_or(normalize_path(p));
-    std::vector<std::shared_ptr<WriteHandle>> matches;
-    {
-        Lock handles(open_writes_mutex_);
-        for (auto i = open_writes_.begin(); i != open_writes_.end();) {
-            auto handle = i->lock();
-            if (!handle) {
-                i = open_writes_.erase(i);
-                continue;
-            }
-            // path_ is changed only while open_writes_mutex_ is held by rename().
-            if (handle->path_ == q)
-                matches.push_back(std::move(handle));
-            ++i;
-        }
-    }
-
-    std::vector<WriteHandleDiagnostics> out;
-    out.reserve(matches.size());
-    for (const auto& handle : matches)
-        out.push_back(handle->diagnostics());
-    return out;
 }
 
 void FileSystem::commit_write(WriteHandle& handle, const FsEntry& expected, uint64_t z,
@@ -2423,12 +2391,6 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
     });
     if (out)
         *out = std::move(committed);
-}
-MetadataSnapshot FileSystem::local_snapshot() const {
-    const auto record = local_.replica().current();
-    if (!valid_metadata_record(record))
-        throw MetadataNotReady("local metadata replica unavailable");
-    return decode_snapshot(record.payload);
 }
 
 MetadataSnapshotView FileSystem::local_snapshot_view() {

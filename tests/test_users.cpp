@@ -364,7 +364,7 @@ MACHA_FAST_TEST("users", test_user_and_session_encodings) {
             store.create("carol", "secret", {std::string(role_manage_users)}, node_id(1));
         REQUIRE(created.has_value());
         id = created->id;
-        // Write-through: durable when the call returns, with no persist() call.
+        // Write-through: durable when the call returns.
     }
     REQUIRE(std::filesystem::exists(path));
     {

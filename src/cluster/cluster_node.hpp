@@ -30,12 +30,6 @@ class ClusterNode {
     static constexpr ThreadSafety node_id_safety = ThreadSafety::thread_safe;
     virtual NodeId node_id() const = 0;
 
-    // Names this process's durable placements; a replica stamped with another
-    // epoch was placed by an earlier incarnation.
-    static constexpr Waits durability_epoch_waits = Waits::none;
-    static constexpr ThreadSafety durability_epoch_safety = ThreadSafety::thread_safe;
-    virtual NodeId durability_epoch() const = 0;
-
     // The roster placement ranks, this node included. Membership is itself
     // thread safe.
     static constexpr Waits membership_waits = Waits::none;

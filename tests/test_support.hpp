@@ -539,9 +539,6 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     void propagate_session(const AuthSession& session) {
         accounts_.propagate_session(session);
     }
-    bool apply_user(const UserRecord& user) {
-        return accounts_.apply_user(user);
-    }
     void propagate_users() {
         accounts_.propagate_users();
     }

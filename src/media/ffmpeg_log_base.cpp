@@ -8,30 +8,6 @@
 
 namespace macha {
 
-std::string_view ffmpeg_log_level_name(FfmpegLogLevel level) noexcept {
-    switch (level) {
-    case FfmpegLogLevel::quiet:
-        return "QUIET";
-    case FfmpegLogLevel::panic:
-        return "PANIC";
-    case FfmpegLogLevel::fatal:
-        return "FATAL";
-    case FfmpegLogLevel::error:
-        return "ERROR";
-    case FfmpegLogLevel::warning:
-        return "WARNING";
-    case FfmpegLogLevel::info:
-        return "INFO";
-    case FfmpegLogLevel::verbose:
-        return "VERBOSE";
-    case FfmpegLogLevel::debug:
-        return "DEBUG";
-    case FfmpegLogLevel::trace:
-        return "TRACE";
-    }
-    return "?";
-}
-
 FfmpegLogLevel parse_ffmpeg_log_level(std::string_view value) {
     std::string level(value);
     std::transform(level.begin(), level.end(), level.begin(),

@@ -30,7 +30,6 @@ enum class TorrentPhase : uint8_t {
     cancelled = 5,
 };
 std::string_view torrent_phase_name(TorrentPhase) noexcept;
-std::optional<TorrentPhase> parse_torrent_phase(std::string_view);
 bool torrent_phase_terminal(TorrentPhase) noexcept;
 
 // What the operator asked for. `cancelled` is final.

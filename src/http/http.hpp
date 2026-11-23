@@ -175,11 +175,6 @@ class ReaderBody final : public HttpBodySource {
     }
 };
 
-// Runs a handler as HttpServer does, waiting out deferrals on the caller's
-// thread and re-running until it answers.
-HttpResponse http_resolve(const std::function<HttpResponse(const HttpRequest&)>& handler,
-                          HttpRequest request);
-
 struct HttpServerDiagnostics {
     struct Lane {
         uint64_t workers{};
@@ -244,7 +239,6 @@ class HttpServer {
     void start();
     void request_stop();
     void stop();
-    bool running() const;
     uint16_t bound_port() const;
     HttpServerDiagnostics diagnostics() const;
 

@@ -163,11 +163,10 @@ class ReadHandle {
     ReadHandle(dagda::Context&, FsEntry, PlaybackTracker* = nullptr, std::string path = {},
                FrameType frame_type = FrameType::read_ahead);
     ~ReadHandle();
-    void promote(FrameType) noexcept;
     // Copies into `out` on the caller's thread, before returning. `cancelled` is co-owned
     // with the store, which may check it after a read has returned.
     size_t read(uint64_t, std::span<uint8_t>, Clock::time_point deadline = {},
-                std::shared_ptr<std::atomic_bool> cancelled = {});
+                const std::shared_ptr<std::atomic_bool>& cancelled = {});
 };
 enum class WriteDurability : uint8_t {
     immediate,
@@ -593,17 +592,17 @@ class FileSystem final : public PublicationTarget {
     // Every path in this node's own head whose content is `id`, in order. From
     // the index.
     std::vector<std::string> media_paths(std::string_view id);
-    std::shared_ptr<WriteHandle> open_write(const std::string&, bool, bool cache_puts = false,
-                                            WriteDurability = WriteDurability::immediate,
-                                            uint64_t publication_pipeline_bytes = 0,
-                                            DataWorkContext work_context = DataWorkContext{});
+    std::shared_ptr<WriteHandle>
+    open_write(const std::string&, bool, bool cache_puts = false,
+               WriteDurability = WriteDurability::immediate,
+               uint64_t publication_pipeline_bytes = 0,
+               const DataWorkContext& work_context = DataWorkContext{});
     // open_write() for a publication generation, never truncating.
     uint64_t reachability_epoch() const noexcept override;
     std::shared_ptr<PublicationWriter> open_publication(const std::string& path, bool cache_puts,
                                                         uint64_t pipeline_bytes,
                                                         DataWorkContext work_context) override;
     std::optional<uint64_t> active_write_size(const std::string&);
-    std::vector<WriteHandleDiagnostics> active_write_diagnostics(const std::string&);
     // `stale_basis_is_replayable`: a mismatched basis is ESTALE, not EAGAIN. A
     // publication writer's basis is then permanently wrong, so the generation
     // must be replayed from the spool against a fresh writer. Foreground
@@ -612,7 +611,6 @@ class FileSystem final : public PublicationTarget {
                      FsEntry*, std::optional<int64_t> mtime_override = {},
                      bool stale_basis_is_replayable = false);
     std::pair<uint64_t, uint64_t> logical_capacity() const;
-    MetadataSnapshot local_snapshot() const;
     MetadataSnapshotView local_snapshot_view();
     std::optional<MetadataSnapshotView> available_snapshot_view() const;
     // The latest mutation this node authored and accepted: a view lacking it

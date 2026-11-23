@@ -207,9 +207,6 @@ class NodeRuntime : public ClusterNode {
     NodeId node_id() const override {
         return identity_.id;
     }
-    NodeId durability_epoch() const override {
-        return identity_.durability_epoch;
-    }
     // Republishes this node's metadata generation to peers that connect;
     // owners call it after advertising.
     void publish_self();
@@ -233,10 +230,9 @@ class NodeRuntime : public ClusterNode {
     const TelemetryStore& telemetry() const {
         return telemetry_;
     }
-    // A no-dial notification on established routes; never blocks. Returns
-    // how many peers it was queued for.
-    size_t broadcast_best_effort(const RpcMessage& message, FrameType frame_type);
-    // The same, never skipped because the route table was momentarily in use.
+    // A no-dial notification on established routes; never blocks, and never
+    // skipped because the route table was momentarily in use. Returns how many
+    // peers it was queued for.
     size_t broadcast_notify(const RpcMessage& message, FrameType frame_type);
     // Each call names its deadline (call_deadline.hpp); without a frame, the type's.
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload,
@@ -247,24 +243,12 @@ class NodeRuntime : public ClusterNode {
                   std::chrono::milliseconds deadline) override;
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType,
                   std::chrono::milliseconds deadline);
-    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload,
-                        std::chrono::milliseconds deadline);
-    AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload,
-                        std::chrono::milliseconds deadline);
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType,
                         std::chrono::milliseconds deadline) override;
-    AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType,
-                        std::chrono::milliseconds deadline);
     // Tells peers this node's accepted metadata changed: advances the
     // announcement epoch, advertises the generation and broadcasts a notice.
     void announce_metadata_generation(uint64_t);
     void reconfigure_local(const Config&);
-    // Cluster bytes by frame class since start (dialled and served together).
-    TrafficTotals traffic_totals() const;
-    // Whether another node reports viewer-class traffic in a sample no older
-    // than `fresh_for`. Repair paces against it as against local viewers,
-    // since its transfers share their links.
-    bool peer_viewers_active(std::chrono::milliseconds fresh_for) const;
     uint64_t remote_metadata_generation() const {
         return remote_metadata_generation_.load();
     }

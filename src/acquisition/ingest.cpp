@@ -582,12 +582,6 @@ void StagingArea::release(std::string_view owner) {
     reservations_.erase(std::string(owner));
 }
 
-uint64_t StagingArea::reservation(std::string_view owner) const {
-    Lock lock(mutex_);
-    auto it = reservations_.find(std::string(owner));
-    return it == reservations_.end() ? 0 : it->second;
-}
-
 std::filesystem::path StagingArea::trash_path() const {
     return config_.staging_path / ".trash";
 }
@@ -2568,13 +2562,6 @@ void IngestManager::cleanup_partials(const IngestJob& job) {
                           " reason=" + e.what());
         }
     }
-}
-
-bool IngestManager::should_pause_or_cancel(const IngestJob& job) const {
-    Lock lock(mutex_);
-    auto it = jobs_.find(job.id);
-    return it == jobs_.end() || it->second.state == IngestJobState::paused ||
-           it->second.state == IngestJobState::cancelled;
 }
 
 } // namespace macha

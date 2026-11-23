@@ -357,59 +357,14 @@ RpcReply NodeRuntime::call(const Endpoint& endpoint, MessageType type,
 }
 
 AsyncRpc NodeRuntime::call_async(const NodeInfo& node, MessageType type,
-                                 std::span<const uint8_t> payload,
-                                 std::chrono::milliseconds deadline) {
-    return call_async(node, type, payload, default_frame_type(type), deadline);
-}
-
-AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
-                                 std::span<const uint8_t> payload,
-                                 std::chrono::milliseconds deadline) {
-    return call_async(endpoint, type, payload, default_frame_type(type), deadline);
-}
-
-AsyncRpc NodeRuntime::call_async(const NodeInfo& node, MessageType type,
                                  std::span<const uint8_t> payload, FrameType frame_type,
                                  std::chrono::milliseconds deadline) {
     refuse_when_stopping();
     return place(node, type, payload, frame_type, deadline);
 }
 
-AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
-                                 std::span<const uint8_t> payload, FrameType frame_type,
-                                 std::chrono::milliseconds deadline) {
-    refuse_when_stopping();
-    return host_.call_async(endpoint, type, payload, frame_type, deadline);
-}
-
-size_t NodeRuntime::broadcast_best_effort(const RpcMessage& message, FrameType frame_type) {
-    return host_.node().channels().broadcast_best_effort(dannan_message(message), frame_type);
-}
-
 size_t NodeRuntime::broadcast_notify(const RpcMessage& message, FrameType frame_type) {
     return host_.node().channels().notify(dannan_message(message), frame_type);
-}
-
-TrafficTotals NodeRuntime::traffic_totals() const {
-    const auto traffic = host_.node().traffic();
-    TrafficTotals totals;
-    totals.in_bytes = traffic.in_bytes;
-    totals.out_bytes = traffic.out_bytes;
-    return totals;
-}
-
-bool NodeRuntime::peer_viewers_active(std::chrono::milliseconds fresh_for) const {
-    for (const auto& view : telemetry_.views(fresh_for)) {
-        if (view.telemetry.node_id == node_id() || !view.fresh)
-            continue;
-        for (const auto& entry : view.telemetry.traffic) {
-            const auto type = static_cast<FrameType>(entry.frame_class);
-            if ((type == FrameType::foreground || type == FrameType::read_ahead) &&
-                (entry.in_bytes_per_s || entry.out_bytes_per_s))
-                return true;
-        }
-    }
-    return false;
 }
 
 void NodeRuntime::announce_metadata_generation(uint64_t generation) {

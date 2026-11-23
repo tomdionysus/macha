@@ -506,7 +506,6 @@ class CatalogueManager {
     bool definitely_absent(std::string_view id) const;
     CatalogueClearResult clear_metadata_with_media(std::string_view id,
                                                    std::optional<uint64_t> expected_revision = {});
-    size_t clear_metadata(std::string_view id, std::optional<uint64_t> expected_revision = {});
     // Unbinds `media_id` from item `item_id`, or from every item when none is
     // named. A movie, episode or track left with no media is removed, and so
     // is each item above a removed one left with no children, whoever made

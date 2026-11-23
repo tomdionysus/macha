@@ -185,7 +185,6 @@ class StagingArea {
     bool contains(const std::filesystem::path&) const;
     bool reserve(std::string owner, uint64_t bytes);
     void release(std::string_view owner);
-    uint64_t reservation(std::string_view owner) const;
     StagingStatus status() const;
 
     // Deletes a staging payload without waiting: renames it into `.trash`
@@ -286,7 +285,6 @@ class IngestManager {
     bool exists_ignoring_case(const std::string& path);
     bool allowed_external_source(const std::filesystem::path&) const;
     void ensure_namespace_parents(std::string_view path);
-    bool should_pause_or_cancel(const IngestJob&) const;
     void set_blocked(IngestJob&, std::string code, std::string message);
     void cleanup_partials(const IngestJob&);
     // Removes a file's partial from the namespace; it starts again from zero.

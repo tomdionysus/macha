@@ -47,7 +47,12 @@ two history rewrites; the maintainer's backups hold the maps.
    50,140), 92.9% of functions**; per-file list in `build/evidence/coverage-2026-11-23/list.txt`. Most missed lines:
    `fuse_frontend.cpp` 811, `media_catalogue.cpp` 807, `filesystem.cpp` 616 (70.9%), `media_engine.cpp` 521
    (65.7%), `torrent_coordinator.cpp` 407 (59.7%); lowest: `cluster/membership.cpp` 44.5%. The dead
-   `replica_selector` (0%) removed. Closing the gaps is the next coverage work.
+   `replica_selector` (0%) removed. Of 278 functions no test calls: 31 dead (being removed), 117 untested with
+   real callers, 120 lambdas, destructors and callbacks. The untested, in order of what users see: JSON `\u`
+   escapes (`json.cpp:163`, `:177`); FUSE chown, truncate and statfs; the remux packet path; WebVTT subtitles;
+   playback's failure rollback; media error answers; probing unmatched files; the connectivity check;
+   acquisition file actions; torrent search and the Torznab chain; then ingest's hint resubmission and the
+   torrent coordinator's intents.
    **The release** (`project_release_procedure`): the pre-merge gate on a Pi (`tools/ci.sh --local` with ASan, and the
    coverage build, which gives Macha's first whole-tree figure); squash the port onto `develop`; GitHub CI green on
    `develop` (red since 2026-11-13 on the ingest/torrent ASan crash, item 4 below); debs; tag; merge to `main`.

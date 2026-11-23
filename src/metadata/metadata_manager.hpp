@@ -246,8 +246,6 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     // anything the retention callback uses is stopped.
     void request_replication_stop();
     void stop_replication();
-    // Commits accepted here that the replicator has not yet offered.
-    size_t replication_pending() const;
     // What the replicator owes the peers: commits whose claims are queued,
     // those claims' size, and claims dropped past the bound since start.
     struct ReplicationBacklog {

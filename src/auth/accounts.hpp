@@ -67,7 +67,6 @@ class Accounts {
     // the notification could not be queued for is told by the gossip loop,
     // woken for it.
     void propagate_session(const AuthSession&);
-    bool apply_user(const UserRecord&);
     // Sends the whole table, tombstones included, to every peer, likewise.
     void propagate_users();
 

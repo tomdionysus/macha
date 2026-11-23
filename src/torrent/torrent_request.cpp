@@ -79,15 +79,6 @@ std::string_view torrent_phase_name(TorrentPhase phase) noexcept {
     return "failed";
 }
 
-std::optional<TorrentPhase> parse_torrent_phase(std::string_view name) {
-    for (auto phase :
-         {TorrentPhase::awaiting_node, TorrentPhase::downloading, TorrentPhase::importing,
-          TorrentPhase::completed, TorrentPhase::failed, TorrentPhase::cancelled})
-        if (torrent_phase_name(phase) == name)
-            return phase;
-    return std::nullopt;
-}
-
 bool torrent_phase_terminal(TorrentPhase phase) noexcept {
     return phase == TorrentPhase::completed || phase == TorrentPhase::failed ||
            phase == TorrentPhase::cancelled;

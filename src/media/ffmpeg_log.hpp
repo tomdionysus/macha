@@ -17,7 +17,6 @@ enum class FfmpegLogLevel : unsigned char {
     trace,
 };
 
-std::string_view ffmpeg_log_level_name(FfmpegLogLevel) noexcept;
 FfmpegLogLevel parse_ffmpeg_log_level(std::string_view);
 
 // Installs the process-wide libav log callback and libav's own threshold.

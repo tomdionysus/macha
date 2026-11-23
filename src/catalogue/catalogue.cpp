@@ -2201,11 +2201,6 @@ CatalogueUnbindResult CatalogueManager::unbind_media(std::optional<std::string_v
     return result;
 }
 
-size_t CatalogueManager::clear_metadata(std::string_view id,
-                                        std::optional<uint64_t> expected_revision) {
-    return clear_metadata_with_media(id, expected_revision).removed_items;
-}
-
 CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string mime_type,
                                                  std::span<const uint8_t> bytes, FrameType frame) {
     if (bytes.empty())

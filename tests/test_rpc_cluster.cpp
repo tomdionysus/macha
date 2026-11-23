@@ -32,7 +32,7 @@ MACHA_FAST_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     std::optional<AsyncRpc> moved;
     {
         std::promise<RpcReply> promise;
-        AsyncRpc original(promise.get_future(), [&] { ++cancelled; }, {});
+        AsyncRpc original(promise.get_future(), [&] { ++cancelled; });
         moved.emplace(std::move(original));
     }
     CHECK(cancelled.load() == 0);
@@ -42,9 +42,9 @@ MACHA_FAST_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     // Move assignment cancels the target's request and leaves the source inert.
     std::promise<RpcReply> first_promise;
     std::promise<RpcReply> second_promise;
-    AsyncRpc first(first_promise.get_future(), [&] { ++cancelled; }, {});
+    AsyncRpc first(first_promise.get_future(), [&] { ++cancelled; });
     {
-        AsyncRpc second(second_promise.get_future(), [&] { ++cancelled; }, {});
+        AsyncRpc second(second_promise.get_future(), [&] { ++cancelled; });
         first = std::move(second);
         CHECK(cancelled.load() == 2);
     }
@@ -2557,7 +2557,7 @@ class StalledCalls {
                     }
                 }
             };
-            return AsyncRpc(promise->get_future(), fail, fail, {}, [started] {
+            return AsyncRpc(promise->get_future(), fail, [started] {
                 return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
                                                                              started);
             });

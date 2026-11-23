@@ -182,8 +182,7 @@ AsyncRpc DannanHost::wrap(const std::shared_ptr<std::promise<RpcReply>>& promise
     // their stall budgets as long as it lasts, no longer.
     const auto made = Clock::now();
     return AsyncRpc(
-        std::move(future), [handle] { handle->cancel(); }, [handle] { handle->abort(); },
-        [handle](FrameType frame) { handle->promote(frame); },
+        std::move(future), [handle] { handle->cancel(); },
         [handle, made] {
             const auto idle = handle->idle_for();
             if (idle != std::chrono::milliseconds::max())

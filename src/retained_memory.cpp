@@ -50,10 +50,6 @@ RetainedMemoryLedger::Lease RetainedMemoryLedger::restore(WorkClass work, Memory
     return ledger_.restore(work, dannan_owner(owner), bytes);
 }
 
-void RetainedMemoryLedger::wake() {
-    ledger_.wake();
-}
-
 void RetainedMemoryLedger::stop() {
     ledger_.stop();
 }

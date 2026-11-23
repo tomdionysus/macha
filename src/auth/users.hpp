@@ -164,18 +164,9 @@ class UserStore {
                                      const NodeId& by);
     std::optional<UserRecord> remove(std::string_view user_id, const NodeId& by);
 
-    // Sets root's password without the old one. The caller must have verified
-    // a recovery key first; this checks nothing.
-    std::optional<UserRecord> reset_root_password(std::string_view new_password, const NodeId& by);
-    std::optional<RecoveryEnvelope> root_recovery() const;
-    // Replaces the envelope, invalidating the previous recovery key.
-    bool set_root_recovery(const RecoveryEnvelope&, const NodeId& by);
-
     // Local merge. True when the table changed: persist and re-broadcast.
     bool apply(UserRecord);
     bool apply_all(const std::vector<UserRecord>&);
-
-    void persist() const;
 
   private:
     std::optional<UserRecord> mutate(std::string_view user_id,

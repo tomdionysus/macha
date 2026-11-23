@@ -41,8 +41,4 @@ class NodeResources {
     void stop();
 };
 
-// A ledger sized from the configuration, for parts built without a node (tests and
-// tools); a node's is its own.
-std::unique_ptr<dannan::sched::RetainedMemoryLedger> standalone_memory(const Config&);
-
 } // namespace macha

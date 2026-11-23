@@ -159,10 +159,6 @@ void Accounts::request_gossip() {
     wait_cv_.notify_all();
 }
 
-bool Accounts::apply_user(const UserRecord& user) {
-    return users_.apply(user);
-}
-
 void Accounts::propagate_users() {
     // Always the full table: a peer offline longer than the gossip TTL must
     // still converge, and at tens of records it is smaller than the telemetry set.

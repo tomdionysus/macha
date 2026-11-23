@@ -3,7 +3,6 @@
 
 #include "types.hpp"
 
-#include <array>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -42,12 +41,6 @@ struct TrafficClass {
     uint32_t in_bytes_per_s{};
     uint32_t out_bytes_per_s{};
     auto operator<=>(const TrafficClass&) const = default;
-};
-
-// Cumulative per-class totals, indexed by FrameType wire value.
-struct TrafficTotals {
-    std::array<uint64_t, 6> in_bytes{};
-    std::array<uint64_t, 6> out_bytes{};
 };
 
 struct NodeTelemetry {

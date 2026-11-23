@@ -78,11 +78,6 @@ MetadataManager::ReplicationBacklog MetadataManager::replication_backlog() const
     return {owed_claims_.size(), owed_claim_bytes_, owed_dropped_.load(std::memory_order_relaxed)};
 }
 
-size_t MetadataManager::replication_pending() const {
-    Lock lock(owed_mutex_);
-    return owed_claims_.size() + (owed_head_ ? 1 : 0) + (replicating_ ? 1 : 0);
-}
-
 bool MetadataManager::wait_replicated(std::chrono::milliseconds timeout) {
     Lock lock(owed_mutex_);
     return owed_changed_.wait_for(lock.native(), timeout, [&]() MACHA_REQUIRES(owed_mutex_) {

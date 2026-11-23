@@ -20,9 +20,9 @@ namespace macha::test_support {
 // A ClusterNode with no transport. The roster is what the test adds, and a
 // call to a peer runs that peer's handler in this process: call() on the
 // caller's thread, call_async() on a thread of its own, so a handler may
-// block (on a TestGate) without holding the caller. A cancelled or aborted
-// call fails at once, as a closed route fails it; its handler still runs to
-// the end. Every call is recorded.
+// block (on a TestGate) without holding the caller. A cancelled call fails
+// at once, as a closed route fails it; its handler still runs to the end.
+// Every call is recorded.
 class FakeClusterNode final : public ClusterNode {
   public:
     using Handler = std::function<RpcMessage(MessageType, const Bytes& payload, FrameType)>;
@@ -33,8 +33,8 @@ class FakeClusterNode final : public ClusterNode {
         size_t bytes{};
     };
 
-    FakeClusterNode(Config config, NodeInfo self, NodeId epoch)
-        : config_(std::move(config)), self_id_(self.id), epoch_(epoch),
+    FakeClusterNode(Config config, NodeInfo self)
+        : config_(std::move(config)), self_id_(self.id),
           members_(std::move(self), std::chrono::hours(1)) {}
 
     ~FakeClusterNode() override {
@@ -78,9 +78,6 @@ class FakeClusterNode final : public ClusterNode {
     NodeId node_id() const override {
         return self_id_;
     }
-    NodeId durability_epoch() const override {
-        return epoch_;
-    }
     Membership& membership() override {
         return members_;
     }
@@ -123,7 +120,7 @@ class FakeClusterNode final : public ClusterNode {
                 }
             }
         });
-        return AsyncRpc(std::move(future), fail, fail, {}, [started] {
+        return AsyncRpc(std::move(future), fail, [started] {
             return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
         });
     }
@@ -150,7 +147,6 @@ class FakeClusterNode final : public ClusterNode {
 
     const Config config_;
     const NodeId self_id_;
-    const NodeId epoch_;
     Membership members_;
     mutable std::mutex mutex_;
     std::map<NodeId, Handler> handlers_;
