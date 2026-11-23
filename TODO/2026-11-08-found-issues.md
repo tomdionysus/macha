@@ -174,13 +174,9 @@ Ordered by what they cost a user.
     caller and is removed; a cancelled waiter returns only on a release or its deadline. Check whether any waiter
     passes `cancelled` and needs it prompt.
 
-21. **From the coverage tests, 2026-11-23 (read; not fixed):**
-    - Torrent search hands out references past the 4,096 it keeps: all of one search share an expiry, so which
-      die is arbitrary and a client gets references that answer 404.
-    - A Torznab item's `infohash` attribute is not read; an item with only an infohash (no magnet, link or
-      enclosure) is dropped.
-    - A configured Torznab key file that cannot be read stops the node at start (`TorznabSearchProvider`'s
-      constructor throws through `NodeServices`); configuration validation does not check it first.
+21. **From the coverage tests, 2026-11-23.** Fixed in 0.95.8: the dead references, infohash-only items, the
+    unreadable key file, and (found later the same day) the remux boundary before every stream started and the two
+    torrent coordinator intent defects. Still open:
     - `provider_errors` maps provider names to English messages with no snake_case code.
     - Numeric character references (`&#39;`, `&#x27;`) in indexer answers are not decoded.
     - The catalogue's media routes answer errors as `{"error": code, "message", "reason"}`, not the common
