@@ -4,6 +4,11 @@ Contracts settled with the client sessions (from 2026-09-13), kept here
 because they were agreed across sessions and exist nowhere else in this
 repository. A server change that breaks one breaks four clients at once.
 
+**Next release, not yet built (the maintainer, 2026-11-23: change it, announce first).** The catalogue's media
+routes (`/api/v1/catalogue/media/...`: profile, keyframes, content, conversions) answer errors in the common
+envelope, `{"status": code, "error": {"code", "message", "reason"?}}`, in place of `{"error": code, "message",
+"reason"?}`; the codes and HTTP statuses do not change.
+
 **0.95.3 (not yet announced: no Core or client session was running on 2026-11-22; announce before it
 ships to the live nodes).** Each `nodes[]` entry in `GET /api/v1/status` gains `dannan_version` and
 `dagda_version`, strings in full x.y.z (`0.9.2`, `0.3.3`), or `null` when that node has sent no telemetry

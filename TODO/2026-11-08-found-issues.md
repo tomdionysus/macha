@@ -174,6 +174,23 @@ Ordered by what they cost a user.
     caller and is removed; a cancelled waiter returns only on a release or its deadline. Check whether any waiter
     passes `cancelled` and needs it prompt.
 
+21. **From the coverage tests, 2026-11-23 (read; not fixed):**
+    - Torrent search hands out references past the 4,096 it keeps: all of one search share an expiry, so which
+      die is arbitrary and a client gets references that answer 404.
+    - A Torznab item's `infohash` attribute is not read; an item with only an infohash (no magnet, link or
+      enclosure) is dropped.
+    - A configured Torznab key file that cannot be read stops the node at start (`TorznabSearchProvider`'s
+      constructor throws through `NodeServices`); configuration validation does not check it first.
+    - `provider_errors` maps provider names to English messages with no snake_case code.
+    - Numeric character references (`&#39;`, `&#x27;`) in indexer answers are not decoded.
+    - The catalogue's media routes answer errors as `{"error": code, "message", "reason"}`, not the common
+      `{"status": code, "error": {code, message, reason}}`; the maintainer ruled (2026-11-23) they move to the
+      common envelope, announced to the clients first (`CLIENT-CONTRACTS.md`).
+    - `docs/catalogue.md` says `422 keyframes_failed` carries a profile failure's axes; the code sends only
+      `reason`. `docs/operations.md` gives the connectivity check one line: its answer and codes
+      (`node_not_found`, `bad_node_id`) are undocumented.
+    - An existing job with no file at the index answers 404 with the message "job not found".
+
 ## The live cluster
 
 - **Replication is slow by policy, not stalled.** Repair's credit is `bandwidth x idle_bandwidth_fraction x
