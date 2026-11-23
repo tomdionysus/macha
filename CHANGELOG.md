@@ -1,5 +1,18 @@
 # Current release
 
+## 0.95.6: torrent search reads indexers right; a zero limit matches nothing
+
+- Torrent search: an indexer's title or field decodes once. An escaped entity (`&amp;lt;`)
+  read as the character it named, and text inside CDATA was decoded as if it held entities;
+  it is now taken as written.
+- Torrent search: an indexer that refuses a search with an `<error>` document and HTTP 200 (how
+  indexers report a bad API key) is that provider's error in `provider_errors`, with the
+  indexer's description. It read as a search that found nothing.
+- `GET /api/v1/manage/unmatched/{id}/matches?limit=0` answers no matches, as documented; it
+  answered one.
+- Tests for the torrent search chain, the acquisition file actions (local and relayed), the
+  catalogue's media error answers, probing unmatched files, and the connectivity check.
+
 ## 0.95.5: two unlocks of freed memory fixed
 
 Two places locked an object's own mutex, erased the last owner of the object while holding it, and

@@ -1295,11 +1295,11 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
                 const auto wanted_kind = leaf_kind(probes, hint->provider);
                 Json::Array matches;
                 for (const auto& item : catalogue_.search(query, std::max<size_t>(limit * 4, 20))) {
+                    if (matches.size() >= limit)
+                        break;
                     if (wanted_kind && item.kind != *wanted_kind)
                         continue;
                     matches.push_back(catalogue_item_json(item));
-                    if (matches.size() >= limit)
-                        break;
                 }
                 Json::Object out;
                 out["query"] = query;

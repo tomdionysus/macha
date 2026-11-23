@@ -580,6 +580,193 @@ MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_refer
         CHECK(emptied->media_ids.empty());
     }
 }
+
+// ManageApi probing unmatched files: one record answers with the scanner's
+// filename hypotheses, and its matches search the catalogue by the first
+// hypothesis (a film's title, an episode's series) for items of its kind;
+// without one, the file's name is the query and the kind is the provider's
+// that failed it, or any kind. A query or limit given wins; a bad limit,
+// an unknown record and a file that has gone are refused.
+MACHA_TEST("invariants", test_unmatched_files_are_probed_and_matched_by_their_first_hypothesis) {
+    CatalogueBench bench("manage-probes");
+    auto& fs = bench.fs();
+    auto& catalogue = bench.catalogue();
+    auto& hints = bench.hints();
+    for (const auto* dir :
+         {"/Movies", "/TV", "/TV/The Widening", "/TV/The Widening/Season 02", "/Music", "/Other"})
+        fs.mkdir(dir, 0755, getuid(), getgid());
+    const auto item = [](CatalogueKind kind, std::string id, std::string title,
+                         std::optional<std::string> parent = {}) {
+        CatalogueItem out;
+        out.kind = kind;
+        out.id = std::move(id);
+        out.title = std::move(title);
+        out.parent_id = std::move(parent);
+        return out;
+    };
+    auto season =
+        item(CatalogueKind::season, "tmdb:tv:63639:season:2", "Season 2", "tmdb:tv:63639");
+    season.season_number = 2;
+    auto episode = item(CatalogueKind::episode, "tmdb:tv:63639:season:2:episode:5", "The Widening",
+                        "tmdb:tv:63639:season:2");
+    episode.season_number = 2;
+    episode.episode_number = 5;
+    // A film and a show of one name, and a show with an episode of its name:
+    // the kind, not the name, tells them apart.
+    catalogue.upsert_many({item(CatalogueKind::movie, "tmdb:movie:335984", "Glass Harbour 2049"),
+                           item(CatalogueKind::show, "tmdb:tv:1", "Glass Harbour 2049"),
+                           item(CatalogueKind::show, "tmdb:tv:63639", "The Widening"), season,
+                           episode});
+
+    auto http = std::make_unique<FakeHttpClient>();
+    auto* http_ptr = http.get();
+    auto scanner =
+        bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
+    ManageApi manage(bench.node(), bench.metadata(), fs, catalogue, hints, *scanner);
+    const auto get = [&](const std::string& path,
+                         std::map<std::string, std::string, std::less<>> query = {}) {
+        auto response =
+            manage.handle(request_for("GET", "/api/v1/manage/unmatched/" + path, {}, query));
+        return std::pair{response.status, body_json(response)};
+    };
+    const auto matched_ids = [](const Json& body) {
+        std::set<std::string> out;
+        for (const auto& match : body.find("matches")->asArray())
+            out.insert(match.find("id")->asString());
+        return out;
+    };
+
+    {
+        // A film: its title and year, and only films match.
+        const auto [hint_id, media_id] =
+            bench.unmatched("/Movies/Glass.Harbour.2049.2017.1080p.BluRay.mkv", 31);
+        auto [status, body] = get(hint_id);
+        REQUIRE(status == 200);
+        CHECK(body.find("item")->find("id")->asString() == hint_id);
+        CHECK(body.find("item")->find("media_id")->asString() == media_id);
+        CHECK(body.find("item")->find("current")->asBool());
+        const auto& probes = body.find("probes")->asArray();
+        REQUIRE(!probes.empty());
+        for (const auto& probe : probes)
+            CHECK(probe.find("kind")->asString() == "movie");
+        const auto& first = probes.front();
+        CHECK(first.find("title")->asString() == "Glass Harbour 2049");
+        CHECK(first.find("year")->asInt64() == 2017);
+        CHECK(!first.find("generator")->asString().empty());
+        CHECK(first.find("score")->isNumber());
+        CHECK(first.find("evidence")->isArray());
+        for (const auto* absent : {"season_number", "episode_number", "disc_number", "track_number",
+                                   "series_index", "isbn", "language"})
+            CHECK(first.find(absent)->isNull());
+        CHECK(first.find("authors")->asArray().empty());
+        CHECK(first.find("author")->asString().empty());
+        CHECK(first.find("series_name")->asString().empty());
+
+        std::tie(status, body) = get(hint_id + "/matches");
+        REQUIRE(status == 200);
+        CHECK(body.find("query")->asString() == "Glass Harbour 2049");
+        CHECK(matched_ids(body) == std::set<std::string>{"tmdb:movie:335984"});
+
+        // A query given replaces the suggestion; the kind still follows the probe.
+        std::tie(status, body) = get(hint_id + "/matches", {{"q", "The Widening"}});
+        REQUIRE(status == 200);
+        CHECK(body.find("query")->asString() == "The Widening");
+        CHECK(body.find("matches")->asArray().empty());
+
+        // limit is 0..50.
+        std::tie(status, body) = get(hint_id + "/matches", {{"limit", "0"}});
+        REQUIRE(status == 200);
+        CHECK(body.find("matches")->asArray().empty());
+        CHECK(get(hint_id + "/matches", {{"limit", "50"}}).first == 200);
+        for (const auto* limit : {"51", "-1", "ten", "5x"}) {
+            std::tie(status, body) = get(hint_id + "/matches", {{"limit", limit}});
+            CHECK(status == 400);
+            CHECK(error_code(body) == "bad_limit");
+            CHECK(!error_message(body).empty());
+        }
+
+        // The file gone: the record no longer names these bytes.
+        fs.unlink("/Movies/Glass.Harbour.2049.2017.1080p.BluRay.mkv");
+        for (const auto* tail : {"", "/matches"}) {
+            std::tie(status, body) = get(hint_id + tail);
+            CHECK(status == 409);
+            CHECK(error_code(body) == "stale_unmatched");
+        }
+    }
+
+    {
+        // An episode: its series is the query, and only episodes match.
+        const auto [hint_id, media_id] =
+            bench.unmatched("/TV/The Widening/Season 02/The.Widening.S02E05.Home.mkv", 32);
+        auto [status, body] = get(hint_id);
+        REQUIRE(status == 200);
+        const auto& probes = body.find("probes")->asArray();
+        REQUIRE(!probes.empty());
+        const auto& first = probes.front();
+        CHECK(first.find("kind")->asString() == "episode");
+        CHECK(first.find("series")->asString() == "The Widening");
+        CHECK(first.find("season_number")->asInt64() == 2);
+        CHECK(first.find("episode_number")->asInt64() == 5);
+        CHECK(first.find("title")->asString() == "Home");
+
+        std::tie(status, body) = get(hint_id + "/matches");
+        REQUIRE(status == 200);
+        CHECK(body.find("query")->asString() == "The Widening");
+        CHECK(matched_ids(body) == std::set<std::string>{"tmdb:tv:63639:season:2:episode:5"});
+    }
+
+    {
+        // Outside every provider's roots there is no hypothesis: the file's
+        // name, its separators as spaces, is the query, and any kind matches.
+        const auto hint_id = bench.unmatched("/Other/Glass_Harbour-2049.mkv", 33).first;
+        auto [status, body] = get(hint_id);
+        REQUIRE(status == 200);
+        CHECK(body.find("probes")->asArray().empty());
+        std::tie(status, body) = get(hint_id + "/matches");
+        REQUIRE(status == 200);
+        CHECK(body.find("query")->asString() == "Glass Harbour 2049");
+        CHECK((matched_ids(body) == std::set<std::string>{"tmdb:movie:335984", "tmdb:tv:1"}));
+    }
+
+    {
+        // No hypothesis, but a provider failed it: items of that provider's
+        // kind only.
+        catalogue.upsert_many({item(CatalogueKind::movie, "manual:movie:shared", "Shared Title"),
+                               item(CatalogueKind::episode, "manual:episode:shared", "Shared Title",
+                                    "tmdb:tv:63639:season:2"),
+                               item(CatalogueKind::track, "manual:track:shared", "Shared Title"),
+                               item(CatalogueKind::book, "manual:book:shared", "Shared Title"),
+                               item(CatalogueKind::show, "manual:show:shared", "Shared Title")});
+        uint8_t seed = 40;
+        for (const auto& [provider, expected] :
+             std::vector<std::pair<std::string, std::string>>{{"movies", "manual:movie:shared"},
+                                                              {"tv", "manual:episode:shared"},
+                                                              {"music", "manual:track:shared"},
+                                                              {"books", "manual:book:shared"}}) {
+            fs.mkdir("/Other/" + provider, 0755, getuid(), getgid());
+            const auto path = "/Other/" + provider + "/Shared.Title.mkv";
+            write_file(fs, path, pattern(4096, ++seed));
+            const auto media_id = file_media_id(fs.getattr(path));
+            const auto hint_id =
+                hints.submit(path, "scanner", media_id, CatalogueHintPriority::periodic_scan);
+            REQUIRE(hints.claim_next().has_value());
+            hints.mark_no_match(hint_id, provider, media_id, "no_provider_match");
+            auto [status, body] = get(hint_id + "/matches");
+            REQUIRE(status == 200);
+            CHECK(body.find("query")->asString() == "Shared Title");
+            CHECK(matched_ids(body) == std::set<std::string>{expected});
+        }
+    }
+
+    // An unknown record.
+    for (const auto* tail : {"", "/matches"}) {
+        auto [status, body] = get("0123456789abcdef" + std::string(tail));
+        CHECK(status == 404);
+        CHECK(error_code(body) == "not_found");
+    }
+    // Probing and matching are local: no provider was asked.
+    CHECK(http_ptr->requests() == 0);
+}
 #if defined(__linux__)
 std::atomic_bool track_fsync{false};
 std::atomic_uint64_t fsync_calls{0};
@@ -1548,6 +1735,128 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
     // The per-node prefix still routes alongside the diagnostics route.
     CHECK(get("/api/v1/status/nodes").status == 200);
     CHECK(get("/api/v1/status/nodes/not-a-node-id").status == 400);
+}
+
+// The connectivity check. Cluster wide it lists every member, this node
+// reachable by definition, beside the public endpoint discovery it refreshed;
+// for one node it pings that node alone. A peer is pinged over RPC: reachable
+// while it runs, and once stopped unreachable with the call's error and its
+// code. A node not in the cluster, a malformed id and a GET are refused.
+MACHA_TEST("invariants", test_the_connectivity_check_answers_for_this_node_and_each_peer) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("connectivity-node");
+    config.dead_after = 60s;
+    BareNode node(config, cluster.keys());
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
+    ClusterStatusService status(
+        node, node.accounts(),
+        [&] { return node.store_context().activity().idle_for(WorkClass::foreground); },
+        node.resources.memory);
+    const auto call = [&](std::string method, std::string path) {
+        auto response = status.handle(request_for(std::move(method), std::move(path)));
+        return std::pair{response.status, body_json(response)};
+    };
+    const auto self = to_string(node.node_id());
+    const auto result_for = [](const Json& body, const std::string& id) -> const Json* {
+        for (const auto& result : body.find("results")->asArray())
+            if (result.find("node_id")->asString() == id)
+                return &result;
+        return nullptr;
+    };
+
+    {
+        // This node alone.
+        auto [code, body] = call("POST", "/api/v1/status/connectivity/check");
+        REQUIRE(code == 200);
+        REQUIRE(body.find("results")->asArray().size() == 1);
+        const auto* own = result_for(body, self);
+        REQUIRE(own != nullptr);
+        CHECK(own->find("reachable")->asBool());
+        CHECK(own->find("error_code") == nullptr);
+        CHECK(own->find("error") == nullptr);
+        CHECK(body.find("checked_at_unix_ms")->asUInt64() > 0);
+        const auto* connectivity = body.find("connectivity");
+        REQUIRE(connectivity != nullptr);
+        for (const auto* section :
+             {"configured", "advertised", "upnp", "external_ip", "check", "dial_back"})
+            CHECK(connectivity->find(section)->isObject());
+        const auto advertised = node.membership().self();
+        CHECK(connectivity->find("advertised")->find("host")->asString() == advertised.host);
+        CHECK(connectivity->find("advertised")->find("port")->asUInt64() == advertised.port);
+        CHECK(!connectivity->find("upnp")->find("enabled")->asBool());
+        CHECK(!connectivity->find("external_ip")->find("enabled")->asBool());
+        // A same-node probe is never proof that the Internet can connect.
+        CHECK(!connectivity->find("check")->find("externally_verified")->asBool());
+        CHECK(connectivity->find("inbound_capable")->isBool());
+        CHECK(connectivity->find("hosts_extents")->isBool());
+
+        // For one node: that node's result, and no discovery refresh.
+        std::tie(code, body) = call("POST", "/api/v1/status/nodes/" + self + "/connectivity/check");
+        REQUIRE(code == 200);
+        REQUIRE(body.find("results")->asArray().size() == 1);
+        CHECK(result_for(body, self) != nullptr);
+        CHECK(body.find("connectivity") == nullptr);
+    }
+
+    // A peer that has met this node.
+    auto peer_config = cluster.node_config("connectivity-peer", 0, {{"127.0.0.1", config.port}});
+    BareNode peer(peer_config, cluster.keys());
+    peer.start();
+    REQUIRE(peer.wait_local_state_ready(10s));
+    REQUIRE(wait_until([&] { return active_on(node, peer.node_id()); }, 15s));
+    const auto peer_id = to_string(peer.node_id());
+    {
+        auto [code, body] = call("POST", "/api/v1/status/connectivity/check");
+        REQUIRE(code == 200);
+        CHECK(body.find("results")->asArray().size() == 2);
+        REQUIRE(result_for(body, peer_id) != nullptr);
+        CHECK(result_for(body, peer_id)->find("reachable")->asBool());
+        CHECK(result_for(body, peer_id)->find("error_code") == nullptr);
+        CHECK(result_for(body, self)->find("reachable")->asBool());
+
+        std::tie(code, body) =
+            call("POST", "/api/v1/status/nodes/" + peer_id + "/connectivity/check");
+        REQUIRE(code == 200);
+        REQUIRE(body.find("results")->asArray().size() == 1);
+        CHECK(result_for(body, peer_id)->find("reachable")->asBool());
+    }
+
+    // The peer stopped: still a member, no longer answering.
+    peer.stop();
+    {
+        auto [code, body] = call("POST", "/api/v1/status/nodes/" + peer_id + "/connectivity/check");
+        REQUIRE(code == 200);
+        const auto* stopped = result_for(body, peer_id);
+        REQUIRE(stopped != nullptr);
+        CHECK(!stopped->find("reachable")->asBool());
+        REQUIRE(stopped->find("error_code") != nullptr);
+        CHECK(stopped->find("error_code")->asString() == "rpc_failed");
+        CHECK(!stopped->find("error")->asString().empty());
+    }
+
+    // Refusals.
+    {
+        auto [code, body] = call("POST", "/api/v1/status/nodes/" + to_string(random_node_id()) +
+                                             "/connectivity/check");
+        CHECK(code == 404);
+        CHECK(error_code(body) == "node_not_found");
+        CHECK(!error_message(body).empty());
+        std::tie(code, body) = call("POST", "/api/v1/status/nodes/not-a-node/connectivity/check");
+        CHECK(code == 400);
+        CHECK(error_code(body) == "bad_node_id");
+        for (const auto& path : {std::string("/api/v1/status/connectivity/check"),
+                                 "/api/v1/status/nodes/" + self + "/connectivity/check"}) {
+            std::tie(code, body) = call("GET", path);
+            CHECK(code == 404);
+            CHECK(error_code(body) == "not_found");
+        }
+        // A node's own status takes no POST.
+        std::tie(code, body) = call("POST", "/api/v1/status/nodes/" + self);
+        CHECK(code == 404);
+        CHECK(error_code(body) == "not_found");
+    }
+    node.stop();
 }
 
 // Steady time that stands still until the test moves it.

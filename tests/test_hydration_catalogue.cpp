@@ -18,6 +18,9 @@
 #include <dlfcn.h>
 #endif
 
+#include <poll.h>
+#include <thread>
+
 using namespace macha;
 using namespace std::chrono_literals;
 using namespace macha::test_support;
@@ -3633,6 +3636,178 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_are_paused_resumed_and_cance
     ingest.stop();
 }
 
+MACHA_TEST("hydration_catalogue",
+           test_the_file_routes_of_an_ingest_job_answer_each_action_and_each_refusal) {
+    // A paused job of three files (one copied, one to copy, one failed) is
+    // restored from its state file with no worker running, so nothing moves
+    // under the routes. Each file action answers 200 with the job; an action
+    // the file's state does not allow is 409 invalid_state; a file or job
+    // that is not there is 404 not_found, and so is an index or action that
+    // is not one.
+    TestNode fixture("ingest-file-routes");
+    fixture.prepare();
+    const auto state_path = fixture.config().state_path;
+    const std::string id = "ingest-file-routes";
+    {
+        const auto file = [](const std::string& name, bool completed,
+                             const std::string& error_code = {}) {
+            Json::Object out;
+            out["source_path"] = "/import/" + name;
+            out["destination_path"] = "/Movies/" + name;
+            out["temporary_path"] = std::string();
+            out["size"] = static_cast<uint64_t>(4096);
+            out["copied"] = static_cast<uint64_t>(completed ? 4096 : 0);
+            out["completed"] = completed;
+            out["skipped"] = false;
+            out["catalogue_candidate"] = true;
+            if (!error_code.empty()) {
+                out["error_code"] = error_code;
+                out["error"] = "the source changed while it was copied";
+            }
+            return Json(std::move(out));
+        };
+        Json::Object job;
+        job["id"] = id;
+        job["source_type"] = "filesystem";
+        job["display_name"] = "Three Files";
+        job["source_path"] = "/import";
+        job["state"] = "paused";
+        job["bytes_total"] = static_cast<uint64_t>(3 * 4096);
+        job["bytes_completed"] = static_cast<uint64_t>(4096);
+        job["files_total"] = static_cast<uint64_t>(3);
+        job["files_completed"] = static_cast<uint64_t>(1);
+        job["files_failed"] = static_cast<uint64_t>(1);
+        job["created_unix_ms"] = static_cast<uint64_t>(1);
+        job["updated_unix_ms"] = static_cast<uint64_t>(2);
+        job["files"] =
+            Json::Array{file("Copied Movie 2001.mkv", true), file("Waiting Movie 2002.mkv", false),
+                        file("Failed Movie 2003.mkv", false, "source_changed")};
+        Json::Object root;
+        root["version"] = static_cast<uint64_t>(2);
+        root["jobs"] = Json::Array{Json(std::move(job))};
+        std::filesystem::create_directories(state_path / "ingest");
+        std::ofstream out(state_path / "ingest" / "jobs.json", std::ios::binary | std::ios::trunc);
+        out << Json(std::move(root)).dump();
+        REQUIRE(out.good());
+    }
+    fixture.start();
+    const auto self = to_string(fixture.node().node_id());
+
+    CatalogueHintQueue hints(state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+    REQUIRE(ingest.job(id).has_value());
+    TorrentConfig torrent_config;
+    TorrentSearchManager search(torrent_config);
+    SubsystemRegistry registry;
+    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
+    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
+                                   state_path);
+    AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
+    const auto post = [&](const std::string& rest) {
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/ingest/jobs/" + rest;
+        return acquisition.handle(request);
+    };
+    const auto code_of = [](const HttpResponse& response) {
+        const auto body = api_body(response);
+        CHECK(body.find("status")->asString() == body.find("error")->find("code")->asString());
+        CHECK(!body.find("error")->find("message")->asString().empty());
+        return body.find("error")->find("code")->asString();
+    };
+    // A file's state as the job's own route shows it.
+    const auto file_state = [&](size_t index) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/ingest/jobs/" + id;
+        const auto detail = acquisition.handle(request);
+        REQUIRE(detail.status == 200);
+        return api_body(detail).find("files")->asArray().at(index).find("state")->asString();
+    };
+    const auto job_route = [&](const std::string& tail) { return id + "/files/" + tail; };
+
+    // Paused: the answer is the job as it now stands, without its files, and
+    // named by the node that owns it.
+    {
+        const auto paused = post(job_route("1/pause"));
+        REQUIRE(paused.status == 200);
+        const auto body = api_body(paused);
+        CHECK(body.find("id")->asString() == id);
+        CHECK(body.find("node_id")->asString() == self);
+        CHECK(body.find("state")->asString() == "paused");
+        CHECK(body.find("files") == nullptr);
+        CHECK(file_state(1) == "paused");
+    }
+    // A second pause, and a resume of a file that is not paused, change nothing.
+    {
+        const auto again = post(job_route("1/pause"));
+        CHECK(again.status == 409);
+        CHECK(code_of(again) == "invalid_state");
+    }
+    REQUIRE(post(job_route("1/resume")).status == 200);
+    CHECK(file_state(1) == "queued");
+    {
+        const auto again = post(job_route("1/resume"));
+        CHECK(again.status == 409);
+        CHECK(code_of(again) == "invalid_state");
+    }
+
+    // A copied file takes no action.
+    for (const auto* action : {"pause", "resume", "cancel"}) {
+        const auto refused = post(job_route(std::string("0/") + action));
+        CHECK(refused.status == 409);
+        CHECK(code_of(refused) == "invalid_state");
+    }
+    CHECK(file_state(0) == "completed");
+
+    // A failed file stays failed: pause and resume are refused, cancel leaves
+    // it out.
+    for (const auto* action : {"pause", "resume"}) {
+        const auto refused = post(job_route(std::string("2/") + action));
+        CHECK(refused.status == 409);
+        CHECK(code_of(refused) == "invalid_state");
+    }
+    CHECK(file_state(2) == "failed");
+    REQUIRE(post(job_route("2/cancel")).status == 200);
+    CHECK(file_state(2) == "cancelled");
+
+    // Cancelled once; a second cancel is refused.
+    REQUIRE(post(job_route("1/cancel")).status == 200);
+    CHECK(file_state(1) == "cancelled");
+    {
+        const auto again = post(job_route("1/cancel"));
+        CHECK(again.status == 409);
+        CHECK(code_of(again) == "invalid_state");
+    }
+
+    // No file at the index, and no such job.
+    {
+        const auto missing_file = post(job_route("3/pause"));
+        CHECK(missing_file.status == 404);
+        CHECK(code_of(missing_file) == "not_found");
+        const auto missing_job = post("no-such-job/files/0/pause");
+        CHECK(missing_job.status == 404);
+        CHECK(code_of(missing_job) == "not_found");
+    }
+
+    // An index that is not a number, an action that is not one of the three,
+    // or a route with a part missing or added: not found, and nothing changed.
+    const auto before = *ingest.job(id);
+    for (const auto* tail : {"0/stop", "0/clear", "x/pause", "-1/pause", "/pause", "1", "1/",
+                             "1/pause/now", "99999999999999999999999/pause"}) {
+        const auto refused = post(job_route(tail));
+        CHECK(refused.status == 404);
+        CHECK(code_of(refused) == "not_found");
+    }
+    const auto after = *ingest.job(id);
+    CHECK(after.updated_unix_ms == before.updated_unix_ms);
+    for (size_t index = 0; index < after.files.size(); ++index)
+        CHECK(after.files[index].control == before.files[index].control);
+}
+
 // The partial a job would write for a destination.
 std::string partial_of(const std::string& destination, const std::string& id) {
     return destination + ".macha-ingest-" + id.substr(0, 12) + ".part";
@@ -5109,6 +5284,118 @@ MACHA_TEST("hydration_catalogue", test_catalogue_lists_page_in_key_order) {
     auto bad = api_request("GET", "/api/v1/catalogue/items");
     bad.query["cursor"] = "not-hex";
     CHECK(api.handle(bad).status == 400);
+}
+
+MACHA_TEST("hydration_catalogue", test_the_media_routes_say_why_the_engine_could_not_answer) {
+    // The keyframe and profile routes over an engine that fails in each way
+    // it can: a failure the engine names is 422 with its code and the
+    // engine's reason; an engine that is not here, media that is not here,
+    // and an identity that is not immutable each have their own code. None
+    // is a 5xx: the client decides whether another node is worth asking.
+    CatalogueNode node("catalogue-media-errors");
+    const std::map<std::string, MediaFailure> failures{
+        {"macha:unreadable", MediaFailure::unreadable},
+        {"macha:unsupported", MediaFailure::unsupported},
+        {"macha:timed-out", MediaFailure::timed_out}};
+    const std::map<std::string, std::string> reasons{{"macha:unreadable", "source_unreadable"},
+                                                     {"macha:unsupported", "source_unsupported"},
+                                                     {"macha:timed-out", "source_read_timed_out"}};
+    const auto engine = [&](const std::string& id) {
+        if (const auto found = failures.find(id); found != failures.end())
+            throw MediaError(found->second, "the engine could not read " + id);
+    };
+    std::vector<std::string> asked;
+    CatalogueApi api(
+        node.catalogue(), node.hints(),
+        [&](const std::vector<std::string>& ids) -> size_t {
+            // Background profiling takes only this one.
+            return ids == std::vector<std::string>{"macha:queued"} ? 1 : 0;
+        },
+        [&](const std::string& id) -> std::optional<MediaProbeResult> {
+            asked.push_back(id);
+            engine(id);
+            if (id == "macha:no-engine")
+                throw MediaEngineUnavailable();
+            if (id == "macha:broken")
+                throw std::runtime_error("the profile could not be stored");
+            return std::nullopt;
+        },
+        std::chrono::hours(24 * 30), {},
+        [&](const std::string& id) -> std::optional<Bytes> {
+            asked.push_back(id);
+            engine(id);
+            return std::nullopt;
+        });
+    const auto get = [&](const std::string& id, const std::string& route) {
+        return api.handle(api_request("GET", "/api/v1/catalogue/media/" + id + "/" + route));
+    };
+    const auto refusal = [](const HttpResponse& response) {
+        const auto body = api_body(response);
+        CHECK(!body.find("message")->asString().empty());
+        return body;
+    };
+
+    for (const auto& [id, reason] : reasons) {
+        const auto keyframes = get(id, "keyframes");
+        CHECK(keyframes.status == 422);
+        auto body = refusal(keyframes);
+        CHECK(body.find("error")->asString() == "keyframes_failed");
+        CHECK(body.find("reason")->asString() == reason);
+        CHECK(body.find("message")->asString() == "the engine could not read " + id);
+
+        const auto profile = get(id, "profile");
+        CHECK(profile.status == 422);
+        body = refusal(profile);
+        CHECK(body.find("error")->asString() == "profile_failed");
+        CHECK(body.find("reason")->asString() == reason);
+    }
+
+    // A failure the engine does not name has no reason to give.
+    {
+        const auto broken = get("macha:broken", "profile");
+        CHECK(broken.status == 422);
+        const auto body = refusal(broken);
+        CHECK(body.find("error")->asString() == "profile_failed");
+        CHECK(body.find("reason") == nullptr);
+    }
+    // No engine on this node: not here, as for media it has no file of.
+    {
+        const auto elsewhere = get("macha:no-engine", "profile");
+        CHECK(elsewhere.status == 404);
+        CHECK(refusal(elsewhere).find("error")->asString() == "media_engine_unavailable");
+    }
+    // Media this node cannot find: background profiling took it, or nothing did.
+    {
+        const auto queued = get("macha:queued", "profile");
+        CHECK(queued.status == 202);
+        const auto body = api_body(queued);
+        CHECK(body.find("status")->asString() == "pending");
+        CHECK(body.find("media_id")->asString() == "macha:queued");
+        CHECK(queued.headers.at("Retry-After") == "1");
+        CHECK(queued.headers.at("Location") == "/api/v1/catalogue/media/macha:queued/profile");
+        for (const auto* route : {"profile", "keyframes", "content"}) {
+            const auto missing = get("macha:gone", route);
+            CHECK(missing.status == 404);
+            CHECK(refusal(missing).find("error")->asString() == "not_found");
+        }
+    }
+    // An encoded identity is decoded before it is looked up.
+    CHECK(get("macha%3Aunreadable", "keyframes").status == 422);
+
+    // An identity that is not immutable is refused before the engine is asked.
+    asked.clear();
+    for (const auto* id : {"path:%2FMovies%2Fx.mkv", "tmdb:movie:1", "", "MACHA:upper"}) {
+        for (const auto* route : {"profile", "keyframes", "content"}) {
+            const auto refused = get(id, route);
+            CHECK(refused.status == 400);
+            CHECK(refusal(refused).find("error")->asString() == "bad_media_id");
+        }
+        const auto conversion = api.handle(
+            api_request("GET", "/api/v1/catalogue/media/" + std::string(id) + "/conversions/epub"));
+        CHECK(conversion.status == 400);
+        CHECK(refusal(conversion).find("error")->asString() == "bad_media_id");
+    }
+    CHECK(asked.empty());
 }
 
 MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_artwork) {
@@ -6765,5 +7052,666 @@ MACHA_TEST("hydration_catalogue", test_ingest_files_a_book_under_its_first_autho
 }
 
 #endif
+
+constexpr std::string_view kTorznabUrl =
+    "http://indexer.example.net/api/v2.0/indexers/all/results/torznab";
+
+TorrentSearchProviderConfig torznab_provider(std::string name, std::string url) {
+    TorrentSearchProviderConfig provider;
+    provider.name = std::move(name);
+    provider.url = std::move(url);
+    return provider;
+}
+
+// A Torznab feed around the given items, shaped as Prowlarr and Jackett answer.
+std::string torznab_feed(std::string_view items) {
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+           "<rss version=\"2.0\" xmlns:torznab=\"http://torznab.com/schemas/2015/feed\">"
+           "<channel><title>Indexer</title><description>Search</description>" +
+           std::string(items) + "</channel></rss>";
+}
+
+// An item whose magnet is a torznab:attr, its ampersand escaped as XML has it.
+std::string torznab_magnet_item(std::string_view title, char hash_digit) {
+    return "<item><title>" + std::string(title) +
+           "</title><torznab:attr name=\"magneturl\" value=\"magnet:?xt=urn:btih:" +
+           std::string(40, hash_digit) + "&amp;dn=item\"/></item>";
+}
+
+// The magnet a result built from torznab_magnet_item carries.
+std::optional<std::string> torznab_magnet(char hash_digit) {
+    return sanitize_magnet_uri("magnet:?xt=urn:btih:" + std::string(40, hash_digit) + "&dn=item");
+}
+
+std::string torznab_search_error(TorrentSearchProvider& provider, std::string_view query) {
+    try {
+        (void)provider.search(query);
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return {};
+}
+
+// A Torznab indexer on loopback, for the code that builds its own HTTP client:
+// each path answers what it was given, and every request's query is kept.
+class LoopbackIndexer {
+    struct Answer {
+        int status{};
+        std::string content_type;
+        std::string body;
+    };
+    using Query = std::map<std::string, std::string, std::less<>>;
+    mutable std::mutex mutex_;
+    std::map<std::string, Answer, std::less<>> answers_;
+    std::vector<std::pair<std::string, Query>> asked_;
+    std::unique_ptr<HttpServer> server_;
+
+    HttpResponse respond(const HttpRequest& request) {
+        std::lock_guard lock(mutex_);
+        asked_.emplace_back(request.path, request.query);
+        const auto found = answers_.find(request.path);
+        if (found == answers_.end())
+            return http_error(404, "not_found", "no such feed");
+        const auto& answer = found->second;
+        return HttpResponse(answer.status, answer.content_type, {},
+                            Bytes(answer.body.begin(), answer.body.end()));
+    }
+
+  public:
+    LoopbackIndexer() {
+        CatalogueApiConfig config;
+        config.enabled = true;
+        config.listen = "127.0.0.1";
+        config.port = 0;
+        config.workers = 2;
+        config.control_workers = 1;
+        config.max_connections = 64;
+        config.stream_chunk_bytes = 64 * 1024;
+        server_ = std::make_unique<HttpServer>(
+            config, [this](const HttpRequest& request) { return respond(request); });
+        server_->start();
+        REQUIRE(wait_until([&] { return server_->bound_port() != 0; }, 1s));
+    }
+    ~LoopbackIndexer() {
+        server_->stop();
+    }
+    LoopbackIndexer(const LoopbackIndexer&) = delete;
+    LoopbackIndexer& operator=(const LoopbackIndexer&) = delete;
+
+    void answer(std::string path, int status, std::string content_type, std::string body) {
+        std::lock_guard lock(mutex_);
+        answers_[std::move(path)] = {status, std::move(content_type), std::move(body)};
+    }
+    std::string url(std::string_view path) const {
+        return "http://127.0.0.1:" + std::to_string(server_->bound_port()) + std::string(path);
+    }
+    std::vector<Query> queries(std::string_view path) const {
+        std::lock_guard lock(mutex_);
+        std::vector<Query> out;
+        for (const auto& [asked_path, query] : asked_)
+            if (asked_path == path)
+                out.push_back(query);
+        return out;
+    }
+};
+
+// Takes each connection and closes it without a byte of answer: an indexer
+// that sends nothing.
+class SilentListener {
+    int fd_{-1};
+    uint16_t port_{};
+    std::atomic_bool stop_{};
+    std::jthread thread_;
+
+  public:
+    SilentListener() {
+        fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(fd_ >= 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        REQUIRE(bind(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+        REQUIRE(listen(fd_, 8) == 0);
+        socklen_t length = sizeof(address);
+        REQUIRE(getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &length) == 0);
+        port_ = ntohs(address.sin_port);
+        thread_ = std::jthread([this] {
+            while (!stop_.load()) {
+                pollfd ready{fd_, POLLIN, 0};
+                if (poll(&ready, 1, 20) <= 0)
+                    continue;
+                const int client = accept(fd_, nullptr, nullptr);
+                if (client >= 0)
+                    close(client);
+            }
+        });
+    }
+    ~SilentListener() {
+        stop_.store(true);
+        thread_.join();
+        close(fd_);
+    }
+    SilentListener(const SilentListener&) = delete;
+    SilentListener& operator=(const SilentListener&) = delete;
+
+    uint16_t port() const noexcept {
+        return port_;
+    }
+};
+
+MACHA_FAST_TEST("hydration_catalogue", test_a_torznab_answer_lists_its_items_in_provider_order) {
+    // Proves each item of a feed becomes one result, in the order the feed
+    // lists them, named for its provider and carrying the magnet from its
+    // torznab:attr with the attribute's "&amp;" decoded (the dn survives). The
+    // channel's own title is no item; an item with no title, or nothing to
+    // download, is left out. References are the manager's, not the provider's.
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add("t=search", 200, "application/rss+xml",
+              torznab_feed(torznab_magnet_item("Zebra 2001", 'a') +
+                           "<item><title>No Download</title><guid>1</guid></item>"
+                           "<item><torznab:attr name=\"magneturl\" value=\"magnet:?xt=urn:btih:" +
+                           std::string(40, 'f') + "\"/></item>" +
+                           torznab_magnet_item("Apple 1999", 'b') +
+                           torznab_magnet_item("Mango 2010", 'c')));
+    TorznabSearchProvider provider(torznab_provider("prowlarr", std::string(kTorznabUrl)),
+                                   std::move(http));
+    CHECK(provider.name() == "prowlarr");
+
+    const auto results = provider.search("fruit");
+    REQUIRE(results.size() == 3);
+    CHECK(results[0].title == "Zebra 2001");
+    CHECK(results[1].title == "Apple 1999");
+    CHECK(results[2].title == "Mango 2010");
+    const std::array<char, 3> hashes{'a', 'b', 'c'};
+    for (size_t i = 0; i < results.size(); ++i) {
+        CHECK(results[i].provider == "prowlarr");
+        CHECK(results[i].magnet_uri == torznab_magnet(hashes[i]));
+        CHECK(results[i].magnet_uri->find("dn=item") != std::string::npos);
+        CHECK(!results[i].torrent_url);
+        CHECK(results[i].acquisition_ref.empty());
+    }
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_torznab_entities_and_cdata_in_a_title_are_decoded) {
+    // Proves the five XML entities in a title read as their characters, a CDATA
+    // title is taken without its markers, and control characters are dropped.
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add("t=search", 200, "application/rss+xml",
+              torznab_feed("<item><title>Tom &amp; Jerry &lt;1940&gt; &quot;Cat&quot; "
+                           "&apos;n&apos; Mouse</title><link>magnet:?xt=urn:btih:" +
+                           std::string(40, '1') +
+                           "</link></item>"
+                           "<item><title><![CDATA[Fast & Furious <Extended>]]></title>"
+                           "<link>magnet:?xt=urn:btih:" +
+                           std::string(40, '2') +
+                           "</link></item>"
+                           "<item><title>Bell\x07 Title\x01</title><link>magnet:?xt=urn:btih:" +
+                           std::string(40, '3') + "</link></item>"));
+    TorznabSearchProvider provider(torznab_provider("jackett", std::string(kTorznabUrl)),
+                                   std::move(http));
+    const auto results = provider.search("tom");
+    REQUIRE(results.size() == 3);
+    CHECK(results[0].title == "Tom & Jerry <1940> \"Cat\" 'n' Mouse");
+    CHECK(results[1].title == "Fast & Furious <Extended>");
+    CHECK(results[2].title == "Bell Title");
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_an_escaped_entity_in_a_torznab_title_is_decoded_once) {
+    // Proves decoding is a single pass: "&amp;lt;" in a title is the text
+    // "&lt;", never "<"; and a CDATA section's text is taken as written, so
+    // its "&amp;" stays "&amp;".
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add("t=search", 200, "application/rss+xml",
+              torznab_feed("<item><title>Escaped &amp;lt;tag&amp;gt; Title</title>"
+                           "<link>magnet:?xt=urn:btih:" +
+                           std::string(40, '1') +
+                           "</link></item>"
+                           "<item><title><![CDATA[R&amp;D Documentary]]></title>"
+                           "<link>magnet:?xt=urn:btih:" +
+                           std::string(40, '2') + "</link></item>"));
+    TorznabSearchProvider provider(torznab_provider("jackett", std::string(kTorznabUrl)),
+                                   std::move(http));
+    const auto results = provider.search("escaped");
+    REQUIRE(results.size() == 2);
+    CHECK(results[0].title == "Escaped &lt;tag&gt; Title");
+    CHECK(results[1].title == "R&amp;D Documentary");
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_torznab_attributes_give_size_seeders_and_peers) {
+    // Proves an item's size, seeders and peers come from its torznab:attr
+    // elements, quoted either way; a <size> element is preferred to the
+    // attribute and a non-numeric one falls back to it; a value that is not a
+    // number is "not said", never zero; and pubDate is kept as written.
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add(
+        "t=search", 200, "application/rss+xml",
+        torznab_feed(
+            "<item><title>Both Sizes</title><pubDate>Mon, 01 Sep 2026 12:00:00 +0000</pubDate>"
+            "<size>1000</size><link>magnet:?xt=urn:btih:" +
+            std::string(40, '1') +
+            "</link><torznab:attr name=\"size\" value=\"2000\"/>"
+            "<torznab:attr name=\"seeders\" value=\"12\"/>"
+            "<torznab:attr name=\"peers\" value=\"3\"/>"
+            "<torznab:attr name=\"infohash\" value=\"" +
+            std::string(40, '1') +
+            "\"/></item>"
+            "<item><title>Attribute Size</title><link>magnet:?xt=urn:btih:" +
+            std::string(40, '2') +
+            "</link><torznab:attr name='size' value='8589934592'/>"
+            "<torznab:attr name='seeders' value='many'/></item>"
+            "<item><title>Unreadable Element</title><size>big</size>"
+            "<link>magnet:?xt=urn:btih:" +
+            std::string(40, '3') + "</link><torznab:attr name=\"size\" value=\"42\"/></item>"));
+    TorznabSearchProvider provider(torznab_provider("prowlarr", std::string(kTorznabUrl)),
+                                   std::move(http));
+    const auto results = provider.search("size");
+    REQUIRE(results.size() == 3);
+
+    CHECK(results[0].size_bytes == uint64_t{1000});
+    CHECK(results[0].seeders == uint64_t{12});
+    CHECK(results[0].leechers == uint64_t{3});
+    CHECK(results[0].published == "Mon, 01 Sep 2026 12:00:00 +0000");
+
+    CHECK(results[1].size_bytes == uint64_t{8589934592});
+    CHECK(!results[1].seeders);
+    CHECK(!results[1].leechers);
+    CHECK(results[1].published.empty());
+
+    CHECK(results[2].size_bytes == uint64_t{42});
+}
+
+MACHA_FAST_TEST("hydration_catalogue",
+                test_a_torznab_download_link_is_kept_only_on_the_providers_own_origin) {
+    // Proves a .torrent link is made absolute on the provider's origin when
+    // relative, kept when it is on that origin, and refused when it names any
+    // other host or scheme; an enclosure is the fallback for a refused link; a
+    // magnet link is sanitised (its file: tracker dropped); and a magneturl
+    // attribute wins over the link.
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add(
+        "t=search", 200, "application/rss+xml",
+        torznab_feed("<item><title>Relative</title><link>/dl/one.torrent?file=One</link></item>"
+                     "<item><title>Same Origin</title>"
+                     "<link>http://indexer.example.net/dl/two.torrent</link></item>"
+                     "<item><title>Foreign</title>"
+                     "<link>http://elsewhere.example.net/dl/three.torrent</link></item>"
+                     "<item><title>Enclosure</title><link>http://elsewhere.example.net/page</link>"
+                     "<enclosure url=\"/dl/four.torrent\" length=\"1\" "
+                     "type=\"application/x-bittorrent\"/></item>"
+                     "<item><title>Magnet Link</title><link>magnet:?xt=urn:btih:" +
+                     std::string(40, '5') + "&amp;tr=file%3A%2F%2F%2Fetc%2Fpasswd</link></item>" +
+                     "<item><title>Attribute Wins</title><link>/dl/six.torrent</link>"
+                     "<torznab:attr name=\"magneturl\" value=\"magnet:?xt=urn:btih:" +
+                     std::string(40, '6') +
+                     "\"/></item>"
+                     "<item><title>Wrong Scheme</title>"
+                     "<link>ftp://indexer.example.net/seven.torrent</link></item>"));
+    TorznabSearchProvider provider(torznab_provider("prowlarr", std::string(kTorznabUrl)),
+                                   std::move(http));
+    const auto results = provider.search("links");
+    REQUIRE(results.size() == 5);
+
+    CHECK(results[0].title == "Relative");
+    CHECK(results[0].torrent_url == "http://indexer.example.net/dl/one.torrent?file=One");
+    CHECK(!results[0].magnet_uri);
+    CHECK(results[1].title == "Same Origin");
+    CHECK(results[1].torrent_url == "http://indexer.example.net/dl/two.torrent");
+    CHECK(results[2].title == "Enclosure");
+    CHECK(results[2].torrent_url == "http://indexer.example.net/dl/four.torrent");
+    CHECK(results[3].title == "Magnet Link");
+    CHECK(results[3].magnet_uri ==
+          sanitize_magnet_uri("magnet:?xt=urn:btih:" + std::string(40, '5')));
+    CHECK(!results[3].torrent_url);
+    CHECK(results[4].title == "Attribute Wins");
+    CHECK(results[4].magnet_uri ==
+          sanitize_magnet_uri("magnet:?xt=urn:btih:" + std::string(40, '6')));
+    CHECK(!results[4].torrent_url);
+}
+
+MACHA_FAST_TEST("hydration_catalogue",
+                test_a_torznab_request_carries_the_query_the_limit_and_the_key_from_its_file) {
+    // Proves the search URL is the provider's URL (joined with "&" after its
+    // own query, "?" otherwise) plus t=search, the URL-encoded query, the
+    // provider's max_results as limit, and the API key read from its file with
+    // surrounding whitespace trimmed; max_results also caps the results kept;
+    // without a key file no apikey is sent; and an empty query asks nothing.
+    TempDir dir;
+    auto keyed = torznab_provider("keyed", "http://indexer.example.net/api?cat=2000");
+    keyed.max_results = 2;
+    keyed.api_key_file = write_token(dir.path() / "torznab.key", "  s3cr3t key  ");
+    auto keyed_http = std::make_unique<FakeHttpClient>();
+    auto* keyed_requests = keyed_http.get();
+    keyed_http->add("t=search", 200, "application/rss+xml",
+                    torznab_feed(torznab_magnet_item("One", 'a') + torznab_magnet_item("Two", 'b') +
+                                 torznab_magnet_item("Three", 'c')));
+    TorznabSearchProvider keyed_provider(keyed, std::move(keyed_http));
+
+    const auto results = keyed_provider.search("Some Film & Co");
+    REQUIRE(results.size() == 2);
+    CHECK(results[0].title == "One");
+    CHECK(results[1].title == "Two");
+    CHECK(keyed_requests->requests() == 1);
+    CHECK(keyed_requests->requests_containing(
+              "http://indexer.example.net/api?cat=2000&t=search&q=Some%20Film%20%26%20Co"
+              "&limit=2&apikey=s3cr3t%20key") == 1);
+
+    CHECK(keyed_provider.search("").empty());
+    CHECK(keyed_requests->requests() == 1);
+
+    auto open_http = std::make_unique<FakeHttpClient>();
+    auto* open_requests = open_http.get();
+    open_http->add("t=search", 200, "application/rss+xml", torznab_feed(""));
+    TorznabSearchProvider open_provider(torznab_provider("open", "http://indexer.example.net/api"),
+                                        std::move(open_http));
+    CHECK(open_provider.search("film").empty());
+    CHECK(open_requests->requests_containing(
+              "http://indexer.example.net/api?t=search&q=film&limit=100") == 1);
+    CHECK(open_requests->requests_containing("apikey") == 0);
+}
+
+MACHA_FAST_TEST("hydration_catalogue",
+                test_a_torznab_key_file_that_cannot_be_read_refuses_the_provider) {
+    // Proves a configured API key file that cannot be read refuses the
+    // provider with an error naming the file, rather than searching without
+    // the key.
+    TempDir dir;
+    auto config = torznab_provider("keyed", std::string(kTorznabUrl));
+    config.api_key_file = dir.path() / "missing.key";
+    std::string error;
+    try {
+        TorznabSearchProvider provider(config, std::make_unique<FakeHttpClient>());
+    } catch (const std::runtime_error& e) {
+        error = e.what();
+    }
+    CHECK(error.find("API key file") != std::string::npos);
+    CHECK(error.find("missing.key") != std::string::npos);
+}
+
+MACHA_FAST_TEST("hydration_catalogue",
+                test_a_torznab_failure_status_or_html_page_is_the_providers_error) {
+    // Proves a non-2xx answer fails the search naming the status, and a page
+    // of HTML where a feed should be (a login or error page) fails it as HTML.
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add("/broken", 502, "text/plain", "bad gateway");
+    TorznabSearchProvider broken(torznab_provider("broken", "http://indexer.example.net/broken"),
+                                 std::move(http));
+    CHECK(torznab_search_error(broken, "film") == "Torznab returned HTTP 502");
+
+    for (const auto* path : {"/doctype", "/bare", "/upper"}) {
+        auto pages = std::make_unique<FakeHttpClient>();
+        pages->add("/doctype", 200, "text/html", "<!DOCTYPE html><html><body>Login</body></html>");
+        pages->add("/bare", 200, "text/html", "\n  <html><body>Error</body></html>");
+        pages->add("/upper", 200, "text/html", "<HTML><BODY>Error</BODY></HTML>");
+        TorznabSearchProvider page(
+            torznab_provider("page", "http://indexer.example.net" + std::string(path)),
+            std::move(pages));
+        CHECK(torznab_search_error(page, "film") ==
+              "Torznab provider returned HTML instead of XML");
+    }
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_a_torznab_error_document_is_the_providers_error) {
+    // Proves an indexer's <error> answer, sent with HTTP 200 as Torznab
+    // indexers send a refused API key, fails the search with the indexer's
+    // description instead of passing for a search that found nothing.
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add("t=search", 200, "application/xml",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+              "<error code=\"100\" description=\"Invalid API Key\"/>");
+    TorznabSearchProvider provider(torznab_provider("prowlarr", std::string(kTorznabUrl)),
+                                   std::move(http));
+    const auto error = torznab_search_error(provider, "film");
+    CHECK(!error.empty());
+    CHECK(error.find("Invalid API Key") != std::string::npos);
+}
+
+MACHA_FAST_TEST("hydration_catalogue",
+                test_a_truncated_or_foreign_torznab_answer_keeps_whole_items_and_never_crashes) {
+    // Proves malformed answers are read without a crash or an out-of-range
+    // read: a feed cut off inside an item keeps the whole items before it; an
+    // unclosed "<item" tag, a JSON body and an empty body list nothing.
+    const auto whole = torznab_feed(torznab_magnet_item("Whole", 'a'));
+    const std::array<std::pair<std::string, size_t>, 5> answers{{
+        {whole.substr(0, whole.find("</channel>")) +
+             "<item><title>Cut off</title><link>magnet:?xt=urn:btih:",
+         1},
+        {"<rss><channel><item", 0},
+        {"<rss><channel><item><title>No end", 0},
+        {R"({"error":"not a feed"})", 0},
+        {"", 0},
+    }};
+    for (const auto& [body, expected] : answers) {
+        auto http = std::make_unique<FakeHttpClient>();
+        http->add("t=search", 200, "application/rss+xml", body);
+        TorznabSearchProvider provider(torznab_provider("prowlarr", std::string(kTorznabUrl)),
+                                       std::move(http));
+        const auto results = provider.search("film");
+        CHECK(results.size() == expected);
+        if (expected == 1)
+            CHECK(results.front().title == "Whole");
+    }
+}
+
+MACHA_TEST("hydration_catalogue",
+           test_a_search_asks_every_enabled_provider_and_keeps_their_order_and_failures) {
+    // Proves TorrentSearchManager::search, over real HTTP to a loopback
+    // indexer, asks each enabled provider once with the query, lists results
+    // in configured provider order, reports a failed provider by name without
+    // failing the search, never asks a disabled one, and gives each result a
+    // distinct reference that resolve turns back into its magnet or its
+    // absolute .torrent URL, as often as asked.
+    LoopbackIndexer indexer;
+    indexer.answer("/first", 200, "application/rss+xml",
+                   torznab_feed(torznab_magnet_item("First One", 'a') +
+                                "<item><title>First Two</title>"
+                                "<link>/dl/second.torrent</link></item>"));
+    indexer.answer("/broken", 502, "text/plain", "bad gateway");
+    indexer.answer("/disabled", 200, "application/rss+xml",
+                   torznab_feed(torznab_magnet_item("Never Asked", 'd')));
+    indexer.answer("/last", 200, "application/rss+xml",
+                   torznab_feed(torznab_magnet_item("Last One", 'c')));
+
+    TorrentConfig config;
+    config.search_providers.push_back(torznab_provider("first", indexer.url("/first")));
+    config.search_providers.push_back(torznab_provider("broken", indexer.url("/broken")));
+    auto disabled = torznab_provider("disabled", indexer.url("/disabled"));
+    disabled.enabled = false;
+    config.search_providers.push_back(disabled);
+    config.search_providers.push_back(torznab_provider("last", indexer.url("/last")));
+    TorrentSearchManager search(config);
+    CHECK(search.enabled());
+
+    const auto response = search.search("some film");
+    REQUIRE(response.results.size() == 3);
+    CHECK(response.results[0].title == "First One");
+    CHECK(response.results[0].provider == "first");
+    CHECK(response.results[1].title == "First Two");
+    CHECK(response.results[1].provider == "first");
+    CHECK(response.results[2].title == "Last One");
+    CHECK(response.results[2].provider == "last");
+    REQUIRE(response.errors.size() == 1);
+    CHECK(response.errors.at("broken") == "Torznab returned HTTP 502");
+
+    for (const auto* path : {"/first", "/broken", "/last"}) {
+        const auto asked = indexer.queries(path);
+        REQUIRE(asked.size() == 1);
+        CHECK(asked.front().at("t") == "search");
+        CHECK(asked.front().at("q") == "some film");
+    }
+    CHECK(indexer.queries("/disabled").empty());
+
+    std::set<std::string> refs;
+    for (const auto& result : response.results) {
+        CHECK(!result.acquisition_ref.empty());
+        refs.insert(result.acquisition_ref);
+    }
+    CHECK(refs.size() == 3);
+    CHECK(search.resolve(response.results[0].acquisition_ref) == torznab_magnet('a'));
+    CHECK(search.resolve(response.results[1].acquisition_ref) == indexer.url("/dl/second.torrent"));
+    CHECK(search.resolve(response.results[2].acquisition_ref) == torznab_magnet('c'));
+    CHECK(search.resolve(response.results[0].acquisition_ref) == torznab_magnet('a'));
+}
+
+MACHA_TEST("hydration_catalogue",
+           test_a_provider_that_refuses_the_connection_or_sends_nothing_is_a_provider_error) {
+    // Proves a provider whose port refuses the connection, and one that
+    // accepts and closes without answering, are each reported as that
+    // provider's HTTP failure, while a working provider beside them still
+    // answers; with no provider at all a search is empty and not enabled.
+    const auto refused_port = free_port(); // probed free: nothing listens there
+    SilentListener silent;
+    LoopbackIndexer indexer;
+    indexer.answer("/ok", 200, "application/rss+xml",
+                   torznab_feed(torznab_magnet_item("Still Here", 'a')));
+
+    TorrentConfig config;
+    config.search_providers.push_back(
+        torznab_provider("refused", "http://127.0.0.1:" + std::to_string(refused_port) + "/api"));
+    config.search_providers.push_back(
+        torznab_provider("silent", "http://127.0.0.1:" + std::to_string(silent.port()) + "/api"));
+    config.search_providers.push_back(torznab_provider("working", indexer.url("/ok")));
+    TorrentSearchManager search(config);
+
+    const auto response = search.search("film");
+    REQUIRE(response.results.size() == 1);
+    CHECK(response.results.front().title == "Still Here");
+    CHECK(response.results.front().provider == "working");
+    REQUIRE(response.errors.size() == 2);
+    CHECK(response.errors.at("refused").starts_with("HTTP GET failed: "));
+    CHECK(response.errors.at("silent").starts_with("HTTP GET failed: "));
+
+    TorrentSearchManager none(TorrentConfig{});
+    CHECK(!none.enabled());
+    const auto empty = none.search("film");
+    CHECK(empty.results.empty());
+    CHECK(empty.errors.empty());
+}
+
+MACHA_TEST("hydration_catalogue",
+           test_search_references_are_bounded_and_unknown_ones_resolve_to_nothing) {
+    // Proves resolve answers nothing for an empty or never-issued reference,
+    // and that the references held are bounded: five providers of 1000
+    // results each give 5000 references, of which exactly 4096 still resolve.
+    std::string items;
+    for (int i = 0; i < 1000; ++i)
+        items += "<item><title>Item " + std::to_string(i) + "</title><link>/dl/" +
+                 std::to_string(i) + ".torrent</link></item>";
+    LoopbackIndexer indexer;
+    indexer.answer("/many", 200, "application/rss+xml", torznab_feed(items));
+
+    TorrentConfig config;
+    for (int i = 0; i < 5; ++i) {
+        auto provider = torznab_provider("many-" + std::to_string(i), indexer.url("/many"));
+        provider.max_results = 1000;
+        config.search_providers.push_back(provider);
+    }
+    TorrentSearchManager search(config);
+    CHECK(!search.resolve(""));
+    CHECK(!search.resolve("0123456789abcdef0123456789abcdef"));
+
+    const auto response = search.search("many");
+    CHECK(response.errors.empty());
+    REQUIRE(response.results.size() == 5000);
+    size_t resolvable = 0;
+    for (const auto& result : response.results)
+        if (search.resolve(result.acquisition_ref))
+            ++resolvable;
+    CHECK(resolvable == 4096);
+}
+
+MACHA_TEST("hydration_catalogue",
+           test_the_search_route_hides_download_links_and_an_add_takes_a_result_by_reference) {
+    // Proves GET /api/v1/torrents/search answers each result's documented
+    // fields (null where the indexer said nothing) and each failed provider's
+    // message, never the magnet or .torrent URL behind a result; and that a
+    // POST of an acquisition_ref resolves it: a magnet result is taken as a
+    // cluster request, a .torrent result with no node to read it is refused
+    // as add_failed, and an unknown reference is 404 not_found.
+    const std::string hash = "1234567890123456789012345678901234567890";
+    LoopbackIndexer indexer;
+    indexer.answer("/feed", 200, "application/rss+xml",
+                   torznab_feed("<item><title>Magnet Result</title>"
+                                "<pubDate>Mon, 01 Sep 2026 12:00:00 +0000</pubDate>"
+                                "<size>4096</size>"
+                                "<torznab:attr name=\"seeders\" value=\"7\"/>"
+                                "<torznab:attr name=\"peers\" value=\"2\"/>"
+                                "<torznab:attr name=\"magneturl\" value=\"magnet:?xt=urn:btih:" +
+                                hash +
+                                "&amp;dn=Found\"/></item>"
+                                "<item><title>Torrent Result</title>"
+                                "<link>/dl/result.torrent</link></item>"));
+    indexer.answer("/down", 503, "text/plain", "maintenance");
+
+    TestNode fixture("torrent-search");
+    fixture.prepare();
+    fixture.start();
+    CatalogueHintQueue hints(fixture.config().state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+    TorrentConfig torrent_config;
+    torrent_config.search_providers.push_back(torznab_provider("indexer", indexer.url("/feed")));
+    torrent_config.search_providers.push_back(torznab_provider("down", indexer.url("/down")));
+    TorrentSearchManager search(torrent_config);
+    SubsystemRegistry registry;
+    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
+    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
+                                   fixture.config().state_path);
+    AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
+
+    auto request = api_request("GET", "/api/v1/torrents/search");
+    request.query["q"] = "result";
+    const auto found = acquisition.handle(request);
+    REQUIRE(found.status == 200);
+    const std::string text(found.body.begin(), found.body.end());
+    CHECK(text.find("urn:btih") == std::string::npos);
+    CHECK(text.find("/dl/result.torrent") == std::string::npos);
+    const auto body = api_body(found);
+    const auto& results = body.find("results")->asArray();
+    REQUIRE(results.size() == 2);
+
+    const auto& magnet = results[0];
+    CHECK(magnet.find("provider")->asString() == "indexer");
+    CHECK(magnet.find("title")->asString() == "Magnet Result");
+    CHECK(magnet.find("size_bytes")->asUInt64() == 4096);
+    CHECK(magnet.find("seeders")->asUInt64() == 7);
+    CHECK(magnet.find("leechers")->asUInt64() == 2);
+    CHECK(magnet.find("published")->asString() == "Mon, 01 Sep 2026 12:00:00 +0000");
+    CHECK(magnet.find("magnet_uri") == nullptr);
+    CHECK(magnet.find("torrent_url") == nullptr);
+
+    const auto& torrent = results[1];
+    CHECK(torrent.find("title")->asString() == "Torrent Result");
+    CHECK(torrent.find("size_bytes")->isNull());
+    CHECK(torrent.find("seeders")->isNull());
+    CHECK(torrent.find("leechers")->isNull());
+    CHECK(torrent.find("published")->isNull());
+
+    const auto* provider_errors = body.find("provider_errors");
+    REQUIRE(provider_errors != nullptr);
+    REQUIRE(provider_errors->find("down") != nullptr);
+    CHECK(provider_errors->find("down")->asString() == "Torznab returned HTTP 503");
+    CHECK(provider_errors->find("indexer") == nullptr);
+
+    const auto add = [&](std::string_view ref) {
+        const auto json = R"({"acquisition_ref":")" + std::string(ref) + R"("})";
+        return acquisition.handle(
+            api_request("POST", "/api/v1/torrents/jobs", Bytes(json.begin(), json.end())));
+    };
+    const auto taken = add(magnet.find("acquisition_ref")->asString());
+    REQUIRE(taken.status == 202);
+    CHECK(api_body(taken).find("info_hash")->asString() == hash);
+    CHECK(api_body(taken).find("job")->find("phase")->asString() == "awaiting_node");
+
+    const auto unreadable = add(torrent.find("acquisition_ref")->asString());
+    CHECK(unreadable.status == 409);
+    CHECK(api_body(unreadable).find("error")->find("code")->asString() == "placement_failed");
+    CHECK(api_body(unreadable).find("error")->find("reason")->asString() == "add_failed");
+
+    const auto unknown = add("0123456789abcdef0123456789abcdef");
+    CHECK(unknown.status == 404);
+    CHECK(api_body(unknown).find("error")->find("code")->asString() == "not_found");
+}
 
 } // namespace

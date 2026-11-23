@@ -96,21 +96,33 @@ std::string sanitize_text(std::string value, size_t limit = 1024) {
     return trim(std::move(value));
 }
 
-std::string xml_decode(std::string value) {
+// One pass: each entity is decoded once, so an escaped entity ("&amp;lt;") reads as the
+// entity's text ("&lt;"), never as the character it names.
+std::string xml_decode(std::string_view value) {
     struct Entity {
-        const char* encoded;
-        const char* decoded;
+        std::string_view encoded;
+        char decoded;
     };
     static constexpr Entity entities[] = {
-        {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&apos;", "'"}};
-    for (const auto& entity : entities) {
-        size_t pos = 0;
-        while ((pos = value.find(entity.encoded, pos)) != std::string::npos) {
-            value.replace(pos, std::strlen(entity.encoded), entity.decoded);
-            pos += std::strlen(entity.decoded);
+        {"&amp;", '&'}, {"&lt;", '<'}, {"&gt;", '>'}, {"&quot;", '"'}, {"&apos;", '\''}};
+    std::string out;
+    out.reserve(value.size());
+    for (size_t pos = 0; pos < value.size();) {
+        const Entity* match = nullptr;
+        if (value[pos] == '&')
+            for (const auto& entity : entities)
+                if (value.substr(pos).starts_with(entity.encoded)) {
+                    match = &entity;
+                    break;
+                }
+        if (match) {
+            out.push_back(match->decoded);
+            pos += match->encoded.size();
+        } else {
+            out.push_back(value[pos++]);
         }
     }
-    return value;
+    return out;
 }
 
 std::optional<std::string> xml_tag(std::string_view item, std::string_view tag) {
@@ -126,10 +138,11 @@ std::optional<std::string> xml_tag(std::string_view item, std::string_view tag) 
     const auto end = item.find(close, start);
     if (end == std::string_view::npos)
         return {};
-    auto value = std::string(item.substr(start, end - start));
+    const auto value = item.substr(start, end - start);
+    // CDATA is text as written: nothing in it is an entity.
     if (value.starts_with("<![CDATA[") && value.ends_with("]]>") && value.size() >= 12)
-        value = value.substr(9, value.size() - 12);
-    return sanitize_text(xml_decode(std::move(value)), 4096);
+        return sanitize_text(std::string(value.substr(9, value.size() - 12)), 4096);
+    return sanitize_text(xml_decode(value), 4096);
 }
 
 std::optional<std::string> xml_attribute(std::string_view element, std::string_view name) {
@@ -550,6 +563,27 @@ std::vector<TorrentSearchResult> TorznabSearchProvider::search(std::string_view 
     if (prefix.starts_with("<!DOCTYPE html") || prefix.starts_with("<html") ||
         prefix.starts_with("<HTML"))
         throw std::runtime_error("Torznab provider returned HTML instead of XML");
+    // An indexer refuses (a bad API key, a limit reached) with an <error> document and
+    // HTTP 200; it is the provider's error, not a search that found nothing.
+    {
+        auto body = std::string_view(prefix);
+        if (body.starts_with("<?xml")) {
+            const auto declared = body.find("?>");
+            body =
+                declared == std::string_view::npos ? std::string_view{} : body.substr(declared + 2);
+            while (!body.empty() && std::isspace(static_cast<unsigned char>(body.front())))
+                body.remove_prefix(1);
+        }
+        if (body.starts_with("<error")) {
+            const auto open = xml.find("<error");
+            const auto close = xml.find('>', open);
+            const auto element = std::string_view(xml).substr(
+                open, close == std::string::npos ? std::string::npos : close - open);
+            const auto description = xml_attribute(element, "description");
+            throw std::runtime_error("Torznab provider refused the search: " +
+                                     description.value_or("no description"));
+        }
+    }
 
     std::vector<TorrentSearchResult> out;
     size_t pos = 0;

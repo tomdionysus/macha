@@ -3295,6 +3295,154 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
 }
 #endif // MACHA_TEST_PLUGIN_DIR
 
+// A file action on a job another node owns is relayed to that node and
+// answered with its result: applied, refused as invalid, or no such file.
+// Once the owner cannot be reached, the node that took the request says so
+// instead of guessing, while a job no node has heard of is still not found.
+MACHA_TEST("rpc_cluster", test_a_file_action_on_a_peers_ingest_job_is_the_owners_answer) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 =
+        config_for(cluster.path() / "file-action-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 =
+        config_for(cluster.path() / "file-action-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    for (auto* config : {&c1, &c2}) {
+        config->replication = 1;
+        config->write_copies = 1;
+        config->metadata_write_copies = 1;
+        config->catalogue.scanner.enabled = true;
+        config->catalogue.scanner.movies.enabled = false;
+        config->catalogue.scanner.tv.enabled = false;
+        config->catalogue.api.enabled = false;
+        config->ingest.enabled = true;
+    }
+
+    // Node 2 owns a paused job of two files: the first still to copy, the
+    // second copied. Paused, it stays as it is while node 2 runs.
+    const std::string job_id = "peer-file-actions";
+    {
+        const auto file = [](const std::string& name, bool completed) {
+            Json::Object out;
+            out["source_path"] = "/import/" + name;
+            out["destination_path"] = "/Movies/" + name;
+            out["temporary_path"] = std::string();
+            out["size"] = static_cast<uint64_t>(4096);
+            out["copied"] = static_cast<uint64_t>(completed ? 4096 : 0);
+            out["completed"] = completed;
+            out["skipped"] = false;
+            out["catalogue_candidate"] = true;
+            return Json(std::move(out));
+        };
+        Json::Object job;
+        job["id"] = job_id;
+        job["source_type"] = "filesystem";
+        job["display_name"] = "Two Files";
+        job["source_path"] = "/import";
+        job["state"] = "paused";
+        job["bytes_total"] = static_cast<uint64_t>(2 * 4096);
+        job["bytes_completed"] = static_cast<uint64_t>(4096);
+        job["files_total"] = static_cast<uint64_t>(2);
+        job["files_completed"] = static_cast<uint64_t>(1);
+        job["created_unix_ms"] = static_cast<uint64_t>(1);
+        job["updated_unix_ms"] = static_cast<uint64_t>(2);
+        job["files"] =
+            Json::Array{file("Waiting Movie 2002.mkv", false), file("Copied Movie 2001.mkv", true)};
+        Json::Object root;
+        root["version"] = static_cast<uint64_t>(2);
+        root["jobs"] = Json::Array{Json(std::move(job))};
+        const auto state = c2.state_path / "ingest";
+        std::filesystem::create_directories(state);
+        std::ofstream out(state / "jobs.json", std::ios::binary | std::ios::trunc);
+        out << Json(std::move(root)).dump();
+        REQUIRE(out.good());
+    }
+
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 2 &&
+               s2.node().membership().active().size() == 2;
+    }));
+    REQUIRE(s2.ingest().job(job_id).has_value());
+    CHECK(!s1.ingest().job(job_id).has_value());
+    const auto node2 = to_string(s2.node().node_id());
+    // Node 1 learns of the job from its poll of node 2.
+    s1.cluster_jobs().refresh_now();
+    REQUIRE(s1.cluster_jobs().ingest_job(job_id).has_value());
+
+    const auto post = [&](const std::string& rest) {
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/ingest/jobs/" + rest;
+        return s1.acquisition_api().handle(request);
+    };
+    const auto body_json = [](const HttpResponse& response) {
+        return Json::parse(
+            std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+    };
+    const auto code_of = [&](const HttpResponse& response) {
+        const auto body = body_json(response);
+        CHECK(body.find("status")->asString() == body.find("error")->find("code")->asString());
+        CHECK(!body.find("error")->find("message")->asString().empty());
+        return body.find("error")->find("code")->asString();
+    };
+    const auto file_state = [&](size_t index) {
+        const auto job = s2.ingest().job(job_id);
+        REQUIRE(job.has_value());
+        return ingest_file_state_name(*job, index);
+    };
+    const auto files = job_id + "/files/";
+
+    // Paused through node 1: node 2 applies it and answers with its job.
+    {
+        const auto paused = post(files + "0/pause");
+        REQUIRE(paused.status == 200);
+        const auto body = body_json(paused);
+        CHECK(body.find("id")->asString() == job_id);
+        CHECK(body.find("node_id")->asString() == node2);
+        CHECK(body.find("state")->asString() == "paused");
+        CHECK(file_state(0) == "paused");
+    }
+    // Node 2's refusals come back as they are.
+    {
+        const auto again = post(files + "0/pause");
+        CHECK(again.status == 409);
+        CHECK(code_of(again) == "invalid_state");
+        const auto copied = post(files + "1/cancel");
+        CHECK(copied.status == 409);
+        CHECK(code_of(copied) == "invalid_state");
+        const auto missing = post(files + "5/pause");
+        CHECK(missing.status == 404);
+        CHECK(code_of(missing) == "not_found");
+    }
+    // Resumed through node 1.
+    REQUIRE(post(files + "0/resume").status == 200);
+    CHECK(file_state(0) == "queued");
+    CHECK(file_state(1) == "completed");
+
+    // Node 2 stops. Node 1 still lists the job from its last poll, and every
+    // action on it, a file's or the job's own, is refused as unreachable.
+    s2.stop();
+    s1.cluster_jobs().refresh_now();
+    REQUIRE(s1.cluster_jobs().ingest_job(job_id).has_value());
+    for (const auto& rest : {files + "0/pause", files + "0/cancel", job_id + "/cancel"}) {
+        const auto refused = post(rest);
+        CHECK(refused.status == 503);
+        CHECK(code_of(refused) == "node_unreachable");
+    }
+    // A job no node has heard of is not found, not unreachable.
+    {
+        const auto nowhere = post("no-such-job/files/0/pause");
+        CHECK(nowhere.status == 404);
+        CHECK(code_of(nowhere) == "not_found");
+    }
+    s1.stop();
+}
+
 // A node truncates its own history while its peer is away, and goes on
 // committing. The peer returns holding the head from before the truncation,
 // takes the newer head, and the two serve one namespace.
