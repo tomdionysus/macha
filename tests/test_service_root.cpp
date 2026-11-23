@@ -479,7 +479,7 @@ MACHA_TEST("service_root", test_each_route_reaches_the_api_that_owns_it) {
         {"/api/v1/files", 200, "\"path\":\"/\""},
         {"/api/v1/files/nothing", 404, "no such file or directory"},
         {"/api/v1/catalogue/items", 200, "\"items\":[]"},
-        {"/api/v1/nothing", 404, "\"error\":{\"code\":\"not_found\""},
+        {"/api/v1/nothing", 404, "\"error\":\"not_found\""},
     };
     for (const auto& route : routes) {
         const auto reply = http_request(port, "GET", route.path, admin);

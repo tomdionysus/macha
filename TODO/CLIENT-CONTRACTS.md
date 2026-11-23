@@ -4,12 +4,12 @@ Contracts settled with the client sessions (from 2026-09-13), kept here
 because they were agreed across sessions and exist nowhere else in this
 repository. A server change that breaks one breaks four clients at once.
 
-**0.95.7, built, not deployed (the maintainer, 2026-11-23: change it, announce first).** Every
-`/api/v1/catalogue` route (not only the media routes), and the `404 not_found` for an `/api/v1` path no route claims,
-answers errors in the common
-envelope, `{"status": code, "error": {"code", "message", "reason"?}}`, in place of `{"error": code, "message",
-"reason"?}`; further fields a code names (`kind`, `parent_id`, `parent_kind`, `reference_id`, `reference_kind`) move
-inside `error` too. The codes and HTTP statuses do not change.
+**Held until announced (the maintainer, 2026-11-23: change it, announce first; built as 0.95.7, then taken out
+of 0.95.9 so the fixes could ship).** Every `/api/v1/catalogue` route, and the `404 not_found` for an `/api/v1`
+path no route claims, answers errors in the common envelope `{"status": code, "error": {"code", "message",
+"reason"?}}` in place of `{"error": code, "message", "reason"?}`; further fields a code names (`kind`,
+`parent_id`, `parent_kind`, `reference_id`, `reference_kind`) move inside `error`. Codes and HTTP statuses do not
+change. It returns in a release of its own once Core and every client have been told.
 
 **0.95.3 (not yet announced: no Core or client session was running on 2026-11-22; announce before it
 ships to the live nodes).** Each `nodes[]` entry in `GET /api/v1/status` gains `dannan_version` and

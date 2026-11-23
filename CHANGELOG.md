@@ -1,5 +1,12 @@
 # Current release
 
+## 0.95.9: 0.95.8's fixes without the catalogue envelope change
+
+- API: the catalogue's errors, and the `404 not_found` for an `/api/v1` path no route claims,
+  answer as they did before 0.95.7: `{"error": code, "message", "reason"?}`, further fields at the
+  top level. 0.95.7's move to the common envelope returns in a release of its own once Core and
+  every client have been told; this one carries 0.95.8's fixes to the live nodes first.
+
 ## 0.95.8: remuxed segments match their playlist; paused torrents stay paused
 
 - Playback: a remux whose audio (or any stream) starts after the first planned segment
