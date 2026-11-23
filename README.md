@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.95.9*
+*v0.96.0*
 
 [![Release](https://img.shields.io/github/v/tag/tomdionysus/macha?sort=semver&label=release)](https://github.com/tomdionysus/macha/tags)
 [![CI](https://github.com/tomdionysus/macha/actions/workflows/ci.yml/badge.svg)](https://github.com/tomdionysus/macha/actions/workflows/ci.yml)
@@ -133,8 +133,8 @@ versions, systemd setup, upgrades and removal:
 [Quick start](docs/quickstart.md).
 
 Macha runs on two shared libraries, [Dannan](https://github.com/tomdionysus/dannan)
-0.9.2 (the cluster transport) and [Dagda](https://github.com/tomdionysus/dagda)
-0.3.3 (the object store). Build and install them first, under `/usr/local`,
+0.11.1 (the cluster transport) and [Dagda](https://github.com/tomdionysus/dagda)
+0.4.0 (the object store). Build and install them first, under `/usr/local`,
 then Macha:
 
 ```bash

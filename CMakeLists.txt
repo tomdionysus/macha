@@ -8,7 +8,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.95.9 LANGUAGES CXX)
+project(macha VERSION 0.96.0 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -155,11 +155,11 @@ find_package(CURL REQUIRED)
 # because src/http/http_compression.cpp calls deflate() itself.
 find_package(ZLIB REQUIRED)
 find_package(yaml-cpp QUIET)
-# The cluster's transport and node: Dannan 0.9.2, or a later patch of the same
+# The cluster's transport and node: Dannan 0.11.1, or a later patch of the same
 # minor (a patch keeps the minor's ABI; a minor is a new API).
-find_package(dannan 0.9.2 CONFIG REQUIRED)
+find_package(dannan 0.11.1 CONFIG REQUIRED)
 # The store: Dagda, the exact release, built on the same Dannan.
-find_package(dagda 0.3.3 CONFIG REQUIRED)
+find_package(dagda 0.4.0 CONFIG REQUIRED)
 
 # Some environments expose a static CURL::libcurl without its transitive link
 # dependencies. Prefer pkg-config's complete imported target when available.

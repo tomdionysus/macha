@@ -441,10 +441,12 @@ MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generati
         auto& ledger = node.memory();
         // Viewer class, because it is bounded only by the non-control
         // capacity: a loader-class lease could not take the whole budget a
-        // wedged publication pipeline fills.
+        // wedged publication pipeline fills. What the node already holds (its
+        // transfer buffers among it) is left out.
+        const auto stats = ledger.stats();
         auto hog = ledger.try_acquire(WorkClass::foreground, MemoryOwner::playback_segment,
-                                      ledger.stats().capacity_bytes -
-                                          ledger.stats().control_reserve_bytes);
+                                      stats.capacity_bytes - stats.control_reserve_bytes -
+                                          stats.used_bytes);
         REQUIRE(hog.has_value());
 
         auto stalled_progress = std::make_shared<std::atomic_uint64_t>(0);

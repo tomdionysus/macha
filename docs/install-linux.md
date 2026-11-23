@@ -15,8 +15,8 @@ Macha requires:
   60, `libavutil` 58, `libswscale` 7 and `libswresample` 4, or later)
 - pkg-config and POSIX threads
 - Boost 1.83 or later (Asio) development headers
-- [Dannan](https://github.com/tomdionysus/dannan) 0.9.2, the cluster transport,
-  and [Dagda](https://github.com/tomdionysus/dagda) 0.3.3, the store, built and
+- [Dannan](https://github.com/tomdionysus/dannan) 0.11.1, the cluster transport,
+  and [Dagda](https://github.com/tomdionysus/dagda) 0.4.0, the store, built and
   installed first (below)
 
 FUSE 3 is required for the mounted filesystem. libtorrent-rasterbar 2.0 or
@@ -102,17 +102,17 @@ pkg-config --exists 'libavformat >= 60' 'libavcodec >= 60' 'libavutil >= 58' \
 
 ## Build Dannan and Dagda
 
-Macha builds against Dannan 0.9.2 and Dagda 0.3.3, each from its tag, Dannan
+Macha builds against Dannan 0.11.1 and Dagda 0.4.0, each from its tag, Dannan
 first:
 
 ```bash
-git clone --branch 0.9.2 https://github.com/tomdionysus/dannan.git
+git clone --branch 0.11.1 https://github.com/tomdionysus/dannan.git
 cmake -S dannan -B dannan/build -DCMAKE_BUILD_TYPE=Release
 cmake --build dannan/build --parallel
 sudo cmake --install dannan/build --prefix /usr/local
 sudo ldconfig
 
-git clone --branch 0.3.3 https://github.com/tomdionysus/dagda.git
+git clone --branch 0.4.0 https://github.com/tomdionysus/dagda.git
 cmake -S dagda -B dagda/build -DCMAKE_BUILD_TYPE=Release
 cmake --build dagda/build --parallel
 sudo cmake --install dagda/build --prefix /usr/local

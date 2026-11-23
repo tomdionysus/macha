@@ -464,7 +464,7 @@ set it came in.
 
 `nodes[].version` is the Macha release a node runs. `nodes[].dannan_version` and
 `nodes[].dagda_version` are the Dannan and Dagda libraries it runs, each in
-full (`0.9.2`) as the loaded library reports itself. They come from the node's
+full (`0.11.1`) as the loaded library reports itself. They come from the node's
 telemetry alone: `null` when the node has sent none or does not report them.
 
 `nodes[].control_storage` is that node's control store (metadata objects,

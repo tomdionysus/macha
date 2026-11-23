@@ -120,8 +120,9 @@ minute: `memory_limit_bytes`, `memory_budget_bytes` (the parts' total),
 `retained_memory_bytes` is the process-wide admission budget for heap objects
 which survive an asynchronous boundary, including FUSE write/operation state,
 RPC queues and active playback fragment stores. Dannan's transport draws on the
-same budget and reserves, and repair's window is an eighth of it (see
-[Maintenance](#maintenance)).
+same budget and reserves; its pool of large transfer buffers, reused rather than
+freed, is bounded at a third of it (256 MiB at the default), and repair's window
+is an eighth of it, under that bound (see [Maintenance](#maintenance)).
 
 The reserves are headroom within that total: each must be non-zero, and together they must fit in `retained_memory_bytes`, or the node refuses to start. The control, viewer and loader reserves are the
 [governing laws](principles-and-laws.md#scheduling-laws) expressed as memory: durable

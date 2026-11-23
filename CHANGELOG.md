@@ -1,5 +1,20 @@
 # Current release
 
+## 0.96.0: on Dannan 0.11.1 and Dagda 0.4.0; repair returns its memory
+
+- Built on Dannan 0.11.1 (from 0.9.2) and Dagda 0.4.0 (from 0.3.3). Install both first:
+  `libdannan0.11` (0.11.1 or later) and `libdagda0.4.0`.
+- Repair no longer leaves memory with the allocator. 0.95.2 bounded what repair has in flight,
+  but each transfer's buffers were freed into glibc's per-thread arenas and kept: a node of 8 GB
+  climbed to about 1.5 GB resident. Dannan and Dagda now take transfer buffers from the node's
+  pool and give them back, so blocks of an extent's size are reused, and repair holds within a
+  few extents of where it began. No allocator setting is needed.
+- The node's transfer-buffer pool is bounded at a third of `runtime.retained_memory_bytes` (256
+  MiB at the default), the same budget it is charged to; repair's window stays under it.
+- From Dannan: each node measures its peers' clocks, and one more than two seconds off against
+  most of the cluster stops issuing hybrid-clock stamps until it is back; a stamp more than five
+  seconds ahead of a node's own clock is not merged (one minute before).
+
 ## 0.95.9: 0.95.8's fixes without the catalogue envelope change
 
 - API: the catalogue's errors, and the `404 not_found` for an `/api/v1` path no route claims,

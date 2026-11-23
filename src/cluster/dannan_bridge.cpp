@@ -78,6 +78,9 @@ dannan::NodeConfig dannan_node_config(const Config& config, dannan::identity::Cl
     out.loader_reserve_bytes = config.runtime.loader_memory_reserve_bytes;
     out.reassembly_reserve_bytes = config.runtime.reassembly_memory_reserve_bytes;
     out.memory_limit_bytes = 0;
+    // The node's pool of large transfer buffers, charged to the same budget: a third of it
+    // (256 MiB at the default 768 MiB). Repair's window stays under it less four extents.
+    out.transfer_buffers_bound = config.runtime.retained_memory_bytes / 3;
     if (!config.custody.credential.empty())
         out.custody = dannan::identity::KeySource::systemd_credential(
             config.custody.credential, config.custody.credentials_directory);
