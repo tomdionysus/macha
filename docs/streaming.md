@@ -243,7 +243,7 @@ Connections are HTTP/1.1 keep-alive by default, reused for up to `keep_alive_max
 
 Session creation and control require the session bearer token from `POST /api/v1/session`. Returned stream URLs use a separate high-entropy capability in the path so native players can fetch direct files, playlists and fragments without the bearer token. Stream capabilities expire with the playback session.
 
-Every JSON object response carries a top-level snake_case `status`: `"ok"` on success, unless the handler states its own. An error's `status` is its `error.code`, except the playback errors built outside the common envelope - `account_session_limit`, `account_transcode_limit` and the `playback_*_failed` stage errors - whose `status` is `"error"`. Branch on `error.code`. The catalogue routes, and any `/api/v1` path no route claims (`404`), carry the code as the string `error` instead, with `message` beside it (see [Catalogue](catalogue.md)). Stream bodies, `204` and non-JSON responses carry no `status`.
+Every JSON object response carries a top-level snake_case `status`: `"ok"` on success, unless the handler states its own. An error's `status` is its `error.code`, except the playback errors built outside the common envelope - `account_session_limit`, `account_transcode_limit` and the `playback_*_failed` stage errors - whose `status` is `"error"`. Branch on `error.code`. Stream bodies, `204` and non-JSON responses carry no `status`.
 
 ## Status
 

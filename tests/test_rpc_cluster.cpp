@@ -3757,8 +3757,10 @@ MACHA_TEST("rpc_cluster", test_inbound_auto_resolves_from_dial_back_and_survives
     site.stop();
     site.config.advertise_host = "127.0.0.1";
     auto& reachable = site.start();
-    CHECK(!reachable.inbound_capable()); // persisted, until evidence says otherwise
+    // It starts from the persisted answer (checked above); a dial-back may land at once, so
+    // only the flip and its source are certain.
     REQUIRE(wait_until([&] { return reachable.inbound_capable(); }, 20s));
+    CHECK(reachable.inbound_resolution().source.starts_with("probe:"));
     CHECK(reachable.hosts_extents());
     REQUIRE(wait_until([&] { return hub.node->membership().inbound_capable(site_id); }, 10s));
     CHECK(wait_until([&] { return hub.node->membership().hosts_extents(site_id); }, 10s));

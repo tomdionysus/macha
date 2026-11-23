@@ -1,5 +1,13 @@
 # Current release
 
+## 0.95.7: the catalogue answers errors in the API's common envelope
+
+- API: every error from the `/api/v1/catalogue` routes is `{"status": code, "error": {"code",
+  "message", "reason"?}}`, as the other routes answer, in place of `{"error": code, "message",
+  "reason"?}`; further fields a code names (`kind`, `parent_id`, `reference_id` and the like) sit
+  inside `error`. The `404 not_found` for an `/api/v1` path no route claims answers the same way.
+  Codes and HTTP statuses do not change. Announced to Core and the clients first.
+
 ## 0.95.6: torrent search reads indexers right; a zero limit matches nothing
 
 - Torrent search: an indexer's title or field decodes once. An escaped entity (`&amp;lt;`)

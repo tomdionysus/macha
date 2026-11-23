@@ -5331,7 +5331,7 @@ MACHA_TEST("hydration_catalogue", test_the_media_routes_say_why_the_engine_could
     };
     const auto refusal = [](const HttpResponse& response) {
         const auto body = api_body(response);
-        CHECK(!body.find("message")->asString().empty());
+        CHECK(!body.find("error")->find("message")->asString().empty());
         return body;
     };
 
@@ -5339,15 +5339,15 @@ MACHA_TEST("hydration_catalogue", test_the_media_routes_say_why_the_engine_could
         const auto keyframes = get(id, "keyframes");
         CHECK(keyframes.status == 422);
         auto body = refusal(keyframes);
-        CHECK(body.find("error")->asString() == "keyframes_failed");
-        CHECK(body.find("reason")->asString() == reason);
-        CHECK(body.find("message")->asString() == "the engine could not read " + id);
+        CHECK(body.find("error")->find("code")->asString() == "keyframes_failed");
+        CHECK(body.find("error")->find("reason")->asString() == reason);
+        CHECK(body.find("error")->find("message")->asString() == "the engine could not read " + id);
 
         const auto profile = get(id, "profile");
         CHECK(profile.status == 422);
         body = refusal(profile);
-        CHECK(body.find("error")->asString() == "profile_failed");
-        CHECK(body.find("reason")->asString() == reason);
+        CHECK(body.find("error")->find("code")->asString() == "profile_failed");
+        CHECK(body.find("error")->find("reason")->asString() == reason);
     }
 
     // A failure the engine does not name has no reason to give.
@@ -5355,14 +5355,15 @@ MACHA_TEST("hydration_catalogue", test_the_media_routes_say_why_the_engine_could
         const auto broken = get("macha:broken", "profile");
         CHECK(broken.status == 422);
         const auto body = refusal(broken);
-        CHECK(body.find("error")->asString() == "profile_failed");
-        CHECK(body.find("reason") == nullptr);
+        CHECK(body.find("error")->find("code")->asString() == "profile_failed");
+        CHECK(body.find("error")->find("reason") == nullptr);
     }
     // No engine on this node: not here, as for media it has no file of.
     {
         const auto elsewhere = get("macha:no-engine", "profile");
         CHECK(elsewhere.status == 404);
-        CHECK(refusal(elsewhere).find("error")->asString() == "media_engine_unavailable");
+        CHECK(refusal(elsewhere).find("error")->find("code")->asString() ==
+              "media_engine_unavailable");
     }
     // Media this node cannot find: background profiling took it, or nothing did.
     {
@@ -5376,7 +5377,7 @@ MACHA_TEST("hydration_catalogue", test_the_media_routes_say_why_the_engine_could
         for (const auto* route : {"profile", "keyframes", "content"}) {
             const auto missing = get("macha:gone", route);
             CHECK(missing.status == 404);
-            CHECK(refusal(missing).find("error")->asString() == "not_found");
+            CHECK(refusal(missing).find("error")->find("code")->asString() == "not_found");
         }
     }
     // An encoded identity is decoded before it is looked up.
@@ -5388,12 +5389,12 @@ MACHA_TEST("hydration_catalogue", test_the_media_routes_say_why_the_engine_could
         for (const auto* route : {"profile", "keyframes", "content"}) {
             const auto refused = get(id, route);
             CHECK(refused.status == 400);
-            CHECK(refusal(refused).find("error")->asString() == "bad_media_id");
+            CHECK(refusal(refused).find("error")->find("code")->asString() == "bad_media_id");
         }
         const auto conversion = api.handle(
             api_request("GET", "/api/v1/catalogue/media/" + std::string(id) + "/conversions/epub"));
         CHECK(conversion.status == 400);
-        CHECK(refusal(conversion).find("error")->asString() == "bad_media_id");
+        CHECK(refusal(conversion).find("error")->find("code")->asString() == "bad_media_id");
     }
     CHECK(asked.empty());
 }
@@ -5444,18 +5445,18 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_ar
         CHECK(item_call("PATCH", "movie%3Anope", R"({"year":2000})").status == 404);
         auto malformed = item_call("PATCH", "movie%3Aedit-test", "[1,2]");
         CHECK(malformed.status == 400);
-        CHECK(api_body(malformed).find("error")->asString() == "bad_item");
+        CHECK(api_body(malformed).find("error")->find("code")->asString() == "bad_item");
         auto missing = item_call("PUT", "season%3Aedit-test",
                                  R"({"kind":"season","title":"S1","parent_id":"show:absent"})");
         CHECK(missing.status == 400);
-        CHECK(api_body(missing).find("error")->asString() == "parent_not_found");
-        CHECK(api_body(missing).find("parent_id")->asString() == "show:absent");
+        CHECK(api_body(missing).find("error")->find("code")->asString() == "parent_not_found");
+        CHECK(api_body(missing).find("error")->find("parent_id")->asString() == "show:absent");
         auto wrong = item_call("PUT", "episode%3Aedit-test",
                                R"({"kind":"episode","title":"E1","parent_id":"show:edit-test"})");
         CHECK(wrong.status == 400);
-        CHECK(api_body(wrong).find("error")->asString() == "bad_parent_kind");
-        CHECK(api_body(wrong).find("kind")->asString() == "episode");
-        CHECK(api_body(wrong).find("parent_kind")->asString() == "show");
+        CHECK(api_body(wrong).find("error")->find("code")->asString() == "bad_parent_kind");
+        CHECK(api_body(wrong).find("error")->find("kind")->asString() == "episode");
+        CHECK(api_body(wrong).find("error")->find("parent_kind")->asString() == "show");
         CHECK(!node.catalogue().get("episode:edit-test").has_value());
         CHECK(item_call("PUT", "season%3Aedit-test",
                         R"({"kind":"season","title":"S1","parent_id":"show:edit-test"})")
@@ -6567,14 +6568,14 @@ MACHA_TEST("hydration_catalogue",
     auto missing = call("PUT", "/api/v1/catalogue/items/book%3Ahand", {},
                         R"({"kind":"book","title":"Hand Book","author_ids":["author:nobody"]})");
     CHECK(missing.status == 400);
-    CHECK(api_body(missing).find("error")->asString() == "reference_not_found");
-    CHECK(api_body(missing).find("reference_id")->asString() == "author:nobody");
+    CHECK(api_body(missing).find("error")->find("code")->asString() == "reference_not_found");
+    CHECK(api_body(missing).find("error")->find("reference_id")->asString() == "author:nobody");
     auto wrong = call(
         "PUT", "/api/v1/catalogue/items/book%3Ahand", {},
         R"({"kind":"book","title":"Hand Book","series":[{"series_id":"author:tessa-pembrooke","index":2.5}]})");
     CHECK(wrong.status == 400);
-    CHECK(api_body(wrong).find("error")->asString() == "bad_reference_kind");
-    CHECK(api_body(wrong).find("reference_kind")->asString() == "author");
+    CHECK(api_body(wrong).find("error")->find("code")->asString() == "bad_reference_kind");
+    CHECK(api_body(wrong).find("error")->find("reference_kind")->asString() == "author");
     auto not_a_book =
         call("PUT", "/api/v1/catalogue/items/movie%3Ahand", {},
              R"({"kind":"movie","title":"Film","author_ids":["author:tessa-pembrooke"]})");
@@ -6588,8 +6589,8 @@ MACHA_TEST("hydration_catalogue",
 
     auto profile = call("GET", "/api/v1/catalogue/media/" + epub_id + "/profile");
     CHECK(profile.status == 422);
-    CHECK(api_body(profile).find("error")->asString() == "profile_not_applicable");
-    CHECK(api_body(profile).find("kind")->asString() == "book");
+    CHECK(api_body(profile).find("error")->find("code")->asString() == "profile_not_applicable");
+    CHECK(api_body(profile).find("error")->find("kind")->asString() == "book");
 
     auto whole = call("GET", "/api/v1/catalogue/media/" + epub_id + "/content");
     REQUIRE(whole.status == 200);
@@ -6966,10 +6967,11 @@ MACHA_TEST("hydration_catalogue", test_books_are_converted_through_the_catalogue
     CHECK(api_body(unavailable).find("error")->find("code")->asString() ==
           "conversion_unavailable");
     CHECK(call(api, "PUT", base + "docx").status == 400);
-    CHECK(api_body(call(api, "PUT", base + "mobi")).find("error")->asString() == "bad_format");
+    CHECK(api_body(call(api, "PUT", base + "mobi")).find("error")->find("code")->asString() ==
+          "bad_format");
     auto not_book = call(api, "PUT", "/api/v1/catalogue/media/" + movie_id + "/conversions/epub");
     CHECK(not_book.status == 422);
-    CHECK(api_body(not_book).find("error")->asString() == "not_a_book");
+    CHECK(api_body(not_book).find("error")->find("code")->asString() == "not_a_book");
     CHECK(call(api, "GET", base + "epub").status == 404);
 
     auto started = call(api, "PUT", base + "epub");

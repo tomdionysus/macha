@@ -106,7 +106,7 @@ is never built on the playback path. The response is `immutable` with the
 media id as its `ETag`. Codes: `400 bad_media_id`, `404 not_found` (this node
 cannot find the file), `422 keyframes_not_supported` (a container that keeps
 no byte index: only MP4 and Matroska do), `422 keyframes_failed` (the file
-could not be read, with the failure axes of a profile failure). One index is
+could not be read; `error.reason` says why, as for a profile failure). One index is
 built at a time on a node.
 
 Pre-session availability is guaranteed for a `macha:` identity, so a miss is
@@ -195,7 +195,7 @@ The `error` text is for people; act on the codes.
 
 Reads need `media_viewer`; every mutation needs `manager`.
 
-Errors on the `/api/v1/catalogue` routes carry the code as the string `error`, with `message` beside it and any further fields (`reason`, `parent_id`, `kind`, `parent_kind`) at the top level: `{"status": "error", "error": "bad_item", "message": "..."}`. An unexpected failure is `503 catalogue_unavailable`.
+Errors on the `/api/v1/catalogue` routes use the API's common envelope: `{"status": "bad_item", "error": {"code": "bad_item", "message": "..."}}`, with any further fields a code names (`reason`, `parent_id`, `kind`, `parent_kind`) inside `error`. An unexpected failure is `503 catalogue_unavailable`.
 
 Every item returned carries `availability` (`complete`, `partial`, `unavailable` or `unknown`) and, for a set, `availability_members`: how much of it the reachable cluster holds, as described in [Files and availability](files.md#catalogue-items). They are not part of the item: a `PUT` or `PATCH` body that names them is ignored there.
 

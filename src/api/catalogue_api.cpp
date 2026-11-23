@@ -73,17 +73,30 @@ HttpResponse json(int status, std::string value) {
     return {status, "application/json; charset=utf-8", {}, body(std::move(value))};
 }
 
+// The API's one error envelope: {"status": code, "error": {code, message}}.
 HttpResponse error(int status, std::string_view code, std::string_view message) {
-    return json(status,
-                "{\"error\":" + json_escape(code) + ",\"message\":" + json_escape(message) + "}");
+    return http_error(status, code, message);
 }
 
-// Same shape as error(), plus the engine's reason it could not produce facts;
-// the client decides whether to try another node, another source, or give up.
+// With further fields (kind, parent_id, ...) inside the error object, beside code and message.
+HttpResponse error_with(int status, std::string_view code, std::string_view message,
+                        const std::vector<std::pair<std::string, std::string>>& fields) {
+    Json::Object detail;
+    detail["code"] = std::string(code);
+    detail["message"] = std::string(message);
+    for (const auto& [name, value] : fields)
+        detail[name] = value;
+    Json::Object root;
+    root["status"] = std::string(code);
+    root["error"] = std::move(detail);
+    return json(status, Json(std::move(root)).dump());
+}
+
+// Plus the engine's reason it could not produce facts, as error.reason; the client
+// decides whether to try another node, another source, or give up.
 HttpResponse media_error(int status, std::string_view code, std::string_view message,
                          MediaFailure failure) {
-    return json(status, "{\"error\":" + json_escape(code) + ",\"message\":" + json_escape(message) +
-                            ",\"reason\":" + json_escape(media_failure_name(failure)) + "}");
+    return http_error(status, code, message, media_failure_name(failure));
 }
 
 std::string optional_number(const std::optional<int32_t>& value) {
@@ -795,8 +808,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 return error(400, "bad_media_id", "immutable macha media ID required");
             // A book has no streams to profile; it is read through its content.
             if (book_media(media_id))
-                return json(422, "{\"error\":\"profile_not_applicable\",\"message\":"
-                                 "\"a book's file has no playback profile\",\"kind\":\"book\"}");
+                return error_with(422, "profile_not_applicable",
+                                  "a book's file has no playback profile", {{"kind", "book"}});
             auto profile = catalogue_.media_profile(media_id);
             if (!profile && resolve_media_profile_) {
                 // No stored profile: produce and persist one now on the foreground path a
@@ -947,11 +960,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
     } catch (const CatalogueConflict& e) {
         return error(409, "conflict", e.what());
     } catch (const BadItem& e) {
-        std::string body =
-            "{\"error\":" + json_escape(e.code) + ",\"message\":" + json_escape(e.what());
-        for (const auto& [name, value] : e.fields)
-            body += "," + json_escape(name) + ":" + json_escape(value);
-        return json(400, body + "}");
+        return error_with(400, e.code, e.what(), e.fields);
     } catch (const std::exception& e) {
         return error(503, "catalogue_unavailable", e.what());
     }
@@ -1044,14 +1053,12 @@ HttpResponse CatalogueApi::media_conversion(const HttpRequest& request, const st
         if (!state)
             return error(404, "not_found", "no conversion into this format here");
         if (state->phase == ConversionState::Phase::converting) {
-            auto response =
-                json(409, "{\"error\":\"not_ready\",\"message\":\"the conversion is running\"}");
+            auto response = error(409, "not_ready", "the conversion is running");
             response.headers["Retry-After"] = "2";
             return response;
         }
         if (state->phase == ConversionState::Phase::failed)
-            return json(422, "{\"error\":" + json_escape(state->error_code) +
-                                 ",\"message\":\"the conversion failed\"}");
+            return error(422, state->error_code, "the conversion failed");
         const auto source = conversions_->content(media_id, format);
         if (!source)
             return error(404, "not_found", "no conversion into this format here");
