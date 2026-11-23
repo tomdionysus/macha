@@ -50,8 +50,6 @@ class Membership {
     // node starts.
     void follow(std::shared_ptr<const MembershipView>);
     NodeInfo self() const;
-    void usage(uint64_t);
-    void storage(uint64_t used, uint64_t capacity);
     void endpoint(std::string host, uint16_t port);
     void metadata_generation(uint64_t);
     // Sets this node's NodeInfo::flags bits; true when either changed.

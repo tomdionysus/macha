@@ -13,17 +13,6 @@ NodeInfo Membership::self() const {
     s.seen_unix_ms = unix_ms();
     return s;
 }
-void Membership::usage(uint64_t u) {
-    Lock g(m_);
-    self_.used = u;
-    self_.seen_unix_ms = unix_ms();
-}
-void Membership::storage(uint64_t used, uint64_t capacity) {
-    Lock g(m_);
-    self_.used = used;
-    self_.capacity = capacity;
-    self_.seen_unix_ms = unix_ms();
-}
 void Membership::endpoint(std::string host, uint16_t port) {
     Lock g(m_);
     if (host.empty() || !port)

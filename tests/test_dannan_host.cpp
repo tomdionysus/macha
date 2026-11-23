@@ -263,6 +263,20 @@ MACHA_TEST("dannan_host", test_membership_follows_the_nodes_roster) {
     members.observe(stranger, true);
     REQUIRE(members.all().size() == 2);
 
+    // This node's advertised endpoint follows a change; an incomplete one is refused and
+    // changes nothing.
+    members.endpoint("192.0.2.7", 7447);
+    CHECK(members.self().host == "192.0.2.7");
+    CHECK(members.self().port == 7447);
+    bool refused = false;
+    try {
+        members.endpoint("", 7447);
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    CHECK(refused);
+    CHECK(members.self().host == "192.0.2.7");
+
     b.stop();
     a.stop();
 }
