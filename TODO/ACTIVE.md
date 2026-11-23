@@ -63,6 +63,8 @@ two history rewrites; the maintainer's backups hold the maps.
      fixed in `d7929ad`, 60 of 60 since.
    - The catalogue SIGSEGV (`test_catalogue_sync_search_and_artwork_gc`) not reproduced: 90 of 90 under ASan,
      and 7 full plain runs under `--jobs 3` clean for it.
+   - **0.95.6 live on both nodes from 2026-11-23 18:27Z (live-a) and 18:28Z (live-b).** 0.95.7 (the catalogue's
+     common error envelope) is built and held until Core and the clients are told (the maintainer's ruling).
    - **0.95.5 live on both nodes from 2026-11-23 10:04Z (live-a) and 10:05Z (live-b).**
    - **Heap corruption: found and fixed in 0.95.5** (`build/evidence/heap-2026-11-22/`). Under load the plain
      suite crashed: burst-rmdir SIGSEGV in 2 of 7 runs, the publication case on `malloc(): unaligned tcache chunk
