@@ -96,6 +96,18 @@ std::string sanitize_text(std::string value, size_t limit = 1024) {
     return trim(std::move(value));
 }
 
+// A v1 info hash as a magnet names it: 40 hex digits, or 32 base32 characters.
+bool valid_info_hash(std::string_view hash) {
+    if (hash.size() == 40)
+        return std::all_of(hash.begin(), hash.end(),
+                           [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); });
+    if (hash.size() == 32)
+        return std::all_of(hash.begin(), hash.end(), [](char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '2' && c <= '7');
+        });
+    return false;
+}
+
 // One pass: each entity is decoded once, so an escaped entity ("&amp;lt;") reads as the
 // entity's text ("&lt;"), never as the character it names.
 std::string xml_decode(std::string_view value) {
@@ -634,6 +646,11 @@ std::vector<TorrentSearchResult> TorznabSearchProvider::search(std::string_view 
                 }
             }
         }
+        // An item that names only its info hash is reached through a magnet built from it.
+        if (!result.magnet_uri && !result.torrent_url)
+            if (auto hash = torznab_attr(item, "infohash"); hash && valid_info_hash(*hash))
+                result.magnet_uri = sanitize_magnet_uri("magnet:?xt=urn:btih:" + *hash +
+                                                        "&dn=" + url_encode(result.title));
         if (!result.title.empty() && (result.magnet_uri || result.torrent_url))
             out.push_back(std::move(result));
         pos = end + 7;
@@ -641,12 +658,38 @@ std::vector<TorrentSearchResult> TorznabSearchProvider::search(std::string_view 
     return out;
 }
 
+namespace {
+
+// A configured provider that could not be made (its key file unreadable): the node runs,
+// and every search says why this provider gave nothing.
+class UnavailableSearchProvider final : public TorrentSearchProvider {
+    std::string name_;
+    std::string why_;
+
+  public:
+    UnavailableSearchProvider(std::string name, std::string why)
+        : name_(std::move(name)), why_(std::move(why)) {}
+    std::string_view name() const noexcept override {
+        return name_;
+    }
+    std::vector<TorrentSearchResult> search(std::string_view) override {
+        throw std::runtime_error(why_);
+    }
+};
+
+} // namespace
+
 TorrentSearchManager::TorrentSearchManager(const TorrentConfig& config) {
     for (const auto& provider : config.search_providers) {
-        if (!provider.enabled)
+        if (!provider.enabled || provider.type != "torznab")
             continue;
-        if (provider.type == "torznab")
+        try {
             providers_.push_back(std::make_unique<TorznabSearchProvider>(provider));
+        } catch (const std::exception& e) {
+            Log::warn("torrent search provider " + provider.name + " unavailable: " + e.what());
+            providers_.push_back(
+                std::make_unique<UnavailableSearchProvider>(provider.name, e.what()));
+        }
     }
 }
 
@@ -671,22 +714,31 @@ TorrentSearchResponse TorrentSearchManager::search(std::string_view query) {
         else
             ++it;
     }
+    // At capacity, an earlier search's reference nearest expiry is retired, so repeated
+    // searches cannot grow memory without bound. A search never retires its own: once its
+    // references fill the store, the rest of its results are left out rather than handed
+    // a reference that no longer resolves.
+    std::vector<TorrentSearchResult> kept;
     for (auto& result : response.results) {
         auto uri = result.magnet_uri ? result.magnet_uri : result.torrent_url;
         if (!uri)
             continue;
         while (acquisitions_.size() >= max_acquisitions_) {
-            // At capacity, retire the reference nearest expiry, so repeated
-            // searches cannot grow memory without bound.
             auto victim = std::min_element(
                 acquisitions_.begin(), acquisitions_.end(), [](const auto& a, const auto& b) {
                     return a.second.expires_unix_ms < b.second.expires_unix_ms;
                 });
+            if (victim->second.expires_unix_ms >= expires)
+                break;
             acquisitions_.erase(victim);
         }
+        if (acquisitions_.size() >= max_acquisitions_)
+            break;
         result.acquisition_ref = to_string(random_node_id());
         acquisitions_[result.acquisition_ref] = {*uri, expires};
+        kept.push_back(std::move(result));
     }
+    response.results = std::move(kept);
     return response;
 }
 

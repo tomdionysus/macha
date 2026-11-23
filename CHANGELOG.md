@@ -1,5 +1,25 @@
 # Current release
 
+## 0.95.8: remuxed segments match their playlist; paused torrents stay paused
+
+- Playback: a remux whose audio (or any stream) starts after the first planned segment
+  boundary published segments one playlist entry out of step, and that stream played early. A
+  boundary before every stream had started flushed the muxer, writing the moov without the late
+  stream's start, and the moov flush that followed cut a fragment the plan had no entry for. Such
+  a boundary is now carried without a flush, and the moov flush first drains the muxer's
+  interleaving queue.
+- Torrents: an intent older than the one a node has journalled no longer pauses or resumes the
+  job; and a pass publishes journalled intents before it reads the cluster's requests, so a
+  paused torrent no longer runs for one pass after every publish (the first after a restart
+  among them).
+- Torrent search: a provider whose API key file cannot be read no longer stops the node; it
+  stays configured and every search reports why it gave nothing. A search hands out no
+  reference that is already retired: it retires only earlier searches' references, and leaves
+  out the rest of its own results once they fill the store. An indexer item that names only its
+  info hash is reached through a magnet built from it.
+- Tests for the remux and WebVTT paths, playback's mid-stream failure and start rollback,
+  ingest's hint resubmission, and the torrent coordinator's intents.
+
 ## 0.95.7: the catalogue answers errors in the API's common envelope
 
 - API: every error from the `/api/v1/catalogue` routes is `{"status": code, "error": {"code",

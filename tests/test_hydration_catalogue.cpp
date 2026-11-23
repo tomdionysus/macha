@@ -8,6 +8,7 @@
 #endif
 #include "api/acquisition_api.hpp"
 #include "api/paging.hpp"
+#include "catalogue/media_information.hpp"
 #include "subsystem/subsystem_abi.hpp"
 #include "subsystem/subsystem_registry.hpp"
 #include "supervised.hpp"
@@ -2794,6 +2795,425 @@ MACHA_TEST("hydration_catalogue",
     registry.withdraw_torrent(torrents.get());
 }
 
+namespace {
+
+// A node's metadata as it stands while the cluster's cannot be written: reads
+// are the node's own, status says unwritable, and a commit is refused.
+class UnwritableMetadata final : public MetadataView {
+    MetadataView& inner_;
+
+  public:
+    explicit UnwritableMetadata(MetadataView& inner) : inner_(inner) {}
+
+    std::optional<MetadataSnapshotView> current() const override {
+        return inner_.current();
+    }
+    MetadataSnapshotView local() override {
+        return inner_.local();
+    }
+    MetadataSnapshotView converged() override {
+        return inner_.converged();
+    }
+    MetadataSnapshotView converged(const WorkContext& work) override {
+        return inner_.converged(work);
+    }
+    uint64_t current_generation() const noexcept override {
+        return inner_.current_generation();
+    }
+    uint64_t current_namespace_revision() const noexcept override {
+        return inner_.current_namespace_revision();
+    }
+    MetadataRecord record() override {
+        return inner_.record();
+    }
+    Page<std::pair<std::string, FsEntry>, std::string>
+    entries(const MetadataSnapshotView& view, Cursor<std::string> from, Budget& budget) override {
+        return inner_.entries(view, std::move(from), budget);
+    }
+    std::optional<MetadataSnapshotView> release_head() const override {
+        return inner_.release_head();
+    }
+    MetadataClusterStatus status() const noexcept override {
+        auto out = inner_.status();
+        out.observed_unix_ms = std::max<uint64_t>(out.observed_unix_ms, 1);
+        out.availability = MetadataAvailability::read_only;
+        out.write_available = false;
+        return out;
+    }
+    MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>&,
+                                size_t = 8, std::optional<MetadataMutationIdentity> = {}) override {
+        throw std::runtime_error("cluster metadata is not writable");
+    }
+    bool resolve_conflict(const std::string&, std::string_view) override {
+        throw std::runtime_error("cluster metadata is not writable");
+    }
+    uint64_t conflicts_superseded() const noexcept override {
+        return inner_.conflicts_superseded();
+    }
+    uint64_t conflicts_resolved() const noexcept override {
+        return inner_.conflicts_resolved();
+    }
+    MetadataMutationTiming mutation_timing() const noexcept override {
+        return inner_.mutation_timing();
+    }
+    MetadataHeadStanding head_standing() const noexcept override {
+        return inner_.head_standing();
+    }
+    std::optional<std::optional<ObjectId>>
+    common_ancestor_catalogue_root(const Hash256& left, const Hash256& right) const override {
+        return inner_.common_ancestor_catalogue_root(left, right);
+    }
+};
+
+// A torrent_intent message's payload.
+Bytes intent_payload(const std::string& id, std::string_view desired, uint64_t changed_unix_ms) {
+    Json::Object body;
+    body["job_id"] = id;
+    body["desired"] = std::string(desired);
+    body["changed_unix_ms"] = changed_unix_ms;
+    const auto text = Json(std::move(body)).dump();
+    return Bytes(text.begin(), text.end());
+}
+
+Json reply_json(const Bytes& reply) {
+    return Json::parse(std::string(reply.begin(), reply.end()));
+}
+
+// The coordinator's intent journal, or none when it was never written.
+std::optional<Json> read_intent_journal(const std::filesystem::path& state_path) {
+    std::ifstream in(state_path / "torrent" / "intents.json", std::ios::binary);
+    if (!in)
+        return std::nullopt;
+    std::ostringstream text;
+    text << in.rdbuf();
+    return Json::parse(text.str());
+}
+
+// A request this cluster's metadata records as downloading on `owner`.
+TorrentRequest claimed_request(char tag, const NodeId& owner) {
+    TorrentRequest request;
+    request.id = std::string(32, tag);
+    request.info_hash = std::string(40, tag);
+    request.source = "magnet:?xt=urn:btih:" + request.info_hash;
+    request.created_unix_ms = 1;
+    request.desired_changed_unix_ms = 1;
+    request.claim = TorrentClaim{owner, 1, 1};
+    request.phase = TorrentPhase::downloading;
+    request.phase_epoch = 1;
+    request.progress_unix_ms = 1;
+    return request;
+}
+
+void record_request(MetadataView& metadata, const TorrentRequest& request) {
+    metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+        snapshot.torrent_requests[request.id] = request;
+        delta.upsert_torrent_requests[request.id] = request;
+    });
+}
+
+} // namespace
+
+MACHA_TEST("hydration_catalogue",
+           test_an_owner_applies_an_intent_while_metadata_is_unwritable_and_journals_it) {
+    // While metadata cannot be written, an action on a job this node owns is
+    // applied to the local job at once and journalled, and the node's own
+    // passes keep to the journal over the older metadata. An older intent
+    // changes neither the journal nor the job, though an older cancel still
+    // wins. One that names no job here, or that cannot be read, is refused
+    // and journals nothing. After a restart the journal is read back, and the
+    // first pass with metadata writable publishes it, keeps the job as it
+    // asked, and empties the journal.
+    TestNode fixture("torrent-intent-owner");
+    fixture.prepare();
+    fixture.start();
+    const auto self = fixture.node().node_id();
+    const auto state_path = fixture.config().state_path;
+
+    CatalogueHintQueue hints(state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+    SubsystemRegistry registry;
+    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
+    auto torrents = std::make_shared<TableTorrentService>();
+    registry.publish_torrent(torrents);
+
+    const auto owned = claimed_request('d', self);
+    const auto& id = owned.id;
+    record_request(fixture.metadata(), owned);
+    (void)torrents->adopt(id, owned.source, false);
+    REQUIRE(torrents->job(id)->state == TorrentJobState::downloading);
+
+    uint64_t paused_at = 0;
+    {
+        UnwritableMetadata unwritable(fixture.metadata());
+        TorrentCoordinator stranded(fixture.node(), unwritable, registry, cluster_jobs, state_path);
+
+        // Applied here at once, shown as asked, journalled; metadata is untouched.
+        const auto paused = stranded.act(id, "pause");
+        REQUIRE(paused.status == 202);
+        REQUIRE(paused.request.has_value());
+        CHECK(paused.request->desired == TorrentDesired::paused);
+        paused_at = paused.request->desired_changed_unix_ms;
+        CHECK(paused_at > owned.desired_changed_unix_ms);
+        CHECK(torrents->job(id)->state == TorrentJobState::paused);
+        CHECK(stranded.request(id)->desired == TorrentDesired::active);
+        {
+            const auto journal = read_intent_journal(state_path);
+            REQUIRE(journal.has_value());
+            const auto* entry = journal->find(id);
+            REQUIRE(entry != nullptr);
+            CHECK(entry->find("desired")->asString() == "paused");
+            CHECK(entry->find("changed_unix_ms")->asUInt64() == paused_at);
+        }
+
+        // The node's own pass follows the journal, not the older metadata.
+        stranded.pass_now();
+        CHECK(torrents->job(id)->state == TorrentJobState::paused);
+
+        // An intent older than the journalled one changes neither.
+        {
+            const auto payload = intent_payload(id, "active", paused_at - 1);
+            CHECK(reply_json(stranded.handle_intent(payload)).find("applied")->asBool());
+        }
+        CHECK(torrents->job(id)->state == TorrentJobState::paused);
+        CHECK(read_intent_journal(state_path)->find(id)->find("desired")->asString() == "paused");
+        stranded.pass_now();
+        CHECK(torrents->job(id)->state == TorrentJobState::paused);
+
+        // Refused: no such job here, a desired state that is not one, a
+        // payload missing its time, and one that is not JSON.
+        const auto before = read_intent_journal(state_path)->dump();
+        const auto bytes_of = [](std::string_view text) { return Bytes(text.begin(), text.end()); };
+        for (const auto& payload :
+             {intent_payload("no-such-job", "paused", paused_at + 1),
+              intent_payload(id, "stopped", paused_at + 1),
+              bytes_of(R"({"job_id":")" + id + R"(","desired":"paused"})"), bytes_of("not json")}) {
+            const auto reply = reply_json(stranded.handle_intent(payload));
+            CHECK(!reply.find("applied")->asBool());
+        }
+        CHECK(read_intent_journal(state_path)->dump() == before);
+        CHECK(torrents->job(id)->state == TorrentJobState::paused);
+    }
+
+    // Restarted with metadata writable: the journal is read back and published.
+    TorrentCoordinator restarted(fixture.node(), fixture.metadata(), registry, cluster_jobs,
+                                 state_path);
+    REQUIRE(restarted.request(id)->desired == TorrentDesired::active);
+    restarted.pass_now();
+    {
+        const auto published = restarted.request(id);
+        REQUIRE(published.has_value());
+        CHECK(published->desired == TorrentDesired::paused);
+        CHECK(published->desired_changed_unix_ms == paused_at);
+        CHECK(published->desired_changed_by == self);
+    }
+    CHECK(read_intent_journal(state_path)->asObject().empty());
+    // The publishing pass keeps the job as the intent asked.
+    CHECK(torrents->job(id)->state == TorrentJobState::paused);
+    restarted.pass_now();
+    CHECK(torrents->job(id)->state == TorrentJobState::paused);
+
+    // A cancel older than the journalled pause still replaces it: cancel is
+    // final. Published, the request ends cancelled.
+    {
+        const auto newer = unix_ms() + 60'000;
+        const auto pause = intent_payload(id, "paused", newer);
+        REQUIRE(reply_json(restarted.handle_intent(pause)).find("applied")->asBool());
+        const auto cancel = intent_payload(id, "cancelled", 2);
+        REQUIRE(reply_json(restarted.handle_intent(cancel)).find("applied")->asBool());
+    }
+    CHECK(torrents->job(id)->state == TorrentJobState::cancelled);
+    {
+        const auto journal = read_intent_journal(state_path);
+        REQUIRE(journal.has_value());
+        CHECK(journal->find(id)->find("desired")->asString() == "cancelled");
+        CHECK(journal->find(id)->find("changed_unix_ms")->asUInt64() == 2);
+    }
+    restarted.pass_now();
+    {
+        const auto cancelled = restarted.request(id);
+        REQUIRE(cancelled.has_value());
+        CHECK(cancelled->desired == TorrentDesired::cancelled);
+        CHECK(cancelled->phase == TorrentPhase::cancelled);
+    }
+    CHECK(read_intent_journal(state_path)->asObject().empty());
+    registry.withdraw_torrent(torrents.get());
+}
+
+MACHA_TEST("hydration_catalogue",
+           test_an_intent_for_another_nodes_job_goes_to_its_owner_and_a_peer_resolves_a_torrent) {
+    // While metadata cannot be written, an action on a job another node owns
+    // is sent to that owner as a torrent_intent and answered as the owner
+    // took it; this node journals nothing. An owner that refuses, or that is
+    // not a member, is unreachable; an unclaimed job has no one to apply it.
+    // A search result's .torrent, with no torrent service here, is resolved by
+    // a torrent-capable peer, and the add records what the peer read; the
+    // peer's error is the refusal's message when it cannot.
+    TestNode fixture("torrent-intent-remote");
+    fixture.prepare();
+    fixture.start();
+    const auto state_path = fixture.config().state_path;
+
+    CatalogueHintQueue hints(state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+    SubsystemRegistry registry; // no torrent service on this node
+    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
+
+    const std::string resolved_hash(40, '7');
+    std::mutex peer_mutex;
+    std::vector<Json> intents_seen;
+    std::vector<Json> actions_seen;
+    bool apply_intents = true;
+    bool resolve_torrents = true;
+    StandInPeer owner(fixture.path(), fixture.keyfile(), "torrent-owner",
+                      {.bootstrap = {{"127.0.0.1", fixture.config().port}}});
+    const auto json_message = [](MessageType type, Json body) {
+        const auto text = body.dump();
+        return RpcMessage{type, Bytes(text.begin(), text.end())};
+    };
+    owner.routes.bind(
+        MessageType::get_torrent_jobs, [&](const NodeInfo&, FrameType, const RpcMessage&) {
+            Json::Object node;
+            node["accepting"] = true;
+            Json::Object body;
+            body["jobs"] = Json::Array{};
+            body["node"] = std::move(node);
+            return json_message(MessageType::torrent_jobs_reply, Json(std::move(body)));
+        });
+    owner.routes.bind(
+        MessageType::torrent_intent, [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            std::lock_guard lock(peer_mutex);
+            intents_seen.push_back(reply_json(request.payload));
+            Json::Object body;
+            body["applied"] = apply_intents;
+            return json_message(MessageType::torrent_intent_reply, Json(std::move(body)));
+        });
+    const auto resolve_answer = [&] {
+        Json::Object body;
+        body["resolved"] = resolve_torrents;
+        if (resolve_torrents) {
+            body["magnet"] = "magnet:?xt=urn:btih:" + resolved_hash + "&dn=Resolved";
+            body["name"] = std::string("Resolved Film");
+        } else {
+            body["error"] = std::string("the indexer refused the download");
+        }
+        return Json(std::move(body));
+    };
+    owner.routes.bind(MessageType::torrent_job_action, [&](const NodeInfo&, FrameType,
+                                                           const RpcMessage& request) {
+        std::lock_guard lock(peer_mutex);
+        actions_seen.push_back(reply_json(request.payload));
+        return json_message(MessageType::torrent_job_action_reply, resolve_answer());
+    });
+    owner.start();
+    REQUIRE(wait_until([&] { return active_on(fixture.node(), owner.id()); }, 15s));
+    const auto intents_count = [&] {
+        std::lock_guard lock(peer_mutex);
+        return intents_seen.size();
+    };
+
+    // The owner's intent travels to it.
+    {
+        UnwritableMetadata unwritable(fixture.metadata());
+        TorrentCoordinator coordinator(fixture.node(), unwritable, registry, cluster_jobs,
+                                       state_path);
+        const auto remote = claimed_request('a', owner.id());
+        const auto gone = claimed_request('b', random_node_id()); // never a member
+        auto unclaimed = claimed_request('c', owner.id());
+        unclaimed.claim.reset();
+        unclaimed.phase = TorrentPhase::awaiting_node;
+        unclaimed.phase_epoch = 0;
+        record_request(fixture.metadata(), remote);
+        record_request(fixture.metadata(), gone);
+        record_request(fixture.metadata(), unclaimed);
+
+        const auto paused = coordinator.act(remote.id, "pause");
+        REQUIRE(paused.status == 202);
+        REQUIRE(paused.request.has_value());
+        CHECK(paused.request->desired == TorrentDesired::paused);
+        {
+            std::lock_guard lock(peer_mutex);
+            REQUIRE(intents_seen.size() == 1);
+            const auto& sent = intents_seen.front();
+            CHECK(sent.find("job_id")->asString() == remote.id);
+            CHECK(sent.find("desired")->asString() == "paused");
+            CHECK(sent.find("changed_unix_ms")->asUInt64() ==
+                  paused.request->desired_changed_unix_ms);
+        }
+        CHECK(coordinator.request(remote.id)->desired == TorrentDesired::active);
+        CHECK(!read_intent_journal(state_path).has_value());
+
+        // The owner does not take it.
+        {
+            std::lock_guard lock(peer_mutex);
+            apply_intents = false;
+        }
+        const auto refused = coordinator.act(remote.id, "cancel");
+        CHECK(refused.status == 503);
+        CHECK(refused.code == "node_unreachable");
+        CHECK(intents_count() == 2);
+
+        // An owner that is not a member is not called.
+        const auto absent = coordinator.act(gone.id, "pause");
+        CHECK(absent.status == 503);
+        CHECK(absent.code == "node_unreachable");
+        CHECK(intents_count() == 2);
+
+        // Nobody holds an unclaimed job, so nothing can apply the action.
+        const auto nobody = coordinator.act(unclaimed.id, "cancel");
+        CHECK(nobody.status == 503);
+        CHECK(nobody.code == "metadata_unavailable");
+        CHECK(intents_count() == 2);
+        CHECK(!read_intent_journal(state_path).has_value());
+    }
+
+    // A search result's .torrent is resolved by the capable peer.
+    cluster_jobs.refresh_now();
+    {
+        const auto nodes = cluster_jobs.torrent_nodes();
+        REQUIRE(nodes.size() == 1);
+        CHECK(nodes.front().node_id == owner.id());
+        CHECK(nodes.front().reachable);
+        CHECK(!nodes.front().local);
+    }
+    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
+                                   state_path);
+    const std::string torrent_url = "https://indexer.example.net/download/7.torrent";
+    {
+        const auto added = coordinator.add(torrent_url, true, std::nullopt, std::nullopt);
+        REQUIRE(added.status == 202);
+        REQUIRE(added.request.has_value());
+        CHECK(added.request->info_hash == resolved_hash);
+        CHECK(added.request->name == "Resolved Film");
+        CHECK(added.request->source.starts_with("magnet:?xt=urn"));
+        CHECK(coordinator.request(added.request->id).has_value());
+        std::lock_guard lock(peer_mutex);
+        REQUIRE(actions_seen.size() == 1);
+        const auto& asked = actions_seen.front();
+        CHECK(asked.find("action")->asString() == "resolve");
+        CHECK(asked.find("uri")->asString() == torrent_url);
+        CHECK(asked.find("search_result")->asBool());
+    }
+    {
+        std::lock_guard lock(peer_mutex);
+        resolve_torrents = false;
+    }
+    {
+        const auto refused = coordinator.add("https://indexer.example.net/download/8.torrent", true,
+                                             std::nullopt, std::nullopt);
+        CHECK(refused.status == 409);
+        CHECK(refused.code == "placement_failed");
+        CHECK(refused.reason == "add_failed");
+        CHECK(refused.message == "the indexer refused the download");
+        CHECK(coordinator.requests().size() == 4); // the three above and the resolved add
+    }
+}
+
 // Only meaningful in a build that produced the plugin: without libtorrent
 // there is no download engine to load, and the capability is absent by
 // design rather than differently compiled.
@@ -3806,6 +4226,139 @@ MACHA_TEST("hydration_catalogue",
     CHECK(after.updated_unix_ms == before.updated_unix_ms);
     for (size_t index = 0; index < after.files.size(); ++index)
         CHECK(after.files[index].control == before.files[index].control);
+}
+
+MACHA_TEST("hydration_catalogue",
+           test_a_cataloguing_job_whose_hints_were_lost_submits_them_again_in_one_write) {
+    // Two jobs are restored in the cataloguing state. One has no hint left in
+    // the queue: its copied catalogue candidates with a destination are
+    // submitted again in one queue write, and media information is asked for
+    // each; a sidecar, a failed file and a file with no destination are left
+    // out. The second's hint is still queued, so it submits nothing. A third,
+    // with nothing to catalogue, submits nothing and completes. Later polls
+    // submit nothing more, and the first two wait on the catalogue.
+    CatalogueNode node("ingest-lost-hints");
+    const auto state_path = node.config().state_path;
+    const std::string lost = "ingest-hints-lost";
+    const std::string waiting = "ingest-hints-waiting";
+    const std::string nothing = "ingest-hints-none";
+    const std::string first = "/Movies/First Movie (2001).mkv";
+    const std::string sidecar = "/Movies/First Movie (2001).en.srt";
+    const std::string second = "/Movies/Second Movie (2002).mkv";
+    const std::string failed = "/Movies/Failed Movie (2003).mkv";
+    const std::string queued = "/Movies/Queued Movie (2004).mkv";
+    // The first two jobs' destinations are in the namespace, so a media
+    // request for any of them would be queued.
+    node.mkdir("/Movies");
+    const std::array destinations{first, sidecar, second, failed, queued};
+    for (size_t index = 0; index < destinations.size(); ++index)
+        (void)node.write(destinations[index],
+                         pattern(4096 + index, static_cast<uint8_t>(index + 1)));
+    {
+        const auto file = [](const std::string& destination, bool completed, bool candidate,
+                             const std::string& error_code = {}) {
+            Json::Object out;
+            out["source_path"] = "/import" + (destination.empty() ? "/Unplaced.mkv" : destination);
+            out["destination_path"] = destination;
+            out["size"] = static_cast<uint64_t>(4096);
+            out["copied"] = static_cast<uint64_t>(completed ? 4096 : 0);
+            out["completed"] = completed;
+            out["skipped"] = false;
+            out["catalogue_candidate"] = candidate;
+            if (!error_code.empty()) {
+                out["error_code"] = error_code;
+                out["error"] = "the source changed while it was copied";
+            }
+            return Json(std::move(out));
+        };
+        const auto job = [](const std::string& id, Json::Array files, uint64_t completed,
+                            uint64_t failures) {
+            Json::Object out;
+            out["id"] = id;
+            out["source_type"] = "filesystem";
+            out["display_name"] = id;
+            out["source_path"] = "/import";
+            out["state"] = "cataloguing";
+            out["files_total"] = static_cast<uint64_t>(files.size());
+            out["files_completed"] = completed;
+            out["files_failed"] = failures;
+            out["created_unix_ms"] = static_cast<uint64_t>(1);
+            out["updated_unix_ms"] = static_cast<uint64_t>(2);
+            out["files"] = std::move(files);
+            return Json(std::move(out));
+        };
+        Json::Object root;
+        root["version"] = static_cast<uint64_t>(2);
+        root["jobs"] = Json::Array{
+            job(lost,
+                Json::Array{file(first, true, true), file(sidecar, true, false),
+                            file(second, true, true), file(failed, false, true, "source_changed"),
+                            file({}, true, true)},
+                4, 1),
+            job(waiting, Json::Array{file(queued, true, true)}, 1, 0),
+            job(nothing, Json::Array{file("/Movies/Notes.txt", true, false)}, 1, 0)};
+        std::filesystem::create_directories(state_path / "ingest");
+        std::ofstream out(state_path / "ingest" / "jobs.json", std::ios::binary | std::ios::trunc);
+        out << Json(std::move(root)).dump();
+        REQUIRE(out.good());
+    }
+    (void)node.hints().submit(queued, "ingest", waiting, CatalogueHintPriority::ingest);
+    const auto revision = node.hints().revision();
+
+    // No engine and never started: requests only queue, which is what is read.
+    MediaInformationService media(node.filesystem(), node.catalogue(), nullptr, state_path);
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    IngestManager ingest(node.node(), node.filesystem(), node.hints(), config, &media);
+    REQUIRE(ingest.job(lost)->state == IngestJobState::cataloguing);
+    REQUIRE(ingest.job(waiting)->state == IngestJobState::cataloguing);
+    REQUIRE(ingest.job(nothing)->state == IngestJobState::cataloguing);
+    CHECK(node.hints().revision() == revision); // restoring the state submits nothing
+    ingest.start();
+
+    // Each job records its catalogue counts once its hints are back.
+    REQUIRE(wait_until(
+        [&] {
+            const auto a = ingest.job(lost);
+            const auto b = ingest.job(waiting);
+            const auto c = ingest.job(nothing);
+            return a && a->catalogue_total == 2 && b && b->catalogue_total == 1 && c &&
+                   c->state == IngestJobState::completed;
+        },
+        10s));
+    CHECK(node.hints().revision() == revision + 1);
+    CHECK(node.hints().summary("ingest", nothing).total == 0);
+    const auto paths_of = [](const std::vector<CatalogueHint>& hints) {
+        std::set<std::string> out;
+        for (const auto& hint : hints)
+            out.insert(hint.path);
+        return out;
+    };
+    const std::set<std::string> resubmitted{first, second};
+    {
+        const auto summary = node.hints().summary("ingest", lost);
+        CHECK(summary.total == 2);
+        CHECK(summary.pending == 2);
+        CHECK(paths_of(summary.hints) == resubmitted);
+        const auto still = node.hints().summary("ingest", waiting);
+        CHECK(still.total == 1);
+        CHECK(paths_of(still.hints) == std::set<std::string>{queued});
+        CHECK(paths_of(media.hints().list()) == resubmitted);
+    }
+
+    // Three more polls of the catalogue loop (every 500 ms while a job waits):
+    // nothing is submitted again, and the first two still wait on the catalogue.
+    std::this_thread::sleep_for(1500ms);
+    CHECK(node.hints().revision() == revision + 1);
+    CHECK(paths_of(media.hints().list()) == resubmitted);
+    for (const auto& id : {lost, waiting}) {
+        const auto job = ingest.job(id);
+        REQUIRE(job.has_value());
+        CHECK(job->state == IngestJobState::cataloguing);
+        CHECK(job->catalogue_pending == job->catalogue_total);
+    }
+    ingest.stop();
 }
 
 // The partial a job would write for a destination.
@@ -7412,6 +7965,34 @@ MACHA_FAST_TEST("hydration_catalogue",
 }
 
 MACHA_FAST_TEST("hydration_catalogue",
+                test_a_torznab_item_naming_only_its_info_hash_gets_a_magnet) {
+    // Proves an item with no magnet, link or enclosure but an infohash attribute is
+    // reached through a magnet built from the hash (hex or base32), named by its title;
+    // a hash that is not one is dropped with the item.
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add("t=search", 200, "application/rss+xml",
+              torznab_feed("<item><title>Hex Only</title><torznab:attr name=\"infohash\" value=\"" +
+                           std::string(40, 'a') +
+                           "\"/></item>"
+                           "<item><title>Base32 Only</title><torznab:attr name=\"infohash\" "
+                           "value=\"" +
+                           std::string(32, 'B') +
+                           "\"/></item>"
+                           "<item><title>Bad Hash</title><torznab:attr name=\"infohash\" "
+                           "value=\"not-a-hash\"/></item>"));
+    TorznabSearchProvider provider(torznab_provider("prowlarr", std::string(kTorznabUrl)),
+                                   std::move(http));
+    const auto results = provider.search("hash");
+    REQUIRE(results.size() == 2);
+    REQUIRE(results[0].magnet_uri.has_value());
+    CHECK(results[0].magnet_uri->find(std::string(40, 'a')) != std::string::npos);
+    CHECK(results[0].magnet_uri->find("dn=Hex") != std::string::npos);
+    REQUIRE(results[1].magnet_uri.has_value());
+    CHECK(results[1].magnet_uri->find(std::string(32, 'B')) != std::string::npos);
+    CHECK(!results[0].torrent_url.has_value());
+}
+
+MACHA_FAST_TEST("hydration_catalogue",
                 test_a_torznab_key_file_that_cannot_be_read_refuses_the_provider) {
     // Proves a configured API key file that cannot be read refuses the
     // provider with an error naming the file, rather than searching without
@@ -7427,6 +8008,17 @@ MACHA_FAST_TEST("hydration_catalogue",
     }
     CHECK(error.find("API key file") != std::string::npos);
     CHECK(error.find("missing.key") != std::string::npos);
+
+    // The node still starts: the manager keeps the provider, and every search names
+    // why it gave nothing.
+    TorrentConfig torrents;
+    torrents.search_providers.push_back(config);
+    TorrentSearchManager manager(torrents);
+    CHECK(manager.enabled());
+    const auto response = manager.search("film");
+    CHECK(response.results.empty());
+    REQUIRE(response.errors.contains("keyed"));
+    CHECK(response.errors.at("keyed").find("missing.key") != std::string::npos);
 }
 
 MACHA_FAST_TEST("hydration_catalogue",
@@ -7592,8 +8184,9 @@ MACHA_TEST("hydration_catalogue",
 MACHA_TEST("hydration_catalogue",
            test_search_references_are_bounded_and_unknown_ones_resolve_to_nothing) {
     // Proves resolve answers nothing for an empty or never-issued reference,
-    // and that the references held are bounded: five providers of 1000
-    // results each give 5000 references, of which exactly 4096 still resolve.
+    // and that the references held are bounded without handing out a dead one:
+    // five providers of 1000 results each give the first 4096, every one of
+    // which resolves; a second search retires the first's references, not its own.
     std::string items;
     for (int i = 0; i < 1000; ++i)
         items += "<item><title>Item " + std::to_string(i) + "</title><link>/dl/" +
@@ -7613,12 +8206,16 @@ MACHA_TEST("hydration_catalogue",
 
     const auto response = search.search("many");
     CHECK(response.errors.empty());
-    REQUIRE(response.results.size() == 5000);
-    size_t resolvable = 0;
+    REQUIRE(response.results.size() == 4096);
     for (const auto& result : response.results)
-        if (search.resolve(result.acquisition_ref))
-            ++resolvable;
-    CHECK(resolvable == 4096);
+        CHECK(search.resolve(result.acquisition_ref).has_value());
+
+    std::this_thread::sleep_for(2ms);
+    const auto again = search.search("many");
+    REQUIRE(again.results.size() == 4096);
+    for (const auto& result : again.results)
+        CHECK(search.resolve(result.acquisition_ref).has_value());
+    CHECK(!search.resolve(response.results.front().acquisition_ref));
 }
 
 MACHA_TEST("hydration_catalogue",

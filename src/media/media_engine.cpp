@@ -1533,12 +1533,20 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                                            : packet->pts * av_q2d(pipe.output_stream->time_base);
                         if ((packet->flags & AV_PKT_FLAG_KEY) != 0 &&
                             cuts.before_keyframe(seconds)) {
-                            const auto before = writer.published();
-                            cut_fragment(out);
-                            // Writing the delayed moov produces no moof; the buffered media joins
-                            // the next fragment, so carry the boundary.
-                            if (writer.published() == before)
+                            if (!all_streams_started()) {
+                                // No flush before every stream has muxed a packet: it would
+                                // write the moov without a later stream's start, which then
+                                // plays early, and the moov flush below would cut a fragment
+                                // the plan has no entry for. The boundary is carried.
                                 writer.carry_boundary();
+                            } else {
+                                const auto before = writer.published();
+                                cut_fragment(out);
+                                // Writing the delayed moov produces no moof; the buffered media
+                                // joins the next fragment, so carry the boundary.
+                                if (writer.published() == before)
+                                    writer.carry_boundary();
+                            }
                         }
                     }
                     write_mux_packet(out, packet.get());
@@ -1593,6 +1601,9 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                     // and the moov written now, before any real boundary; spending a real
                     // boundary on it would double the first fragment.
                     moov_flushed = true;
+                    // The interleaving queue first: a stream's first packet may still wait
+                    // there, and the moov must be written knowing where it starts.
+                    av_require(av_interleaved_write_frame(out, nullptr), "drain the interleaver");
                     const auto before = writer.published();
                     cut_fragment(out);
                     if (writer.published() != before)

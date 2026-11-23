@@ -3251,3 +3251,112 @@ MACHA_TEST("media_playback", test_an_async_start_answers_at_once_and_reports_its
         CHECK(call(f, "DELETE", playing_id).status == 204);
     }
 }
+
+namespace {
+
+// FakeMediaEngine whose first `failures` generations fail before their first
+// fragment, as a pipeline that cannot open its source does.
+class FailingStartMediaEngine final : public FakeMediaEngine {
+    unsigned failures_;
+    std::atomic_uint starts_{};
+
+  public:
+    explicit FailingStartMediaEngine(unsigned failures) : failures_(failures) {}
+
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource& source,
+                                                  const HlsVodPlan& vod_plan,
+                                                  std::chrono::milliseconds segment_duration,
+                                                  size_t max_ahead_segments, uint64_t memory_limit,
+                                                  const std::filesystem::path& spill) override {
+        if (++starts_ > failures_) {
+            return FakeMediaEngine::start_hls(source, vod_plan, segment_duration,
+                                              max_ahead_segments, memory_limit, spill);
+        }
+        auto store = std::make_shared<MediaSegmentStore>(
+            max_ahead_segments, memory_limit, spill, segment_duration, vod_plan.segment_durations);
+        store->fail("synthetic pipeline failure before its first fragment");
+        return std::make_unique<FakeMediaEngineSession>(std::move(store));
+    }
+
+    unsigned starts() const {
+        return starts_.load();
+    }
+};
+
+} // namespace
+
+MACHA_TEST("media_playback", test_a_generation_that_fails_mid_stream_answers_stream_failed) {
+    // Once a generation fails, a request that would wait on production (an
+    // unproduced fragment, or the playlist the store now withholds) answers
+    // 503 stream_failed with the pipeline's reason at once, holding nothing;
+    // a fragment produced before the failure is still served.
+    PlaybackNode node;
+    const auto media_id = node.write("/media/fails-mid-stream.mkv", pattern(64 * 1024, 51));
+    auto streaming = node.streaming();
+    streaming.startup_timeout = 2s;
+    auto engine = std::make_shared<ObservableHlsMediaEngine>();
+    auto playback = node.playback(streaming, engine);
+    auto created =
+        create_session(*playback, media_id, Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
+    REQUIRE(created.status == 201);
+    const auto url = body_of(created).find("stream")->find("url")->asString();
+    const auto base = url.substr(0, url.rfind('/') + 1);
+    REQUIRE(playback->handle(playback_request("GET", base + segment_name(0))).status == 200);
+
+    auto store = engine->store();
+    REQUIRE(store != nullptr);
+    store->fail("synthetic demux failure");
+
+    for (const auto& name : {segment_name(1), std::string("media.m3u8")}) {
+        const auto response = playback->handle(playback_request("GET", base + name));
+        CHECK(!response.defer.has_value());
+        REQUIRE(response.status == 503);
+        const auto body = body_of(response);
+        const auto* error = body.find("error");
+        REQUIRE(error != nullptr);
+        CHECK(error->find("code")->asString() == "stream_failed");
+        CHECK(error->find("message")->asString().find("synthetic demux failure") !=
+              std::string::npos);
+    }
+    CHECK(playback->handle(playback_request("GET", base + segment_name(0))).status == 200);
+    CHECK(session_call(*playback, "DELETE", session_id_of(created)).status == 204);
+}
+
+MACHA_TEST("media_playback", test_a_session_whose_start_fails_releases_what_admission_took) {
+    // A transcode whose pipeline fails before its first fragment answers 503
+    // naming the start stage, and gives back all admission took: the node's
+    // only session slot, its only video and audio transcode slots and the
+    // account's only transcode. The next create is admitted at once.
+    PlaybackNode node;
+    const auto media_id = node.write("/media/start-fails.mkv", pattern(64 * 1024, 52));
+    auto streaming = node.streaming();
+    streaming.max_sessions = 1;
+    streaming.max_video_transcodes = 1;
+    streaming.max_audio_transcodes = 1;
+    streaming.max_transcodes_per_account = 1;
+    streaming.startup_timeout = 2s;
+    auto engine = std::make_shared<FailingStartMediaEngine>(1);
+    auto playback = node.playback(streaming, engine);
+    const auto transcode = Json::Object{{"mode", "transcode"}, {"container", "fmp4"}};
+
+    const auto failed = create_session(*playback, media_id, transcode);
+    REQUIRE(failed.status == 503);
+    const auto failed_body = body_of(failed);
+    const auto* error = failed_body.find("error");
+    REQUIRE(error != nullptr);
+    CHECK(error->find("code")->asString() == "playback_pipeline_start_failed");
+    CHECK(error->find("stage")->asString() == "pipeline_start");
+    CHECK(error->find("node_healthy")->asBool());
+    CHECK(engine->starts() == 1);
+    const auto after_failure = playback_status(*playback);
+    CHECK(after_failure.find("sessions")->asUInt64() == 0);
+    CHECK(after_failure.find("video_transcodes")->asUInt64() == 0);
+
+    const auto admitted = create_session(*playback, media_id, transcode);
+    REQUIRE(admitted.status == 201);
+    CHECK(engine->starts() == 2);
+    const auto running = playback_status(*playback);
+    CHECK(running.find("sessions")->asUInt64() == 1);
+    CHECK(running.find("video_transcodes")->asUInt64() == 1);
+    CHECK(session_call(*playback, "DELETE", session_id_of(admitted)).status == 204);
+}

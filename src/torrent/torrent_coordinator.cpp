@@ -721,20 +721,25 @@ TorrentCoordinator::Outcome TorrentCoordinator::apply_intent_locally(const std::
         out.message = "this node does not hold the job";
         return out;
     }
-    if (desired == TorrentDesired::paused)
-        (void)local->pause(id);
-    else if (desired == TorrentDesired::active)
-        (void)local->resume(id);
-    else
-        (void)local->cancel(id);
+    // An intent older than the one journalled changes nothing: the job follows the newest.
+    bool newest = false;
     {
         Lock lock(mutex_);
         auto& intent = intents_[id];
         if (changed_unix_ms >= intent.changed_unix_ms || desired == TorrentDesired::cancelled) {
             intent.desired = desired;
             intent.changed_unix_ms = changed_unix_ms;
+            newest = true;
         }
         save_intents_locked();
+    }
+    if (newest) {
+        if (desired == TorrentDesired::paused)
+            (void)local->pause(id);
+        else if (desired == TorrentDesired::active)
+            (void)local->resume(id);
+        else
+            (void)local->cancel(id);
     }
     Log::info("torrent intent applied while metadata is unwritable id=" + id +
               " desired=" + std::string(torrent_desired_name(desired)));
@@ -919,10 +924,12 @@ void TorrentCoordinator::pass_now() {
 }
 
 void TorrentCoordinator::pass() {
+    // Published first, so the view this pass acts on holds them: taken before, it would
+    // still hold the older desired state the intents replaced.
+    publish_intents();
     const auto view = current_view();
     if (!view)
         return;
-    publish_intents();
     const auto& requests = view->snapshot->torrent_requests;
     const auto self = node_.node_id();
     const auto now = unix_ms();

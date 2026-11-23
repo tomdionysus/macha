@@ -4,7 +4,8 @@
 // deterministic source longer than 90 seconds with non-zero starts, audio
 // priming and a seek. From the fragments actually published it measures where
 // each stream starts, how much media each carries, and whether they stay
-// together. It cannot measure pitch.
+// together. It cannot measure pitch. The same generated sources drive the
+// remux (stream copy) path and WebVTT extraction from a SubRip stream.
 
 #include "test_backend_support.hpp"
 
@@ -75,7 +76,38 @@ struct Synthesized {
     double duration_seconds{};
     int video_stream{-1};
     int audio_stream{-1};
+    int subtitle_stream{-1};
 };
+
+struct SubtitleCue {
+    int64_t start_ms{};
+    int64_t duration_ms{};
+    std::string text;
+};
+
+// What to generate. Cues, in start order, add a SubRip stream after audio.
+struct SourceShape {
+    double seconds{kSourceSeconds};
+    double audio_start_seconds{kAudioStartSeconds};
+    std::vector<SubtitleCue> cues;
+};
+
+void write_cue(AVFormatContext* out, AVStream* stream, const SubtitleCue& cue) {
+    AVPacket* packet = av_packet_alloc();
+    if (!packet)
+        throw std::runtime_error("allocate subtitle packet");
+    const std::unique_ptr<AVPacket, void (*)(AVPacket*)> guard(
+        packet, [](AVPacket* p) { av_packet_free(&p); });
+    require_av(av_new_packet(packet, static_cast<int>(cue.text.size())),
+               "allocate subtitle payload");
+    std::memcpy(packet->data, cue.text.data(), cue.text.size());
+    packet->stream_index = stream->index;
+    packet->pts = av_rescale_q(cue.start_ms, AVRational{1, 1000}, stream->time_base);
+    packet->dts = packet->pts;
+    packet->duration = av_rescale_q(cue.duration_ms, AVRational{1, 1000}, stream->time_base);
+    packet->flags |= AV_PKT_FLAG_KEY;
+    require_av(av_interleaved_write_frame(out, packet), "write subtitle packet");
+}
 
 struct EncoderContext {
     AVCodecContext* ctx{};
@@ -111,7 +143,8 @@ void drain_encoder(AVFormatContext* out, AVCodecContext* enc, AVStream* stream, 
     av_packet_free(&packet);
 }
 
-Synthesized synthesize_source(const std::filesystem::path& path, const char* muxer = "matroska") {
+Synthesized synthesize_source(const std::filesystem::path& path, const char* muxer = "matroska",
+                              const SourceShape& shape = {}) {
     // mpeg4: in every ordinary build, and fast; the source codec is not under test.
     const auto* video_codec = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
     const auto* audio_codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
@@ -169,6 +202,19 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
     video_stream->time_base = video.ctx->time_base;
     audio_stream->time_base = audio.ctx->time_base;
 
+    // SubRip needs no encoder: a packet's payload is the cue's text.
+    AVStream* subtitle_stream = nullptr;
+    if (!shape.cues.empty()) {
+        subtitle_stream = avformat_new_stream(out, nullptr);
+        if (!subtitle_stream)
+            throw std::runtime_error("allocate source subtitle stream");
+        subtitle_stream->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+        subtitle_stream->codecpar->codec_id = AV_CODEC_ID_SUBRIP;
+        subtitle_stream->time_base = AVRational{1, 1000};
+        require_av(av_dict_set(&subtitle_stream->metadata, "language", "eng", 0),
+                   "set source subtitle language");
+    }
+
     require_av(avio_open(&out->pb, path.c_str(), AVIO_FLAG_WRITE), "open source file");
     require_av(avformat_write_header(out, nullptr), "write source header");
 
@@ -193,14 +239,21 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
                "copy source frame layout");
     require_av(av_frame_get_buffer(audio_frame, 0), "allocate source audio buffer");
 
-    const int64_t total_video_frames = static_cast<int64_t>(kSourceSeconds * kFrameRate);
-    const int64_t total_audio_samples = static_cast<int64_t>(kSourceSeconds * kSampleRate);
-    const int64_t audio_start_sample = static_cast<int64_t>(kAudioStartSeconds * kSampleRate);
+    const int64_t total_video_frames = static_cast<int64_t>(shape.seconds * kFrameRate);
+    const int64_t total_audio_samples = static_cast<int64_t>(shape.seconds * kSampleRate);
+    const int64_t audio_start_sample =
+        static_cast<int64_t>(shape.audio_start_seconds * kSampleRate);
 
     // Cheap deterministic content: a moving luma ramp and a fixed tone, the
     // same bytes on every run and machine.
     int64_t audio_sample = 0;
+    size_t next_cue = 0;
     for (int64_t frame_index = 0; frame_index < total_video_frames; ++frame_index) {
+        // Cues go in at their time, so the muxer sees every stream in order.
+        const int64_t frame_ms = frame_index * 1000 / kFrameRate;
+        while (subtitle_stream && next_cue < shape.cues.size() &&
+               shape.cues[next_cue].start_ms <= frame_ms)
+            write_cue(out, subtitle_stream, shape.cues[next_cue++]);
         require_av(av_frame_make_writable(video_frame), "make source video frame writable");
         const auto luma = static_cast<uint8_t>(frame_index & 0xff);
         for (int y = 0; y < kHeight; ++y)
@@ -235,13 +288,17 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
     // Flush both encoders; AAC still holds priming samples.
     drain_encoder(out, video.ctx, video_stream, nullptr);
     drain_encoder(out, audio.ctx, audio_stream, nullptr);
+    // Cues past the end of the A/V media.
+    while (subtitle_stream && next_cue < shape.cues.size())
+        write_cue(out, subtitle_stream, shape.cues[next_cue++]);
     require_av(av_write_trailer(out), "write source trailer");
     avio_closep(&out->pb);
 
     Synthesized result;
-    result.duration_seconds = kSourceSeconds;
+    result.duration_seconds = shape.seconds;
     result.video_stream = video_stream->index;
     result.audio_stream = audio_stream->index;
+    result.subtitle_stream = subtitle_stream ? subtitle_stream->index : -1;
 
     std::ifstream in(path, std::ios::binary);
     if (!in)
@@ -288,6 +345,7 @@ struct StreamTimeline {
     double first_seconds{};
     double last_seconds{};
     double end_seconds{}; // last presentation time plus that packet's duration
+    bool first_key{};     // the first packet read is a sync sample
     // Media actually carried, start to end: the number drift moves.
     double span_seconds() const {
         return end_seconds - first_seconds;
@@ -405,6 +463,7 @@ Timeline measure(const Bytes& fragmented_mp4) {
             target->first_seconds = seconds;
             target->last_seconds = seconds;
             target->end_seconds = seconds + duration;
+            target->first_key = (packet->flags & AV_PKT_FLAG_KEY) != 0;
         }
         // Packets are not monotonic with B-frames: take the maximum, not the last.
         target->last_seconds = std::max(target->last_seconds, seconds);
@@ -748,4 +807,304 @@ MACHA_HEAVY_TEST("transcode_timeline", test_a_keyframe_index_places_every_keyfra
             CHECK(audio->entries.size() <= static_cast<size_t>(kSourceSeconds) + 2);
         }
     }
+}
+
+namespace {
+
+MediaSource memory_source(const Synthesized& synthesized, std::string media_id) {
+    MediaSource source;
+    source.media_id = std::move(media_id);
+    source.logical_path = "/Movies/" + source.media_id + ".mkv";
+    source.size = synthesized.bytes.size();
+    source.open = [&synthesized](MediaReadPurpose) {
+        return std::make_shared<MemoryInput>(synthesized.bytes);
+    };
+    return source;
+}
+
+std::string fragment_name(size_t index) {
+    std::ostringstream name;
+    name << "segment-" << std::setfill('0') << std::setw(6) << index << ".m4s";
+    return name.str();
+}
+
+Bytes joined(const Bytes& init, const Bytes& fragment) {
+    Bytes out(init.begin(), init.end());
+    out.insert(out.end(), fragment.begin(), fragment.end());
+    return out;
+}
+
+struct RemuxRun {
+    std::vector<double> planned;
+    Bytes init;
+    std::vector<Bytes> fragments;
+    MediaSegmentStore::Snapshot state;
+    std::optional<int> exit_code;
+    std::string diagnostics;
+
+    double planned_seconds() const {
+        double total = 0.0;
+        for (const double d : planned)
+            total += d;
+        return total;
+    }
+    Bytes whole() const {
+        Bytes out(init.begin(), init.end());
+        for (const auto& fragment : fragments)
+            out.insert(out.end(), fragment.begin(), fragment.end());
+        return out;
+    }
+};
+
+// A stream-copy generation planned by the engine from the source's own keyframe
+// index, consumed in order until the store stops producing.
+RemuxRun remux(MediaEngine& engine, const Synthesized& synthesized,
+               const std::filesystem::path& spill, std::chrono::milliseconds segment_duration) {
+    const auto source = memory_source(synthesized, "remux");
+    const auto probe = engine.probe(source, std::chrono::milliseconds{30000});
+
+    PlaybackPlan plan;
+    plan.mode = PlaybackMode::remux;
+    plan.container = MediaContainer::fmp4;
+    plan.video_stream = synthesized.video_stream;
+    plan.audio_stream = synthesized.audio_stream;
+    plan.subtitle_stream = -1;
+    plan.video = MediaTransform::copy;
+    plan.audio = MediaTransform::copy;
+    plan.video_codec = "mpeg4";
+    plan.audio_codec = "aac";
+
+    auto vod = engine.prepare_hls_vod(source, plan, probe.duration_seconds, segment_duration, false,
+                                      std::chrono::milliseconds{60000});
+    REQUIRE(!vod.segment_durations.empty());
+    // Still a copy: the planner used the keyframe index rather than refusing it.
+    REQUIRE(vod.playback.video == MediaTransform::copy);
+    REQUIRE(vod.playback.audio == MediaTransform::copy);
+
+    RemuxRun run;
+    run.planned = vod.segment_durations;
+    // Look-ahead beyond the plan: the consumer's pace is not under test.
+    auto session = engine.start_hls(source, vod, segment_duration, run.planned.size() + 1,
+                                    64ULL * 1024 * 1024, spill);
+    REQUIRE(session != nullptr);
+    auto store = session->segments();
+    REQUIRE(store != nullptr);
+    const bool ready = store->wait_ready(std::chrono::milliseconds{60000});
+    if (!ready)
+        std::cout << "remux produced no fragment: " << store->snapshot().error << "\n";
+    REQUIRE(ready);
+    const auto init = store->object("init.mp4");
+    REQUIRE(init.has_value());
+    run.init = *init;
+    for (size_t i = 0; i <= run.planned.size(); ++i) {
+        session->note_segment_requested(i);
+        auto fragment = store->wait_object(fragment_name(i), std::chrono::milliseconds{60000});
+        if (!fragment)
+            break;
+        run.fragments.push_back(std::move(*fragment));
+    }
+    REQUIRE(wait_until([&] { return !session->running(); }, std::chrono::milliseconds{60000}));
+    run.state = store->snapshot();
+    run.exit_code = session->exit_code();
+    run.diagnostics = session->diagnostics();
+    session->stop();
+
+    std::cout << "remux: fragments=" << run.fragments.size() << " for a " << run.planned.size()
+              << "-entry plan of " << run.planned_seconds()
+              << "s produced_ms=" << run.state.produced_media_ms
+              << " exit=" << (run.exit_code ? *run.exit_code : -1) << " error=" << run.state.error
+              << "\n";
+    return run;
+}
+
+} // namespace
+
+MACHA_TEST("media_engine",
+           test_a_remux_copies_every_packet_into_fragments_cut_at_planned_keyframes) {
+    // Stream copy into fMP4: one fragment per planned entry, each opening on the
+    // video keyframe its entry starts at. An AAC frame is 21.3 ms and the
+    // boundaries are whole seconds, so a packet straddles every boundary; each
+    // lands in exactly one fragment, neither dropped nor repeated.
+    StreamingConfig streaming;
+    auto engine = make_libav_media_engine(streaming);
+    REQUIRE(engine != nullptr);
+    TempDir temp;
+    SourceShape shape;
+    shape.seconds = 12.0;
+    const auto synthesized = synthesize_source(temp.path() / "source.mkv", "matroska", shape);
+
+    const auto run = remux(*engine, synthesized, temp.path() / "spill", std::chrono::seconds{2});
+    CHECK(run.exit_code == 0);
+    CHECK(run.state.error.empty());
+    REQUIRE(run.planned.size() >= 5);
+    REQUIRE(run.fragments.size() == run.planned.size());
+    // Published durations are the plan's, once each.
+    CHECK(std::llabs(static_cast<int64_t>(run.state.produced_media_ms) -
+                     std::llround(run.planned_seconds() * 1000.0)) <= 2);
+
+    const auto whole = measure(run.whole());
+    REQUIRE(whole.video.present);
+    REQUIRE(whole.audio.present);
+    CHECK(whole.video.span_seconds() > shape.seconds - 0.5);
+    CHECK(whole.audio.span_seconds() > shape.seconds - 0.5);
+
+    double boundary = 0.0;
+    Timeline previous;
+    for (size_t i = 0; i < run.fragments.size(); ++i) {
+        const auto one = measure(joined(run.init, run.fragments[i]));
+        REQUIRE(one.video.present);
+        REQUIRE(one.audio.present);
+        CHECK(one.video.first_key);
+        CHECK(std::fabs(one.video.first_seconds - boundary) <= 0.002);
+        if (i) {
+            // One 25 fps frame apart, never overlapping.
+            CHECK(one.video.first_seconds > previous.video.last_seconds);
+            CHECK(one.video.first_seconds - previous.video.last_seconds < 0.05);
+            // The straddling AAC packet: carried once, the next one frame on.
+            CHECK(one.audio.first_seconds > previous.audio.last_seconds);
+            CHECK(one.audio.first_seconds - previous.audio.last_seconds < 0.03);
+        }
+        boundary += run.planned[i];
+        previous = one;
+    }
+}
+
+MACHA_TEST("media_engine",
+           test_a_remux_boundary_before_every_stream_has_started_carries_its_length_forward) {
+    // Audio begins 2.5 s in, after the planned boundaries at 1 s and 2 s. A cut
+    // there finds nothing the muxer can fragment yet, so the boundary passes
+    // without a fragment and its length is carried into a later one. The
+    // generation still ends clean, carries all the media, and publishes the
+    // plan's length exactly once: no planned second lost, none counted twice.
+    StreamingConfig streaming;
+    auto engine = make_libav_media_engine(streaming);
+    REQUIRE(engine != nullptr);
+    TempDir temp;
+    SourceShape shape;
+    shape.seconds = 12.0;
+    shape.audio_start_seconds = 2.5;
+    const auto synthesized = synthesize_source(temp.path() / "source.mkv", "matroska", shape);
+
+    const auto run = remux(*engine, synthesized, temp.path() / "spill", std::chrono::seconds{1});
+    CHECK(run.exit_code == 0);
+    CHECK(run.state.error.empty());
+    REQUIRE(run.planned.size() >= 10);
+    REQUIRE(!run.fragments.empty());
+    // A boundary passed without a fragment.
+    CHECK(run.fragments.size() < run.planned.size());
+
+    // The first fragment holds the media of more than its own planned entry.
+    const auto first = measure(joined(run.init, run.fragments.front()));
+    REQUIRE(first.video.present);
+    CHECK(first.video.first_seconds < 0.002);
+    CHECK(first.video.end_seconds > run.planned.front() + 0.5);
+
+    const auto whole = measure(run.whole());
+    REQUIRE(whole.video.present);
+    REQUIRE(whole.audio.present);
+    CHECK(whole.video.span_seconds() > shape.seconds - 0.5);
+    // Late, less the AAC priming frame, but not shifted to zero.
+    CHECK(whole.audio.first_seconds > shape.audio_start_seconds - 0.1);
+
+    CHECK(std::llabs(static_cast<int64_t>(run.state.produced_media_ms) -
+                     std::llround(run.planned_seconds() * 1000.0)) <= 2);
+}
+
+namespace {
+
+// Two cues inside a 12 s source and one an hour in, past the A/V media.
+Synthesized subtitled_source(const std::filesystem::path& path) {
+    SourceShape shape;
+    shape.seconds = 12.0;
+    shape.cues = {{1'000, 1'500, "First cue"},
+                  {5'000, 1'500, "Second cue"},
+                  {3'725'500, 1'500, "An hour in"}};
+    auto synthesized = synthesize_source(path, "matroska", shape);
+    REQUIRE(synthesized.subtitle_stream >= 0);
+    return synthesized;
+}
+
+std::string webvtt(MediaEngine& engine, const Synthesized& synthesized, int64_t start_ms,
+                   int64_t end_ms, int64_t origin_ms = 0, std::optional<int> stream = {}) {
+    const auto source = memory_source(synthesized, "subtitled");
+    const int chosen = stream.value_or(synthesized.subtitle_stream);
+    return engine.extract_webvtt_segment(source, chosen, std::chrono::milliseconds{start_ms},
+                                         std::chrono::milliseconds{end_ms},
+                                         std::chrono::milliseconds{origin_ms});
+}
+
+template <class Exception, class Fn> bool throws(Fn&& fn) {
+    try {
+        fn();
+    } catch (const Exception&) {
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+MACHA_TEST("media_engine", test_a_webvtt_segment_carries_the_cues_that_start_inside_it) {
+    // SubRip in Matroska, decoded and written as WebVTT: a segment holds the
+    // cues that start in its range, numbered from one, each with its own end;
+    // a later segment seeks to its range and repeats nothing before it.
+    StreamingConfig streaming;
+    auto engine = make_libav_media_engine(streaming);
+    REQUIRE(engine != nullptr);
+    TempDir temp;
+    const auto synthesized = subtitled_source(temp.path() / "subtitled.mkv");
+
+    CHECK(webvtt(*engine, synthesized, 0, 4'000) ==
+          "WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.500\nFirst cue\n\n");
+    CHECK(webvtt(*engine, synthesized, 4'000, 8'000) ==
+          "WEBVTT\n\n1\n00:00:05.000 --> 00:00:06.500\nSecond cue\n\n");
+    CHECK(webvtt(*engine, synthesized, 0, 8'000) ==
+          "WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.500\nFirst cue\n\n"
+          "2\n00:00:05.000 --> 00:00:06.500\nSecond cue\n\n");
+}
+
+MACHA_TEST("media_engine", test_webvtt_cue_times_are_hours_minutes_seconds_and_milliseconds) {
+    // Cue times are HH:MM:SS.mmm with every field padded, hours included.
+    StreamingConfig streaming;
+    auto engine = make_libav_media_engine(streaming);
+    REQUIRE(engine != nullptr);
+    TempDir temp;
+    const auto synthesized = subtitled_source(temp.path() / "subtitled.mkv");
+
+    CHECK(webvtt(*engine, synthesized, 3'720'000, 3'730'000) ==
+          "WEBVTT\n\n1\n01:02:05.500 --> 01:02:07.000\nAn hour in\n\n");
+}
+
+MACHA_TEST("media_engine", test_webvtt_cue_times_are_relative_to_the_timeline_origin) {
+    // A seek generation's timeline starts at its origin: cue times are shifted
+    // by it, a cue that began before it shows from zero, and a cue that ended
+    // before it is left out.
+    StreamingConfig streaming;
+    auto engine = make_libav_media_engine(streaming);
+    REQUIRE(engine != nullptr);
+    TempDir temp;
+    const auto synthesized = subtitled_source(temp.path() / "subtitled.mkv");
+
+    CHECK(webvtt(*engine, synthesized, 0, 4'000, 500) ==
+          "WEBVTT\n\n1\n00:00:00.500 --> 00:00:02.000\nFirst cue\n\n");
+    CHECK(webvtt(*engine, synthesized, 0, 4'000, 1'500) ==
+          "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\nFirst cue\n\n");
+    CHECK(webvtt(*engine, synthesized, 0, 4'000, 3'000) == "WEBVTT\n\n");
+}
+
+MACHA_TEST("media_engine", test_a_webvtt_segment_without_a_cue_is_an_empty_document) {
+    // A range no cue starts in is a valid, empty WebVTT document, inside the
+    // A/V media or past it; an empty range or a stream that is not a subtitle
+    // is refused as the caller's error.
+    StreamingConfig streaming;
+    auto engine = make_libav_media_engine(streaming);
+    REQUIRE(engine != nullptr);
+    TempDir temp;
+    const auto synthesized = subtitled_source(temp.path() / "subtitled.mkv");
+
+    CHECK(webvtt(*engine, synthesized, 8'000, 12'000) == "WEBVTT\n\n");
+    CHECK(webvtt(*engine, synthesized, 12'000, 60'000) == "WEBVTT\n\n");
+    CHECK(throws<std::invalid_argument>([&] { webvtt(*engine, synthesized, 4'000, 4'000); }));
+    CHECK(throws<std::invalid_argument>(
+        [&] { webvtt(*engine, synthesized, 0, 4'000, 0, synthesized.video_stream); }));
 }
