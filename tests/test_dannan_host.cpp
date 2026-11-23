@@ -192,17 +192,24 @@ MACHA_TEST("dannan_host", test_a_call_reaches_the_peers_route_and_answers) {
     REQUIRE(refusal.has_value());
     REQUIRE(refusal->status == 501);
 
-    // The metadata notice reaches its own handler, ahead of every queue.
+    // The metadata notice reaches its own handler, ahead of every queue. A broadcast is a
+    // notification: it goes to the sessions there are now, and one sent while the two
+    // nodes settle which of their two connections to keep can be lost. Sent again until
+    // one lands, as a node's next notice would be.
     Writer notice;
     notice.u64(168518);
-    a.node().channels().broadcast(
-        dannan_message(RpcMessage(MessageType::metadata_notice, notice.take())));
+    const auto message = dannan_message(RpcMessage(MessageType::metadata_notice, notice.take()));
     REQUIRE(wait_until(
         [&] {
-            std::lock_guard lock(notices_mutex);
-            return !notices.empty();
+            {
+                std::lock_guard lock(notices_mutex);
+                if (!notices.empty())
+                    return true;
+            }
+            (void)a.node().channels().broadcast(message);
+            return false;
         },
-        10s));
+        10s, 250ms));
     {
         std::lock_guard lock(notices_mutex);
         REQUIRE(notices.front() == 168518);

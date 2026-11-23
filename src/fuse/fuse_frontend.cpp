@@ -2630,7 +2630,9 @@ struct FuseFrontend::State {
         auto found = inodes.find(id);
         if (found == inodes.end() || id == 1)
             return;
-        const auto& inode = found->second;
+        // Held by value, before the lock: erasing the table's entry below may drop the last
+        // other owner, and the lock must be released before the inode and its mutex go.
+        const auto inode = found->second;
         Lock inode_lock(inode->mutex);
         const bool detached = !inode->published_path;
         const bool no_handles = !inode->open_handles && !inode->writable_handles;

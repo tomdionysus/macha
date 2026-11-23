@@ -53,16 +53,17 @@ two history rewrites; the maintainer's backups hold the maps.
      fixed in `d7929ad`, 60 of 60 since.
    - The catalogue SIGSEGV (`test_catalogue_sync_search_and_artwork_gc`) not reproduced: 90 of 90 under ASan,
      and 7 full plain runs under `--jobs 3` clean for it.
-   - **Heap corruption, reproduced under load (plain build, 0.95.4, `--jobs 3`):** the burst-rmdir case
-     (`test_removing_empty_directories_in_a_burst_keeps_the_node_up`) SIGSEGV in 2 of 7 full runs, and
-     `test_publication_writer_failure_stays_invisible` aborted once with `malloc(): unaligned tcache chunk
-     detected` inside `dannan::net::RequestScheduler::stop` at the test node's stop (core read; evidence in
-     `build/evidence/heap-2026-11-22/`). Glibc caught it late, so the stop is where it surfaced, not the cause.
-     Alone, under ASan, both pass. The ASan suite under `--jobs 2` (3 runs) never failed those two; run 3 failed
-     the ingest/torrent case on ASan's own thread-registry CHECK (as on `develop`'s CI): ASan's bookkeeping
-     overwritten, which uninstrumented code (libtorrent) could do, but the plain crashes run with torrent off.
-     A race under load fits both; next, TSan with Dannan and Dagda instrumented (running on build-3,
-     `build/pi/macha_sanitize.sh`, PASSES=tsan).
+   - **Heap corruption: found and fixed in 0.95.5** (`build/evidence/heap-2026-11-22/`). Under load the plain
+     suite crashed: burst-rmdir SIGSEGV in 2 of 7 runs, the publication case on `malloc(): unaligned tcache chunk
+     detected`. TSan (Dannan and Dagda instrumented) found two unlocks of freed memory: `reclaim_inode_if_quiescent`
+     (FUSE) and `erase_idempotency_for_session_locked` (playback) each erased the object's last owner while
+     holding its mutex. After the fix: 6 full runs under load with neither case failing, and 20 and 10 repeats
+     clean. TSan's other reports (a promise's shared state released on a Dannan thread, `exception_ptr`) sit in
+     uninstrumented libstdc++ atomics: likely false positives, not acted on.
+   - `test_a_call_reaches_the_peers_route_and_answers` failed once under load: one broadcast lost while the two
+     nodes settled their connections; the test now sends again until one lands (20 of 20).
+   - The ingest/torrent ASan CHECK (develop's CI) remains: ASan's own registry overwritten; libtorrent is the
+     uninstrumented suspect. Next: the CI's ASan run on 0.95.5, then libtorrent instrumented if it recurs.
    - Live: found-issues 1 and 2 (heap corruption, the FUSE `rm` crash) are still open.
 5. **Repin onto Dannan 0.10.1 and Dagda 0.4.0** (0.4.0 carries 0.3.3's repair fix): read each release's notes and
    changelog, drop workarounds, use new APIs, record it in the repin commit.

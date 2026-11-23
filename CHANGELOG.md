@@ -1,5 +1,18 @@
 # Current release
 
+## 0.95.5: two unlocks of freed memory fixed
+
+Two places locked an object's own mutex, erased the last owner of the object while holding it, and
+then unlocked the freed mutex: a write to freed memory, which corrupted the heap. Under load the
+suite crashed with SIGSEGV or glibc's `malloc(): unaligned tcache chunk detected`, at times far
+from the cause; ThreadSanitizer found both.
+
+- FUSE: reclaiming a quiescent inode (after a removal, from the namespace loop or a lookup).
+  A burst of directory removals could crash the node.
+- Playback: clearing a session's idempotent creations when the session is deleted.
+
+Each now holds the object by value until its lock is released.
+
 ## 0.95.4: Status shows each node's control store; a failed catalogue install backs off
 
 - API: each `nodes[]` entry in `GET /api/v1/status` gains `control_storage` (`available`,

@@ -1545,8 +1545,11 @@ struct PlaybackManager::Impl {
 
     void erase_idempotency_for_session_locked(std::string_view session_id) MACHA_REQUIRES(mutex) {
         for (auto it = idempotent_creations.begin(); it != idempotent_creations.end();) {
-            Lock creation_lock(it->second->mutex);
-            if (it->second->complete && it->second->session_id == session_id)
+            // Held by value, before the lock: the erase may drop the last other owner, and
+            // the lock must be released before the creation and its mutex go.
+            const auto creation = it->second;
+            Lock creation_lock(creation->mutex);
+            if (creation->complete && creation->session_id == session_id)
                 it = idempotent_creations.erase(it);
             else
                 ++it;
