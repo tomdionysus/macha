@@ -19,7 +19,10 @@ genuine Macha defect is fixed in Macha first and the libraries match the fix.
 
 Ordered by what they cost a user.
 
-1. **Heap corruption on live-a** (run, not explained). Four crashes from 17:18Z to 18:11Z on 2026-11-06, all
+1. **Heap corruption on live-a** (run). **Likely explained, 2026-11-23, fixed in 0.95.5:** reclaiming a FUSE inode
+   after a removal unlocked the inode's mutex after erasing its last owner (a write to freed memory), found by TSan
+   and reproduced as the burst-rmdir crash under load; three of the four crashes below came seconds after a
+   recursive delete through the mount. Confirm by its absence on the live nodes once 0.95.5 runs there. Four crashes from 17:18Z to 18:11Z on 2026-11-06, all
    inside `malloc`: two SIGSEGV at one libc instruction, two SIGABRT with `corrupted double-linked list (not
    small)`. Three of four came seconds after a recursive delete through the FUSE mount; three of four stacks
    were building the large ingest-job or catalogue-hint JSON, which only live-a holds. live-b ran the same
@@ -36,8 +39,8 @@ Ordered by what they cost a user.
    (26, then a power loss on the Pi at 23:17Z; then 27), no ASan or UBSan report. Not reproduced without a peer: next,
    an ASan pair over the real network (build-3 with the mount, build-2 the replica, 2 replicas), so writes replicate
    and repair runs as on live-b.
-2. **`rm` in the FUSE mount with a filter can crash macha** (operator's report, 2026-11-06). Not reproduced
-   here; may be item 1.
+2. **`rm` in the FUSE mount with a filter can crash macha** (operator's report, 2026-11-06). Likely item 1,
+   fixed in 0.95.5.
 3. **A full control store is silent and costly** (run). **2026-11-22, 0.95.4:** Status shows each node's
    `control_storage` and a condition within 5% of the limit (the silent half). The retry half is unproven on the
    ported code: a catalogue hint whose commit the store refuses defers a fixed `provider_batch_delay` (30 s) and
