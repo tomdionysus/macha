@@ -27,6 +27,36 @@ using namespace macha::test_support;
 
 namespace {
 
+// A request body's \u escapes decode to UTF-8 at every width, a surrogate pair to one
+// code point; every malformed escape is refused with JsonError, never read as text.
+MACHA_TEST("foundations", test_json_unicode_escapes_decode_and_malformed_ones_are_refused) {
+    const auto text = [](const std::string& body) { return Json::parse(body).asString(); };
+    CHECK(text(R"("A")") == "A");
+    CHECK(text(R"("é")") == "\xc3\xa9");
+    CHECK(text(R"("é")") == "\xc3\xa9");
+    CHECK(text(R"("€")") == "\xe2\x82\xac");
+    CHECK(text(R"("🎬")") == "\xf0\x9f\x8e\xac");
+    CHECK(text(R"("a\"\\\/\b\f\n\r\tz")") == "a\"\\/\b\f\n\r\tz");
+
+    const auto refused = [](const std::string& body) {
+        try {
+            (void)Json::parse(body);
+        } catch (const JsonError&) {
+            return true;
+        }
+        return false;
+    };
+    CHECK(refused(R"("\u00G1")"));
+    CHECK(refused(R"("\u00")"));
+    CHECK(refused(R"("\uD83C")"));
+    CHECK(refused(R"("\uD83Cx")"));
+    CHECK(refused(R"("\uD83CA")"));
+    CHECK(refused(R"("\uDFAC")"));
+    CHECK(refused(R"("\q")"));
+    CHECK(refused("\"a\x01\""));
+    CHECK(refused(R"("unterminated)"));
+}
+
 // Repair's in-flight bytes are bounded by the memory budget, not by what it
 // takes the link to be: an eighth of the retained-memory budget, never less
 // than an extent, and the store's repair is given that bound.

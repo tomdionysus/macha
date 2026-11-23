@@ -4498,6 +4498,54 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_k
     frontend->stop();
 }
 
+// What the kernel asks by path: truncate shrinks and grows a file (the grown part reads
+// zero), chown sets only what it is told to, and statfs reports a capacity at least
+// what is used.
+MACHA_TEST("filesystem_fuse", test_fuse_path_truncate_chown_and_statfs) {
+    TestService fixture("fuse-path-attributes");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_write_copies = 1;
+    config.write_copies = 1;
+    auto& service = fixture.start();
+    auto frontend =
+        make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
+
+    const std::string path = "/attributes.bin";
+    auto handle = frontend->create(path, 0644, getuid(), getgid(), false, true, false);
+    const auto bytes = pattern(10000, 7);
+    REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
+    frontend->release(handle.inode, true);
+
+    frontend->truncate(path, 4096);
+    CHECK(frontend->getattr(path).size == 4096);
+    frontend->truncate(path, 8192);
+    CHECK(frontend->getattr(path).size == 8192);
+    {
+        auto reader = frontend->open(path, true, false, false, false);
+        Bytes back(8192);
+        REQUIRE(frontend->read(reader, 0, back) == back.size());
+        CHECK(std::equal(back.begin(), back.begin() + 4096, bytes.begin()));
+        CHECK(std::all_of(back.begin() + 4096, back.end(), [](uint8_t b) { return b == 0; }));
+        frontend->release(reader.inode, false);
+    }
+
+    const auto before = frontend->getattr(path);
+    frontend->chown(path, before.uid + 1, before.gid + 1, true, false);
+    CHECK(frontend->getattr(path).uid == before.uid + 1);
+    CHECK(frontend->getattr(path).gid == before.gid);
+    frontend->chown(path, before.uid + 7, before.gid + 2, false, true);
+    CHECK(frontend->getattr(path).uid == before.uid + 1);
+    CHECK(frontend->getattr(path).gid == before.gid + 2);
+
+    const auto [capacity, used] = frontend->logical_capacity();
+    CHECK(capacity > 0);
+    CHECK(used <= capacity);
+
+    REQUIRE(frontend->wait_for_idle(30s));
+    frontend->stop();
+}
+
 // With no peer and no new input, the maintenance pass parks rather than
 // rediscovering an unavailable write floor on an interval; a peer joining
 // wakes it at once and the floor forms; identical membership exchanges
