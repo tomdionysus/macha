@@ -63,6 +63,8 @@ two history rewrites; the maintainer's backups hold the maps.
      fixed in `d7929ad`, 60 of 60 since.
    - The catalogue SIGSEGV (`test_catalogue_sync_search_and_artwork_gc`) not reproduced: 90 of 90 under ASan,
      and 7 full plain runs under `--jobs 3` clean for it.
+   - **0.95.9 live on both nodes from 2026-11-23 21:58Z (live-a) and 21:59Z (live-b):** 0.95.8's fixes (remux
+     segments, torrent intents, torrent search) without 0.95.7's catalogue envelope, which waits for Core.
    - **0.95.6 live on both nodes from 2026-11-23 18:27Z (live-a) and 18:28Z (live-b).** 0.95.7 (the catalogue's
      common error envelope) is built and held until Core and the clients are told (the maintainer's ruling).
    - **0.95.5 live on both nodes from 2026-11-23 10:04Z (live-a) and 10:05Z (live-b).**
@@ -129,6 +131,11 @@ corruption; a Macha restart on either live node.
   --exclude '/build*' --exclude /.git --exclude CLAUDE.md --exclude CLAUDE.local.md`; no `-t`, no `--delete`.
 
 ## Builds
+
+**No preferred node (the maintainer's rule, 2026-11-23, relayed):** take whichever Pi has the cores free now; rsync
+the tree there and build from scratch, installing any missing -dev package (1 core, nice 19, board note). Wait
+only when none has them, with `claim-board wait --any`. The only exception is a job that must run on one machine,
+named in the claim.
 
 The shared build Pis: build-1 `root@192.0.2.169`, build-2 `.170`, build-3 `.202`, build-4 `.228`; Pi 5, 16 GB,
 Debian 13 arm64, shared by every session. No builds on the Mac. Claim per step on the claim board, only the cores the
