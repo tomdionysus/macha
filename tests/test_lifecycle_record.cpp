@@ -51,6 +51,8 @@ Config node_config(std::string_view node, const std::filesystem::path& root) {
     auto config = load_yaml_config(path);
     for (const auto& backend : config.storage_backends)
         std::filesystem::create_directories(backend.path);
+    // A deployed node's key custody, made as the operator makes it.
+    give_custody(config);
     // No plugins: record the build under test, not whatever is installed.
     config.plugin_path = std::filesystem::path{};
     return config;

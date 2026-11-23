@@ -3,6 +3,7 @@ start status
 start catalogue-http
 start node
 start startup
+open store
 local state recovered
 services constructed
 start catalogue-installer
@@ -15,8 +16,10 @@ start cluster-unmatched
 start torrent-coordinator
 start streaming
 start subsystems
+register reachability
 start maintenance
 services ready
+close routes
 stop catalogue-http
 request_stop maintenance
 request_stop catalogue-installer
@@ -35,6 +38,7 @@ request_stop metadata-replicator
 cancel-io outbound-rpc
 stop metadata-replicator
 stop maintenance
+unregister reachability
 stop catalogue-installer
 stop streaming
 stop manage-api
@@ -42,6 +46,7 @@ stop ingest
 stop hydration
 stop scanner
 stop media-information
+stop store
 request_stop status
 request_stop catalogue-http
 request_stop node
