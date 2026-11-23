@@ -43,7 +43,12 @@ two history rewrites; the maintainer's backups hold the maps.
      `/api/v1/manage/metadata/conflicts`;
    - the cutover check, then `maintenance.collect_garbage` (false on both until then);
    - clearing the nodes' kits (below), only what the kits installed.
-3. **The release** (`project_release_procedure`): the pre-merge gate on a Pi (`tools/ci.sh --local` with ASan, and the
+3. **Coverage, first whole-tree figure (2026-11-23, 0.95.5, `build/pi/macha_coverage.sh`): 82.8% of lines (41,520 of
+   50,140), 92.9% of functions**; per-file list in `build/evidence/coverage-2026-11-23/list.txt`. Most missed lines:
+   `fuse_frontend.cpp` 811, `media_catalogue.cpp` 807, `filesystem.cpp` 616 (70.9%), `media_engine.cpp` 521
+   (65.7%), `torrent_coordinator.cpp` 407 (59.7%); lowest: `cluster/membership.cpp` 44.5%. The dead
+   `replica_selector` (0%) removed. Closing the gaps is the next coverage work.
+   **The release** (`project_release_procedure`): the pre-merge gate on a Pi (`tools/ci.sh --local` with ASan, and the
    coverage build, which gives Macha's first whole-tree figure); squash the port onto `develop`; GitHub CI green on
    `develop` (red since 2026-11-13 on the ingest/torrent ASan crash, item 4 below); debs; tag; merge to `main`.
 4. **P0 failures, never tolerated as flakes.** 2026-11-22, on 0.95.2 with Dannan 0.9.2 and Dagda 0.3.3 both

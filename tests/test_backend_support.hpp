@@ -7,7 +7,6 @@
 #include "cluster/cluster.hpp"
 #include "cluster/net.hpp"
 #include "cluster/placement.hpp"
-#include "cluster/replica_selector.hpp"
 #include "codec.hpp"
 #include "config.hpp"
 #include "crypto.hpp"

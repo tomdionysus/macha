@@ -295,7 +295,6 @@ set(MACHA_CORE_SOURCES
     src/cluster/store_node.cpp
     src/cluster/telemetry_bridge.cpp
     src/cluster/cluster.cpp
-    src/cluster/replica_selector.cpp
     src/metadata/metadata.cpp
     src/metadata/metadata_merge.cpp
     src/metadata/namespace_tree.cpp
