@@ -102,6 +102,26 @@ two history rewrites; the maintainer's backups hold the maps.
     under `census_follow`; books as the web client reported at 0.92.2. Done in 0.95.3: cancelling an ingest (4) and
     the genesis password file's fsync.
 
+11. **Greatly improve the classifier and the matcher** (the maintainer, 2026-11-24). The diskA import left 1,281 files
+    unmatched and filed many wrongly; on live-a they were matched and refiled by hand-written scripts
+    (`build/diska-audit/`: `tv_parse.py`, `tv_match.py`, `tv_plan.py`, `music_match.py`), which show what the code
+    must do itself. Found:
+    - **Category:** TV episodes filed under `/Movies` (149: The Altos, Portal Expanse, Mr Plum, Roomy, ...),
+      show extras filed as films (61: featurettes, breakdowns, video blogs), films filed under a show
+      (`Star Voyage (2009)` in the TNG folder, Clubhouse under `/TV`). An episode name or a season folder is TV.
+    - **Filing:** every episode to `/TV/<Show>/Season NN/`; observed instead a folder per episode, numbered show
+      folders (`77 Cafe Cafe`), loose episodes at `/TV`'s top, the file name used as the show folder, `Season 1` and
+      `Season 01` side by side, duplicates stored twice (91). Same-name shows of different years kept apart by year
+      (All Beasts Large and Little 1978 and 2020).
+    - **Parsing:** `Show Season N Episode NN - Title` not recognised; numbered folder prefixes kept in the series
+      name; `S01 - E09 - Title` with the show only in the title parsed as a film; `Aftermath 2024 S02E01` (bare year);
+      release tags and `S00E04-E05` multi-episode files.
+    - **Matching:** well-parsed episodes still get `no_provider_match` (SST S04E07, cause unknown); specials numbered
+      differently from TMDB's season 0 (match specials by title; needs a season's episode list from the provider,
+      which the API cannot give today); music albums with format suffixes (`CDM`, `CDR`, `WEB`, `Vinyl`), artists
+      joined with `;` or `featuring`, soundtrack titles; match a whole album folder to one release by its track list.
+    - **Extras and samples:** recognise and skip samples, trailers and extras at import.
+
 **Reopen on sight:** `credit wait abandoned`; `metadata merge recorded a conflict`; `RPC stalled (control)`; heap
 corruption; a Macha restart on either live node.
 
