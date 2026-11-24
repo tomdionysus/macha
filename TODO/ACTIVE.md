@@ -22,8 +22,8 @@ two history rewrites; the maintainer's backups hold the maps.
   `feature/classifier`), untagged, not merged; the live nodes run it. `develop` and `main` are 0.94.2 and older;
   merges, tags and the release go on the maintainer's word.
 - **A third live node, live-c** (the maintainer, 2026-11-24, through the coordinator): the former build Pi build-4,
-  4 GB, advertised under example.net, failure domain site-a, joining through live-a and live-b, with live-b's
-  roles. State (custody, `/var/lib/macha`, config, metadata) on the NVMe; DATA on the 10 TB HDD, one GPT partition,
+  4 GB, advertised under example.net, its own failure domain site-c, joining through live-a and live-b, with
+  live-b's roles. Joined 2026-11-24 12:28Z on 0.96.1. State (custody, `/var/lib/macha`, config, metadata) on the NVMe; DATA on the 10 TB HDD, one GPT partition,
   ext4 labelled `macha-data`, mounted at `/mnt/diskB` by UUID with `nofail,x-systemd.device-timeout=30s`, the unit
   requiring the mount; DATA at `/mnt/diskB/data` (limit 9T), cores in `/mnt/diskB/crash`. Kit in
   the untracked `build/cutover/` directory. Waits for the HDD and the coordinator's "ready"; haproxy and a certificate after.
