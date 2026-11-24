@@ -83,6 +83,35 @@ MACHA_FAST_TEST("runtime_dependencies", test_glibc_allocator_arena_limit_is_hard
 #endif
 }
 
+MACHA_FAST_TEST("runtime_dependencies", test_allocator_usage_follows_allocations) {
+    const auto before = process_allocator_usage();
+#if defined(MACHA_TEST_GLIBC)
+    REQUIRE(before.has_value());
+    // Small blocks come from the heaps; one far above the mmap threshold is its
+    // own mapping. Both count as in use until freed.
+    std::vector<std::unique_ptr<uint8_t[]>> blocks;
+    for (int i = 0; i < 128; ++i) {
+        blocks.emplace_back(new uint8_t[64 * 1024]);
+        blocks.back()[0] = static_cast<uint8_t>(i);
+    }
+    std::unique_ptr<uint8_t[]> large(new uint8_t[64 * 1024 * 1024]);
+    large[0] = 1;
+    const auto held = process_allocator_usage();
+    REQUIRE(held.has_value());
+    CHECK(held->in_use_bytes >= before->in_use_bytes + 72 * 1024 * 1024);
+    CHECK(held->mapped_bytes >= before->mapped_bytes + 64 * 1024 * 1024);
+    CHECK(held->heap_bytes >= held->in_use_bytes - held->mapped_bytes);
+    blocks.clear();
+    large.reset();
+    const auto after = process_allocator_usage();
+    REQUIRE(after.has_value());
+    CHECK(after->in_use_bytes + 64 * 1024 * 1024 <= held->in_use_bytes);
+    CHECK(after->mapped_bytes + 64 * 1024 * 1024 <= held->mapped_bytes);
+#else
+    CHECK(!before.has_value());
+#endif
+}
+
 MACHA_FAST_TEST("runtime_dependencies", test_ffmpeg_log_bridge) {
     auto capture = std::make_shared<CapturingLogger>(LogLevel::info);
     Log::set_logger(capture);

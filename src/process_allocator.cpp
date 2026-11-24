@@ -38,4 +38,18 @@ ProcessAllocatorPolicy configure_process_allocator(size_t arena_max) {
 #endif
 }
 
+std::optional<ProcessAllocatorUsage> process_allocator_usage() {
+#if defined(MACHA_HAS_GLIBC_MALLOPT) && !defined(MACHA_SANITIZER_ALLOCATOR)
+    const auto info = ::mallinfo2();
+    ProcessAllocatorUsage usage;
+    usage.heap_bytes = info.arena;
+    usage.mapped_bytes = info.hblkhd;
+    usage.in_use_bytes = info.uordblks + info.hblkhd;
+    usage.free_bytes = info.fordblks;
+    return usage;
+#else
+    return std::nullopt;
+#endif
+}
+
 } // namespace macha

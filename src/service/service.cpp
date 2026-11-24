@@ -7,6 +7,7 @@
 #include "log.hpp"
 #include "macha_version.hpp"
 #include "metadata/namespace_control_store.hpp"
+#include "process_allocator.hpp"
 #include "startup_progress.hpp"
 #include "supervised.hpp"
 #include <algorithm>
@@ -709,6 +710,12 @@ void Service::stop() {
 std::map<std::string, uint64_t> Service::observation_gauges() {
     std::map<std::string, uint64_t> gauges{{"rss_bytes", process_resident_bytes()},
                                            {"maintenance_wakeups", maintenance_wakeups()}};
+    if (const auto allocator = process_allocator_usage()) {
+        gauges["allocator_heap_bytes"] = allocator->heap_bytes;
+        gauges["allocator_mapped_bytes"] = allocator->mapped_bytes;
+        gauges["allocator_in_use_bytes"] = allocator->in_use_bytes;
+        gauges["allocator_free_bytes"] = allocator->free_bytes;
+    }
     if (services_ready_.load(std::memory_order_acquire) &&
         !observation_stopping_.load(std::memory_order_acquire))
         gauges.merge(services_->observation_gauges());

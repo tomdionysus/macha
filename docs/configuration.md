@@ -115,7 +115,12 @@ configured and shrunk size. The observation log reports each part once a
 minute: `memory_limit_bytes`, `memory_budget_bytes` (the parts' total),
 `memory_in_flight_capacity_bytes` and `memory_in_flight_bytes`,
 `memory_metadata_cache_bytes`, `memory_ledger_caches_bytes`,
-`memory_catalogue_bytes`, beside `rss_bytes`.
+`memory_catalogue_bytes`, beside `rss_bytes`. Under glibc's allocator it also
+reports the allocator's own account, summed over every arena:
+`allocator_heap_bytes` (taken from the system for its heaps),
+`allocator_mapped_bytes` (blocks held as their own mappings),
+`allocator_in_use_bytes` (allocated) and `allocator_free_bytes` (freed, but
+still held by the allocator rather than returned to the system).
 
 `retained_memory_bytes` is the process-wide admission budget for heap objects
 which survive an asynchronous boundary, including FUSE write/operation state,

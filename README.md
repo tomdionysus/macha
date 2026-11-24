@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.96.1*
+*v0.96.2*
 
 [![Release](https://img.shields.io/github/v/tag/tomdionysus/macha?sort=semver&label=release)](https://github.com/tomdionysus/macha/tags)
 [![CI](https://github.com/tomdionysus/macha/actions/workflows/ci.yml/badge.svg)](https://github.com/tomdionysus/macha/actions/workflows/ci.yml)

@@ -3,6 +3,7 @@
 #include "log.hpp"
 #include "macha_version.hpp"
 #include "observation.hpp"
+#include "process_allocator.hpp"
 #include "test_support.hpp"
 
 #include <fstream>
@@ -407,6 +408,11 @@ MACHA_TEST("observation", test_a_service_writes_its_lifecycle_to_the_observation
             ++windows;
             CHECK(record.find("version")->asString() == kBuildIdentity);
             CHECK(record.find("gauges")->find("rss_bytes") != nullptr);
+            // The allocator's own account, wherever the allocator gives one.
+            CHECK((record.find("gauges")->find("allocator_in_use_bytes") != nullptr) ==
+                  process_allocator_usage().has_value());
+            CHECK((record.find("gauges")->find("allocator_free_bytes") != nullptr) ==
+                  process_allocator_usage().has_value());
         }
     }
     // A backend coming online during construction may precede "start".

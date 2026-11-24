@@ -1,5 +1,12 @@
 # Current release
 
+## 0.96.2: the allocator's own account of its memory
+
+- The observation log records glibc's account of the memory it holds, summed over every arena, once a minute:
+  `allocator_heap_bytes`, `allocator_mapped_bytes`, `allocator_in_use_bytes` and `allocator_free_bytes`.
+  Resident memory on the live nodes is two to two and a half times the configured budget, and the excess sits in
+  allocator arenas no other gauge counts; these tell memory in use from memory freed but kept.
+
 ## 0.96.1: episodes no longer filed as films
 
 - `Show Season 1 Episode 02` and `S01 - E02 - Title` are read as episodes; both were imported
