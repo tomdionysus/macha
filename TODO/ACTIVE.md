@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-11-22 about 17:45Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-24 about 09:50Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note.** The version before this rationalisation is
 `archive/2026-11-22-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md` (not ordered),
 `2026-11-08-found-issues.md` (Macha's defects), `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not
@@ -9,18 +9,20 @@ two history rewrites; the maintainer's backups hold the maps.
 
 ## Where it stands
 
-- **The port is live.** Both live nodes, live-a and live-b, serve **Macha 0.95.2 on Dagda 0.3.3 and Dannan 0.9.2**
-  (live-a since 2026-11-22 12:23Z, live-b since 14:28Z). The store cutover ran 2026-11-20 to 21 on 0.95.1; its record
-  is `archive/2026-11-18-cutover-runbook.md`, "Done".
+- **The port is live.** Both live nodes, live-a and live-b, serve **Macha 0.96.1 on Dannan 0.11.1 and Dagda 0.4.0**
+  (both since 2026-11-24 09:45Z and 09:48Z; 0.96.0, the repin, from 00:33Z). The store cutover ran 2026-11-20 to 21
+  on 0.95.1; its record is `archive/2026-11-18-cutover-runbook.md`, "Done".
 - **The post-cutover OOM is fixed.** live-a was killed twice (2026-11-21 22:21Z and 2026-11-22 01:08Z) by repair:
   Dagda 0.3.2's network estimate misread to 15 to 20 GiB/s, repair's burst (5 s of the estimate) read every planned
   object before sending, and RSS reached 4.7 to 5.6 GB on an 8 GB Pi. Dagda 0.3.3 fixes the estimate's sampling and
   bounds the push window; Macha 0.95.2 sets that window to an eighth of the retained-memory budget (96 MiB). On it,
   live-a held 0.97 to 1.20 GB through 76 GB of repair, the estimate steady at 10 to 12 MiB/s. The stopgaps
   (`maintenance.max_bandwidth: 16M`, a glibc `MALLOC_MMAP_THRESHOLD_` drop-in) are removed from both nodes.
-- **The branch:** `port/dannan-dagda`, 0.95.3 (`3f28e08`: the import submits each hint once; the genesis password
-  file durable), pushed, untagged, not merged; the live nodes run 0.95.2. `develop` and `main`
-  are 0.94.2 and older; merges, tags and the release go on the maintainer's word.
+- **The branch:** `port/dannan-dagda`, 0.96.1 (`370170d2`: episodes no longer filed as films, squashed from
+  `feature/classifier`), untagged, not merged; the live nodes run it. `develop` and `main` are 0.94.2 and older;
+  merges, tags and the release go on the maintainer's word.
+- **Next repin: Dagda 0.5.0 with Dannan 0.12.1, in one step, once Dagda 0.5.0 is tagged** (the coordinator,
+  2026-11-24: the group's top priority).
 
 ## Now, in order
 
@@ -83,8 +85,8 @@ two history rewrites; the maintainer's backups hold the maps.
    - The ingest/torrent ASan CHECK (develop's CI) remains: ASan's own registry overwritten; libtorrent is the
      uninstrumented suspect. Next: the CI's ASan run on 0.95.5, then libtorrent instrumented if it recurs.
    - Live: found-issues 1 and 2 (heap corruption, the FUSE `rm` crash) are still open.
-5. **Repin: done in 0.96.0 (Dannan 0.11.1, Dagda 0.4.0).** The next is Dagda 0.5.0 with Dannan 0.12.0 in one
-   move, once Dagda 0.5.0 is tagged (the coordinating session, 2026-11-23): Dannan 0.12.0 brings what Macha asked
+5. **Repin: done in 0.96.0 (Dannan 0.11.1, Dagda 0.4.0).** The next is Dagda 0.5.0 with Dannan 0.12.1 in one
+   move, once Dagda 0.5.0 is tagged (the coordinating session, 2026-11-24): Dannan 0.12 brings what Macha asked
    for (deferred requests bounded in bytes and per peer, readiness and health, keyed limits, the process runner
    for mobitool); read "Adopting 0.12.0" then. Dagda 0.5.0 carries D5 fenced leases and D6.
 6. **Report the Dannan and Dagda versions** in Status and the clients (`BACKLOG.md`, "Status and clients"); an API
@@ -102,7 +104,10 @@ two history rewrites; the maintainer's backups hold the maps.
     under `census_follow`; books as the web client reported at 0.92.2. Done in 0.95.3: cancelling an ingest (4) and
     the genesis password file's fsync.
 
-11. **Greatly improve the classifier and the matcher** (the maintainer, 2026-11-24). The diskA import left 1,281 files
+11. **Greatly improve the classifier and the matcher** (the maintainer, 2026-11-24). Done in 0.96.1: the episode
+    forms `Season N Episode NN` and `S01 - E02`, running numbers before the series, bundle folder names, year
+    spans, extras folders never naming a series. Next (the maintainer: extras are kept, always under their show or
+    film, never a film of their own): extras whose title is not in the same import, then the rest below. The diskA import left 1,281 files
     unmatched and filed many wrongly; on live-a they were matched and refiled by hand-written scripts
     (`build/diska-audit/`: `tv_parse.py`, `tv_match.py`, `tv_plan.py`, `music_match.py`), which show what the code
     must do itself. Found:
