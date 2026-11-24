@@ -186,6 +186,13 @@ Ordered by what they cost a user.
       `reason`. `docs/operations.md` gives the connectivity check one line: its answer and codes
       (`node_not_found`, `bad_node_id`) are undocumented.
     - An existing job with no file at the index answers 404 with the message "job not found".
+22. **`hosts_extents: auto` makes a node with disks cache-only when it is not inbound-capable** (run, 2026-11-24,
+    live-c). `resolve_hosts_extents` (`dannan_bridge.cpp:225`) returns `!storage_backends.empty() && inbound_capable`,
+    so a node whose advertised name did not resolve at join held 0 bytes until `hosts_extents: true` was set by hand.
+    Against the design: Dannan carries data both ways over a node's outbound links, so such a node still stores,
+    serves its extents and is a repair source (live-c filled over its outbound sessions before it was reachable).
+    Proposed: `auto` stores when there are storage backends; `false` stays the explicit edge role; the validator's
+    "reachable from inbound-capable peers only" warning reworded. **The maintainer, 2026-11-24: revisit later.**
 
 ## The live cluster
 
