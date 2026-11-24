@@ -23,7 +23,10 @@ two history rewrites; the maintainer's backups hold the maps.
   merges, tags and the release go on the maintainer's word.
 - **A third live node, live-c** (the maintainer, 2026-11-24, through the coordinator): the former build Pi build-4,
   4 GB, advertised under example.net, its own failure domain site-c, joining through live-a and live-b, with
-  live-b's roles. Joined 2026-11-24 12:28Z on 0.96.1. State (custody, `/var/lib/macha`, config, metadata) on the NVMe; DATA on the 10 TB HDD, one GPT partition,
+  live-b's roles. Joined 2026-11-24 12:28Z on 0.96.1; at its own site and inbound-capable from 17:14Z. Its USB
+  enclosure (JMicron 152d:0580 under UAS) dropped mid-write once, 2026-11-24 17:10Z (no undervoltage; the mount went,
+  macha.service stopped with it, fsck recovered the journal clean at the next boot). The maintainer: leave UAS on and
+  watch; on a repeat, the remedy is `usb-storage.quirks=152d:0580:u`. State (custody, `/var/lib/macha`, config, metadata) on the NVMe; DATA on the 10 TB HDD, one GPT partition,
   ext4 labelled `macha-data`, mounted at `/mnt/diskB` by UUID with `nofail,x-systemd.device-timeout=30s`, the unit
   requiring the mount; DATA at `/mnt/diskB/data` (limit 9T), cores in `/mnt/diskB/crash`. Kit in
   the untracked `build/cutover/` directory. Waits for the HDD and the coordinator's "ready"; haproxy and a certificate after.
