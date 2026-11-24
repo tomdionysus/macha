@@ -1,5 +1,15 @@
 # Current release
 
+## 0.96.1: episodes no longer filed as films
+
+- `Show Season 1 Episode 02` and `S01 - E02 - Title` are read as episodes; both were imported
+  under `/Movies` as films of their own.
+- A running number before the series (`10 - Cafe Cafe S2e02`) is no longer part of its name, so
+  each episode no longer starts a show of its own.
+- A folder named for a bundle (`Mr. Plum - The Complete Collection (1990-2007)`) gives the series
+  without the description, and a span of years dates the series by its first.
+- A file in a folder of extras is never an episode of a series named after that folder.
+
 ## 0.96.0: on Dannan 0.11.1 and Dagda 0.4.0; repair returns its memory
 
 - Built on Dannan 0.11.1 (from 0.9.2) and Dagda 0.4.0 (from 0.3.3). Install both first:

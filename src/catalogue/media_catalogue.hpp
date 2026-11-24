@@ -116,6 +116,9 @@ std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path, c
 std::vector<MediaProbeCandidate> probe_host_media_candidates(const std::filesystem::path&,
                                                              uint64_t size);
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&);
+// A folder of extras, by the names libraries and releases give them: what is in
+// one is neither an episode nor a film of its own.
+bool media_extras_folder(std::string_view name);
 FrameType catalogue_media_profile_frame_type() noexcept;
 
 struct RemoteArtwork {

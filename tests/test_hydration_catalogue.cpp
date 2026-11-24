@@ -721,6 +721,21 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
                  "Cafe Cafe", 0, 1, 0, "The Visitors Are Coming [Pilot]"},
              EpisodeRegression{"/TV/Test Show S01E01 - Ordinary Episode [rartv].mkv", "Test Show",
                                0, 1, 1, "Ordinary Episode"},
+             EpisodeRegression{
+                 "/TV/Cafe Cafe 1984 Season 1 to 3 Complete DVDRip x264 [i_c]/Cafe Cafe 1984 "
+                 "Season 2/10 - Cafe Cafe S2e02 - The Courting Of Widow Marchand.mkv",
+                 "Cafe Cafe", 0, 2, 2, "The Courting Of Widow Marchand"},
+             EpisodeRegression{
+                 "/TV/The Altos - The Complete Series (Season 1, 2, 3, 4, 5 & 6) + "
+                 "Extras/Season 1/The Altos Season 1 Episode 01 - Pilot.avi",
+                 "The Altos", 0, 1, 1, "Pilot"},
+             EpisodeRegression{"/TV/Portal Expanse/Portal Expanse Season 2 Episode 20 - "
+                               "Crucible.avi",
+                               "Portal Expanse", 0, 2, 20, "Crucible"},
+             EpisodeRegression{
+                 "/TV/Mr. Plum - The Complete Collection (1990-2007)/S01 - E01 - Mr. Plum.mkv",
+                 "Mr Plum", 1990, 1, 1, "Mr Plum"},
+             EpisodeRegression{"/TV/24/24 - S01E01 - Midnight.mkv", "24", 0, 1, 1, "Midnight"},
              EpisodeRegression{"/TV/Brown Books (2000)/Brown Books (2000) - S01E01 - Cooking the "
                                "Ledgers (576p DVD x265 Ghost).mkv",
                                "Brown Books", 2000, 1, 1, "Cooking the Ledgers"},
@@ -753,6 +768,21 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
         else
             CHECK(!parsed->year.has_value());
     }
+
+    // A featurette with no series in its name is not an episode of its folder;
+    // one that names its series is.
+    for (const auto& candidate : probe_media_candidates(
+             "/TV/Dunmore Paranormal (2018)/Featurettes/Season 2 - Episode 1 Breakdown.mkv",
+             fake))
+        CHECK(candidate.probe.kind != MediaProbeKind::episode);
+    auto bundled = probe_media_path("/TV/Other Show (2020) + Extras/Other Show S01E01.mkv", fake);
+    REQUIRE(bundled.has_value());
+    CHECK(bundled->kind == MediaProbeKind::episode);
+    CHECK(bundled->series == "Other Show");
+    CHECK(media_extras_folder("Featurettes"));
+    CHECK(media_extras_folder("Behind the Scenes"));
+    CHECK(!media_extras_folder("Season 1"));
+    CHECK(!media_extras_folder("Extraordinary Barrister Wren"));
 
     auto multi_episode =
         probe_media_path("/TV/Starhold Meridian (2003)/Season 4/Starhold Meridian (2003) - "

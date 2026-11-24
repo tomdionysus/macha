@@ -305,15 +305,6 @@ namespace {
 // By folder of the job's source: the series of the episodes under it, counted.
 using SeriesBelow = std::map<std::filesystem::path, std::map<std::string, size_t>>;
 
-// A folder of extras, by the names libraries and releases give them.
-bool extras_folder(const std::string& name) {
-    static const std::regex word(R"((^|[^a-z0-9])(featurettes?|extras?|bonus)($|[^a-z0-9]))",
-                                 std::regex::icase);
-    static const std::regex whole(R"(behind the scenes|deleted scenes|interviews|trailers|shorts)",
-                                  std::regex::icase);
-    return std::regex_search(name, word) || std::regex_match(name, whole);
-}
-
 // Where a file goes if it is an extra of a series: below the series' folder,
 // keeping the folders it has below its title, which is the outermost folder
 // with episodes under it. The job's own folder is a title only when one series
@@ -333,7 +324,7 @@ std::optional<std::string> series_extra_destination(const std::filesystem::path&
                 std::max_element(found->second.begin(), found->second.end(),
                                  [](const auto& a, const auto& b) { return a.second < b.second; });
             if (std::none_of(folders.begin() + static_cast<std::ptrdiff_t>(first), folders.end(),
-                             extras_folder))
+                             [](const std::string& name) { return media_extras_folder(name); }))
                 return {};
             auto destination = most->first;
             for (size_t i = first; i < folders.size(); ++i)

@@ -341,8 +341,16 @@ int32_t plausible_year_ceiling() {
 
 std::optional<int32_t> year_from(std::string_view text) {
     static const std::regex re(R"((?:19|20)[0-9]{2})");
+    // A span of years ("1990-2007") dates its first.
+    static const std::regex span(
+        R"((?:^|[^0-9])((?:19|20)[0-9]{2})\s*-\s*(?:19|20)[0-9]{2}(?:$|[^0-9]))");
     static const int32_t ceiling = plausible_year_ceiling();
     std::string owned(text);
+    if (std::smatch first; std::regex_search(owned, first, span)) {
+        const auto value = std::stoi(first[1].str());
+        if (value <= ceiling)
+            return value;
+    }
     std::optional<int32_t> result;
     for (std::sregex_iterator it(owned.begin(), owned.end(), re), end; it != end; ++it) {
         const auto pos = static_cast<size_t>((*it).position());
@@ -412,7 +420,7 @@ std::string clean_series_name(std::string value) {
     // Cut from the first bundle marker ("Season 1-4 S01-S04", "Complete
     // Series"): it describes the layout, not the series title.
     static const std::regex bundle_suffix(
-        R"((?:[ ._\-]+)(?:(?:season|seasons|series)[ ._\-]*[0-9]{1,2}[ ._\-]*-[ ._\-]*[0-9]{1,2}|s[0-9]{1,2}[ ._\-]*-[ ._\-]*s?[0-9]{1,2}|complete(?:[ ._\-]+series)?)(?:[ ._\-].*)?$)",
+        R"((?:[ ._\-]+)(?:(?:season|seasons|series)[ ._\-]*[0-9]{1,2}[ ._\-]*-[ ._\-]*[0-9]{1,2}|s[0-9]{1,2}[ ._\-]*-[ ._\-]*s?[0-9]{1,2}|(?:the[ ._\-]+)?complete(?:[ ._\-]+(?:series|collection))?)(?:[ ._\-].*)?$)",
         std::regex::icase);
     value = std::regex_replace(value, bundle_suffix, "");
 
@@ -504,16 +512,21 @@ struct EpisodePattern {
     std::optional<int32_t> episode_end;
 };
 
+// "Show S01E02", "S01 - E02", "Show 1x02" and "Show Season 1 Episode 02".
 std::optional<EpisodePattern> episode_pattern(std::string_view value) {
     static const std::regex se_re(
-        R"((.*?)(?:[ ._-]+|^)s(\d{1,2})e(\d{1,3})(?:[ ._-]*(?:-|e)[ ._-]*e?(\d{1,3}))?(?:[ ._-]+(.*))?$)",
+        R"((.*?)(?:[ ._-]+|^)s(\d{1,2})[ ._-]*e(\d{1,3})(?:[ ._-]*(?:-|e)[ ._-]*e?(\d{1,3}))?(?:[ ._-]+(.*))?$)",
         std::regex::icase);
     static const std::regex x_re(
         R"((.*?)(?:[ ._-]+|^)(\d{1,2})x(\d{1,3})(?:[ ._-]*-[ ._-]*(\d{1,3}))?(?:[ ._-]+(.*))?$)",
         std::regex::icase);
+    static const std::regex words_re(
+        R"((.*?)(?:[ ._-]+|^)season[ ._-]*(\d{1,2})[ ._,-]*episode[ ._-]*(\d{1,3})(?:[ ._-]*-[ ._-]*(\d{1,3}))?(?:[ ._-]+(.*))?$)",
+        std::regex::icase);
     std::string owned(value);
     std::smatch match;
-    if (!std::regex_match(owned, match, se_re) && !std::regex_match(owned, match, x_re))
+    if (!std::regex_match(owned, match, se_re) && !std::regex_match(owned, match, x_re) &&
+        !std::regex_match(owned, match, words_re))
         return {};
     EpisodePattern out;
     out.prefix = match[1].str();
@@ -543,6 +556,18 @@ std::optional<int32_t> season_directory_number(std::string_view value) {
 std::string strip_collection_ordinal(const std::string& value) {
     static const std::regex ordinal(R"(^\s*0[0-9]{1,2}[ ._-]+)");
     return std::regex_replace(value, ordinal, "");
+}
+
+// A running number before an episode's series ("10 - Cafe Cafe S2e02"); a
+// series that is a number ("24 - S01E01") has nothing after its dash.
+std::string strip_episode_ordinal(const std::string& value) {
+    static const std::regex ordinal(R"(^\s*[0-9]{1,3}\s+-\s+(?=\S))");
+    return std::regex_replace(strip_collection_ordinal(value), ordinal, "");
+}
+
+// The file sits in a folder of extras: a folder that cannot name its series.
+bool in_extras_folder(const std::vector<std::string>& parts) {
+    return parts.size() >= 2 && media_extras_folder(parts[parts.size() - 2]);
 }
 
 std::pair<std::string, std::optional<std::string>> strip_movie_edition(std::string value) {
@@ -760,7 +785,7 @@ class FilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenera
         auto pattern = episode_pattern(stem(path));
         if (!pattern)
             return {};
-        const auto prefix = strip_collection_ordinal(pattern->prefix);
+        const auto prefix = strip_episode_ordinal(pattern->prefix);
         if (clean_series_name(prefix).empty())
             return {};
         auto probe = make_probe(path, entry, MediaProbeKind::episode);
@@ -830,7 +855,7 @@ class DirectoryEpisodeCandidateGenerator final : public MediaProbeCandidateGener
         if (!pattern)
             return {};
         const auto parts = components(path);
-        if (parts.size() < 2)
+        if (parts.size() < 2 || in_extras_folder(parts))
             return {};
 
         size_t series_index = parts.size() - 2;
@@ -2034,6 +2059,15 @@ std::vector<MediaProbeCandidate> probe_host_media_candidates(const std::filesyst
 #endif
     return probe_media_candidates(
         MediaProbeContext{{}, path.generic_string(), entry, embedded ? &*embedded : nullptr});
+}
+
+bool media_extras_folder(std::string_view name) {
+    static const std::regex word(R"((^|[^a-z0-9])(featurettes?|extras?|bonus)($|[^a-z0-9]))",
+                                 std::regex::icase);
+    static const std::regex whole(R"(behind the scenes|deleted scenes|interviews|trailers|shorts)",
+                                  std::regex::icase);
+    const std::string owned(name);
+    return std::regex_search(owned, word) || std::regex_match(owned, whole);
 }
 
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry& entry) {
