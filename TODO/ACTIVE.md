@@ -63,6 +63,9 @@ two history rewrites; the maintainer's backups hold the maps.
      fixed in `d7929ad`, 60 of 60 since.
    - The catalogue SIGSEGV (`test_catalogue_sync_search_and_artwork_gc`) not reproduced: 90 of 90 under ASan,
      and 7 full plain runs under `--jobs 3` clean for it.
+   - **0.96.0 live on both nodes from 2026-11-24 00:33Z (live-a) and 00:34Z (live-b): the repin onto Dannan 0.11.1
+     and Dagda 0.4.0** (repair returns its buffers to Dannan's pool; transfer bound a third of the budget). Watch
+     live-a's resident memory through repair: it should hold flat, where 0.95.x climbed to about 1.5 GB.
    - **0.95.9 live on both nodes from 2026-11-23 21:58Z (live-a) and 21:59Z (live-b):** 0.95.8's fixes (remux
      segments, torrent intents, torrent search) without 0.95.7's catalogue envelope, which waits for Core.
    - **0.95.6 live on both nodes from 2026-11-23 18:27Z (live-a) and 18:28Z (live-b).** 0.95.7 (the catalogue's
@@ -80,12 +83,10 @@ two history rewrites; the maintainer's backups hold the maps.
    - The ingest/torrent ASan CHECK (develop's CI) remains: ASan's own registry overwritten; libtorrent is the
      uninstrumented suspect. Next: the CI's ASan run on 0.95.5, then libtorrent instrumented if it recurs.
    - Live: found-issues 1 and 2 (heap corruption, the FUSE `rm` crash) are still open.
-5. **Repin onto Dannan 0.11.1 and Dagda 0.4.0** (Dagda 0.4.0, tagged 2026-11-23 at `94a1b60`, is built on Dannan
-   0.11.1, needs libdannan0.11 at 0.11.1 or later, and its SONAME is the whole version, so Macha rebuilds against
-   libdagda0.4.0). 0.4.0 carries the repair memory fix (the retention live-a showed) and 0.3.3's estimate fix. Read
-   each release's notes and changelog, drop workarounds, use new APIs, record it in the repin commit. Still open
-   upstream, asked to be prioritised by the coordinating session: Dagda D5 fenced leases (torrent claims, catalogue
-   scanner, sweeper); Dannan 0.12.0 readiness, keyed limits, the process runner, byte-bounded deferred requests.
+5. **Repin: done in 0.96.0 (Dannan 0.11.1, Dagda 0.4.0).** The next is Dagda 0.5.0 with Dannan 0.12.0 in one
+   move, once Dagda 0.5.0 is tagged (the coordinating session, 2026-11-23): Dannan 0.12.0 brings what Macha asked
+   for (deferred requests bounded in bytes and per peer, readiness and health, keyed limits, the process runner
+   for mobitool); read "Adopting 0.12.0" then. Dagda 0.5.0 carries D5 fenced leases and D6.
 6. **Report the Dannan and Dagda versions** in Status and the clients (`BACKLOG.md`, "Status and clients"); an API
    change, announced to Core and every client first.
 7. **GoogleTest:** Macha's `MACHA_TEST` cases move on their own branch, one process per case, the count matching
