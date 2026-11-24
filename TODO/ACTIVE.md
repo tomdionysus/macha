@@ -1,188 +1,102 @@
 # Active tasks
 
-Last updated: 2026-11-24 about 09:50Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
+Last updated: 2026-11-24 about 19:00Z, on `port/dannan-dagda`. **State a branch's content from its diff and a node's
 state from its files, never from a prior note.** The version before this rationalisation is
-`archive/2026-11-22-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md` (not ordered),
-`2026-11-08-found-issues.md` (Macha's defects), `COMPLETED.md`, `CLIENT-CONTRACTS.md`, `archive/` (a record, not
-requirements). Commit hashes written in this directory before 2026-11-20 18:10Z name commits from before that day's
-two history rewrites; the maintainer's backups hold the maps.
+`archive/2026-11-24-ACTIVE-before-rationalisation.md`. Alongside: `BACKLOG.md` (not ordered),
+`2026-11-08-found-issues.md` (Macha's defects), `COMPLETED.md`, `CLIENT-CONTRACTS.md`, the dated plans, `archive/`
+(a record, not requirements). Commit hashes written here before 2026-11-20 18:10Z name commits from before that day's
+history rewrites; the maintainer's backups hold the maps.
 
 ## Where it stands
 
-- **The port is live.** Both live nodes, live-a and live-b, serve **Macha 0.96.1 on Dannan 0.11.1 and Dagda 0.4.0**
-  (both since 2026-11-24 09:45Z and 09:48Z; 0.96.0, the repin, from 00:33Z). The store cutover ran 2026-11-20 to 21
-  on 0.95.1; its record is `archive/2026-11-18-cutover-runbook.md`, "Done".
-- **The post-cutover OOM is fixed.** live-a was killed twice (2026-11-21 22:21Z and 2026-11-22 01:08Z) by repair:
-  Dagda 0.3.2's network estimate misread to 15 to 20 GiB/s, repair's burst (5 s of the estimate) read every planned
-  object before sending, and RSS reached 4.7 to 5.6 GB on an 8 GB Pi. Dagda 0.3.3 fixes the estimate's sampling and
-  bounds the push window; Macha 0.95.2 sets that window to an eighth of the retained-memory budget (96 MiB). On it,
-  live-a held 0.97 to 1.20 GB through 76 GB of repair, the estimate steady at 10 to 12 MiB/s. The stopgaps
-  (`maintenance.max_bandwidth: 16M`, a glibc `MALLOC_MMAP_THRESHOLD_` drop-in) are removed from both nodes.
-- **The branch:** `port/dannan-dagda`, 0.96.1 (`370170d2`: episodes no longer filed as films, squashed from
-  `feature/classifier`), untagged, not merged; the live nodes run it. `develop` and `main` are 0.94.2 and older;
-  merges, tags and the release go on the maintainer's word.
-- **A third live node, live-c** (the maintainer, 2026-11-24, through the coordinator): the former build Pi build-4,
-  4 GB, advertised under example.net, its own failure domain site-c, joining through live-a and live-b, with
-  live-b's roles. Joined 2026-11-24 12:28Z on 0.96.1; at its own site and inbound-capable from 17:14Z. Its USB
-  enclosure (JMicron 152d:0580 under UAS) dropped mid-write once, 2026-11-24 17:10Z (no undervoltage; the mount went,
-  macha.service stopped with it, fsck recovered the journal clean at the next boot). The maintainer: leave UAS on and
-  watch; on a repeat, the remedy is `usb-storage.quirks=152d:0580:u`. State (custody, `/var/lib/macha`, config, metadata) on the NVMe; DATA on the 10 TB HDD, one GPT partition,
-  ext4 labelled `macha-data`, mounted at `/mnt/diskB` by UUID with `nofail,x-systemd.device-timeout=30s`, the unit
-  requiring the mount; DATA at `/mnt/diskB/data` (limit 9T), cores in `/mnt/diskB/crash`. Kit in
-  the untracked `build/cutover/` directory. Waits for the HDD and the coordinator's "ready"; haproxy and a certificate after.
-- **Next repin: Dagda 0.5.0 with Dannan 0.12.1, in one step, once Dagda 0.5.0 is tagged** (the coordinator,
-  2026-11-24: the group's top priority).
+- **Three live nodes, all on Macha 0.96.1 with Dannan 0.11.1 and Dagda 0.4.0**, healthy, 3 of 3 online and storing,
+  28 TiB, two copies on two different sites (live-a site-a, live-b site-b, live-c site-c). Details below.
+- **The branch:** `port/dannan-dagda` at 0.96.1 (`370170d2`) plus TODO commits, pushed, untagged, not merged.
+  `develop` and `main` are 0.94.2 and older; merges, tags and the release go on the maintainer's word.
+- **live-c is filling:** rebalancing onto it at about 3 MiB/s over the internet (senders' upload), about 3.6 TiB to
+  go on 2026-11-24 18:30Z, so about two weeks. Nothing is at risk meanwhile: every extent keeps two copies.
+- **Next repin: Dagda 0.5.0 with Dannan 0.12.1 in one step, once Dagda 0.5.0 is tagged** (the coordinator: the
+  group's top priority). Dannan 0.12 brings what Macha asked for (deferred requests bounded in bytes and per peer,
+  readiness and health, keyed limits, the process runner for mobitool); read "Adopting 0.12.0" then. Dagda 0.5.0
+  carries D5 fenced leases and D6.
 
 ## Now, in order
 
-1. **Close out the OOM.** Watch live-a through an estimate misread on 0.95.2 (Dagda's line: RSS above about 1.3 GB, or
-   the estimate more than quadrupling in one step, is a finding to send Dagda). Then stop the samplers on live-a
-   (`/root/oom-watch/sampler.pid`; Dagda's `arena.pid` is Dagda's to stop) and report.
-2. **Post-cutover** (the maintainer, 2026-11-22: check then GC; deploy 0.95.3; stop the samplers; clear the kits):
-   - done 2026-11-22: 0.95.3 on both nodes (live-a 18:17Z, live-b 18:18Z; Status shows each on Dannan 0.9.2,
-     Dagda 0.3.3); samplers stopped, logs in `build/evidence/oom-2026-11-22/`; the cutover kits removed (custody
-     copies and `pre-0.95.3` kept);
-   - the cutover check on live-a, read-only as root on-box (`build/cutover/diag-keys.py`): the namespace's
-     1,624,424 extents all held by a reachable node, 0 unavailable, 0 unknown; repair 0 unsourceable, 0 unreadable.
-     `collect_garbage: true` on live-a from 18:27Z (a restart: a SIGHUP does not reload maintenance keys).
-     live-b not checked through its own API (signing in there from live-a was refused); the maintainer turned its
-     GC on anyway (same replicated namespace), from 21:32Z;
-   - 0.95.4 on both nodes from 21:31Z (live-a) and 21:32Z (live-b): Status shows each node's `control_storage`
-     (live-a 4.74 of 8.59 GB, live-b 4.48) and the nearly-full condition; a failed catalogue install backs off;
-   - the baseline comparison against `2026-11-06-pi-baselines.md` (state each node's replication state with it);
-   - the `catalogue_root` merge conflict: superseded by the next catalogue root, or the maintainer resolves it at
-     `/api/v1/manage/metadata/conflicts`;
-   - the cutover check, then `maintenance.collect_garbage` (false on both until then);
-   - clearing the nodes' kits (below), only what the kits installed.
-3. **Coverage, first whole-tree figure (2026-11-23, 0.95.5, `build/pi/macha_coverage.sh`): 82.8% of lines (41,520 of
-   50,140), 92.9% of functions**; per-file list in `build/evidence/coverage-2026-11-23/list.txt`. Most missed lines:
-   `fuse_frontend.cpp` 811, `media_catalogue.cpp` 807, `filesystem.cpp` 616 (70.9%), `media_engine.cpp` 521
-   (65.7%), `torrent_coordinator.cpp` 407 (59.7%); lowest: `cluster/membership.cpp` 44.5%. The dead
-   `replica_selector` (0%) removed. Of 278 functions no test calls: 31 dead (being removed), 117 untested with
-   real callers, 120 lambdas, destructors and callbacks. The untested, in order of what users see: JSON `\u`
-   escapes (`json.cpp:163`, `:177`); FUSE chown, truncate and statfs; the remux packet path; WebVTT subtitles;
-   playback's failure rollback; media error answers; probing unmatched files; the connectivity check;
-   acquisition file actions; torrent search and the Torznab chain; then ingest's hint resubmission and the
-   torrent coordinator's intents.
-   **The release** (`project_release_procedure`): the pre-merge gate on a Pi (`tools/ci.sh --local` with ASan, and the
-   coverage build, which gives Macha's first whole-tree figure); squash the port onto `develop`; GitHub CI green on
-   `develop` (red since 2026-11-13 on the ingest/torrent ASan crash, item 4 below); debs; tag; merge to `main`.
-4. **P0 failures, never tolerated as flakes.** 2026-11-22, on 0.95.2 with Dannan 0.9.2 and Dagda 0.3.3 both
-   instrumented: the whole suite passes under ASan (556/556), the ingest/torrent case that keeps `develop` red
-   among them.
-   - The status race was the test's (`test_status_renders_each_node_from_what_it_knows`, 22 of 30 under ASan):
-     fixed in `d7929ad`, 60 of 60 since.
-   - The catalogue SIGSEGV (`test_catalogue_sync_search_and_artwork_gc`) not reproduced: 90 of 90 under ASan,
-     and 7 full plain runs under `--jobs 3` clean for it.
-   - **0.96.0 live on both nodes from 2026-11-24 00:33Z (live-a) and 00:34Z (live-b): the repin onto Dannan 0.11.1
-     and Dagda 0.4.0** (repair returns its buffers to Dannan's pool; transfer bound a third of the budget). Watch
-     live-a's resident memory through repair: it should hold flat, where 0.95.x climbed to about 1.5 GB.
-   - **0.95.9 live on both nodes from 2026-11-23 21:58Z (live-a) and 21:59Z (live-b):** 0.95.8's fixes (remux
-     segments, torrent intents, torrent search) without 0.95.7's catalogue envelope, which waits for Core.
-   - **0.95.6 live on both nodes from 2026-11-23 18:27Z (live-a) and 18:28Z (live-b).** 0.95.7 (the catalogue's
-     common error envelope) is built and held until Core and the clients are told (the maintainer's ruling).
-   - **0.95.5 live on both nodes from 2026-11-23 10:04Z (live-a) and 10:05Z (live-b).**
-   - **Heap corruption: found and fixed in 0.95.5** (`build/evidence/heap-2026-11-22/`). Under load the plain
-     suite crashed: burst-rmdir SIGSEGV in 2 of 7 runs, the publication case on `malloc(): unaligned tcache chunk
-     detected`. TSan (Dannan and Dagda instrumented) found two unlocks of freed memory: `reclaim_inode_if_quiescent`
-     (FUSE) and `erase_idempotency_for_session_locked` (playback) each erased the object's last owner while
-     holding its mutex. After the fix: 6 full runs under load with neither case failing, and 20 and 10 repeats
-     clean. TSan's other reports (a promise's shared state released on a Dannan thread, `exception_ptr`) sit in
-     uninstrumented libstdc++ atomics: likely false positives, not acted on.
-   - `test_a_call_reaches_the_peers_route_and_answers` failed once under load: one broadcast lost while the two
-     nodes settled their connections; the test now sends again until one lands (20 of 20).
-   - The ingest/torrent ASan CHECK (develop's CI) remains: ASan's own registry overwritten; libtorrent is the
-     uninstrumented suspect. Next: the CI's ASan run on 0.95.5, then libtorrent instrumented if it recurs.
-   - Live: found-issues 1 and 2 (heap corruption, the FUSE `rm` crash) are still open.
-5. **Repin: done in 0.96.0 (Dannan 0.11.1, Dagda 0.4.0).** The next is Dagda 0.5.0 with Dannan 0.12.1 in one
-   move, once Dagda 0.5.0 is tagged (the coordinating session, 2026-11-24): Dannan 0.12 brings what Macha asked
-   for (deferred requests bounded in bytes and per peer, readiness and health, keyed limits, the process runner
-   for mobitool); read "Adopting 0.12.0" then. Dagda 0.5.0 carries D5 fenced leases and D6.
+1. **live-a's memory on 0.96.x.** The repin was meant to hold resident memory flat through repair; 0.95.x reached
+   about 1.5 GB. Read on 0.96.1: 2.33 GB about seven hours after a boot (memory budget 1.0 GB), 2.0 to 2.1 GB on
+   0.96.0. Read the observation gauges (`/var/lib/macha/observation/observations.jsonl`) for what grows; a Dannan or
+   Dagda cause goes to its session with the mechanism. Dagda's line: RSS above about 1.3 GB is a finding.
+2. **The repin** above, when Dagda 0.5.0 is tagged.
+3. **The classifier and matcher** (the maintainer, 2026-11-24: greatly improve them). 0.96.1 did the episode forms,
+   ordinals, bundle names, year spans and extras folders. Next: extras whose title is not in the same import (kept,
+   under their show or film, never a film of their own); then `BACKLOG.md`, "Import".
+4. **Skip intro and credits:** plan accepted, `2026-11-24-skip-segments-plan.md` (Chromaprint; Macha's own work; a
+   `/segments` route per media). Phase 1 when the maintainer says where it falls.
+5. **The release** (`project_release_procedure`): the pre-merge gate on a Pi (`tools/ci.sh --local` with ASan, and the
+   coverage build); squash the port onto `develop`; GitHub CI green on `develop` (red since 2026-11-13 on the
+   ingest/torrent ASan CHECK: ASan's registry overwritten, libtorrent the uninstrumented suspect); debs; tag; merge
+   to `main`. Coverage at 0.95.5: 82.8% of lines; per file in `build/evidence/coverage-2026-11-23/list.txt`; untested (JSON `\u` escapes, FUSE chown/truncate/statfs, the remux packet
+   path, WebVTT, playback rollback, media error answers, unmatched probing, acquisition file actions, Torznab).
 6. **Report the Dannan and Dagda versions** in Status and the clients (`BACKLOG.md`, "Status and clients"); an API
-   change, announced to Core and every client first.
+   change, announced to Core and every client first. The catalogue's common error envelope (0.95.7) is held the same
+   way (`CLIENT-CONTRACTS.md`).
 7. **GoogleTest:** Macha's `MACHA_TEST` cases move on their own branch, one process per case, the count matching
    before and after; GoogleTest from Dannan's `dannan::testing` export.
-8. **The stack audits** (`2026-11-20-duplication-audit.md`, `2026-11-20-no-special-node-audit.md`): the converged
-   placement plan is the coordinating session's; negotiation goes through it.
-9. **The deferred API intents** (`2026-11-18-port-api-announcement.md`): Dannan's and Dagda's native forms, once
-   fidelity is shown and the maintainer says.
-10. **Macha's defects**, `2026-11-08-found-issues.md` in its order: a full control store is silent (3; Status
-    reports no control-store use, and with `collect_garbage` false nothing is reclaimed: 4,544 MiB of 8 GiB on
-    live-a, 4,298 on live-b, 2026-11-22, growth logged in `build/cutover/control-store.log`), import filing (9),
-    then the rest; and from the old list: the stop not checked by the release horizon's census or the tree diff
-    under `census_follow`; books as the web client reported at 0.92.2. Done in 0.95.3: cancelling an ingest (4) and
-    the genesis password file's fsync.
-
-11. **Greatly improve the classifier and the matcher** (the maintainer, 2026-11-24). Done in 0.96.1: the episode
-    forms `Season N Episode NN` and `S01 - E02`, running numbers before the series, bundle folder names, year
-    spans, extras folders never naming a series. Next (the maintainer: extras are kept, always under their show or
-    film, never a film of their own): extras whose title is not in the same import, then the rest below. The diskA import left 1,281 files
-    unmatched and filed many wrongly; on live-a they were matched and refiled by hand-written scripts
-    (`build/diska-audit/`: `tv_parse.py`, `tv_match.py`, `tv_plan.py`, `music_match.py`), which show what the code
-    must do itself. Found:
-    - **Category:** TV episodes filed under `/Movies` (149: The Altos, Portal Expanse, Mr Plum, Roomy, ...),
-      show extras filed as films (61: featurettes, breakdowns, video blogs), films filed under a show
-      (`Star Voyage (2009)` in the TNG folder, Clubhouse under `/TV`). An episode name or a season folder is TV.
-    - **Filing:** every episode to `/TV/<Show>/Season NN/`; observed instead a folder per episode, numbered show
-      folders (`77 Cafe Cafe`), loose episodes at `/TV`'s top, the file name used as the show folder, `Season 1` and
-      `Season 01` side by side, duplicates stored twice (91). Same-name shows of different years kept apart by year
-      (All Beasts Large and Little 1978 and 2020).
-    - **Parsing:** `Show Season N Episode NN - Title` not recognised; numbered folder prefixes kept in the series
-      name; `S01 - E09 - Title` with the show only in the title parsed as a film; `Aftermath 2024 S02E01` (bare year);
-      release tags and `S00E04-E05` multi-episode files.
-    - **Matching:** well-parsed episodes still get `no_provider_match` (SST S04E07, cause unknown); specials numbered
-      differently from TMDB's season 0 (match specials by title; needs a season's episode list from the provider,
-      which the API cannot give today); music albums with format suffixes (`CDM`, `CDR`, `WEB`, `Vinyl`), artists
-      joined with `;` or `featuring`, soundtrack titles; match a whole album folder to one release by its track list.
-    - **Extras and samples:** recognise and skip samples, trailers and extras at import.
+8. **The stack audits** (`2026-11-20-duplication-audit.md`, `2026-11-20-no-special-node-audit.md`) and **the deferred
+   API intents** (`2026-11-18-port-api-announcement.md`): through the coordinating session; on the maintainer's word.
+9. **Macha's defects**, `2026-11-08-found-issues.md` in its order. 22 (`hosts_extents: auto` makes a node with disks
+   cache-only when unreachable) waits: the maintainer, 2026-11-24, "revisit later".
 
 **Reopen on sight:** `credit wait abandoned`; `metadata merge recorded a conflict`; `RPC stalled (control)`; heap
-corruption; a Macha restart on either live node.
+corruption; a Macha restart on any live node; a USB disconnect on live-c.
 
 ## Waiting on the maintainer
 
-- The word for each item of "Post-cutover" and for the release.
+- Where phase 1 of skip intro and credits falls against the rest; the word for the release.
 - Where the Dagda 0.3.3 debs go (built by Dagda, local only).
 - Carried, unchecked: the media-kind import hint; truncated pack records; the `*.pre-migration.*` archives; the
-  replica journal reader with no writer left; whether the heap chase resumes with media load.
+  replica journal reader with no writer left.
 
-## The live nodes (read 2026-11-22)
+## The live nodes (read 2026-11-24)
 
-- **live-a** (root@192.0.2.50, Pi 5, 8 GB, site-a, API 192.0.2.50:7438, advertises `live-a.example.net`,
-  `bootstrap: []`) and **live-b** (root@live-b.example.net, Pi 5, 16 GB, site-b, API 203.0.113.50:7438 inside only,
-  inbound at :7437, bootstrap live-a). Never build on either. DATA `/mnt/diskB/data`; cores to `/mnt/diskB/crash`.
-- Install under `/usr/local`: Macha, `libdannan.so.0.9.2`, `libdagda.so.0.3.3`, `dannan-custody`,
-  `dannan-import-macha`, `dagda-migrate`. Layout v19. Custody sealed by systemd-creds (`dannan-root`, drop-in
-  `custody.conf`); `custody: credential` in `macha.yaml`.
-- Config: `maintenance.idle_bandwidth_fraction` 0.5, `max_bandwidth` 0B, `collect_garbage` false; dht replicas 2,
-  write_copies 1, metadata_write_copies 1, extent 4M; control store limit 8G; heartbeat 5 s, `telemetry_interval_ms`
-  10000. Observations once a minute in `/var/lib/macha/observation/observations.jsonl` (`rss_bytes`,
-  `repair_estimated_network_bps`, `repair_bytes_transferred`).
-- Kits left in `/root` (cleared on the maintainer's word): `stage-0.95.1`, `stage-0.95.2`, `pre-0.95.1` and
-  `pre-0.95.2` (rollback binaries and `macha.yaml`), `backup-0.95.1`, `migrate-0.95.1`, `custody-0.95.0` or
-  `custody-0.95.1`, live-a's `phys` and `oom-watch`; `macha.yaml.pre-max-bandwidth` beside the config. Rolling 0.95.2
-  back to 0.95.1 needs no migration: `pre-0.95.2/bin.tgz`, then `ldconfig`.
-- **Access:** the API needs a session; scripts in `build/baselines/`. Sync a tree to a Pi with `rsync -rlp --checksum
-  --exclude '/build*' --exclude /.git --exclude CLAUDE.md --exclude CLAUDE.local.md`; no `-t`, no `--delete`.
+Real names and addresses are in the untracked `CLAUDE.local.md`. Never build on a live node.
+
+- **live-a** (root@192.0.2.50, Pi 5, 8 GB, site-a, API 192.0.2.50:7438 behind haproxy for https, `bootstrap: []`).
+  Undervoltage logged through its boots; a power loss reset it 2026-11-24 11:34Z (the known supply problem; never
+  recommend another supply). Its import sources and the hand-run scripts are in `/root/diska-import/`.
+- **live-b** (Pi 5, 16 GB, site-b, API on its LAN address, inbound at :7437, bootstrap live-a, haproxy for https).
+- **live-c** (Pi 5, 4 GB, site-c, its own site since 2026-11-24): bootstrap live-a and live-b; memory sized for 4 GB
+  (retained 512M, reserves 128M viewer, 48M loader, 48M control); `hosts_extents: true` (set by hand, found-issue
+  22). State on the NVMe; DATA on a 10 TB USB disk (JMicron 152d:0580 under UAS; it dropped once, 2026-11-24 17:10Z;
+  the maintainer: leave UAS on and watch, the remedy on a repeat is `usb-storage.quirks=152d:0580:u`), ext4 labelled
+  `diskB`, mounted at `/mnt/diskB` with `nofail`, the unit requiring the mount. Its own DNS updater (Manannan 0.4.0,
+  one record, its own name) and haproxy with a Let's Encrypt certificate renewed by http-01 through haproxy (certbot
+  on 127.0.0.1:8888). Its install kit is in the untracked `build/cutover/`.
+- **All three:** Macha under `/usr/local` with `libdannan.so.0.11`, `libdagda.so.0.4.0`, `dannan-custody`,
+  `dannan-import-macha`, `dagda-migrate`; custody sealed by systemd-creds; DATA `/mnt/diskB/data`, cores to
+  `/mnt/diskB/crash`. dht replicas 2, write_copies 1, metadata_write_copies 1, extent 4M; control store 8G;
+  `collect_garbage: true`. Observations once a minute in `/var/lib/macha/observation/observations.jsonl`.
+- **Deploying:** a tarball built on a Pi (`build/pi/macha_package.sh`) and an install script per release in the
+  untracked `build/cutover/stage-<version>/`, one node at a time, waiting for health before the next.
+- **Access:** the API needs a session; the test account's credentials are on live-a only. Sync a tree to a Pi with
+  `rsync -rlp --checksum --exclude '/build*' --exclude /.git --exclude CLAUDE.md --exclude CLAUDE.local.md`; no `-t`,
+  no `--delete`.
 
 ## Builds
 
-**No preferred node (the maintainer's rule, 2026-11-23, relayed):** take whichever Pi has the cores free now; rsync
-the tree there and build from scratch, installing any missing -dev package (1 core, nice 19, board note). Wait
-only when none has them, with `claim-board wait --any`. The only exception is a job that must run on one machine,
-named in the claim.
+**No preferred node (the maintainer's rule, 2026-11-23):** take whichever Pi has the cores free now; rsync the tree
+there and build, installing any missing -dev package (1 core, nice 19, a board note). Wait only when none has them,
+with `claim-board wait --any`.
 
-The shared build Pis: build-1 `root@192.0.2.169`, build-2 `.170`, build-3 `.202`, build-4 `.228`; Pi 5, 16 GB,
-Debian 13 arm64, shared by every session. No builds on the Mac. Claim per step on the claim board, only the cores the
-step uses (1 for a test binary or packaging, N for a -jN compile), release when it ends; `claim-board wait` in the
-background when none are free. Development packages may be installed (1 core claimed, nice 19, a board note);
-remove only what an install manifest lists.
+The shared build Pis are build-1 `root@192.0.2.169`, build-2 `.170`, build-3 `.202` (Pi 5, 16 GB, Debian 13 arm64,
+shared by every session); build-4 left the build cluster and is live-c. No builds on the Mac. Claim per step, only
+the cores the step uses, release when it ends.
 
-build-3 holds Macha's tree `/home/maintainer/macha-store-2` (`build-port`, 0.95.2, suite 556/556) and the prefixes in
-`/home/maintainer/deps` (`prefix-0.9.2`, `prefix-dagda-0.3.3`, older ones). Scripts in `build/pi/`:
-`macha_port_compile.sh`, `macha_package.sh` (`V`, `DAGDA`), `macha_sanitize.sh` (instrumented Dannan and Dagda).
-Tests: `build-port/macha-tests --jobs 3`, or `--serial [--verbose] --filter NAME`; tee every result into a log on the
-Pi. Temporary diagnostics go on the Pi's copy only.
+build-2 holds the current tree `/home/maintainer/macha-repin` (`build`, 0.96.1, suite 584/584) and the prefixes
+`/home/maintainer/deps/prefix-dannan-0.11.1` and `prefix-dagda-0.4.0`. Scripts in `build/pi/`:
+`macha_repin_build.sh` (`J`), `macha_package.sh` (`S`, `B`, `V`, `DANNAN`, `DAGDA`, `OUTDIR`), `deps_repin.sh`,
+`macha_sanitize.sh`, `macha_coverage.sh`. Tests: `build/macha-tests --jobs N` (and `-runtime`, `-torrent`), or
+`--serial [--verbose] --filter NAME`; tee results into a log on the Pi. Format with the Pi's clang-format.
 
 ## Standing rules
 
@@ -204,8 +118,9 @@ Pi. Temporary diagnostics go on the Pi's copy only.
 - **Every response has a snake_case code; clients own sorting and presentation; every API change is announced to Core
   and every client before it ships.**
 - **One definition per concept**: a type Dannan or Dagda defines is aliased, never twinned. **Agreement is Dannan's.**
-- **Builds** only on the Pis, claimed per step, nice 19. Format with clang-format 19; clang-tidy reports nothing.
-- **Git**: push `port/dannan-dagda` freely, anything else on his word; no tag, merge or PR unasked; stage named paths;
-  no attribution trailers; no em dashes; versions in full x.y.z; placeholders only for hosts, addresses and people.
+- **Builds** only on the Pis, claimed per step, nice 19. clang-tidy reports nothing.
+- **Git**: features on their own branch, squashed onto the port; push `port/dannan-dagda` freely, anything else on his
+  word; no tag, merge or PR unasked; stage named paths; no attribution trailers; no em dashes; versions in full
+  x.y.z; placeholders only for hosts, addresses and people in tracked files.
 - **Text tools**: code lookups through basemind or Read; scratch files and logs in `build/`, never `/tmp`.
 - **The composition root is code**: concrete classes, constructor references, dependency order.

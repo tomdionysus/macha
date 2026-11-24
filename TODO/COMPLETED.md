@@ -1,6 +1,28 @@
 # Completed and tested
 
-Last updated: 2026-11-22. Documents named below without a path are in `archive/`.
+Last updated: 2026-11-24. Documents named below without a path are in `archive/`.
+
+## 2026-11-22 to 11-24 -- 0.95.2 to 0.96.1, the diskA clean-up, a third live node (`port/dannan-dagda`)
+
+- Post-cutover: the cutover check on live-a (1,624,424 extents all held by a reachable node), then
+  `maintenance.collect_garbage: true` on both nodes; samplers stopped and the cutover kits cleared.
+- 0.95.3 to 0.95.6: the import submits each hint once; the genesis password file durable; Status shows each node's
+  control storage and the nearly-full condition; a failed catalogue install backs off; two unlocks of freed memory
+  fixed (FUSE inode reclaim, playback idempotency), the heap corruption under load gone; Torznab and ingest fixes.
+- 0.95.8 and 0.95.9: remuxed segments match their playlist; torrent intents and search fixed. 0.95.7's catalogue
+  envelope was taken out again (held for Core, `CLIENT-CONTRACTS.md`).
+- 0.96.0: repinned onto Dannan 0.11.1 and Dagda 0.4.0 (repair's transfer buffers from Dannan's pool, bounded at a
+  third of the retained-memory budget).
+- 0.96.1 (`370170d2`, from `feature/classifier`): `Season N Episode NN` and `S01 - E02` are episodes; running numbers
+  before a series dropped; bundle folder names cleaned; a span of years dated by its first; an extras folder never
+  names a series. Suite 584/584.
+- The diskA audit and import on live-a: 13,791 media files audited; the missing imported; samples, trailers and
+  extras removed (875); TV reorganised to `/TV/<Show>/Season NN/` (621 moves, 91 duplicates, 1,066 empty folders);
+  603 + 2 episodes and 185 music tracks matched by script (`build/diska-audit/`); the Callrigger and Facerigger
+  DVD images copied in and verified; the disk then reformatted on the maintainer's word and reused for live-c.
+- live-c joined (2026-11-24): its own site (site-c), own DNS updater and TLS proxy; the cluster at 28 TiB, three
+  sites, two copies each.
+- Coverage measured once (0.95.5): 82.8% of lines, 92.9% of functions; 31 dead functions removed.
 
 ## 2026-11-20 to 11-22 -- the cutover, and the repair OOM fixed (`port/dannan-dagda`)
 

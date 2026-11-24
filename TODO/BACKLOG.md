@@ -163,20 +163,24 @@ directory (`ingest.cpp:405`); `admit_deferred` scans every inode
 
 ## Import
 
-- **Fix: a large import submits every file's catalogue hint twice, the second time as a slow
-  no-op pass.** Each file's hint goes in when that file lands (`src/acquisition/ingest.cpp:1872`,
-  `:1904`, `:2073`), and the catalogue matches as the job runs. After the last copy, `process_job`
-  (`:1421`) calls `enqueue_catalogue_hints` (`:1270`), which submits them all again. Every
-  `submit_many` forces a durable rewrite of all hints (`src/catalogue/catalogue_hints.cpp:359`),
-  though its comment expects one write per discovery pass. Seen on live-a at 0.93.4, job
-  b2bf6286: 7565 files, 5 MB `hints.json`, one thread at 100% from 13:13Z; hints change only in
-  `updated_unix_ms`. Meanwhile the job shows `importing`, 100%, a stale `current_file` and rate,
-  and logs nothing. **Operator 2026-11-06: remove the second pass.** Read for this: all three
-  places that set `file.completed` submit the hint straight after, so a normal run and a resume
-  lose nothing. One gap: they set `completed` before the submit, so a submit that throws can leave
-  a file recorded complete with no hint, which only the second pass now covers. Submit first, then
-  set `completed`, in the same change. Keep the `refresh_catalogue_jobs` call (`:1230`): it refills
-  a cataloguing job with no hints. The per-file rewrite during the copy stays a cost of its own.
+- **The classifier and matcher, from the diskA clean-up** (the maintainer, 2026-11-24: greatly improve them; 0.96.1
+  did the first part). On live-a the import's gaps were filled by scripts (`build/diska-audit/`: `tv_parse.py`,
+  `tv_match.py`, `tv_plan.py`, `music_match.py`), which show what the code must do itself. Left:
+  - **Extras** (the maintainer: kept, always under their show or film, never a film of their own): an extras folder
+    whose title's episodes are not in the same import is filed as a film today.
+  - **Category:** films filed under a show (`Star Voyage (2009)` in the TNG folder, Clubhouse under `/TV`); an
+    episode name or a season folder means TV.
+  - **Filing:** every episode to `/TV/<Show>/Season NN/`; seen instead: the file name used as the show folder,
+    loose episodes at `/TV`'s top, `Season 1` and `Season 01` side by side, the same file stored twice. Same-name
+    shows of different years stay apart by year (All Beasts Large and Little 1978 and 2020).
+  - **Parsing:** a bare year after the series (`Aftermath 2024 S02E01`); release tags; multi-episode files
+    (`S00E04-E05`).
+  - **Matching:** well-parsed episodes still `no_provider_match` (SST S04E07, cause unknown); specials numbered
+    differently from TMDB's season 0 (match by title, which needs a season's episode list from the provider; the
+    API cannot give one); music albums with format suffixes (`CDM`, `CDR`, `WEB`, `Vinyl`), artists joined with `;`
+    or `featuring`, `(Disc N)` and catalogue numbers in album names; match a whole album folder to one release by
+    its track list; tracks with no album tag need a recording match the API lacks.
+  - **Samples and trailers:** skipped at import (`ignore_terms` keeps them out of the catalogue only).
 
 - Whether an owned source should survive `clear` and `remove_after_ms` while a job has failed
   files: clearing it removes a failed file's bytes, per the docs and a review of the code, so
