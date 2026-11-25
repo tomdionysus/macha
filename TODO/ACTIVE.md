@@ -9,9 +9,9 @@ history rewrites; the maintainer's backups hold the maps.
 
 ## Where it stands
 
-- **Three live nodes, all on Macha 0.96.1 with Dannan 0.11.1 and Dagda 0.4.0**, healthy, 3 of 3 online and storing,
+- **Three live nodes, all on Macha 0.96.2 with Dannan 0.11.1 and Dagda 0.4.0**, healthy, 3 of 3 online and storing,
   28 TiB, two copies on two different sites (live-a site-a, live-b site-b, live-c site-c). Details below.
-- **The branch:** `port/dannan-dagda` at 0.96.1 (`370170d2`) plus TODO commits, pushed, untagged, not merged.
+- **The branch:** `port/dannan-dagda` at 0.96.2 (`6ef66e5f`) plus TODO commits, pushed, untagged, not merged.
   `develop` and `main` are 0.94.2 and older; merges, tags and the release go on the maintainer's word.
 - **live-c is filling:** rebalancing onto it at about 3 MiB/s over the internet (senders' upload), about 3.6 TiB to
   go on 2026-11-24 18:30Z, so about two weeks. Nothing is at risk meanwhile: every extent keeps two copies.
@@ -22,10 +22,14 @@ history rewrites; the maintainer's backups hold the maps.
 
 ## Now, in order
 
-1. **live-a's memory on 0.96.x.** The repin was meant to hold resident memory flat through repair; 0.95.x reached
-   about 1.5 GB. Read on 0.96.1: 2.33 GB about seven hours after a boot (memory budget 1.0 GB), 2.0 to 2.1 GB on
-   0.96.0. Read the observation gauges (`/var/lib/macha/observation/observations.jsonl`) for what grows; a Dannan or
-   Dagda cause goes to its session with the mechanism. Dagda's line: RSS above about 1.3 GB is a finding.
+1. **Memory: 630 to 990 MiB of live heap no gauge counts, on every node.** On 0.96.1 resident memory was 2 to 2.4
+   times the budget (live-a 2.35 GB, live-b 1.82 GB, live-c 1.06 GB, peak 1.36 GB of its 4 GB) and plateaued rather
+   than climbed. 0.96.2 (2026-11-24 19:35Z, all three) logs glibc's own account (`allocator_*` gauges): just after
+   start, in use 912 / 1,406 / 771 MiB against 127 / 417 / 144 MiB counted; free-but-held only 96 to 231 MiB, so
+   not fragmentation. An empty standalone node (`build/pi/empty_node.sh`) holds 1 MiB, so it is the state every node
+   loads, about the same whether a node stores 62 GB or 6 TB. Next (the maintainer, 2026-11-24): a heap profile
+   with heaptrack on live-c (a temporary unit drop-in, `zz-heaptrack.conf`, removed afterwards), then the cause to
+   whichever of Macha, Dannan or Dagda owns it.
 2. **The repin** above, when Dagda 0.5.0 is tagged.
 3. **The classifier and matcher** (the maintainer, 2026-11-24: greatly improve them). 0.96.1 did the episode forms,
    ordinals, bundle names, year spans and extras folders. Next: extras whose title is not in the same import (kept,
