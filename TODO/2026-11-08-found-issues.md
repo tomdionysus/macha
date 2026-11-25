@@ -193,6 +193,13 @@ Ordered by what they cost a user.
     serves its extents and is a repair source (live-c filled over its outbound sessions before it was reachable).
     Proposed: `auto` stores when there are storage backends; `false` stays the explicit edge role; the validator's
     "reachable from inbound-capable peers only" warning reworded. **The maintainer, 2026-11-24: revisit later.**
+23. **The FUSE frontend holds every file's extent list twice, for the life of the process** (run: heaptrack on live-c,
+    2026-11-25, 181 MB of a 793 MB peak; output on build-3, `/home/maintainer/heap/peaks.txt`). At mount, every
+    namespace entry becomes an inode whose `base` and `visible` are full `FsEntry` copies, extents included
+    (`fuse_frontend.cpp:4769-4787`); about 1.6 million extents, twice. **The maintainer: load a file's extents on open
+    and drop them at the last close**; after the match fixes. The profile's other large users went to their
+    sessions with the mechanism: Dagda (`LocalStore::list()` from the availability survey, 184 MB; repair's
+    concatenated lack lists, about 120 MB) and Dannan (the assembler joining very large messages, 103 MB).
 
 ## The live cluster
 
